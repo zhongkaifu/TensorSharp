@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\InferenceEngine\InferenceEngine.csproj" />
+  </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib')">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

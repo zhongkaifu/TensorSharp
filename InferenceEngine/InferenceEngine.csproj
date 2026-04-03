@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp\TensorSharp.csproj" />
+    <ProjectReference Include="..\TensorSharp.GGML\TensorSharp.GGML.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NLayer" Version="1.16.0" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.osx-arm64" Version="4.13.0.18" />
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260330" />
+  </ItemGroup>
+</Project>

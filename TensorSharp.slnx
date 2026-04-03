@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="AdvUtils/AdvUtils.csproj" />
+  <Project Path="InferenceConsole/InferenceConsole.csproj" />
+  <Project Path="InferenceEngine/InferenceEngine.csproj" />
+  <Project Path="InferenceWeb/InferenceWeb.csproj" />
+  <Project Path="TensorSharp.GGML/TensorSharp.GGML.csproj" />
+  <Project Path="TensorSharp/TensorSharp.csproj" />
+</Solution>
