@@ -1,0 +1,15 @@
+{"id": "math_simple", "messages": [{"role": "user", "content": "What is 2 + 3?"}], "max_tokens": 50}
+{"id": "math_multiply", "messages": [{"role": "user", "content": "What is 12 * 15?"}], "max_tokens": 50}
+{"id": "greeting", "messages": [{"role": "user", "content": "Hello! Who are you?"}], "max_tokens": 100}
+{"id": "multi_turn", "messages": [{"role": "user", "content": "My name is Alice."}, {"role": "assistant", "content": "Nice to meet you, Alice!"}, {"role": "user", "content": "What is my name?"}], "max_tokens": 50}
+{"id": "system_prompt", "messages": [{"role": "system", "content": "You are a helpful pirate assistant. Always respond like a pirate."}, {"role": "user", "content": "What is the capital of France?"}], "max_tokens": 100}
+{"id": "code_python", "messages": [{"role": "user", "content": "Write a Python function that returns the factorial of a number."}], "max_tokens": 200}
+{"id": "translation", "messages": [{"role": "user", "content": "Translate 'Hello, how are you?' to French, German, and Japanese."}], "max_tokens": 150}
+{"id": "creative_sampling", "messages": [{"role": "user", "content": "Write a haiku about the ocean."}], "max_tokens": 100, "temperature": 0.8, "top_p": 0.9, "seed": 42}
+{"id": "low_temp", "messages": [{"role": "user", "content": "What is the boiling point of water in Celsius?"}], "max_tokens": 30, "temperature": 0.1}
+{"id": "with_penalties", "messages": [{"role": "user", "content": "List five distinct colors."}], "max_tokens": 80, "temperature": 0.5, "repetition_penalty": 1.2, "top_k": 40}
+{"id": "stop_sequence", "messages": [{"role": "user", "content": "Count from 1 to 20, separated by commas."}], "max_tokens": 100, "stop": [", 10"]}
+{"id": "reasoning", "messages": [{"role": "user", "content": "If a train travels at 60 mph for 2.5 hours, how far does it go?"}], "max_tokens": 100}
+{"id": "chinese", "messages": [{"role": "user", "content": "请用中文介绍一下北京的故宫。"}], "max_tokens": 200}
+{"id": "prompt_simple", "prompt": "Explain what gravity is in one sentence.", "max_tokens": 60}
+{"id": "multi_turn_reasoning", "messages": [{"role": "user", "content": "I have 3 apples."}, {"role": "assistant", "content": "Okay, you have 3 apples."}, {"role": "user", "content": "I ate one and gave two to my friend. How many do I have left?"}], "max_tokens": 50}

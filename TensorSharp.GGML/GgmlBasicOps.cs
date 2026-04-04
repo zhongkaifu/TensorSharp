@@ -327,6 +327,46 @@ namespace TensorSharp.GGML
             GgmlNative.AddmmQuant(resultView, m1View, weightData, ggmlType, ne0, ne1, rawBytes);
         }
 
+        /// <summary>
+        /// Native row selection (embedding lookup) from a quantized tensor.
+        /// Uses GGML's ggml_get_rows which dequantizes on-the-fly (GPU-accelerated on Metal).
+        /// </summary>
+        public static void GetRowsQuant(Tensor result, IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes, Tensor indices)
+        {
+            if (result.DimensionCount != 2 || result.ElementType != DType.Float32)
+                throw new ArgumentException("GetRowsQuant requires a 2D Float32 result tensor.");
+            if (!(result.Storage is GgmlStorage))
+                throw new ArgumentException("GetRowsQuant requires GgmlStorage for result.");
+
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
+                || !TryCreateContiguousTensor(indices, out GgmlContiguousTensor indexTensor, DType.Int32))
+            {
+                throw new NotSupportedException("GGML GetRowsQuant requires a standard-layout result and contiguous Int32 indices.");
+            }
+
+            GgmlNative.GetRowsQuant(resultView, weightData, ggmlType, ne0, ne1, rawBytes, indexTensor);
+        }
+
+        /// <summary>
+        /// Batched quantized matmul: processes multiple sub-weights at different offsets within a single quantized blob.
+        /// </summary>
+        public static void AddmmQuantBatch(Tensor result, Tensor m1, IntPtr weightData, int ggmlType, long ne0, long rawBytes,
+            int batchCount, long[] weightOffsets, long[] weightNe1Arr)
+        {
+            if (result.DimensionCount != 2 || m1.DimensionCount != 2)
+                throw new ArgumentException("AddmmQuantBatch requires 2D tensors.");
+            if (!(m1.Storage is GgmlStorage) || !(result.Storage is GgmlStorage))
+                throw new ArgumentException("AddmmQuantBatch requires GgmlStorage tensors.");
+
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
+                || !TryCreateRawView(m1, out GgmlTensorView2D m1View))
+            {
+                throw new NotSupportedException("GGML AddmmQuantBatch requires tensors with supported row-contiguous layouts.");
+            }
+
+            GgmlNative.AddmmQuantBatch(resultView, m1View, weightData, ggmlType, ne0, rawBytes, batchCount, weightOffsets, weightNe1Arr);
+        }
+
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
@@ -393,6 +433,51 @@ namespace TensorSharp.GGML
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
                 intermediateSize, ropeMode);
+        }
+
+        public static void Gemma4ModelDecode(
+            IntPtr hiddenData, int hiddenSize, int numLayers,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            int[] kvSourceArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int position,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr)
+        {
+            GgmlNative.Gemma4ModelDecode(
+                hiddenData, hiddenSize, numLayers,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                kvSourceArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, position,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr);
         }
 
         [RegisterOpStorageType("addmmbatch", typeof(GgmlStorage))]

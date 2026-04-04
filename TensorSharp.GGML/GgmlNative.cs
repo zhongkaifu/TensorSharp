@@ -235,6 +235,28 @@ internal enum GgmlIndexReductionOp
             long m2RawBytes);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GetRowsQuantF32(
+            GgmlTensorView2D result,
+            IntPtr srcData,
+            int srcGgmlType,
+            long srcNe0,
+            long srcNe1,
+            long srcRawBytes,
+            GgmlContiguousTensor indices);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_AddmmQuantBatchF32(
+            GgmlTensorView2D result,
+            GgmlTensorView2D m1,
+            IntPtr m2Data,
+            int m2GgmlType,
+            long m2Ne0,
+            long m2RawBytes,
+            int batchCount,
+            long[] weightOffsets,
+            long[] weightNe1Arr);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_AddmmBatchF32(
             GgmlTensorView3D result,
             GgmlTensorView3D src,
@@ -358,6 +380,29 @@ internal enum GgmlIndexReductionOp
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
             int intermediateSize, int ropeMode);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4ModelDecode(
+            IntPtr hiddenData, int hiddenSize, int numLayers,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            int[] kvSourceArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int position,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern IntPtr TSGgml_AlignedAlloc(UIntPtr size);
@@ -509,6 +554,17 @@ internal enum GgmlIndexReductionOp
         public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
         {
             CheckResult(TSGgml_AddmmQuantF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "addmm_quant");
+        }
+
+        public static void GetRowsQuant(GgmlTensorView2D result, IntPtr srcData, int srcGgmlType, long srcNe0, long srcNe1, long srcRawBytes, GgmlContiguousTensor indices)
+        {
+            CheckResult(TSGgml_GetRowsQuantF32(result, srcData, srcGgmlType, srcNe0, srcNe1, srcRawBytes, indices), "get_rows_quant");
+        }
+
+        public static void AddmmQuantBatch(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2RawBytes,
+            int batchCount, long[] weightOffsets, long[] weightNe1Arr)
+        {
+            CheckResult(TSGgml_AddmmQuantBatchF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2RawBytes, batchCount, weightOffsets, weightNe1Arr), "addmm_quant_batch");
         }
 
         public static void AddmmBatch(GgmlTensorView3D result, GgmlTensorView3D src, GgmlTensorView3D m1, GgmlTensorView3D m2, float beta, float alpha)
@@ -732,6 +788,51 @@ internal enum GgmlIndexReductionOp
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
                 intermediateSize, ropeMode), "transformer_model_decode");
+        }
+
+        public static void Gemma4ModelDecode(
+            IntPtr hiddenData, int hiddenSize, int numLayers,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            int[] kvSourceArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int position,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr)
+        {
+            CheckResult(TSGgml_Gemma4ModelDecode(
+                hiddenData, hiddenSize, numLayers,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                kvSourceArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, position,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr), "gemma4_model_decode");
         }
 
         /// <summary>Allocate memory with 16 KB alignment (page-aligned for Metal host_ptr).</summary>

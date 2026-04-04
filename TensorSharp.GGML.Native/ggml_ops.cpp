@@ -1473,6 +1473,225 @@ namespace
         return 1;
     }
 
+    // get_rows from a quantized source tensor: result[i] = dequant(src[indices[i]])
+    int get_rows_quant_f32_impl(
+        const TensorView2DDesc& result_desc,
+        const QuantizedWeightDesc& src_quant,
+        const ContiguousTensorDesc& indices_desc)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result_desc, "result") || !validate_desc(indices_desc, "indices"))
+            return 0;
+
+        if (src_quant.data == nullptr || src_quant.ne0 <= 0 || src_quant.ne1 <= 0 || src_quant.raw_bytes <= 0)
+        {
+            set_last_error("Invalid quantized weight descriptor for get_rows_quant.");
+            return 0;
+        }
+
+        const int num_indices = static_cast<int>(indices_desc.element_count);
+        const int embedding_dim = static_cast<int>(src_quant.ne0);
+
+        if (result_desc.dim0 != num_indices || result_desc.dim1 != embedding_dim)
+        {
+            set_last_error("Shape mismatch in get_rows_quant: result must be [num_indices, ne0].");
+            return 0;
+        }
+
+        const std::size_t ctx_size = 2 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for get_rows_quant.");
+            return 0;
+        }
+
+        std::vector<BufferHandle> host_ptr_buffers;
+        bool use_zero_copy = can_map_standard_view(result_desc);
+
+        // Result binding (F32 output)
+        TensorBinding result_binding;
+        if (use_zero_copy)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            if (!create_binding_from_host_ptr_2d(context.value, g_backend, result_desc, result_binding, buf))
+                use_zero_copy = false;
+            else
+                host_ptr_buffers.emplace_back(buf);
+        }
+        if (!use_zero_copy)
+            result_binding = create_standard_binding(context.value, result_desc);
+
+        // Source tensor: quantized type
+        ggml_type qtype = static_cast<ggml_type>(src_quant.ggml_type);
+        ggml_tensor* src_tensor = ggml_new_tensor_2d(context.value, qtype, src_quant.ne0, src_quant.ne1);
+
+        // Index tensor: I32
+        ggml_tensor* index_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_I32, num_indices);
+
+        if (result_binding.storage == nullptr || result_binding.tensor == nullptr ||
+            src_tensor == nullptr || index_tensor == nullptr)
+        {
+            set_last_error("Failed to allocate ggml tensors for get_rows_quant.");
+            return 0;
+        }
+
+        TensorBinding src_binding = { src_tensor, src_tensor, static_cast<std::size_t>(src_quant.raw_bytes) };
+
+        // Cache quantized source buffer (same as addmm_quant)
+        bool src_bound = false;
+        {
+            ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+            if (dev != nullptr && src_quant.raw_bytes >= 4096)
+            {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                if (props.caps.buffer_from_host_ptr)
+                {
+                    ggml_backend_buffer_t buf = nullptr;
+                    auto it = g_host_buffer_cache.find(src_quant.data);
+                    if (it != g_host_buffer_cache.end() && it->second.bytes == static_cast<std::size_t>(src_quant.raw_bytes))
+                    {
+                        buf = it->second.buffer;
+                    }
+                    else
+                    {
+                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, src_quant.data,
+                                static_cast<std::size_t>(src_quant.raw_bytes),
+                                static_cast<std::size_t>(src_quant.raw_bytes));
+                        if (buf != nullptr)
+                            g_host_buffer_cache[src_quant.data] = {buf, static_cast<std::size_t>(src_quant.raw_bytes)};
+                    }
+                    if (buf != nullptr)
+                    {
+                        ggml_status st = ggml_backend_tensor_alloc(buf, src_tensor, src_quant.data);
+                        src_bound = (st == GGML_STATUS_SUCCESS);
+                    }
+                }
+            }
+        }
+
+        // Build graph: get_rows(src, indices) -> copy -> result
+        ggml_tensor* rows_tensor = ggml_get_rows(context.value, src_tensor, index_tensor);
+        if (rows_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml get_rows node for get_rows_quant.");
+            return 0;
+        }
+
+        ggml_tensor* output_tensor = ggml_cpy(context.value, rows_tensor, result_binding.tensor);
+        if (output_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml output copy node for get_rows_quant.");
+            return 0;
+        }
+
+        ggml_set_output(output_tensor);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        if (graph == nullptr)
+        {
+            set_last_error("Failed to create ggml graph for get_rows_quant.");
+            return 0;
+        }
+
+        ggml_build_forward_expand(graph, output_tensor);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate ggml backend buffer for get_rows_quant.");
+            return 0;
+        }
+
+        // Upload quantized source if not zero-copy bound
+        if (!src_bound)
+            upload_binding(src_binding, src_quant.data, src_binding.raw_bytes);
+
+        // Upload indices
+        std::vector<std::int32_t> indices;
+        if (!read_i32_values(indices, indices_desc, "indices"))
+            return 0;
+        ggml_backend_tensor_set(index_tensor, indices.data(), 0, indices.size() * sizeof(std::int32_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for get_rows_quant.");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        if (!use_zero_copy)
+            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+
+    // Batched quantized matmul: result[b] = input[b] * quantWeights[b]^T
+    // Each batch uses a separate quantized weight at offset b*per_weight_bytes
+    int addmm_quant_batch_f32_impl(
+        const TensorView2DDesc& result_desc,
+        const TensorView2DDesc& m1_desc,
+        const QuantizedWeightDesc& m2_quant,
+        int batch_count,
+        const std::int64_t* weight_offsets,
+        const std::int64_t* weight_ne1_arr)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result_desc, "result") || !validate_desc(m1_desc, "m1"))
+            return 0;
+
+        if (m2_quant.data == nullptr || batch_count <= 0)
+        {
+            set_last_error("Invalid arguments for addmm_quant_batch.");
+            return 0;
+        }
+
+        // Process each batch sequentially using the existing single-batch impl
+        const int in_dim = m1_desc.dim1;
+        int result_row = 0;
+        int m1_row = 0;
+
+        for (int b = 0; b < batch_count; b++)
+        {
+            std::int64_t ne1_b = weight_ne1_arr[b];
+            std::int64_t offset_b = weight_offsets[b];
+
+            TensorView2DDesc r_desc = result_desc;
+            r_desc.dim0 = 1;
+            r_desc.data = static_cast<char*>(result_desc.data) + static_cast<std::size_t>(result_row) * result_desc.stride0 * sizeof(float);
+            r_desc.raw_bytes = static_cast<std::int64_t>(r_desc.dim1) * sizeof(float);
+
+            TensorView2DDesc input_desc = m1_desc;
+            input_desc.dim0 = 1;
+            input_desc.data = static_cast<char*>(m1_desc.data) + static_cast<std::size_t>(m1_row) * m1_desc.stride0 * sizeof(float);
+            input_desc.raw_bytes = static_cast<std::int64_t>(input_desc.dim1) * sizeof(float);
+
+            QuantizedWeightDesc w_desc;
+            w_desc.data = static_cast<char*>(m2_quant.data) + offset_b;
+            w_desc.ggml_type = m2_quant.ggml_type;
+            w_desc.ne0 = m2_quant.ne0;
+            w_desc.ne1 = ne1_b;
+            long rowSize = ggml_row_size(static_cast<ggml_type>(m2_quant.ggml_type), m2_quant.ne0);
+            w_desc.raw_bytes = ne1_b * rowSize;
+
+            int ok = addmm_quant_f32_impl(r_desc, input_desc, w_desc);
+            if (!ok) return 0;
+
+            result_row++;
+            m1_row++;
+        }
+
+        clear_last_error();
+        return 1;
+    }
+
     int addmm_batch_f32_impl(
         const TensorView3DDesc& result_desc,
         const TensorView3DDesc& src_desc,
@@ -5885,6 +6104,70 @@ TSG_EXPORT int TSGgml_AddmmQuantF32(
     }
 }
 
+TSG_EXPORT int TSGgml_GetRowsQuantF32(
+    TensorView2DDesc result,
+    void* src_data,
+    int src_ggml_type,
+    std::int64_t src_ne0,
+    std::int64_t src_ne1,
+    std::int64_t src_raw_bytes,
+    ContiguousTensorDesc indices)
+{
+    try
+    {
+        QuantizedWeightDesc src_quant;
+        src_quant.data = src_data;
+        src_quant.ggml_type = src_ggml_type;
+        src_quant.ne0 = src_ne0;
+        src_quant.ne1 = src_ne1;
+        src_quant.raw_bytes = src_raw_bytes;
+        return get_rows_quant_f32_impl(result, src_quant, indices);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml get_rows_quant failure.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_AddmmQuantBatchF32(
+    TensorView2DDesc result,
+    TensorView2DDesc m1,
+    void* m2_data,
+    int m2_ggml_type,
+    std::int64_t m2_ne0,
+    std::int64_t m2_raw_bytes,
+    int batch_count,
+    std::int64_t* weight_offsets,
+    std::int64_t* weight_ne1_arr)
+{
+    try
+    {
+        QuantizedWeightDesc m2_quant;
+        m2_quant.data = m2_data;
+        m2_quant.ggml_type = m2_ggml_type;
+        m2_quant.ne0 = m2_ne0;
+        m2_quant.ne1 = 0;
+        m2_quant.raw_bytes = m2_raw_bytes;
+        return addmm_quant_batch_f32_impl(result, m1, m2_quant, batch_count, weight_offsets, weight_ne1_arr);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml addmm_quant_batch failure.");
+        return 0;
+    }
+}
+
 TSG_EXPORT int TSGgml_AddmmBatchF32(
     TensorView3DDesc result,
     TensorView3DDesc src,
@@ -7212,6 +7495,638 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
     catch (...)
     {
         set_last_error("Unknown error in transformer model decode.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Gemma4 full-model decode: ALL dense transformer layers in a single GGML graph.
+// Handles Gemma4-specific features: GELU activation, V norm, post-attn/FFN norms,
+// layer scalars, different head dims per layer type, sliding window, softcap.
+// ============================================================================
+
+TSG_EXPORT int TSGgml_Gemma4ModelDecode(
+    float* hidden_data, int hidden_size, int num_layers,
+    // Per-layer weight pointers (arrays of size num_layers)
+    void** attn_norm_arr,
+    void** qkv_arr,
+    void** q_norm_arr, void** k_norm_arr,
+    void** o_arr,
+    void** post_attn_norm_arr,
+    void** ffn_norm_arr,
+    void** gu_arr, void** down_arr,
+    void** post_ffn_norm_arr,
+    // Per-layer KV caches
+    void** k_cache_arr, void** v_cache_arr,
+    // Per-layer metadata (arrays of size num_layers)
+    int* head_dim_arr,
+    int* kv_heads_arr,
+    int* cache_size_arr,
+    int* is_local_arr,
+    int* kv_source_arr,
+    float* rope_base_arr,
+    float* layer_scalar_arr,
+    // Per-layer weight shapes
+    int* qkv_type_arr, std::int64_t* qkv_ne0_arr, std::int64_t* qkv_ne1_arr, std::int64_t* qkv_bytes_arr,
+    int* o_type_arr, std::int64_t* o_ne0_arr, std::int64_t* o_ne1_arr, std::int64_t* o_bytes_arr,
+    int* gu_type_arr, std::int64_t* gu_ne0_arr, std::int64_t* gu_ne1_arr, std::int64_t* gu_bytes_arr,
+    int* down_type_arr, std::int64_t* down_ne0_arr, std::int64_t* down_ne1_arr, std::int64_t* down_bytes_arr,
+    // Global params
+    int num_heads, int position,
+    float eps, int sliding_window,
+    // RoPE freq_factors (nullable, for global layers with proportional RoPE)
+    float* rope_freq_factors, int rope_freq_factors_len,
+    int* rope_n_dims_arr,
+    // PLE data (nullable)
+    float* ple_data, int ple_dim,
+    void** ple_gate_arr, int* ple_gate_type_arr, std::int64_t* ple_gate_ne0_arr, std::int64_t* ple_gate_ne1_arr, std::int64_t* ple_gate_bytes_arr,
+    void** ple_proj_arr, int* ple_proj_type_arr, std::int64_t* ple_proj_ne0_arr, std::int64_t* ple_proj_ne1_arr, std::int64_t* ple_proj_bytes_arr,
+    void** ple_post_norm_arr)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        const int totalSeqLen = position + 1;
+
+        // Compute max head dim for context sizing
+        int maxHd = 0;
+        for (int l = 0; l < num_layers; l++)
+            if (head_dim_arr[l] > maxHd) maxHd = head_dim_arr[l];
+
+        // Prepare per-layer contiguous KV cache copies
+        struct LayerInfo {
+            int hd;
+            int kvHeads;
+            int qDim;
+            int kDim;
+            int cacheSize;
+            bool isLocal;
+            bool isShared;
+            int kvSource;
+            int attendLen;
+            std::vector<float> k_buf;
+            std::vector<float> v_buf;
+        };
+        std::vector<LayerInfo> li(num_layers);
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& info = li[l];
+            info.hd = head_dim_arr[l];
+            info.kvHeads = kv_heads_arr[l];
+            info.qDim = num_heads * info.hd;
+            info.kDim = info.kvHeads * info.hd;
+            info.kvSource = kv_source_arr[l];
+            info.isShared = (info.kvSource != l);
+
+            // For shared layers, use the donor's cache size/local flag
+            int kvSrc = info.kvSource;
+            info.cacheSize = cache_size_arr[kvSrc];
+            info.isLocal = is_local_arr[kvSrc] != 0;
+            info.attendLen = info.isLocal ? std::min(totalSeqLen, sliding_window) : totalSeqLen;
+        }
+
+        // Extract KV cache data: only for unique KV source layers (avoid duplicate copies)
+        std::unordered_map<int, int> kvSrcDone;
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& info = li[l];
+            int kvSrc = info.kvSource;
+            if (kvSrcDone.count(kvSrc)) continue;
+            kvSrcDone[kvSrc] = 1;
+
+            int windowLen = info.attendLen - 1;
+            if (windowLen <= 0) continue;
+
+            auto& srcInfo = li[kvSrc];
+            srcInfo.k_buf.resize(static_cast<std::size_t>(windowLen) * info.kDim);
+            srcInfo.v_buf.resize(static_cast<std::size_t>(windowLen) * info.kDim);
+            float* kc = static_cast<float*>(k_cache_arr[kvSrc]);
+            float* vc = static_cast<float*>(v_cache_arr[kvSrc]);
+
+            if (info.isLocal)
+            {
+                int start = (totalSeqLen > sliding_window) ? totalSeqLen - sliding_window : 0;
+                for (int h = 0; h < info.kvHeads; h++)
+                {
+                    float* kHead = kc + h * info.cacheSize * info.hd;
+                    float* vHead = vc + h * info.cacheSize * info.hd;
+                    for (int p = 0; p < windowLen; p++)
+                    {
+                        int cacheIdx = (start + p) % info.cacheSize;
+                        std::memcpy(srcInfo.k_buf.data() + (h * windowLen + p) * info.hd,
+                                   kHead + cacheIdx * info.hd, info.hd * sizeof(float));
+                        std::memcpy(srcInfo.v_buf.data() + (h * windowLen + p) * info.hd,
+                                   vHead + cacheIdx * info.hd, info.hd * sizeof(float));
+                    }
+                }
+            }
+            else
+            {
+                for (int h = 0; h < info.kvHeads; h++)
+                {
+                    std::memcpy(srcInfo.k_buf.data() + h * windowLen * info.hd,
+                               kc + h * info.cacheSize * info.hd,
+                               static_cast<std::size_t>(windowLen) * info.hd * sizeof(float));
+                    std::memcpy(srcInfo.v_buf.data() + h * windowLen * info.hd,
+                               vc + h * info.cacheSize * info.hd,
+                               static_cast<std::size_t>(windowLen) * info.hd * sizeof(float));
+                }
+            }
+        }
+
+        // Create GGML context
+        const std::size_t ctx_size = 32 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for Gemma4 model decode.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        ggml_tensor* current = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+        ggml_tensor* freq_factors_t = nullptr;
+        if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
+            freq_factors_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rope_freq_factors_len);
+
+        // PLE input
+        ggml_tensor* ple_input = nullptr;
+        if (ple_data != nullptr && ple_dim > 0)
+            ple_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_layers * ple_dim);
+
+        struct LayerTensors {
+            ggml_tensor* attn_norm_w;
+            ggml_tensor* qkv_w;
+            ggml_tensor* q_norm_w;
+            ggml_tensor* k_norm_w;
+            ggml_tensor* o_w;
+            ggml_tensor* post_attn_norm_w;
+            ggml_tensor* ffn_norm_w;
+            ggml_tensor* gu_w;
+            ggml_tensor* down_w;
+            ggml_tensor* post_ffn_norm_w;
+            ggml_tensor* k_cached_t;
+            ggml_tensor* v_cached_t;
+            ggml_tensor* k_new_out;
+            ggml_tensor* v_new_out;
+            // PLE
+            ggml_tensor* ple_gate_w;
+            ggml_tensor* ple_proj_w;
+            ggml_tensor* ple_post_norm_w;
+        };
+        std::vector<LayerTensors> layers(num_layers);
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+
+            lt.attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type_arr[l]), qkv_ne0_arr[l], qkv_ne1_arr[l]);
+            lt.q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
+            lt.k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
+            lt.o_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type_arr[l]), o_ne0_arr[l], o_ne1_arr[l]);
+            lt.post_attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gu_type_arr[l]), gu_ne0_arr[l], gu_ne1_arr[l]);
+            lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type_arr[l]), down_ne0_arr[l], down_ne1_arr[l]);
+            lt.post_ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+
+            if (!info.isShared)
+            {
+                lt.k_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.kDim);
+                lt.v_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.kDim);
+            }
+            else
+            {
+                lt.k_new_out = nullptr;
+                lt.v_new_out = nullptr;
+            }
+
+            int windowLen = info.attendLen - 1;
+            // For shared layers, reuse donor's cached_t (set below after all layers created)
+            if (!info.isShared && windowLen > 0)
+            {
+                lt.k_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, windowLen, info.kvHeads);
+                lt.v_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, windowLen, info.kvHeads);
+            }
+            else
+            {
+                lt.k_cached_t = nullptr;
+                lt.v_cached_t = nullptr;
+            }
+
+            lt.ple_gate_w = nullptr;
+            lt.ple_proj_w = nullptr;
+            lt.ple_post_norm_w = nullptr;
+            if (ple_data != nullptr && ple_gate_arr != nullptr && ple_gate_arr[l] != nullptr)
+            {
+                lt.ple_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_gate_type_arr[l]),
+                    ple_gate_ne0_arr[l], ple_gate_ne1_arr[l]);
+                lt.ple_proj_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_proj_type_arr[l]),
+                    ple_proj_ne0_arr[l], ple_proj_ne1_arr[l]);
+                lt.ple_post_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            }
+        }
+
+        // Link shared layers to donor KV tensors
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& info = li[l];
+            if (info.isShared)
+            {
+                layers[l].k_cached_t = layers[info.kvSource].k_cached_t;
+                layers[l].v_cached_t = layers[info.kvSource].v_cached_t;
+            }
+        }
+
+        // Build compute graph
+        ggml_tensor* hidden = current;
+
+        // Track new K/V tensors produced by non-shared layers for concat with cached
+        std::vector<ggml_tensor*> layer_k_new(num_layers, nullptr);
+        std::vector<ggml_tensor*> layer_v_new(num_layers, nullptr);
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+            float rope_base = rope_base_arr[l];
+
+            // 1. Attn norm
+            ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), lt.attn_norm_w);
+
+            ggml_tensor* normed_2d = ggml_reshape_2d(ctx, normed, hidden_size, 1);
+            ggml_tensor* q_rope;
+            ggml_tensor* k_full;
+            ggml_tensor* v_full;
+
+            if (!info.isShared)
+            {
+                // 2. Fused QKV projection
+                ggml_tensor* qkv_flat = ggml_reshape_1d(ctx,
+                    ggml_mul_mat(ctx, lt.qkv_w, normed_2d), info.qDim + 2 * info.kDim);
+                ggml_tensor* q_raw = ggml_view_1d(ctx, qkv_flat, info.qDim, 0);
+                ggml_tensor* k_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
+                    static_cast<std::size_t>(info.qDim) * sizeof(float));
+                ggml_tensor* v_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
+                    static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float));
+
+                // Per-head Q/K norm
+                ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_raw, info.hd, num_heads);
+                ggml_tensor* k_2d = ggml_reshape_2d(ctx, k_raw, info.hd, info.kvHeads);
+                ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), lt.q_norm_w);
+                ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), lt.k_norm_w);
+
+                // V norm (unweighted RMSNorm)
+                ggml_tensor* v_2d = ggml_reshape_2d(ctx, v_raw, info.hd, info.kvHeads);
+                ggml_tensor* v_normed = ggml_rms_norm(ctx, v_2d, eps);
+
+                // RoPE (use per-layer n_dims and optional freq_factors)
+                int rope_dims = rope_n_dims_arr[l];
+                ggml_tensor* rope_ff = info.isLocal ? nullptr : freq_factors_t;
+                ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, info.hd, num_heads, 1);
+                ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_normed, info.hd, info.kvHeads, 1);
+                q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff,
+                    rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);
+                ggml_tensor* k_rope_t = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff,
+                    rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);
+
+                ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope_t, 0, 2, 1, 3);
+                ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_normed, info.hd, info.kvHeads, 1);
+                ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+
+                int windowLen = info.attendLen - 1;
+                if (windowLen > 0)
+                {
+                    k_full = ggml_concat(ctx, lt.k_cached_t, ggml_cont(ctx, k_rope_perm), 1);
+                    v_full = ggml_concat(ctx, lt.v_cached_t, ggml_cont(ctx, v_perm), 1);
+                }
+                else
+                {
+                    k_full = ggml_cont(ctx, k_rope_perm);
+                    v_full = ggml_cont(ctx, v_perm);
+                }
+
+                // Store new K/V refs for KV output
+                layer_k_new[l] = k_rope_t;
+                layer_v_new[l] = ggml_reshape_1d(ctx, v_normed, info.kDim);
+            }
+            else
+            {
+                // Shared layer: Q-only projection (qkv_w is just Q weight)
+                ggml_tensor* q_flat = ggml_reshape_1d(ctx,
+                    ggml_mul_mat(ctx, lt.qkv_w, normed_2d), info.qDim);
+                ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_flat, info.hd, num_heads);
+                ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), lt.q_norm_w);
+                int rope_dims = rope_n_dims_arr[l];
+                ggml_tensor* rope_ff = info.isLocal ? nullptr : freq_factors_t;
+                ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, info.hd, num_heads, 1);
+                q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff,
+                    rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);
+
+                // Use the donor layer's K/V (already computed earlier in the graph)
+                int donor = info.kvSource;
+                auto& donorInfo = li[donor];
+                int windowLen = info.attendLen - 1;
+
+                if (layer_k_new[donor] != nullptr && windowLen > 0)
+                {
+                    // Donor's new K/V were produced - concat with cached
+                    ggml_tensor* dk_perm = ggml_permute(ctx, layer_k_new[donor], 0, 2, 1, 3);
+                    ggml_tensor* dv_1d = layer_v_new[donor];
+                    ggml_tensor* dv_3d = ggml_reshape_3d(ctx, dv_1d, donorInfo.hd, donorInfo.kvHeads, 1);
+                    ggml_tensor* dv_perm = ggml_permute(ctx, dv_3d, 0, 2, 1, 3);
+                    k_full = ggml_concat(ctx, lt.k_cached_t, ggml_cont(ctx, dk_perm), 1);
+                    v_full = ggml_concat(ctx, lt.v_cached_t, ggml_cont(ctx, dv_perm), 1);
+                }
+                else if (layer_k_new[donor] != nullptr)
+                {
+                    ggml_tensor* dk_perm = ggml_permute(ctx, layer_k_new[donor], 0, 2, 1, 3);
+                    ggml_tensor* dv_1d = layer_v_new[donor];
+                    ggml_tensor* dv_3d = ggml_reshape_3d(ctx, dv_1d, donorInfo.hd, donorInfo.kvHeads, 1);
+                    ggml_tensor* dv_perm = ggml_permute(ctx, dv_3d, 0, 2, 1, 3);
+                    k_full = ggml_cont(ctx, dk_perm);
+                    v_full = ggml_cont(ctx, dv_perm);
+                }
+                else if (windowLen > 0)
+                {
+                    k_full = lt.k_cached_t;
+                    v_full = lt.v_cached_t;
+                }
+                else
+                {
+                    // No cached data and no new data - should not happen
+                    set_last_error("Shared layer has no KV data available.");
+                    return 0;
+                }
+            }
+
+            // Manual attention: scores = softmax(K^T @ Q), output = V_T @ scores
+            // Gemma4 uses QK-Norm (per-head RMSNorm on Q/K), so no 1/sqrt(d) scaling
+            ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
+            ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);
+            scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f, 0.0f);
+            ggml_tensor* v_t = ggml_cont(ctx, ggml_transpose(ctx, v_full));
+            ggml_tensor* attn_out = ggml_mul_mat(ctx, v_t, scores);
+
+            // 8. O projection
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, 1);
+            ggml_tensor* o_flat = ggml_reshape_1d(ctx,
+                ggml_mul_mat(ctx, lt.o_w, attn_flat), hidden_size);
+
+            // 9. Post-attn norm + residual
+            ggml_tensor* post_attn_normed = ggml_mul(ctx,
+                ggml_rms_norm(ctx, o_flat, eps), lt.post_attn_norm_w);
+            ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn_normed);
+
+            // 10. FFN: norm → gate_up → GELU*up → down → post_ffn_norm
+            ggml_tensor* ffn_normed = ggml_mul(ctx,
+                ggml_rms_norm(ctx, residual1, eps), lt.ffn_norm_w);
+            ggml_tensor* ffn_normed_2d = ggml_reshape_2d(ctx, ffn_normed, hidden_size, 1);
+
+            std::int64_t intermediate_size = gu_ne1_arr[l] / 2;
+            ggml_tensor* gu_flat = ggml_reshape_1d(ctx,
+                ggml_mul_mat(ctx, lt.gu_w, ffn_normed_2d), 2 * intermediate_size);
+            ggml_tensor* gate = ggml_view_1d(ctx, gu_flat, intermediate_size, 0);
+            ggml_tensor* up = ggml_view_1d(ctx, gu_flat, intermediate_size,
+                static_cast<std::size_t>(intermediate_size) * sizeof(float));
+            ggml_tensor* ffn_hidden = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+
+            ggml_tensor* ffn_2d = ggml_reshape_2d(ctx, ffn_hidden, intermediate_size, 1);
+            ggml_tensor* down_flat = ggml_reshape_1d(ctx,
+                ggml_mul_mat(ctx, lt.down_w, ffn_2d), hidden_size);
+
+            // 11. Post-FFN norm + residual
+            ggml_tensor* post_ffn_normed = ggml_mul(ctx,
+                ggml_rms_norm(ctx, down_flat, eps), lt.post_ffn_norm_w);
+            ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn_normed);
+
+            // 12. PLE injection (if present)
+            if (lt.ple_gate_w != nullptr && ple_input != nullptr)
+            {
+                ggml_tensor* ple_slice = ggml_view_1d(ctx, ple_input, ple_dim,
+                    static_cast<std::size_t>(l) * ple_dim * sizeof(float));
+                ggml_tensor* ple_slice_2d = ggml_reshape_2d(ctx, residual2, hidden_size, 1);
+                ggml_tensor* ple_gate_proj = ggml_reshape_1d(ctx,
+                    ggml_mul_mat(ctx, lt.ple_gate_w, ple_slice_2d), ple_dim);
+                ggml_tensor* ple_gated = ggml_mul(ctx, ggml_gelu(ctx, ple_gate_proj), ple_slice);
+                ggml_tensor* ple_gated_2d = ggml_reshape_2d(ctx, ple_gated, ple_dim, 1);
+                ggml_tensor* ple_proj = ggml_reshape_1d(ctx,
+                    ggml_mul_mat(ctx, lt.ple_proj_w, ple_gated_2d), hidden_size);
+                ggml_tensor* ple_normed = ggml_mul(ctx,
+                    ggml_rms_norm(ctx, ple_proj, eps), lt.ple_post_norm_w);
+                residual2 = ggml_add(ctx, residual2, ple_normed);
+            }
+
+            // 13. Layer scalar
+            float scalar = layer_scalar_arr[l];
+            if (std::fabs(scalar - 1.0f) > 1e-6f)
+                residual2 = ggml_scale(ctx, residual2, scalar);
+
+            hidden = residual2;
+
+            // Mark KV outputs (only for non-shared layers)
+            if (!info.isShared && lt.k_new_out != nullptr && layer_k_new[l] != nullptr)
+            {
+                ggml_tensor* k_flat = ggml_reshape_1d(ctx, layer_k_new[l], info.kDim);
+                lt.k_new_out = ggml_cpy(ctx, k_flat, lt.k_new_out);
+                ggml_set_output(lt.k_new_out);
+
+                lt.v_new_out = ggml_cpy(ctx, layer_v_new[l], lt.v_new_out);
+                ggml_set_output(lt.v_new_out);
+            }
+        }
+
+        // Output: copy hidden state
+        ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
+        ggml_set_output(out_hidden);
+
+        // Build graph
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 128 + 512;
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_build_forward_expand(graph, out_hidden);
+        for (int l = 0; l < num_layers; l++)
+        {
+            if (!li[l].isShared && layers[l].k_new_out != nullptr)
+            {
+                ggml_build_forward_expand(graph, layers[l].k_new_out);
+                ggml_build_forward_expand(graph, layers[l].v_new_out);
+            }
+        }
+
+        // Bind weight data
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        bool can_host_ptr = false;
+        if (dev != nullptr)
+        {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            can_host_ptr = props.caps.buffer_from_host_ptr;
+        }
+
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+            if (t == nullptr || data == nullptr) return;
+            if (can_host_ptr && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (cacheable)
+                {
+                    auto it = g_host_buffer_cache.find(data);
+                    if (it != g_host_buffer_cache.end() && it->second.bytes == bytes)
+                        buf = it->second.buffer;
+                    else
+                    {
+                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                        if (buf != nullptr)
+                            g_host_buffer_cache[data] = {buf, bytes};
+                    }
+                }
+                else
+                {
+                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                    if (buf != nullptr)
+                        ephemeral_bufs.emplace_back(buf);
+                }
+                if (buf != nullptr)
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, data);
+                    if (st == GGML_STATUS_SUCCESS)
+                        return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+
+            bind_or_mark(lt.qkv_w, qkv_arr[l], static_cast<std::size_t>(qkv_bytes_arr[l]), true);
+            bind_or_mark(lt.o_w, o_arr[l], static_cast<std::size_t>(o_bytes_arr[l]), true);
+            bind_or_mark(lt.gu_w, gu_arr[l], static_cast<std::size_t>(gu_bytes_arr[l]), true);
+            bind_or_mark(lt.down_w, down_arr[l], static_cast<std::size_t>(down_bytes_arr[l]), true);
+
+            bind_or_mark(lt.attn_norm_w, attn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.post_attn_norm_w, post_attn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.ffn_norm_w, ffn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.post_ffn_norm_w, post_ffn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.q_norm_w, q_norm_arr[l], static_cast<std::size_t>(info.hd) * sizeof(float), true);
+            if (!info.isShared)
+                bind_or_mark(lt.k_norm_w, k_norm_arr[l], static_cast<std::size_t>(info.hd) * sizeof(float), true);
+
+            if (!info.isShared)
+            {
+                int windowLen = info.attendLen - 1;
+                if (windowLen > 0)
+                {
+                    auto& srcInfo = li[info.kvSource];
+                    bind_or_mark(lt.k_cached_t, srcInfo.k_buf.data(), srcInfo.k_buf.size() * sizeof(float), false);
+                    bind_or_mark(lt.v_cached_t, srcInfo.v_buf.data(), srcInfo.v_buf.size() * sizeof(float), false);
+                }
+            }
+
+            if (lt.ple_gate_w != nullptr)
+            {
+                bind_or_mark(lt.ple_gate_w, ple_gate_arr[l], static_cast<std::size_t>(ple_gate_bytes_arr[l]), true);
+                bind_or_mark(lt.ple_proj_w, ple_proj_arr[l], static_cast<std::size_t>(ple_proj_bytes_arr[l]), true);
+                bind_or_mark(lt.ple_post_norm_w, ple_post_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            }
+        }
+
+        // Allocate backend buffer
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for Gemma4 model decode.");
+            return 0;
+        }
+
+        // Upload data
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+
+        std::int32_t pos_val = position;
+        ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+
+        if (freq_factors_t != nullptr)
+            ggml_backend_tensor_set(freq_factors_t, rope_freq_factors, 0,
+                static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
+
+        if (ple_input != nullptr && ple_data != nullptr)
+            ggml_backend_tensor_set(ple_input, ple_data, 0,
+                static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
+
+        // Execute single graph
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
+            return 0;
+        }
+        ggml_backend_synchronize(g_backend);
+
+        // Download hidden state
+        ggml_backend_tensor_get(hidden_out, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+
+        // Download new KV and write to caches (non-shared layers only)
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& info = li[l];
+            if (info.isShared || layers[l].k_new_out == nullptr)
+                continue;
+
+            std::vector<float> k_new_buf(static_cast<std::size_t>(info.kDim));
+            std::vector<float> v_new_buf(static_cast<std::size_t>(info.kDim));
+            ggml_backend_tensor_get(layers[l].k_new_out, k_new_buf.data(), 0,
+                static_cast<std::size_t>(info.kDim) * sizeof(float));
+            ggml_backend_tensor_get(layers[l].v_new_out, v_new_buf.data(), 0,
+                static_cast<std::size_t>(info.kDim) * sizeof(float));
+
+            float* kc = static_cast<float*>(k_cache_arr[l]);
+            float* vc = static_cast<float*>(v_cache_arr[l]);
+
+            int cachePos;
+            if (info.isLocal)
+                cachePos = position % info.cacheSize;
+            else
+                cachePos = position;
+
+            for (int h = 0; h < info.kvHeads; h++)
+            {
+                std::memcpy(kc + h * info.cacheSize * info.hd + cachePos * info.hd,
+                           k_new_buf.data() + h * info.hd,
+                           static_cast<std::size_t>(info.hd) * sizeof(float));
+                std::memcpy(vc + h * info.cacheSize * info.hd + cachePos * info.hd,
+                           v_new_buf.data() + h * info.hd,
+                           static_cast<std::size_t>(info.hd) * sizeof(float));
+            }
+        }
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Gemma4 model decode.");
         return 0;
     }
 }

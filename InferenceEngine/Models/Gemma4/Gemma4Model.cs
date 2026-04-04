@@ -52,6 +52,7 @@ namespace InferenceEngine
 
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
+        private int[] _kvCacheSize; // per-layer cache capacity (slidingWindow for SWA, maxSeqLen for global)
 
         private float[] _layerScalars;
         private bool _hasTiedOutput;
@@ -60,6 +61,9 @@ namespace InferenceEngine
 
         private int _numExperts;
         private int _numExpertsUsed;
+
+        private bool _canUseFusedDecode;
+        private Gemma4DecodeArrays _decodeArrays;
 
         private Gemma4VisionEncoder _visionEncoder;
         private Gemma4AudioEncoder _audioEncoder;
@@ -176,9 +180,16 @@ namespace InferenceEngine
 
             DetectHeadDimsFromWeights();
             LoadLayerScalars();
+            FuseQKVWeights();
             FuseGateUpWeights();
+            FuseExpertGateUpWeights();
             PrecomputeRoPE();
-            InitKVCache(8192);
+            int maxCtx = 4096;
+            string ctxEnv = Environment.GetEnvironmentVariable("MAX_CONTEXT");
+            if (!string.IsNullOrEmpty(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
+                maxCtx = envCtx;
+            InitKVCache(maxCtx);
+            BuildGemma4DecodeArrays();
         }
 
         private bool IsLocalLayer(int layer) =>
@@ -308,24 +319,33 @@ namespace InferenceEngine
         {
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
+            _kvCacheSize = new int[Config.NumLayers];
 
+            long totalCacheBytes = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_kvDonorMap.ContainsKey(l)) continue;
 
                 int kvHeads = KVHeadsForLayer(l);
                 int hd = HeadDimForLayer(l);
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, kvHeads, maxSeqLen, hd);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, kvHeads, maxSeqLen, hd);
+                int cacheLen = IsLocalLayer(l) ? _slidingWindow : maxSeqLen;
+                _kvCacheSize[l] = cacheLen;
+                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
+                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
                 Ops.Fill(_kvCacheK[l], 0f);
                 Ops.Fill(_kvCacheV[l], 0f);
+                totalCacheBytes += (long)kvHeads * cacheLen * hd * 4 * 2;
             }
 
             foreach (var kv in _kvDonorMap)
             {
                 _kvCacheK[kv.Key] = _kvCacheK[kv.Value];
                 _kvCacheV[kv.Key] = _kvCacheV[kv.Value];
+                _kvCacheSize[kv.Key] = _kvCacheSize[kv.Value];
             }
+
+            Console.WriteLine($"  KV cache: {totalCacheBytes / 1024 / 1024} MB " +
+                $"(global layers: {maxSeqLen} seq, SWA layers: {_slidingWindow} seq)");
         }
 
         public override void ResetKVCache()
@@ -382,16 +402,25 @@ namespace InferenceEngine
             if (_pleDim > 0)
                 perLayerInputs = ComputePLE(tokens, hidden, seqLen);
 
-            for (int l = 0; l < Config.NumLayers; l++)
+            if (seqLen == 1 && _canUseFusedDecode)
             {
-                Tensor perLayerInput = null;
-                if (perLayerInputs != null)
-                    perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
+                long tFused = Stopwatch.GetTimestamp();
+                NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
+                _linearTicks += Stopwatch.GetTimestamp() - tFused;
+            }
+            else
+            {
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    Tensor perLayerInput = null;
+                    if (perLayerInputs != null)
+                        perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
 
-                bool isShared = _kvDonorMap.ContainsKey(l);
-                hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput);
+                    bool isShared = _kvDonorMap.ContainsKey(l);
+                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput);
 
-                perLayerInput?.Dispose();
+                    perLayerInput?.Dispose();
+                }
             }
 
             perLayerInputs?.Dispose();
@@ -463,6 +492,263 @@ namespace InferenceEngine
             Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
         }
 
+        #region Fused Decode
+
+        private class Gemma4DecodeArrays
+        {
+            public IntPtr[] AttnNorm, Qkv, QNorm, KNorm, O, PostAttnNorm;
+            public IntPtr[] FfnNorm, Gu, Down, PostFfnNorm;
+            public IntPtr[] KCache, VCache;
+            public int[] HeadDim, KvHeads, CacheSize, IsLocal, KvSource, RopeNDims;
+            public float[] RopeBase, LayerScalar;
+            public int[] QkvType; public long[] QkvNe0, QkvNe1, QkvBytes;
+            public int[] OType; public long[] ONe0, ONe1, OBytes;
+            public int[] GuType; public long[] GuNe0, GuNe1, GuBytes;
+            public int[] DownType; public long[] DownNe0, DownNe1, DownBytes;
+            // PLE
+            public IntPtr[] PleGate, PleProj, PlePostNorm;
+            public int[] PleGateType, PleProjType;
+            public long[] PleGateNe0, PleGateNe1, PleGateBytes;
+            public long[] PleProjNe0, PleProjNe1, PleProjBytes;
+        }
+
+        private unsafe void BuildGemma4DecodeArrays()
+        {
+            if (!IsGgmlBackend) return;
+
+            bool anyMoE = false;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (HasMoE(l)) { anyMoE = true; break; }
+            }
+            if (anyMoE)
+            {
+                _canUseFusedDecode = false;
+                return;
+            }
+
+            int n = Config.NumLayers;
+
+            // Verify all layers have the needed quantized weight
+            for (int l = 0; l < n; l++)
+            {
+                string prefix = $"blk.{l}";
+                bool isShared = _kvDonorMap.ContainsKey(l);
+                string qkvKey = isShared ? $"{prefix}.attn_q.weight" : $"{prefix}.attn_qkv.weight";
+                if (!_quantWeights.ContainsKey(qkvKey))
+                {
+                    _canUseFusedDecode = false;
+                    return;
+                }
+            }
+
+            var a = new Gemma4DecodeArrays();
+            a.AttnNorm = new IntPtr[n]; a.Qkv = new IntPtr[n]; a.QNorm = new IntPtr[n]; a.KNorm = new IntPtr[n];
+            a.O = new IntPtr[n]; a.PostAttnNorm = new IntPtr[n];
+            a.FfnNorm = new IntPtr[n]; a.Gu = new IntPtr[n]; a.Down = new IntPtr[n]; a.PostFfnNorm = new IntPtr[n];
+            a.KCache = new IntPtr[n]; a.VCache = new IntPtr[n];
+            a.HeadDim = new int[n]; a.KvHeads = new int[n]; a.CacheSize = new int[n]; a.IsLocal = new int[n];
+            a.KvSource = new int[n]; a.RopeNDims = new int[n];
+            a.RopeBase = new float[n]; a.LayerScalar = new float[n];
+            a.QkvType = new int[n]; a.QkvNe0 = new long[n]; a.QkvNe1 = new long[n]; a.QkvBytes = new long[n];
+            a.OType = new int[n]; a.ONe0 = new long[n]; a.ONe1 = new long[n]; a.OBytes = new long[n];
+            a.GuType = new int[n]; a.GuNe0 = new long[n]; a.GuNe1 = new long[n]; a.GuBytes = new long[n];
+            a.DownType = new int[n]; a.DownNe0 = new long[n]; a.DownNe1 = new long[n]; a.DownBytes = new long[n];
+            a.PleGate = new IntPtr[n]; a.PleProj = new IntPtr[n]; a.PlePostNorm = new IntPtr[n];
+            a.PleGateType = new int[n]; a.PleProjType = new int[n];
+            a.PleGateNe0 = new long[n]; a.PleGateNe1 = new long[n]; a.PleGateBytes = new long[n];
+            a.PleProjNe0 = new long[n]; a.PleProjNe1 = new long[n]; a.PleProjBytes = new long[n];
+
+            for (int l = 0; l < n; l++)
+            {
+                string prefix = $"blk.{l}";
+                bool isShared = _kvDonorMap.ContainsKey(l);
+                int kvSource = _kvDonorMap.TryGetValue(l, out int donor) ? donor : l;
+                bool isLocal = IsLocalLayer(kvSource);
+                int hd = HeadDimForLayer(l);
+                int kvH = KVHeadsForLayer(l);
+
+                a.HeadDim[l] = hd;
+                a.KvHeads[l] = kvH;
+                a.CacheSize[l] = _kvCacheSize[kvSource];
+                a.IsLocal[l] = isLocal ? 1 : 0;
+                a.KvSource[l] = kvSource;
+                a.RopeBase[l] = IsLocalLayer(l) ? _ropeLocalBase : _ropeGlobalBase;
+                a.RopeNDims[l] = IsLocalLayer(l) ? _localHeadDim : _partialRotaryDims;
+                a.LayerScalar[l] = _layerScalars[l];
+
+                a.AttnNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_norm.weight"]);
+                a.QNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_q_norm.weight"]);
+                a.KCache[l] = (IntPtr)GetFloatPtr(_kvCacheK[kvSource]);
+                a.VCache[l] = (IntPtr)GetFloatPtr(_kvCacheV[kvSource]);
+
+                if (!isShared)
+                    a.KNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_k_norm.weight"]);
+
+                // Post-attention norm
+                string postAttnKey = _weights.ContainsKey($"{prefix}.post_attention_norm.weight")
+                    ? $"{prefix}.post_attention_norm.weight" : $"{prefix}.attn_post_norm.weight";
+                a.PostAttnNorm[l] = (IntPtr)GetFloatPtr(_weights[postAttnKey]);
+
+                // FFN norm
+                a.FfnNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.ffn_norm.weight"]);
+
+                // Post-FFN norm
+                string postFfnKey = _weights.ContainsKey($"{prefix}.post_ffw_norm.weight")
+                    ? $"{prefix}.post_ffw_norm.weight" : $"{prefix}.ffn_post_norm.weight";
+                a.PostFfnNorm[l] = (IntPtr)GetFloatPtr(_weights[postFfnKey]);
+
+                // For shared layers, use Q-only weight; for non-shared, use fused QKV
+                if (isShared)
+                {
+                    string qName = $"{prefix}.attn_q.weight";
+                    if (_quantWeights.TryGetValue(qName, out var qW))
+                    {
+                        a.Qkv[l] = qW.Data;
+                        a.QkvType[l] = qW.GgmlType;
+                        a.QkvNe0[l] = qW.Ne0;
+                        a.QkvNe1[l] = qW.Ne1;
+                        a.QkvBytes[l] = qW.RawBytes;
+                    }
+                }
+                else
+                {
+                    string qkvName = $"{prefix}.attn_qkv.weight";
+                    if (_quantWeights.TryGetValue(qkvName, out var qkvW))
+                    {
+                        a.Qkv[l] = qkvW.Data;
+                        a.QkvType[l] = qkvW.GgmlType;
+                        a.QkvNe0[l] = qkvW.Ne0;
+                        a.QkvNe1[l] = qkvW.Ne1;
+                        a.QkvBytes[l] = qkvW.RawBytes;
+                    }
+                }
+
+                string oName = $"{prefix}.attn_output.weight";
+                if (_quantWeights.TryGetValue(oName, out var oW))
+                {
+                    a.O[l] = oW.Data;
+                    a.OType[l] = oW.GgmlType;
+                    a.ONe0[l] = oW.Ne0;
+                    a.ONe1[l] = oW.Ne1;
+                    a.OBytes[l] = oW.RawBytes;
+                }
+
+                string guName = $"{prefix}.ffn_gate_up.weight";
+                if (_quantWeights.TryGetValue(guName, out var guW))
+                {
+                    a.Gu[l] = guW.Data;
+                    a.GuType[l] = guW.GgmlType;
+                    a.GuNe0[l] = guW.Ne0;
+                    a.GuNe1[l] = guW.Ne1;
+                    a.GuBytes[l] = guW.RawBytes;
+                }
+
+                string downName = $"{prefix}.ffn_down.weight";
+                if (_quantWeights.TryGetValue(downName, out var downW))
+                {
+                    a.Down[l] = downW.Data;
+                    a.DownType[l] = downW.GgmlType;
+                    a.DownNe0[l] = downW.Ne0;
+                    a.DownNe1[l] = downW.Ne1;
+                    a.DownBytes[l] = downW.RawBytes;
+                }
+
+                // PLE weights (optional) - check both quantized and F32 dictionaries
+                string pleGateName = $"{prefix}.inp_gate.weight";
+                bool hasPleGate = false;
+                if (_quantWeights.TryGetValue(pleGateName, out var pleGW))
+                {
+                    a.PleGate[l] = pleGW.Data;
+                    a.PleGateType[l] = pleGW.GgmlType;
+                    a.PleGateNe0[l] = pleGW.Ne0;
+                    a.PleGateNe1[l] = pleGW.Ne1;
+                    a.PleGateBytes[l] = pleGW.RawBytes;
+                    hasPleGate = true;
+                }
+                else if (_weights.TryGetValue(pleGateName, out var pleGateF32))
+                {
+                    a.PleGate[l] = (IntPtr)GetFloatPtr(pleGateF32);
+                    a.PleGateType[l] = 0; // GGML_TYPE_F32
+                    a.PleGateNe0[l] = pleGateF32.Sizes[1];
+                    a.PleGateNe1[l] = pleGateF32.Sizes[0];
+                    a.PleGateBytes[l] = pleGateF32.ElementCount() * 4;
+                    hasPleGate = true;
+                }
+
+                if (hasPleGate)
+                {
+                    string pleProjName = $"{prefix}.proj.weight";
+                    if (_quantWeights.TryGetValue(pleProjName, out var plePW))
+                    {
+                        a.PleProj[l] = plePW.Data;
+                        a.PleProjType[l] = plePW.GgmlType;
+                        a.PleProjNe0[l] = plePW.Ne0;
+                        a.PleProjNe1[l] = plePW.Ne1;
+                        a.PleProjBytes[l] = plePW.RawBytes;
+                    }
+                    else if (_weights.TryGetValue(pleProjName, out var pleProjF32))
+                    {
+                        a.PleProj[l] = (IntPtr)GetFloatPtr(pleProjF32);
+                        a.PleProjType[l] = 0; // GGML_TYPE_F32
+                        a.PleProjNe0[l] = pleProjF32.Sizes[1];
+                        a.PleProjNe1[l] = pleProjF32.Sizes[0];
+                        a.PleProjBytes[l] = pleProjF32.ElementCount() * 4;
+                    }
+
+                    string plePostNormName = $"{prefix}.post_norm.weight";
+                    if (_weights.ContainsKey(plePostNormName))
+                        a.PlePostNorm[l] = (IntPtr)GetFloatPtr(_weights[plePostNormName]);
+                }
+            }
+
+            _decodeArrays = a;
+            _canUseFusedDecode = true;
+            Console.WriteLine("  Gemma4 fused model decode enabled");
+        }
+
+        private unsafe void NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs)
+        {
+            float* hiddenPtr = GetFloatPtr(hidden);
+            var a = _decodeArrays;
+
+            IntPtr pleDataPtr = IntPtr.Zero;
+            if (perLayerInputs != null)
+                pleDataPtr = (IntPtr)GetFloatPtr(perLayerInputs);
+
+            IntPtr freqFactorsPtr = IntPtr.Zero;
+            int freqFactorsLen = 0;
+            if (_weights.TryGetValue("rope_freqs.weight", out var freqTensor))
+            {
+                freqFactorsPtr = (IntPtr)GetFloatPtr(freqTensor);
+                freqFactorsLen = (int)freqTensor.ElementCount();
+            }
+
+            GgmlBasicOps.Gemma4ModelDecode(
+                (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers,
+                a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                a.O, a.PostAttnNorm,
+                a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                a.KCache, a.VCache,
+                a.HeadDim, a.KvHeads, a.CacheSize, a.IsLocal,
+                a.KvSource,
+                a.RopeBase, a.LayerScalar,
+                a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                a.OType, a.ONe0, a.ONe1, a.OBytes,
+                a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                Config.NumHeads, startPos,
+                Config.Eps, _slidingWindow,
+                freqFactorsPtr, freqFactorsLen,
+                a.RopeNDims,
+                pleDataPtr, _pleDim,
+                a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
+                a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
+                a.PlePostNorm);
+        }
+
+        #endregion
+
         #region PLE (Per-Layer Embedding)
 
         private unsafe Tensor ComputePLE(int[] tokens, Tensor hiddenState, int seqLen)
@@ -473,19 +759,8 @@ namespace InferenceEngine
             if (_quantWeights.TryGetValue("per_layer_token_embd.weight", out var pleQw))
             {
                 pleTokenEmb = new Tensor(_allocator, DType.Float32, seqLen, totalPleDim);
-                float* dstPtr = GetFloatPtr(pleTokenEmb);
-                long rowBytes = NativeDequant.RowSize(pleQw.GgmlType, pleQw.Ne0);
-                float[] rowBuf = new float[totalPleDim];
-
-                for (int i = 0; i < seqLen; i++)
-                {
-                    long srcOffset = (long)tokens[i] * rowBytes;
-                    IntPtr rowPtr = (IntPtr)((byte*)pleQw.Data.ToPointer() + srcOffset);
-                    NativeDequant.DequantizeToFloat32(pleQw.GgmlType, rowPtr, rowBuf, 0, pleQw.Ne0);
-                    fixed (float* src = rowBuf)
-                        Buffer.MemoryCopy(src, dstPtr + (long)i * totalPleDim,
-                            totalPleDim * sizeof(float), totalPleDim * sizeof(float));
-                }
+                using var pleIdx = CreateIntTensor(tokens, seqLen);
+                GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.Data, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
 
                 float pleScale = MathF.Sqrt(_pleDim);
                 Ops.Mul(pleTokenEmb, pleTokenEmb, pleScale);
@@ -566,9 +841,13 @@ namespace InferenceEngine
         {
             if (_numExperts == 0) return false;
             string routerKey = $"blk.{layer}.ffn_gate_inp.weight";
-            string downKey = $"blk.{layer}.ffn_down_exps.weight";
-            return (_weights.ContainsKey(routerKey) || _quantWeights.ContainsKey(routerKey)) &&
-                   (_weights.ContainsKey(downKey) || _quantWeights.ContainsKey(downKey));
+            if (!_weights.ContainsKey(routerKey) && !_quantWeights.ContainsKey(routerKey))
+                return false;
+            // Check for expert weights (could be original 3D tensor or split per-expert)
+            string downKey3D = $"blk.{layer}.ffn_down_exps.weight";
+            string downKey0 = $"blk.{layer}.ffn_down_exps.0.weight";
+            return _weights.ContainsKey(downKey3D) || _quantWeights.ContainsKey(downKey3D) ||
+                   _weights.ContainsKey(downKey0) || _quantWeights.ContainsKey(downKey0);
         }
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
@@ -664,14 +943,14 @@ namespace InferenceEngine
 
         private unsafe Tensor MoEForward(Tensor hiddenState, int layer, string prefix, int seqLen)
         {
-            // Pre-norm for MoE input
+            // Router receives UN-normed hiddenState (Router does its own unweighted RMSNorm)
+            var (routingWeights, selectedExperts) = MoERoute(hiddenState, prefix, seqLen);
+
+            // Pre-norm for expert input (separate from router norm)
             string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
             if (!_weights.ContainsKey(moeNormKey))
                 moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
             using var moeInput = RMSNormOp(hiddenState, moeNormKey);
-
-            // Router: RMSNorm(no weight) -> scale -> project -> softmax -> topk
-            var (routingWeights, selectedExperts) = MoERoute(moeInput, prefix, seqLen);
 
             // Expert computation: for each token, run selected experts
             int hiddenDim = (int)moeInput.Sizes[1];
@@ -681,6 +960,9 @@ namespace InferenceEngine
             float* inputPtr = GetFloatPtr(moeInput);
             float* outputPtr = GetFloatPtr(output);
 
+            var tokenInput = new Tensor(_allocator, DType.Float32, 1, hiddenDim);
+            float* tokenPtr = GetFloatPtr(tokenInput);
+
             for (int s = 0; s < seqLen; s++)
             {
                 for (int e = 0; e < _numExpertsUsed; e++)
@@ -688,9 +970,6 @@ namespace InferenceEngine
                     int expertIdx = selectedExperts[s * _numExpertsUsed + e];
                     float weight = routingWeights[s * _numExpertsUsed + e];
 
-                    // Create single-token input for this expert
-                    using var tokenInput = new Tensor(_allocator, DType.Float32, 1, hiddenDim);
-                    float* tokenPtr = GetFloatPtr(tokenInput);
                     Buffer.MemoryCopy(inputPtr + (long)s * hiddenDim, tokenPtr,
                         hiddenDim * sizeof(float), hiddenDim * sizeof(float));
 
@@ -737,6 +1016,7 @@ namespace InferenceEngine
                 }
             }
 
+            tokenInput.Dispose();
             return output;
         }
 
@@ -826,13 +1106,129 @@ namespace InferenceEngine
             return (routingWeights, selectedExperts);
         }
 
+        private unsafe void FuseQKVWeights()
+        {
+            int fused = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                bool isShared = _kvDonorMap.ContainsKey(l);
+                if (isShared) continue;
+
+                string prefix = $"blk.{l}";
+                string qName = $"{prefix}.attn_q.weight";
+                string kName = $"{prefix}.attn_k.weight";
+                string vName = $"{prefix}.attn_v.weight";
+                string qkvName = $"{prefix}.attn_qkv.weight";
+
+                bool hasV = _quantWeights.ContainsKey(vName) || _weights.ContainsKey(vName);
+
+                if (_quantWeights.TryGetValue(qName, out var qw) &&
+                    _quantWeights.TryGetValue(kName, out var kw))
+                {
+                    QuantizedWeight vw = null;
+                    bool hasQuantV = _quantWeights.TryGetValue(vName, out vw);
+
+                    if (qw.GgmlType == kw.GgmlType && qw.Ne0 == kw.Ne0 &&
+                        (!hasQuantV || (vw.GgmlType == kw.GgmlType && vw.Ne0 == kw.Ne0)))
+                    {
+                        long vBytes = hasQuantV ? vw.RawBytes : kw.RawBytes;
+                        long vNe1 = hasQuantV ? vw.Ne1 : kw.Ne1;
+                        long totalBytes = qw.RawBytes + kw.RawBytes + vBytes;
+                        IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                        Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
+                        Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
+                        if (hasQuantV)
+                            Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), vBytes, vBytes);
+                        else
+                            Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), vBytes, kw.RawBytes);
+                        _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vNe1);
+                        _quantWeights.Remove(qName); qw.Dispose();
+                        _quantWeights.Remove(kName); kw.Dispose();
+                        if (hasQuantV) { _quantWeights.Remove(vName); vw.Dispose(); }
+                        fused++;
+                    }
+                }
+                else if (_weights.TryGetValue(qName, out var qf) &&
+                         _weights.TryGetValue(kName, out var kf))
+                {
+                    Tensor vf = null;
+                    bool hasF32V = _weights.TryGetValue(vName, out vf);
+
+                    int qDim = (int)qf.Sizes[0], kDim = (int)kf.Sizes[0];
+                    int vDim = hasF32V ? (int)vf.Sizes[0] : kDim;
+                    int inDim = (int)qf.Sizes[1];
+                    var fusedTensor = new Tensor(_allocator, DType.Float32, qDim + kDim + vDim, inDim);
+                    using (var s0 = fusedTensor.Narrow(0, 0, qDim)) Ops.Copy(s0, qf);
+                    using (var s1 = fusedTensor.Narrow(0, qDim, kDim)) Ops.Copy(s1, kf);
+                    if (hasF32V)
+                    {
+                        using (var s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, vf);
+                    }
+                    else
+                    {
+                        using (var s2 = fusedTensor.Narrow(0, qDim + kDim, vDim)) Ops.Copy(s2, kf);
+                    }
+                    _weights[qkvName] = fusedTensor;
+                    _weights.Remove(qName); qf.Dispose();
+                    _weights.Remove(kName); kf.Dispose();
+                    if (hasF32V) { _weights.Remove(vName); vf.Dispose(); }
+                    fused++;
+                }
+            }
+            if (fused > 0)
+                Console.WriteLine($"  Fused QKV projections: {fused}");
+        }
+
+        private unsafe void FuseExpertGateUpWeights()
+        {
+            if (_numExperts == 0) return;
+            int fused = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    string gateName = $"blk.{l}.ffn_gate_exps.{e}.weight";
+                    string upName = $"blk.{l}.ffn_up_exps.{e}.weight";
+                    string fusedName = $"blk.{l}.ffn_gate_up_exps.{e}.weight";
+
+                    if (_quantWeights.TryGetValue(gateName, out var gw) &&
+                        _quantWeights.TryGetValue(upName, out var uw) &&
+                        gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
+                    {
+                        long totalBytes = gw.RawBytes + uw.RawBytes;
+                        IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                        Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
+                        Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
+                        _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
+                        _quantWeights.Remove(gateName); gw.Dispose();
+                        _quantWeights.Remove(upName); uw.Dispose();
+                        fused++;
+                    }
+                    else if (_weights.TryGetValue(gateName, out var gf) &&
+                             _weights.TryGetValue(upName, out var uf))
+                    {
+                        int gateDim = (int)gf.Sizes[0], upDim = (int)uf.Sizes[0];
+                        int inDim = (int)gf.Sizes[1];
+                        var fusedTensor = new Tensor(_allocator, DType.Float32, gateDim + upDim, inDim);
+                        using (var s0 = fusedTensor.Narrow(0, 0, gateDim)) Ops.Copy(s0, gf);
+                        using (var s1 = fusedTensor.Narrow(0, gateDim, upDim)) Ops.Copy(s1, uf);
+                        _weights[fusedName] = fusedTensor;
+                        _weights.Remove(gateName); gf.Dispose();
+                        _weights.Remove(upName); uf.Dispose();
+                        fused++;
+                    }
+                }
+            }
+            if (fused > 0)
+                Console.WriteLine($"  Fused expert projections: {fused} Gate+Up");
+        }
+
         #endregion
 
         private Tensor FFNGelu(Tensor input, string gateUpWeightName, string downWeightName, int seqLen)
         {
             Tensor gateUp = LinearForward(input, gateUpWeightName);
-            int intermSize = Config.IntermediateSize;
-            int halfDim = intermSize > 0 ? intermSize : (int)(gateUp.Sizes[1] / 2);
+            int halfDim = (int)(gateUp.Sizes[1] / 2);
 
             Tensor gate, up;
             if (seqLen == 1)
@@ -866,49 +1262,73 @@ namespace InferenceEngine
             int hd = HeadDimForLayer(layer);
             int kvHeads = KVHeadsForLayer(layer);
 
-            Tensor q = LinearForward(input, $"{prefix}.attn_q.weight");
+            int qDim = Config.NumHeads * hd;
+            int kDim = kvHeads * hd;
 
-            // QK norm: reshape to [seqLen*numHeads, hd], normalize, reshape back
-            if (seqLen == 1)
-            {
-                RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
-            }
-            else
-            {
-                q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
-            }
+            Tensor q, k = null, v = null;
+            string qkvName = $"{prefix}.attn_qkv.weight";
+            bool useFusedQKV = !isShared && (_quantWeights.ContainsKey(qkvName) || _weights.ContainsKey(qkvName));
 
-            Tensor k = null, v = null;
-            if (!isShared)
+            if (useFusedQKV)
             {
-                k = LinearForward(input, $"{prefix}.attn_k.weight");
-
-                // V: use attn_v if present, otherwise K=V (raw K before K norm)
-                bool hasVWeight = _weights.ContainsKey($"{prefix}.attn_v.weight") ||
-                                  _quantWeights.ContainsKey($"{prefix}.attn_v.weight");
-                if (hasVWeight)
+                Tensor qkv = LinearForward(input, qkvName);
+                int vDim = (int)qkv.Sizes[1] - qDim - kDim;
+                if (seqLen == 1)
                 {
-                    v = LinearForward(input, $"{prefix}.attn_v.weight");
+                    q = qkv.Narrow(1, 0, qDim);
+                    k = qkv.Narrow(1, qDim, kDim);
+                    v = qkv.Narrow(1, qDim + kDim, vDim);
                 }
                 else
                 {
-                    // K=V: use raw K projection as V (before K norm)
-                    v = new Tensor(_allocator, DType.Float32, k.Sizes);
-                    Ops.Copy(v, k);
+                    using (var qView = qkv.Narrow(1, 0, qDim)) q = Ops.NewContiguous(qView);
+                    using (var kView = qkv.Narrow(1, qDim, kDim)) k = Ops.NewContiguous(kView);
+                    using (var vView = qkv.Narrow(1, qDim + kDim, vDim)) v = Ops.NewContiguous(vView);
                 }
+                qkv.Dispose();
 
-                // K norm
                 if (seqLen == 1)
                 {
+                    RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
                     RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
                 }
                 else
                 {
+                    q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
                     k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
                 }
-
-                // V norm (unweighted RMSNorm)
                 ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
+            }
+            else
+            {
+                q = LinearForward(input, $"{prefix}.attn_q.weight");
+
+                if (seqLen == 1)
+                    RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
+                else
+                    q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
+
+                if (!isShared)
+                {
+                    k = LinearForward(input, $"{prefix}.attn_k.weight");
+
+                    bool hasVWeight = _weights.ContainsKey($"{prefix}.attn_v.weight") ||
+                                      _quantWeights.ContainsKey($"{prefix}.attn_v.weight");
+                    if (hasVWeight)
+                        v = LinearForward(input, $"{prefix}.attn_v.weight");
+                    else
+                    {
+                        v = new Tensor(_allocator, DType.Float32, k.Sizes);
+                        Ops.Copy(v, k);
+                    }
+
+                    if (seqLen == 1)
+                        RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                    else
+                        k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+
+                    ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
+                }
             }
 
             // Apply NeoX-style RoPE
@@ -939,18 +1359,29 @@ namespace InferenceEngine
             {
                 if (!isShared)
                 {
+                    int cachePos = isLocal ? (startPos % _kvCacheSize[layer]) : startPos;
                     CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
-                        kvHeads, hd, startPos);
+                        kvHeads, hd, cachePos);
                 }
 
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor) ? donor : layer;
-                int attendLen = isLocal ? Math.Min(totalSeqLen, _slidingWindow) : totalSeqLen;
-                int attendStart = totalSeqLen - attendLen;
+                int cacheLen = _kvCacheSize[kvCacheLayer];
 
-                result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
-                AttentionDecodeWithWindow(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
-                    Config.NumHeads, kvHeads, hd, hd,
-                    attendStart, totalSeqLen, 1f);
+                if (isLocal)
+                {
+                    int attendLen = Math.Min(totalSeqLen, _slidingWindow);
+                    result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
+                    AttentionDecodeCircular(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
+                        Config.NumHeads, kvHeads, hd, hd,
+                        startPos, attendLen, cacheLen, 1f);
+                }
+                else
+                {
+                    result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
+                    AttentionDecodeWithWindow(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
+                        Config.NumHeads, kvHeads, hd, hd,
+                        0, totalSeqLen, 1f);
+                }
             }
             else
             {
@@ -958,8 +1389,16 @@ namespace InferenceEngine
                 {
                     Tensor kHeads = ReshapeToHeads(k, kvHeads, seqLen, hd);
                     Tensor vHeads = ReshapeToHeads(v, kvHeads, seqLen, hd);
-                    CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
-                    CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
+                    if (isLocal)
+                    {
+                        CopyToCacheCircular(_kvCacheK[layer], kHeads, startPos, seqLen, _kvCacheSize[layer]);
+                        CopyToCacheCircular(_kvCacheV[layer], vHeads, startPos, seqLen, _kvCacheSize[layer]);
+                    }
+                    else
+                    {
+                        CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
+                        CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
+                    }
                     kHeads.Dispose();
                     vHeads.Dispose();
                 }
@@ -968,17 +1407,19 @@ namespace InferenceEngine
 
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor2) ? donor2 : layer;
                 int groupSize = Config.NumHeads / kvHeads;
-                Tensor kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, totalSeqLen);
-                Tensor vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, totalSeqLen);
+                int cacheLen = _kvCacheSize[kvCacheLayer];
+                int kvLen = Math.Min(totalSeqLen, cacheLen);
+                Tensor kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, kvLen);
+                Tensor vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, kvLen);
 
                 using var kT = kExpanded.Transpose(1, 2);
-                var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, totalSeqLen);
+                var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, kvLen);
                 Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
                 qHeads.Dispose();
                 kExpanded.Dispose();
 
                 int windowSize = isLocal ? _slidingWindow : 0;
-                ApplyCausalMask(scores, seqLen, totalSeqLen, windowSize);
+                ApplyCausalMask(scores, seqLen, kvLen, windowSize);
                 Ops.Softmax(scores, scores);
 
                 var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
@@ -1152,6 +1593,81 @@ namespace InferenceEngine
                 VecZero(rHead, valDim);
                 for (int t = 0; t < attendLen; t++)
                     VecScaleAdd(rHead, vHead + (attendStart + t) * valDim, scores[t], valDim);
+            }
+        }
+
+        private unsafe void AttentionDecodeCircular(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
+            int currentPos, int attendLen, int cacheSize, float scale)
+        {
+            float* qPtr = GetFloatPtr(q);
+            float* kPtr = GetFloatPtr(kCache);
+            float* vPtr = GetFloatPtr(vCache);
+            float* rPtr = GetFloatPtr(result);
+            int groupSize = numHeads / numKVHeads;
+
+            float* scores = stackalloc float[attendLen];
+
+            int startLogicalPos = currentPos + 1 - attendLen;
+            if (startLogicalPos < 0) startLogicalPos = 0;
+            int actualAttendLen = currentPos + 1 - startLogicalPos;
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* qHead = qPtr + h * keyDim;
+                int kvHead = h / groupSize;
+                float* kHead = kPtr + kvHead * cacheSize * keyDim;
+                float* vHead = vPtr + kvHead * cacheSize * valDim;
+
+                float maxScore = float.NegativeInfinity;
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    int logicalPos = startLogicalPos + t;
+                    int cacheIdx = logicalPos % cacheSize;
+                    float s = VecDot(qHead, kHead + cacheIdx * keyDim, keyDim) * scale;
+                    scores[t] = s;
+                    if (s > maxScore) maxScore = s;
+                }
+
+                float sumExp = 0;
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    float e = MathF.Exp(scores[t] - maxScore);
+                    scores[t] = e;
+                    sumExp += e;
+                }
+                float invSum = 1f / sumExp;
+                for (int t = 0; t < actualAttendLen; t++)
+                    scores[t] *= invSum;
+
+                float* rHead = rPtr + h * valDim;
+                VecZero(rHead, valDim);
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    int logicalPos = startLogicalPos + t;
+                    int cacheIdx = logicalPos % cacheSize;
+                    VecScaleAdd(rHead, vHead + cacheIdx * valDim, scores[t], valDim);
+                }
+            }
+        }
+
+        private unsafe void CopyToCacheCircular(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize)
+        {
+            float* srcPtr = GetFloatPtr(src);
+            float* cachePtr = GetFloatPtr(cache);
+            int numHeads = (int)cache.Sizes[0];
+            int headDim = (int)cache.Sizes[2];
+            int headBytes = headDim * sizeof(float);
+
+            for (int s = 0; s < seqLen; s++)
+            {
+                int cacheIdx = (startPos + s) % cacheSize;
+                for (int h = 0; h < numHeads; h++)
+                {
+                    float* srcRow = srcPtr + (long)h * seqLen * headDim + (long)s * headDim;
+                    float* dstRow = cachePtr + (long)h * cacheSize * headDim + (long)cacheIdx * headDim;
+                    Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
+                }
             }
         }
 

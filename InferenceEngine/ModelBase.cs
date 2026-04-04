@@ -193,15 +193,16 @@ namespace InferenceEngine
 
         protected virtual bool IsQuantizedLinearWeight(GgufTensorInfo info)
         {
-            if (info.Shape.Length != 2)
-                return false;
             if (info.Type == GgmlTensorType.F32)
                 return false;
             if (!IsGgmlBackend && info.Type == GgmlTensorType.F16)
                 return false;
-            if (info.Name == "token_embd.weight")
-                return false;
-            return true;
+            if (info.Shape.Length == 2)
+                return true;
+            // 3D tensors: MoE expert weights (ffn_gate_exps, ffn_up_exps, ffn_down_exps)
+            if (info.Shape.Length == 3 && info.Name.Contains("_exps."))
+                return true;
+            return false;
         }
 
         protected void LoadWeights()
@@ -221,20 +222,43 @@ namespace InferenceEngine
                     long ne0 = (long)info.Shape[0];
                     long ne1 = (long)info.Shape[1];
 
-                    if (byteCount > int.MaxValue / 2)
+                    if (info.Shape.Length == 3 && info.Name.Contains("_exps."))
+                    {
+                        // 3D MoE expert tensor: split into per-expert 2D quantized weights
+                        int numExperts = (int)info.Shape[2];
+                        long perExpertBytes = byteCount / numExperts;
+                        IntPtr bulkPtr = GgmlBasicOps.AlignedAlloc(byteCount);
+                        _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
+
+                        string baseName = info.Name;
+                        if (baseName.EndsWith(".weight"))
+                            baseName = baseName.Substring(0, baseName.Length - 7);
+
+                        for (int e = 0; e < numExperts; e++)
+                        {
+                            IntPtr expertPtr = GgmlBasicOps.AlignedAlloc(perExpertBytes);
+                            unsafe
+                            {
+                                Buffer.MemoryCopy(
+                                    ((byte*)bulkPtr.ToPointer()) + e * perExpertBytes,
+                                    expertPtr.ToPointer(),
+                                    perExpertBytes, perExpertBytes);
+                            }
+                            _quantWeights[$"{baseName}.{e}.weight"] = new QuantizedWeight(expertPtr, perExpertBytes, (int)info.Type, ne0, ne1);
+                        }
+
+                        GgmlBasicOps.AlignedFree(bulkPtr);
+                        countQuant += numExperts;
+                        totalQuantBytes += byteCount;
+                    }
+                    else
                     {
                         IntPtr ptr = GgmlBasicOps.AlignedAlloc(byteCount);
                         _gguf.ReadTensorDataToNative(info, ptr, byteCount);
                         _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
+                        countQuant++;
+                        totalQuantBytes += byteCount;
                     }
-                    else
-                    {
-                        byte[] raw = _gguf.ReadTensorData(info);
-                        _quantWeights[info.Name] = new QuantizedWeight(raw, (int)info.Type, ne0, ne1);
-                    }
-
-                    countQuant++;
-                    totalQuantBytes += byteCount;
                 }
                 else
                 {
@@ -248,60 +272,25 @@ namespace InferenceEngine
                     for (int i = 0; i < ggufShape.Length; i++)
                         tsShape[i] = ggufShape[ggufShape.Length - 1 - i];
 
-                    if (numElements > int.MaxValue)
+                    var tensor = new Tensor(_allocator, DType.Float32, tsShape);
+                    IntPtr destPtr = GetStoragePtr(tensor);
+
+                    if (info.Type == GgmlTensorType.F32)
                     {
-                        var tensor = new Tensor(_allocator, DType.Float32, tsShape);
-                        IntPtr destPtr = GetStoragePtr(tensor);
-
-                        if (info.Type == GgmlTensorType.F32)
-                        {
-                            _gguf.ReadTensorDataToFloat32Native(info, destPtr, numElements);
-                        }
-                        else
-                        {
-                            IntPtr ptr = GgmlBasicOps.AlignedAlloc(byteCount);
-                            try
-                            {
-                                _gguf.ReadTensorDataToNative(info, ptr, byteCount);
-                                NativeDequant.DequantizeToFloat32Native((int)info.Type, ptr, destPtr, numElements);
-                            }
-                            finally { GgmlBasicOps.AlignedFree(ptr); }
-                        }
-
-                        _weights[info.Name] = tensor;
+                        _gguf.ReadTensorDataToFloat32Native(info, destPtr, numElements);
                     }
                     else
                     {
-                        float[] f32 = new float[numElements];
-
-                        if (byteCount > int.MaxValue / 2)
+                        IntPtr tempPtr = GgmlBasicOps.AlignedAlloc(byteCount);
+                        try
                         {
-                            if (info.Type == GgmlTensorType.F32)
-                            {
-                                _gguf.ReadTensorDataToFloat32(info, f32, numElements);
-                            }
-                            else
-                            {
-                                IntPtr ptr = GgmlBasicOps.AlignedAlloc(byteCount);
-                                try
-                                {
-                                    _gguf.ReadTensorDataToNative(info, ptr, byteCount);
-                                    NativeDequant.DequantizeToFloat32((int)info.Type, ptr, f32, 0, numElements);
-                                }
-                                finally { GgmlBasicOps.AlignedFree(ptr); }
-                            }
+                            _gguf.ReadTensorDataToNative(info, tempPtr, byteCount);
+                            NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
                         }
-                        else
-                        {
-                            byte[] raw = _gguf.ReadTensorData(info);
-                            if (info.Type == GgmlTensorType.F32)
-                                Buffer.BlockCopy(raw, 0, f32, 0, raw.Length);
-                            else
-                                NativeDequant.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
-                        }
-
-                        _weights[info.Name] = CreateFloatTensor(f32, tsShape);
+                        finally { GgmlBasicOps.AlignedFree(tempPtr); }
                     }
+
+                    _weights[info.Name] = tensor;
 
                     countF32++;
                     totalF32Bytes += numElements * 4;
@@ -376,8 +365,17 @@ namespace InferenceEngine
 
         protected unsafe Tensor Embedding(int[] tokens)
         {
-            var embWeight = _weights["token_embd.weight"];
             int dim = Config.HiddenSize;
+
+            if (_quantWeights.TryGetValue("token_embd.weight", out var qw))
+            {
+                var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                using var idxTensor = CreateIntTensor(tokens, tokens.Length);
+                GgmlBasicOps.GetRowsQuant(result, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
+                return result;
+            }
+
+            var embWeight = _weights["token_embd.weight"];
 
             if (embWeight.IsContiguous())
             {
@@ -749,6 +747,19 @@ namespace InferenceEngine
                 }
             }
             return maxIdx;
+        }
+
+        /// <summary>
+        /// Sample a token using the given sampling configuration.
+        /// Creates a one-shot sampler; for repeated calls in a generation loop,
+        /// prefer creating a <see cref="TokenSampler"/> once and calling it directly.
+        /// </summary>
+        public int Sample(float[] logits, SamplingConfig config, IList<int> generatedTokenIds = null)
+        {
+            if (config == null || config.IsGreedy)
+                return SampleGreedy(logits);
+            var sampler = new TokenSampler(config);
+            return sampler.Sample(logits, generatedTokenIds);
         }
 
         public virtual void Dispose()

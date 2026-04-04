@@ -107,8 +107,38 @@ namespace InferenceEngine
             return sb.ToString();
         }
 
+        /// <summary>
+        /// Render a chat prompt using the model's built-in GGUF template if available,
+        /// otherwise fall back to hardcoded architecture-specific templates.
+        /// Multimodal tokens (image/audio/video) are injected into message content
+        /// before rendering so both Jinja2 and hardcoded paths produce correct output.
+        /// </summary>
         public static string RenderFromGgufTemplate(string template, List<ChatMessage> messages,
             bool addGenerationPrompt = true, string architecture = null)
+        {
+            if (!string.IsNullOrWhiteSpace(template))
+            {
+                try
+                {
+                    var preprocessed = InjectMultimodalTokens(messages, architecture);
+                    var jinja = new Jinja2Template(template);
+                    var context = BuildJinja2Context(preprocessed, addGenerationPrompt, architecture);
+                    string result = jinja.Render(context);
+                    if (result.Length > 0)
+                        return result;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering failed for architecture '{architecture}': {ex.Message}");
+                    Console.Error.WriteLine($"[ChatTemplate] Falling back to hardcoded template.");
+                }
+            }
+
+            return RenderHardcoded(messages, addGenerationPrompt, architecture);
+        }
+
+        private static string RenderHardcoded(List<ChatMessage> messages,
+            bool addGenerationPrompt, string architecture)
         {
             if (architecture == "gemma3")
                 return RenderGemma3(messages, addGenerationPrompt);
@@ -123,6 +153,85 @@ namespace InferenceEngine
             }
 
             return RenderQwen3(messages, addGenerationPrompt);
+        }
+
+        private static Dictionary<string, object> BuildJinja2Context(
+            List<ChatMessage> messages, bool addGenerationPrompt, string architecture)
+        {
+            var msgList = new List<object>();
+            foreach (var m in messages)
+            {
+                var dict = new Dictionary<string, object>
+                {
+                    ["role"] = m.Role,
+                    ["content"] = m.Content ?? ""
+                };
+                msgList.Add(dict);
+            }
+
+            var ctx = new Dictionary<string, object>
+            {
+                ["messages"] = msgList,
+                ["add_generation_prompt"] = addGenerationPrompt,
+                ["bos_token"] = "",
+                ["eos_token"] = "",
+            };
+
+            return ctx;
+        }
+
+        /// <summary>
+        /// Pre-process messages to inject multimodal placeholder tokens into the content string
+        /// so the Jinja2 template's {{ message['content'] }} renders them correctly.
+        /// </summary>
+        private static List<ChatMessage> InjectMultimodalTokens(List<ChatMessage> messages, string architecture)
+        {
+            var result = new List<ChatMessage>(messages.Count);
+            foreach (var msg in messages)
+            {
+                bool hasMedia = (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
+                                (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
+
+                if (!hasMedia)
+                {
+                    result.Add(msg);
+                    continue;
+                }
+
+                var sb = new StringBuilder();
+                if (architecture == "gemma4")
+                {
+                    if (msg.IsVideo && msg.ImagePaths != null)
+                        sb.Append("<|video>");
+                    if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths) sb.Append("<|image>");
+                    if (msg.AudioPaths != null)
+                        foreach (var _ in msg.AudioPaths) sb.Append("<|audio>");
+                }
+                else if (architecture == "gemma3")
+                {
+                    if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths) sb.Append("<start_of_image>");
+                }
+                else if (architecture is "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe")
+                {
+                    if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths)
+                            sb.Append("<|vision_start|><|image_pad|><|vision_end|>");
+                }
+
+                sb.Append(msg.Content ?? "");
+
+                result.Add(new ChatMessage
+                {
+                    Role = msg.Role,
+                    Content = sb.ToString(),
+                    ImagePaths = msg.ImagePaths,
+                    AudioPaths = msg.AudioPaths,
+                    IsVideo = msg.IsVideo
+                });
+            }
+            return result;
         }
 
         /// <summary>

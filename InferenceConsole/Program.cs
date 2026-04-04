@@ -9,9 +9,11 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using InferenceEngine;
 using TensorSharp;
 using TensorSharp.Cpu;
@@ -33,6 +35,10 @@ namespace InferenceConsole
             int maxTokens = 100;
             bool runTest = false;
             string backendStr = "ggml_cpu";
+            string testTemplatesDir = null;
+            string inputJsonl = null;
+
+            var samplingConfig = new SamplingConfig();
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -40,6 +46,7 @@ namespace InferenceConsole
                 {
                     case "--model": modelPath = args[++i]; break;
                     case "--input": inputFile = args[++i]; break;
+                    case "--input-jsonl": inputJsonl = args[++i]; break;
                     case "--output": outputFile = args[++i]; break;
                     case "--image": imagePath = args[++i]; break;
                     case "--audio": audioPath = args[++i]; break;
@@ -48,7 +55,26 @@ namespace InferenceConsole
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
+                    case "--test-templates": testTemplatesDir = args[++i]; break;
+                    case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
+                    case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--min-p": samplingConfig.MinP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--repeat-penalty": samplingConfig.RepetitionPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--presence-penalty": samplingConfig.PresencePenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--frequency-penalty": samplingConfig.FrequencyPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "--seed": samplingConfig.Seed = int.Parse(args[++i]); break;
+                    case "--stop":
+                        samplingConfig.StopSequences ??= new List<string>();
+                        samplingConfig.StopSequences.Add(args[++i]);
+                        break;
                 }
+            }
+
+            if (testTemplatesDir != null)
+            {
+                TestChatTemplates(testTemplatesDir);
+                return;
             }
 
             if (modelPath == null)
@@ -66,8 +92,8 @@ namespace InferenceConsole
             {
                 Console.Error.WriteLine($"Model file not found: {modelPath ?? "(none)"}");
                 Console.Error.WriteLine("Usage: InferenceConsole --model <path.gguf> [--input <input.txt>] " +
-                    "[--image <image.png>] [--output <output.txt>] [--max-tokens N] [--test] " +
-                    "[--backend cpu|ggml_cpu|ggml_metal]");
+                    "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
+                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal]");
                 return;
             }
 
@@ -133,6 +159,12 @@ namespace InferenceConsole
                 return;
             }
 
+            if (inputJsonl != null)
+            {
+                RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig);
+                return;
+            }
+
             string rawText;
             if (inputFile != null && File.Exists(inputFile))
             {
@@ -183,7 +215,8 @@ namespace InferenceConsole
                 Console.WriteLine($"Audio: {audioPath} ({new FileInfo(audioPath).Length / 1024} KB)");
             }
 
-            string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths, isVideo: videoPath != null);
+            string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
+                isVideo: videoPath != null, samplingConfig: samplingConfig);
 
             if (outputFile != null)
             {
@@ -197,8 +230,222 @@ namespace InferenceConsole
             }
         }
 
+        static void RunJsonlBatch(ModelBase model, string inputJsonlPath, string outputFile, int defaultMaxTokens,
+            SamplingConfig defaultSampling)
+        {
+            if (!File.Exists(inputJsonlPath))
+            {
+                Console.Error.WriteLine($"JSONL file not found: {inputJsonlPath}");
+                return;
+            }
+
+            string[] lines = File.ReadAllLines(inputJsonlPath);
+            var results = new List<string>();
+            int total = lines.Length;
+            int completed = 0;
+
+            Console.WriteLine($"Processing {total} requests from {inputJsonlPath}");
+            Console.WriteLine(new string('=', 60));
+
+            var totalSw = Stopwatch.StartNew();
+
+            for (int lineIdx = 0; lineIdx < lines.Length; lineIdx++)
+            {
+                string line = lines[lineIdx].Trim();
+                if (string.IsNullOrEmpty(line)) continue;
+
+                JsonDocument doc;
+                try
+                {
+                    doc = JsonDocument.Parse(line);
+                }
+                catch (JsonException ex)
+                {
+                    Console.Error.WriteLine($"[Line {lineIdx + 1}] Invalid JSON: {ex.Message}");
+                    results.Add(JsonSerializer.Serialize(new { line = lineIdx + 1, error = $"Invalid JSON: {ex.Message}" }));
+                    continue;
+                }
+
+                var root = doc.RootElement;
+                string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() : $"request_{lineIdx + 1}";
+
+                Console.WriteLine($"\n[{lineIdx + 1}/{total}] Processing request: {id}");
+
+                try
+                {
+                    var messages = ParseMessages(root);
+                    int maxTokens = root.TryGetProperty("max_tokens", out var mt) ? mt.GetInt32() : defaultMaxTokens;
+                    var sampling = ParseSamplingFromJson(root, defaultSampling);
+
+                    var imagePaths = ParseStringList(root, "images");
+                    var audioPaths = ParseStringList(root, "audios");
+                    bool isVideo = root.TryGetProperty("is_video", out var iv) && iv.GetBoolean();
+
+                    model.ResetKVCache();
+
+                    string rendered = ChatTemplate.RenderFromGgufTemplate(
+                        model.Config.ChatTemplate, messages, addGenerationPrompt: true,
+                        architecture: model.Config.Architecture);
+
+                    Console.WriteLine($"Rendered prompt:\n---\n{rendered}\n---");
+
+                    var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                    Console.WriteLine($"Input tokens ({inputTokens.Count}): [{string.Join(", ", inputTokens.Take(20))}{(inputTokens.Count > 20 ? ", ..." : "")}]");
+
+                    var sw = Stopwatch.StartNew();
+                    float[] logits = model.Forward(inputTokens.ToArray());
+                    double prefillMs = sw.Elapsed.TotalMilliseconds;
+
+                    var cfg = sampling ?? SamplingConfig.Greedy;
+                    var sampler = new TokenSampler(cfg);
+                    var generatedTokens = new List<int>();
+                    var sb = new StringBuilder();
+
+                    for (int step = 0; step < maxTokens; step++)
+                    {
+                        int nextToken = sampler.Sample(logits, generatedTokens);
+                        if (model.Tokenizer.IsEos(nextToken)) break;
+
+                        generatedTokens.Add(nextToken);
+                        string decoded = model.Tokenizer.Decode(generatedTokens);
+                        sb.Clear();
+                        sb.Append(decoded);
+
+                        if (cfg.StopSequences != null)
+                        {
+                            var (trimmed, shouldStop) = sampler.CheckStopSequences(decoded);
+                            if (shouldStop)
+                            {
+                                sb.Clear();
+                                sb.Append(trimmed);
+                                break;
+                            }
+                        }
+
+                        logits = model.Forward(new[] { nextToken });
+                    }
+
+                    double totalMs = sw.Elapsed.TotalMilliseconds;
+                    string output = sb.ToString();
+                    double tokPerSec = generatedTokens.Count / (totalMs / 1000.0);
+
+                    Console.WriteLine($"Output ({generatedTokens.Count} tokens, {tokPerSec:F1} tok/s): {output}");
+
+                    var resultObj = new Dictionary<string, object>
+                    {
+                        ["id"] = id,
+                        ["output"] = output,
+                        ["tokens_generated"] = generatedTokens.Count,
+                        ["prefill_ms"] = Math.Round(prefillMs, 2),
+                        ["total_ms"] = Math.Round(totalMs, 2),
+                        ["tokens_per_second"] = Math.Round(tokPerSec, 2),
+                    };
+                    results.Add(JsonSerializer.Serialize(resultObj));
+                    completed++;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Line {lineIdx + 1}] Error: {ex.Message}");
+                    var errorObj = new Dictionary<string, object>
+                    {
+                        ["id"] = id,
+                        ["error"] = ex.Message,
+                    };
+                    results.Add(JsonSerializer.Serialize(errorObj));
+                }
+            }
+
+            totalSw.Stop();
+
+            Console.WriteLine(new string('=', 60));
+            Console.WriteLine($"Completed {completed}/{total} requests in {totalSw.Elapsed.TotalSeconds:F1}s");
+
+            if (outputFile != null)
+            {
+                File.WriteAllLines(outputFile, results);
+                Console.WriteLine($"Results written to {outputFile}");
+            }
+            else
+            {
+                Console.WriteLine("\n=== Results (JSONL) ===");
+                foreach (var r in results)
+                    Console.WriteLine(r);
+            }
+        }
+
+        static List<ChatMessage> ParseMessages(JsonElement root)
+        {
+            var messages = new List<ChatMessage>();
+
+            if (root.TryGetProperty("messages", out var msgsArr) && msgsArr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var msg in msgsArr.EnumerateArray())
+                {
+                    var cm = new ChatMessage
+                    {
+                        Role = msg.TryGetProperty("role", out var r) ? r.GetString() : "user",
+                        Content = msg.TryGetProperty("content", out var c) ? c.GetString() : "",
+                    };
+                    if (msg.TryGetProperty("images", out var imgs) && imgs.ValueKind == JsonValueKind.Array)
+                        cm.ImagePaths = imgs.EnumerateArray().Select(e => e.GetString()).ToList();
+                    if (msg.TryGetProperty("audios", out var auds) && auds.ValueKind == JsonValueKind.Array)
+                        cm.AudioPaths = auds.EnumerateArray().Select(e => e.GetString()).ToList();
+                    if (msg.TryGetProperty("is_video", out var isv))
+                        cm.IsVideo = isv.GetBoolean();
+                    messages.Add(cm);
+                }
+            }
+            else if (root.TryGetProperty("prompt", out var prompt))
+            {
+                messages.Add(new ChatMessage { Role = "user", Content = prompt.GetString() });
+            }
+
+            return messages;
+        }
+
+        static List<string> ParseStringList(JsonElement root, string key)
+        {
+            if (!root.TryGetProperty(key, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return null;
+            var list = arr.EnumerateArray().Select(e => e.GetString()).Where(s => s != null).ToList();
+            return list.Count > 0 ? list : null;
+        }
+
+        static SamplingConfig ParseSamplingFromJson(JsonElement root, SamplingConfig fallback)
+        {
+            bool hasAny = false;
+            var cfg = new SamplingConfig
+            {
+                Temperature = fallback.Temperature,
+                TopK = fallback.TopK,
+                TopP = fallback.TopP,
+                MinP = fallback.MinP,
+                RepetitionPenalty = fallback.RepetitionPenalty,
+                PresencePenalty = fallback.PresencePenalty,
+                FrequencyPenalty = fallback.FrequencyPenalty,
+                Seed = fallback.Seed,
+                StopSequences = fallback.StopSequences != null ? new List<string>(fallback.StopSequences) : null,
+            };
+
+            if (root.TryGetProperty("temperature", out var temp)) { cfg.Temperature = (float)temp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("top_k", out var tk)) { cfg.TopK = tk.GetInt32(); hasAny = true; }
+            if (root.TryGetProperty("top_p", out var tp)) { cfg.TopP = (float)tp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("min_p", out var mp)) { cfg.MinP = (float)mp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("repetition_penalty", out var rp)) { cfg.RepetitionPenalty = (float)rp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("presence_penalty", out var pp)) { cfg.PresencePenalty = (float)pp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("frequency_penalty", out var fp)) { cfg.FrequencyPenalty = (float)fp.GetDouble(); hasAny = true; }
+            if (root.TryGetProperty("seed", out var sd)) { cfg.Seed = sd.GetInt32(); hasAny = true; }
+            if (root.TryGetProperty("stop", out var st) && st.ValueKind == JsonValueKind.Array)
+            {
+                cfg.StopSequences = st.EnumerateArray().Select(e => e.GetString()).Where(s => s != null).ToList();
+                hasAny = true;
+            }
+
+            return hasAny ? cfg : fallback;
+        }
+
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
-            List<string> audioPaths = null, bool isVideo = false)
+            List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null)
         {
             var messages = new List<ChatMessage>
             {
@@ -503,9 +750,19 @@ namespace InferenceConsole
 
             PrintTopLogits(logits, model, "prefill");
 
+            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var sampler = new TokenSampler(cfg);
+
+            if (!cfg.IsGreedy)
+            {
+                Console.WriteLine($"Sampling: temp={cfg.Temperature}, top_k={cfg.TopK}, top_p={cfg.TopP}, " +
+                    $"min_p={cfg.MinP}, rep_pen={cfg.RepetitionPenalty}, pres_pen={cfg.PresencePenalty}, " +
+                    $"freq_pen={cfg.FrequencyPenalty}, seed={cfg.Seed}");
+            }
+
             for (int step = 0; step < maxTokens; step++)
             {
-                int nextToken = model.SampleGreedy(logits);
+                int nextToken = sampler.Sample(logits, generatedTokens);
                 Console.Write($"[{nextToken}:{model.Tokenizer.Vocab[nextToken]}]");
 
                 if (model.Tokenizer.IsEos(nextToken))
@@ -515,6 +772,18 @@ namespace InferenceConsole
                 }
 
                 generatedTokens.Add(nextToken);
+
+                // Check stop sequences
+                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                {
+                    string partial = model.Tokenizer.Decode(generatedTokens);
+                    var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
+                    if (shouldStop)
+                    {
+                        Console.WriteLine(" <STOP>");
+                        return trimmed;
+                    }
+                }
 
                 logits = model.Forward(new[] { nextToken });
                 if (step < 3)
@@ -711,6 +980,155 @@ namespace InferenceConsole
                 Console.WriteLine($"Failed to query ollama: {ex.Message}");
                 return "";
             }
+        }
+
+        static void TestChatTemplates(string modelDir)
+        {
+            Console.WriteLine($"=== Chat Template Test ===");
+            Console.WriteLine($"Scanning: {modelDir}\n");
+
+            var ggufFiles = Directory.GetFiles(modelDir, "*.gguf")
+                .Where(f => !Path.GetFileName(f).Contains("mmproj", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f)
+                .ToArray();
+
+            if (ggufFiles.Length == 0)
+            {
+                Console.WriteLine("No GGUF model files found.");
+                return;
+            }
+
+            // Test scenarios
+            var singleTurn = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "What is 1+1?" }
+            };
+            var multiTurn = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "Hello!" },
+                new ChatMessage { Role = "assistant", Content = "Hi there! How can I help?" },
+                new ChatMessage { Role = "user", Content = "What is the capital of France?" }
+            };
+            var withSystem = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "system", Content = "You are a helpful assistant." },
+                new ChatMessage { Role = "user", Content = "Tell me a joke." }
+            };
+
+            int passed = 0, failed = 0, skipped = 0;
+
+            foreach (string file in ggufFiles)
+            {
+                string fileName = Path.GetFileName(file);
+                Console.WriteLine($"--- {fileName} ---");
+
+                try
+                {
+                    using var gguf = new GgufFile(file);
+                    string arch = gguf.GetString("general.architecture");
+                    string template = gguf.GetString("tokenizer.chat_template");
+
+                    Console.WriteLine($"  Architecture: {arch}");
+                    Console.WriteLine($"  Template: {(template != null ? $"{template.Length} chars" : "(none)")}");
+
+                    if (template == null)
+                    {
+                        Console.WriteLine($"  SKIP: No chat template in GGUF metadata\n");
+                        skipped++;
+                        continue;
+                    }
+
+                    var scenarios = new (string Name, List<ChatMessage> Msgs)[]
+                    {
+                        ("single-turn", singleTurn),
+                        ("multi-turn", multiTurn),
+                        ("with-system", withSystem),
+                    };
+
+                    bool allPassed = true;
+                    foreach (var (name, msgs) in scenarios)
+                    {
+                        // Render with Jinja2
+                        string jinja2Result = null;
+                        Exception jinja2Error = null;
+                        try
+                        {
+                            var preprocessed = msgs; // no multimodal in this test
+                            var jinja = new Jinja2Template(template);
+                            var ctx = BuildTemplateTestContext(preprocessed, true);
+                            jinja2Result = jinja.Render(ctx);
+                        }
+                        catch (Exception ex)
+                        {
+                            jinja2Error = ex;
+                        }
+
+                        // Render with hardcoded fallback
+                        string hardcodedResult = ChatTemplate.RenderFromGgufTemplate(
+                            null, msgs, addGenerationPrompt: true, architecture: arch);
+
+                        if (jinja2Error != null)
+                        {
+                            Console.WriteLine($"  [{name}] FAIL - Jinja2 error: {jinja2Error.Message}");
+                            allPassed = false;
+                            continue;
+                        }
+
+                        string j2 = jinja2Result?.Trim() ?? "";
+                        string hc = hardcodedResult?.Trim() ?? "";
+                        bool match = j2 == hc;
+
+                        if (match)
+                        {
+                            Console.WriteLine($"  [{name}] PASS - Jinja2 matches hardcoded ({j2.Length} chars)");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"  [{name}] MISMATCH");
+                            Console.WriteLine($"    Jinja2    ({j2.Length} chars): {Escape(j2)}");
+                            Console.WriteLine($"    Hardcoded ({hc.Length} chars): {Escape(hc)}");
+                            allPassed = false;
+                        }
+                    }
+
+                    if (allPassed) passed++; else failed++;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  ERROR: {ex.Message}");
+                    failed++;
+                }
+
+                Console.WriteLine();
+            }
+
+            Console.WriteLine($"=== Results: {passed} passed, {failed} failed, {skipped} skipped out of {ggufFiles.Length} models ===");
+        }
+
+        static Dictionary<string, object> BuildTemplateTestContext(List<ChatMessage> messages, bool addGenerationPrompt)
+        {
+            var msgList = new List<object>();
+            foreach (var m in messages)
+            {
+                msgList.Add(new Dictionary<string, object>
+                {
+                    ["role"] = m.Role,
+                    ["content"] = m.Content ?? ""
+                });
+            }
+            return new Dictionary<string, object>
+            {
+                ["messages"] = msgList,
+                ["add_generation_prompt"] = addGenerationPrompt,
+                ["bos_token"] = "",
+                ["eos_token"] = "",
+            };
+        }
+
+        static string Escape(string s)
+        {
+            if (s.Length > 200) s = s.Substring(0, 200) + "...";
+            return s.Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
         }
     }
 }
