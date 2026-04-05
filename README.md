@@ -105,6 +105,16 @@ bash build-macos.sh
 
 This compiles `libGgmlOps.dylib` with Metal GPU support. The build output is automatically copied to the application's output directory.
 
+### Build the native GGML library (Linux)
+
+The Linux script builds a CPU-only `libGgmlOps.so`:
+
+```bash
+cd TensorSharp.GGML.Native
+bash build-linux.sh
+```
+
+
 ## Usage
 
 ### Console Application
