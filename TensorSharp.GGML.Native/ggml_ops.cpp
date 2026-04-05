@@ -23,6 +23,9 @@
 #include "ggml-backend.h"
 #include "ggml-metal.h"
 #include "ggml-cpu.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 #include "ggml-quants.h"
 
 // GGML context memory pool: reuse mem_buffers to avoid per-op allocation overhead
@@ -265,6 +268,7 @@ namespace
 
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;
+    constexpr int BACKEND_TYPE_CUDA = 3;
 
     void initialize_backend()
     {
@@ -288,6 +292,20 @@ namespace
                 return;
             }
         }
+        else if (g_backend_type == BACKEND_TYPE_CUDA)
+        {
+#if defined(GGML_USE_CUDA)
+            g_backend = ggml_backend_cuda_init(0);
+            if (g_backend == nullptr)
+            {
+                set_last_error("ggml-cuda backend initialization failed.");
+                return;
+            }
+#else
+            set_last_error("ggml-cuda backend requested, but this native bridge was built without CUDA support.");
+            return;
+#endif
+        }
         else
         {
             set_last_error("Unknown GGML backend type requested.");
@@ -299,7 +317,7 @@ namespace
 
     bool ensure_backend(int backend_type)
     {
-        if (backend_type != BACKEND_TYPE_METAL && backend_type != BACKEND_TYPE_CPU)
+        if (backend_type != BACKEND_TYPE_METAL && backend_type != BACKEND_TYPE_CPU && backend_type != BACKEND_TYPE_CUDA)
         {
             set_last_error("Invalid GGML backend type.");
             return false;

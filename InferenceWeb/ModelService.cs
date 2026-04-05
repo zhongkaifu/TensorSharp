@@ -48,6 +48,7 @@ namespace InferenceWeb
                 _backend = backendStr switch
                 {
                     "ggml_metal" => BackendType.GgmlMetal,
+                    "ggml_cuda" => BackendType.GgmlCuda,
                     "ggml_cpu" => BackendType.GgmlCpu,
                     "cpu" => BackendType.Cpu,
                     _ => BackendType.GgmlCpu

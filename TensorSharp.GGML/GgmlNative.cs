@@ -20,6 +20,7 @@ public enum GgmlBackendType
 {
     Metal = 1,
     Cpu = 2,
+    Cuda = 3,
 }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -532,7 +533,12 @@ internal enum GgmlIndexReductionOp
             {
                 if (TSGgml_IsBackendAvailable((int)backendType) == 0)
                 {
-                    string backendName = backendType == GgmlBackendType.Metal ? "ggml-metal" : "ggml-cpu";
+                    string backendName = backendType switch
+                    {
+                        GgmlBackendType.Metal => "ggml-metal",
+                        GgmlBackendType.Cuda => "ggml-cuda",
+                        _ => "ggml-cpu",
+                    };
                     throw new InvalidOperationException($"Failed to initialize {backendName}. {GetLastErrorMessage("Build the native GGML bridge and ensure the requested GGML backend is available.")}");
                 }
             }
