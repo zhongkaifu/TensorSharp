@@ -23,7 +23,12 @@ namespace TensorSharp.GGML
             this.deviceId = deviceId;
         }
 
-        public BlasEnum BlasEnum => context.BackendType == GgmlBackendType.Metal ? BlasEnum.GGML_METAL : BlasEnum.GGML_CPU;
+        public BlasEnum BlasEnum => context.BackendType switch
+        {
+            GgmlBackendType.Metal => BlasEnum.GGML_METAL,
+            GgmlBackendType.Cuda => BlasEnum.CUDA,
+            _ => BlasEnum.GGML_CPU,
+        };
 
         public int DeviceId => deviceId;
 
@@ -33,7 +38,7 @@ namespace TensorSharp.GGML
         {
             if (elementType == DType.Float16)
             {
-                throw new NotSupportedException("The GGML Metal backend currently supports Float32 tensors only. Disable AMP to use this backend.");
+                throw new NotSupportedException("The GGML backend currently supports Float32 tensors only. Disable AMP to use this backend.");
             }
 
             return new GgmlStorage(this, context, elementType, elementCount);

@@ -1171,13 +1171,13 @@ namespace TensorSharp.GGML
         [RegisterOpStorageType("float2half", typeof(GgmlStorage))]
         public Tensor Float2Half(Tensor result, Tensor src)
         {
-            throw new NotSupportedException("The GGML Metal backend currently supports Float32 tensors only. Disable AMP to use this backend.");
+            throw new NotSupportedException("The GGML backend currently supports Float32 tensors only. Disable AMP to use this backend.");
         }
 
         [RegisterOpStorageType("half2float", typeof(GgmlStorage))]
         public Tensor Half2Float(Tensor result, Tensor src)
         {
-            throw new NotSupportedException("The GGML Metal backend currently supports Float32 tensors only. Disable AMP to use this backend.");
+            throw new NotSupportedException("The GGML backend currently supports Float32 tensors only. Disable AMP to use this backend.");
         }
 
         private static Tensor ExecuteUnary(Tensor result, Tensor src, GgmlUnaryOp op, string opName)
