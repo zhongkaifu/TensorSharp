@@ -1,8 +1,30 @@
-<Solution>
-  <Project Path="AdvUtils/AdvUtils.csproj" />
-  <Project Path="InferenceConsole/InferenceConsole.csproj" />
-  <Project Path="InferenceEngine/InferenceEngine.csproj" />
-  <Project Path="InferenceWeb/InferenceWeb.csproj" />
-  <Project Path="TensorSharp.GGML/TensorSharp.GGML.csproj" />
-  <Project Path="TensorSharp/TensorSharp.csproj" />
-</Solution>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ProjectsToBuild Include="AdvUtils/AdvUtils.csproj" />
+    <ProjectsToBuild Include="InferenceConsole/InferenceConsole.csproj" />
+    <ProjectsToBuild Include="InferenceEngine/InferenceEngine.csproj" />
+    <ProjectsToBuild Include="InferenceWeb/InferenceWeb.csproj" />
+    <ProjectsToBuild Include="TensorSharp.GGML/TensorSharp.GGML.csproj" />
+    <ProjectsToBuild Include="TensorSharp/TensorSharp.csproj" />
+  </ItemGroup>
+
+  <Target Name="Build">
+    <MSBuild Projects="@(ProjectsToBuild)"
+             Targets="Build"
+             Properties="Configuration=$(Configuration);Platform=$(Platform)" />
+  </Target>
+
+  <Target Name="Clean">
+    <MSBuild Projects="@(ProjectsToBuild)"
+             Targets="Clean"
+             Properties="Configuration=$(Configuration);Platform=$(Platform)" />
+  </Target>
+
+  <Target Name="Restore">
+    <MSBuild Projects="@(ProjectsToBuild)"
+             Targets="Restore"
+             Properties="Configuration=$(Configuration);Platform=$(Platform)" />
+  </Target>
+
+  <Target Name="Rebuild" DependsOnTargets="Clean;Build" />
+</Project>
