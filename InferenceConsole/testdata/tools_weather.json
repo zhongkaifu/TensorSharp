@@ -1,0 +1,33 @@
+[
+  {
+    "Name": "get_current_weather",
+    "Description": "Get the current weather in a given location",
+    "Parameters": {
+      "location": {
+        "Type": "string",
+        "Description": "The city and state, e.g. San Francisco, CA"
+      },
+      "unit": {
+        "Type": "string",
+        "Description": "The temperature unit",
+        "Enum": ["celsius", "fahrenheit"]
+      }
+    },
+    "Required": ["location"]
+  },
+  {
+    "Name": "get_forecast",
+    "Description": "Get the weather forecast for the next N days",
+    "Parameters": {
+      "location": {
+        "Type": "string",
+        "Description": "The city and state"
+      },
+      "days": {
+        "Type": "integer",
+        "Description": "Number of days to forecast (1-7)"
+      }
+    },
+    "Required": ["location", "days"]
+  }
+]

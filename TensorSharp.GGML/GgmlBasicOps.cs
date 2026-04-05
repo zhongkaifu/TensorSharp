@@ -1081,8 +1081,9 @@ namespace TensorSharp.GGML
                 {
                     int t = row % seqLen;
                     int threshold = startPos + t;
+                    int sStart = Math.Max(0, threshold + 1);
                     float* rowPtr = ptr + row * cols;
-                    for (int s = threshold + 1; s < cols; s++)
+                    for (int s = sStart; s < cols; s++)
                     {
                         rowPtr[s] += maskedValue;
                     }

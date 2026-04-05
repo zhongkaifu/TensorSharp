@@ -37,6 +37,8 @@ namespace InferenceConsole
             string backendStr = "ggml_cpu";
             string testTemplatesDir = null;
             string inputJsonl = null;
+            bool enableThinking = false;
+            string toolsFile = null;
 
             var samplingConfig = new SamplingConfig();
 
@@ -56,6 +58,8 @@ namespace InferenceConsole
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
                     case "--test-templates": testTemplatesDir = args[++i]; break;
+                    case "--think": enableThinking = true; break;
+                    case "--tools": toolsFile = args[++i]; break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -69,6 +73,19 @@ namespace InferenceConsole
                         samplingConfig.StopSequences.Add(args[++i]);
                         break;
                 }
+            }
+
+            List<ToolFunction> tools = null;
+            if (toolsFile != null)
+            {
+                if (!File.Exists(toolsFile))
+                {
+                    Console.Error.WriteLine($"Tools file not found: {toolsFile}");
+                    return;
+                }
+                tools = JsonSerializer.Deserialize<List<ToolFunction>>(File.ReadAllText(toolsFile),
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                Console.WriteLine($"Loaded {tools.Count} tool definition(s) from {toolsFile}");
             }
 
             if (testTemplatesDir != null)
@@ -216,7 +233,8 @@ namespace InferenceConsole
             }
 
             string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
-                isVideo: videoPath != null, samplingConfig: samplingConfig);
+                isVideo: videoPath != null, samplingConfig: samplingConfig,
+                enableThinking: enableThinking, tools: tools);
 
             if (outputFile != null)
             {
@@ -445,7 +463,8 @@ namespace InferenceConsole
         }
 
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
-            List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null)
+            List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null,
+            bool enableThinking = false, List<ToolFunction> tools = null)
         {
             var messages = new List<ChatMessage>
             {
@@ -454,7 +473,8 @@ namespace InferenceConsole
 
             string rendered = ChatTemplate.RenderFromGgufTemplate(
                 model.Config.ChatTemplate, messages, addGenerationPrompt: true,
-                architecture: model.Config.Architecture);
+                architecture: model.Config.Architecture,
+                tools: tools, enableThinking: enableThinking);
 
             Console.WriteLine($"Rendered prompt:\n---\n{rendered}\n---");
 
@@ -760,6 +780,14 @@ namespace InferenceConsole
                     $"freq_pen={cfg.FrequencyPenalty}, seed={cfg.Seed}");
             }
 
+            var parser = OutputParserFactory.Create(model.Config.Architecture);
+            parser.Init(enableThinking, tools);
+            bool useParser = enableThinking || (tools != null && tools.Count > 0);
+            if (useParser)
+            {
+                Console.WriteLine($"Output parser: {parser.GetType().Name} (thinking={enableThinking}, tools={tools?.Count ?? 0})");
+            }
+
             for (int step = 0; step < maxTokens; step++)
             {
                 int nextToken = sampler.Sample(logits, generatedTokens);
@@ -773,7 +801,6 @@ namespace InferenceConsole
 
                 generatedTokens.Add(nextToken);
 
-                // Check stop sequences
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
                     string partial = model.Tokenizer.Decode(generatedTokens);
@@ -781,6 +808,11 @@ namespace InferenceConsole
                     if (shouldStop)
                     {
                         Console.WriteLine(" <STOP>");
+                        if (useParser)
+                        {
+                            var finalParsed = parser.Add(trimmed, true);
+                            return FormatParsedResult(finalParsed, enableThinking);
+                        }
                         return trimmed;
                     }
                 }
@@ -793,7 +825,40 @@ namespace InferenceConsole
             Console.WriteLine();
             model.PrintTimingStats();
             string decoded = model.Tokenizer.Decode(generatedTokens);
+
+            if (useParser)
+            {
+                var parsed = parser.Add(decoded, true);
+                return FormatParsedResult(parsed, enableThinking);
+            }
             return decoded;
+        }
+
+        static string FormatParsedResult(ParsedOutput parsed, bool showThinking)
+        {
+            var sb = new StringBuilder();
+            if (showThinking && !string.IsNullOrEmpty(parsed.Thinking))
+            {
+                sb.AppendLine("\n--- Thinking ---");
+                sb.AppendLine(parsed.Thinking.Trim());
+                sb.AppendLine("--- End Thinking ---\n");
+            }
+            if (!string.IsNullOrEmpty(parsed.Content))
+            {
+                sb.Append(parsed.Content);
+            }
+            if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
+            {
+                sb.AppendLine("\n--- Tool Calls ---");
+                foreach (var tc in parsed.ToolCalls)
+                {
+                    sb.AppendLine($"  Function: {tc.Name}");
+                    sb.AppendLine($"  Arguments: {JsonSerializer.Serialize(tc.Arguments, new JsonSerializerOptions { WriteIndented = true })}");
+                    sb.AppendLine();
+                }
+                sb.AppendLine("--- End Tool Calls ---");
+            }
+            return sb.ToString();
         }
 
         

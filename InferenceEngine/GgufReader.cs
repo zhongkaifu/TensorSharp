@@ -27,8 +27,11 @@ namespace InferenceEngine
         F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3,
         Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q8_1 = 9,
         Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
+        IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19,
+        IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23,
         I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28,
-        BF16 = 30,
+        IQ1_M = 29, BF16 = 30,
+        TQ1_0 = 34, TQ2_0 = 35,
     }
 
     public class GgufTensorInfo
@@ -283,6 +286,7 @@ namespace InferenceEngine
                 case GgmlTensorType.Q5_1:
                 case GgmlTensorType.Q8_0:
                 case GgmlTensorType.Q8_1:
+                case GgmlTensorType.IQ4_NL:
                     return 32;
                 default:
                     return 256;
@@ -308,6 +312,17 @@ namespace InferenceEngine
                 case GgmlTensorType.Q5_K: return 2 + 2 + 12 + 256 / 8 + 256 / 2;
                 case GgmlTensorType.Q6_K: return 256 / 2 + 256 / 4 + 256 / 16 + 2;
                 case GgmlTensorType.Q8_K: return 4 + 256 + 2 * 256 / 16;
+                case GgmlTensorType.IQ2_XXS: return 2 + 256 / 8 * 2;           // 66
+                case GgmlTensorType.IQ2_XS: return 2 + 256 / 8 * 2 + 256 / 32; // 74
+                case GgmlTensorType.IQ3_XXS: return 2 + 3 * (256 / 8);         // 98
+                case GgmlTensorType.IQ1_S: return 2 + 256 / 8 + 256 / 16;      // 50
+                case GgmlTensorType.IQ4_NL: return 2 + 32 / 2;                 // 18
+                case GgmlTensorType.IQ3_S: return 2 + 13 * (256 / 32) + 256 / 64; // 110
+                case GgmlTensorType.IQ2_S: return 2 + 256 / 4 + 256 / 16;      // 82
+                case GgmlTensorType.IQ4_XS: return 2 + 2 + 256 / 64 + 256 / 2; // 136
+                case GgmlTensorType.IQ1_M: return 256 / 8 + 256 / 16 + 256 / 32; // 56
+                case GgmlTensorType.TQ1_0: return 2 + 256 / 64 + (256 - 4 * 256 / 64) / 5; // 54
+                case GgmlTensorType.TQ2_0: return 2 + 256 / 4;                 // 66
                 case GgmlTensorType.I8: return 1;
                 case GgmlTensorType.I16: return 2;
                 case GgmlTensorType.I32: return 4;

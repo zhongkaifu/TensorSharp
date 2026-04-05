@@ -1385,6 +1385,7 @@ namespace InferenceEngine
             }
             else
             {
+                Tensor kHeadsForAttn = null, vHeadsForAttn = null;
                 if (!isShared)
                 {
                     Tensor kHeads = ReshapeToHeads(k, kvHeads, seqLen, hd);
@@ -1399,18 +1400,32 @@ namespace InferenceEngine
                         CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
                         CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
                     }
-                    kHeads.Dispose();
-                    vHeads.Dispose();
+                    kHeadsForAttn = kHeads;
+                    vHeadsForAttn = vHeads;
                 }
 
                 Tensor qHeads = ReshapeToHeads(q, Config.NumHeads, seqLen, hd);
 
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor2) ? donor2 : layer;
                 int groupSize = Config.NumHeads / kvHeads;
-                int cacheLen = _kvCacheSize[kvCacheLayer];
-                int kvLen = Math.Min(totalSeqLen, cacheLen);
-                Tensor kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, kvLen);
-                Tensor vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, kvLen);
+
+                int kvLen;
+                Tensor kExpanded, vExpanded;
+                if (kHeadsForAttn != null && startPos == 0)
+                {
+                    kvLen = seqLen;
+                    kExpanded = ExpandKVHeads(kHeadsForAttn, groupSize, seqLen);
+                    vExpanded = ExpandKVHeads(vHeadsForAttn, groupSize, seqLen);
+                }
+                else
+                {
+                    int cacheLen = _kvCacheSize[kvCacheLayer];
+                    kvLen = Math.Min(totalSeqLen, cacheLen);
+                    kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, kvLen);
+                    vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, kvLen);
+                }
+                kHeadsForAttn?.Dispose();
+                vHeadsForAttn?.Dispose();
 
                 using var kT = kExpanded.Transpose(1, 2);
                 var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, kvLen);

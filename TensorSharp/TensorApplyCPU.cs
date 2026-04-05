@@ -1071,19 +1071,20 @@ namespace TensorSharp
 			}
 		}
 
-		unsafe static public void AddCausalMask(float* data, int totalRows, int cols, int seqLen, int startPos, float maskedValue)
+	unsafe static public void AddCausalMask(float* data, int totalRows, int cols, int seqLen, int startPos, float maskedValue)
+	{
+		for (int row = 0; row < totalRows; row++)
 		{
-			for (int row = 0; row < totalRows; row++)
+			int t = row % seqLen;
+			int threshold = startPos + t;
+			int sStart = Math.Max(0, threshold + 1);
+			float* rowPtr = data + row * cols;
+			for (int s = sStart; s < cols; s++)
 			{
-				int t = row % seqLen;
-				int threshold = startPos + t;
-				float* rowPtr = data + row * cols;
-				for (int s = threshold + 1; s < cols; s++)
-				{
-					rowPtr[s] += maskedValue;
-				}
+				rowPtr[s] += maskedValue;
 			}
 		}
+	}
 
 		unsafe static public void BuildTriMask(Tensor result, int rows, int cols, float value, float maskedValue)
 		{

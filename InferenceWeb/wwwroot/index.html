@@ -217,6 +217,33 @@ button.primary:hover { background: var(--accent-hover); }
   color: var(--text2);
 }
 
+.queue-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #1e2a42;
+  border: 1px solid #2a3a5a;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--accent);
+  margin-bottom: 8px;
+  animation: fadeIn 0.3s ease;
+}
+
+.queue-indicator .queue-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .typing-indicator {
   display: inline-flex;
   gap: 4px;
@@ -237,6 +264,13 @@ button.primary:hover { background: var(--accent-hover); }
 @keyframes blink {
   0%, 60%, 100% { opacity: 0.3; }
   30% { opacity: 1; }
+}
+
+.model-label {
+  font-size: 10px;
+  color: var(--accent);
+  opacity: 0.7;
+  margin-bottom: 4px;
 }
 
 .stats {
@@ -318,7 +352,64 @@ button.primary:hover { background: var(--accent-hover); }
 
 .input-actions button.send-btn:hover { background: var(--accent-hover); }
 
+.input-actions button.stop-btn {
+  background: var(--danger);
+  color: #fff;
+  font-size: 14px;
+  padding: 6px 14px;
+  animation: pulseStop 1.5s ease-in-out infinite;
+}
+
+.input-actions button.stop-btn:hover { background: #f66; }
+
+@keyframes pulseStop {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
 #file-input { display: none; }
+
+.model-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 800px;
+  margin: 0 auto 6px auto;
+  font-size: 12px;
+  color: var(--text2);
+}
+
+.model-switcher label {
+  white-space: nowrap;
+}
+
+.model-switcher select {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+  max-width: 320px;
+  cursor: pointer;
+}
+
+.model-switcher select:hover { border-color: #444; }
+.model-switcher select:focus { border-color: var(--accent); outline: none; }
+
+.model-switcher .switch-indicator {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #3a2a1a;
+  color: #fa5;
+  display: none;
+  white-space: nowrap;
+}
+
+.model-switcher .switch-indicator.visible { display: inline; }
 
 .attachments {
   display: flex;
@@ -432,6 +523,7 @@ button.primary:hover { background: var(--accent-hover); }
 <header>
   <h1><span class="icon">&#x2B22;</span> TensorSharp Chat</h1>
   <div class="header-controls">
+    <span id="queue-badge" class="status-badge" style="display:none" title="Request queue status"></span>
     <span id="status-badge" class="status-badge">No model loaded</span>
     <button id="btn-settings" title="Settings">&#x2699;</button>
     <button id="btn-clear" title="New chat">&#x2795; New Chat</button>
@@ -449,6 +541,11 @@ button.primary:hover { background: var(--accent-hover); }
 
   <div id="input-area">
     <div class="attachments" id="attachments"></div>
+    <div class="model-switcher" id="model-switcher">
+      <label>Model:</label>
+      <select id="inline-model-select"><option value="">Loading...</option></select>
+      <span class="switch-indicator" id="switch-indicator">will switch model</span>
+    </div>
     <div class="input-row">
       <div class="input-wrapper">
         <textarea id="message-input" placeholder="Type a message..." rows="1"></textarea>
@@ -498,6 +595,9 @@ const attachmentsDiv = document.getElementById('attachments');
 let chatHistory = [];
 let pendingAttachments = [];
 let isGenerating = false;
+let currentAbortController = null;
+let currentLoadedModel = null;
+let availableModels = [];
 
 messageInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -527,21 +627,56 @@ async function fetchModels() {
   try {
     const res = await fetch('/api/models');
     const data = await res.json();
+    availableModels = data.models || [];
+
     const select = document.getElementById('model-select');
     select.innerHTML = '';
-    if (data.models.length === 0) {
+    if (availableModels.length === 0) {
       select.innerHTML = '<option>No .gguf files found in model directory</option>';
       return;
     }
-    data.models.forEach(m => {
+    availableModels.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m;
       opt.textContent = m;
       if (m === data.loaded) opt.selected = true;
       select.appendChild(opt);
     });
+
+    if (data.loaded) currentLoadedModel = data.loaded;
+    populateInlineModelSelect();
   } catch (e) {
     console.error('Failed to fetch models:', e);
+  }
+}
+
+function populateInlineModelSelect() {
+  const sel = document.getElementById('inline-model-select');
+  sel.innerHTML = '';
+  if (availableModels.length === 0) {
+    sel.innerHTML = '<option value="">No models</option>';
+    return;
+  }
+  availableModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m.replace(/\.gguf$/i, '');
+    if (m === currentLoadedModel) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  updateSwitchIndicator();
+}
+
+document.getElementById('inline-model-select').addEventListener('change', updateSwitchIndicator);
+
+function updateSwitchIndicator() {
+  const sel = document.getElementById('inline-model-select');
+  const indicator = document.getElementById('switch-indicator');
+  const selected = sel.value;
+  if (currentLoadedModel && selected && selected !== currentLoadedModel) {
+    indicator.classList.add('visible');
+  } else {
+    indicator.classList.remove('visible');
   }
 }
 
@@ -560,8 +695,10 @@ async function loadModel() {
     });
     const data = await res.json();
     if (data.ok) {
+      currentLoadedModel = data.model;
       statusBadge.textContent = data.model + ' (' + (data.architecture || '?') + ')';
       statusBadge.classList.add('loaded');
+      populateInlineModelSelect();
       hideSettings();
       clearChat();
     } else {
@@ -591,7 +728,7 @@ function clearChat() {
     chatContainer.innerHTML = `
       <div class="empty-state">
         <div class="big-icon">&#x1F4AC;</div>
-        <p>Start a conversation. You can attach images, videos, or audio files.</p>
+        <p>Start a conversation. You can switch models at any turn using the dropdown below, or attach images, videos, and audio files.</p>
       </div>`;
   }
 }
@@ -641,7 +778,8 @@ async function sendMessage() {
   if (isGenerating) return;
   const text = messageInput.value.trim();
   if (!text && pendingAttachments.length === 0) return;
-  if (!statusBadge.classList.contains('loaded')) {
+  const selectedModel = document.getElementById('inline-model-select').value;
+  if (!statusBadge.classList.contains('loaded') && !selectedModel) {
     showSettings();
     return;
   }
@@ -680,22 +818,35 @@ async function sendMessage() {
   if (empt) empt.remove();
 
   isGenerating = true;
+  currentAbortController = new AbortController();
+  setSendButtonState(true);
+
   const assistDiv = addAssistantBubble();
   const bubbleText = assistDiv.querySelector('.bubble-text');
   const statsDiv = assistDiv.querySelector('.stats');
+  const queueDiv = assistDiv.querySelector('.queue-indicator');
+
+  let fullText = '';
+  let wasAborted = false;
 
   try {
     const maxTokens = parseInt(document.getElementById('max-tokens').value) || 200;
+    const chatPayload = { messages: chatHistory, maxTokens };
+    if (selectedModel) chatPayload.model = selectedModel;
+    const backendSel = document.getElementById('backend-select');
+    if (backendSel) chatPayload.backend = backendSel.value;
+
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: chatHistory, maxTokens })
+      body: JSON.stringify(chatPayload),
+      signal: currentAbortController.signal
     });
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let fullText = '';
     let buffer = '';
+    let queueCleared = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -709,6 +860,47 @@ async function sendMessage() {
         if (!line.startsWith('data: ')) continue;
         try {
           const data = JSON.parse(line.slice(6));
+          if (data.queue_position !== undefined) {
+            if (queueDiv) {
+              queueDiv.style.display = 'inline-flex';
+              queueDiv.textContent = '';
+              const spinner = document.createElement('div');
+              spinner.className = 'queue-spinner';
+              queueDiv.appendChild(spinner);
+              const txt = document.createElement('span');
+              txt.textContent = data.queue_position === 1
+                ? 'Next in queue (1 request ahead)'
+                : `Position ${data.queue_position} in queue (${data.queue_position} requests ahead)`;
+              queueDiv.appendChild(txt);
+              chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+            continue;
+          }
+          if (data.model_loading) {
+            if (queueDiv) {
+              queueDiv.style.display = 'inline-flex';
+              queueDiv.textContent = '';
+              const spinner = document.createElement('div');
+              spinner.className = 'queue-spinner';
+              queueDiv.appendChild(spinner);
+              const txt = document.createElement('span');
+              txt.textContent = 'Loading model: ' + data.model_loading + '...';
+              queueDiv.appendChild(txt);
+              chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+            continue;
+          }
+          if (data.model_loaded) {
+            currentLoadedModel = data.model_loaded;
+            statusBadge.textContent = data.model_loaded + ' (' + (data.architecture || '?') + ')';
+            statusBadge.classList.add('loaded');
+            populateInlineModelSelect();
+            continue;
+          }
+          if (!queueCleared && queueDiv) {
+            queueDiv.style.display = 'none';
+            queueCleared = true;
+          }
           if (data.token) {
             fullText += data.token;
             bubbleText.textContent = fullText;
@@ -720,14 +912,45 @@ async function sendMessage() {
         } catch {}
       }
     }
-
-    chatHistory.push({ role: 'assistant', content: fullText });
   } catch (e) {
-    bubbleText.textContent = 'Error: ' + e.message;
+    if (e.name === 'AbortError') {
+      wasAborted = true;
+      statsDiv.textContent = 'Stopped by user';
+    } else {
+      bubbleText.textContent = 'Error: ' + e.message;
+    }
   } finally {
+    if (fullText) {
+      chatHistory.push({ role: 'assistant', content: fullText });
+    }
     isGenerating = false;
+    currentAbortController = null;
+    setSendButtonState(false);
     const indicator = assistDiv.querySelector('.typing-indicator');
     if (indicator) indicator.remove();
+    const queueInd = assistDiv.querySelector('.queue-indicator');
+    if (queueInd) queueInd.style.display = 'none';
+  }
+}
+
+function abortGeneration() {
+  if (currentAbortController) {
+    currentAbortController.abort();
+  }
+}
+
+function setSendButtonState(generating) {
+  const btn = document.getElementById('btn-send');
+  if (generating) {
+    btn.className = 'stop-btn';
+    btn.innerHTML = '&#x25A0;';
+    btn.setAttribute('onclick', 'abortGeneration()');
+    btn.title = 'Stop generating';
+  } else {
+    btn.className = 'send-btn';
+    btn.innerHTML = '&#x27A4;';
+    btn.setAttribute('onclick', 'sendMessage()');
+    btn.title = 'Send message';
   }
 }
 
@@ -764,9 +987,13 @@ function addUserBubble(text, attachments) {
 function addAssistantBubble() {
   const div = document.createElement('div');
   div.className = 'message assistant';
+  const selectedModel = document.getElementById('inline-model-select').value || currentLoadedModel || '';
+  const modelDisplay = selectedModel.replace(/\.gguf$/i, '');
   div.innerHTML = `
     <div class="avatar">&#x2B22;</div>
     <div class="bubble">
+      <div class="model-label">${escapeHtml(modelDisplay)}</div>
+      <div class="queue-indicator" style="display:none"><div class="queue-spinner"></div><span>Waiting in queue...</span></div>
       <span class="bubble-text"></span>
       <div class="typing-indicator"><span></span><span></span><span></span></div>
       <div class="stats"></div>
@@ -785,11 +1012,38 @@ function escapeHtml(str) {
 fetchModels().then(() => {
   fetch('/api/models').then(r => r.json()).then(data => {
     if (data.loaded) {
+      currentLoadedModel = data.loaded;
       statusBadge.textContent = data.loaded + ' (' + (data.architecture || '?') + ')';
       statusBadge.classList.add('loaded');
+      populateInlineModelSelect();
     }
   });
 });
+
+const queueBadge = document.getElementById('queue-badge');
+
+async function pollQueueStatus() {
+  try {
+    const res = await fetch('/api/queue/status');
+    const data = await res.json();
+    if (data.pending_requests > 0 || data.busy) {
+      queueBadge.style.display = '';
+      if (data.pending_requests > 0) {
+        queueBadge.textContent = `Queue: ${data.pending_requests} waiting`;
+        queueBadge.style.background = '#3a2a1a';
+        queueBadge.style.color = '#fa5';
+      } else {
+        queueBadge.textContent = 'Queue: processing';
+        queueBadge.style.background = '#1a3a1a';
+        queueBadge.style.color = '#5b5';
+      }
+    } else {
+      queueBadge.style.display = 'none';
+    }
+  } catch {}
+}
+
+setInterval(pollQueueStatus, 2000);
 </script>
 </body>
 </html>

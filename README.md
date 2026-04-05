@@ -1,6 +1,6 @@
 # TensorSharp
 
-[English](README.md) | [中文](readme_cn.md)
+[English](README.md) | [中文](README_cn.md)
 
 A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
@@ -8,23 +8,27 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 
 - **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` tags (Qwen 3, Qwen 3.5, Gemma 4)
+- **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, and other quantization formats; performs native quantized matmul without dequantizing to FP32
 - **GPU-accelerated** -- Apple Metal backend via GGML with fused whole-model GPU dispatch for Gemma 4 decode (~2.6x speedup over per-op dispatch)
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
+- **Request queue** -- FIFO inference queue ensures single-request execution for KV cache stability, with real-time position tracking for clients
 - **Batch processing** -- JSONL input support in the console application
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console)
 - **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B)
+- **Large file uploads** -- supports video/audio uploads up to 500 MB in the web interface
 
 ## Supported Model Architectures
 
-| Architecture | Example Models | Multimodal |
-|---|---|---|
-| Gemma 4 | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio |
-| Gemma 3 | gemma-3-4b | Image |
-| Qwen 3 | Qwen3-4B | Text only |
-| Qwen 3.5 | Qwen3.5-9B | Image |
+| Architecture | Example Models | Multimodal | Thinking | Tool Calling |
+|---|---|---|---|---|
+| Gemma 4 | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
+| Gemma 3 | gemma-3-4b | Image | No | No |
+| Qwen 3 | Qwen3-4B | Text only | Yes | Yes |
+| Qwen 3.5 | Qwen3.5-9B | Image | Yes | Yes |
 
 ## Compute Backends
 
@@ -52,12 +56,16 @@ TensorSharp/
 │   ├── ModelBase.cs             # Base class for all model architectures
 │   ├── ChatTemplate.cs          # Chat template rendering (hardcoded + Jinja2 from GGUF)
 │   ├── Jinja2Template.cs        # Jinja2 template renderer
+│   ├── OutputParser.cs          # Extracts thinking, content, and tool calls from model output
 │   ├── SamplingConfig.cs        # Sampling parameter configuration
 │   ├── TokenSampler.cs          # Token sampling (greedy, top-k, top-p, min-p, penalties)
 │   └── MediaHelper.cs           # Video frame extraction, audio decoding
 ├── InferenceConsole/            # CLI application
 ├── InferenceWeb/                # Web chatbot + API server (ASP.NET Core)
+│   ├── ModelService.cs          # Model lifecycle management
+│   ├── InferenceQueue.cs        # FIFO request queue with position tracking
 │   ├── wwwroot/index.html       # Chat UI
+│   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
 └── ExternalProjects/            # Third-party dependencies (ggml)
 ```
@@ -117,6 +125,13 @@ cd InferenceConsole/bin
 # Audio inference (Gemma 4)
 ./InferenceConsole --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# Thinking / reasoning mode
+./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal --think
+
+# Tool calling
+./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
+    --tools tools.json
+
 # With sampling parameters
 ./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42
@@ -140,6 +155,8 @@ cd InferenceConsole/bin
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
 | `--backend <type>` | Compute backend: `cpu`, `ggml_cpu`, or `ggml_metal` |
+| `--think` | Enable thinking/reasoning mode (chain-of-thought) |
+| `--tools <path>` | JSON file with tool/function definitions |
 | `--temperature <f>` | Sampling temperature (0 = greedy) |
 | `--top-k <N>` | Top-K filtering (0 = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (1.0 = disabled) |
@@ -175,8 +192,11 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 
 - Multi-turn chat conversations
 - Model selection from available GGUF files in `MODEL_DIR`
-- Image, video, and audio uploads for multimodal inference
+- Image, video, and audio uploads for multimodal inference (up to 500 MB)
+- Thinking/reasoning mode toggle
+- Tool calling with function definitions
 - Streaming token generation via Server-Sent Events
+- Request queue with real-time position feedback
 
 **Environment variables:**
 
@@ -205,6 +225,16 @@ curl -X POST http://localhost:5000/api/generate \
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "stream": false}'
+
+# Chat with thinking mode
+curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Solve 17*23"}], "think": true, "stream": false}'
+
+# Chat with tool calling
+curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "What is the weather?"}], "tools": [{"function": {"name": "get_weather", "description": "Get current weather", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
 ```
 
 **OpenAI-compatible API:**
@@ -230,6 +260,33 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+**Queue status:**
+
+```bash
+curl http://localhost:5000/api/queue/status
+# {"busy":false,"pending_requests":0,"total_processed":42}
+```
+
+## Thinking / Reasoning Mode
+
+Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+
+- **Qwen 3 / Qwen 3.5:** uses `<think>...</think>` tags
+- **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
+
+Enable via `--think` (console), `"think": true` (Ollama API), or the thinking toggle in the web UI.
+
+## Tool Calling / Function Calling
+
+Models can invoke user-defined tools and participate in multi-turn tool-call conversations. Define tools as JSON and pass them via `--tools` (console) or the `tools` parameter in the API.
+
+Each architecture uses its own wire format for tool calls:
+
+- **Qwen 3 / Qwen 3.5:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
+
+The output parser (`OutputParser.cs`) automatically extracts tool calls from the model's raw output regardless of architecture.
+
 ## Multimodal Support
 
 ### Gemma 4
@@ -252,9 +309,9 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.GGML** registers GPU-accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS, this provides Metal GPU compute. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
 
-3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, and the forward pass for each architecture. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, output parsing (thinking extraction, tool-call extraction), and the forward pass for each architecture. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
-4. **InferenceConsole** and **InferenceWeb** are application layers that handle I/O and user interaction. InferenceWeb provides Ollama-compatible and OpenAI-compatible REST APIs alongside a browser-based chat UI.
+4. **InferenceConsole** and **InferenceWeb** are application layers that handle I/O and user interaction. InferenceWeb provides Ollama-compatible and OpenAI-compatible REST APIs alongside a browser-based chat UI, with a FIFO inference queue to serialize concurrent requests.
 
 ### Performance Optimizations
 
@@ -263,6 +320,19 @@ TensorSharp is structured as a layered system:
 - **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations.
+
+## Testing
+
+Integration tests for InferenceWeb are in `InferenceWeb/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, queue behavior, concurrent requests, and abort support.
+
+```bash
+# Start InferenceWeb, then run:
+python3 InferenceWeb/testdata/test_multiturn.py
+# or
+bash InferenceWeb/testdata/test_multiturn.sh
+```
+
+See [InferenceWeb/testdata/README.md](InferenceWeb/testdata/README.md) for the full test matrix.
 
 ## Author
 

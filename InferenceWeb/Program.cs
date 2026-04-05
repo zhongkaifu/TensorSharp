@@ -17,11 +17,24 @@ using System.Text.Json;
 using InferenceEngine;
 using InferenceWeb;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = 500 * 1024 * 1024; // 500 MB
+});
+
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = 500 * 1024 * 1024; // 500 MB
+});
+
 builder.Services.AddSingleton<ModelService>();
+builder.Services.AddSingleton<InferenceQueue>();
 
 string webRoot = builder.Environment.WebRootPath;
 if (string.IsNullOrEmpty(webRoot) || !Directory.Exists(webRoot))
@@ -55,6 +68,17 @@ string defaultBackend = Environment.GetEnvironmentVariable("BACKEND") ?? "ggml_m
 // Internal Web UI endpoints (original)
 // ============================================================
 
+app.MapGet("/api/queue/status", (InferenceQueue queue) =>
+{
+    var status = queue.GetStatus();
+    return Results.Ok(new
+    {
+        busy = status.Busy,
+        pending_requests = status.PendingRequests,
+        total_processed = status.TotalProcessed
+    });
+});
+
 app.MapGet("/api/models", (ModelService svc) =>
 {
     var files = svc.ScanModels(modelDir);
@@ -67,7 +91,7 @@ app.MapGet("/api/models", (ModelService svc) =>
     });
 });
 
-app.MapPost("/api/models/load", async (HttpRequest req, ModelService svc) =>
+app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelService svc, InferenceQueue queue) =>
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(req.Body);
     string modelName = body.GetProperty("model").GetString();
@@ -79,6 +103,9 @@ app.MapPost("/api/models/load", async (HttpRequest req, ModelService svc) =>
         return Results.NotFound(new { error = $"Model not found: {modelName}" });
 
     string mmProjPath = mmproj != null ? Path.Combine(modelDir, mmproj) : null;
+
+    using var ticket = queue.Enqueue(ctx.RequestAborted);
+    await ticket.WaitUntilReadyAsync();
 
     try
     {
@@ -138,20 +165,28 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName });
 });
 
-app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc) =>
+app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueue queue) =>
 {
-    if (!svc.IsLoaded)
+    var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
+
+    string switchModel = body.TryGetProperty("model", out var modelEl) ? modelEl.GetString() : null;
+    string switchBackend = body.TryGetProperty("backend", out var beEl) ? beEl.GetString() : null;
+
+    if (string.IsNullOrEmpty(switchModel) && !svc.IsLoaded)
     {
         ctx.Response.StatusCode = 400;
         await ctx.Response.WriteAsJsonAsync(new { error = "No model loaded" });
         return;
     }
 
-    var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
     var messagesEl = body.GetProperty("messages");
     int maxTokens = body.TryGetProperty("maxTokens", out var mt) ? mt.GetInt32() : 200;
 
     var samplingConfig = ParseSamplingConfig(body);
+    bool uiThink = body.TryGetProperty("think", out var uiThinkProp) && uiThinkProp.GetBoolean();
+    List<ToolFunction> uiTools = null;
+    if (body.TryGetProperty("tools", out var uiToolsEl) && uiToolsEl.ValueKind == JsonValueKind.Array)
+        uiTools = ParseOllamaTools(body);
 
     var messages = new List<ChatMessage>();
     foreach (var msgEl in messagesEl.EnumerateArray())
@@ -178,27 +213,112 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc) =>
     ctx.Response.Headers["Cache-Control"] = "no-cache";
     ctx.Response.Headers["Connection"] = "keep-alive";
 
-    var writer = ctx.Response.BodyWriter;
-    var sw = Stopwatch.StartNew();
-    int tokenCount = 0;
-
-    try
+    using var ticket = queue.Enqueue(ctx.RequestAborted);
+    while (!ticket.IsReady)
     {
-        await foreach (var piece in svc.ChatStreamAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig))
+        string queueData = JsonSerializer.Serialize(new { queue_position = ticket.Position, queue_pending = queue.PendingCount });
+        await ctx.Response.WriteAsync($"data: {queueData}\n\n", ctx.RequestAborted);
+        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    if (!string.IsNullOrEmpty(switchModel))
+    {
+        string backend = switchBackend ?? defaultBackend;
+        bool wasSwitch = !svc.IsModelAlreadyLoaded(switchModel);
+        if (wasSwitch)
         {
-            tokenCount++;
-            string data = JsonSerializer.Serialize(new { token = piece });
-            await ctx.Response.WriteAsync($"data: {data}\n\n", ctx.RequestAborted);
+            string loadingData = JsonSerializer.Serialize(new { model_loading = switchModel });
+            await ctx.Response.WriteAsync($"data: {loadingData}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        }
+        if (!svc.EnsureModelLoaded(switchModel, modelDir, backend))
+        {
+            string errData = JsonSerializer.Serialize(new { done = true, error = $"Model '{switchModel}' not found" });
+            await ctx.Response.WriteAsync($"data: {errData}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            return;
+        }
+        if (wasSwitch)
+        {
+            string loadedData = JsonSerializer.Serialize(new { model_loaded = svc.LoadedModelName, architecture = svc.Architecture });
+            await ctx.Response.WriteAsync($"data: {loadedData}\n\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         }
     }
-    catch (OperationCanceledException) { }
 
-    sw.Stop();
-    double tokPerSec = tokenCount > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
-    string done = JsonSerializer.Serialize(new { done = true, tokenCount, elapsed = sw.Elapsed.TotalSeconds, tokPerSec });
-    await ctx.Response.WriteAsync($"data: {done}\n\n");
-    await ctx.Response.Body.FlushAsync();
+    var writer = ctx.Response.BodyWriter;
+    var sw = Stopwatch.StartNew();
+    int tokenCount = 0;
+    bool useUiParser = uiThink || (uiTools != null && uiTools.Count > 0);
+    var uiRawSb = new StringBuilder();
+
+    bool aborted = false;
+    try
+    {
+        await foreach (var piece in svc.ChatStreamAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+            uiTools, uiThink))
+        {
+            tokenCount++;
+            if (useUiParser)
+            {
+                uiRawSb.Append(piece);
+            }
+            else
+            {
+                string data = JsonSerializer.Serialize(new { token = piece });
+                await ctx.Response.WriteAsync($"data: {data}\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            }
+        }
+    }
+    catch (OperationCanceledException) { aborted = true; }
+
+    try
+    {
+        if (useUiParser && !aborted)
+        {
+            var parser = OutputParserFactory.Create(svc.Architecture);
+            parser.Init(uiThink, uiTools);
+            var parsed = parser.Add(uiRawSb.ToString(), true);
+
+            if (!string.IsNullOrEmpty(parsed.Thinking))
+            {
+                string thinkData = JsonSerializer.Serialize(new { thinking = parsed.Thinking });
+                await ctx.Response.WriteAsync($"data: {thinkData}\n\n");
+                await ctx.Response.Body.FlushAsync();
+            }
+
+            if (!string.IsNullOrEmpty(parsed.Content))
+            {
+                string contentData = JsonSerializer.Serialize(new { token = parsed.Content });
+                await ctx.Response.WriteAsync($"data: {contentData}\n\n");
+                await ctx.Response.Body.FlushAsync();
+            }
+
+            if (parsed.ToolCalls != null)
+            {
+                string tcData = JsonSerializer.Serialize(new
+                {
+                    tool_calls = parsed.ToolCalls.ConvertAll(tc => new
+                    {
+                        name = tc.Name,
+                        arguments = tc.Arguments
+                    })
+                });
+                await ctx.Response.WriteAsync($"data: {tcData}\n\n");
+                await ctx.Response.Body.FlushAsync();
+            }
+        }
+
+        sw.Stop();
+        double tokPerSec = tokenCount > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
+        string done = JsonSerializer.Serialize(new { done = true, tokenCount, elapsed = sw.Elapsed.TotalSeconds, tokPerSec,
+            aborted });
+        await ctx.Response.WriteAsync($"data: {done}\n\n");
+        await ctx.Response.Body.FlushAsync();
+    }
+    catch (Exception) { }
 });
 
 // ============================================================
@@ -263,7 +383,7 @@ app.MapPost("/api/show", async (HttpContext ctx, ModelService svc) =>
     });
 });
 
-app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc) =>
+app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc, InferenceQueue queue) =>
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
 
@@ -275,13 +395,6 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc) =>
     }
 
     string modelName = modelProp.GetString();
-    if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
-    {
-        ctx.Response.StatusCode = 404;
-        await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
-        return;
-    }
-
     string prompt = body.TryGetProperty("prompt", out var pp) ? pp.GetString() ?? "" : "";
     bool stream = true;
     if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
@@ -292,10 +405,29 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc) =>
 
     var imagePaths = DecodeBase64Images(body, uploadDir);
 
+    using var ticket = queue.Enqueue(ctx.RequestAborted);
+
     if (stream)
     {
         ctx.Response.ContentType = "application/x-ndjson";
         ctx.Response.Headers["Cache-Control"] = "no-cache";
+
+        while (!ticket.IsReady)
+        {
+            var queueResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
+                response = "", done = false, queue_position = ticket.Position, queue_pending = queue.PendingCount };
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(queueResp) + "\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            var errResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
+                response = "", done = true, done_reason = "error", error = $"model '{modelName}' not found" };
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(errResp) + "\n", ctx.RequestAborted);
+            return;
+        }
 
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
             in svc.GenerateStreamAsync(prompt, imagePaths, maxTokens, ctx.RequestAborted, samplingConfig))
@@ -334,6 +466,15 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc) =>
     }
     else
     {
+        await ticket.WaitUntilReadyAsync();
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            ctx.Response.StatusCode = 404;
+            await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
+            return;
+        }
+
         var sb = new StringBuilder();
         int promptTokens = 0, evalTokens = 0;
         long totalNs = 0, promptNs = 0, evalNs = 0;
@@ -366,7 +507,7 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc) =>
     }
 });
 
-app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
+app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, InferenceQueue queue) =>
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
 
@@ -378,12 +519,6 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
     }
 
     string modelName = modelProp.GetString();
-    if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
-    {
-        ctx.Response.StatusCode = 404;
-        await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
-        return;
-    }
 
     if (!body.TryGetProperty("messages", out var messagesEl) || messagesEl.ValueKind != JsonValueKind.Array)
     {
@@ -400,18 +535,52 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
         maxTokens = np.GetInt32();
 
     var messages = ParseOllamaMessages(messagesEl, uploadDir);
+    var ollamaTools = ParseOllamaTools(body);
+    bool ollamaThink = body.TryGetProperty("think", out var thinkProp) && thinkProp.GetBoolean();
+
+    using var ticket = queue.Enqueue(ctx.RequestAborted);
 
     if (stream)
     {
         ctx.Response.ContentType = "application/x-ndjson";
         ctx.Response.Headers["Cache-Control"] = "no-cache";
 
+        while (!ticket.IsReady)
+        {
+            var queueResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
+                message = new { role = "assistant", content = "" }, done = false,
+                queue_position = ticket.Position, queue_pending = queue.PendingCount };
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(queueResp) + "\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            var errResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
+                message = new { role = "assistant", content = "" }, done = true,
+                done_reason = "error", error = $"model '{modelName}' not found" };
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(errResp) + "\n", ctx.RequestAborted);
+            return;
+        }
+
+        var parser = OutputParserFactory.Create(svc.Architecture);
+        parser.Init(ollamaThink, ollamaTools);
+        bool useParser = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0);
+        var allContent = new StringBuilder();
+
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig))
+            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+                ollamaTools, ollamaThink))
         {
             object resp;
             if (!done)
             {
+                if (useParser)
+                {
+                    allContent.Append(piece);
+                    continue;
+                }
                 resp = new
                 {
                     model = svc.LoadedModelName,
@@ -422,33 +591,75 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
             }
             else
             {
-                resp = new
+                if (useParser)
                 {
-                    model = svc.LoadedModelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    message = new { role = "assistant", content = "" },
-                    done = true,
-                    done_reason = "stop",
-                    total_duration = totalNs,
-                    prompt_eval_count = promptTokens,
-                    prompt_eval_duration = promptNs,
-                    eval_count = evalTokens,
-                    eval_duration = evalNs
-                };
+                    var parsed = parser.Add(allContent.ToString(), true);
+                    var toolCallsJson = parsed.ToolCalls?.ConvertAll(tc => new
+                    {
+                        function = new { name = tc.Name, arguments = tc.Arguments }
+                    });
+
+                    resp = new
+                    {
+                        model = svc.LoadedModelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new
+                        {
+                            role = "assistant",
+                            content = parsed.Content ?? "",
+                            thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                            tool_calls = toolCallsJson
+                        },
+                        done = true,
+                        done_reason = parsed.ToolCalls != null ? "tool_calls" : "stop",
+                        total_duration = totalNs,
+                        prompt_eval_count = promptTokens,
+                        prompt_eval_duration = promptNs,
+                        eval_count = evalTokens,
+                        eval_duration = evalNs
+                    };
+                }
+                else
+                {
+                    resp = new
+                    {
+                        model = svc.LoadedModelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new { role = "assistant", content = "" },
+                        done = true,
+                        done_reason = "stop",
+                        total_duration = totalNs,
+                        prompt_eval_count = promptTokens,
+                        prompt_eval_duration = promptNs,
+                        eval_count = evalTokens,
+                        eval_duration = evalNs
+                    };
+                }
             }
 
-            await ctx.Response.WriteAsync(JsonSerializer.Serialize(resp) + "\n", ctx.RequestAborted);
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(resp,
+                new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }) + "\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         }
     }
     else
     {
+        await ticket.WaitUntilReadyAsync();
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            ctx.Response.StatusCode = 404;
+            await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
+            return;
+        }
+
         var sb = new StringBuilder();
         int promptTokens = 0, evalTokens = 0;
         long totalNs = 0, promptNs = 0, evalNs = 0;
 
         await foreach (var (piece, done, pt, et, tn, pn, en)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig))
+            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+                ollamaTools, ollamaThink))
         {
             if (!done)
                 sb.Append(piece);
@@ -459,19 +670,48 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
             }
         }
 
-        await ctx.Response.WriteAsJsonAsync(new
+        string rawOutput = sb.ToString();
+        var parser2 = OutputParserFactory.Create(svc.Architecture);
+        parser2.Init(ollamaThink, ollamaTools);
+        bool useParser2 = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0);
+        object finalMessage;
+        string doneReason = "stop";
+
+        if (useParser2)
+        {
+            var parsed = parser2.Add(rawOutput, true);
+            var toolCallsJson = parsed.ToolCalls?.ConvertAll(tc => new
+            {
+                function = new { name = tc.Name, arguments = tc.Arguments }
+            });
+            finalMessage = new
+            {
+                role = "assistant",
+                content = parsed.Content ?? "",
+                thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                tool_calls = toolCallsJson
+            };
+            if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
+                doneReason = "tool_calls";
+        }
+        else
+        {
+            finalMessage = new { role = "assistant", content = rawOutput };
+        }
+
+        await ctx.Response.WriteAsync(JsonSerializer.Serialize(new
         {
             model = svc.LoadedModelName,
             created_at = DateTime.UtcNow.ToString("o"),
-            message = new { role = "assistant", content = sb.ToString() },
+            message = finalMessage,
             done = true,
-            done_reason = "stop",
+            done_reason = doneReason,
             total_duration = totalNs,
             prompt_eval_count = promptTokens,
             prompt_eval_duration = promptNs,
             eval_count = evalTokens,
             eval_duration = evalNs
-        });
+        }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }));
     }
 });
 
@@ -479,7 +719,7 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc) =>
 // OpenAI-compatible API endpoint
 // ============================================================
 
-app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
+app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, InferenceQueue queue) =>
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
 
@@ -491,12 +731,6 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
     }
 
     string modelName = modelProp.GetString();
-    if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
-    {
-        ctx.Response.StatusCode = 404;
-        await ctx.Response.WriteAsJsonAsync(new { error = new { message = $"model '{modelName}' not found", type = "invalid_request_error" } });
-        return;
-    }
 
     if (!body.TryGetProperty("messages", out var messagesEl) || messagesEl.ValueKind != JsonValueKind.Array)
     {
@@ -511,16 +745,52 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
     var messages = ParseOpenAIMessages(messagesEl, uploadDir);
     string requestId = $"chatcmpl-{Guid.NewGuid():N}".Substring(0, 30);
 
+    var openaiTools = ParseOpenAITools(body);
+    bool openaiThink = body.TryGetProperty("think", out var oaiThinkProp) && oaiThinkProp.GetBoolean();
+
+    using var ticket = queue.Enqueue(ctx.RequestAborted);
+
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers["Cache-Control"] = "no-cache";
 
+        while (!ticket.IsReady)
+        {
+            var queueResp = new { id = requestId, @object = "chat.completion.chunk", model = modelName,
+                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                choices = new[] { new { index = 0, delta = new { role = "assistant", content = "" },
+                    finish_reason = (string)null } },
+                queue_position = ticket.Position, queue_pending = queue.PendingCount };
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(queueResp)}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            var errChunk = new { id = requestId, @object = "chat.completion.chunk", model = modelName,
+                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                choices = new[] { new { index = 0, delta = new { content = $"Error: model '{modelName}' not found" },
+                    finish_reason = "stop" } } };
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(errChunk)}\n\ndata: [DONE]\n\n", ctx.RequestAborted);
+            return;
+        }
+
+        bool useOaiStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0);
+        var oaiStreamSb = new StringBuilder();
+
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig))
+            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+                openaiTools, openaiThink))
         {
             if (!done)
             {
+                if (useOaiStreamParser)
+                {
+                    oaiStreamSb.Append(piece);
+                    continue;
+                }
                 var chunk = new
                 {
                     id = requestId,
@@ -542,29 +812,85 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
             }
             else
             {
-                var chunk = new
+                if (useOaiStreamParser)
                 {
-                    id = requestId,
-                    @object = "chat.completion.chunk",
-                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    model = svc.LoadedModelName,
-                    choices = new[]
+                    var streamParser = OutputParserFactory.Create(svc.Architecture);
+                    streamParser.Init(openaiThink, openaiTools);
+                    var parsed = streamParser.Add(oaiStreamSb.ToString(), true);
+                    string finReason = (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0) ? "tool_calls" : "stop";
+
+                    if (!string.IsNullOrEmpty(parsed.Content))
                     {
-                        new
+                        var contentChunk = new
                         {
-                            index = 0,
-                            delta = new { role = (string)null, content = (string)null },
-                            finish_reason = "stop"
-                        }
-                    },
-                    usage = new
-                    {
-                        prompt_tokens = promptTokens,
-                        completion_tokens = evalTokens,
-                        total_tokens = promptTokens + evalTokens
+                            id = requestId,
+                            @object = "chat.completion.chunk",
+                            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                            model = svc.LoadedModelName,
+                            choices = new[]
+                            {
+                                new
+                                {
+                                    index = 0,
+                                    delta = new { role = (string)null, content = parsed.Content },
+                                    finish_reason = (string)null
+                                }
+                            }
+                        };
+                        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n", ctx.RequestAborted);
+                        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                     }
-                };
-                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+
+                    var endChunk = new
+                    {
+                        id = requestId,
+                        @object = "chat.completion.chunk",
+                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        model = svc.LoadedModelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta = new { role = (string)null, content = (string)null },
+                                finish_reason = finReason
+                            }
+                        },
+                        usage = new
+                        {
+                            prompt_tokens = promptTokens,
+                            completion_tokens = evalTokens,
+                            total_tokens = promptTokens + evalTokens
+                        }
+                    };
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(endChunk)}\n\n", ctx.RequestAborted);
+                }
+                else
+                {
+                    var chunk = new
+                    {
+                        id = requestId,
+                        @object = "chat.completion.chunk",
+                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        model = svc.LoadedModelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta = new { role = (string)null, content = (string)null },
+                                finish_reason = "stop"
+                            }
+                        },
+                        usage = new
+                        {
+                            prompt_tokens = promptTokens,
+                            completion_tokens = evalTokens,
+                            total_tokens = promptTokens + evalTokens
+                        }
+                    };
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+                }
                 await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
@@ -572,30 +898,73 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
     }
     else
     {
+        await ticket.WaitUntilReadyAsync();
+
+        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        {
+            ctx.Response.StatusCode = 404;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = $"model '{modelName}' not found", type = "invalid_request_error" } });
+            return;
+        }
+
         var sb = new StringBuilder();
         int promptTokens = 0, evalTokens = 0;
 
         await foreach (var (piece, done, pt, et, tn, pn, en)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig))
+            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+                openaiTools, openaiThink))
         {
             if (!done)
                 sb.Append(piece);
             else { promptTokens = pt; evalTokens = et; }
         }
 
-        await ctx.Response.WriteAsJsonAsync(new
+        string rawOutput = sb.ToString();
+        bool useOaiParser = openaiThink || (openaiTools != null && openaiTools.Count > 0);
+        object responseMessage;
+        string finishReason = "stop";
+
+        if (useOaiParser)
+        {
+            var parser = OutputParserFactory.Create(svc.Architecture);
+            parser.Init(openaiThink, openaiTools);
+            var parsed = parser.Add(rawOutput, true);
+
+            var toolCallsList = parsed.ToolCalls?.Select((tc, idx) => new
+            {
+                id = $"call_{Guid.NewGuid():N}".Substring(0, 24),
+                type = "function",
+                function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) }
+            }).ToArray();
+
+            responseMessage = new
+            {
+                role = "assistant",
+                content = parsed.Content ?? "",
+                thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                tool_calls = toolCallsList
+            };
+            if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
+                finishReason = "tool_calls";
+        }
+        else
+        {
+            responseMessage = new { role = "assistant", content = rawOutput };
+        }
+
+        await ctx.Response.WriteAsync(JsonSerializer.Serialize(new
         {
             id = requestId,
             @object = "chat.completion",
             created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             model = svc.LoadedModelName,
-            choices = new[]
+            choices = new object[]
             {
                 new
                 {
                     index = 0,
-                    message = new { role = "assistant", content = sb.ToString() },
-                    finish_reason = "stop"
+                    message = responseMessage,
+                    finish_reason = finishReason
                 }
             },
             usage = new
@@ -604,7 +973,7 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc) =>
                 completion_tokens = evalTokens,
                 total_tokens = promptTokens + evalTokens
             }
-        });
+        }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }));
     }
 
 });
@@ -816,6 +1185,91 @@ static List<ChatMessage> ParseOpenAIMessages(JsonElement messagesEl, string uplo
         messages.Add(msg);
     }
     return messages;
+}
+
+static List<ToolFunction> ParseOllamaTools(JsonElement body)
+{
+    if (!body.TryGetProperty("tools", out var toolsEl) || toolsEl.ValueKind != JsonValueKind.Array)
+        return null;
+
+    var tools = new List<ToolFunction>();
+    foreach (var toolEl in toolsEl.EnumerateArray())
+    {
+        if (!toolEl.TryGetProperty("function", out var fnEl)) continue;
+        var tf = new ToolFunction
+        {
+            Name = fnEl.TryGetProperty("name", out var n) ? n.GetString() : "",
+            Description = fnEl.TryGetProperty("description", out var d) ? d.GetString() : ""
+        };
+
+        if (fnEl.TryGetProperty("parameters", out var paramsEl))
+        {
+            if (paramsEl.TryGetProperty("properties", out var propsEl) &&
+                propsEl.ValueKind == JsonValueKind.Object)
+            {
+                tf.Parameters = new Dictionary<string, ToolParameter>();
+                foreach (var prop in propsEl.EnumerateObject())
+                {
+                    var tp = new ToolParameter
+                    {
+                        Type = prop.Value.TryGetProperty("type", out var pt) ? pt.GetString() : "string",
+                        Description = prop.Value.TryGetProperty("description", out var pd) ? pd.GetString() : null
+                    };
+                    if (prop.Value.TryGetProperty("enum", out var enumEl) && enumEl.ValueKind == JsonValueKind.Array)
+                        tp.Enum = enumEl.EnumerateArray().Select(e => e.GetString()).ToList();
+                    tf.Parameters[prop.Name] = tp;
+                }
+            }
+            if (paramsEl.TryGetProperty("required", out var reqEl) && reqEl.ValueKind == JsonValueKind.Array)
+                tf.Required = reqEl.EnumerateArray().Select(e => e.GetString()).ToList();
+        }
+        tools.Add(tf);
+    }
+    return tools.Count > 0 ? tools : null;
+}
+
+static List<ToolFunction> ParseOpenAITools(JsonElement body)
+{
+    if (!body.TryGetProperty("tools", out var toolsEl) || toolsEl.ValueKind != JsonValueKind.Array)
+        return null;
+
+    var tools = new List<ToolFunction>();
+    foreach (var toolEl in toolsEl.EnumerateArray())
+    {
+        string type = toolEl.TryGetProperty("type", out var t) ? t.GetString() : "function";
+        if (type != "function") continue;
+        if (!toolEl.TryGetProperty("function", out var fnEl)) continue;
+
+        var tf = new ToolFunction
+        {
+            Name = fnEl.TryGetProperty("name", out var n) ? n.GetString() : "",
+            Description = fnEl.TryGetProperty("description", out var d) ? d.GetString() : ""
+        };
+
+        if (fnEl.TryGetProperty("parameters", out var paramsEl))
+        {
+            if (paramsEl.TryGetProperty("properties", out var propsEl) &&
+                propsEl.ValueKind == JsonValueKind.Object)
+            {
+                tf.Parameters = new Dictionary<string, ToolParameter>();
+                foreach (var prop in propsEl.EnumerateObject())
+                {
+                    var tp = new ToolParameter
+                    {
+                        Type = prop.Value.TryGetProperty("type", out var pt) ? pt.GetString() : "string",
+                        Description = prop.Value.TryGetProperty("description", out var pd) ? pd.GetString() : null
+                    };
+                    if (prop.Value.TryGetProperty("enum", out var enumEl) && enumEl.ValueKind == JsonValueKind.Array)
+                        tp.Enum = enumEl.EnumerateArray().Select(e => e.GetString()).ToList();
+                    tf.Parameters[prop.Name] = tp;
+                }
+            }
+            if (paramsEl.TryGetProperty("required", out var reqEl) && reqEl.ValueKind == JsonValueKind.Array)
+                tf.Required = reqEl.EnumerateArray().Select(e => e.GetString()).ToList();
+        }
+        tools.Add(tf);
+    }
+    return tools.Count > 0 ? tools : null;
 }
 
 static List<string> DecodeBase64Images(JsonElement body, string uploadDir)

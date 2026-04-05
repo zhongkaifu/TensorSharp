@@ -1,0 +1,32 @@
+[
+  {
+    "Name": "calculate",
+    "Description": "Evaluate a mathematical expression",
+    "Parameters": {
+      "expression": {
+        "Type": "string",
+        "Description": "The mathematical expression to evaluate, e.g. '2 + 3 * 4'"
+      }
+    },
+    "Required": ["expression"]
+  },
+  {
+    "Name": "convert_units",
+    "Description": "Convert a value from one unit to another",
+    "Parameters": {
+      "value": {
+        "Type": "number",
+        "Description": "The numeric value to convert"
+      },
+      "from_unit": {
+        "Type": "string",
+        "Description": "The source unit"
+      },
+      "to_unit": {
+        "Type": "string",
+        "Description": "The target unit"
+      }
+    },
+    "Required": ["value", "from_unit", "to_unit"]
+  }
+]

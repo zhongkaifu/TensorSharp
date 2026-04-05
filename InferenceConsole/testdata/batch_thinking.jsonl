@@ -1,0 +1,3 @@
+{"prompt": "What is 25 * 37? Think step by step.", "max_tokens": 500}
+{"prompt": "Is 97 a prime number? Think carefully.", "max_tokens": 500}
+{"prompt": "If I have 3 apples and give away 1, then buy 5 more, how many do I have?", "max_tokens": 300}

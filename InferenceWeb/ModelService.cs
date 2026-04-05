@@ -24,7 +24,6 @@ namespace InferenceWeb
     public class ModelService : IDisposable
     {
         private ModelBase _model;
-        private readonly SemaphoreSlim _inferenceLock = new(1, 1);
         private string _loadedModelPath;
         private string _loadedMmProjPath;
         private BackendType _backend;
@@ -35,39 +34,42 @@ namespace InferenceWeb
         public string Architecture => _model?.Config?.Architecture;
         public ModelBase Model => _model;
 
+        /// <summary>
+        /// Check if the specified model is already loaded (no locking needed, just a name comparison).
+        /// </summary>
+        public bool IsModelAlreadyLoaded(string modelName)
+        {
+            return _model != null && string.Equals(LoadedModelName, modelName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Load a model. Must be called within the InferenceQueue to prevent concurrent access.
+        /// </summary>
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
-            _inferenceLock.Wait();
-            try
+            _model?.Dispose();
+            _model = null;
+            _loadedModelPath = null;
+            _loadedMmProjPath = null;
+
+            _backend = backendStr switch
             {
-                _model?.Dispose();
-                _model = null;
-                _loadedModelPath = null;
-                _loadedMmProjPath = null;
+                "ggml_metal" => BackendType.GgmlMetal,
+                "ggml_cpu" => BackendType.GgmlCpu,
+                "cpu" => BackendType.Cpu,
+                _ => BackendType.GgmlCpu
+            };
 
-                _backend = backendStr switch
-                {
-                    "ggml_metal" => BackendType.GgmlMetal,
-                    "ggml_cpu" => BackendType.GgmlCpu,
-                    "cpu" => BackendType.Cpu,
-                    _ => BackendType.GgmlCpu
-                };
+            _model = ModelBase.Create(modelPath, _backend);
+            _loadedModelPath = modelPath;
 
-                _model = ModelBase.Create(modelPath, _backend);
-                _loadedModelPath = modelPath;
+            if (mmProjPath == null)
+                mmProjPath = AutoDetectMmProj(modelPath);
 
-                if (mmProjPath == null)
-                    mmProjPath = AutoDetectMmProj(modelPath);
-
-                if (mmProjPath != null && File.Exists(mmProjPath))
-                {
-                    LoadEncoders(mmProjPath);
-                    _loadedMmProjPath = mmProjPath;
-                }
-            }
-            finally
+            if (mmProjPath != null && File.Exists(mmProjPath))
             {
-                _inferenceLock.Release();
+                LoadEncoders(mmProjPath);
+                _loadedMmProjPath = mmProjPath;
             }
         }
 
@@ -114,67 +116,62 @@ namespace InferenceWeb
             }
         }
 
+        /// <summary>
+        /// Stream chat inference tokens. Must be called within the InferenceQueue to prevent concurrent access.
+        /// </summary>
         public async IAsyncEnumerable<string> ChatStreamAsync(
             List<ChatMessage> history,
             int maxTokens,
             [EnumeratorCancellation] CancellationToken cancellationToken,
-            SamplingConfig samplingConfig = null)
+            SamplingConfig samplingConfig = null,
+            List<ToolFunction> tools = null, bool enableThinking = false)
         {
-            await _inferenceLock.WaitAsync(cancellationToken);
-            try
+            string arch = _model.Config.Architecture;
+            string rendered = ChatTemplate.RenderFromGgufTemplate(
+                _model.Config.ChatTemplate, history, addGenerationPrompt: true,
+                architecture: arch, tools: tools, enableThinking: enableThinking);
+
+            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+
+            var lastMsg = history.LastOrDefault(m => m.Role == "user");
+            if (lastMsg != null)
+                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+
+            _model.ResetKVCache();
+            float[] logits = _model.Forward(inputTokens.ToArray());
+            var generatedTokens = new List<int>();
+
+            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var sampler = new TokenSampler(cfg);
+
+            for (int step = 0; step < maxTokens; step++)
             {
-                string arch = _model.Config.Architecture;
-                string rendered = ChatTemplate.RenderFromGgufTemplate(
-                    _model.Config.ChatTemplate, history, addGenerationPrompt: true,
-                    architecture: arch);
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
-                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+                int nextToken = sampler.Sample(logits, generatedTokens);
+                if (_model.Tokenizer.IsEos(nextToken))
+                    break;
 
-                var lastMsg = history.LastOrDefault(m => m.Role == "user");
-                if (lastMsg != null)
-                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
-
-                _model.ResetKVCache();
-                float[] logits = _model.Forward(inputTokens.ToArray());
-                var generatedTokens = new List<int>();
-
-                var cfg = samplingConfig ?? SamplingConfig.Greedy;
-                var sampler = new TokenSampler(cfg);
-
-                for (int step = 0; step < maxTokens; step++)
+                generatedTokens.Add(nextToken);
+                string piece = _model.Tokenizer.Decode(generatedTokens);
+                if (generatedTokens.Count > 1)
                 {
-                    if (cancellationToken.IsCancellationRequested)
-                        break;
-
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    if (_model.Tokenizer.IsEos(nextToken))
-                        break;
-
-                    generatedTokens.Add(nextToken);
-                    string piece = _model.Tokenizer.Decode(generatedTokens);
-                    if (generatedTokens.Count > 1)
-                    {
-                        string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                        piece = piece.Substring(prev.Length);
-                    }
-
-                    // Check stop sequences
-                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                    {
-                        string decoded = _model.Tokenizer.Decode(generatedTokens);
-                        var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                        if (shouldStop)
-                            break;
-                    }
-
-                    yield return piece;
-
-                    logits = _model.Forward(new[] { nextToken });
+                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
+                    piece = piece.Substring(prev.Length);
                 }
-            }
-            finally
-            {
-                _inferenceLock.Release();
+
+                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                {
+                    string decoded = _model.Tokenizer.Decode(generatedTokens);
+                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
+                    if (shouldStop)
+                        break;
+                }
+
+                yield return piece;
+
+                logits = _model.Forward(new[] { nextToken });
             }
         }
 
@@ -325,9 +322,14 @@ namespace InferenceWeb
             return inputTokens;
         }
 
+        /// <summary>
+        /// Ensure the specified model is loaded. Skips loading if already loaded.
+        /// Must be called within the InferenceQueue to prevent concurrent access.
+        /// Returns false if the model file cannot be found.
+        /// </summary>
         public bool EnsureModelLoaded(string modelName, string modelDir, string defaultBackend)
         {
-            if (_model != null && LoadedModelName == modelName)
+            if (IsModelAlreadyLoaded(modelName))
                 return true;
 
             string modelPath = Path.Combine(modelDir, modelName);
@@ -337,13 +339,23 @@ namespace InferenceWeb
                     .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f)
                         .Equals(modelName, StringComparison.OrdinalIgnoreCase));
                 if (match != null) modelPath = match;
-                else return false;
+                else
+                {
+                    match = Directory.GetFiles(modelDir, "*.gguf")
+                        .FirstOrDefault(f => Path.GetFileName(f)
+                            .Equals(modelName, StringComparison.OrdinalIgnoreCase));
+                    if (match != null) modelPath = match;
+                    else return false;
+                }
             }
 
             LoadModel(modelPath, null, defaultBackend);
             return _model != null;
         }
 
+        /// <summary>
+        /// Stream generate tokens. Must be called within the InferenceQueue to prevent concurrent access.
+        /// </summary>
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
             GenerateStreamAsync(
                 string prompt,
@@ -352,140 +364,128 @@ namespace InferenceWeb
                 [EnumeratorCancellation] CancellationToken cancellationToken,
                 SamplingConfig samplingConfig = null)
         {
-            await _inferenceLock.WaitAsync(cancellationToken);
-            try
+            string arch = _model.Config.Architecture;
+            var messages = new List<ChatMessage>
             {
-                string arch = _model.Config.Architecture;
-                var messages = new List<ChatMessage>
+                new ChatMessage { Role = "user", Content = prompt, ImagePaths = imagePaths }
+            };
+
+            string rendered = ChatTemplate.RenderFromGgufTemplate(
+                _model.Config.ChatTemplate, messages, addGenerationPrompt: true,
+                architecture: arch);
+
+            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+            var lastMsg = messages[0];
+            if (lastMsg.ImagePaths != null && lastMsg.ImagePaths.Count > 0)
+                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+
+            _model.ResetKVCache();
+
+            var sw = Stopwatch.StartNew();
+            float[] logits = _model.Forward(inputTokens.ToArray());
+            long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+            int promptTokenCount = inputTokens.Count;
+
+            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var sampler = new TokenSampler(cfg);
+            var generatedTokens = new List<int>();
+
+            var evalSw = Stopwatch.StartNew();
+            for (int step = 0; step < maxTokens; step++)
+            {
+                if (cancellationToken.IsCancellationRequested) break;
+
+                int nextToken = sampler.Sample(logits, generatedTokens);
+                if (_model.Tokenizer.IsEos(nextToken)) break;
+
+                generatedTokens.Add(nextToken);
+                string piece = _model.Tokenizer.Decode(generatedTokens);
+                if (generatedTokens.Count > 1)
                 {
-                    new ChatMessage { Role = "user", Content = prompt, ImagePaths = imagePaths }
-                };
-
-                string rendered = ChatTemplate.RenderFromGgufTemplate(
-                    _model.Config.ChatTemplate, messages, addGenerationPrompt: true,
-                    architecture: arch);
-
-                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-                var lastMsg = messages[0];
-                if (lastMsg.ImagePaths != null && lastMsg.ImagePaths.Count > 0)
-                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
-
-                _model.ResetKVCache();
-
-                var sw = Stopwatch.StartNew();
-                float[] logits = _model.Forward(inputTokens.ToArray());
-                long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-                int promptTokenCount = inputTokens.Count;
-
-                var cfg = samplingConfig ?? SamplingConfig.Greedy;
-                var sampler = new TokenSampler(cfg);
-                var generatedTokens = new List<int>();
-
-                var evalSw = Stopwatch.StartNew();
-                for (int step = 0; step < maxTokens; step++)
-                {
-                    if (cancellationToken.IsCancellationRequested) break;
-
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    if (_model.Tokenizer.IsEos(nextToken)) break;
-
-                    generatedTokens.Add(nextToken);
-                    string piece = _model.Tokenizer.Decode(generatedTokens);
-                    if (generatedTokens.Count > 1)
-                    {
-                        string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                        piece = piece.Substring(prev.Length);
-                    }
-
-                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                    {
-                        string decoded = _model.Tokenizer.Decode(generatedTokens);
-                        var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                        if (shouldStop) break;
-                    }
-
-                    yield return (piece, false, 0, 0, 0, 0, 0);
-                    logits = _model.Forward(new[] { nextToken });
+                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
+                    piece = piece.Substring(prev.Length);
                 }
 
-                long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-                long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                {
+                    string decoded = _model.Tokenizer.Decode(generatedTokens);
+                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
+                    if (shouldStop) break;
+                }
 
-                yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
+                yield return (piece, false, 0, 0, 0, 0, 0);
+                logits = _model.Forward(new[] { nextToken });
             }
-            finally
-            {
-                _inferenceLock.Release();
-            }
+
+            long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+            long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+
+            yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
         }
 
+        /// <summary>
+        /// Stream chat inference tokens with timing metrics. Must be called within the InferenceQueue.
+        /// </summary>
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
             ChatStreamWithMetricsAsync(
                 List<ChatMessage> history,
                 int maxTokens,
                 [EnumeratorCancellation] CancellationToken cancellationToken,
-                SamplingConfig samplingConfig = null)
+                SamplingConfig samplingConfig = null,
+                List<ToolFunction> tools = null, bool enableThinking = false)
         {
-            await _inferenceLock.WaitAsync(cancellationToken);
-            try
+            string arch = _model.Config.Architecture;
+            string rendered = ChatTemplate.RenderFromGgufTemplate(
+                _model.Config.ChatTemplate, history, addGenerationPrompt: true,
+                architecture: arch, tools: tools, enableThinking: enableThinking);
+
+            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+            var lastMsg = history.LastOrDefault(m => m.Role == "user");
+            if (lastMsg != null)
+                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+
+            _model.ResetKVCache();
+
+            var sw = Stopwatch.StartNew();
+            float[] logits = _model.Forward(inputTokens.ToArray());
+            long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+            int promptTokenCount = inputTokens.Count;
+
+            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var sampler = new TokenSampler(cfg);
+            var generatedTokens = new List<int>();
+
+            var evalSw = Stopwatch.StartNew();
+            for (int step = 0; step < maxTokens; step++)
             {
-                string arch = _model.Config.Architecture;
-                string rendered = ChatTemplate.RenderFromGgufTemplate(
-                    _model.Config.ChatTemplate, history, addGenerationPrompt: true,
-                    architecture: arch);
+                if (cancellationToken.IsCancellationRequested) break;
 
-                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-                var lastMsg = history.LastOrDefault(m => m.Role == "user");
-                if (lastMsg != null)
-                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+                int nextToken = sampler.Sample(logits, generatedTokens);
+                if (_model.Tokenizer.IsEos(nextToken)) break;
 
-                _model.ResetKVCache();
-
-                var sw = Stopwatch.StartNew();
-                float[] logits = _model.Forward(inputTokens.ToArray());
-                long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-                int promptTokenCount = inputTokens.Count;
-
-                var cfg = samplingConfig ?? SamplingConfig.Greedy;
-                var sampler = new TokenSampler(cfg);
-                var generatedTokens = new List<int>();
-
-                var evalSw = Stopwatch.StartNew();
-                for (int step = 0; step < maxTokens; step++)
+                generatedTokens.Add(nextToken);
+                string piece = _model.Tokenizer.Decode(generatedTokens);
+                if (generatedTokens.Count > 1)
                 {
-                    if (cancellationToken.IsCancellationRequested) break;
-
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    if (_model.Tokenizer.IsEos(nextToken)) break;
-
-                    generatedTokens.Add(nextToken);
-                    string piece = _model.Tokenizer.Decode(generatedTokens);
-                    if (generatedTokens.Count > 1)
-                    {
-                        string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                        piece = piece.Substring(prev.Length);
-                    }
-
-                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                    {
-                        string decoded = _model.Tokenizer.Decode(generatedTokens);
-                        var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                        if (shouldStop) break;
-                    }
-
-                    yield return (piece, false, 0, 0, 0, 0, 0);
-                    logits = _model.Forward(new[] { nextToken });
+                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
+                    piece = piece.Substring(prev.Length);
                 }
 
-                long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-                long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                {
+                    string decoded = _model.Tokenizer.Decode(generatedTokens);
+                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
+                    if (shouldStop) break;
+                }
 
-                yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
+                yield return (piece, false, 0, 0, 0, 0, 0);
+                logits = _model.Forward(new[] { nextToken });
             }
-            finally
-            {
-                _inferenceLock.Release();
-            }
+
+            long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+            long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+
+            yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
         }
 
         public List<string> ScanModels(string directory)
@@ -501,7 +501,6 @@ namespace InferenceWeb
         {
             _model?.Dispose();
             _model = null;
-            _inferenceLock.Dispose();
         }
     }
 }
