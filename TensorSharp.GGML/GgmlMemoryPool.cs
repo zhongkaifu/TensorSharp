@@ -15,15 +15,15 @@ using System.Threading;
 namespace TensorSharp.GGML
 {
     /// <summary>
-    /// Memory pool for GGML Metal backend. Reuses allocations to reduce allocator overhead.
-    /// On macOS, uses page-aligned blocks for Metal shared memory (zero-copy).
-    /// Apple Silicon uses 16KB pages; Intel Macs use 4KB. We use 16KB on macOS for optimal
-    /// Metal buffer_from_host_ptr compatibility (required for zero-copy).
+    /// Memory pool for GGML allocations. Reuses allocations to reduce allocator overhead.
+    /// GGML host-ptr buffers require aligned addresses, so use aligned allocations on every
+    /// platform: 16KB on macOS for Metal shared memory, 32 bytes elsewhere for GGML CPU.
     /// </summary>
     internal sealed class GgmlMemoryPool
     {
         /// <summary>16KB - Apple Silicon page size; required for Metal newBufferWithBytesNoCopy.</summary>
         private const int MetalPageSize = 16 * 1024;
+        private const int GgmlHostPtrAlignment = 32;
         private const int BlockSize = 32 * 1024 * 1024; // 32 MB per block
         private const int InitialBlockCount = 4;
         private const int MaxPooledBlocks = 64;
@@ -35,9 +35,8 @@ namespace TensorSharp.GGML
 
         public GgmlMemoryPool()
         {
-            _useAlignedAlloc = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
-            // Apple Silicon uses 16KB pages; use MetalPageSize on macOS for zero-copy compatibility
-            _pageSize = _useAlignedAlloc ? MetalPageSize : 4096;
+            _useAlignedAlloc = true;
+            _pageSize = RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? MetalPageSize : GgmlHostPtrAlignment;
         }
 
         public IntPtr Allocate(long byteLength)

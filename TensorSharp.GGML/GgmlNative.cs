@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -938,13 +939,21 @@ internal enum GgmlIndexReductionOp
         private static IEnumerable<string> GetCandidatePaths(Assembly assembly)
         {
             string baseDirectory = AppContext.BaseDirectory;
-            yield return Path.Combine(baseDirectory, "libGgmlOps.dylib");
-            yield return Path.Combine(Path.GetDirectoryName(assembly.Location) ?? baseDirectory, "libGgmlOps.dylib");
+            string assemblyDirectory = Path.GetDirectoryName(assembly.Location) ?? baseDirectory;
+
+            foreach (string fileName in GetCandidateFileNames())
+            {
+                yield return Path.Combine(baseDirectory, fileName);
+                yield return Path.Combine(assemblyDirectory, fileName);
+            }
 
             foreach (string root in EnumerateRepoRoots(baseDirectory))
             {
-                yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "libGgmlOps.dylib");
-                yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", "libGgmlOps.dylib");
+                foreach (string fileName in GetCandidateFileNames())
+                {
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", fileName);
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", fileName);
+                }
             }
         }
 
@@ -953,13 +962,33 @@ internal enum GgmlIndexReductionOp
             DirectoryInfo current = new DirectoryInfo(startDirectory);
             while (current != null)
             {
-                if (File.Exists(Path.Combine(current.FullName, "Seq2SeqSharp.sln")))
+                if (IsRepoRoot(current.FullName))
                 {
                     yield return current.FullName;
                 }
 
                 current = current.Parent;
             }
+        }
+
+        private static IEnumerable<string> GetCandidateFileNames()
+        {
+            yield return OperatingSystem.IsWindows() ? "GgmlOps.dll" :
+                OperatingSystem.IsMacOS() ? "libGgmlOps.dylib" :
+                "libGgmlOps.so";
+        }
+
+        private static bool IsRepoRoot(string path)
+        {
+            string[] markers =
+            {
+                "TensorSharp.slnx",
+                "TensorSharp.sln",
+                "Seq2SeqSharp.sln",
+            };
+
+            return markers.Any(marker => File.Exists(Path.Combine(path, marker)))
+                || Directory.Exists(Path.Combine(path, ".git"));
         }
 
         private static string GetLastErrorMessage(string fallback)
