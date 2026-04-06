@@ -23,7 +23,12 @@ namespace TensorSharp.GGML
             this.deviceId = deviceId;
         }
 
-        public BlasEnum BlasEnum => context.BackendType == GgmlBackendType.Metal ? BlasEnum.GGML_METAL : BlasEnum.GGML_CPU;
+        public BlasEnum BlasEnum => context.BackendType switch
+        {
+            GgmlBackendType.Metal => BlasEnum.GGML_METAL,
+            GgmlBackendType.Cuda => BlasEnum.CUDA,
+            _ => BlasEnum.GGML_CPU,
+        };
 
         public int DeviceId => deviceId;
 

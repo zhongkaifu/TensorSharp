@@ -24,6 +24,7 @@ namespace InferenceEngine
         Cpu,
         GgmlCpu,
         GgmlMetal,
+        GgmlCuda,
     }
 
     public class ModelConfig
@@ -124,6 +125,10 @@ namespace InferenceEngine
                     _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Metal);
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
+                case BackendType.GgmlCuda:
+                    _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Cuda);
+                    _allocator = new GgmlAllocator(_ggmlContext, 0);
+                    break;
                 case BackendType.Cpu:
                     _allocator = new CpuAllocator(BlasEnum.DotNet);
                     break;
@@ -135,7 +140,7 @@ namespace InferenceEngine
             _gguf = new GgufFile(ggufPath);
         }
 
-        protected bool IsGgmlBackend => _backend == BackendType.GgmlCpu || _backend == BackendType.GgmlMetal;
+        protected bool IsGgmlBackend => _backend == BackendType.GgmlCpu || _backend == BackendType.GgmlMetal || _backend == BackendType.GgmlCuda;
 
         protected void ParseBaseConfig()
         {

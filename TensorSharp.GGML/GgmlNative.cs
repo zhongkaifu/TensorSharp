@@ -20,6 +20,7 @@ public enum GgmlBackendType
 {
     Metal = 1,
     Cpu = 2,
+    Cuda = 3,
 }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -532,7 +533,12 @@ internal enum GgmlIndexReductionOp
             {
                 if (TSGgml_IsBackendAvailable((int)backendType) == 0)
                 {
-                    string backendName = backendType == GgmlBackendType.Metal ? "ggml-metal" : "ggml-cpu";
+                    string backendName = backendType switch
+                    {
+                        GgmlBackendType.Metal => "ggml-metal",
+                        GgmlBackendType.Cuda => "ggml-cuda",
+                        _ => "ggml-cpu",
+                    };
                     throw new InvalidOperationException($"Failed to initialize {backendName}. {GetLastErrorMessage("Build the native GGML bridge and ensure the requested GGML backend is available.")}");
                 }
             }
@@ -938,13 +944,32 @@ internal enum GgmlIndexReductionOp
         private static IEnumerable<string> GetCandidatePaths(Assembly assembly)
         {
             string baseDirectory = AppContext.BaseDirectory;
-            yield return Path.Combine(baseDirectory, "libGgmlOps.dylib");
-            yield return Path.Combine(Path.GetDirectoryName(assembly.Location) ?? baseDirectory, "libGgmlOps.dylib");
-
-            foreach (string root in EnumerateRepoRoots(baseDirectory))
+            foreach (string nativeLibraryName in GetNativeLibraryFileNames())
             {
-                yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "libGgmlOps.dylib");
-                yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", "libGgmlOps.dylib");
+                yield return Path.Combine(baseDirectory, nativeLibraryName);
+                yield return Path.Combine(Path.GetDirectoryName(assembly.Location) ?? baseDirectory, nativeLibraryName);
+
+                foreach (string root in EnumerateRepoRoots(baseDirectory))
+                {
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", nativeLibraryName);
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", nativeLibraryName);
+                }
+            }
+        }
+
+        private static IEnumerable<string> GetNativeLibraryFileNames()
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                yield return "GgmlOps.dll";
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                yield return "libGgmlOps.dylib";
+            }
+            else
+            {
+                yield return "libGgmlOps.so";
             }
         }
 
