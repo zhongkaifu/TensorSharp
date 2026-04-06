@@ -171,6 +171,10 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
 
     string switchModel = body.TryGetProperty("model", out var modelEl) ? modelEl.GetString() : null;
     string switchBackend = body.TryGetProperty("backend", out var beEl) ? beEl.GetString() : null;
+    bool newChat = body.TryGetProperty("newChat", out var ncProp) && ncProp.GetBoolean();
+
+    if (newChat)
+        svc.InvalidateKVCache();
 
     if (string.IsNullOrEmpty(switchModel) && !svc.IsLoaded)
     {

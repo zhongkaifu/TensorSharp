@@ -598,6 +598,7 @@ let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
 let availableModels = [];
+let needsCacheReset = false;
 
 messageInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -717,6 +718,7 @@ function clearChat() {
   pendingAttachments = [];
   attachmentsDiv.innerHTML = '';
   chatContainer.innerHTML = '';
+  needsCacheReset = true;
   if (!statusBadge.classList.contains('loaded')) {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
@@ -835,6 +837,10 @@ async function sendMessage() {
     if (selectedModel) chatPayload.model = selectedModel;
     const backendSel = document.getElementById('backend-select');
     if (backendSel) chatPayload.backend = backendSel.value;
+    if (needsCacheReset) {
+      chatPayload.newChat = true;
+      needsCacheReset = false;
+    }
 
     const res = await fetch('/api/chat', {
       method: 'POST',

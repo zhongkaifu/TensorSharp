@@ -28,6 +28,9 @@ namespace InferenceWeb
         private string _loadedMmProjPath;
         private BackendType _backend;
 
+        private string _cachedRenderedText;
+        private string _cachedResponseText;
+
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
@@ -42,6 +45,13 @@ namespace InferenceWeb
             return _model != null && string.Equals(LoadedModelName, modelName, StringComparison.OrdinalIgnoreCase);
         }
 
+        public void InvalidateKVCache()
+        {
+            _cachedRenderedText = null;
+            _cachedResponseText = null;
+            _model?.ResetKVCache();
+        }
+
         /// <summary>
         /// Load a model. Must be called within the InferenceQueue to prevent concurrent access.
         /// </summary>
@@ -51,6 +61,8 @@ namespace InferenceWeb
             _model = null;
             _loadedModelPath = null;
             _loadedMmProjPath = null;
+            _cachedRenderedText = null;
+            _cachedResponseText = null;
 
             _backend = backendStr switch
             {
@@ -118,6 +130,7 @@ namespace InferenceWeb
 
         /// <summary>
         /// Stream chat inference tokens. Must be called within the InferenceQueue to prevent concurrent access.
+        /// Reuses the KV cache from the previous turn when the rendered text prefix matches.
         /// </summary>
         public async IAsyncEnumerable<string> ChatStreamAsync(
             List<ChatMessage> history,
@@ -131,16 +144,28 @@ namespace InferenceWeb
                 _model.Config.ChatTemplate, history, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
-            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-
             var lastMsg = history.LastOrDefault(m => m.Role == "user");
-            if (lastMsg != null)
-                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+            bool hasMultimodal = HasMultimodalContent(lastMsg);
 
-            _model.ResetKVCache();
-            float[] logits = _model.Forward(inputTokens.ToArray());
+            float[] logits;
+            if (!hasMultimodal && TryGetCacheSuffix(rendered, out string suffixText))
+            {
+                var suffixTokens = _model.Tokenizer.Encode(suffixText, addSpecial: false);
+                Console.WriteLine($"[KV cache] Reusing cache, forwarding {suffixTokens.Count} new tokens");
+                logits = _model.Forward(suffixTokens.ToArray());
+            }
+            else
+            {
+                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+                if (lastMsg != null)
+                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+                if (_cachedRenderedText != null)
+                    Console.WriteLine("[KV cache] Reset (text mismatch or multimodal)");
+                _model.ResetKVCache();
+                logits = _model.Forward(inputTokens.ToArray());
+            }
+
             var generatedTokens = new List<int>();
-
             var cfg = samplingConfig ?? SamplingConfig.Greedy;
             var sampler = new TokenSampler(cfg);
 
@@ -173,6 +198,9 @@ namespace InferenceWeb
 
                 logits = _model.Forward(new[] { nextToken });
             }
+
+            _cachedRenderedText = rendered;
+            _cachedResponseText = _model.Tokenizer.Decode(generatedTokens);
         }
 
         private List<int> ProcessMultimodal(ChatMessage msg, List<int> inputTokens, string arch)
@@ -379,7 +407,7 @@ namespace InferenceWeb
             if (lastMsg.ImagePaths != null && lastMsg.ImagePaths.Count > 0)
                 inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
 
-            _model.ResetKVCache();
+            InvalidateKVCache();
 
             var sw = Stopwatch.StartNew();
             float[] logits = _model.Forward(inputTokens.ToArray());
@@ -425,6 +453,7 @@ namespace InferenceWeb
 
         /// <summary>
         /// Stream chat inference tokens with timing metrics. Must be called within the InferenceQueue.
+        /// Reuses the KV cache from the previous turn when the rendered text prefix matches.
         /// </summary>
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
             ChatStreamWithMetricsAsync(
@@ -439,17 +468,33 @@ namespace InferenceWeb
                 _model.Config.ChatTemplate, history, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
-            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             var lastMsg = history.LastOrDefault(m => m.Role == "user");
-            if (lastMsg != null)
-                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+            bool hasMultimodal = HasMultimodalContent(lastMsg);
 
-            _model.ResetKVCache();
-
+            int promptTokenCount;
             var sw = Stopwatch.StartNew();
-            float[] logits = _model.Forward(inputTokens.ToArray());
+            float[] logits;
+
+            if (!hasMultimodal && TryGetCacheSuffix(rendered, out string suffixText))
+            {
+                var suffixTokens = _model.Tokenizer.Encode(suffixText, addSpecial: false);
+                Console.WriteLine($"[KV cache] Reusing cache, forwarding {suffixTokens.Count} new tokens");
+                logits = _model.Forward(suffixTokens.ToArray());
+                promptTokenCount = suffixTokens.Count;
+            }
+            else
+            {
+                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+                if (lastMsg != null)
+                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+                if (_cachedRenderedText != null)
+                    Console.WriteLine("[KV cache] Reset (text mismatch or multimodal)");
+                _model.ResetKVCache();
+                logits = _model.Forward(inputTokens.ToArray());
+                promptTokenCount = inputTokens.Count;
+            }
+
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-            int promptTokenCount = inputTokens.Count;
 
             var cfg = samplingConfig ?? SamplingConfig.Greedy;
             var sampler = new TokenSampler(cfg);
@@ -485,7 +530,39 @@ namespace InferenceWeb
             long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
 
+            _cachedRenderedText = rendered;
+            _cachedResponseText = _model.Tokenizer.Decode(generatedTokens);
+
             yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
+        }
+
+        /// <summary>
+        /// Check if the new rendered prompt starts with the cached rendered text + generated response.
+        /// If so, extract the suffix that needs to be tokenized and forwarded.
+        /// The suffix always begins at a special token boundary (e.g. end-of-turn marker),
+        /// ensuring independent tokenization is correct.
+        /// </summary>
+        private bool TryGetCacheSuffix(string rendered, out string suffixText)
+        {
+            suffixText = null;
+            if (_cachedRenderedText == null || _cachedResponseText == null)
+                return false;
+
+            string expectedPrefix = _cachedRenderedText + _cachedResponseText;
+            if (rendered.Length > expectedPrefix.Length && rendered.StartsWith(expectedPrefix, StringComparison.Ordinal))
+            {
+                suffixText = rendered.Substring(expectedPrefix.Length);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool HasMultimodalContent(ChatMessage msg)
+        {
+            if (msg == null) return false;
+            return (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
+                   (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
         }
 
         public List<string> ScanModels(string directory)
