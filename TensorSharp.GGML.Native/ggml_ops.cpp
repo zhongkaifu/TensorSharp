@@ -1365,7 +1365,16 @@ namespace
         {
             ggml_backend_buffer_t buf = nullptr;
             if (!create_binding_from_host_ptr_2d(context.value, g_backend, m1_desc, m1_binding, buf))
+            {
+                // Zero-copy requires both result and m1 bindings to succeed.
+                // If m1 cannot be host-mapped (e.g., alignment constraints), fall back both tensors
+                // to regular backend-managed buffers to keep upload/download logic consistent.
                 use_zero_copy = false;
+                result_binding = create_standard_binding(context.value, result_desc);
+                m1_binding = can_map_standard_view(m1_desc)
+                    ? create_standard_binding(context.value, m1_desc)
+                    : create_packed_standard_binding(context.value, m1_desc, packed_m1);
+            }
             else
                 host_ptr_buffers.emplace_back(buf);
         }
