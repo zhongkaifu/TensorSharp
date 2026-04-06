@@ -25,12 +25,26 @@
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />
     <ProjectReference Include="..\TensorSharp\TensorSharp.csproj" />
   </ItemGroup>
-  <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('OSX')) And !Exists('$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib')">
-    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-macos.sh&quot;" />
+
+  <PropertyGroup>
+    <GgmlNativeProjectDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native</GgmlNativeProjectDir>
+    <GgmlNativeBuildPlatform Condition="'$(Platform)' != '' and '$(Platform)' != 'AnyCPU'">$(Platform)</GgmlNativeBuildPlatform>
+    <GgmlNativeBuildPlatform Condition="'$(GgmlNativeBuildPlatform)' == ''">x64</GgmlNativeBuildPlatform>
+    <GgmlNativeLibraryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeLibraryName>
+    <GgmlNativeLibraryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeLibraryName>
+  </PropertyGroup>
+
+  <Target Name="BuildGgmlNativeMac" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('OSX')) And !Exists('$(GgmlNativeProjectDir)/build/$(GgmlNativeLibraryName)')">
+    <Exec Command="bash &quot;$(GgmlNativeProjectDir)/build-macos.sh&quot;" />
   </Target>
-  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+
+  <Target Name="BuildGgmlNativeLinux" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('Linux')) And !Exists('$(GgmlNativeProjectDir)/build/$(GgmlNativeLibraryName)')">
+    <Exec Command="bash &quot;$(GgmlNativeProjectDir)/build-linux.sh&quot; --platform &quot;$(GgmlNativeBuildPlatform)&quot;" />
+  </Target>
+
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeLibraryName)' != '' And Exists('$(GgmlNativeProjectDir)/build/$(GgmlNativeLibraryName)')">
     <ItemGroup>
-      <GgmlNativeBinary Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib" />
+      <GgmlNativeBinary Include="$(GgmlNativeProjectDir)/build/$(GgmlNativeLibraryName)" />
     </ItemGroup>
     <Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
