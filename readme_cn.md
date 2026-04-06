@@ -105,6 +105,16 @@ bash build-macos.sh
 
 该过程会编译带 Metal GPU 支持的 `libGgmlOps.dylib`。构建产物会自动复制到应用输出目录。
 
+### 构建原生 GGML 库（Linux）
+
+Linux 脚本会编译 CPU-only 的 `libGgmlOps.so`：
+
+```bash
+cd TensorSharp.GGML.Native
+bash build-linux.sh
+```
+
+
 ## 使用方法
 
 ### 控制台应用

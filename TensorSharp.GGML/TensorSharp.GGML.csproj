@@ -28,10 +28,19 @@
   <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('OSX')) And !Exists('$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib')">
     <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-macos.sh&quot;" />
   </Target>
+  <Target Name="BuildGgmlNativeLinux" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('Linux')) And !Exists('$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-linux/libGgmlOps.so')">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-linux.sh&quot;" />
+  </Target>
   <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
     <ItemGroup>
       <GgmlNativeBinary Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib" />
     </ItemGroup>
     <Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyGgmlNativeBinaryLinux" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <ItemGroup>
+      <GgmlNativeBinaryLinux Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-linux/libGgmlOps.so" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GgmlNativeBinaryLinux)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
 </Project>
