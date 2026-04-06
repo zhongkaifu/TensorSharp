@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(GgmlOps LANGUAGES C CXX OBJC OBJCXX)
+project(GgmlOps LANGUAGES C CXX)
+option(TENSORSHARP_GGML_NATIVE_BUILD_TESTS "Build TensorSharp GGML native regression tests" OFF)
+
+if (APPLE)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -19,9 +25,9 @@ add_compile_definitions(GGML_VERSION=\"0.0.0\" GGML_COMMIT=\"unknown\")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CPU ON CACHE BOOL "" FORCE)
-set(GGML_METAL ON CACHE BOOL "" FORCE)
-set(GGML_METAL_NDEBUG ON CACHE BOOL "" FORCE)
-set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+set(GGML_METAL_NDEBUG OFF CACHE BOOL "" FORCE)
+set(GGML_METAL_EMBED_LIBRARY OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_HIP OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
@@ -39,6 +45,12 @@ set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 
+if (APPLE)
+    set(GGML_METAL ON CACHE BOOL "" FORCE)
+    set(GGML_METAL_NDEBUG ON CACHE BOOL "" FORCE)
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src" ggml-build)
 
 add_library(GgmlOps SHARED ggml_ops.cpp)
@@ -48,6 +60,18 @@ target_include_directories(GgmlOps PRIVATE
 )
 target_link_libraries(GgmlOps PRIVATE ggml)
 
+if (APPLE)
+    target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_METAL=1)
+endif()
+
 set_target_properties(GgmlOps PROPERTIES
     OUTPUT_NAME GgmlOps
 )
+
+if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    add_executable(GgmlOpsGetRowsQuantTest tests/get_rows_quant_test.cpp)
+    target_include_directories(GgmlOpsGetRowsQuantTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+    )
+    target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
+endif()

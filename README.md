@@ -94,16 +94,27 @@ dotnet build InferenceConsole/InferenceConsole.csproj
 dotnet build InferenceWeb/InferenceWeb.csproj
 ```
 
-### Build the native GGML library (macOS)
+### Build the native GGML library
 
 The native library is built automatically during the first `dotnet build` if it doesn't exist. To build it manually:
 
 ```bash
 cd TensorSharp.GGML.Native
+```
+
+macOS:
+
+```bash
 bash build-macos.sh
 ```
 
-This compiles `libGgmlOps.dylib` with Metal GPU support. The build output is automatically copied to the application's output directory.
+Linux:
+
+```bash
+bash build-linux.sh
+```
+
+On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux it compiles `libGgmlOps.so` with the GGML CPU backend. The build output is automatically copied to the application's output directory.
 
 ## Usage
 
