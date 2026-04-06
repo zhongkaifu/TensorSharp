@@ -875,6 +875,36 @@ namespace
         ggml_backend_tensor_set(binding.storage, data, 0, size);
     }
 
+    bool is_pointer_aligned_for_backend(ggml_backend_t backend, const void* ptr)
+    {
+        if (backend == nullptr || ptr == nullptr)
+            return false;
+        std::size_t alignment = ggml_backend_get_alignment(backend);
+        if (alignment == 0)
+            alignment = GGML_MEM_ALIGN;
+        return (reinterpret_cast<std::uintptr_t>(ptr) % alignment) == 0;
+    }
+
+    bool try_create_host_ptr_buffer(
+        ggml_backend_t backend,
+        ggml_backend_dev_t dev,
+        void* data,
+        std::size_t raw_bytes,
+        ggml_backend_buffer_t& out_buffer)
+    {
+        out_buffer = nullptr;
+        if (backend == nullptr || dev == nullptr || data == nullptr || raw_bytes == 0)
+            return false;
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!props.caps.buffer_from_host_ptr)
+            return false;
+        if (!is_pointer_aligned_for_backend(backend, data))
+            return false;
+        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, data, raw_bytes, raw_bytes);
+        return out_buffer != nullptr;
+    }
+
     // Create a binding that uses host ptr directly as Metal shared memory (zero host-device copies on Apple Silicon).
     // Returns empty binding on failure. Caller must keep buffer_handle alive until compute completes.
     bool create_binding_from_host_ptr_2d(
@@ -886,13 +916,9 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.raw_bytes);
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, raw_bytes / static_cast<std::int64_t>(sizeof(float)));
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -917,13 +943,9 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.raw_bytes);
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, raw_bytes / static_cast<std::int64_t>(sizeof(float)));
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -947,13 +969,9 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.raw_bytes);
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, raw_bytes / static_cast<std::int64_t>(sizeof(float)));
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -979,13 +997,9 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.raw_bytes);
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, raw_bytes / static_cast<std::int64_t>(sizeof(float)));
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -1011,13 +1025,9 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.raw_bytes);
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, raw_bytes / static_cast<std::int64_t>(sizeof(float)));
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -1044,15 +1054,11 @@ namespace
     {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == nullptr) return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr) return false;
 
         std::size_t raw_bytes = static_cast<std::size_t>(desc.element_count) * sizeof(float);
         if (raw_bytes == 0) return false;
 
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, desc.data, raw_bytes, raw_bytes);
-        if (out_buffer == nullptr) return false;
+        if (!try_create_host_ptr_buffer(backend, dev, desc.data, raw_bytes, out_buffer)) return false;
 
         ggml_tensor* base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, desc.element_count);
         if (base == nullptr) { ggml_backend_buffer_free(out_buffer); out_buffer = nullptr; return false; }
@@ -1399,9 +1405,12 @@ namespace
                     }
                     else
                     {
-                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, m2_quant.data,
-                                static_cast<std::size_t>(m2_quant.raw_bytes),
-                                static_cast<std::size_t>(m2_quant.raw_bytes));
+                        (void)try_create_host_ptr_buffer(
+                            g_backend,
+                            dev,
+                            m2_quant.data,
+                            static_cast<std::size_t>(m2_quant.raw_bytes),
+                            buf);
                         if (buf != nullptr)
                             g_host_buffer_cache[m2_quant.data] = {buf, static_cast<std::size_t>(m2_quant.raw_bytes)};
                     }
@@ -1558,9 +1567,12 @@ namespace
                     }
                     else
                     {
-                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, src_quant.data,
-                                static_cast<std::size_t>(src_quant.raw_bytes),
-                                static_cast<std::size_t>(src_quant.raw_bytes));
+                        (void)try_create_host_ptr_buffer(
+                            g_backend,
+                            dev,
+                            src_quant.data,
+                            static_cast<std::size_t>(src_quant.raw_bytes),
+                            buf);
                         if (buf != nullptr)
                             g_host_buffer_cache[src_quant.data] = {buf, static_cast<std::size_t>(src_quant.raw_bytes)};
                     }
@@ -7018,14 +7030,14 @@ namespace
                     }
                     else
                     {
-                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                        (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                         if (buf != nullptr)
                             g_host_buffer_cache[data] = {buf, bytes};
                     }
                 }
                 else
                 {
-                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                    (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                     if (buf != nullptr)
                         ephemeral_bufs.emplace_back(buf);
                 }
@@ -7393,14 +7405,14 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
                         buf = it->second.buffer;
                     else
                     {
-                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                        (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                         if (buf != nullptr)
                             g_host_buffer_cache[data] = {buf, bytes};
                     }
                 }
                 else
                 {
-                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                    (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                     if (buf != nullptr)
                         ephemeral_bufs.emplace_back(buf);
                 }
@@ -7987,14 +7999,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                         buf = it->second.buffer;
                     else
                     {
-                        buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                        (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                         if (buf != nullptr)
                             g_host_buffer_cache[data] = {buf, bytes};
                     }
                 }
                 else
                 {
-                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
+                    (void)try_create_host_ptr_buffer(g_backend, dev, data, bytes, buf);
                     if (buf != nullptr)
                         ephemeral_bufs.emplace_back(buf);
                 }
