@@ -43,6 +43,7 @@ extern "C" {
 namespace
 {
     constexpr int BackendTypeCpu = 2;
+    constexpr int BackendTypeCuda = 3;
     constexpr int TensorSharpDTypeI32 = 3;
 
     struct AlignedBuffer
@@ -150,12 +151,34 @@ namespace
     }
 }
 
-int main()
+int main(int argc, char** argv)
 {
-    if (TSGgml_IsBackendAvailable(BackendTypeCpu) == 0)
+    int backendType = BackendTypeCpu;
+    std::string backendName = "GGML CPU";
+
+    if (argc >= 2)
+    {
+        std::string arg = argv[1];
+        if (arg == "cpu" || arg == "ggml_cpu")
+        {
+            backendType = BackendTypeCpu;
+            backendName = "GGML CPU";
+        }
+        else if (arg == "cuda" || arg == "ggml_cuda")
+        {
+            backendType = BackendTypeCuda;
+            backendName = "GGML CUDA";
+        }
+        else
+        {
+            fail("Unknown backend argument. Use cpu or cuda.");
+        }
+    }
+
+    if (TSGgml_IsBackendAvailable(backendType) == 0)
     {
         const char* err = TSGgml_GetLastError();
-        fail(std::string("Failed to initialize GGML CPU backend: ") + (err != nullptr ? err : "<null>"));
+        fail("Failed to initialize " + backendName + " backend: " + (err != nullptr ? err : "<null>"));
     }
 
     constexpr int rows = 32;
@@ -184,6 +207,6 @@ int main()
     run_case("unaligned source buffer", aligned_result.ptr, unaligned_source, rows, cols, indices);
     run_case("unaligned source and result buffers", unaligned_result, unaligned_source, rows, cols, indices);
 
-    std::cout << "GgmlOpsGetRowsQuantTest passed" << std::endl;
+    std::cout << "GgmlOpsGetRowsQuantTest passed (" << backendName << ")" << std::endl;
     return 0;
 }

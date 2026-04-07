@@ -68,6 +68,7 @@ namespace InferenceWeb
             {
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cpu" => BackendType.GgmlCpu,
+                "cuda" or "ggml_cuda" => BackendType.GgmlCuda,
                 "cpu" => BackendType.Cpu,
                 _ => BackendType.GgmlCpu
             };

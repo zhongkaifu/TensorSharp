@@ -179,7 +179,7 @@ namespace TensorSharp.GGML
 
         public override void SetElementsAsHalf(long index, half[] value)
         {
-            throw new NotSupportedException("The GGML Metal backend currently supports Float32 tensors only. Disable AMP to use this backend.");
+            throw new NotSupportedException("GGML backends currently support Float32 tensors only. Disable AMP to use this backend.");
         }
 
         public override void CopyToStorage(long storageIndex, IntPtr src, long byteCount)
