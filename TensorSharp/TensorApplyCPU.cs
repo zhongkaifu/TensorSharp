@@ -18,15 +18,18 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Buffers;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Xml;
+using System.Threading.Tasks;
 using TensorSharp.Cpu;
 
 namespace TensorSharp
 {
 	public class TensorApplyCPU
 	{
+        private const int ParallelWorkThreshold = 1 << 15;
 
         #region Tensor iteration methods
         unsafe public delegate void Apply1KernelFunction(float* x);
@@ -36,6 +39,81 @@ namespace TensorSharp
 		unsafe public delegate void Apply5KernelFunction(float* x, float* y, float* z, float* k, float* l);
 		unsafe public delegate void ApplyDim2KernelFuncton(float* x, long sizeX, long stridesX, float* y, long sizeY, long stridesY);
 		unsafe public delegate void ApplyDim3KernelFuncton(float* x, long sizeX, long stridesX, float* y, long sizeY, long stridesY, float* z, long sizeZ, long stridesZ);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe private static bool TryGetContiguousFloat(Tensor tensor, out float* ptr, out int length)
+        {
+            if (tensor.ElementType == DType.Float32 && tensor.IsContiguous() && tensor.ElementCount() <= int.MaxValue)
+            {
+                ptr = (float*)CpuNativeHelpers.GetBufferStart(tensor);
+                length = (int)tensor.ElementCount();
+                return true;
+            }
+
+            ptr = null;
+            length = 0;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe private static bool TryGetContiguousRows(Tensor tensor, out float* ptr, out int rows, out int cols)
+        {
+            if (tensor.ElementType == DType.Float32 && tensor.IsContiguous() && tensor.ElementCount() <= int.MaxValue && tensor.Sizes[^1] <= int.MaxValue)
+            {
+                cols = (int)tensor.Sizes[^1];
+                int elementCount = (int)tensor.ElementCount();
+                if (cols > 0 && elementCount % cols == 0)
+                {
+                    ptr = (float*)CpuNativeHelpers.GetBufferStart(tensor);
+                    rows = elementCount / cols;
+                    return true;
+                }
+            }
+
+            ptr = null;
+            rows = 0;
+            cols = 0;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool ShouldParallelize(int outerWork, int innerWork)
+        {
+            return outerWork > 1 && (long)outerWork * innerWork >= ParallelWorkThreshold;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe private static Vector<float> LoadVec(float* ptr)
+        {
+            return Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)ptr);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe private static void StoreVec(float* ptr, Vector<float> value)
+        {
+            Unsafe.WriteUnaligned(ref *(byte*)ptr, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe private static float DotContiguous(float* lhs, float* rhs, int length)
+        {
+            int vectorSize = Vector<float>.Count;
+            Vector<float> acc = Vector<float>.Zero;
+            int i = 0;
+
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                acc += LoadVec(lhs + i) * LoadVec(rhs + i);
+            }
+
+            float sum = Vector.Sum(acc);
+            for (; i < length; i++)
+            {
+                sum += lhs[i] * rhs[i];
+            }
+
+            return sum;
+        }
 
 		unsafe static void Apply1(Tensor tensor1, Apply1KernelFunction func)
 		{
@@ -268,6 +346,12 @@ namespace TensorSharp
 
 		unsafe public static void Fill(Tensor result, float value)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length))
+            {
+                new Span<float>(resultPtr, length).Fill(value);
+                return;
+            }
+
 			unsafe void func(float* r)
 			{
 				*r = value;
@@ -289,6 +373,28 @@ namespace TensorSharp
 
 		unsafe public static void Copy(Tensor result, Tensor src)
 		{
+            if (result.IsContiguous() && src.IsContiguous() &&
+                result.ElementType == src.ElementType &&
+                result.ElementCount() == src.ElementCount())
+            {
+                long byteCount = result.ElementCount() * result.ElementType.Size();
+                if (byteCount <= int.MaxValue)
+                {
+                    byte* srcBytes = (byte*)CpuNativeHelpers.GetBufferStart(src);
+                    byte* resultBytes = (byte*)CpuNativeHelpers.GetBufferStart(result);
+                    new ReadOnlySpan<byte>(srcBytes, (int)byteCount).CopyTo(new Span<byte>(resultBytes, (int)byteCount));
+                }
+                else
+                {
+                    Buffer.MemoryCopy(
+                        CpuNativeHelpers.GetBufferStart(src).ToPointer(),
+                        CpuNativeHelpers.GetBufferStart(result).ToPointer(),
+                        byteCount,
+                        byteCount);
+                }
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && src.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -385,6 +491,26 @@ namespace TensorSharp
 
 		unsafe public static void Add(Tensor result, Tensor lhs, Tensor rhs)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
+                TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
+                length == lhsLength && length == rhsLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(lhsPtr + i) + LoadVec(rhsPtr + i));
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = lhsPtr[i] + rhsPtr[i];
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -418,6 +544,26 @@ namespace TensorSharp
 
 		unsafe public static void Sub(Tensor result, Tensor lhs, Tensor rhs)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
+                TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
+                length == lhsLength && length == rhsLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(lhsPtr + i) - LoadVec(rhsPtr + i));
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = lhsPtr[i] - rhsPtr[i];
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -450,6 +596,26 @@ namespace TensorSharp
 
 		unsafe public static void Add(Tensor result, Tensor src, float value)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                Vector<float> vecValue = new Vector<float>(value);
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(srcPtr + i) + vecValue);
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = srcPtr[i] + value;
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && src.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -493,6 +659,26 @@ namespace TensorSharp
 
 		unsafe public static void RSub(Tensor result, float value, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                Vector<float> vecValue = new Vector<float>(value);
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, vecValue - LoadVec(srcPtr + i));
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = value - srcPtr[i];
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && src.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -526,6 +712,26 @@ namespace TensorSharp
 
 		unsafe public static void Mul(Tensor result, Tensor src, float value)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                Vector<float> vecValue = new Vector<float>(value);
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(srcPtr + i) * vecValue);
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = srcPtr[i] * value;
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && src.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -557,6 +763,26 @@ namespace TensorSharp
 
 		unsafe public static void Div(Tensor result, Tensor lhs, float rhs)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
+                length == lhsLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                Vector<float> vecValue = new Vector<float>(rhs);
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(lhsPtr + i) / vecValue);
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = lhsPtr[i] / rhs;
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -587,6 +813,26 @@ namespace TensorSharp
 
 		unsafe public static void Mul(Tensor result, Tensor lhs, Tensor rhs)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(lhs, out float* lhsPtr, out int lhsLength) &&
+                TryGetContiguousFloat(rhs, out float* rhsPtr, out int rhsLength) &&
+                length == lhsLength && length == rhsLength)
+            {
+                int simdWidth = Vector<float>.Count;
+                int i = 0;
+                for (; i <= length - simdWidth; i += simdWidth)
+                {
+                    StoreVec(resultPtr + i, LoadVec(lhsPtr + i) * LoadVec(rhsPtr + i));
+                }
+
+                for (; i < length; i++)
+                {
+                    resultPtr[i] = lhsPtr[i] * rhsPtr[i];
+                }
+
+                return;
+            }
+
 			int vectorSize = Vector<float>.Count;
 			if (result.Strides[^1] == 1 && lhs.Strides[^1] == 1 && rhs.Strides[^1] == 1 && result.Sizes[^1] % vectorSize == 0)
 			{
@@ -740,6 +986,18 @@ namespace TensorSharp
 
 		unsafe static public void Sigmoid(Tensor result, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = sigmoid(srcPtr[i]);
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* s)
 			{
 				*r = sigmoid(*s);
@@ -775,9 +1033,21 @@ namespace TensorSharp
 
 		unsafe static public void Tanh(Tensor result, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = MathF.Tanh(srcPtr[i]);
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* s)
 			{
-				*r = (float)Math.Tanh(*s);
+				*r = MathF.Tanh(*s);
 			};
 
 			Apply2(result, src, func);
@@ -786,9 +1056,21 @@ namespace TensorSharp
 
 		unsafe static public void Log(Tensor result, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = MathF.Log(srcPtr[i]);
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* s)
 			{
-				*r = (float)Math.Log(*s);
+				*r = MathF.Log(*s);
 			};
 
 			Apply2(result, src, func);
@@ -796,9 +1078,21 @@ namespace TensorSharp
 
         unsafe static public void Exp(Tensor result, Tensor src)
         {
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = MathF.Exp(srcPtr[i]);
+                }
+
+                return;
+            }
+
             unsafe void func(float* r, float* s)
             {
-                *r = (float)Math.Exp(*s);
+                *r = MathF.Exp(*s);
             };
 
             Apply2(result, src, func);
@@ -859,6 +1153,19 @@ namespace TensorSharp
 
 		unsafe static public void SiLU(Tensor result, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    float value = srcPtr[i];
+                    resultPtr[i] = value / (1.0f + MathF.Exp(-value));
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* s)
 			{
 				*r = SiLU(*s);
@@ -869,6 +1176,18 @@ namespace TensorSharp
 
 		unsafe static public void GELU(Tensor result, Tensor src)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
+                length == srcLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = GELU(srcPtr[i]);
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* s)
 			{
 				*r = GELU(*s);
@@ -878,6 +1197,19 @@ namespace TensorSharp
 
 		unsafe static public void GELUMul(Tensor result, Tensor gate, Tensor up)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
+                TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
+                length == gateLength && length == upLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = GELU(gatePtr[i]) * upPtr[i];
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* g, float* u)
 			{
 				*r = GELU(*g) * *u;
@@ -887,6 +1219,20 @@ namespace TensorSharp
 
 		unsafe static public void SiLUMul(Tensor result, Tensor gate, Tensor up)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
+                TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
+                length == gateLength && length == upLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    float gateValue = gatePtr[i];
+                    resultPtr[i] = (gateValue / (1.0f + MathF.Exp(-gateValue))) * upPtr[i];
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* g, float* u)
 			{
 				*r = SiLU(*g) * *u;
@@ -896,9 +1242,22 @@ namespace TensorSharp
 
 		unsafe static public void SigmoidMul(Tensor result, Tensor x, Tensor gate)
 		{
+            if (TryGetContiguousFloat(result, out float* resultPtr, out int length) &&
+                TryGetContiguousFloat(x, out float* xPtr, out int xLength) &&
+                TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
+                length == xLength && length == gateLength)
+            {
+                for (int i = 0; i < length; i++)
+                {
+                    resultPtr[i] = xPtr[i] * (1.0f / (1.0f + MathF.Exp(-gatePtr[i])));
+                }
+
+                return;
+            }
+
 			unsafe void func(float* r, float* a, float* b)
 			{
-				float sig = 1.0f / (1.0f + (float)Math.Exp(-*b));
+				float sig = 1.0f / (1.0f + MathF.Exp(-*b));
 				*r = *a * sig;
 			}
 			Apply3(result, x, gate, func);
@@ -1060,30 +1419,67 @@ namespace TensorSharp
 
 		unsafe static public void RepeatInterleave(float* dst, float* src, int sliceCount, int repeats, int sliceSize)
 		{
-			for (int i = 0; i < sliceCount; i++)
-			{
-				float* srcSlice = src + i * sliceSize;
-				for (int r = 0; r < repeats; r++)
-				{
-					float* dstSlice = dst + (i * repeats + r) * sliceSize;
-					Buffer.MemoryCopy(srcSlice, dstSlice, sliceSize * sizeof(float), sliceSize * sizeof(float));
-				}
-			}
+            long sliceBytes = (long)sliceSize * sizeof(float);
+
+            void CopySlice(int i)
+            {
+                float* srcSlice = src + i * sliceSize;
+                float* dstSlice = dst + i * repeats * sliceSize;
+                for (int r = 0; r < repeats; r++)
+                {
+                    Buffer.MemoryCopy(srcSlice, dstSlice + r * sliceSize, sliceBytes, sliceBytes);
+                }
+            }
+
+            if (ShouldParallelize(sliceCount, repeats * sliceSize))
+            {
+                Parallel.For(0, sliceCount, CopySlice);
+            }
+            else
+            {
+                for (int i = 0; i < sliceCount; i++)
+                {
+                    CopySlice(i);
+                }
+            }
 		}
 
 	unsafe static public void AddCausalMask(float* data, int totalRows, int cols, int seqLen, int startPos, float maskedValue)
 	{
-		for (int row = 0; row < totalRows; row++)
-		{
-			int t = row % seqLen;
-			int threshold = startPos + t;
-			int sStart = Math.Max(0, threshold + 1);
-			float* rowPtr = data + row * cols;
-			for (int s = sStart; s < cols; s++)
-			{
-				rowPtr[s] += maskedValue;
-			}
-		}
+        void MaskRow(int row)
+        {
+            int t = row % seqLen;
+            int threshold = startPos + t;
+            int sStart = Math.Max(0, threshold + 1);
+            if (sStart >= cols)
+            {
+                return;
+            }
+
+            float* rowPtr = data + row * cols;
+            if (float.IsNegativeInfinity(maskedValue))
+            {
+                new Span<float>(rowPtr + sStart, cols - sStart).Fill(float.NegativeInfinity);
+                return;
+            }
+
+            for (int s = sStart; s < cols; s++)
+            {
+                rowPtr[s] += maskedValue;
+            }
+        }
+
+        if (ShouldParallelize(totalRows, cols))
+        {
+            Parallel.For(0, totalRows, MaskRow);
+        }
+        else
+        {
+            for (int row = 0; row < totalRows; row++)
+            {
+                MaskRow(row);
+            }
+        }
 	}
 
 		unsafe static public void BuildTriMask(Tensor result, int rows, int cols, float value, float maskedValue)
@@ -1266,52 +1662,88 @@ namespace TensorSharp
             float* result = (float*)CpuNativeHelpers.GetBufferStart(tOut);
             float* src = (float*)CpuNativeHelpers.GetBufferStart(tIn);
             bool isNeoX = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+            int activeRopeDim = Math.Min(ropeDim, cols);
+            int pairCount = activeRopeDim / 2;
+            long rowBytes = (long)cols * sizeof(float);
 
-            for (int row = 0; row < rows; ++row)
+            if (pairCount <= 0)
             {
-                float* resultRow = result + row * cols;
-                float* srcRow = src + row * cols;
-
-                for (int i = 0; i < cols; ++i)
+                if (result != src)
                 {
-                    resultRow[i] = srcRow[i];
+                    Buffer.MemoryCopy(src, result, rowBytes * rows, rowBytes * rows);
                 }
 
-                int p = ReadPosition(positions, row);
-                if (isNeoX)
-                {
-                    int half = ropeDim / 2;
-                    for (int i = 0; i < half; ++i)
-                    {
-                        float theta = (float)Math.Pow(freqBase, -2.0 * i / ropeDim);
-                        float angle = theta * p * freqScale;
-                        float cosTheta = (float)Math.Cos(angle);
-                        float sinTheta = (float)Math.Sin(angle);
+                return;
+            }
 
-                        int leftIndex = i;
-                        int rightIndex = i + half;
-                        float left = srcRow[leftIndex];
-                        float right = srcRow[rightIndex];
-                        resultRow[leftIndex] = left * cosTheta - right * sinTheta;
-                        resultRow[rightIndex] = right * cosTheta + left * sinTheta;
+            float[] invFreqBuffer = ArrayPool<float>.Shared.Rent(pairCount);
+            try
+            {
+                for (int i = 0; i < pairCount; i++)
+                {
+                    invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim) * freqScale;
+                }
+
+                bool useIntPositions = positions.ElementType == DType.Int32;
+                int* positionInts = useIntPositions ? (int*)CpuNativeHelpers.GetBufferStart(positions) : null;
+                float* positionFloats = useIntPositions ? null : (float*)CpuNativeHelpers.GetBufferStart(positions);
+
+                void ApplyRow(int row)
+                {
+                    float* resultRow = result + row * cols;
+                    float* srcRow = src + row * cols;
+                    if (resultRow != srcRow)
+                    {
+                        Buffer.MemoryCopy(srcRow, resultRow, rowBytes, rowBytes);
                     }
+
+                    int position = useIntPositions ? positionInts[row] : (int)positionFloats[row];
+                    if (isNeoX)
+                    {
+                        int half = pairCount;
+                        for (int i = 0; i < half; ++i)
+                        {
+                            float angle = invFreqBuffer[i] * position;
+                            float cosTheta = MathF.Cos(angle);
+                            float sinTheta = MathF.Sin(angle);
+
+                            float left = srcRow[i];
+                            float right = srcRow[i + half];
+                            resultRow[i] = left * cosTheta - right * sinTheta;
+                            resultRow[i + half] = right * cosTheta + left * sinTheta;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0, pair = 0; i < pairCount; ++i, pair += 2)
+                        {
+                            float angle = invFreqBuffer[i] * position;
+                            float cosTheta = MathF.Cos(angle);
+                            float sinTheta = MathF.Sin(angle);
+
+                            float left = srcRow[pair];
+                            float right = srcRow[pair + 1];
+                            resultRow[pair] = left * cosTheta - right * sinTheta;
+                            resultRow[pair + 1] = right * cosTheta + left * sinTheta;
+                        }
+                    }
+                }
+
+                if (ShouldParallelize(rows, activeRopeDim))
+                {
+                    Parallel.For(0, rows, ApplyRow);
                 }
                 else
                 {
-                    for (int pair = 0; pair < ropeDim; pair += 2)
+                    for (int row = 0; row < rows; ++row)
                     {
-                        int i = pair / 2;
-                        float theta = (float)Math.Pow(freqBase, -2.0 * i / ropeDim);
-                        float angle = theta * p * freqScale;
-                        float cosTheta = (float)Math.Cos(angle);
-                        float sinTheta = (float)Math.Sin(angle);
-
-                        float left = srcRow[pair];
-                        float right = srcRow[pair + 1];
-                        resultRow[pair] = left * cosTheta - right * sinTheta;
-                        resultRow[pair + 1] = right * cosTheta + left * sinTheta;
+                        ApplyRow(row);
                     }
                 }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(invFreqBuffer);
             }
         }
 
@@ -1365,8 +1797,73 @@ namespace TensorSharp
 			return false;
         }
 
-        unsafe static public void Softmax(Tensor tOut, Tensor tIn, int rows, int cols)
+		unsafe static public void Softmax(Tensor tOut, Tensor tIn, int rows, int cols)
 		{
+            if (TryGetContiguousRows(tOut, out float* contiguousOut, out int outRows, out int outCols) &&
+                TryGetContiguousRows(tIn, out float* contiguousIn, out int inRows, out int inCols) &&
+                rows == outRows && rows == inRows && cols == outCols && cols == inCols)
+            {
+                void ComputeRow(int row)
+                {
+                    float* so = contiguousOut + row * cols;
+                    float* sp = contiguousIn + row * cols;
+
+                    int vectorSize = Vector<float>.Count;
+                    Vector<float> vecMax = new Vector<float>(float.NegativeInfinity);
+                    int i = 0;
+                    for (; i <= cols - vectorSize; i += vectorSize)
+                    {
+                        vecMax = Vector.Max(vecMax, LoadVec(sp + i));
+                    }
+
+                    float max = float.NegativeInfinity;
+                    for (int lane = 0; lane < vectorSize; lane++)
+                    {
+                        max = MathF.Max(max, vecMax[lane]);
+                    }
+
+                    for (; i < cols; ++i)
+                    {
+                        max = MathF.Max(max, sp[i]);
+                    }
+
+                    float sum = 0.0f;
+                    for (i = 0; i < cols; ++i)
+                    {
+                        float ex = MathF.Exp(sp[i] - max);
+                        so[i] = ex;
+                        sum += ex;
+                    }
+
+                    float invSum = 1.0f / sum;
+                    Vector<float> vecInvSum = new Vector<float>(invSum);
+                    i = 0;
+                    for (; i <= cols - vectorSize; i += vectorSize)
+                    {
+                        StoreVec(so + i, LoadVec(so + i) * vecInvSum);
+                    }
+
+                    for (; i < cols; i++)
+                    {
+                        so[i] *= invSum;
+                    }
+                }
+
+                if (ShouldParallelize(rows, cols))
+                {
+                    Parallel.For(0, rows, ComputeRow);
+                }
+                else
+                {
+                    for (int row = 0; row < rows; ++row)
+                    {
+                        ComputeRow(row);
+                    }
+                }
+
+                return;
+            }
+
 			float* pOut = (float*)CpuNativeHelpers.GetBufferStart(tOut);
 			float* pIn = (float*)CpuNativeHelpers.GetBufferStart(tIn);
 
@@ -1446,6 +1943,64 @@ namespace TensorSharp
 
 		unsafe static public void IndexSelect(Tensor result_, Tensor src_, Tensor indice_, int rows, int cols, bool isAdd)
 		{
+            if (TryGetContiguousRows(result_, out float* contiguousResult, out int resultRows, out int resultCols) &&
+                TryGetContiguousRows(src_, out float* contiguousSrc, out int srcRows, out int srcCols) &&
+                resultRows == rows && resultCols == cols && srcCols == cols &&
+                indice_.IsContiguous() && indice_.ElementCount() == rows)
+            {
+                void* contiguousIndice = (void*)CpuNativeHelpers.GetBufferStart(indice_);
+                bool contiguousInt32 = indice_.ElementType == DType.Int32;
+                long rowBytes = (long)cols * sizeof(float);
+
+                void CopyRow(int row)
+                {
+                    int srcIdx = contiguousInt32 ? ((int*)contiguousIndice)[row] : (int)((float*)contiguousIndice)[row];
+                    if (srcIdx < 0)
+                    {
+                        return;
+                    }
+
+                    if ((uint)srcIdx >= (uint)srcRows)
+                    {
+                        throw new IndexOutOfRangeException($"Invalid index in index_select. Idx = '{srcIdx}', srcRows = '{srcRows}'");
+                    }
+
+                    float* resultRow = contiguousResult + row * cols;
+                    float* srcRow = contiguousSrc + srcIdx * cols;
+                    if (!isAdd)
+                    {
+                        Buffer.MemoryCopy(srcRow, resultRow, rowBytes, rowBytes);
+                        return;
+                    }
+
+                    int vectorSize = Vector<float>.Count;
+                    int i = 0;
+                    for (; i <= cols - vectorSize; i += vectorSize)
+                    {
+                        StoreVec(resultRow + i, LoadVec(resultRow + i) + LoadVec(srcRow + i));
+                    }
+
+                    for (; i < cols; ++i)
+                    {
+                        resultRow[i] += srcRow[i];
+                    }
+                }
+
+                if (ShouldParallelize(rows, cols))
+                {
+                    Parallel.For(0, rows, CopyRow);
+                }
+                else
+                {
+                    for (int row = 0; row < rows; row++)
+                    {
+                        CopyRow(row);
+                    }
+                }
+
+                return;
+            }
+
 			float* result = (float*)CpuNativeHelpers.GetBufferStart(result_);
 			float* src = (float*)CpuNativeHelpers.GetBufferStart(src_);
 			void* indice = (void*)CpuNativeHelpers.GetBufferStart(indice_);
@@ -1598,6 +2153,83 @@ namespace TensorSharp
 			int rows,
 			int cols)
 		{
+            if (TryGetContiguousRows(out_, out float* contiguousOut, out int outRows, out int outCols) &&
+                TryGetContiguousRows(in_, out float* contiguousIn, out int inRows, out int inCols) &&
+                TryGetContiguousFloat(gamma_, out float* gammaPtr, out int gammaLength) &&
+                rows == outRows && rows == inRows && cols == outCols && cols == inCols && gammaLength == cols &&
+                (beta_ == null || (TryGetContiguousFloat(beta_, out _, out int betaLength) && betaLength == cols)))
+            {
+                float* betaPtr = beta_ != null ? (float*)CpuNativeHelpers.GetBufferStart(beta_) : null;
+                bool hasBiasFast = betaPtr != null;
+                float colsAsFloat = cols;
+                int vectorSize = Vector<float>.Count;
+
+                void ApplyRow(int row)
+                {
+                    float* yRow = contiguousOut + row * cols;
+                    float* xRow = contiguousIn + row * cols;
+
+                    Vector<float> acc = Vector<float>.Zero;
+                    int i = 0;
+                    for (; i <= cols - vectorSize; i += vectorSize)
+                    {
+                        Vector<float> vx = LoadVec(xRow + i);
+                        acc += vx * vx;
+                    }
+
+                    float sqSum = Vector.Sum(acc);
+                    for (; i < cols; i++)
+                    {
+                        sqSum += xRow[i] * xRow[i];
+                    }
+
+                    float invRms = 1.0f / MathF.Sqrt(sqSum / colsAsFloat + eps);
+                    Vector<float> vecInvRms = new Vector<float>(invRms);
+
+                    i = 0;
+                    if (hasBiasFast)
+                    {
+                        for (; i <= cols - vectorSize; i += vectorSize)
+                        {
+                            Vector<float> value = LoadVec(xRow + i) * vecInvRms * LoadVec(gammaPtr + i) + LoadVec(betaPtr + i);
+                            StoreVec(yRow + i, value);
+                        }
+
+                        for (; i < cols; i++)
+                        {
+                            yRow[i] = gammaPtr[i] * (xRow[i] * invRms) + betaPtr[i];
+                        }
+                    }
+                    else
+                    {
+                        for (; i <= cols - vectorSize; i += vectorSize)
+                        {
+                            Vector<float> value = LoadVec(xRow + i) * vecInvRms * LoadVec(gammaPtr + i);
+                            StoreVec(yRow + i, value);
+                        }
+
+                        for (; i < cols; i++)
+                        {
+                            yRow[i] = gammaPtr[i] * (xRow[i] * invRms);
+                        }
+                    }
+                }
+
+                if (ShouldParallelize(rows, cols))
+                {
+                    Parallel.For(0, rows, ApplyRow);
+                }
+                else
+                {
+                    for (int row = 0; row < rows; row++)
+                    {
+                        ApplyRow(row);
+                    }
+                }
+
+                return;
+            }
+
 			float* outPtr = (float*)CpuNativeHelpers.GetBufferStart(out_);
 			float* inPtr = (float*)CpuNativeHelpers.GetBufferStart(in_);
 			float* gamma = (float*)CpuNativeHelpers.GetBufferStart(gamma_);

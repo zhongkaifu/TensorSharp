@@ -19,8 +19,11 @@
 
 using AdvUtils;
 using System;
+using System.Numerics;
 using System.Reflection.Metadata;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using TensorSharp.Core;
 using TensorSharp.Cpu.LinearAlgebra;
 
@@ -75,6 +78,8 @@ namespace TensorSharp.Cpu
     {
         const string mklDllName = "mkl_rt.2.dll";
         internal const string mklDllNameLinux = "mkl_rt";
+        private const int ParallelWorkThreshold = 1 << 15;
+        private static readonly SGEMM ManagedSgemm = new SGEMM();
 
         static MatrixMultiplication()
         {
@@ -110,6 +115,329 @@ namespace TensorSharp.Cpu
             }
 
             return Transpose.ConjTrans;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool ShouldParallelize(int outerWork, int innerWork)
+        {
+            return outerWork > 1 && (long)outerWork * innerWork >= ParallelWorkThreshold;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool UsesManagedBlas(Tensor a, Tensor b, Tensor c)
+        {
+            return a.Allocator.BlasEnum != BlasEnum.MKL &&
+                   b.Allocator.BlasEnum != BlasEnum.MKL &&
+                   c.Allocator.BlasEnum != BlasEnum.MKL;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsRowMajorContiguous2D(Tensor tensor)
+        {
+            return tensor.DimensionCount == 2 &&
+                   tensor.ElementType == DType.Float32 &&
+                   tensor.Strides[1] == 1 &&
+                   tensor.Strides[0] == tensor.Sizes[1];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsColumnMajorContiguous2D(Tensor tensor)
+        {
+            return tensor.DimensionCount == 2 &&
+                   tensor.ElementType == DType.Float32 &&
+                   tensor.Strides[0] == 1 &&
+                   tensor.Strides[1] == tensor.Sizes[0];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsRowMajorContiguous3D(Tensor tensor)
+        {
+            return tensor.DimensionCount == 3 &&
+                   tensor.ElementType == DType.Float32 &&
+                   tensor.Strides[2] == 1 &&
+                   tensor.Strides[1] == tensor.Sizes[2] &&
+                   tensor.Strides[0] == tensor.Sizes[1] * tensor.Sizes[2];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsColumnMajorContiguous3D(Tensor tensor)
+        {
+            return tensor.DimensionCount == 3 &&
+                   tensor.ElementType == DType.Float32 &&
+                   tensor.Strides[1] == 1 &&
+                   tensor.Strides[2] == tensor.Sizes[1] &&
+                   tensor.Strides[0] == tensor.Sizes[1] * tensor.Sizes[2];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe Vector<float> LoadVec(float* ptr)
+        {
+            return Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)ptr);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void StoreVec(float* ptr, Vector<float> value)
+        {
+            Unsafe.WriteUnaligned(ref *(byte*)ptr, value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotContiguous(float* lhs, float* rhs, int length)
+        {
+            int vectorSize = Vector<float>.Count;
+            Vector<float> acc = Vector<float>.Zero;
+            int i = 0;
+
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                acc += LoadVec(lhs + i) * LoadVec(rhs + i);
+            }
+
+            float sum = Vector.Sum(acc);
+            for (; i < length; i++)
+            {
+                sum += lhs[i] * rhs[i];
+            }
+
+            return sum;
+        }
+
+        private static unsafe void ApplyBeta(float* row, int length, float beta)
+        {
+            if (beta == 1.0f)
+            {
+                return;
+            }
+
+            if (beta == 0.0f)
+            {
+                new Span<float>(row, length).Fill(0.0f);
+                return;
+            }
+
+            int vectorSize = Vector<float>.Count;
+            Vector<float> vecBeta = new Vector<float>(beta);
+            int i = 0;
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                StoreVec(row + i, LoadVec(row + i) * vecBeta);
+            }
+
+            for (; i < length; i++)
+            {
+                row[i] *= beta;
+            }
+        }
+
+        private static unsafe void ManagedGemmRowRowOne(float alpha, float* aRow, float* bBase, int bRowStride, float beta, float* cRow, int n, int k)
+        {
+            ApplyBeta(cRow, n, beta);
+            if (alpha == 0.0f)
+            {
+                return;
+            }
+
+            int vectorSize = Vector<float>.Count;
+            for (int kk = 0; kk < k; kk++)
+            {
+                float scaledA = alpha * aRow[kk];
+                if (scaledA == 0.0f)
+                {
+                    continue;
+                }
+
+                float* bRow = bBase + kk * bRowStride;
+                Vector<float> vecA = new Vector<float>(scaledA);
+                int j = 0;
+                for (; j <= n - vectorSize; j += vectorSize)
+                {
+                    StoreVec(cRow + j, LoadVec(cRow + j) + LoadVec(bRow + j) * vecA);
+                }
+
+                for (; j < n; j++)
+                {
+                    cRow[j] += scaledA * bRow[j];
+                }
+            }
+        }
+
+        private static unsafe void ManagedGemmRowColOne(float alpha, float* aRow, float* bBase, int bColStride, float beta, float* cRow, int n, int k)
+        {
+            if (alpha == 0.0f)
+            {
+                ApplyBeta(cRow, n, beta);
+                return;
+            }
+
+            for (int j = 0; j < n; j++)
+            {
+                float value = alpha * DotContiguous(aRow, bBase + j * bColStride, k);
+                cRow[j] = beta == 0.0f ? value : value + beta * cRow[j];
+            }
+        }
+
+        private static unsafe bool TryManagedGemm(float alpha, Tensor a, Tensor b, float beta, Tensor c)
+        {
+            if (!UsesManagedBlas(a, b, c) || !IsRowMajorContiguous2D(a) || !IsRowMajorContiguous2D(c))
+            {
+                return false;
+            }
+
+            float* aPtr = (float*)CpuNativeHelpers.GetBufferStart(a);
+            float* bPtr = (float*)CpuNativeHelpers.GetBufferStart(b);
+            float* cPtr = (float*)CpuNativeHelpers.GetBufferStart(c);
+            int m = (int)c.Sizes[0];
+            int n = (int)c.Sizes[1];
+            int k = (int)a.Sizes[1];
+            int aRowStride = (int)a.Strides[0];
+            int cRowStride = (int)c.Strides[0];
+
+            if (IsRowMajorContiguous2D(b))
+            {
+                int bRowStride = (int)b.Strides[0];
+
+                void ComputeRowRow(int row)
+                {
+                    ManagedGemmRowRowOne(alpha, aPtr + row * aRowStride, bPtr, bRowStride, beta, cPtr + row * cRowStride, n, k);
+                }
+
+                if (ShouldParallelize(m, n * k))
+                {
+                    Parallel.For(0, m, ComputeRowRow);
+                }
+                else
+                {
+                    for (int row = 0; row < m; row++)
+                    {
+                        ComputeRowRow(row);
+                    }
+                }
+
+                return true;
+            }
+
+            if (!IsColumnMajorContiguous2D(b))
+            {
+                return false;
+            }
+
+            int bColStride = (int)b.Strides[1];
+            if (m == 1 && ShouldParallelize(n, k))
+            {
+                float* aRow = aPtr;
+                float* cRow = cPtr;
+                void ComputeColumn(int col)
+                {
+                    float value = alpha * DotContiguous(aRow, bPtr + col * bColStride, k);
+                    cRow[col] = beta == 0.0f ? value : value + beta * cRow[col];
+                }
+
+                Parallel.For(0, n, ComputeColumn);
+                return true;
+            }
+
+            void ComputeRowCol(int row)
+            {
+                ManagedGemmRowColOne(alpha, aPtr + row * aRowStride, bPtr, bColStride, beta, cPtr + row * cRowStride, n, k);
+            }
+
+            if (ShouldParallelize(m, n * k))
+            {
+                Parallel.For(0, m, ComputeRowCol);
+            }
+            else
+            {
+                for (int row = 0; row < m; row++)
+                {
+                    ComputeRowCol(row);
+                }
+            }
+
+            return true;
+        }
+
+        private static unsafe bool TryManagedGemmBatch(float alpha, Tensor a, Tensor b, float beta, Tensor c)
+        {
+            if (!UsesManagedBlas(a, b, c) || !IsRowMajorContiguous3D(a) || !IsRowMajorContiguous3D(c))
+            {
+                return false;
+            }
+
+            float* aPtr = (float*)CpuNativeHelpers.GetBufferStart(a);
+            float* bPtr = (float*)CpuNativeHelpers.GetBufferStart(b);
+            float* cPtr = (float*)CpuNativeHelpers.GetBufferStart(c);
+            int batch = (int)c.Sizes[0];
+            int m = (int)c.Sizes[1];
+            int n = (int)c.Sizes[2];
+            int k = (int)a.Sizes[2];
+            int aBatchStride = (int)a.Strides[0];
+            int aRowStride = (int)a.Strides[1];
+            int cBatchStride = (int)c.Strides[0];
+            int cRowStride = (int)c.Strides[1];
+
+            if (IsRowMajorContiguous3D(b))
+            {
+                int bBatchStrideRow = (int)b.Strides[0];
+                int bRowStride = (int)b.Strides[1];
+
+                void ComputeBatchRowRow(int batchIndex)
+                {
+                    float* aBatch = aPtr + batchIndex * aBatchStride;
+                    float* bBatch = bPtr + batchIndex * bBatchStrideRow;
+                    float* cBatch = cPtr + batchIndex * cBatchStride;
+                    for (int row = 0; row < m; row++)
+                    {
+                        ManagedGemmRowRowOne(alpha, aBatch + row * aRowStride, bBatch, bRowStride, beta, cBatch + row * cRowStride, n, k);
+                    }
+                }
+
+                if (ShouldParallelize(batch, m * n * k))
+                {
+                    Parallel.For(0, batch, ComputeBatchRowRow);
+                }
+                else
+                {
+                    for (int batchIndex = 0; batchIndex < batch; batchIndex++)
+                    {
+                        ComputeBatchRowRow(batchIndex);
+                    }
+                }
+
+                return true;
+            }
+
+            if (!IsColumnMajorContiguous3D(b))
+            {
+                return false;
+            }
+
+            int bBatchStrideCol = (int)b.Strides[0];
+            int bColStride = (int)b.Strides[2];
+
+            void ComputeBatchRowCol(int batchIndex)
+            {
+                float* aBatch = aPtr + batchIndex * aBatchStride;
+                float* bBatch = bPtr + batchIndex * bBatchStrideCol;
+                float* cBatch = cPtr + batchIndex * cBatchStride;
+                for (int row = 0; row < m; row++)
+                {
+                    ManagedGemmRowColOne(alpha, aBatch + row * aRowStride, bBatch, bColStride, beta, cBatch + row * cRowStride, n, k);
+                }
+            }
+
+            if (ShouldParallelize(batch, m * n * k))
+            {
+                Parallel.For(0, batch, ComputeBatchRowCol);
+            }
+            else
+            {
+                for (int batchIndex = 0; batchIndex < batch; batchIndex++)
+                {
+                    ComputeBatchRowCol(batchIndex);
+                }
+            }
+
+            return true;
         }
 
 
@@ -356,6 +684,11 @@ namespace TensorSharp.Cpu
                 throw new InvalidOperationException("Size mismatch");
             }
 
+            if (TryManagedGemm(alpha, a, b, beta, c))
+            {
+                return;
+            }
+
             bool copyC = false;
             Tensor aClone;
             Tensor bClone;
@@ -470,6 +803,37 @@ namespace TensorSharp.Cpu
             if (a.Sizes[1] != c.Sizes[1] || b.Sizes[2] != c.Sizes[2] || a.Sizes[2] != b.Sizes[1])
             {
                 throw new InvalidOperationException("Size mismatch");
+            }
+
+            if (TryManagedGemmBatch(alpha, a, b, beta, c))
+            {
+                return;
+            }
+
+            if (UsesManagedBlas(a, b, c))
+            {
+                int batchSize = (int)c.Sizes[0];
+                void ComputeBatch(int batchIndex)
+                {
+                    using Tensor aBatch = a.Select(0, batchIndex);
+                    using Tensor bBatch = b.Select(0, batchIndex);
+                    using Tensor cBatch = c.Select(0, batchIndex);
+                    Gemm(alpha, aBatch, bBatch, beta, cBatch);
+                }
+
+                if (ShouldParallelize(batchSize, (int)(c.Sizes[1] * c.Sizes[2])))
+                {
+                    Parallel.For(0, batchSize, ComputeBatch);
+                }
+                else
+                {
+                    for (int batchIndex = 0; batchIndex < batchSize; batchIndex++)
+                    {
+                        ComputeBatch(batchIndex);
+                    }
+                }
+
+                return;
             }
 
             BlasOp aOp = default(BlasOp);
@@ -632,8 +996,7 @@ namespace TensorSharp.Cpu
                         }
                         else
                         {
-                            SGEMM sgemm = new SGEMM();
-                            sgemm.Run(System.Text.ASCIIEncoding.ASCII.GetString(&transa, 1), System.Text.ASCIIEncoding.ASCII.GetString(&transb, 1), m, n, k, alpha, aPtrSingle, lda, bPtrSingle, ldb, beta, cPtrSingle, ldc);
+                            ManagedSgemm.Run(System.Text.ASCIIEncoding.ASCII.GetString(&transa, 1), System.Text.ASCIIEncoding.ASCII.GetString(&transb, 1), m, n, k, alpha, aPtrSingle, lda, bPtrSingle, ldb, beta, cPtrSingle, ldc);
                         }
                     }
                     catch (Exception err)

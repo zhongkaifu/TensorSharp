@@ -1532,34 +1532,44 @@ namespace
         std::vector<BufferHandle> host_ptr_buffers;
         bool use_zero_copy = can_map_standard_view(m1_desc);
 
-        // Result binding
+        // Result/input bindings. If zero-copy host binding fails for either tensor,
+        // fall back to standard ggml-owned buffers for both.
         TensorBinding result_binding;
-        if (use_zero_copy)
-        {
-            ggml_backend_buffer_t buf = nullptr;
-            if (!create_binding_from_host_ptr_2d(context.value, g_backend, result_desc, result_binding, buf))
-                use_zero_copy = false;
-            else
-                host_ptr_buffers.emplace_back(buf);
-        }
-        if (!use_zero_copy)
-            result_binding = create_standard_binding(context.value, result_desc);
-
-        // m1 (input) binding
         TensorBinding m1_binding;
         std::vector<float> packed_m1;
         if (use_zero_copy)
         {
-            ggml_backend_buffer_t buf = nullptr;
-            if (!create_binding_from_host_ptr_2d(context.value, g_backend, m1_desc, m1_binding, buf))
-                use_zero_copy = false;
+            ggml_backend_buffer_t result_buf = nullptr;
+            ggml_backend_buffer_t m1_buf = nullptr;
+            const bool result_ok = create_binding_from_host_ptr_2d(context.value, g_backend, result_desc, result_binding, result_buf);
+            const bool m1_ok = result_ok && create_binding_from_host_ptr_2d(context.value, g_backend, m1_desc, m1_binding, m1_buf);
+
+            if (result_ok && m1_ok)
+            {
+                host_ptr_buffers.emplace_back(result_buf);
+                host_ptr_buffers.emplace_back(m1_buf);
+            }
             else
-                host_ptr_buffers.emplace_back(buf);
+            {
+                if (m1_buf != nullptr)
+                    ggml_backend_buffer_free(m1_buf);
+                if (result_buf != nullptr)
+                    ggml_backend_buffer_free(result_buf);
+
+                use_zero_copy = false;
+                result_binding = create_standard_binding(context.value, result_desc);
+                m1_binding = can_map_standard_view(m1_desc)
+                    ? create_standard_binding(context.value, m1_desc)
+                    : create_packed_standard_binding(context.value, m1_desc, packed_m1);
+            }
         }
         else
+        {
+            result_binding = create_standard_binding(context.value, result_desc);
             m1_binding = can_map_standard_view(m1_desc)
                 ? create_standard_binding(context.value, m1_desc)
                 : create_packed_standard_binding(context.value, m1_desc, packed_m1);
+        }
 
         // m2 (quantized weight) binding: create ggml tensor with actual quantized type
         ggml_type qtype = static_cast<ggml_type>(m2_quant.ggml_type);

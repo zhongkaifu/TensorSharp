@@ -100,6 +100,7 @@ namespace InferenceEngine
 
         protected readonly Dictionary<string, Tensor> _weights = new();
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
+        private bool _quantBackendReady;
 
         protected int _cacheSeqLen;
         protected float[] _logitsBuffer;
@@ -143,6 +144,17 @@ namespace InferenceEngine
         protected bool IsGgmlBackend => _backend == BackendType.GgmlCpu ||
                                         _backend == BackendType.GgmlMetal ||
                                         _backend == BackendType.GgmlCuda;
+
+        protected void EnsureQuantBackendAvailable()
+        {
+            if (_quantBackendReady)
+                return;
+
+            if (!IsGgmlBackend)
+                GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cpu);
+
+            _quantBackendReady = true;
+        }
 
         protected void ParseBaseConfig()
         {
@@ -224,8 +236,10 @@ namespace InferenceEngine
                 var info = kv.Value;
                 long byteCount = _gguf.GetTensorByteCount(info);
 
-                if (IsGgmlBackend && IsQuantizedLinearWeight(info))
+                if (IsQuantizedLinearWeight(info))
                 {
+                    EnsureQuantBackendAvailable();
+
                     long ne0 = (long)info.Shape[0];
                     long ne1 = (long)info.Shape[1];
 
