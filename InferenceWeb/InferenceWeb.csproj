@@ -5,13 +5,18 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
   </PropertyGroup>
+  <PropertyGroup>
+    <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\InferenceEngine\InferenceEngine.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib')">
-    <Copy SourceFiles="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build/libGgmlOps.dylib" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">
+    <Copy SourceFiles="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

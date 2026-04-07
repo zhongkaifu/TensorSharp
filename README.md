@@ -1,6 +1,6 @@
 # TensorSharp
 
-[English](README.md) | [中文](readme_cn.md)
+[English](README.md) | [中文](README_cn.md)
 
 A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
@@ -10,8 +10,9 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` tags (Qwen 3, Qwen 3.5, Gemma 4)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
-- **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, and other quantization formats; performs native quantized matmul without dequantizing to FP32
-- **GPU-accelerated** -- Apple Metal backend via GGML with fused whole-model GPU dispatch for Gemma 4 decode (~2.6x speedup over per-op dispatch)
+- **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
+- **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Linux/NVIDIA, with fused whole-model GPU dispatch for Gemma 4 decode on Metal (~2.6x speedup over per-op dispatch)
+- **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
@@ -35,6 +36,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Backend | Flag | Description |
 |---|---|---|
 | GGML Metal | `--backend ggml_metal` | GPU-accelerated via Apple Metal (macOS). Recommended for Apple Silicon. |
+| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Linux with an NVIDIA GPU. |
 | GGML CPU | `--backend ggml_cpu` | CPU inference using native GGML with optimized kernels. |
 | Pure C# CPU | `--backend cpu` | Portable CPU inference with no native dependencies. |
 
@@ -43,7 +45,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 ```
 TensorSharp/
 ├── TensorSharp/                 # Core tensor library (CPU operations, SIMD)
-├── TensorSharp.GGML/            # GGML backend bindings (Metal/CPU via native library)
+├── TensorSharp.GGML/            # GGML backend bindings (Metal/CUDA/CPU via native library)
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps)
 ├── AdvUtils/                    # Utility library
 ├── InferenceEngine/             # Model loading, tokenization, and inference logic
@@ -72,8 +74,9 @@ TensorSharp/
 
 ## Prerequisites
 
-- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) or later (.NET 10 for InferenceWeb)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library
+- **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
 
 ## Building
@@ -108,13 +111,25 @@ macOS:
 bash build-macos.sh
 ```
 
-Linux:
+Linux (CPU-only):
 
 ```bash
 bash build-linux.sh
 ```
 
-On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux it compiles `libGgmlOps.so` with the GGML CPU backend. The build output is automatically copied to the application's output directory.
+Linux (GGML_CUDA enabled):
+
+```bash
+bash build-linux.sh --cuda
+```
+
+You can also request a CUDA-enabled native build from `dotnet build`:
+
+```bash
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceConsole.csproj -c Release
+```
+
+On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux, `build-linux.sh` builds `libGgmlOps.so` with the GGML CPU backend by default, and `build-linux.sh --cuda` enables GGML_CUDA support for NVIDIA GPUs. The build output is automatically copied to the application's output directory.
 
 ## Usage
 
@@ -126,6 +141,10 @@ cd InferenceConsole/bin
 # Text inference
 ./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
+
+# Text inference on Linux + NVIDIA GPU
+./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_cuda
 
 # Image inference (Gemma 3/4, Qwen 3.5)
 ./InferenceConsole --model <model.gguf> --image photo.png --backend ggml_metal
@@ -165,7 +184,7 @@ cd InferenceConsole/bin
 | `--audio <path>` | Audio file (WAV, MP3, OGG) for audio inference |
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--backend <type>` | Compute backend: `cpu`, `ggml_cpu`, or `ggml_metal` |
+| `--backend <type>` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--think` | Enable thinking/reasoning mode (chain-of-thought) |
 | `--tools <path>` | JSON file with tool/function definitions |
 | `--temperature <f>` | Sampling temperature (0 = greedy) |
@@ -197,6 +216,9 @@ cd InferenceWeb/bin
 
 # Set environment variables and run
 MODEL_DIR=./models BACKEND=ggml_metal ./InferenceWeb
+
+# Linux + NVIDIA GPU
+MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
 ```
 
 Open `http://localhost:5000` in your browser. The web interface supports:
@@ -214,7 +236,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 | Variable | Description |
 |---|---|
 | `MODEL_DIR` | Directory containing GGUF model files |
-| `BACKEND` | Compute backend (default: `ggml_metal`) |
+| `BACKEND` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `PORT` | HTTP port (default: `5000`) |
 
 ### HTTP APIs
@@ -318,7 +340,7 @@ TensorSharp is structured as a layered system:
 
 1. **TensorSharp** provides the core `Tensor` type, storage abstraction, and an extensible operation registry (`Ops`). CPU implementations use `System.Numerics.Vectors` for SIMD acceleration.
 
-2. **TensorSharp.GGML** registers GPU-accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS, this provides Metal GPU compute. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
+2. **TensorSharp.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
 
 3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, output parsing (thinking extraction, tool-call extraction), and the forward pass for each architecture. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
@@ -329,6 +351,7 @@ TensorSharp is structured as a layered system:
 - **Fused GPU decode** (Gemma 4): all transformer layers are executed in a single GGML compute graph dispatch on Metal, reducing CPU-GPU round-trips from hundreds per token to one. This achieves ~2.6x speedup over per-operation dispatch.
 - **Fused weight projections**: Q/K/V projections are fused into a single QKV matmul; gate and up projections are fused into a single gate_up matmul.
 - **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth.
+- **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations.
 
