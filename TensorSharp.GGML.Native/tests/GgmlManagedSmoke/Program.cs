@@ -10,6 +10,17 @@ long sourceBytes = rows * cols * sizeof(float);
 
 static float ExpectedValue(int row, int col) => (row * 1000) + col;
 
+static GgmlBackendType ParseBackend(string[] args)
+{
+    string backend = args.Length == 0 ? "cpu" : args[0].ToLowerInvariant();
+    return backend switch
+    {
+        "cpu" or "ggml_cpu" => GgmlBackendType.Cpu,
+        "cuda" or "ggml_cuda" => GgmlBackendType.Cuda,
+        _ => throw new ArgumentException("Unknown backend. Use cpu or cuda.")
+    };
+}
+
 float[] source = new float[rows * cols];
 for (int row = 0; row < rows; ++row)
 {
@@ -24,7 +35,8 @@ Marshal.Copy(source, 0, weightData, source.Length);
 
 try
 {
-    var context = new GgmlContext(new[] { 0 }, GgmlBackendType.Cpu);
+    GgmlBackendType backendType = ParseBackend(args);
+    var context = new GgmlContext(new[] { 0 }, backendType);
     var allocator = new GgmlAllocator(context, 0);
 
     using var result = new Tensor(allocator, DType.Float32, 2, cols);
@@ -49,7 +61,7 @@ try
         }
     }
 
-    Console.WriteLine("GgmlManagedSmoke passed");
+    Console.WriteLine($"GgmlManagedSmoke passed ({backendType})");
 }
 finally
 {

@@ -110,7 +110,7 @@ namespace InferenceConsole
                 Console.Error.WriteLine($"Model file not found: {modelPath ?? "(none)"}");
                 Console.Error.WriteLine("Usage: InferenceConsole --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
-                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal]");
+                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal|ggml_cuda]");
                 return;
             }
 
@@ -119,7 +119,8 @@ namespace InferenceConsole
                 "cpu" => BackendType.Cpu,
                 "ggml_cpu" => BackendType.GgmlCpu,
                 "ggml_metal" => BackendType.GgmlMetal,
-                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, ggml_cpu, ggml_metal"),
+                "cuda" or "ggml_cuda" => BackendType.GgmlCuda,
+                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, ggml_cpu, ggml_metal, ggml_cuda"),
             };
 
             using var model = ModelBase.Create(modelPath, backend);

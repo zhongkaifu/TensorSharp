@@ -267,6 +267,7 @@ namespace
 
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;
+    constexpr int BACKEND_TYPE_CUDA = 3;
 
     void initialize_backend()
     {
@@ -295,6 +296,27 @@ namespace
                 return;
             }
         }
+        else if (g_backend_type == BACKEND_TYPE_CUDA)
+        {
+#if defined(GGML_USE_CUDA)
+            ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (device == nullptr)
+            {
+                set_last_error("No GGML GPU device is available for ggml-cuda.");
+                return;
+            }
+
+            g_backend = ggml_backend_dev_init(device, nullptr);
+            if (g_backend == nullptr)
+            {
+                set_last_error("ggml-cuda backend initialization failed.");
+                return;
+            }
+#else
+            set_last_error("The ggml-cuda backend is not available in this build.");
+            return;
+#endif
+        }
         else
         {
             set_last_error("Unknown GGML backend type requested.");
@@ -306,7 +328,9 @@ namespace
 
     bool ensure_backend(int backend_type)
     {
-        if (backend_type != BACKEND_TYPE_METAL && backend_type != BACKEND_TYPE_CPU)
+        if (backend_type != BACKEND_TYPE_METAL &&
+            backend_type != BACKEND_TYPE_CPU &&
+            backend_type != BACKEND_TYPE_CUDA)
         {
             set_last_error("Invalid GGML backend type.");
             return false;

@@ -62,7 +62,8 @@ app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions
 
 string modelDir = Environment.GetEnvironmentVariable("MODEL_DIR")
     ?? Path.Combine(AppContext.BaseDirectory, "models");
-string defaultBackend = Environment.GetEnvironmentVariable("BACKEND") ?? "ggml_metal";
+string defaultBackend = Environment.GetEnvironmentVariable("BACKEND")
+    ?? (OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu");
 
 // ============================================================
 // Internal Web UI endpoints (original)
@@ -1324,4 +1325,3 @@ Console.WriteLine("  POST /api/chat                  - Chat (Web UI SSE)");
 Console.WriteLine("  POST /api/models/load           - Load model (Web UI)");
 Console.WriteLine("  GET  /api/models                - List models (Web UI)");
 app.Run("http://0.0.0.0:5000");
-

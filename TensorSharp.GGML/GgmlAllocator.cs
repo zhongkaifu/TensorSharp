@@ -33,7 +33,7 @@ namespace TensorSharp.GGML
         {
             if (elementType == DType.Float16)
             {
-                throw new NotSupportedException("The GGML Metal backend currently supports Float32 tensors only. Disable AMP to use this backend.");
+                throw new NotSupportedException("GGML backends currently support Float32 tensors only. Disable AMP to use this backend.");
             }
 
             return new GgmlStorage(this, context, elementType, elementCount);

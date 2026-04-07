@@ -7,8 +7,11 @@
 //
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+#nullable enable
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -81,7 +84,7 @@ namespace InferenceEngine
             if (!string.Equals(libraryName, DllName, StringComparison.Ordinal))
                 return IntPtr.Zero;
 
-            foreach (string candidate in GetCandidatePaths())
+            foreach (string candidate in GetCandidatePaths(assembly))
             {
                 if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
                     return handle;
@@ -90,22 +93,62 @@ namespace InferenceEngine
             return IntPtr.Zero;
         }
 
-        private static string[] GetCandidatePaths()
+        private static IEnumerable<string> GetCandidatePaths(Assembly assembly)
         {
             string baseDir = AppContext.BaseDirectory;
-            string nativeBuildDir = Path.Combine(
-                Path.GetDirectoryName(Path.GetDirectoryName(baseDir.TrimEnd(Path.DirectorySeparatorChar))),
-                "TensorSharp.GGML.Native", "build");
+            string assemblyDirectory = Path.GetDirectoryName(assembly.Location) ?? baseDir;
 
-            return new[]
+            foreach (string fileName in GetCandidateFileNames())
             {
-                Path.Combine(baseDir, "libGgmlOps.dylib"),
-                Path.Combine(nativeBuildDir, "libGgmlOps.dylib"),
-                Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(baseDir.TrimEnd(Path.DirectorySeparatorChar))),
-                    "..", "TensorSharp.GGML.Native", "build", "libGgmlOps.dylib"),
-                "/Users/ZhongkaiFu/work/TensorSharp/TensorSharp.GGML.Native/build/libGgmlOps.dylib",
-                "/Users/ZhongkaiFu/work/Seq2SeqSharp/TensorSharp.GGML.Native/build/libGgmlOps.dylib",
+                yield return Path.Combine(baseDir, fileName);
+                yield return Path.Combine(assemblyDirectory, fileName);
+            }
+
+            foreach (string root in EnumerateRepoRoots(baseDir))
+            {
+                foreach (string fileName in GetCandidateFileNames())
+                {
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", fileName);
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", fileName);
+                }
+            }
+
+            yield return "/Users/ZhongkaiFu/work/TensorSharp/TensorSharp.GGML.Native/build/libGgmlOps.dylib";
+            yield return "/Users/ZhongkaiFu/work/Seq2SeqSharp/TensorSharp.GGML.Native/build/libGgmlOps.dylib";
+        }
+
+        private static IEnumerable<string> EnumerateRepoRoots(string startDirectory)
+        {
+            DirectoryInfo? current = new DirectoryInfo(startDirectory);
+            while (current != null)
+            {
+                if (IsRepoRoot(current.FullName))
+                {
+                    yield return current.FullName;
+                }
+
+                current = current.Parent;
+            }
+        }
+
+        private static IEnumerable<string> GetCandidateFileNames()
+        {
+            yield return OperatingSystem.IsWindows() ? "GgmlOps.dll" :
+                OperatingSystem.IsMacOS() ? "libGgmlOps.dylib" :
+                "libGgmlOps.so";
+        }
+
+        private static bool IsRepoRoot(string path)
+        {
+            string[] markers =
+            {
+                "TensorSharp.slnx",
+                "TensorSharp.sln",
+                "Seq2SeqSharp.sln",
             };
+
+            return markers.Any(marker => File.Exists(Path.Combine(path, marker)))
+                || Directory.Exists(Path.Combine(path, ".git"));
         }
     }
 }
