@@ -1,6 +1,6 @@
 # TensorSharp
 
-[English](README.md) | [中文](README_cn.md)
+[English](README.md) | [中文](readme_cn.md)
 
 一个用于在本地运行大型语言模型（LLM）的 C# 推理引擎，使用 GGUF 模型文件。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 
@@ -10,8 +10,9 @@
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5）
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
-- **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32
-- **GPU 加速** —— 通过 GGML 使用 Apple Metal 后端，并针对 Gemma 4 decode 使用整模型融合 GPU 调度（相对逐算子调度约提升 2.6 倍）
+- **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
+- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Linux/NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode（相对逐算子调度约提升 2.6 倍）
+- **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
 - **聊天模板** —— 从 GGUF 元数据自动加载（Jinja2），并为不同架构提供硬编码回退模板
@@ -35,6 +36,7 @@
 | 后端 | 参数 | 说明 |
 |---|---|---|
 | GGML Metal | `--backend ggml_metal` | 通过 Apple Metal（macOS）进行 GPU 加速。推荐用于 Apple Silicon。 |
+| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Linux + NVIDIA GPU 上进行加速。 |
 | GGML CPU | `--backend ggml_cpu` | 使用原生 GGML 与优化内核进行 CPU 推理。 |
 | 纯 C# CPU | `--backend cpu` | 无原生依赖的可移植 CPU 推理。 |
 
@@ -43,7 +45,7 @@
 ```text
 TensorSharp/
 ├── TensorSharp/                 # 核心张量库（CPU 运算、SIMD）
-├── TensorSharp.GGML/            # GGML 后端绑定（通过原生库支持 Metal/CPU）
+├── TensorSharp.GGML/            # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps）
 ├── AdvUtils/                    # 工具库
 ├── InferenceEngine/             # 模型加载、分词和推理逻辑
@@ -72,8 +74,9 @@ TensorSharp/
 
 ## 前置要求
 
-- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) 或更高版本（InferenceWeb 需要 .NET 10）
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具
+- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda`，还需要 NVIDIA 驱动和 CUDA Toolkit 12.x 或其他兼容版本
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
 
 ## 构建
@@ -94,16 +97,39 @@ dotnet build InferenceConsole/InferenceConsole.csproj
 dotnet build InferenceWeb/InferenceWeb.csproj
 ```
 
-### 构建原生 GGML 库（macOS）
+### 构建原生 GGML 库
 
 如果原生库不存在，首次执行 `dotnet build` 时会自动构建。也可以手动构建：
 
 ```bash
 cd TensorSharp.GGML.Native
+```
+
+macOS：
+
+```bash
 bash build-macos.sh
 ```
 
-该过程会编译带 Metal GPU 支持的 `libGgmlOps.dylib`。构建产物会自动复制到应用输出目录。
+Linux（仅 CPU）：
+
+```bash
+bash build-linux.sh
+```
+
+Linux（启用 GGML_CUDA）：
+
+```bash
+bash build-linux.sh --cuda
+```
+
+也可以在 `dotnet build` 时通过环境变量请求 CUDA 版本的原生库：
+
+```bash
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceConsole.csproj -c Release
+```
+
+在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Linux 上，`build-linux.sh` 默认生成带 GGML CPU 后端的 `libGgmlOps.so`，而 `build-linux.sh --cuda` 会启用面向 NVIDIA GPU 的 GGML_CUDA 支持。构建产物会自动复制到应用输出目录。
 
 ## 使用方法
 
@@ -115,6 +141,10 @@ cd InferenceConsole/bin
 # 文本推理
 ./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
+
+# Linux + NVIDIA GPU 文本推理
+./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_cuda
 
 # 图像推理（Gemma 3/4，Qwen 3.5）
 ./InferenceConsole --model <model.gguf> --image photo.png --backend ggml_metal
@@ -154,7 +184,7 @@ cd InferenceConsole/bin
 | `--audio <path>` | 音频文件（WAV、MP3、OGG）用于音频推理 |
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
-| `--backend <type>` | 计算后端：`cpu`、`ggml_cpu` 或 `ggml_metal` |
+| `--backend <type>` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
 | `--think` | 启用思维链/推理模式 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
@@ -186,6 +216,9 @@ cd InferenceWeb/bin
 
 # 设置环境变量并运行
 MODEL_DIR=./models BACKEND=ggml_metal ./InferenceWeb
+
+# Linux + NVIDIA GPU
+MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
 ```
 
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
@@ -203,7 +236,7 @@ MODEL_DIR=./models BACKEND=ggml_metal ./InferenceWeb
 | 变量 | 说明 |
 |---|---|
 | `MODEL_DIR` | GGUF 模型文件所在目录 |
-| `BACKEND` | 计算后端（默认：`ggml_metal`） |
+| `BACKEND` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `PORT` | HTTP 端口（默认：`5000`） |
 
 ### HTTP API
@@ -307,7 +340,7 @@ TensorSharp 采用分层系统结构：
 
 1. **TensorSharp** 提供核心 `Tensor` 类型、存储抽象和可扩展的操作注册表（`Ops`）。CPU 实现使用 `System.Numerics.Vectors` 进行 SIMD 加速。
 
-2. **TensorSharp.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的 GPU 加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
+2. **TensorSharp.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
 
 3. **InferenceEngine** 实现模型相关逻辑：GGUF 解析、分词（SentencePiece BPE）、聊天模板渲染（来自 GGUF 元数据的 Jinja2 + 硬编码回退）、可配置 token 采样、输出解析（思维链提取、工具调用提取），以及各架构前向计算。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
@@ -318,6 +351,7 @@ TensorSharp 采用分层系统结构：
 - **融合 GPU decode**（Gemma 4）：在 Metal 上将所有 Transformer 层合并为单次 GGML 计算图调度，将每个 token 的 CPU-GPU 往返从数百次降低到一次。相较逐算子调度约提升 2.6 倍。
 - **融合权重投影**：Q/K/V 投影融合为单次 QKV matmul；gate 与 up 投影融合为单次 gate_up matmul。
 - **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。
+- **优化后的纯 C# CPU 路径**：托管 GEMM 快速路径和连续 Float32 内核加速了 decode、softmax、RMSNorm、RoPE、融合激活等热点路径，同时在 CPU 加载时保持量化 GGUF 权重压缩状态。
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
 - **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管内存分配。
 

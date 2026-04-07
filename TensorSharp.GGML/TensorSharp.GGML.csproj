@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <OutputType>Library</OutputType>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -23,6 +23,8 @@
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
     <GgmlNativeBuildScript Condition="$([MSBuild]::IsOSPlatform('OSX'))">build-macos.sh</GgmlNativeBuildScript>
     <GgmlNativeBuildScript Condition="$([MSBuild]::IsOSPlatform('Linux'))">build-linux.sh</GgmlNativeBuildScript>
+    <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
+    <GgmlNativeForceBuild Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">true</GgmlNativeForceBuild>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
@@ -32,8 +34,8 @@
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />
     <ProjectReference Include="..\TensorSharp\TensorSharp.csproj" />
   </ItemGroup>
-  <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="'$(GgmlNativeBuildScript)' != '' And !Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">
-    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot;" />
+  <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="'$(GgmlNativeBuildScript)' != '' And ( !Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)') Or '$(GgmlNativeForceBuild)' == 'true' )">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
   </Target>
   <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">
     <ItemGroup>
