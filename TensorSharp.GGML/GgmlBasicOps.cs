@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using TensorSharp.Core;
+using TensorSharp.Cpu;
 
 namespace TensorSharp.GGML
 {
@@ -315,8 +316,8 @@ namespace TensorSharp.GGML
                 throw new ArgumentException("AddmmQuant requires 2D tensors for result and m1.");
             if (m1.ElementType != DType.Float32 || result.ElementType != DType.Float32)
                 throw new ArgumentException("AddmmQuant requires Float32 tensors for result and m1.");
-            if (!(m1.Storage is GgmlStorage) || !(result.Storage is GgmlStorage))
-                throw new ArgumentException("AddmmQuant requires GgmlStorage tensors.");
+            if (!HasNativeBufferStorage(m1) || !HasNativeBufferStorage(result))
+                throw new ArgumentException("AddmmQuant requires tensors backed by native CPU-accessible storage.");
 
             if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
                 || !TryCreateRawView(m1, out GgmlTensorView2D m1View))
@@ -335,8 +336,8 @@ namespace TensorSharp.GGML
         {
             if (result.DimensionCount != 2 || result.ElementType != DType.Float32)
                 throw new ArgumentException("GetRowsQuant requires a 2D Float32 result tensor.");
-            if (!(result.Storage is GgmlStorage))
-                throw new ArgumentException("GetRowsQuant requires GgmlStorage for result.");
+            if (!HasNativeBufferStorage(result))
+                throw new ArgumentException("GetRowsQuant requires a result tensor backed by native CPU-accessible storage.");
 
             if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
                 || !TryCreateContiguousTensor(indices, out GgmlContiguousTensor indexTensor, DType.Int32))
@@ -355,8 +356,8 @@ namespace TensorSharp.GGML
         {
             if (result.DimensionCount != 2 || m1.DimensionCount != 2)
                 throw new ArgumentException("AddmmQuantBatch requires 2D tensors.");
-            if (!(m1.Storage is GgmlStorage) || !(result.Storage is GgmlStorage))
-                throw new ArgumentException("AddmmQuantBatch requires GgmlStorage tensors.");
+            if (!HasNativeBufferStorage(m1) || !HasNativeBufferStorage(result))
+                throw new ArgumentException("AddmmQuantBatch requires tensors backed by native CPU-accessible storage.");
 
             if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
                 || !TryCreateRawView(m1, out GgmlTensorView2D m1View))
@@ -370,6 +371,7 @@ namespace TensorSharp.GGML
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
+        public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 
         public static void TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
@@ -1441,7 +1443,7 @@ namespace TensorSharp.GGML
         {
             if (!CanMapTensorToStandardGgmlView(tensor)
                 || tensor.DimensionCount > 4
-                || !(tensor.Storage is GgmlStorage)
+                || !HasNativeBufferStorage(tensor)
                 || !TryGetRawSpanBytes(tensor, out long rawBytes))
             {
                 view = default;
@@ -1514,7 +1516,7 @@ namespace TensorSharp.GGML
 
         private static bool TryCreateContiguousTensor(Tensor tensor, out GgmlContiguousTensor contiguousTensor, params DType[] allowedTypes)
         {
-            if (!(tensor.Storage is GgmlStorage) || !tensor.IsContiguous())
+            if (!HasNativeBufferStorage(tensor) || !tensor.IsContiguous())
             {
                 contiguousTensor = default;
                 return false;
@@ -1534,7 +1536,7 @@ namespace TensorSharp.GGML
         {
             if (tensor.DimensionCount != 2
                 || tensor.ElementType != DType.Float32
-                || !(tensor.Storage is GgmlStorage)
+                || !HasNativeBufferStorage(tensor)
                 || !TryGetRawSpanBytes(tensor, out long rawBytes)
                 || !TryGetInt32(tensor.Sizes[0], out int dim0)
                 || !TryGetInt32(tensor.Sizes[1], out int dim1)
@@ -1553,7 +1555,7 @@ namespace TensorSharp.GGML
         {
             if (tensor.DimensionCount != 3
                 || tensor.ElementType != DType.Float32
-                || !(tensor.Storage is GgmlStorage)
+                || !HasNativeBufferStorage(tensor)
                 || !TryGetRawSpanBytes(tensor, out long rawBytes)
                 || !TryGetInt32(tensor.Sizes[0], out int dim0)
                 || !TryGetInt32(tensor.Sizes[1], out int dim1)
@@ -1618,7 +1620,7 @@ namespace TensorSharp.GGML
             compactTensor = null;
 
             if (tensor.ElementType != DType.Float32
-                || !(tensor.Storage is GgmlStorage)
+                || !HasNativeBufferStorage(tensor)
                 || tensor.DimensionCount < 1
                 || tensor.DimensionCount > 4
                 || tensor.Strides[tensor.DimensionCount - 1] != 1)
@@ -1867,9 +1869,17 @@ namespace TensorSharp.GGML
             }
         }
 
+        private static bool HasNativeBufferStorage(Tensor tensor) =>
+            tensor != null && (tensor.Storage is GgmlStorage || tensor.Storage is CpuStorage);
+
         private static IntPtr GetBufferStart(Tensor tensor)
         {
-            return ((GgmlStorage)tensor.Storage).PtrAtElement(tensor.StorageOffset);
+            return tensor.Storage switch
+            {
+                GgmlStorage ggmlStorage => ggmlStorage.PtrAtElement(tensor.StorageOffset),
+                CpuStorage cpuStorage => cpuStorage.PtrAtElement(tensor.StorageOffset),
+                _ => throw new ArgumentException("Tensor storage must expose a native CPU-accessible buffer.", nameof(tensor)),
+            };
         }
 
         private static void ValidateAddmmArguments(Tensor result, Tensor src, Tensor m1, Tensor m2)

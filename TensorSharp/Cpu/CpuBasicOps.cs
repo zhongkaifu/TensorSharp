@@ -172,22 +172,7 @@ namespace TensorSharp.Cpu
                 Ops.Copy(writeTarget, src);
             }
 
-            if (m1.Allocator.BlasEnum == BlasEnum.MKL || m2.Allocator.BlasEnum == BlasEnum.MKL || writeTarget.Allocator.BlasEnum == BlasEnum.MKL)
-            {
-                MatrixMultiplication.GemmBatch(alpha, m1, m2, beta, writeTarget);
-            }
-            else
-            {
-                int batchSize = (int)src.Sizes[0];
-                for (int i = 0; i < batchSize; i++)
-                {
-                    Tensor a = m1.Select(0, i);
-                    Tensor b = m2.Select(0, i);
-                    Tensor r = writeTarget.Select(0, i);
-
-                    MatrixMultiplication.Gemm(alpha, a, b, beta, r);
-                }
-            }
+            MatrixMultiplication.GemmBatch(alpha, m1, m2, beta, writeTarget);
 
             return writeTarget;
         }
