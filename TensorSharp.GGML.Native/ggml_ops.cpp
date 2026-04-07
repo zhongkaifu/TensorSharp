@@ -249,10 +249,19 @@ namespace
     ggml_backend_t g_backend = nullptr;
     int g_backend_type = 0;
 
-    struct CachedHostBuffer {
-        ggml_backend_buffer_t buffer;
-        std::size_t bytes;
+    enum class CachedBufferMode
+    {
+        HostPtr,
+        DeviceCopy,
     };
+
+    struct CachedHostBuffer {
+        ggml_backend_buffer_t buffer = nullptr;
+        std::size_t bytes = 0;
+        std::size_t buffer_size = 0;
+        CachedBufferMode mode = CachedBufferMode::HostPtr;
+    };
+    std::mutex g_host_buffer_cache_mutex;
     std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
 
     void set_last_error(const std::string& message)
@@ -744,9 +753,24 @@ namespace
         return backend != nullptr ? ggml_backend_get_alignment(backend) : 0;
     }
 
+    bool prefers_device_local_cache(ggml_backend_dev_t dev)
+    {
+        if (dev == nullptr)
+            return false;
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        return props.type == GGML_BACKEND_DEVICE_TYPE_GPU && !props.integrated;
+    }
+
     bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size)
     {
         if (dev == nullptr || ptr == nullptr || size == 0)
+            return false;
+
+        // On discrete GPUs, host-mapped buffers keep tensor reads on system memory and
+        // are far slower than device-local buffers for inference weights / activations.
+        if (prefers_device_local_cache(dev))
             return false;
 
         ggml_backend_dev_props props;
@@ -756,6 +780,20 @@ namespace
 
         const std::size_t alignment = get_host_ptr_alignment(backend, dev);
         return is_pointer_aligned(ptr, alignment);
+    }
+
+    void invalidate_cached_buffer(void* data)
+    {
+        if (data == nullptr)
+            return;
+
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        auto it = g_host_buffer_cache.find(data);
+        if (it == g_host_buffer_cache.end())
+            return;
+
+        ggml_backend_buffer_free(it->second.buffer);
+        g_host_buffer_cache.erase(it);
     }
 
     bool try_get_host_ptr_buffer(
@@ -772,8 +810,11 @@ namespace
 
         if (cacheable)
         {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             auto it = g_host_buffer_cache.find(data);
-            if (it != g_host_buffer_cache.end() && it->second.bytes == bytes)
+            if (it != g_host_buffer_cache.end() &&
+                it->second.bytes == bytes &&
+                it->second.mode == CachedBufferMode::HostPtr)
             {
                 out_buffer = it->second.buffer;
                 return true;
@@ -785,7 +826,91 @@ namespace
             return false;
 
         if (cacheable)
-            g_host_buffer_cache[data] = { out_buffer, bytes };
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            g_host_buffer_cache[data] = {
+                out_buffer,
+                bytes,
+                ggml_backend_buffer_get_size(out_buffer),
+                CachedBufferMode::HostPtr
+            };
+        }
+
+        return true;
+    }
+
+    bool try_get_cacheable_tensor_buffer(
+        ggml_backend_t backend,
+        ggml_backend_dev_t dev,
+        ggml_tensor* tensor,
+        void* data,
+        std::size_t bytes,
+        ggml_backend_buffer_t& out_buffer,
+        void*& out_addr,
+        bool& out_needs_upload)
+    {
+        out_buffer = nullptr;
+        out_addr = nullptr;
+        out_needs_upload = false;
+
+        if (backend == nullptr || dev == nullptr || tensor == nullptr || data == nullptr || bytes == 0)
+            return false;
+
+        const bool use_device_copy = prefers_device_local_cache(dev);
+
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            if (it != g_host_buffer_cache.end())
+            {
+                const bool mode_matches =
+                    (use_device_copy && it->second.mode == CachedBufferMode::DeviceCopy) ||
+                    (!use_device_copy && it->second.mode == CachedBufferMode::HostPtr);
+                const std::size_t required_size = ggml_backend_buffer_get_alloc_size(it->second.buffer, tensor);
+
+                if (mode_matches &&
+                    it->second.bytes == bytes &&
+                    required_size <= it->second.buffer_size)
+                {
+                    out_buffer = it->second.buffer;
+                    out_addr = use_device_copy ? ggml_backend_buffer_get_base(out_buffer) : data;
+                    return true;
+                }
+
+                ggml_backend_buffer_free(it->second.buffer);
+                g_host_buffer_cache.erase(it);
+            }
+        }
+
+        if (use_device_copy)
+        {
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+            if (buft == nullptr)
+                return false;
+
+            const std::size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            out_buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+            if (out_buffer == nullptr)
+                return false;
+
+            ggml_backend_buffer_set_usage(out_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            out_addr = ggml_backend_buffer_get_base(out_buffer);
+            out_needs_upload = true;
+
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            g_host_buffer_cache[data] = {
+                out_buffer,
+                bytes,
+                ggml_backend_buffer_get_size(out_buffer),
+                CachedBufferMode::DeviceCopy
+            };
+            return true;
+        }
+
+        if (!try_get_host_ptr_buffer(backend, dev, data, bytes, true, out_buffer))
+            return false;
+
+        out_addr = data;
 
         return true;
     }
@@ -1451,21 +1576,27 @@ namespace
 
         // Try cached host_ptr binding for quantized weight (stable pointer across calls)
         bool m2_bound = false;
+        bool m2_needs_upload = false;
         {
             ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
             if (dev != nullptr && m2_quant.raw_bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr;
-                if (try_get_host_ptr_buffer(
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(
                         g_backend,
                         dev,
+                        m2_tensor,
                         m2_quant.data,
                         static_cast<std::size_t>(m2_quant.raw_bytes),
-                        true,
-                        buf))
+                        buf,
+                        addr,
+                        m2_needs_upload))
                 {
-                    ggml_status st = ggml_backend_tensor_alloc(buf, m2_tensor, m2_quant.data);
+                    ggml_status st = ggml_backend_tensor_alloc(buf, m2_tensor, addr);
                     m2_bound = (st == GGML_STATUS_SUCCESS);
+                    if (!m2_bound)
+                        invalidate_cached_buffer(m2_quant.data);
                 }
             }
         }
@@ -1511,7 +1642,7 @@ namespace
                 upload_binding(m1_binding, packed_m1.data(), m1_binding.raw_bytes);
         }
 
-        if (!m2_bound)
+        if (!m2_bound || m2_needs_upload)
             upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
@@ -1598,21 +1729,27 @@ namespace
 
         // Cache quantized source buffer (same as addmm_quant)
         bool src_bound = false;
+        bool src_needs_upload = false;
         {
             ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
             if (dev != nullptr && src_quant.raw_bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr;
-                if (try_get_host_ptr_buffer(
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(
                         g_backend,
                         dev,
+                        src_tensor,
                         src_quant.data,
                         static_cast<std::size_t>(src_quant.raw_bytes),
-                        true,
-                        buf))
+                        buf,
+                        addr,
+                        src_needs_upload))
                 {
-                    ggml_status st = ggml_backend_tensor_alloc(buf, src_tensor, src_quant.data);
+                    ggml_status st = ggml_backend_tensor_alloc(buf, src_tensor, addr);
                     src_bound = (st == GGML_STATUS_SUCCESS);
+                    if (!src_bound)
+                        invalidate_cached_buffer(src_quant.data);
                 }
             }
         }
@@ -1651,7 +1788,7 @@ namespace
         }
 
         // Upload quantized source if not zero-copy bound
-        if (!src_bound)
+        if (!src_bound || src_needs_upload)
             upload_binding(src_binding, src_quant.data, src_binding.raw_bytes);
 
         // Upload indices
@@ -6797,6 +6934,7 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
     for (auto& [ptr, cached] : g_host_buffer_cache)
         ggml_backend_buffer_free(cached.buffer);
     g_host_buffer_cache.clear();
@@ -7043,6 +7181,28 @@ namespace
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+            if (t == nullptr || data == nullptr)
+                return;
+
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload)
+                            upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+
+                    invalidate_cached_buffer(data);
+                }
+            }
+
             if (bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr;
@@ -7395,6 +7555,28 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         std::vector<BufferHandle> ephemeral_bufs;
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+            if (t == nullptr || data == nullptr)
+                return;
+
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload)
+                            upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+
+                    invalidate_cached_buffer(data);
+                }
+            }
+
             if (bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr;
@@ -7966,6 +8148,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
             if (t == nullptr || data == nullptr) return;
+
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload)
+                            upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+
+                    invalidate_cached_buffer(data);
+                }
+            }
+
             if (bytes >= 4096)
             {
                 ggml_backend_buffer_t buf = nullptr;
