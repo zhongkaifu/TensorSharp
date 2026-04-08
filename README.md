@@ -277,6 +277,31 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
+
+# Structured outputs (OpenAI response_format)
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Extract the city and country from: Paris, France."}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "location_extraction",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "country": {"type": "string"},
+            "confidence": {"type": ["string", "null"]}
+          },
+          "required": ["city", "country", "confidence"],
+          "additionalProperties": false
+        }
+      }
+    }
+  }'
 ```
 
 **OpenAI Python SDK:**
@@ -357,7 +382,7 @@ TensorSharp is structured as a layered system:
 
 ## Testing
 
-Integration tests for InferenceWeb are in `InferenceWeb/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, queue behavior, concurrent requests, and abort support.
+Integration tests for InferenceWeb are in `InferenceWeb/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support.
 
 ```bash
 # Start InferenceWeb, then run:

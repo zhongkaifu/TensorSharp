@@ -271,6 +271,87 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model
 data: [DONE]
 ```
 
+### Chat Completions with JSON mode
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "user", "content": "Return a JSON object with keys answer and confidence for 2+3."}
+    ],
+    "response_format": {"type": "json_object"},
+    "max_tokens": 80
+  }'
+```
+
+Response:
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "{\"answer\":5,\"confidence\":\"high\"}"
+    },
+    "finish_reason": "stop"
+  }]
+}
+```
+
+### Chat Completions with Structured Outputs (`json_schema`)
+
+InferenceWeb accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, and validates the final output before returning it.
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a concise extraction assistant."
+      },
+      {
+        "role": "user",
+        "content": "Extract the city and country from: Paris, France."
+      }
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "location_extraction",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "country": { "type": "string" },
+            "confidence": { "type": ["string", "null"] }
+          },
+          "required": ["city", "country", "confidence"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 120
+  }'
+```
+
+Response:
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "{\"city\":\"Paris\",\"country\":\"France\",\"confidence\":null}"
+    },
+    "finish_reason": "stop"
+  }]
+}
+```
+
 ### Chat Completions with Image (multimodal, OpenAI format)
 
 ```bash
@@ -320,6 +401,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 | `frequency_penalty` | float       | 0       | Frequency penalty                  |
 | `seed`              | int         | -1      | Random seed                        |
 | `stop`              | string/array| null    | Stop sequences                     |
+| `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
 
 ---
 
@@ -387,6 +469,42 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Using `openai` Python SDK with structured outputs
+
+```python
+from openai import OpenAI
+import json
+
+client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="Qwen3-4B-Q8_0.gguf",
+    messages=[
+        {"role": "user", "content": "Extract the city and country from: Tokyo, Japan."}
+    ],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "location_extraction",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "country": {"type": "string"},
+                    "confidence": {"type": ["string", "null"]}
+                },
+                "required": ["city", "country", "confidence"],
+                "additionalProperties": False
+            }
+        }
+    }
+)
+
+payload = json.loads(response.choices[0].message.content)
+print(payload["city"], payload["country"], payload["confidence"])
+```
+
 ### Streaming with `openai` Python SDK
 
 ```python
@@ -406,6 +524,12 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="", flush=True)
 print()
 ```
+
+Notes:
+
+- `response_format.type = "json_schema"` currently cannot be combined with `tools` or `think`.
+- Streaming structured-output requests are buffered and validated before chunks are emitted.
+- Invalid schemas return HTTP `400`; model responses that still fail validation return HTTP `422`.
 
 ---
 

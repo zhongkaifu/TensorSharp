@@ -752,50 +752,118 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
 
     var openaiTools = ParseOpenAITools(body);
     bool openaiThink = body.TryGetProperty("think", out var oaiThinkProp) && oaiThinkProp.GetBoolean();
+    if (!OpenAIResponseFormatParser.TryParse(body, out StructuredOutputFormat responseFormat, out string responseFormatError))
+    {
+        ctx.Response.StatusCode = 400;
+        await ctx.Response.WriteAsJsonAsync(new { error = new { message = responseFormatError, type = "invalid_request_error" } });
+        return;
+    }
+
+    if (responseFormat != null)
+    {
+        if (openaiThink)
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = "response_format cannot be combined with think=true", type = "invalid_request_error" } });
+            return;
+        }
+
+        if (openaiTools != null && openaiTools.Count > 0)
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = "response_format cannot be combined with tools", type = "invalid_request_error" } });
+            return;
+        }
+
+        var schemaValidation = StructuredOutputValidator.ValidateSchema(responseFormat);
+        if (!schemaValidation.IsValid)
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new
+            {
+                error = new
+                {
+                    message = schemaValidation.ErrorMessage,
+                    type = "invalid_request_error",
+                    details = schemaValidation.Errors
+                }
+            });
+            return;
+        }
+    }
+
+    var inferenceMessages = StructuredOutputPrompt.Apply(messages, responseFormat);
 
     using var ticket = queue.Enqueue(ctx.RequestAborted);
 
     if (stream)
     {
-        ctx.Response.ContentType = "text/event-stream";
-        ctx.Response.Headers["Cache-Control"] = "no-cache";
-
-        while (!ticket.IsReady)
+        bool structuredStream = responseFormat != null;
+        if (!structuredStream)
         {
-            var queueResp = new { id = requestId, @object = "chat.completion.chunk", model = modelName,
-                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                choices = new[] { new { index = 0, delta = new { role = "assistant", content = "" },
-                    finish_reason = (string)null } },
-                queue_position = ticket.Position, queue_pending = queue.PendingCount };
-            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(queueResp)}\n\n", ctx.RequestAborted);
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-            await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+
+            while (!ticket.IsReady)
+            {
+                var queueResp = new
+                {
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    model = modelName,
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    choices = new[] { new { index = 0, delta = new { role = "assistant", content = "" }, finish_reason = (string)null } },
+                    queue_position = ticket.Position,
+                    queue_pending = queue.PendingCount
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(queueResp)}\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                await ticket.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+        }
+        else
+        {
+            await ticket.WaitUntilReadyAsync();
         }
 
         if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
         {
-            var errChunk = new { id = requestId, @object = "chat.completion.chunk", model = modelName,
-                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                choices = new[] { new { index = 0, delta = new { content = $"Error: model '{modelName}' not found" },
-                    finish_reason = "stop" } } };
-            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(errChunk)}\n\ndata: [DONE]\n\n", ctx.RequestAborted);
+            if (structuredStream)
+            {
+                ctx.Response.StatusCode = 404;
+                await ctx.Response.WriteAsJsonAsync(new { error = new { message = $"model '{modelName}' not found", type = "invalid_request_error" } });
+            }
+            else
+            {
+                var errChunk = new
+                {
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    model = modelName,
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    choices = new[] { new { index = 0, delta = new { content = $"Error: model '{modelName}' not found" }, finish_reason = "stop" } }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(errChunk)}\n\ndata: [DONE]\n\n", ctx.RequestAborted);
+            }
             return;
         }
 
         bool useOaiStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0);
+        bool bufferFullResponse = structuredStream || useOaiStreamParser;
         var oaiStreamSb = new StringBuilder();
 
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+            in svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
                 openaiTools, openaiThink))
         {
             if (!done)
             {
-                if (useOaiStreamParser)
+                if (bufferFullResponse)
                 {
                     oaiStreamSb.Append(piece);
                     continue;
                 }
+
                 var chunk = new
                 {
                     id = requestId,
@@ -814,91 +882,158 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                 };
                 await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                continue;
+            }
+
+            if (structuredStream)
+            {
+                var normalized = StructuredOutputValidator.NormalizeOutput(oaiStreamSb.ToString(), responseFormat);
+                if (!normalized.IsValid)
+                {
+                    ctx.Response.StatusCode = 422;
+                    await ctx.Response.WriteAsJsonAsync(new
+                    {
+                        error = new
+                        {
+                            message = normalized.ErrorMessage,
+                            type = "invalid_response_error",
+                            details = normalized.Errors
+                        }
+                    });
+                    return;
+                }
+
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers["Cache-Control"] = "no-cache";
+
+                var contentChunk = new
+                {
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    model = svc.LoadedModelName,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { role = "assistant", content = normalized.NormalizedContent },
+                            finish_reason = (string)null
+                        }
+                    }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n", ctx.RequestAborted);
+
+                var endChunk = new
+                {
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    model = svc.LoadedModelName,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { role = (string)null, content = (string)null },
+                            finish_reason = "stop"
+                        }
+                    },
+                    usage = new
+                    {
+                        prompt_tokens = promptTokens,
+                        completion_tokens = evalTokens,
+                        total_tokens = promptTokens + evalTokens
+                    }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(endChunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                continue;
+            }
+
+            if (useOaiStreamParser)
+            {
+                var streamParser = OutputParserFactory.Create(svc.Architecture);
+                streamParser.Init(openaiThink, openaiTools);
+                var parsed = streamParser.Add(oaiStreamSb.ToString(), true);
+                string finReason = (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0) ? "tool_calls" : "stop";
+
+                if (!string.IsNullOrEmpty(parsed.Content))
+                {
+                    var contentChunk = new
+                    {
+                        id = requestId,
+                        @object = "chat.completion.chunk",
+                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        model = svc.LoadedModelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta = new { role = (string)null, content = parsed.Content },
+                                finish_reason = (string)null
+                            }
+                        }
+                    };
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+
+                var endChunk = new
+                {
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    model = svc.LoadedModelName,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { role = (string)null, content = (string)null },
+                            finish_reason = finReason
+                        }
+                    },
+                    usage = new
+                    {
+                        prompt_tokens = promptTokens,
+                        completion_tokens = evalTokens,
+                        total_tokens = promptTokens + evalTokens
+                    }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(endChunk)}\n\n", ctx.RequestAborted);
             }
             else
             {
-                if (useOaiStreamParser)
+                var chunk = new
                 {
-                    var streamParser = OutputParserFactory.Create(svc.Architecture);
-                    streamParser.Init(openaiThink, openaiTools);
-                    var parsed = streamParser.Add(oaiStreamSb.ToString(), true);
-                    string finReason = (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0) ? "tool_calls" : "stop";
-
-                    if (!string.IsNullOrEmpty(parsed.Content))
+                    id = requestId,
+                    @object = "chat.completion.chunk",
+                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    model = svc.LoadedModelName,
+                    choices = new[]
                     {
-                        var contentChunk = new
+                        new
                         {
-                            id = requestId,
-                            @object = "chat.completion.chunk",
-                            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                            model = svc.LoadedModelName,
-                            choices = new[]
-                            {
-                                new
-                                {
-                                    index = 0,
-                                    delta = new { role = (string)null, content = parsed.Content },
-                                    finish_reason = (string)null
-                                }
-                            }
-                        };
-                        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n", ctx.RequestAborted);
-                        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                            index = 0,
+                            delta = new { role = (string)null, content = (string)null },
+                            finish_reason = "stop"
+                        }
+                    },
+                    usage = new
+                    {
+                        prompt_tokens = promptTokens,
+                        completion_tokens = evalTokens,
+                        total_tokens = promptTokens + evalTokens
                     }
-
-                    var endChunk = new
-                    {
-                        id = requestId,
-                        @object = "chat.completion.chunk",
-                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        model = svc.LoadedModelName,
-                        choices = new[]
-                        {
-                            new
-                            {
-                                index = 0,
-                                delta = new { role = (string)null, content = (string)null },
-                                finish_reason = finReason
-                            }
-                        },
-                        usage = new
-                        {
-                            prompt_tokens = promptTokens,
-                            completion_tokens = evalTokens,
-                            total_tokens = promptTokens + evalTokens
-                        }
-                    };
-                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(endChunk)}\n\n", ctx.RequestAborted);
-                }
-                else
-                {
-                    var chunk = new
-                    {
-                        id = requestId,
-                        @object = "chat.completion.chunk",
-                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                        model = svc.LoadedModelName,
-                        choices = new[]
-                        {
-                            new
-                            {
-                                index = 0,
-                                delta = new { role = (string)null, content = (string)null },
-                                finish_reason = "stop"
-                            }
-                        },
-                        usage = new
-                        {
-                            prompt_tokens = promptTokens,
-                            completion_tokens = evalTokens,
-                            total_tokens = promptTokens + evalTokens
-                        }
-                    };
-                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
-                }
-                await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
-                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
             }
+
+            await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         }
     }
     else
@@ -916,7 +1051,7 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
         int promptTokens = 0, evalTokens = 0;
 
         await foreach (var (piece, done, pt, et, tn, pn, en)
-            in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
+            in svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
                 openaiTools, openaiThink))
         {
             if (!done)
@@ -929,7 +1064,27 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
         object responseMessage;
         string finishReason = "stop";
 
-        if (useOaiParser)
+        if (responseFormat != null)
+        {
+            var normalized = StructuredOutputValidator.NormalizeOutput(rawOutput, responseFormat);
+            if (!normalized.IsValid)
+            {
+                ctx.Response.StatusCode = 422;
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = new
+                    {
+                        message = normalized.ErrorMessage,
+                        type = "invalid_response_error",
+                        details = normalized.Errors
+                    }
+                });
+                return;
+            }
+
+            responseMessage = new { role = "assistant", content = normalized.NormalizedContent };
+        }
+        else if (useOaiParser)
         {
             var parser = OutputParserFactory.Create(svc.Architecture);
             parser.Init(openaiThink, openaiTools);

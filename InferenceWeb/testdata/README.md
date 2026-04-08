@@ -27,16 +27,17 @@ python3 test_multiturn.py
 | 3 | Non-streaming | Ollama `/api/chat/ollama` | 4 | Non-streaming JSON responses, math follow-ups |
 | 4 | Streaming metrics | Ollama `/api/chat/ollama` | 3 | NDJSON streaming, `done_reason`, `eval_count`, `total_duration` |
 | 5 | OpenAI streaming | `/v1/chat/completions` | 4-5 | SSE chunks, `delta.content`, `finish_reason`, `[DONE]` |
-| 6 | OpenAI non-streaming | `/v1/chat/completions` | 4 | Full JSON response, `choices[0].message.content` |
-| 7 | System message + long | Web UI `/api/chat` | 8 | System prompt persistence over many turns |
-| 8 | Queue status | `/api/queue/status` | - | `busy`, `pending_requests`, `total_processed` fields |
-| 9 | Concurrent requests | Web UI `/api/chat` | - | FIFO queue handles 3 simultaneous requests |
-| 10 | Thinking mode | Ollama `/api/chat/ollama` | 3 | `think: true` parameter, multi-turn with reasoning |
-| 11 | Long conversation | Ollama `/api/chat/ollama` | 12 | Stress test — 25 messages total |
-| 12 | Mixed API | Ollama + OpenAI | 3 | Same conversation across different API formats |
-| 13 | Error handling | All | - | Missing fields return 400, empty messages handled |
-| 14 | Tool calls | Ollama `/api/chat/ollama` | 3 | Multi-turn with tool definitions |
-| 15 | Abort | Web UI `/api/chat` | 1 | Mid-generation abort, queue release after abort |
+| 6 | Structured outputs | `/v1/chat/completions` | 1 | `response_format.json_schema`, JSON validation, required keys |
+| 7 | OpenAI non-streaming | `/v1/chat/completions` | 4 | Full JSON response, `choices[0].message.content` |
+| 8 | System message + long | Web UI `/api/chat` | 8 | System prompt persistence over many turns |
+| 9 | Queue status | `/api/queue/status` | - | `busy`, `pending_requests`, `total_processed` fields |
+| 10 | Concurrent requests | Web UI `/api/chat` | - | FIFO queue handles 3 simultaneous requests |
+| 11 | Thinking mode | Ollama `/api/chat/ollama` | 3 | `think: true` parameter, multi-turn with reasoning |
+| 12 | Long conversation | Ollama `/api/chat/ollama` | 12 | Stress test - 25 messages total |
+| 13 | Mixed API | Ollama + OpenAI | 3 | Same conversation across different API formats |
+| 14 | Error handling | All | - | Missing fields return 400, invalid structured schemas rejected |
+| 15 | Tool calls | Ollama `/api/chat/ollama` | 3 | Multi-turn with tool definitions |
+| 16 | Abort | Web UI `/api/chat` | 1 | Mid-generation abort, queue release after abort |
 
 ## Options
 
@@ -69,5 +70,6 @@ python3 test_multiturn.py --max-tokens 120                      # longer respons
 - **Streaming correctness**: Tokens accumulate correctly across chunks
 - **Queue behavior**: Concurrent requests are serialized, queue status is accurate
 - **Error handling**: Invalid requests return proper HTTP error codes
+- **Structured outputs**: OpenAI-style `response_format` schemas are validated and enforced
 - **Abort support**: Mid-generation cancellation works and releases the queue
 - **Metrics**: Timing and token count metrics are present in done events
