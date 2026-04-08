@@ -7,6 +7,32 @@ namespace InferenceWeb.Tests;
 public class StructuredOutputTests
 {
     [Fact]
+    public void Qwen35NoThinkingTemplateKeepsPriorAnswerAsNextTurnPrefix()
+    {
+        const string jinjaTemplate = "{{ 'from-jinja' }}";
+
+        var turn1 = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "What is the tallest mountain in the world?" }
+        };
+        string renderedTurn1 = ChatTemplate.RenderFromGgufTemplate(
+            jinjaTemplate, turn1, addGenerationPrompt: true, architecture: "qwen35", enableThinking: false);
+
+        const string answer = "Mount Everest";
+        var turn2 = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "What is the tallest mountain in the world?" },
+            new() { Role = "assistant", Content = answer },
+            new() { Role = "user", Content = "How tall is it in meters?" }
+        };
+        string renderedTurn2 = ChatTemplate.RenderFromGgufTemplate(
+            jinjaTemplate, turn2, addGenerationPrompt: true, architecture: "qwen35", enableThinking: false);
+
+        Assert.DoesNotContain("from-jinja", renderedTurn1, StringComparison.Ordinal);
+        Assert.StartsWith(renderedTurn1 + answer, renderedTurn2, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ParserAcceptsDocumentedChatCompletionsJsonSchemaShape()
     {
         using var body = JsonDocument.Parse("""

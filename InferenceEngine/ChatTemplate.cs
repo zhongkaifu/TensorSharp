@@ -151,14 +151,23 @@ namespace InferenceEngine
                 if (msg.Role == "assistant")
                 {
                     sb.Append("<|im_start|>assistant\n");
+                    var (reasoningContent, content) = SplitQwen35AssistantContent(msg);
+                    if (!enableThinking || !string.IsNullOrEmpty(reasoningContent))
+                    {
+                        sb.Append("<think>\n");
+                        if (!string.IsNullOrEmpty(reasoningContent))
+                            sb.Append(reasoningContent);
+                        sb.Append("\n</think>\n\n");
+                    }
+
                     if (msg.ToolCalls != null && msg.ToolCalls.Count > 0)
                     {
-                        if (!string.IsNullOrEmpty(msg.Content))
-                            sb.Append(msg.Content);
+                        if (!string.IsNullOrEmpty(content))
+                            sb.Append(content);
                         for (int j = 0; j < msg.ToolCalls.Count; j++)
                         {
                             var tc = msg.ToolCalls[j];
-                            if (j == 0 && !string.IsNullOrWhiteSpace(msg.Content))
+                            if (j == 0 && !string.IsNullOrWhiteSpace(content))
                                 sb.Append("\n\n");
                             else if (j > 0)
                                 sb.Append("\n");
@@ -177,7 +186,7 @@ namespace InferenceEngine
                     }
                     else
                     {
-                        sb.Append(msg.Content ?? "");
+                        sb.Append(content);
                     }
                     if (!prefill)
                         sb.Append("<|im_end|>\n");
@@ -213,6 +222,28 @@ namespace InferenceEngine
                 }
             }
             return sb.ToString();
+        }
+
+        private static (string reasoningContent, string content) SplitQwen35AssistantContent(ChatMessage msg)
+        {
+            string content = msg?.Content ?? "";
+            string reasoningContent = msg?.Thinking ?? "";
+
+            if (!string.IsNullOrEmpty(reasoningContent))
+                return (reasoningContent.Trim(), content);
+
+            int closeIdx = content.IndexOf("</think>", StringComparison.Ordinal);
+            if (closeIdx < 0)
+                return ("", content);
+
+            int openIdx = content.LastIndexOf("<think>", closeIdx, StringComparison.Ordinal);
+            if (openIdx < 0)
+                return ("", content);
+
+            int reasoningStart = openIdx + "<think>".Length;
+            reasoningContent = content.Substring(reasoningStart, closeIdx - reasoningStart).Trim();
+            content = content.Substring(closeIdx + "</think>".Length).TrimStart('\r', '\n');
+            return (reasoningContent, content);
         }
 
         private static Dictionary<string, object> BuildToolParamsDict(ToolFunction tool)
@@ -286,6 +317,9 @@ namespace InferenceEngine
             bool addGenerationPrompt = true, string architecture = null,
             List<ToolFunction> tools = null, bool enableThinking = false)
         {
+            if (IsQwen35Family(architecture) && !enableThinking)
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
@@ -324,6 +358,15 @@ namespace InferenceEngine
             }
 
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+        }
+
+        private static bool IsQwen35Family(string architecture)
+        {
+            return architecture == "qwen35" ||
+                   architecture == "qwen35moe" ||
+                   architecture == "qwen3next" ||
+                   architecture == "qwen3vl" ||
+                   architecture == "qwen3vlmoe";
         }
 
         private static Dictionary<string, object> BuildJinja2Context(
