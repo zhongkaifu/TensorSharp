@@ -101,7 +101,9 @@ namespace ggml_pool
     }
 }
 
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(_WIN32)
+#define TSG_EXPORT extern "C" __declspec(dllexport)
+#elif defined(__clang__) || defined(__GNUC__)
 #define TSG_EXPORT extern "C" __attribute__((visibility("default")))
 #else
 #define TSG_EXPORT extern "C"
