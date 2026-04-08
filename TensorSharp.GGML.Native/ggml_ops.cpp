@@ -727,13 +727,21 @@ namespace
 
     bool can_map_m2_direct(const TensorView2DDesc& desc)
     {
+        // create_direct_m2_binding() remaps M2 so ggml sees rows in ne0 and columns in ne1.
+        // The resulting nb1 becomes the GEMM leading dimension on CUDA, so it must be at
+        // least the row count even when the source is a single-column view.
         return desc.stride0 == 1 &&
+            desc.stride1 >= desc.dim0 &&
             is_non_overlapping_fast_to_slow<2>({ desc.dim0, desc.dim1 }, { desc.stride0, desc.stride1 });
     }
 
     bool can_map_m2_direct(const TensorView3DDesc& desc)
     {
+        // create_direct_m2_binding() remaps batched M2 to [rows, cols, batch].
+        // For the CUDA batched GEMM fast path, nb1/nb0 becomes lda, so the stride between
+        // columns must be at least the logical row count.
         return desc.stride1 == 1 &&
+            desc.stride2 >= desc.dim1 &&
             is_non_overlapping_fast_to_slow<3>({ desc.dim1, desc.dim2, desc.dim0 }, { desc.stride1, desc.stride2, desc.stride0 });
     }
 

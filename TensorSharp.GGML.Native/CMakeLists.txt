@@ -93,4 +93,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
     target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
+
+    add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
+    target_include_directories(GgmlOpsAddmmVectorTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+    )
+    target_link_libraries(GgmlOpsAddmmVectorTest PRIVATE GgmlOps)
 endif()
