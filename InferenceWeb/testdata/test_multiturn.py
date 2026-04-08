@@ -26,6 +26,7 @@ class Colors:
     RED = "\033[91m"
     YELLOW = "\033[93m"
     CYAN = "\033[96m"
+    MAGENTA = "\033[95m"
     RESET = "\033[0m"
     BOLD = "\033[1m"
 
@@ -52,6 +53,16 @@ class TestRunner:
     def header(self, title):
         bar = "=" * 60
         print(f"\n{Colors.CYAN}{bar}\n {title}\n{bar}{Colors.RESET}")
+
+    def model_output(self, label, content):
+        if content is None:
+            content = ""
+        print(f"{Colors.MAGENTA}[MODEL]{Colors.RESET} {label}")
+        if content:
+            for line in str(content).splitlines():
+                print(f"        {line}")
+        else:
+            print("        <empty>")
 
     def _post_json(self, path, payload):
         url = f"{self.base_url}{path}"
@@ -139,6 +150,7 @@ class TestRunner:
 
             content = self._extract_sse_tokens(events)
             has_done = self._has_done(events)
+            self.model_output(f"Turn {turn} output", content)
 
             if content and has_done:
                 self.ok(f"Turn {turn}: {len(content)} chars, done=True")
@@ -172,6 +184,7 @@ class TestRunner:
             "options": {"num_predict": self.max_tokens},
         })
         c1 = r1.get("message", {}).get("content", "")
+        self.model_output("Turn 1 output", c1)
         if c1 and r1.get("done"):
             self.ok(f"Turn 1: Established fact ({len(c1)} chars)")
             messages.append({"role": "assistant", "content": c1})
@@ -188,6 +201,7 @@ class TestRunner:
             "options": {"num_predict": self.max_tokens},
         })
         c2 = r2.get("message", {}).get("content", "")
+        self.model_output("Turn 2 output", c2)
         if c2:
             self.ok(f"Turn 2: Response received ({len(c2)} chars)")
             if "42" in c2:
@@ -208,6 +222,7 @@ class TestRunner:
             "options": {"num_predict": self.max_tokens},
         })
         c3 = r3.get("message", {}).get("content", "")
+        self.model_output("Turn 3 output", c3)
         if c3:
             self.ok(f"Turn 3: Additional context set ({len(c3)} chars)")
             messages.append({"role": "assistant", "content": c3})
@@ -224,6 +239,7 @@ class TestRunner:
             "options": {"num_predict": self.max_tokens},
         })
         c4 = r4.get("message", {}).get("content", "")
+        self.model_output("Turn 4 output", c4)
         if c4:
             self.ok(f"Turn 4: Multi-fact response ({len(c4)} chars)")
             checks = {"Charlie": False, "Berlin": False, "42": False}
@@ -272,6 +288,7 @@ class TestRunner:
             if choices:
                 content = choices[0].get("message", {}).get("content", "")
                 finish = choices[0].get("finish_reason", "")
+                self.model_output(f"Turn {turn} output", content)
                 if content:
                     self.ok(f"Turn {turn}: {len(content)} chars (finish={finish})")
                     messages.append({"role": "assistant", "content": content})
@@ -315,6 +332,7 @@ class TestRunner:
 
             content = self._extract_ndjson_content(items)
             done_items = [it for it in items if it.get("done") is True]
+            self.model_output(f"Turn {turn} output", content)
 
             if not content:
                 self.fail(f"Turn {turn}: No content")
@@ -384,6 +402,7 @@ class TestRunner:
                 except json.JSONDecodeError:
                     pass
 
+            self.model_output(f"Turn {turn} output", content)
             if content:
                 self.ok(f"Turn {turn}: {len(content)} chars (finish={finish_reason})")
                 messages.append({"role": "assistant", "content": content})
@@ -427,6 +446,7 @@ class TestRunner:
             return
 
         content = choices[0].get("message", {}).get("content", "")
+        self.model_output("Structured output", content)
         if not content:
             self.fail("Structured outputs: empty content")
             return
@@ -477,6 +497,7 @@ class TestRunner:
             })
 
             content = resp.get("message", {}).get("content", "")
+            self.model_output(f"Turn {turn} output", content)
             if content and resp.get("done"):
                 self.ok(f"Turn {turn}: {len(content)} chars")
                 messages.append({"role": "assistant", "content": content})
