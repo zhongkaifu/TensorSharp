@@ -392,10 +392,61 @@ class TestRunner:
                 break
 
     # =========================================================================
+    # Test: OpenAI structured outputs
+    # =========================================================================
+    def test_openai_structured_outputs(self):
+        self.header("Test 6: OpenAI Structured Outputs")
+
+        resp = self._post_json_body("/v1/chat/completions", {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "What is 2+3? Return the result."}
+            ],
+            "max_tokens": 80,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "math_result",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": ["string", "number"]},
+                            "confidence": {"type": ["string", "null"]}
+                        },
+                        "required": ["answer", "confidence"],
+                        "additionalProperties": False
+                    }
+                }
+            }
+        })
+
+        choices = resp.get("choices", [])
+        if not choices:
+            self.fail("Structured outputs: missing choices")
+            return
+
+        content = choices[0].get("message", {}).get("content", "")
+        if not content:
+            self.fail("Structured outputs: empty content")
+            return
+
+        try:
+            payload = json.loads(content)
+        except Exception as e:
+            self.fail(f"Structured outputs: invalid JSON ({e})")
+            return
+
+        if isinstance(payload, dict) and "answer" in payload and "confidence" in payload:
+            self.ok(f"Structured outputs: parsed JSON object with keys {sorted(payload.keys())}")
+        else:
+            self.fail(f"Structured outputs: unexpected payload {payload}")
+
+    # =========================================================================
     # Test: Very long conversation - 10 turns
     # =========================================================================
     def test_long_10turn(self):
-        self.header("Test 6: Long Conversation - 10 Turns (Ollama Non-Streaming)")
+        self.header("Test 7: Long Conversation - 10 Turns (Ollama Non-Streaming)")
 
         messages = [
             {"role": "system", "content": "You are a history expert. Keep answers to 1-2 sentences."}
@@ -447,7 +498,7 @@ class TestRunner:
     # Test: Error handling
     # =========================================================================
     def test_error_handling(self):
-        self.header("Test 7: Error Handling")
+        self.header("Test 8: Error Handling")
 
         self.log("Test: Missing model (Ollama)")
         try:
@@ -479,11 +530,43 @@ class TestRunner:
             else:
                 self.fail(f"Missing messages: expected 400, got {e.code}")
 
+        self.log("Test: Invalid structured output schema")
+        try:
+            req = Request(
+                f"{self.base_url}/v1/chat/completions",
+                data=json.dumps({
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "bad_schema",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "answer": {"type": "string"}
+                                },
+                                "required": ["answer"]
+                            }
+                        }
+                    }
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urlopen(req, timeout=10)
+            self.fail(f"Invalid structured schema: expected 400, got {resp.status}")
+        except HTTPError as e:
+            if e.code == 400:
+                self.ok("Invalid structured schema correctly returns 400")
+            else:
+                self.fail(f"Invalid structured schema: expected 400, got {e.code}")
+
     # =========================================================================
     # Test: Queue status
     # =========================================================================
     def test_queue_status(self):
-        self.header("Test 8: Queue Status")
+        self.header("Test 9: Queue Status")
 
         resp = self._post_json_body("/api/queue/status", {}) if False else None
         url = f"{self.base_url}/api/queue/status"
@@ -521,6 +604,7 @@ class TestRunner:
             self.test_openai_system_multiturn,
             self.test_ollama_streaming_metrics,
             self.test_openai_streaming_multiturn,
+            self.test_openai_structured_outputs,
             self.test_long_10turn,
             self.test_error_handling,
             self.test_queue_status,
