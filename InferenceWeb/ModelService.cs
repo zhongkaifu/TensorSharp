@@ -141,11 +141,12 @@ namespace InferenceWeb
             List<ToolFunction> tools = null, bool enableThinking = false)
         {
             string arch = _model.Config.Architecture;
+            var preparedHistory = PrepareHistoryForInference(history, arch);
             string rendered = ChatTemplate.RenderFromGgufTemplate(
-                _model.Config.ChatTemplate, history, addGenerationPrompt: true,
+                _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
-            var lastMsg = history.LastOrDefault(m => m.Role == "user");
+            var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
             bool hasMultimodal = HasMultimodalContent(lastMsg);
 
             float[] logits;
@@ -399,12 +400,13 @@ namespace InferenceWeb
                 new ChatMessage { Role = "user", Content = prompt, ImagePaths = imagePaths }
             };
 
+            var preparedMessages = PrepareHistoryForInference(messages, arch);
             string rendered = ChatTemplate.RenderFromGgufTemplate(
-                _model.Config.ChatTemplate, messages, addGenerationPrompt: true,
+                _model.Config.ChatTemplate, preparedMessages, addGenerationPrompt: true,
                 architecture: arch);
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            var lastMsg = messages[0];
+            var lastMsg = preparedMessages[0];
             if (lastMsg.ImagePaths != null && lastMsg.ImagePaths.Count > 0)
                 inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
 
@@ -465,11 +467,12 @@ namespace InferenceWeb
                 List<ToolFunction> tools = null, bool enableThinking = false)
         {
             string arch = _model.Config.Architecture;
+            var preparedHistory = PrepareHistoryForInference(history, arch);
             string rendered = ChatTemplate.RenderFromGgufTemplate(
-                _model.Config.ChatTemplate, history, addGenerationPrompt: true,
+                _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
-            var lastMsg = history.LastOrDefault(m => m.Role == "user");
+            var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
             bool hasMultimodal = HasMultimodalContent(lastMsg);
 
             int promptTokenCount;
@@ -557,6 +560,48 @@ namespace InferenceWeb
             }
 
             return false;
+        }
+
+        private static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)
+        {
+            if (history == null || history.Count == 0)
+                return history;
+
+            int lastUserIdx = history.FindLastIndex(m => m.Role == "user");
+            if (lastUserIdx < 0)
+                return history;
+
+            var normalized = NormalizeMessageForInference(history[lastUserIdx], arch);
+            if (ReferenceEquals(normalized, history[lastUserIdx]))
+                return history;
+
+            var prepared = new List<ChatMessage>(history);
+            prepared[lastUserIdx] = normalized;
+            return prepared;
+        }
+
+        private static ChatMessage NormalizeMessageForInference(ChatMessage msg, string arch)
+        {
+            int maxVideoFrames = MediaHelper.GetConfiguredMaxVideoFrames();
+            if (arch != "gemma4" || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
+                return msg;
+
+            var sampled = MediaHelper.SelectEvenlySpacedIndices(msg.ImagePaths.Count, maxVideoFrames)
+                .Select(i => msg.ImagePaths[i])
+                .ToList();
+
+            Console.WriteLine($"[video] Downsampled {msg.ImagePaths.Count} frames to {sampled.Count} evenly spaced frames for Gemma4 prefill stability.");
+
+            return new ChatMessage
+            {
+                Role = msg.Role,
+                Content = msg.Content,
+                ImagePaths = sampled,
+                AudioPaths = msg.AudioPaths != null ? new List<string>(msg.AudioPaths) : null,
+                IsVideo = msg.IsVideo,
+                ToolCalls = msg.ToolCalls,
+                Thinking = msg.Thinking
+            };
         }
 
         private static bool HasMultimodalContent(ChatMessage msg)

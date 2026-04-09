@@ -237,6 +237,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 |---|---|
 | `MODEL_DIR` | Directory containing GGUF model files |
 | `BACKEND` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
 | `PORT` | HTTP port (default: `5000`) |
 
 ### HTTP APIs

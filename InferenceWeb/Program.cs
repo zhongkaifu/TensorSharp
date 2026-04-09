@@ -1471,6 +1471,7 @@ static string ResolveModelPath(string modelName, string modelDir)
 }
 
 Console.WriteLine($"Model directory: {modelDir}");
+Console.WriteLine($"Video max frames: {MediaHelper.GetConfiguredMaxVideoFrames()}");
 Console.WriteLine("Starting InferenceWeb on http://localhost:5000");
 Console.WriteLine("API endpoints:");
 Console.WriteLine("  GET  /                         - Health check");
