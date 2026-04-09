@@ -237,6 +237,7 @@ MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
 |---|---|
 | `MODEL_DIR` | GGUF 模型文件所在目录 |
 | `BACKEND` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
+| `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
 | `PORT` | HTTP 端口（默认：`5000`） |
 
 ### HTTP API

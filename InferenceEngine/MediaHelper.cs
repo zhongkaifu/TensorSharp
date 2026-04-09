@@ -18,8 +18,26 @@ namespace InferenceEngine
 {
     public static class MediaHelper
     {
-        public static List<string> ExtractVideoFrames(string videoPath, int maxFrames = 8, double fps = 1.0)
+        public const int DefaultVideoMaxFrames = 4;
+
+        public static int GetConfiguredMaxVideoFrames(int fallback = DefaultVideoMaxFrames)
         {
+            string raw = Environment.GetEnvironmentVariable("VIDEO_MAX_FRAMES");
+            if (!string.IsNullOrWhiteSpace(raw) &&
+                int.TryParse(raw, out int parsed) &&
+                parsed > 0)
+            {
+                return parsed;
+            }
+
+            return fallback > 0 ? fallback : DefaultVideoMaxFrames;
+        }
+
+        public static List<string> ExtractVideoFrames(string videoPath, int maxFrames = 0, double fps = 1.0)
+        {
+            if (maxFrames <= 0)
+                maxFrames = GetConfiguredMaxVideoFrames();
+
             string tempDir = Path.Combine(Path.GetTempPath(), $"frames_{Guid.NewGuid():N}");
             Directory.CreateDirectory(tempDir);
 
@@ -33,14 +51,18 @@ namespace InferenceEngine
                 throw new Exception($"Invalid video: fps={videoFps}, frames={totalFrames}");
 
             int frameInterval = Math.Max(1, (int)Math.Round(videoFps / fps));
+            var candidateFrames = new List<int>();
+            for (int frameIdx = 0; frameIdx < totalFrames; frameIdx += frameInterval)
+                candidateFrames.Add(frameIdx);
+
+            var selectedPositions = SelectEvenlySpacedIndices(candidateFrames.Count, maxFrames);
 
             var frames = new List<string>();
             using var mat = new Mat();
 
-            for (int frameIdx = 0; frames.Count < maxFrames; frameIdx += frameInterval)
+            foreach (int pos in selectedPositions)
             {
-                if (frameIdx >= totalFrames)
-                    break;
+                int frameIdx = candidateFrames[pos];
 
                 capture.Set(VideoCaptureProperties.PosFrames, frameIdx);
                 if (!capture.Read(mat) || mat.Empty())
@@ -52,6 +74,42 @@ namespace InferenceEngine
             }
 
             return frames;
+        }
+
+        public static List<int> SelectEvenlySpacedIndices(int count, int maxCount)
+        {
+            var indices = new List<int>();
+            if (count <= 0 || maxCount <= 0)
+                return indices;
+
+            if (count <= maxCount)
+            {
+                for (int i = 0; i < count; i++)
+                    indices.Add(i);
+                return indices;
+            }
+
+            if (maxCount == 1)
+            {
+                indices.Add(count / 2);
+                return indices;
+            }
+
+            double step = (double)(count - 1) / (maxCount - 1);
+            int previous = -1;
+            for (int i = 0; i < maxCount; i++)
+            {
+                int idx = (int)Math.Round(i * step);
+                if (idx <= previous)
+                    idx = previous + 1;
+                if (idx >= count)
+                    idx = count - 1;
+
+                indices.Add(idx);
+                previous = idx;
+            }
+
+            return indices;
         }
 
         private static void SaveMatAsPng(Mat mat, string path)
