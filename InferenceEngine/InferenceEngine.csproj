@@ -12,7 +12,11 @@
   <ItemGroup>
     <PackageReference Include="NLayer" Version="1.16.0" />
     <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.ubuntu.24.04-x64" Version="4.13.0.18" />
     <PackageReference Include="OneWare.OpenCvSharp4.runtime.osx-arm64" Version="4.13.0.18" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.osx-x64" Version="4.13.0.18" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.win-x64" Version="4.13.0.18" />
     <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260330" />
+    <PackageReference Include="StbImageSharp" Version="2.30.15" />
   </ItemGroup>
 </Project>
