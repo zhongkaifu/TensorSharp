@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.IO;
+using StbImageSharp;
 
 namespace InferenceEngine
 {
@@ -52,14 +53,42 @@ namespace InferenceEngine
 
         internal static byte[] DecodeImageToRGBA(byte[] fileBytes, out int width, out int height)
         {
-            if (fileBytes.Length >= 8 && fileBytes[0] == 0x89 && fileBytes[1] == 0x50)
+            if (IsPng(fileBytes))
                 return DecodePNG(fileBytes, out width, out height);
 
-            if (fileBytes.Length >= 2 && fileBytes[0] == 0xFF && fileBytes[1] == 0xD8)
+            if (IsJpeg(fileBytes))
                 return DecodeJPEG(fileBytes, out width, out height);
 
             throw new NotSupportedException("Only PNG and JPEG image formats are supported");
         }
+
+        internal static (int width, int height) ReadImageDimensions(string imagePath)
+        {
+            byte[] fileBytes = File.ReadAllBytes(imagePath);
+
+            if (IsPng(fileBytes))
+                return ReadPngDimensions(fileBytes);
+
+            if (IsJpeg(fileBytes))
+            {
+                DecodeJPEG(fileBytes, out int width, out int height);
+                return (width, height);
+            }
+
+            throw new NotSupportedException("Only PNG and JPEG image formats are supported");
+        }
+
+        private static bool IsPng(byte[] fileBytes) =>
+            fileBytes.Length >= 8 &&
+            fileBytes[0] == 0x89 &&
+            fileBytes[1] == 0x50 &&
+            fileBytes[2] == 0x4E &&
+            fileBytes[3] == 0x47;
+
+        private static bool IsJpeg(byte[] fileBytes) =>
+            fileBytes.Length >= 2 &&
+            fileBytes[0] == 0xFF &&
+            fileBytes[1] == 0xD8;
 
         private static byte[] DecodePNG(byte[] data, out int width, out int height)
         {
@@ -179,6 +208,16 @@ namespace InferenceEngine
             return rgba;
         }
 
+        private static (int width, int height) ReadPngDimensions(byte[] data)
+        {
+            if (data.Length < 24 || !IsPng(data))
+                throw new InvalidDataException("Not a PNG file");
+
+            int width = (data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19];
+            int height = (data[20] << 24) | (data[21] << 16) | (data[22] << 8) | data[23];
+            return (width, height);
+        }
+
         private static byte PaethPredictor(byte a, byte b, byte c)
         {
             int p = a + b - c;
@@ -196,8 +235,17 @@ namespace InferenceEngine
 
         private static byte[] DecodeJPEG(byte[] data, out int width, out int height)
         {
-            throw new NotSupportedException(
-                "JPEG decoding not implemented. Please convert image to PNG format.");
+            try
+            {
+                ImageResult decoded = ImageResult.FromMemory(data, ColorComponents.RedGreenBlueAlpha);
+                width = decoded.Width;
+                height = decoded.Height;
+                return decoded.Data;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidDataException("Failed to decode JPEG image.", ex);
+            }
         }
 
         internal static byte[] CompositeOverWhite(byte[] rgba, int width, int height)

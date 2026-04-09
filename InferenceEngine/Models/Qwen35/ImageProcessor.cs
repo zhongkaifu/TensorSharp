@@ -8,7 +8,6 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
-using System.Buffers.Binary;
 using System.IO;
 
 namespace InferenceEngine
@@ -34,14 +33,9 @@ namespace InferenceEngine
             LongestEdge = longestEdge;
         }
 
-        public static (int width, int height) ReadPngDimensions(string path)
+        public static (int width, int height) ReadImageDimensions(string path)
         {
-            using var stream = File.OpenRead(path);
-            Span<byte> header = stackalloc byte[24];
-            stream.Read(header);
-            int width = BinaryPrimitives.ReadInt32BigEndian(header.Slice(16, 4));
-            int height = BinaryPrimitives.ReadInt32BigEndian(header.Slice(20, 4));
-            return (width, height);
+            return Gemma3ImageProcessor.ReadImageDimensions(path);
         }
 
         public (int height, int width) SmartResize(int height, int width)
@@ -79,7 +73,7 @@ namespace InferenceEngine
 
         public int ComputeImageTokenCount(string imagePath)
         {
-            var (width, height) = ReadPngDimensions(imagePath);
+            var (width, height) = ReadImageDimensions(imagePath);
             return ComputeImageTokenCount(height, width);
         }
 

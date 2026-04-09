@@ -628,7 +628,7 @@ namespace InferenceConsole
                         var tokenCounts = new int[imagePaths.Count];
                         for (int i = 0; i < imagePaths.Count; i++)
                         {
-                            var (width, height) = Qwen35ImageProcessor.ReadPngDimensions(imagePaths[i]);
+                            var (width, height) = Qwen35ImageProcessor.ReadImageDimensions(imagePaths[i]);
                             tokenCounts[i] = processor.ComputeImageTokenCount(height, width);
                             var (gridH, gridW) = processor.GetPatchGrid(height, width);
                             var (resizedH, resizedW) = processor.SmartResize(height, width);

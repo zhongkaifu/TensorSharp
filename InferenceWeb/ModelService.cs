@@ -290,7 +290,7 @@ namespace InferenceWeb
                     var tokenCounts = new int[msg.ImagePaths.Count];
                     for (int i = 0; i < msg.ImagePaths.Count; i++)
                     {
-                        var (w, h) = Qwen35ImageProcessor.ReadPngDimensions(msg.ImagePaths[i]);
+                        var (w, h) = Qwen35ImageProcessor.ReadImageDimensions(msg.ImagePaths[i]);
                         tokenCounts[i] = processor.ComputeImageTokenCount(h, w);
                     }
                     inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
