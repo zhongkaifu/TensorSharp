@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -526,6 +527,11 @@ namespace
         return static_cast<std::size_t>(desc.dim0) * desc.dim1 * sizeof(float);
     }
 
+    std::size_t logical_row_bytes(const TensorView2DDesc& desc)
+    {
+        return static_cast<std::size_t>(desc.dim1) * sizeof(float);
+    }
+
     std::size_t logical_bytes(const TensorView3DDesc& desc)
     {
         return static_cast<std::size_t>(desc.dim0) * desc.dim1 * desc.dim2 * sizeof(float);
@@ -544,6 +550,40 @@ namespace
     std::size_t logical_bytes(const TensorView4DDesc& desc)
     {
         return static_cast<std::size_t>(desc.ne0) * desc.ne1 * desc.ne2 * desc.ne3 * sizeof(float);
+    }
+
+    constexpr std::size_t k_ggml_cuda_max_copy_bytes = static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+    std::size_t raw_row_bytes(const TensorView2DDesc& desc)
+    {
+        TensorView2DDesc row_desc = desc;
+        row_desc.dim0 = 1;
+        return required_raw_bytes(row_desc);
+    }
+
+    TensorView2DDesc slice_rows_2d(const TensorView2DDesc& desc, int row_start, int row_count)
+    {
+        TensorView2DDesc slice = desc;
+        slice.data = static_cast<char*>(desc.data) +
+            static_cast<std::size_t>(row_start) *
+            static_cast<std::size_t>(desc.stride0) *
+            sizeof(float);
+        slice.dim0 = row_count;
+        slice.raw_bytes = static_cast<std::int64_t>(required_raw_bytes(slice));
+        return slice;
+    }
+
+    int limit_rows_for_cuda_copy(int current_limit, const TensorView2DDesc& desc)
+    {
+        if (current_limit <= 0)
+            return 0;
+
+        const std::size_t per_row_bytes = std::max(logical_row_bytes(desc), raw_row_bytes(desc));
+        if (per_row_bytes == 0 || per_row_bytes > k_ggml_cuda_max_copy_bytes)
+            return 0;
+
+        const int limit = static_cast<int>(k_ggml_cuda_max_copy_bytes / per_row_bytes);
+        return std::min(current_limit, std::max(1, limit));
     }
 
     bool validate_desc(const TensorView2DDesc& desc, const char* name)
@@ -857,7 +897,8 @@ namespace
         std::size_t bytes,
         ggml_backend_buffer_t& out_buffer,
         void*& out_addr,
-        bool& out_needs_upload)
+        bool& out_needs_upload,
+        enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
     {
         out_buffer = nullptr;
         out_addr = nullptr;
@@ -903,7 +944,7 @@ namespace
             if (out_buffer == nullptr)
                 return false;
 
-            ggml_backend_buffer_set_usage(out_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_set_usage(out_buffer, usage);
             out_addr = ggml_backend_buffer_get_base(out_buffer);
             out_needs_upload = true;
 
@@ -1306,6 +1347,56 @@ namespace
             return 0;
         }
 
+        if (g_backend_type == BACKEND_TYPE_CUDA)
+        {
+            const bool needs_chunking =
+                logical_bytes(result_desc) > k_ggml_cuda_max_copy_bytes ||
+                logical_bytes(m1_desc) > k_ggml_cuda_max_copy_bytes ||
+                static_cast<std::size_t>(result_desc.raw_bytes) > k_ggml_cuda_max_copy_bytes ||
+                static_cast<std::size_t>(m1_desc.raw_bytes) > k_ggml_cuda_max_copy_bytes ||
+                (beta != 0.0f && (
+                    logical_bytes(src_desc) > k_ggml_cuda_max_copy_bytes ||
+                    static_cast<std::size_t>(src_desc.raw_bytes) > k_ggml_cuda_max_copy_bytes));
+
+            if (needs_chunking)
+            {
+                int chunk_rows = rows;
+                chunk_rows = limit_rows_for_cuda_copy(chunk_rows, result_desc);
+                chunk_rows = limit_rows_for_cuda_copy(chunk_rows, m1_desc);
+                if (beta != 0.0f)
+                {
+                    chunk_rows = limit_rows_for_cuda_copy(chunk_rows, src_desc);
+                    if (src_desc.dim0 != rows)
+                        chunk_rows = (chunk_rows / src_desc.dim0) * src_desc.dim0;
+                }
+
+                if (chunk_rows <= 0)
+                {
+                    set_last_error("GGML CUDA addmm received a row slice larger than the backend copy limit.");
+                    return 0;
+                }
+
+                if (chunk_rows < rows)
+                {
+                    for (int row_start = 0; row_start < rows; row_start += chunk_rows)
+                    {
+                        const int row_count = std::min(chunk_rows, rows - row_start);
+                        const TensorView2DDesc result_slice = slice_rows_2d(result_desc, row_start, row_count);
+                        const TensorView2DDesc m1_slice = slice_rows_2d(m1_desc, row_start, row_count);
+                        const TensorView2DDesc src_slice = beta == 0.0f
+                            ? TensorView2DDesc{}
+                            : (src_desc.dim0 == rows ? slice_rows_2d(src_desc, row_start, row_count) : src_desc);
+
+                        if (!addmm_f32_impl(result_slice, src_slice, m1_slice, m2_desc, beta, alpha))
+                            return 0;
+                    }
+
+                    clear_last_error();
+                    return 1;
+                }
+            }
+        }
+
         if (!can_map_standard_view(result_desc))
         {
             set_last_error("Result tensor layout is not supported by the ggml addmm Metal path.");
@@ -1529,6 +1620,44 @@ namespace
         {
             set_last_error("Size mismatch: quantized weight dims don't match in addmm_quant.");
             return 0;
+        }
+
+        if (g_backend_type == BACKEND_TYPE_CUDA)
+        {
+            const bool needs_chunking =
+                logical_bytes(result_desc) > k_ggml_cuda_max_copy_bytes ||
+                logical_bytes(m1_desc) > k_ggml_cuda_max_copy_bytes ||
+                static_cast<std::size_t>(result_desc.raw_bytes) > k_ggml_cuda_max_copy_bytes ||
+                static_cast<std::size_t>(m1_desc.raw_bytes) > k_ggml_cuda_max_copy_bytes;
+
+            if (needs_chunking)
+            {
+                int chunk_rows = rows;
+                chunk_rows = limit_rows_for_cuda_copy(chunk_rows, result_desc);
+                chunk_rows = limit_rows_for_cuda_copy(chunk_rows, m1_desc);
+
+                if (chunk_rows <= 0)
+                {
+                    set_last_error("GGML CUDA addmm_quant received a row slice larger than the backend copy limit.");
+                    return 0;
+                }
+
+                if (chunk_rows < rows)
+                {
+                    for (int row_start = 0; row_start < rows; row_start += chunk_rows)
+                    {
+                        const int row_count = std::min(chunk_rows, rows - row_start);
+                        const TensorView2DDesc result_slice = slice_rows_2d(result_desc, row_start, row_count);
+                        const TensorView2DDesc m1_slice = slice_rows_2d(m1_desc, row_start, row_count);
+
+                        if (!addmm_quant_f32_impl(result_slice, m1_slice, m2_quant))
+                            return 0;
+                    }
+
+                    clear_last_error();
+                    return 1;
+                }
+            }
         }
 
         const std::size_t ctx_size = 1024 * 1024;
@@ -6960,6 +7089,11 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     g_host_buffer_cache.clear();
 }
 
+TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
+{
+    invalidate_cached_buffer(ptr);
+}
+
 TSG_EXPORT size_t TSGgml_RowSize(int ggml_type, int64_t ne)
 {
     if (ggml_type < 0 || ggml_type >= GGML_TYPE_COUNT || ne <= 0)
@@ -7014,6 +7148,85 @@ TSG_EXPORT int TSGgml_DequantizeToF32(int ggml_type, const void* src, int64_t nu
 // ============================================================================
 namespace
 {
+    std::size_t kv_cache_bytes(int kv_heads, int cache_size, int head_dim)
+    {
+        return static_cast<std::size_t>(kv_heads) *
+            static_cast<std::size_t>(cache_size) *
+            static_cast<std::size_t>(head_dim) *
+            sizeof(float);
+    }
+
+    ggml_tensor* view_kv_cache_window(
+        ggml_context* ctx,
+        ggml_tensor* cache,
+        int head_dim,
+        int cache_size,
+        int kv_heads,
+        int start_idx,
+        int length)
+    {
+        if (ctx == nullptr || cache == nullptr || head_dim <= 0 || cache_size <= 0 || kv_heads <= 0 || length <= 0)
+            return nullptr;
+
+        start_idx %= cache_size;
+        if (start_idx < 0)
+            start_idx += cache_size;
+
+        const std::size_t nb1 = static_cast<std::size_t>(head_dim) * sizeof(float);
+        const std::size_t nb2 = static_cast<std::size_t>(cache_size) * static_cast<std::size_t>(head_dim) * sizeof(float);
+
+        if (start_idx + length <= cache_size)
+        {
+            return ggml_view_3d(
+                ctx,
+                cache,
+                head_dim,
+                length,
+                kv_heads,
+                nb1,
+                nb2,
+                static_cast<std::size_t>(start_idx) * static_cast<std::size_t>(head_dim) * sizeof(float));
+        }
+
+        const int tail_length = cache_size - start_idx;
+        const int head_length = length - tail_length;
+        ggml_tensor* tail = ggml_view_3d(
+            ctx,
+            cache,
+            head_dim,
+            tail_length,
+            kv_heads,
+            nb1,
+            nb2,
+            static_cast<std::size_t>(start_idx) * static_cast<std::size_t>(head_dim) * sizeof(float));
+        ggml_tensor* head = ggml_view_3d(ctx, cache, head_dim, head_length, kv_heads, nb1, nb2, 0);
+        if (tail == nullptr || head == nullptr)
+            return nullptr;
+
+        return ggml_concat(ctx, tail, head, 1);
+    }
+
+    void write_flat_kv_to_host_cache(
+        float* cache_data,
+        const float* flat_data,
+        int kv_heads,
+        int cache_size,
+        int head_dim,
+        int cache_pos)
+    {
+        if (cache_data == nullptr || flat_data == nullptr || kv_heads <= 0 || cache_size <= 0 || head_dim <= 0)
+            return;
+
+        const std::size_t head_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
+        for (int h = 0; h < kv_heads; ++h)
+        {
+            std::memcpy(
+                cache_data + static_cast<std::size_t>(h) * cache_size * head_dim + static_cast<std::size_t>(cache_pos) * head_dim,
+                flat_data + static_cast<std::size_t>(h) * head_dim,
+                head_bytes);
+        }
+    }
+
     int transformer_layer_decode_impl(
         float* hidden_data, int hidden_size,
         float* attn_norm_data,
@@ -7037,23 +7250,6 @@ namespace
         const int totalSeqLen = position + 1;
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-        // Create contiguous copies of cached KV (strided cache → contiguous buffer)
-        std::vector<float> k_cached_buf, v_cached_buf;
-        if (position > 0)
-        {
-            k_cached_buf.resize(static_cast<std::size_t>(position) * kDim);
-            v_cached_buf.resize(static_cast<std::size_t>(position) * kDim);
-            for (int h = 0; h < num_kv_heads; h++)
-            {
-                std::memcpy(k_cached_buf.data() + h * position * head_dim,
-                            k_cache_data + h * max_seq_len * head_dim,
-                            static_cast<std::size_t>(position) * head_dim * sizeof(float));
-                std::memcpy(v_cached_buf.data() + h * position * head_dim,
-                            v_cache_data + h * max_seq_len * head_dim,
-                            static_cast<std::size_t>(position) * head_dim * sizeof(float));
-            }
-        }
-
         PooledContextHandle context;
         if (!context.init(2 * 1024 * 1024))
         {
@@ -7075,14 +7271,8 @@ namespace
         ggml_tensor* down_w  = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), down_ne0, down_ne1);
 
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-
-        ggml_tensor* k_cached_t = nullptr;
-        ggml_tensor* v_cached_t = nullptr;
-        if (position > 0)
-        {
-            k_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, position, num_kv_heads);
-            v_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, position, num_kv_heads);
-        }
+        ggml_tensor* k_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+        ggml_tensor* v_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
 
         // Output download targets
         ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
@@ -7130,18 +7320,24 @@ namespace
         ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope, 0, 2, 1, 3);
         ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_raw, head_dim, num_kv_heads, 1);
         ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
-        ggml_tensor* k_full;
-        ggml_tensor* v_full;
-        if (position > 0)
+        ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
+        ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+        ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
+            ctx,
+            k_cache_base,
+            k_write,
+            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
+        ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
+            ctx,
+            v_cache_base,
+            v_write,
+            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
+        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+        if (k_full == nullptr || v_full == nullptr)
         {
-            k_full = ggml_concat(ctx, k_cached_t, ggml_cont(ctx, k_rope_perm), 1);
-            v_full = ggml_concat(ctx, v_cached_t, ggml_cont(ctx, v_perm),       1);
-        }
-        else
-        {
-            k_full = ggml_cont(ctx, k_rope_perm);
-            v_full = ggml_cont(ctx, v_perm);
+            set_last_error("Failed to create KV cache views for transformer layer decode.");
+            return 0;
         }
 
         // 7. Flash attention (handles GQA broadcasting automatically)
@@ -7200,7 +7396,8 @@ namespace
         std::vector<HostBinding> upload_list;
         std::vector<BufferHandle> ephemeral_bufs;
 
-        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             if (t == nullptr || data == nullptr)
                 return;
 
@@ -7209,7 +7406,7 @@ namespace
                 ggml_backend_buffer_t buf = nullptr;
                 void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
                 {
                     ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
                     if (st == GGML_STATUS_SUCCESS)
@@ -7247,12 +7444,8 @@ namespace
         bind_or_mark(ffn_norm_w,  ffn_norm_data,  static_cast<std::size_t>(hidden_size) * sizeof(float), true);
         bind_or_mark(q_norm_w,    q_norm_data,    static_cast<std::size_t>(head_dim) * sizeof(float), true);
         bind_or_mark(k_norm_w,    k_norm_data,    static_cast<std::size_t>(head_dim) * sizeof(float), true);
-
-        if (position > 0)
-        {
-            bind_or_mark(k_cached_t, k_cached_buf.data(), k_cached_buf.size() * sizeof(float), false);
-            bind_or_mark(v_cached_t, v_cached_buf.data(), v_cached_buf.size() * sizeof(float), false);
-        }
+        bind_or_mark(k_cache_base, k_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        bind_or_mark(v_cache_base, v_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
         // Allocate backend buffer for remaining tensors (intermediates + non-host-ptr tensors)
         BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
@@ -7289,15 +7482,8 @@ namespace
         ggml_backend_tensor_get(k_new_out, k_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
         ggml_backend_tensor_get(v_new_out, v_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
 
-        for (int h = 0; h < num_kv_heads; h++)
-        {
-            std::memcpy(k_cache_data + h * max_seq_len * head_dim + position * head_dim,
-                        k_new_buf.data() + h * head_dim,
-                        static_cast<std::size_t>(head_dim) * sizeof(float));
-            std::memcpy(v_cache_data + h * max_seq_len * head_dim + position * head_dim,
-                        v_new_buf.data() + h * head_dim,
-                        static_cast<std::size_t>(head_dim) * sizeof(float));
-        }
+        write_flat_kv_to_host_cache(k_cache_data, k_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
+        write_flat_kv_to_host_cache(v_cache_data, v_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
 
         clear_last_error();
         return 1;
@@ -7377,33 +7563,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         const int totalSeqLen = position + 1;
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-        // Pre-copy cached KV for all layers
-        struct LayerKVCache {
-            std::vector<float> k_buf;
-            std::vector<float> v_buf;
-        };
-        std::vector<LayerKVCache> kv_caches(num_layers);
-        if (position > 0)
-        {
-            for (int l = 0; l < num_layers; l++)
-            {
-                auto& cache = kv_caches[l];
-                cache.k_buf.resize(static_cast<std::size_t>(position) * kDim);
-                cache.v_buf.resize(static_cast<std::size_t>(position) * kDim);
-                float* kc = static_cast<float*>(k_cache_arr[l]);
-                float* vc = static_cast<float*>(v_cache_arr[l]);
-                for (int h = 0; h < num_kv_heads; h++)
-                {
-                    std::memcpy(cache.k_buf.data() + h * position * head_dim,
-                                kc + h * max_seq_len * head_dim,
-                                static_cast<std::size_t>(position) * head_dim * sizeof(float));
-                    std::memcpy(cache.v_buf.data() + h * position * head_dim,
-                                vc + h * max_seq_len * head_dim,
-                                static_cast<std::size_t>(position) * head_dim * sizeof(float));
-                }
-            }
-        }
-
         // Large context for all layers
         const std::size_t ctx_size = 16 * 1024 * 1024;
         PooledContextHandle context;
@@ -7428,8 +7587,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_tensor* ffn_norm_w;
             ggml_tensor* gu_w;
             ggml_tensor* down_w;
-            ggml_tensor* k_cached_t;
-            ggml_tensor* v_cached_t;
+            ggml_tensor* k_cache_base;
+            ggml_tensor* v_cache_base;
             ggml_tensor* k_new_out;
             ggml_tensor* v_new_out;
             ggml_tensor* out_k_cpy;
@@ -7448,19 +7607,10 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             lt.ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
             lt.gu_w   = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gu_type), gu_ne0, gu_ne1);
             lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), down_ne0, down_ne1);
+            lt.k_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+            lt.v_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
             lt.k_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
             lt.v_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
-
-            if (position > 0)
-            {
-                lt.k_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, position, num_kv_heads);
-                lt.v_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, position, num_kv_heads);
-            }
-            else
-            {
-                lt.k_cached_t = nullptr;
-                lt.v_cached_t = nullptr;
-            }
         }
 
         // Build computation graph: chain all layers
@@ -7503,18 +7653,24 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope, 0, 2, 1, 3);
             ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_raw, head_dim, num_kv_heads, 1);
             ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
-            ggml_tensor* k_full;
-            ggml_tensor* v_full;
-            if (position > 0)
+            ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
+            ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+            ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
+                ctx,
+                lt.k_cache_base,
+                k_write,
+                static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
+            ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
+                ctx,
+                lt.v_cache_base,
+                v_write,
+                static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
+            ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+            if (k_full == nullptr || v_full == nullptr)
             {
-                k_full = ggml_concat(ctx, lt.k_cached_t, ggml_cont(ctx, k_rope_perm), 1);
-                v_full = ggml_concat(ctx, lt.v_cached_t, ggml_cont(ctx, v_perm), 1);
-            }
-            else
-            {
-                k_full = ggml_cont(ctx, k_rope_perm);
-                v_full = ggml_cont(ctx, v_perm);
+                set_last_error("Failed to create KV cache views for transformer model decode.");
+                return 0;
             }
 
             // Flash attention
@@ -7574,7 +7730,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         std::vector<HostBinding> upload_list;
         std::vector<BufferHandle> ephemeral_bufs;
 
-        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             if (t == nullptr || data == nullptr)
                 return;
 
@@ -7583,7 +7740,7 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
                 ggml_backend_buffer_t buf = nullptr;
                 void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
                 {
                     ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
                     if (st == GGML_STATUS_SUCCESS)
@@ -7624,12 +7781,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             bind_or_mark(lt.ffn_norm_w,  ffn_norm_arr[l],  static_cast<std::size_t>(hidden_size) * sizeof(float), true);
             bind_or_mark(lt.q_norm_w,    q_norm_arr[l],    static_cast<std::size_t>(head_dim) * sizeof(float), true);
             bind_or_mark(lt.k_norm_w,    k_norm_arr[l],    static_cast<std::size_t>(head_dim) * sizeof(float), true);
-
-            if (position > 0)
-            {
-                bind_or_mark(lt.k_cached_t, kv_caches[l].k_buf.data(), kv_caches[l].k_buf.size() * sizeof(float), false);
-                bind_or_mark(lt.v_cached_t, kv_caches[l].v_buf.data(), kv_caches[l].v_buf.size() * sizeof(float), false);
-            }
+            bind_or_mark(lt.k_cache_base, k_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            bind_or_mark(lt.v_cache_base, v_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }
 
         // Allocate backend buffer for intermediates
@@ -7669,17 +7822,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_backend_tensor_get(layers[l].k_new_out, k_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
             ggml_backend_tensor_get(layers[l].v_new_out, v_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
 
-            float* kc = static_cast<float*>(k_cache_arr[l]);
-            float* vc = static_cast<float*>(v_cache_arr[l]);
-            for (int h = 0; h < num_kv_heads; h++)
-            {
-                std::memcpy(kc + h * max_seq_len * head_dim + position * head_dim,
-                            k_new_buf.data() + h * head_dim,
-                            static_cast<std::size_t>(head_dim) * sizeof(float));
-                std::memcpy(vc + h * max_seq_len * head_dim + position * head_dim,
-                            v_new_buf.data() + h * head_dim,
-                            static_cast<std::size_t>(head_dim) * sizeof(float));
-            }
+            write_flat_kv_to_host_cache(static_cast<float*>(k_cache_arr[l]), k_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
+            write_flat_kv_to_host_cache(static_cast<float*>(v_cache_arr[l]), v_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
         }
 
         clear_last_error();
@@ -7753,7 +7897,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         for (int l = 0; l < num_layers; l++)
             if (head_dim_arr[l] > maxHd) maxHd = head_dim_arr[l];
 
-        // Prepare per-layer contiguous KV cache copies
+        // Prepare per-layer KV cache metadata
         struct LayerInfo {
             int hd;
             int kvHeads;
@@ -7764,8 +7908,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             bool isShared;
             int kvSource;
             int attendLen;
-            std::vector<float> k_buf;
-            std::vector<float> v_buf;
         };
         std::vector<LayerInfo> li(num_layers);
 
@@ -7784,55 +7926,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             info.cacheSize = cache_size_arr[kvSrc];
             info.isLocal = is_local_arr[kvSrc] != 0;
             info.attendLen = info.isLocal ? std::min(totalSeqLen, sliding_window) : totalSeqLen;
-        }
-
-        // Extract KV cache data: only for unique KV source layers (avoid duplicate copies)
-        std::unordered_map<int, int> kvSrcDone;
-        for (int l = 0; l < num_layers; l++)
-        {
-            auto& info = li[l];
-            int kvSrc = info.kvSource;
-            if (kvSrcDone.count(kvSrc)) continue;
-            kvSrcDone[kvSrc] = 1;
-
-            int windowLen = info.attendLen - 1;
-            if (windowLen <= 0) continue;
-
-            auto& srcInfo = li[kvSrc];
-            srcInfo.k_buf.resize(static_cast<std::size_t>(windowLen) * info.kDim);
-            srcInfo.v_buf.resize(static_cast<std::size_t>(windowLen) * info.kDim);
-            float* kc = static_cast<float*>(k_cache_arr[kvSrc]);
-            float* vc = static_cast<float*>(v_cache_arr[kvSrc]);
-
-            if (info.isLocal)
-            {
-                int start = (totalSeqLen > sliding_window) ? totalSeqLen - sliding_window : 0;
-                for (int h = 0; h < info.kvHeads; h++)
-                {
-                    float* kHead = kc + h * info.cacheSize * info.hd;
-                    float* vHead = vc + h * info.cacheSize * info.hd;
-                    for (int p = 0; p < windowLen; p++)
-                    {
-                        int cacheIdx = (start + p) % info.cacheSize;
-                        std::memcpy(srcInfo.k_buf.data() + (h * windowLen + p) * info.hd,
-                                   kHead + cacheIdx * info.hd, info.hd * sizeof(float));
-                        std::memcpy(srcInfo.v_buf.data() + (h * windowLen + p) * info.hd,
-                                   vHead + cacheIdx * info.hd, info.hd * sizeof(float));
-                    }
-                }
-            }
-            else
-            {
-                for (int h = 0; h < info.kvHeads; h++)
-                {
-                    std::memcpy(srcInfo.k_buf.data() + h * windowLen * info.hd,
-                               kc + h * info.cacheSize * info.hd,
-                               static_cast<std::size_t>(windowLen) * info.hd * sizeof(float));
-                    std::memcpy(srcInfo.v_buf.data() + h * windowLen * info.hd,
-                               vc + h * info.cacheSize * info.hd,
-                               static_cast<std::size_t>(windowLen) * info.hd * sizeof(float));
-                }
-            }
         }
 
         // Create GGML context
@@ -7906,12 +7999,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 lt.v_new_out = nullptr;
             }
 
-            int windowLen = info.attendLen - 1;
-            // For shared layers, reuse donor's cached_t (set below after all layers created)
-            if (!info.isShared && windowLen > 0)
+            if (!info.isShared)
             {
-                lt.k_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, windowLen, info.kvHeads);
-                lt.v_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, windowLen, info.kvHeads);
+                lt.k_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, info.cacheSize, info.kvHeads);
+                lt.v_cached_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, info.cacheSize, info.kvHeads);
             }
             else
             {
@@ -7946,7 +8037,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         // Build compute graph
         ggml_tensor* hidden = current;
 
-        // Track new K/V tensors produced by non-shared layers for concat with cached
+        // Track the active KV tensors produced by each donor layer.
+        std::vector<ggml_tensor*> layer_k_full(num_layers, nullptr);
+        std::vector<ggml_tensor*> layer_v_full(num_layers, nullptr);
+
+        // Track new K/V tensors produced by non-shared layers for download.
         std::vector<ggml_tensor*> layer_k_new(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_v_new(num_layers, nullptr);
 
@@ -7998,18 +8093,29 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope_t, 0, 2, 1, 3);
                 ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_normed, info.hd, info.kvHeads, 1);
                 ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
-                int windowLen = info.attendLen - 1;
-                if (windowLen > 0)
+                ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
+                ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+                const int cachePos = info.isLocal ? (position % info.cacheSize) : position;
+                const int activeStart = info.isLocal ? ((totalSeqLen - info.attendLen) % info.cacheSize) : 0;
+                ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
+                    ctx,
+                    lt.k_cached_t,
+                    k_write,
+                    static_cast<std::size_t>(cachePos) * static_cast<std::size_t>(info.hd) * sizeof(float));
+                ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
+                    ctx,
+                    lt.v_cached_t,
+                    v_write,
+                    static_cast<std::size_t>(cachePos) * static_cast<std::size_t>(info.hd) * sizeof(float));
+                k_full = view_kv_cache_window(ctx, k_cache_updated, info.hd, info.cacheSize, info.kvHeads, activeStart, info.attendLen);
+                v_full = view_kv_cache_window(ctx, v_cache_updated, info.hd, info.cacheSize, info.kvHeads, activeStart, info.attendLen);
+                if (k_full == nullptr || v_full == nullptr)
                 {
-                    k_full = ggml_concat(ctx, lt.k_cached_t, ggml_cont(ctx, k_rope_perm), 1);
-                    v_full = ggml_concat(ctx, lt.v_cached_t, ggml_cont(ctx, v_perm), 1);
+                    set_last_error("Failed to create Gemma4 KV cache views.");
+                    return 0;
                 }
-                else
-                {
-                    k_full = ggml_cont(ctx, k_rope_perm);
-                    v_full = ggml_cont(ctx, v_perm);
-                }
+                layer_k_full[l] = k_full;
+                layer_v_full[l] = v_full;
 
                 // Store new K/V refs for KV output
                 layer_k_new[l] = k_rope_t;
@@ -8030,40 +8136,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
                 // Use the donor layer's K/V (already computed earlier in the graph)
                 int donor = info.kvSource;
-                auto& donorInfo = li[donor];
-                int windowLen = info.attendLen - 1;
-
-                if (layer_k_new[donor] != nullptr && windowLen > 0)
+                k_full = layer_k_full[donor];
+                v_full = layer_v_full[donor];
+                if (k_full == nullptr || v_full == nullptr)
                 {
-                    // Donor's new K/V were produced - concat with cached
-                    ggml_tensor* dk_perm = ggml_permute(ctx, layer_k_new[donor], 0, 2, 1, 3);
-                    ggml_tensor* dv_1d = layer_v_new[donor];
-                    ggml_tensor* dv_3d = ggml_reshape_3d(ctx, dv_1d, donorInfo.hd, donorInfo.kvHeads, 1);
-                    ggml_tensor* dv_perm = ggml_permute(ctx, dv_3d, 0, 2, 1, 3);
-                    k_full = ggml_concat(ctx, lt.k_cached_t, ggml_cont(ctx, dk_perm), 1);
-                    v_full = ggml_concat(ctx, lt.v_cached_t, ggml_cont(ctx, dv_perm), 1);
-                }
-                else if (layer_k_new[donor] != nullptr)
-                {
-                    ggml_tensor* dk_perm = ggml_permute(ctx, layer_k_new[donor], 0, 2, 1, 3);
-                    ggml_tensor* dv_1d = layer_v_new[donor];
-                    ggml_tensor* dv_3d = ggml_reshape_3d(ctx, dv_1d, donorInfo.hd, donorInfo.kvHeads, 1);
-                    ggml_tensor* dv_perm = ggml_permute(ctx, dv_3d, 0, 2, 1, 3);
-                    k_full = ggml_cont(ctx, dk_perm);
-                    v_full = ggml_cont(ctx, dv_perm);
-                }
-                else if (windowLen > 0)
-                {
-                    k_full = lt.k_cached_t;
-                    v_full = lt.v_cached_t;
-                }
-                else
-                {
-                    // No cached data and no new data - should not happen
                     set_last_error("Shared layer has no KV data available.");
                     return 0;
                 }
             }
+
+            layer_k_full[l] = k_full;
+            layer_v_full[l] = v_full;
 
             // Manual attention: scores = softmax(K^T @ Q), output = V_T @ scores
             // Gemma4 uses QK-Norm (per-head RMSNorm on Q/K), so no 1/sqrt(d) scaling
@@ -8166,7 +8249,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         std::vector<HostBinding> upload_list;
         std::vector<BufferHandle> ephemeral_bufs;
 
-        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable) {
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             if (t == nullptr || data == nullptr) return;
 
             if (cacheable && bytes >= 4096)
@@ -8174,7 +8258,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 ggml_backend_buffer_t buf = nullptr;
                 void* addr = nullptr;
                 bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload))
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
                 {
                     ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
                     if (st == GGML_STATUS_SUCCESS)
@@ -8223,13 +8307,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
             if (!info.isShared)
             {
-                int windowLen = info.attendLen - 1;
-                if (windowLen > 0)
-                {
-                    auto& srcInfo = li[info.kvSource];
-                    bind_or_mark(lt.k_cached_t, srcInfo.k_buf.data(), srcInfo.k_buf.size() * sizeof(float), false);
-                    bind_or_mark(lt.v_cached_t, srcInfo.v_buf.data(), srcInfo.v_buf.size() * sizeof(float), false);
-                }
+                bind_or_mark(lt.k_cached_t, k_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                bind_or_mark(lt.v_cached_t, v_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             }
 
             if (lt.ple_gate_w != nullptr)
@@ -8291,24 +8370,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_backend_tensor_get(layers[l].v_new_out, v_new_buf.data(), 0,
                 static_cast<std::size_t>(info.kDim) * sizeof(float));
 
-            float* kc = static_cast<float*>(k_cache_arr[l]);
-            float* vc = static_cast<float*>(v_cache_arr[l]);
-
             int cachePos;
             if (info.isLocal)
                 cachePos = position % info.cacheSize;
             else
                 cachePos = position;
 
-            for (int h = 0; h < info.kvHeads; h++)
-            {
-                std::memcpy(kc + h * info.cacheSize * info.hd + cachePos * info.hd,
-                           k_new_buf.data() + h * info.hd,
-                           static_cast<std::size_t>(info.hd) * sizeof(float));
-                std::memcpy(vc + h * info.cacheSize * info.hd + cachePos * info.hd,
-                           v_new_buf.data() + h * info.hd,
-                           static_cast<std::size_t>(info.hd) * sizeof(float));
-            }
+            write_flat_kv_to_host_cache(static_cast<float*>(k_cache_arr[l]), k_new_buf.data(), info.kvHeads, info.cacheSize, info.hd, cachePos);
+            write_flat_kv_to_host_cache(static_cast<float*>(v_cache_arr[l]), v_new_buf.data(), info.kvHeads, info.cacheSize, info.hd, cachePos);
         }
 
         clear_last_error();

@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using StbImageSharp;
 
 namespace InferenceEngine
@@ -43,12 +44,7 @@ namespace InferenceEngine
             byte[] fileBytes = File.ReadAllBytes(imagePath);
             int origWidth, origHeight;
             byte[] rgba = DecodeImageToRGBA(fileBytes, out origWidth, out origHeight);
-
-            byte[] composited = CompositeOverWhite(rgba, origWidth, origHeight);
-
-            byte[] resized = BilinearResize(composited, origWidth, origHeight, ImageSize, ImageSize);
-
-            return PackChannelFirst(resized, ImageSize, ImageSize);
+            return ResizeRgbaToChannelFirstNormalized(rgba, origWidth, origHeight, ImageSize, ImageSize);
         }
 
         internal static byte[] DecodeImageToRGBA(byte[] fileBytes, out int width, out int height)
@@ -251,24 +247,30 @@ namespace InferenceEngine
         internal static byte[] CompositeOverWhite(byte[] rgba, int width, int height)
         {
             byte[] result = new byte[width * height * 4];
-            for (int i = 0; i < width * height; i++)
+            Parallel.For(0, height, y =>
             {
-                int a = rgba[i * 4 + 3];
-                if (a == 255)
+                int srcRow = y * width * 4;
+                for (int x = 0; x < width; x++)
                 {
-                    result[i * 4] = rgba[i * 4];
-                    result[i * 4 + 1] = rgba[i * 4 + 1];
-                    result[i * 4 + 2] = rgba[i * 4 + 2];
+                    int pixBase = srcRow + x * 4;
+                    int a = rgba[pixBase + 3];
+                    if (a == 255)
+                    {
+                        result[pixBase] = rgba[pixBase];
+                        result[pixBase + 1] = rgba[pixBase + 1];
+                        result[pixBase + 2] = rgba[pixBase + 2];
+                    }
+                    else
+                    {
+                        float alpha = a / 255f;
+                        result[pixBase] = (byte)(rgba[pixBase] * alpha + 255 * (1 - alpha));
+                        result[pixBase + 1] = (byte)(rgba[pixBase + 1] * alpha + 255 * (1 - alpha));
+                        result[pixBase + 2] = (byte)(rgba[pixBase + 2] * alpha + 255 * (1 - alpha));
+                    }
+
+                    result[pixBase + 3] = 255;
                 }
-                else
-                {
-                    float alpha = a / 255f;
-                    result[i * 4] = (byte)(rgba[i * 4] * alpha + 255 * (1 - alpha));
-                    result[i * 4 + 1] = (byte)(rgba[i * 4 + 1] * alpha + 255 * (1 - alpha));
-                    result[i * 4 + 2] = (byte)(rgba[i * 4 + 2] * alpha + 255 * (1 - alpha));
-                }
-                result[i * 4 + 3] = 255;
-            }
+            });
             return result;
         }
 
@@ -278,7 +280,7 @@ namespace InferenceEngine
             double xRatio = (double)srcW / dstW;
             double yRatio = (double)srcH / dstH;
 
-            for (int dy = 0; dy < dstH; dy++)
+            Parallel.For(0, dstH, dy =>
             {
                 double srcY = (dy + 0.5) * yRatio - 0.5;
                 int y0 = Math.Max(0, (int)srcY);
@@ -305,9 +307,60 @@ namespace InferenceEngine
                     }
                     result[(dy * dstW + dx) * 4 + 3] = 255;
                 }
-            }
+            });
 
             return result;
+        }
+
+        internal static float[] ResizeRgbaToChannelFirstNormalized(byte[] rgba, int srcW, int srcH, int dstW, int dstH)
+        {
+            int pixels = dstW * dstH;
+            float[] result = new float[3 * pixels];
+            double xRatio = (double)srcW / dstW;
+            double yRatio = (double)srcH / dstH;
+
+            Parallel.For(0, dstH, dy =>
+            {
+                double srcY = (dy + 0.5) * yRatio - 0.5;
+                int y0 = Math.Max(0, (int)srcY);
+                int y1 = Math.Min(srcH - 1, y0 + 1);
+                double fy = srcY - y0;
+
+                for (int dx = 0; dx < dstW; dx++)
+                {
+                    double srcX = (dx + 0.5) * xRatio - 0.5;
+                    int x0 = Math.Max(0, (int)srcX);
+                    int x1 = Math.Min(srcW - 1, x0 + 1);
+                    double fx = srcX - x0;
+
+                    int dstIdx = dy * dstW + dx;
+                    result[dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 0);
+                    result[pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 1);
+                    result[2 * pixels + dstIdx] = BilinearSampleNormalized(rgba, srcW, x0, y0, x1, y1, fx, fy, 2);
+                }
+            });
+
+            return result;
+        }
+
+        private static float BilinearSampleNormalized(byte[] rgba, int srcW, int x0, int y0, int x1, int y1,
+            double fx, double fy, int channel)
+        {
+            float v00 = CompositeChannelToNormalized(rgba, (y0 * srcW + x0) * 4, channel);
+            float v01 = CompositeChannelToNormalized(rgba, (y0 * srcW + x1) * 4, channel);
+            float v10 = CompositeChannelToNormalized(rgba, (y1 * srcW + x0) * 4, channel);
+            float v11 = CompositeChannelToNormalized(rgba, (y1 * srcW + x1) * 4, channel);
+
+            double v = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) +
+                       v10 * (1 - fx) * fy + v11 * fx * fy;
+            return Math.Clamp((float)v, -1f, 1f);
+        }
+
+        private static float CompositeChannelToNormalized(byte[] rgba, int pixelBase, int channel)
+        {
+            float alpha = rgba[pixelBase + 3] / 255f;
+            float composited = rgba[pixelBase + channel] * alpha + 255f * (1f - alpha);
+            return composited / 255f * 2f - 1f;
         }
 
         /// <summary>

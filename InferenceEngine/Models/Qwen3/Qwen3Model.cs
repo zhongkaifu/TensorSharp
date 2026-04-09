@@ -151,6 +151,8 @@ namespace InferenceEngine
             {
                 Ops.Fill(_kvCacheK[l], 0);
                 Ops.Fill(_kvCacheV[l], 0);
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;

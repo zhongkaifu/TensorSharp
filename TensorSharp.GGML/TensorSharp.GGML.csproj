@@ -34,7 +34,7 @@
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />
     <ProjectReference Include="..\TensorSharp\TensorSharp.csproj" />
   </ItemGroup>
-  <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="'$(GgmlNativeBuildScript)' != '' And ( !Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)') Or '$(GgmlNativeForceBuild)' == 'true' )">
+  <Target Name="BuildGgmlNative" BeforeTargets="BeforeBuild" Condition="'$(GgmlNativeBuildScript)' != ''">
     <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
   </Target>
   <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">

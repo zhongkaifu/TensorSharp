@@ -11,13 +11,16 @@ using System;
 using System.Collections.Generic;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.GGML;
 
 namespace InferenceEngine
 {
     public class Gemma3VisionEncoder : IDisposable
     {
         private readonly Dictionary<string, Tensor> _weights = new();
+        private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
+        private readonly bool _useNativeAttention;
 
         private readonly int _imageSize;
         private readonly int _patchSize;
@@ -35,6 +38,7 @@ namespace InferenceEngine
         public Gemma3VisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
+            _useNativeAttention = allocator is GgmlAllocator;
             var gguf = new GgufFile(mmProjPath);
 
             _imageSize = (int)gguf.GetUint32("clip.vision.image_size", 896);
@@ -219,7 +223,16 @@ namespace InferenceEngine
 
             float scale = 1f / MathF.Sqrt(headDim);
 
-            // Reshape [numPatches, hiddenSize] -> [numHeads, numPatches, headDim]
+            if (_useNativeAttention)
+            {
+                using var q4 = q.View(1, numPatches, _numHeads, headDim);
+                using var k4 = k.View(1, numPatches, _numHeads, headDim);
+                using var v4 = v.View(1, numPatches, _numHeads, headDim);
+                using var attn4 = Ops.ScaledDotProductAttention(null, q4, k4, v4, null, scale);
+                using var flat = attn4.View(numPatches, _hiddenSize);
+                return LinearForwardWithBias(flat, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+            }
+
             using var qReshaped = q.View(numPatches, _numHeads, headDim);
             using var kReshaped = k.View(numPatches, _numHeads, headDim);
             using var vReshaped = v.View(numPatches, _numHeads, headDim);
@@ -231,47 +244,28 @@ namespace InferenceEngine
             using var kHeads = Ops.NewContiguous(kT0);
             using var vHeads = Ops.NewContiguous(vT0);
 
-            // Batched Q @ K^T -> [numHeads, numPatches, numPatches]
             using var kT = kHeads.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
             Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
-
             Ops.Softmax(scores, scores);
 
-            // Batched softmax @ V -> [numHeads, numPatches, headDim]
             var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, headDim);
             Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
             scores.Dispose();
 
-            // Reshape back: [numHeads, numPatches, headDim] -> [numPatches, hiddenSize]
             using var transposed = attnOutput.Transpose(0, 1);
             using var contiguous = Ops.NewContiguous(transposed);
-            using var flat = contiguous.View(numPatches, _hiddenSize);
-            using var flatContig = Ops.NewContiguous(flat);
+            using var flatContig = contiguous.View(numPatches, _hiddenSize);
             attnOutput.Dispose();
 
             return LinearForwardWithBias(flatContig, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
         }
 
-        private unsafe Tensor VisionMLP(Tensor input, string prefix)
+        private Tensor VisionMLP(Tensor input, string prefix)
         {
             using var fc1Out = LinearForwardWithBias(input, $"{prefix}.ffn_down.weight", $"{prefix}.ffn_down.bias");
-
-            ApplyGELU(fc1Out);
-
+            Ops.GELU(fc1Out, fc1Out);
             return LinearForwardWithBias(fc1Out, $"{prefix}.ffn_up.weight", $"{prefix}.ffn_up.bias");
-        }
-
-        private unsafe void ApplyGELU(Tensor t)
-        {
-            float* ptr = GetFloatPtr(t);
-            int count = (int)t.ElementCount();
-            for (int i = 0; i < count; i++)
-            {
-                double x = ptr[i];
-                double cdf = 0.5 * (1.0 + Math.Tanh(Math.Sqrt(2.0 / Math.PI) * (x + 0.044715 * x * x * x)));
-                ptr[i] = (float)(x * cdf);
-            }
         }
 
         /// <summary>
@@ -354,91 +348,25 @@ namespace InferenceEngine
 
             Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
-
-            using var wT = weight.Transpose();
-            Ops.Addmm(result, 0, result, 1.0f, src, wT);
+            Ops.Addmm(result, 0, result, 1.0f, src, GetOrCreateTransposedWeight(weightName));
 
             contiguousInput?.Dispose();
 
             if (_weights.TryGetValue(biasName, out var bias))
-            {
-                float* rPtr = GetFloatPtr(result);
-                float* bPtr = GetFloatPtr(bias);
-                for (int s = 0; s < seqLen; s++)
-                {
-                    float* row = rPtr + s * outDim;
-                    for (int d = 0; d < outDim; d++)
-                        row[d] += bPtr[d];
-                }
-            }
+                Ops.Add(result, result, bias);
 
             return result;
         }
 
-        private unsafe Tensor LayerNormOp(Tensor input, string weightName, string biasName)
+        private Tensor LayerNormOp(Tensor input, string weightName, string biasName)
         {
-            int rows = (int)input.Sizes[0];
-            int dim = (int)input.Sizes[1];
-            var result = new Tensor(_allocator, DType.Float32, rows, dim);
-
-            float* src = GetFloatPtr(input);
-            float* dst = GetFloatPtr(result);
-            float* w = GetFloatPtr(_weights[weightName]);
-            float* b = _weights.ContainsKey(biasName) ? GetFloatPtr(_weights[biasName]) : null;
-
-            for (int r = 0; r < rows; r++)
-            {
-                float* srcRow = src + r * dim;
-                float* dstRow = dst + r * dim;
-
-                float mean = 0;
-                for (int i = 0; i < dim; i++)
-                    mean += srcRow[i];
-                mean /= dim;
-
-                float variance = 0;
-                for (int i = 0; i < dim; i++)
-                {
-                    float diff = srcRow[i] - mean;
-                    variance += diff * diff;
-                }
-                variance /= dim;
-
-                float invStd = 1f / MathF.Sqrt(variance + _eps);
-                for (int i = 0; i < dim; i++)
-                {
-                    float normalized = (srcRow[i] - mean) * invStd;
-                    dstRow[i] = w[i] * normalized + (b != null ? b[i] : 0f);
-                }
-            }
-
-            return result;
+            _weights.TryGetValue(biasName, out var bias);
+            return Ops.LayerNorm(null, input, _weights[weightName], bias, _eps);
         }
 
-        private unsafe Tensor RMSNormOp(Tensor input, string weightName)
+        private Tensor RMSNormOp(Tensor input, string weightName)
         {
-            int rows = (int)input.Sizes[0];
-            int dim = (int)input.Sizes[1];
-            var result = new Tensor(_allocator, DType.Float32, rows, dim);
-
-            float* src = GetFloatPtr(input);
-            float* dst = GetFloatPtr(result);
-            float* w = GetFloatPtr(_weights[weightName]);
-
-            for (int r = 0; r < rows; r++)
-            {
-                float* srcRow = src + r * dim;
-                float* dstRow = dst + r * dim;
-
-                float sumSq = 0;
-                for (int i = 0; i < dim; i++)
-                    sumSq += srcRow[i] * srcRow[i];
-                float rms = 1f / MathF.Sqrt(sumSq / dim + _eps);
-                for (int i = 0; i < dim; i++)
-                    dstRow[i] = w[i] * srcRow[i] * rms;
-            }
-
-            return result;
+            return Ops.RMSNorm(null, input, _weights[weightName], null, _eps);
         }
 
         private unsafe void DumpTensor(Tensor t, string label, int numRows)
@@ -466,8 +394,22 @@ namespace InferenceEngine
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
         }
 
+        private Tensor GetOrCreateTransposedWeight(string weightName)
+        {
+            if (_transposedWeights.TryGetValue(weightName, out var transposed))
+                return transposed;
+
+            using var weightViewT = _weights[weightName].Transpose();
+            transposed = Ops.NewContiguous(weightViewT);
+            _transposedWeights[weightName] = transposed;
+            return transposed;
+        }
+
         public void Dispose()
         {
+            foreach (var w in _transposedWeights.Values)
+                w.Dispose();
+            _transposedWeights.Clear();
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();

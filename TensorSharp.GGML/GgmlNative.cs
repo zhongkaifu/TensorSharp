@@ -416,6 +416,9 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_ClearHostBufferCache();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_InvalidateHostBuffer(IntPtr ptr);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern UIntPtr TSGgml_RowSize(int ggmlType, long ne);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -545,7 +548,7 @@ internal enum GgmlIndexReductionOp
                         GgmlBackendType.Cuda => "ggml-cuda",
                         _ => "ggml-cpu",
                     };
-                    throw new InvalidOperationException($"Failed to initialize {backendName}. {GetLastErrorMessage("Build the native GGML bridge and ensure the requested GGML backend is available.")}");
+                    throw new InvalidOperationException($"Failed to initialize {backendName}. {GetBackendAvailabilityHint(backendType)}");
                 }
             }
             catch (DllNotFoundException ex)
@@ -868,6 +871,12 @@ internal enum GgmlIndexReductionOp
             TSGgml_ClearHostBufferCache();
         }
 
+        public static void InvalidateHostBuffer(IntPtr ptr)
+        {
+            if (ptr != IntPtr.Zero)
+                TSGgml_InvalidateHostBuffer(ptr);
+        }
+
         /// <summary>Bytes for one row along ne[0]; 0 if type/shape invalid.</summary>
         internal static long RowSizeBytesOrZero(int ggmlType, long ne0)
         {
@@ -1007,6 +1016,25 @@ internal enum GgmlIndexReductionOp
             IntPtr errPtr = TSGgml_GetLastError();
             string message = errPtr == IntPtr.Zero ? null : Marshal.PtrToStringAnsi(errPtr);
             return string.IsNullOrWhiteSpace(message) ? fallback : message;
+        }
+
+        private static string GetBackendAvailabilityHint(GgmlBackendType backendType)
+        {
+            string defaultMessage = "Build the native GGML bridge and ensure the requested GGML backend is available.";
+            string backendMessage = GetLastErrorMessage(defaultMessage);
+
+            if (backendType == GgmlBackendType.Cuda && OperatingSystem.IsLinux())
+            {
+                const string rebuildHint = "Rebuild the native GGML bridge with CUDA enabled, for example: `bash TensorSharp.GGML.Native/build-linux.sh --cuda` or `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build`.";
+
+                if (string.IsNullOrWhiteSpace(backendMessage))
+                    return rebuildHint;
+
+                if (backendMessage.Contains("not available in this build", StringComparison.OrdinalIgnoreCase))
+                    return $"{backendMessage} {rebuildHint}";
+            }
+
+            return backendMessage;
         }
     }
 }

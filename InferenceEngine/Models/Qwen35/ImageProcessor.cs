@@ -91,12 +91,10 @@ namespace InferenceEngine
         {
             byte[] fileBytes = File.ReadAllBytes(imagePath);
             byte[] rgba = Gemma3ImageProcessor.DecodeImageToRGBA(fileBytes, out int origWidth, out int origHeight);
-            byte[] composited = Gemma3ImageProcessor.CompositeOverWhite(rgba, origWidth, origHeight);
 
             var (resizedH, resizedW) = SmartResize(origHeight, origWidth);
-            byte[] resized = Gemma3ImageProcessor.BilinearResize(composited, origWidth, origHeight, resizedW, resizedH);
-
-            float[] pixels = PackChannelFirst(resized, resizedW, resizedH);
+            float[] pixels = Gemma3ImageProcessor.ResizeRgbaToChannelFirstNormalized(
+                rgba, origWidth, origHeight, resizedW, resizedH);
             return (pixels, resizedH, resizedW);
         }
 

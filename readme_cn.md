@@ -129,7 +129,7 @@ bash build-linux.sh --cuda
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceConsole.csproj -c Release
 ```
 
-在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Linux 上，`build-linux.sh` 默认生成带 GGML CPU 后端的 `libGgmlOps.so`，而 `build-linux.sh --cuda` 会启用面向 NVIDIA GPU 的 GGML_CUDA 支持。构建产物会自动复制到应用输出目录。
+在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Linux 上，`build-linux.sh` 会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
 
 ## 使用方法
 
