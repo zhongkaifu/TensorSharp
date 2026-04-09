@@ -11,13 +11,18 @@ using System;
 using System.Collections.Generic;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.GGML;
 
 namespace InferenceEngine
 {
     public class Qwen35VisionEncoder : IDisposable
     {
         private readonly Dictionary<string, Tensor> _weights = new();
+        private readonly Dictionary<string, Tensor> _transposedWeights = new();
+        private readonly Dictionary<long, Tensor> _positionEmbeddingCache = new();
+        private readonly Dictionary<long, RopeCache> _ropeCache = new();
         private readonly IAllocator _allocator;
+        private readonly bool _useNativeAttention;
 
         private readonly int _imageSize;
         private readonly int _patchSize;
@@ -31,6 +36,12 @@ namespace InferenceEngine
         private readonly int _gridPerSide;
         private readonly float _ropeTheta;
 
+        private sealed class RopeCache
+        {
+            public required float[] CosTable { get; init; }
+            public required float[] SinTable { get; init; }
+        }
+
         public int ProjectionDim => _projectionDim;
         public int PatchSize => _patchSize;
         public int SpatialMergeSize => _spatialMergeSize;
@@ -38,6 +49,7 @@ namespace InferenceEngine
         public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
+            _useNativeAttention = allocator is GgmlAllocator;
             var gguf = new GgufFile(mmProjPath);
 
             _imageSize = (int)gguf.GetUint32("clip.vision.image_size", 768);
@@ -128,7 +140,7 @@ namespace InferenceEngine
             if (debug) DumpTensor(hidden, "After PatchEmbed (raster)", numPatches);
 
             // 2. Position embedding (bilinear interpolation, raster order)
-            AddPositionEmbedding(hidden, gridH, gridW, numPatches);
+            AddPositionEmbedding(hidden, gridH, gridW);
             if (debug) DumpTensor(hidden, "After PosEmbed (raster)", numPatches);
 
             // 3. Reorder from raster to block order
@@ -137,19 +149,14 @@ namespace InferenceEngine
             if (debug) DumpTensor(blockOrdered, "After BlockReorder", numPatches);
 
             // 4. Build block-order grid coordinate arrays for RoPE
-            int[] gridY, gridX;
-            BuildBlockOrderCoords(gridH, gridW, out gridY, out gridX);
-
-            // 5. Precompute RoPE cos/sin tables
-            float[] cosTable, sinTable;
-            ComputeRoPETables(gridY, gridX, numPatches, halfDim, out cosTable, out sinTable);
+            RopeCache ropeCache = GetOrCreateRopeCache(gridH, gridW, numPatches, halfDim);
 
             // 6. Encoder blocks
             for (int i = 0; i < _blockCount; i++)
             {
                 Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
                 blockOrdered = EncoderBlock(blockOrdered, i, numPatches, headDim, halfDim,
-                    cosTable, sinTable);
+                    ropeCache.CosTable, ropeCache.SinTable);
                 if (debug && (i == 0 || i == _blockCount - 1))
                     DumpTensor(blockOrdered, $"After block {i}", numPatches);
             }
@@ -170,7 +177,7 @@ namespace InferenceEngine
 
             using var fc1 = LinearForwardWithBias(mergedContig, "mm.0.weight", "mm.0.bias");
             mergedContig.Dispose();
-            ApplyGELU(fc1);
+            Ops.GELU(fc1, fc1);
 
             var projected = LinearForwardWithBias(fc1, "mm.2.weight", "mm.2.bias");
             if (debug) DumpTensor(projected, "Final projected", mergedPatches);
@@ -235,49 +242,9 @@ namespace InferenceEngine
         /// <summary>
         /// Add bilinearly-interpolated position embeddings (computed in raster order).
         /// </summary>
-        private unsafe void AddPositionEmbedding(Tensor hidden, int gridH, int gridW, int numPatches)
+        private void AddPositionEmbedding(Tensor hidden, int gridH, int gridW)
         {
-            var posEmbd = _weights["v.position_embd.weight"];
-            float* posPtr = GetFloatPtr(posEmbd);
-            float* hidPtr = GetFloatPtr(hidden);
-
-            float stepH = gridH > 1 ? (float)(_gridPerSide - 1) / (gridH - 1) : 0f;
-            float stepW = gridW > 1 ? (float)(_gridPerSide - 1) / (gridW - 1) : 0f;
-
-            for (int h = 0; h < gridH; h++)
-            {
-                for (int w = 0; w < gridW; w++)
-                {
-                    float y = h * stepH;
-                    float x = w * stepW;
-
-                    int fy = (int)y, fx = (int)x;
-                    int cy = Math.Min(fy + 1, _gridPerSide - 1);
-                    int cx = Math.Min(fx + 1, _gridPerSide - 1);
-                    float dy = y - fy, dx = x - fx;
-
-                    float w00 = (1 - dy) * (1 - dx);
-                    float w01 = (1 - dy) * dx;
-                    float w10 = dy * (1 - dx);
-                    float w11 = dy * dx;
-
-                    int idx00 = fy * _gridPerSide + fx;
-                    int idx01 = fy * _gridPerSide + cx;
-                    int idx10 = cy * _gridPerSide + fx;
-                    int idx11 = cy * _gridPerSide + cx;
-
-                    int patchIdx = h * gridW + w;
-                    float* hidRow = hidPtr + patchIdx * _hiddenSize;
-
-                    float* p00 = posPtr + idx00 * _hiddenSize;
-                    float* p01 = posPtr + idx01 * _hiddenSize;
-                    float* p10 = posPtr + idx10 * _hiddenSize;
-                    float* p11 = posPtr + idx11 * _hiddenSize;
-
-                    for (int d = 0; d < _hiddenSize; d++)
-                        hidRow[d] += w00 * p00[d] + w01 * p01[d] + w10 * p10[d] + w11 * p11[d];
-                }
-            }
+            Ops.Add(hidden, hidden, GetOrCreatePositionEmbedding(gridH, gridW));
         }
 
         /// <summary>
@@ -313,64 +280,6 @@ namespace InferenceEngine
             }
 
             return result;
-        }
-
-        private void BuildBlockOrderCoords(int gridH, int gridW, out int[] gridY, out int[] gridX)
-        {
-            int numPatches = gridH * gridW;
-            gridY = new int[numPatches];
-            gridX = new int[numPatches];
-            int idx = 0;
-            for (int bh = 0; bh < gridH; bh += _spatialMergeSize)
-            {
-                for (int bw = 0; bw < gridW; bw += _spatialMergeSize)
-                {
-                    for (int mh = 0; mh < _spatialMergeSize; mh++)
-                    {
-                        for (int mw = 0; mw < _spatialMergeSize; mw++)
-                        {
-                            gridY[idx] = bh + mh;
-                            gridX[idx] = bw + mw;
-                            idx++;
-                        }
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Precompute RoPE cos/sin tables for the vision encoder.
-        /// Interleaved y/x frequency bands matching Ollama's qwen3vl vision RoPE.
-        /// cosTable/sinTable: [numPatches * halfDim], row-major [patch, band].
-        /// </summary>
-        private void ComputeRoPETables(int[] gridY, int[] gridX, int numPatches, int halfDim,
-            out float[] cosTable, out float[] sinTable)
-        {
-            int numBands = halfDim / 2;
-            cosTable = new float[numPatches * halfDim];
-            sinTable = new float[numPatches * halfDim];
-
-            float[] invFreqs = new float[numBands];
-            for (int j = 0; j < numBands; j++)
-                invFreqs[j] = 1f / MathF.Pow(_ropeTheta, (2f * j) / halfDim);
-
-            for (int p = 0; p < numPatches; p++)
-            {
-                int y = gridY[p];
-                int x = gridX[p];
-                int baseIdx = p * halfDim;
-
-                for (int j = 0; j < numBands; j++)
-                {
-                    float angleY = y * invFreqs[j];
-                    float angleX = x * invFreqs[j];
-
-                    cosTable[baseIdx + j * 2] = MathF.Cos(angleY);
-                    sinTable[baseIdx + j * 2] = MathF.Sin(angleY);
-                    cosTable[baseIdx + j * 2 + 1] = MathF.Cos(angleX);
-                    sinTable[baseIdx + j * 2 + 1] = MathF.Sin(angleX);
-                }
-            }
         }
 
         private Tensor EncoderBlock(Tensor hidden, int blockIdx, int numPatches, int headDim,
@@ -416,7 +325,19 @@ namespace InferenceEngine
 
             float scale = 1f / MathF.Sqrt(headDim);
 
-            // Reshape [numPatches, hiddenSize] -> [numHeads, numPatches, headDim]
+            if (_useNativeAttention)
+            {
+                using var q4 = q.View(1, numPatches, _numHeads, headDim);
+                using var k4 = k.View(1, numPatches, _numHeads, headDim);
+                using var v4 = v.View(1, numPatches, _numHeads, headDim);
+                using var attn4 = Ops.ScaledDotProductAttention(null, q4, k4, v4, null, scale);
+                using var flat = attn4.View(numPatches, _hiddenSize);
+                q.Dispose();
+                k.Dispose();
+                v.Dispose();
+                return LinearForwardWithBias(flat, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+            }
+
             using var qR = q.View(numPatches, _numHeads, headDim);
             using var kR = k.View(numPatches, _numHeads, headDim);
             using var vR = v.View(numPatches, _numHeads, headDim);
@@ -431,23 +352,18 @@ namespace InferenceEngine
             k.Dispose();
             v.Dispose();
 
-            // Q @ K^T
             using var kT = kHeads.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
             Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
-
             Ops.Softmax(scores, scores);
 
-            // scores @ V
             var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, headDim);
             Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
             scores.Dispose();
 
-            // Reshape back to [numPatches, hiddenSize]
             using var transposed = attnOutput.Transpose(0, 1);
             using var contiguous = Ops.NewContiguous(transposed);
-            using var flat = contiguous.View(numPatches, _hiddenSize);
-            using var flatContig = Ops.NewContiguous(flat);
+            using var flatContig = contiguous.View(numPatches, _hiddenSize);
             attnOutput.Dispose();
 
             return LinearForwardWithBias(flatContig, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
@@ -481,23 +397,11 @@ namespace InferenceEngine
             }
         }
 
-        private unsafe Tensor VisionMLP(Tensor input, string prefix)
+        private Tensor VisionMLP(Tensor input, string prefix)
         {
             using var fc1Out = LinearForwardWithBias(input, $"{prefix}.ffn_up.weight", $"{prefix}.ffn_up.bias");
-            ApplyGELU(fc1Out);
+            Ops.GELU(fc1Out, fc1Out);
             return LinearForwardWithBias(fc1Out, $"{prefix}.ffn_down.weight", $"{prefix}.ffn_down.bias");
-        }
-
-        private unsafe void ApplyGELU(Tensor t)
-        {
-            float* ptr = GetFloatPtr(t);
-            int count = (int)t.ElementCount();
-            for (int i = 0; i < count; i++)
-            {
-                double x = ptr[i];
-                double cdf = 0.5 * (1.0 + Math.Tanh(Math.Sqrt(2.0 / Math.PI) * (x + 0.044715 * x * x * x)));
-                ptr[i] = (float)(x * cdf);
-            }
         }
 
         private unsafe Tensor LinearForwardWithBias(Tensor input, string weightName, string biasName)
@@ -511,64 +415,20 @@ namespace InferenceEngine
             Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
 
-            using var wT = weight.Transpose();
-            Ops.Addmm(result, 0, result, 1.0f, src, wT);
+            Ops.Addmm(result, 0, result, 1.0f, src, GetOrCreateTransposedWeight(weightName));
 
             contiguousInput?.Dispose();
 
             if (_weights.TryGetValue(biasName, out var bias))
-            {
-                float* rPtr = GetFloatPtr(result);
-                float* bPtr = GetFloatPtr(bias);
-                for (int s = 0; s < seqLen; s++)
-                {
-                    float* row = rPtr + s * outDim;
-                    for (int d = 0; d < outDim; d++)
-                        row[d] += bPtr[d];
-                }
-            }
+                Ops.Add(result, result, bias);
 
             return result;
         }
 
-        private unsafe Tensor LayerNormOp(Tensor input, string weightName, string biasName)
+        private Tensor LayerNormOp(Tensor input, string weightName, string biasName)
         {
-            int rows = (int)input.Sizes[0];
-            int dim = (int)input.Sizes[1];
-            var result = new Tensor(_allocator, DType.Float32, rows, dim);
-
-            float* src = GetFloatPtr(input);
-            float* dst = GetFloatPtr(result);
-            float* w = GetFloatPtr(_weights[weightName]);
-            float* b = _weights.ContainsKey(biasName) ? GetFloatPtr(_weights[biasName]) : null;
-
-            for (int r = 0; r < rows; r++)
-            {
-                float* srcRow = src + r * dim;
-                float* dstRow = dst + r * dim;
-
-                float mean = 0;
-                for (int i = 0; i < dim; i++)
-                    mean += srcRow[i];
-                mean /= dim;
-
-                float variance = 0;
-                for (int i = 0; i < dim; i++)
-                {
-                    float diff = srcRow[i] - mean;
-                    variance += diff * diff;
-                }
-                variance /= dim;
-
-                float invStd = 1f / MathF.Sqrt(variance + _eps);
-                for (int i = 0; i < dim; i++)
-                {
-                    float normalized = (srcRow[i] - mean) * invStd;
-                    dstRow[i] = w[i] * normalized + (b != null ? b[i] : 0f);
-                }
-            }
-
-            return result;
+            _weights.TryGetValue(biasName, out var bias);
+            return Ops.LayerNorm(null, input, _weights[weightName], bias, _eps);
         }
 
         private unsafe void DumpTensor(Tensor t, string label, int numRows)
@@ -596,11 +456,135 @@ namespace InferenceEngine
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
         }
 
+        private Tensor GetOrCreateTransposedWeight(string weightName)
+        {
+            if (_transposedWeights.TryGetValue(weightName, out var transposed))
+                return transposed;
+
+            using var weightViewT = _weights[weightName].Transpose();
+            transposed = Ops.NewContiguous(weightViewT);
+            _transposedWeights[weightName] = transposed;
+            return transposed;
+        }
+
+        private unsafe Tensor GetOrCreatePositionEmbedding(int gridH, int gridW)
+        {
+            long key = ((long)gridH << 32) | (uint)gridW;
+            if (_positionEmbeddingCache.TryGetValue(key, out var cached))
+                return cached;
+
+            int numPatches = gridH * gridW;
+            cached = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+            float* posPtr = GetFloatPtr(_weights["v.position_embd.weight"]);
+            float* dstPtr = GetFloatPtr(cached);
+
+            float stepH = gridH > 1 ? (float)(_gridPerSide - 1) / (gridH - 1) : 0f;
+            float stepW = gridW > 1 ? (float)(_gridPerSide - 1) / (gridW - 1) : 0f;
+
+            for (int h = 0; h < gridH; h++)
+            {
+                for (int w = 0; w < gridW; w++)
+                {
+                    float y = h * stepH;
+                    float x = w * stepW;
+
+                    int fy = (int)y;
+                    int fx = (int)x;
+                    int cy = Math.Min(fy + 1, _gridPerSide - 1);
+                    int cx = Math.Min(fx + 1, _gridPerSide - 1);
+                    float dy = y - fy;
+                    float dx = x - fx;
+
+                    float w00 = (1 - dy) * (1 - dx);
+                    float w01 = (1 - dy) * dx;
+                    float w10 = dy * (1 - dx);
+                    float w11 = dy * dx;
+
+                    int idx00 = fy * _gridPerSide + fx;
+                    int idx01 = fy * _gridPerSide + cx;
+                    int idx10 = cy * _gridPerSide + fx;
+                    int idx11 = cy * _gridPerSide + cx;
+
+                    int patchIdx = h * gridW + w;
+                    float* dstRow = dstPtr + patchIdx * _hiddenSize;
+                    float* p00 = posPtr + idx00 * _hiddenSize;
+                    float* p01 = posPtr + idx01 * _hiddenSize;
+                    float* p10 = posPtr + idx10 * _hiddenSize;
+                    float* p11 = posPtr + idx11 * _hiddenSize;
+
+                    for (int d = 0; d < _hiddenSize; d++)
+                        dstRow[d] = w00 * p00[d] + w01 * p01[d] + w10 * p10[d] + w11 * p11[d];
+                }
+            }
+
+            _positionEmbeddingCache[key] = cached;
+            return cached;
+        }
+
+        private RopeCache GetOrCreateRopeCache(int gridH, int gridW, int numPatches, int halfDim)
+        {
+            long key = ((long)gridH << 32) | (uint)gridW;
+            if (_ropeCache.TryGetValue(key, out var cache))
+                return cache;
+
+            int[] gridY = new int[numPatches];
+            int[] gridX = new int[numPatches];
+            int idx = 0;
+            for (int bh = 0; bh < gridH; bh += _spatialMergeSize)
+            {
+                for (int bw = 0; bw < gridW; bw += _spatialMergeSize)
+                {
+                    for (int mh = 0; mh < _spatialMergeSize; mh++)
+                    {
+                        for (int mw = 0; mw < _spatialMergeSize; mw++)
+                        {
+                            gridY[idx] = bh + mh;
+                            gridX[idx] = bw + mw;
+                            idx++;
+                        }
+                    }
+                }
+            }
+
+            int numBands = halfDim / 2;
+            float[] cosTable = new float[numPatches * halfDim];
+            float[] sinTable = new float[numPatches * halfDim];
+            float[] invFreqs = new float[numBands];
+            for (int j = 0; j < numBands; j++)
+                invFreqs[j] = 1f / MathF.Pow(_ropeTheta, (2f * j) / halfDim);
+
+            for (int p = 0; p < numPatches; p++)
+            {
+                int baseIdx = p * halfDim;
+                for (int j = 0; j < numBands; j++)
+                {
+                    float angleY = gridY[p] * invFreqs[j];
+                    float angleX = gridX[p] * invFreqs[j];
+
+                    cosTable[baseIdx + j * 2] = MathF.Cos(angleY);
+                    sinTable[baseIdx + j * 2] = MathF.Sin(angleY);
+                    cosTable[baseIdx + j * 2 + 1] = MathF.Cos(angleX);
+                    sinTable[baseIdx + j * 2 + 1] = MathF.Sin(angleX);
+                }
+            }
+
+            cache = new RopeCache { CosTable = cosTable, SinTable = sinTable };
+            _ropeCache[key] = cache;
+            return cache;
+        }
+
         public void Dispose()
         {
+            foreach (var w in _positionEmbeddingCache.Values)
+                w.Dispose();
+            _positionEmbeddingCache.Clear();
+            foreach (var w in _transposedWeights.Values)
+                w.Dispose();
+            _transposedWeights.Clear();
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();
+            _ropeCache.Clear();
         }
     }
 }

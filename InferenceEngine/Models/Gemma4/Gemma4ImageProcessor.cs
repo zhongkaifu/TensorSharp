@@ -39,14 +39,12 @@ namespace InferenceEngine
             byte[] fileBytes = File.ReadAllBytes(imagePath);
             int origWidth, origHeight;
             byte[] rgba = Gemma3ImageProcessor.DecodeImageToRGBA(fileBytes, out origWidth, out origHeight);
-            byte[] composited = Gemma3ImageProcessor.CompositeOverWhite(rgba, origWidth, origHeight);
 
             int alignSize = PatchSize * NMerge;
             SmartResize(origWidth, origHeight, alignSize, out int targetW, out int targetH);
 
-            byte[] resized = Gemma3ImageProcessor.BilinearResize(composited, origWidth, origHeight, targetW, targetH);
-
-            float[] pixels = PackChannelFirst(resized, targetW, targetH);
+            float[] pixels = Gemma3ImageProcessor.ResizeRgbaToChannelFirstNormalized(
+                rgba, origWidth, origHeight, targetW, targetH);
             return (pixels, targetW, targetH);
         }
 

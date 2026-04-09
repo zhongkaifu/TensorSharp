@@ -11,13 +11,16 @@ using System;
 using System.Collections.Generic;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.GGML;
 
 namespace InferenceEngine
 {
     public class Gemma4VisionEncoder : IDisposable
     {
         private readonly Dictionary<string, Tensor> _weights = new();
+        private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
+        private readonly bool _useNativeAttention;
 
         private readonly int _hiddenSize;
         private readonly int _intermediateSize;
@@ -36,13 +39,25 @@ namespace InferenceEngine
         }
 
         private readonly Dictionary<string, ClampParams> _clampParams = new();
+        private readonly Dictionary<long, Rope2DCache> _ropeCache = new();
         private Tensor _onesForNorm;
+
+        private sealed class Rope2DCache
+        {
+            public required int[] PosX { get; init; }
+            public required int[] PosY { get; init; }
+            public required float[] CosX { get; init; }
+            public required float[] SinX { get; init; }
+            public required float[] CosY { get; init; }
+            public required float[] SinY { get; init; }
+        }
 
         public int ProjectionDim => _projectionDim;
 
         public Gemma4VisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
+            _useNativeAttention = allocator is GgmlAllocator;
             var gguf = new GgufFile(mmProjPath);
 
             _hiddenSize = (int)gguf.GetUint32("clip.vision.embedding_length", 768);
@@ -126,22 +141,15 @@ namespace InferenceEngine
             int patchesY = imgHeight / _patchSize;
             int numPatches = patchesX * patchesY;
             int headDim = _hiddenSize / _numHeads;
+            Rope2DCache ropeCache = GetOrCreateRopeCache(patchesX, patchesY, headDim);
 
             var hidden = PatchEmbed(pixelValues, imgWidth, imgHeight, patchesX, patchesY);
-            AddPositionEmbedding2D(hidden, patchesX, patchesY, numPatches);
-
-            int[] posXData = new int[numPatches];
-            int[] posYData = new int[numPatches];
-            for (int i = 0; i < numPatches; i++)
-            {
-                posXData[i] = i % patchesX;
-                posYData[i] = i / patchesX;
-            }
+            AddPositionEmbedding2D(hidden, ropeCache, numPatches);
 
             for (int i = 0; i < _blockCount; i++)
             {
                 Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
-                hidden = EncoderBlock(hidden, i, numPatches, headDim, posXData, posYData);
+                hidden = EncoderBlock(hidden, i, numPatches, headDim, ropeCache);
             }
             Console.WriteLine(" done");
 
@@ -194,48 +202,33 @@ namespace InferenceEngine
             return result;
         }
 
-        private void AddPositionEmbedding2D(Tensor hidden, int patchesX, int patchesY, int numPatches)
+        private unsafe void AddPositionEmbedding2D(Tensor hidden, Rope2DCache ropeCache, int numPatches)
         {
             var posEmbd = _weights["v.position_embd.weight"];
+            int maxPos = (int)posEmbd.Sizes[1];
+            float* posPtr = GetFloatPtr(posEmbd);
+            float* xTable = posPtr;
+            float* yTable = posPtr + maxPos * _hiddenSize;
+            float* dstPtr = GetFloatPtr(hidden);
 
-            // posEmbd shape in TensorSharp: [2, maxPos, hiddenSize]
-            // tblX = posEmbd[0], tblY = posEmbd[1]
-            long maxPos = posEmbd.Sizes[1];
-            Tensor tblXNarrow = posEmbd.Narrow(0, 0, 1);
-            Tensor tblX = tblXNarrow.View(maxPos, _hiddenSize);
-            tblXNarrow.Dispose();
-            Tensor tblYNarrow = posEmbd.Narrow(0, 1, 1);
-            Tensor tblY = tblYNarrow.View(maxPos, _hiddenSize);
-            tblYNarrow.Dispose();
-
-            int[] xIndices = new int[numPatches];
-            int[] yIndices = new int[numPatches];
-            for (int py = 0; py < patchesY; py++)
-                for (int px = 0; px < patchesX; px++)
-                {
-                    int idx = py * patchesX + px;
-                    xIndices[idx] = px;
-                    yIndices[idx] = py;
-                }
-
-            using var xIdx = CreateIntTensor(xIndices, numPatches);
-            using var yIdx = CreateIntTensor(yIndices, numPatches);
-            using var xEmb = Ops.IndexSelect(null, tblX, xIdx);
-            using var yEmb = Ops.IndexSelect(null, tblY, yIdx);
-            Ops.Add(hidden, hidden, xEmb);
-            Ops.Add(hidden, hidden, yEmb);
-            tblX.Dispose();
-            tblY.Dispose();
+            for (int p = 0; p < numPatches; p++)
+            {
+                float* dstRow = dstPtr + p * _hiddenSize;
+                float* xRow = xTable + ropeCache.PosX[p] * _hiddenSize;
+                float* yRow = yTable + ropeCache.PosY[p] * _hiddenSize;
+                for (int d = 0; d < _hiddenSize; d++)
+                    dstRow[d] += xRow[d] + yRow[d];
+            }
         }
 
         private Tensor EncoderBlock(Tensor hidden, int blockIdx, int numPatches, int headDim,
-            int[] posXData, int[] posYData)
+            Rope2DCache ropeCache)
         {
             string prefix = $"v.blk.{blockIdx}";
 
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.ln1.weight");
             using var attnOut = VisionSelfAttention(attnNormed, prefix, numPatches, headDim,
-                posXData, posYData);
+                ropeCache);
             using var postAttnNormed = RMSNormOp(attnOut, $"{prefix}.attn_post_norm.weight");
 
             Ops.Add(postAttnNormed, postAttnNormed, hidden);
@@ -252,13 +245,32 @@ namespace InferenceEngine
         }
 
         private unsafe Tensor VisionSelfAttention(Tensor input, string prefix, int numPatches, int headDim,
-            int[] posXData, int[] posYData)
+            Rope2DCache ropeCache)
         {
             var q = ClippableLinear(input, $"{prefix}.attn_q");
             var k = ClippableLinear(input, $"{prefix}.attn_k");
             var v = ClippableLinear(input, $"{prefix}.attn_v");
 
-            // Reshape to [numHeads, numPatches, headDim]
+            ApplyPerHeadRMSNorm(q, _weights[$"{prefix}.attn_q_norm.weight"], numPatches, headDim);
+            ApplyPerHeadRMSNorm(k, _weights[$"{prefix}.attn_k_norm.weight"], numPatches, headDim);
+            ApplyUnweightedRMSNorm(v, _numHeads * numPatches, headDim);
+
+            Apply2DRoPE(q, ropeCache, numPatches, headDim);
+            Apply2DRoPE(k, ropeCache, numPatches, headDim);
+
+            if (_useNativeAttention)
+            {
+                using var q4 = q.View(1, numPatches, _numHeads, headDim);
+                using var k4 = k.View(1, numPatches, _numHeads, headDim);
+                using var v4 = v.View(1, numPatches, _numHeads, headDim);
+                using var attn4 = Ops.ScaledDotProductAttention(null, q4, k4, v4, null, 1f);
+                using var flat = attn4.View(numPatches, _hiddenSize);
+                q.Dispose();
+                k.Dispose();
+                v.Dispose();
+                return ClippableLinear(flat, $"{prefix}.attn_out");
+            }
+
             using var qR = q.View(numPatches, _numHeads, headDim);
             using var kR = k.View(numPatches, _numHeads, headDim);
             using var vR = v.View(numPatches, _numHeads, headDim);
@@ -272,19 +284,6 @@ namespace InferenceEngine
             k.Dispose();
             v.Dispose();
 
-            // QK RMSNorm (weighted)
-            ApplyPerHeadRMSNorm(qHeads, _weights[$"{prefix}.attn_q_norm.weight"], _numHeads, numPatches, headDim);
-            ApplyPerHeadRMSNorm(kHeads, _weights[$"{prefix}.attn_k_norm.weight"], _numHeads, numPatches, headDim);
-
-            // V RMSNorm (unweighted)
-            ApplyUnweightedRMSNorm(vHeads, _numHeads * numPatches, headDim);
-
-            // 2D NeoX RoPE: split head dim in half, apply RoPE with X positions to first half,
-            // Y positions to second half
-            Apply2DRoPE(qHeads, posXData, posYData, _numHeads, numPatches, headDim);
-            Apply2DRoPE(kHeads, posXData, posYData, _numHeads, numPatches, headDim);
-
-            // Attention: Q @ K^T (no scaling since QK norms handle it)
             using var kT = kHeads.Transpose(1, 2);
             var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
             Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
@@ -296,46 +295,38 @@ namespace InferenceEngine
 
             using var transposed = attnOutput.Transpose(0, 1);
             using var contiguous = Ops.NewContiguous(transposed);
-            using var flat = contiguous.View(numPatches, _hiddenSize);
-            using var flatContig = Ops.NewContiguous(flat);
+            using var flatContig = contiguous.View(numPatches, _hiddenSize);
             attnOutput.Dispose();
 
             return ClippableLinear(flatContig, $"{prefix}.attn_out");
         }
 
-        private unsafe void Apply2DRoPE(Tensor heads, int[] posX, int[] posY,
-            int numHeads, int numPatches, int headDim)
+        private unsafe void Apply2DRoPE(Tensor data, Rope2DCache ropeCache, int numPatches, int headDim)
         {
-            float* ptr = GetFloatPtr(heads);
+            float* ptr = GetFloatPtr(data);
             int halfDim = headDim / 2;
             int quarterDim = halfDim / 2;
 
-            for (int h = 0; h < numHeads; h++)
+            for (int p = 0; p < numPatches; p++)
             {
-                for (int p = 0; p < numPatches; p++)
+                int ropeBase = p * quarterDim;
+                for (int h = 0; h < _numHeads; h++)
                 {
-                    float* head = ptr + ((long)h * numPatches + p) * headDim;
-
-                    // First half: apply RoPE with X positions
+                    float* head = ptr + ((long)p * _numHeads + h) * headDim;
                     for (int j = 0; j < quarterDim; j++)
                     {
-                        float freq = (float)(1.0 / Math.Pow(_ropeTheta, 2.0 * j / halfDim));
-                        float angle = posX[p] * freq;
-                        float cos = MathF.Cos(angle);
-                        float sin = MathF.Sin(angle);
+                        float cos = ropeCache.CosX[ropeBase + j];
+                        float sin = ropeCache.SinX[ropeBase + j];
                         float x0 = head[j];
                         float x1 = head[j + quarterDim];
                         head[j] = x0 * cos - x1 * sin;
                         head[j + quarterDim] = x0 * sin + x1 * cos;
                     }
 
-                    // Second half: apply RoPE with Y positions
                     for (int j = 0; j < quarterDim; j++)
                     {
-                        float freq = (float)(1.0 / Math.Pow(_ropeTheta, 2.0 * j / halfDim));
-                        float angle = posY[p] * freq;
-                        float cos = MathF.Cos(angle);
-                        float sin = MathF.Sin(angle);
+                        float cos = ropeCache.CosY[ropeBase + j];
+                        float sin = ropeCache.SinY[ropeBase + j];
                         float x0 = head[halfDim + j];
                         float x1 = head[halfDim + j + quarterDim];
                         head[halfDim + j] = x0 * cos - x1 * sin;
@@ -345,10 +336,9 @@ namespace InferenceEngine
             }
         }
 
-        private void ApplyPerHeadRMSNorm(Tensor data, Tensor normWeight,
-            int numHeads, int numPatches, int headDim)
+        private void ApplyPerHeadRMSNorm(Tensor data, Tensor normWeight, int numPatches, int headDim)
         {
-            int total = numHeads * numPatches;
+            int total = _numHeads * numPatches;
             using var reshaped = data.View(total, headDim);
             Ops.RMSNorm(reshaped, reshaped, normWeight, null, _eps);
         }
@@ -361,7 +351,8 @@ namespace InferenceEngine
                 _onesForNorm = new Tensor(_allocator, DType.Float32, dim);
                 Ops.Fill(_onesForNorm, 1f);
             }
-            Ops.RMSNorm(data, data, _onesForNorm, null, _eps);
+            using var reshaped = data.View(numVectors, dim);
+            Ops.RMSNorm(reshaped, reshaped, _onesForNorm, null, _eps);
         }
 
         private unsafe Tensor VisionMLP(Tensor input, string prefix)
@@ -402,8 +393,7 @@ namespace InferenceEngine
                 Clamp(src, cp.InMin, cp.InMax);
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            using var wT = weight.Transpose();
-            Ops.Addmm(result, 0, result, 1f, src, wT);
+            Ops.Addmm(result, 0, result, 1f, src, GetOrCreateTransposedWeight(weightName));
 
             contiguousInput?.Dispose();
 
@@ -487,8 +477,7 @@ namespace InferenceEngine
             int outDim = (int)weight.Sizes[0];
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            using var wT = weight.Transpose();
-            Ops.Addmm(result, 0, result, 1f, input, wT);
+            Ops.Addmm(result, 0, result, 1f, input, GetOrCreateTransposedWeight(weightName));
             return result;
         }
 
@@ -514,12 +503,79 @@ namespace InferenceEngine
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
         }
 
+        private Tensor GetOrCreateTransposedWeight(string weightName)
+        {
+            if (_transposedWeights.TryGetValue(weightName, out var transposed))
+                return transposed;
+
+            using var weightViewT = _weights[weightName].Transpose();
+            transposed = Ops.NewContiguous(weightViewT);
+            _transposedWeights[weightName] = transposed;
+            return transposed;
+        }
+
+        private Rope2DCache GetOrCreateRopeCache(int patchesX, int patchesY, int headDim)
+        {
+            long key = ((long)patchesX << 32) | (uint)patchesY;
+            if (_ropeCache.TryGetValue(key, out var cache))
+                return cache;
+
+            int numPatches = patchesX * patchesY;
+            int halfDim = headDim / 2;
+            int quarterDim = halfDim / 2;
+            int[] posX = new int[numPatches];
+            int[] posY = new int[numPatches];
+            float[] cosX = new float[numPatches * quarterDim];
+            float[] sinX = new float[numPatches * quarterDim];
+            float[] cosY = new float[numPatches * quarterDim];
+            float[] sinY = new float[numPatches * quarterDim];
+            float[] invFreq = new float[quarterDim];
+
+            for (int j = 0; j < quarterDim; j++)
+                invFreq[j] = (float)(1.0 / Math.Pow(_ropeTheta, 2.0 * j / halfDim));
+
+            for (int p = 0; p < numPatches; p++)
+            {
+                int x = p % patchesX;
+                int y = p / patchesX;
+                posX[p] = x;
+                posY[p] = y;
+
+                int baseIdx = p * quarterDim;
+                for (int j = 0; j < quarterDim; j++)
+                {
+                    float angleX = x * invFreq[j];
+                    float angleY = y * invFreq[j];
+                    cosX[baseIdx + j] = MathF.Cos(angleX);
+                    sinX[baseIdx + j] = MathF.Sin(angleX);
+                    cosY[baseIdx + j] = MathF.Cos(angleY);
+                    sinY[baseIdx + j] = MathF.Sin(angleY);
+                }
+            }
+
+            cache = new Rope2DCache
+            {
+                PosX = posX,
+                PosY = posY,
+                CosX = cosX,
+                SinX = sinX,
+                CosY = cosY,
+                SinY = sinY,
+            };
+            _ropeCache[key] = cache;
+            return cache;
+        }
+
         public void Dispose()
         {
             _onesForNorm?.Dispose();
+            foreach (var w in _transposedWeights.Values)
+                w.Dispose();
+            _transposedWeights.Clear();
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();
+            _ropeCache.Clear();
         }
     }
 }

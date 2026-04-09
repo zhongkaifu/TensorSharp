@@ -127,8 +127,16 @@ namespace InferenceEngine
             _cacheSeqLen = 0;
             if (_kvCacheK != null)
             {
-                foreach (var k in _kvCacheK) Ops.Fill(k, 0f);
-                foreach (var v in _kvCacheV) Ops.Fill(v, 0f);
+                foreach (var k in _kvCacheK)
+                {
+                    Ops.Fill(k, 0f);
+                    InvalidateTensorDeviceCache(k);
+                }
+                foreach (var v in _kvCacheV)
+                {
+                    Ops.Fill(v, 0f);
+                    InvalidateTensorDeviceCache(v);
+                }
             }
         }
 

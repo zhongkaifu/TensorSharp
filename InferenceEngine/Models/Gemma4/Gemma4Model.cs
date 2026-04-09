@@ -359,6 +359,8 @@ namespace InferenceEngine
                 if (_kvDonorMap.ContainsKey(l)) continue;
                 Ops.Fill(_kvCacheK[l], 0f);
                 Ops.Fill(_kvCacheV[l], 0f);
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
                 cleared.Add(l);
             }
         }
@@ -1684,6 +1686,8 @@ namespace InferenceEngine
                     Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
                 }
             }
+
+            InvalidateTensorDeviceCache(cache);
         }
 
         private unsafe void ApplyCausalMask(Tensor scores, int queryLen, int totalKVLen, int windowSize)

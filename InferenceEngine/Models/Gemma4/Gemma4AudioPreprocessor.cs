@@ -10,6 +10,7 @@
 using System;
 using System.IO;
 using System.Numerics;
+using System.Threading.Tasks;
 using NLayer;
 using NVorbis;
 
@@ -27,6 +28,10 @@ namespace InferenceEngine
 
         private static readonly int FrameLength = (int)Math.Round(SampleRate * FrameLengthMs / 1000.0); // 320
         private static readonly int HopLength = (int)Math.Round(SampleRate * HopLengthMs / 1000.0); // 160
+        private static readonly int FftLength = ComputeFftLength();
+        private static readonly int NumFreqBins = FftLength / 2 + 1;
+        private static readonly double[] HannWindow = BuildWindow();
+        private static readonly float[] MelFilters = BuildMelFilterBank(NumFreqBins, MelBins, MinFrequency, MaxFrequency, SampleRate);
 
         public static float[] DecodeAudioFile(string path)
         {
@@ -206,43 +211,27 @@ namespace InferenceEngine
 
         public static (float[] melData, int numFrames) ComputeMelSpectrogram(float[] samples)
         {
-            int fftLen = 1;
-            while (fftLen < FrameLength) fftLen <<= 1;
-            fftLen *= 2; // fft_overdrive
-
-            double[] window = new double[FrameLength];
-            double arg = Math.PI * 2.0 / FrameLength;
-            for (int i = 0; i < FrameLength; i++)
-                window[i] = 0.5 - 0.5 * Math.Cos(arg * (i + 0.5));
-
-            int numFreqBins = fftLen / 2 + 1;
-            float[] melFilters = BuildMelFilterBank(numFreqBins, MelBins, MinFrequency, MaxFrequency, SampleRate);
-
             int frameSizeForUnfold = FrameLength + 1;
             int numFrames = (samples.Length - frameSizeForUnfold) / HopLength;
             if (numFrames <= 0) return (null, 0);
 
             float[] result = new float[numFrames * MelBins];
-            Complex[] fftInput = new Complex[fftLen];
-
-            for (int f = 0; f < numFrames; f++)
+            if (numFrames < 8)
             {
-                int start = f * HopLength;
-                for (int i = 0; i < FrameLength; i++)
-                    fftInput[i] = new Complex(samples[start + i] * window[i], 0);
-                for (int i = FrameLength; i < fftLen; i++)
-                    fftInput[i] = Complex.Zero;
-
-                FFT(fftInput);
-
-                for (int m = 0; m < MelBins; m++)
-                {
-                    double melVal = 0;
-                    for (int k = 0; k < numFreqBins; k++)
-                        melVal += fftInput[k].Magnitude * melFilters[k * MelBins + m];
-                    if (melVal < MelFloor) melVal = MelFloor;
-                    result[f * MelBins + m] = (float)Math.Log(melVal);
-                }
+                var fftInput = new Complex[FftLength];
+                for (int f = 0; f < numFrames; f++)
+                    ComputeMelFrame(samples, f, fftInput, result);
+            }
+            else
+            {
+                Parallel.For(0, numFrames,
+                    () => new Complex[FftLength],
+                    (f, _, fftInput) =>
+                    {
+                        ComputeMelFrame(samples, f, fftInput, result);
+                        return fftInput;
+                    },
+                    _ => { });
             }
 
             return (result, numFrames);
@@ -327,9 +316,6 @@ namespace InferenceEngine
                 int padded = samples.Length + (128 - samples.Length % 128);
                 samples = new float[padded];
             }
-            int fftLen = 1;
-            while (fftLen < FrameLength) fftLen <<= 1;
-            fftLen *= 2;
             int frameSizeForUnfold = FrameLength + 1;
             int numFrames = (samples.Length - frameSizeForUnfold) / HopLength;
             if (numFrames <= 0) return 0;
@@ -337,6 +323,43 @@ namespace InferenceEngine
             int tConv0 = (numFrames + 2 - 3) / 2 + 1;
             int tConv1 = (tConv0 + 2 - 3) / 2 + 1;
             return tConv1;
+        }
+
+        private static void ComputeMelFrame(float[] samples, int frameIndex, Complex[] fftInput, float[] result)
+        {
+            int start = frameIndex * HopLength;
+            for (int i = 0; i < FrameLength; i++)
+                fftInput[i] = new Complex(samples[start + i] * HannWindow[i], 0);
+            for (int i = FrameLength; i < FftLength; i++)
+                fftInput[i] = Complex.Zero;
+
+            FFT(fftInput);
+
+            int dstOffset = frameIndex * MelBins;
+            for (int m = 0; m < MelBins; m++)
+            {
+                double melVal = 0;
+                for (int k = 0; k < NumFreqBins; k++)
+                    melVal += fftInput[k].Magnitude * MelFilters[k * MelBins + m];
+                if (melVal < MelFloor) melVal = MelFloor;
+                result[dstOffset + m] = (float)Math.Log(melVal);
+            }
+        }
+
+        private static int ComputeFftLength()
+        {
+            int fftLen = 1;
+            while (fftLen < FrameLength) fftLen <<= 1;
+            return fftLen * 2;
+        }
+
+        private static double[] BuildWindow()
+        {
+            double[] window = new double[FrameLength];
+            double arg = Math.PI * 2.0 / FrameLength;
+            for (int i = 0; i < FrameLength; i++)
+                window[i] = 0.5 - 0.5 * Math.Cos(arg * (i + 0.5));
+            return window;
         }
     }
 }

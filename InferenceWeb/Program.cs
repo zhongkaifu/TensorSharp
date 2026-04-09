@@ -20,8 +20,12 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Keep ASP.NET Core request logs quiet by default while still surfacing warnings and errors.
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 
 builder.WebHost.ConfigureKestrel(options =>
 {

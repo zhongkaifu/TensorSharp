@@ -626,6 +626,7 @@ namespace InferenceEngine
         {
             using var cacheSlice = cache.Narrow(1, startPos, seqLen);
             Ops.Copy(cacheSlice, src);
+            InvalidateTensorDeviceCache(cache);
         }
 
         protected Tensor ExpandKVHeads(Tensor cache, int groupSize, int totalSeqLen)
@@ -653,6 +654,9 @@ namespace InferenceEngine
                 Buffer.MemoryCopy(kSrc + srcOffset, kCachePtr + cacheOffset, headBytes, headBytes);
                 Buffer.MemoryCopy(vSrc + srcOffset, vCachePtr + cacheOffset, headBytes, headBytes);
             }
+
+            InvalidateTensorDeviceCache(kCache);
+            InvalidateTensorDeviceCache(vCache);
         }
 
         protected unsafe void AttentionDecodePureCS(Tensor q, Tensor kCache, Tensor vCache,
@@ -716,6 +720,14 @@ namespace InferenceEngine
             if (t.Storage is CpuStorage cs)
                 return cs.PtrAtElement(t.StorageOffset);
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
+        }
+
+        protected void InvalidateTensorDeviceCache(Tensor tensor)
+        {
+            if (!IsGgmlBackend || tensor == null)
+                return;
+
+            GgmlBasicOps.InvalidateHostBuffer(GetStoragePtr(tensor));
         }
 
         public abstract float[] Forward(int[] tokens);

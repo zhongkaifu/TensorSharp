@@ -11,12 +11,14 @@ using System;
 using System.Collections.Generic;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.GGML;
 
 namespace InferenceEngine
 {
     public class Gemma4AudioEncoder : IDisposable
     {
         private readonly Dictionary<string, Tensor> _weights = new();
+        private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
 
         private readonly int _hiddenSize;
@@ -42,9 +44,11 @@ namespace InferenceEngine
             public bool HasClamp;
         }
         private readonly Dictionary<string, ClampParams> _clampParams = new();
+        private readonly Dictionary<string, float[]> _positionEmbeddingCache = new();
 
         private bool _useOllamaNames;
         private Tensor _onesForNorm;
+        private readonly float[] _causalMask;
 
         public int ProjectionDim => _projectionDim;
 
@@ -77,6 +81,7 @@ namespace InferenceEngine
             gguf.Dispose();
 
             _useOllamaNames = _weights.ContainsKey("a.blk.0.ln1.weight");
+            _causalMask = BuildCausalValidMask();
             Console.WriteLine($"  GGUF naming: {(_useOllamaNames ? "Ollama" : "mmproj/Unsloth")}");
         }
 
@@ -197,8 +202,7 @@ namespace InferenceEngine
                 int outDim = (int)sscpWeight.Sizes[0];
                 hidDim = outDim;
                 hiddenTensor = new Tensor(_allocator, DType.Float32, t1Out, hidDim);
-                using (var wT = sscpWeight.Transpose())
-                    Ops.Addmm(hiddenTensor, 0, hiddenTensor, 1f, projTensor, wT);
+                Ops.Addmm(hiddenTensor, 0, hiddenTensor, 1f, projTensor, GetOrCreateTransposedWeight(sscpWeightName));
                 projTensor.Dispose();
 
                 string biasName = sscpWeightName.Replace(".weight", ".bias");
@@ -215,13 +219,11 @@ namespace InferenceEngine
             Console.Write($" proj=[{seqLen},{hidDim}]");
 
             // Build causal-valid mask
-            float[] causalMask = BuildCausalValidMask();
-
             // Conformer blocks
             for (int i = 0; i < _numLayers; i++)
             {
                 Console.Write($"\r  Audio conformer block {i + 1}/{_numLayers}...                    ");
-                hiddenTensor = ConformerBlock(hiddenTensor, i, seqLen, hidDim, causalMask);
+                hiddenTensor = ConformerBlock(hiddenTensor, i, seqLen, hidDim, _causalMask);
             }
             Console.Write("\r  Audio conformer done.                                         \n");
 
@@ -230,8 +232,7 @@ namespace InferenceEngine
             {
                 int outDim = (int)outProjWeight.Sizes[0];
                 var outProj = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                using (var wT = outProjWeight.Transpose())
-                    Ops.Addmm(outProj, 0, outProj, 1f, hiddenTensor, wT);
+                Ops.Addmm(outProj, 0, outProj, 1f, hiddenTensor, GetOrCreateTransposedWeight("a.output_proj.weight"));
                 if (_weights.TryGetValue("a.output_proj.bias", out var outProjBias))
                     AddBias(outProj, outProjBias, seqLen, outDim);
                 hiddenTensor.Dispose();
@@ -252,8 +253,7 @@ namespace InferenceEngine
             {
                 int fcOutDim = (int)fcWeight.Sizes[0];
                 var fcOut = new Tensor(_allocator, DType.Float32, seqLen, fcOutDim);
-                using (var wT = fcWeight.Transpose())
-                    Ops.Addmm(fcOut, 0, fcOut, 1f, hiddenTensor, wT);
+                Ops.Addmm(fcOut, 0, fcOut, 1f, hiddenTensor, GetOrCreateTransposedWeight(fcWeightName));
 
                 string fcBiasName = fcWeightName.Replace(".weight", ".bias");
                 if (_weights.TryGetValue(fcBiasName, out var fcBias))
@@ -524,51 +524,49 @@ namespace InferenceEngine
 
             for (int h = 0; h < _numHeads; h++)
             {
+                float[] logitsBuffer = new float[ctx];
                 for (int qi = 0; qi < cs; qi++)
                 {
                     int globalQIdx = chunkIdx * cs + qi;
                     if (globalQIdx >= seqLen)
                     {
-                        // Padded position - zero output
                         continue;
                     }
 
-                    float[] logits = new float[ctx];
+                    Span<float> logits = logitsBuffer;
+                    int qOffset = globalQIdx * hidDim + h * _headDim;
 
                     for (int ci = 0; ci < ctx; ci++)
                     {
-                        // Content-content: q[qi] dot k[ci]
+                        int actualTime = chunkIdx * cs + ci - padLeft;
+                        bool causalOK = causalMask[qi * ctx + ci] > 0;
+                        bool validOK = actualTime >= 0 && actualTime < seqLen;
+                        if (!causalOK || !validOK)
+                        {
+                            logits[ci] = -1e9f;
+                            continue;
+                        }
+
                         float dotCC = 0;
-                        int qOffset = globalQIdx * hidDim + h * _headDim;
-                        int kGlobalIdx = chunkIdx * cs + ci; // position in kPadded
+                        int kGlobalIdx = chunkIdx * cs + ci;
                         int kOffset = kGlobalIdx * hidDim + h * _headDim;
 
                         for (int d = 0; d < _headDim; d++)
                             dotCC += qArr[qOffset + d] * kPadded[kOffset + d];
 
-                        // Content-position: q[qi] dot posEmb[relPos]
                         float dotCP = 0;
-                        for (int d = 0; d < _headDim; d++)
+                        int posIdx = RelativeShiftIndex(qi, ci, maxSpan);
+                        if (posIdx >= 0 && posIdx < maxSpan)
                         {
-                            int posIdx = RelativeShiftIndex(qi, ci, maxSpan);
-                            if (posIdx >= 0 && posIdx < maxSpan)
-                                dotCP += qArr[qOffset + d] * posEmb[(posIdx * _numHeads + h) * _headDim + d];
+                            int posOffset = (posIdx * _numHeads + h) * _headDim;
+                            for (int d = 0; d < _headDim; d++)
+                                dotCP += qArr[qOffset + d] * posEmb[posOffset + d];
                         }
 
                         logits[ci] = dotCC + dotCP;
-
-                        // Logit softcap
                         logits[ci] = MathF.Tanh(logits[ci] / _logitCap) * _logitCap;
-
-                        // Apply mask
-                        int actualTime = chunkIdx * cs + ci - padLeft;
-                        bool causalOK = causalMask[qi * ctx + ci] > 0;
-                        bool validOK = actualTime >= 0 && actualTime < seqLen;
-                        if (!causalOK || !validOK)
-                            logits[ci] = -1e9f;
                     }
 
-                    // Softmax
                     float maxLogit = float.NegativeInfinity;
                     for (int ci = 0; ci < ctx; ci++)
                         if (logits[ci] > maxLogit) maxLogit = logits[ci];
@@ -582,7 +580,6 @@ namespace InferenceEngine
                     for (int ci = 0; ci < ctx; ci++)
                         logits[ci] *= invSum;
 
-                    // Weighted sum of values
                     int outOffset = globalQIdx * hidDim + h * _headDim;
                     for (int d = 0; d < _headDim; d++)
                     {
@@ -610,6 +607,9 @@ namespace InferenceEngine
 
         private float[] BuildPositionEmbeddings(string prefix, int maxSpan)
         {
+            if (_positionEmbeddingCache.TryGetValue(prefix, out var cached))
+                return cached;
+
             int halfDim = _hiddenSize / 2;
             double logInc = Math.Log(10000.0) / Math.Max(halfDim - 1, 1);
 
@@ -627,7 +627,10 @@ namespace InferenceEngine
 
             string relKey = ResolveName(prefix, "attn_k_rel") + ".weight";
             if (!_weights.TryGetValue(relKey, out var relWeight))
+            {
+                _positionEmbeddingCache[prefix] = sinEmb;
                 return sinEmb;
+            }
 
             int relOutDim = (int)relWeight.Sizes[0];
             int inDim = (int)relWeight.Sizes[1];
@@ -637,14 +640,14 @@ namespace InferenceEngine
 
             using var sinSlice = sinTensor.Narrow(1, 0, inDim);
             using var sinContig = Ops.NewContiguous(sinSlice);
-            using var wT = relWeight.Transpose();
             var result = new Tensor(_allocator, DType.Float32, maxSpan, relOutDim);
-            Ops.Addmm(result, 0, result, 1f, sinContig, wT);
+            Ops.Addmm(result, 0, result, 1f, sinContig, GetOrCreateTransposedWeight(relKey));
 
             float[] projected = new float[maxSpan * relOutDim];
             result.CopyToArray(projected);
             result.Dispose();
 
+            _positionEmbeddingCache[prefix] = projected;
             return projected;
         }
 
@@ -764,8 +767,7 @@ namespace InferenceEngine
             }
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            using (var wT = weight.Transpose())
-                Ops.Addmm(result, 0, result, 1f, src, wT);
+            Ops.Addmm(result, 0, result, 1f, src, GetOrCreateTransposedWeight(weightName));
 
             if (hasClamp && src != input) src.Dispose();
 
@@ -864,11 +866,26 @@ namespace InferenceEngine
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
         }
 
+        private Tensor GetOrCreateTransposedWeight(string weightName)
+        {
+            if (_transposedWeights.TryGetValue(weightName, out var transposed))
+                return transposed;
+
+            using var weightViewT = _weights[weightName].Transpose();
+            transposed = Ops.NewContiguous(weightViewT);
+            _transposedWeights[weightName] = transposed;
+            return transposed;
+        }
+
         #endregion
 
         public void Dispose()
         {
             _onesForNorm?.Dispose();
+            foreach (var w in _transposedWeights.Values)
+                w.Dispose();
+            _transposedWeights.Clear();
+            _positionEmbeddingCache.Clear();
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();
