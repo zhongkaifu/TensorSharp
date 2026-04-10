@@ -6,11 +6,11 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 
 ## Features
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5
+- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5, GPT OSS
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5
-- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` tags (Qwen 3, Qwen 3.5, Gemma 4)
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
-- **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
+- **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
 - **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Linux/NVIDIA, with fused whole-model GPU dispatch for Gemma 4 decode on Metal (~2.6x speedup over per-op dispatch)
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
@@ -19,7 +19,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Request queue** -- FIFO inference queue ensures single-request execution for KV cache stability, with real-time position tracking for clients
 - **Batch processing** -- JSONL input support in the console application
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console)
-- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B)
+- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b)
 - **Large file uploads** -- supports video/audio uploads up to 500 MB in the web interface
 
 ## Supported Model Architectures
@@ -30,6 +30,9 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Gemma 3 | gemma-3-4b | Image | No | No |
 | Qwen 3 | Qwen3-4B | Text only | Yes | Yes |
 | Qwen 3.5 | Qwen3.5-9B | Image | Yes | Yes |
+| GPT OSS | gpt-oss-20b (MoE) | Text only | Yes | No |
+
+See [Model Architecture Cards](docs/model_cards.md) for detailed documentation of each architecture.
 
 ## Compute Backends
 
@@ -52,6 +55,7 @@ TensorSharp/
 │   ├── Models/
 │   │   ├── Gemma3/
 │   │   ├── Gemma4/              # Vision encoder, audio encoder, MoE, fused GPU decode
+│   │   ├── GptOss/              # MoE, attention sinks, SiLUAlphaLimit, Yarn RoPE
 │   │   ├── Qwen3/
 │   │   └── Qwen35/
 │   ├── GgufReader.cs            # GGUF file parser
@@ -328,10 +332,11 @@ curl http://localhost:5000/api/queue/status
 
 ## Thinking / Reasoning Mode
 
-Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
 
 - **Qwen 3 / Qwen 3.5:** uses `<think>...</think>` tags
 - **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
+- **GPT OSS:** uses Harmony format with `<|channel|>analysis` for thinking and `<|channel|>final` for the response
 
 Enable via `--think` (console), `"think": true` (Ollama API), or the thinking toggle in the web UI.
 

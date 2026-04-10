@@ -365,6 +365,21 @@ namespace InferenceEngine
             }
         }
 
+        public override void TruncateKVCache(int tokenCount)
+        {
+            base.TruncateKVCache(tokenCount);
+            if (_kvCacheK == null) return;
+            var invalidated = new HashSet<int>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (invalidated.Contains(l)) continue;
+                if (_kvDonorMap.ContainsKey(l)) continue;
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                invalidated.Add(l);
+            }
+        }
+
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));

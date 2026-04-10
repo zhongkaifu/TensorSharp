@@ -259,8 +259,15 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
     var writer = ctx.Response.BodyWriter;
     var sw = Stopwatch.StartNew();
     int tokenCount = 0;
-    bool useUiParser = uiThink || (uiTools != null && uiTools.Count > 0);
-    var uiRawSb = new StringBuilder();
+    bool alwaysNeedsParsing = OutputParserFactory.IsAlwaysRequired(svc.Architecture);
+    bool useUiParser = uiThink || (uiTools != null && uiTools.Count > 0) || alwaysNeedsParsing;
+
+    IOutputParser uiParser = null;
+    if (useUiParser)
+    {
+        uiParser = OutputParserFactory.Create(svc.Architecture);
+        uiParser.Init(uiThink, uiTools);
+    }
 
     bool aborted = false;
     try
@@ -269,9 +276,34 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
             uiTools, uiThink))
         {
             tokenCount++;
-            if (useUiParser)
+            if (uiParser != null)
             {
-                uiRawSb.Append(piece);
+                var parsed = uiParser.Add(piece, false);
+                if (!string.IsNullOrEmpty(parsed.Thinking))
+                {
+                    string thinkData = JsonSerializer.Serialize(new { thinking = parsed.Thinking });
+                    await ctx.Response.WriteAsync($"data: {thinkData}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+                if (!string.IsNullOrEmpty(parsed.Content))
+                {
+                    string contentData = JsonSerializer.Serialize(new { token = parsed.Content });
+                    await ctx.Response.WriteAsync($"data: {contentData}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+                if (parsed.ToolCalls != null)
+                {
+                    string tcData = JsonSerializer.Serialize(new
+                    {
+                        tool_calls = parsed.ToolCalls.ConvertAll(tc => new
+                        {
+                            name = tc.Name,
+                            arguments = tc.Arguments
+                        })
+                    });
+                    await ctx.Response.WriteAsync($"data: {tcData}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
             }
             else
             {
@@ -285,31 +317,26 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
 
     try
     {
-        if (useUiParser && !aborted)
+        if (uiParser != null && !aborted)
         {
-            var parser = OutputParserFactory.Create(svc.Architecture);
-            parser.Init(uiThink, uiTools);
-            var parsed = parser.Add(uiRawSb.ToString(), true);
-
-            if (!string.IsNullOrEmpty(parsed.Thinking))
+            var finalParsed = uiParser.Add("", true);
+            if (!string.IsNullOrEmpty(finalParsed.Thinking))
             {
-                string thinkData = JsonSerializer.Serialize(new { thinking = parsed.Thinking });
+                string thinkData = JsonSerializer.Serialize(new { thinking = finalParsed.Thinking });
                 await ctx.Response.WriteAsync($"data: {thinkData}\n\n");
                 await ctx.Response.Body.FlushAsync();
             }
-
-            if (!string.IsNullOrEmpty(parsed.Content))
+            if (!string.IsNullOrEmpty(finalParsed.Content))
             {
-                string contentData = JsonSerializer.Serialize(new { token = parsed.Content });
+                string contentData = JsonSerializer.Serialize(new { token = finalParsed.Content });
                 await ctx.Response.WriteAsync($"data: {contentData}\n\n");
                 await ctx.Response.Body.FlushAsync();
             }
-
-            if (parsed.ToolCalls != null)
+            if (finalParsed.ToolCalls != null)
             {
                 string tcData = JsonSerializer.Serialize(new
                 {
-                    tool_calls = parsed.ToolCalls.ConvertAll(tc => new
+                    tool_calls = finalParsed.ToolCalls.ConvertAll(tc => new
                     {
                         name = tc.Name,
                         arguments = tc.Arguments
@@ -575,8 +602,9 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
 
         var parser = OutputParserFactory.Create(svc.Architecture);
         parser.Init(ollamaThink, ollamaTools);
-        bool useParser = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0);
-        var allContent = new StringBuilder();
+        bool useParser = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0) || parser.AlwaysRequired;
+        var jsonOpts = new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+        List<ToolCall> collectedToolCalls = null;
 
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
             in svc.ChatStreamWithMetricsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
@@ -587,23 +615,56 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
             {
                 if (useParser)
                 {
-                    allContent.Append(piece);
-                    continue;
+                    var parsed = parser.Add(piece, false);
+                    if (parsed.ToolCalls != null)
+                        collectedToolCalls = parsed.ToolCalls;
+                    string thinkChunk = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+                    string contentChunk = parsed.Content ?? "";
+                    if (thinkChunk == null && contentChunk.Length == 0)
+                        continue;
+                    resp = new
+                    {
+                        model = svc.LoadedModelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new { role = "assistant", content = contentChunk, thinking = thinkChunk },
+                        done = false
+                    };
                 }
-                resp = new
+                else
                 {
-                    model = svc.LoadedModelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    message = new { role = "assistant", content = piece },
-                    done = false
-                };
+                    resp = new
+                    {
+                        model = svc.LoadedModelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new { role = "assistant", content = piece },
+                        done = false
+                    };
+                }
             }
             else
             {
                 if (useParser)
                 {
-                    var parsed = parser.Add(allContent.ToString(), true);
-                    var toolCallsJson = parsed.ToolCalls?.ConvertAll(tc => new
+                    var finalParsed = parser.Add("", true);
+                    if (finalParsed.ToolCalls != null)
+                        collectedToolCalls = finalParsed.ToolCalls;
+                    string thinkChunk = !string.IsNullOrEmpty(finalParsed.Thinking) ? finalParsed.Thinking : null;
+                    string contentChunk = finalParsed.Content ?? "";
+
+                    if (thinkChunk != null || contentChunk.Length > 0)
+                    {
+                        var flushResp = new
+                        {
+                            model = svc.LoadedModelName,
+                            created_at = DateTime.UtcNow.ToString("o"),
+                            message = new { role = "assistant", content = contentChunk, thinking = thinkChunk },
+                            done = false
+                        };
+                        await ctx.Response.WriteAsync(JsonSerializer.Serialize(flushResp, jsonOpts) + "\n", ctx.RequestAborted);
+                        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    }
+
+                    var toolCallsJson = collectedToolCalls?.ConvertAll(tc => new
                     {
                         function = new { name = tc.Name, arguments = tc.Arguments }
                     });
@@ -615,12 +676,11 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
                         message = new
                         {
                             role = "assistant",
-                            content = parsed.Content ?? "",
-                            thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                            content = "",
                             tool_calls = toolCallsJson
                         },
                         done = true,
-                        done_reason = parsed.ToolCalls != null ? "tool_calls" : "stop",
+                        done_reason = collectedToolCalls != null ? "tool_calls" : "stop",
                         total_duration = totalNs,
                         prompt_eval_count = promptTokens,
                         prompt_eval_duration = promptNs,
@@ -646,8 +706,7 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
                 }
             }
 
-            await ctx.Response.WriteAsync(JsonSerializer.Serialize(resp,
-                new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }) + "\n", ctx.RequestAborted);
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(resp, jsonOpts) + "\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         }
     }
@@ -682,7 +741,7 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
         string rawOutput = sb.ToString();
         var parser2 = OutputParserFactory.Create(svc.Architecture);
         parser2.Init(ollamaThink, ollamaTools);
-        bool useParser2 = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0);
+        bool useParser2 = ollamaThink || (ollamaTools != null && ollamaTools.Count > 0) || parser2.AlwaysRequired;
         object finalMessage;
         string doneReason = "stop";
 
@@ -693,11 +752,12 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
             {
                 function = new { name = tc.Name, arguments = tc.Arguments }
             });
+            string thinkingOut = ollamaThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             finalMessage = new
             {
                 role = "assistant",
                 content = parsed.Content ?? "",
-                thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                thinking = thinkingOut,
                 tool_calls = toolCallsJson
             };
             if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
@@ -852,9 +912,16 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
             return;
         }
 
-        bool useOaiStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0);
-        bool bufferFullResponse = structuredStream || useOaiStreamParser;
-        var oaiStreamSb = new StringBuilder();
+        bool useOaiStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0) || OutputParserFactory.IsAlwaysRequired(svc.Architecture);
+        bool bufferForStructured = structuredStream;
+        var oaiStreamSb = bufferForStructured ? new StringBuilder() : null;
+        IOutputParser oaiParser = null;
+        List<ToolCall> oaiCollectedToolCalls = null;
+        if (useOaiStreamParser && !bufferForStructured)
+        {
+            oaiParser = OutputParserFactory.Create(svc.Architecture);
+            oaiParser.Init(openaiThink, openaiTools);
+        }
 
         await foreach (var (piece, done, promptTokens, evalTokens, totalNs, promptNs, evalNs)
             in svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
@@ -862,13 +929,43 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
         {
             if (!done)
             {
-                if (bufferFullResponse)
+                if (bufferForStructured)
                 {
                     oaiStreamSb.Append(piece);
                     continue;
                 }
 
-                var chunk = new
+                if (oaiParser != null)
+                {
+                    var parsed = oaiParser.Add(piece, false);
+                    if (parsed.ToolCalls != null)
+                        oaiCollectedToolCalls = parsed.ToolCalls;
+                    string emitContent = parsed.Content ?? "";
+                    if (emitContent.Length == 0 && string.IsNullOrEmpty(parsed.Thinking))
+                        continue;
+                    string chunkContent = emitContent.Length > 0 ? emitContent : null;
+                    var chunk = new
+                    {
+                        id = requestId,
+                        @object = "chat.completion.chunk",
+                        created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        model = svc.LoadedModelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta = new { role = (string)null, content = chunkContent },
+                                finish_reason = (string)null
+                            }
+                        }
+                    };
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    continue;
+                }
+
+                var rawChunk = new
                 {
                     id = requestId,
                     @object = "chat.completion.chunk",
@@ -884,14 +981,24 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                         }
                     }
                 };
-                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(rawChunk)}\n\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 continue;
             }
 
-            if (structuredStream)
+            if (bufferForStructured)
             {
-                var normalized = StructuredOutputValidator.NormalizeOutput(oaiStreamSb.ToString(), responseFormat);
+                string rawContent = oaiStreamSb.ToString();
+
+                if (useOaiStreamParser)
+                {
+                    var structParser = OutputParserFactory.Create(svc.Architecture);
+                    structParser.Init(openaiThink, openaiTools);
+                    var parsed = structParser.Add(rawContent, true);
+                    rawContent = parsed.Content ?? "";
+                }
+
+                var normalized = StructuredOutputValidator.NormalizeOutput(rawContent, responseFormat);
                 if (!normalized.IsValid)
                 {
                     ctx.Response.StatusCode = 422;
@@ -956,16 +1063,15 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                 continue;
             }
 
-            if (useOaiStreamParser)
+            if (oaiParser != null)
             {
-                var streamParser = OutputParserFactory.Create(svc.Architecture);
-                streamParser.Init(openaiThink, openaiTools);
-                var parsed = streamParser.Add(oaiStreamSb.ToString(), true);
-                string finReason = (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0) ? "tool_calls" : "stop";
+                var finalParsed = oaiParser.Add("", true);
+                if (finalParsed.ToolCalls != null)
+                    oaiCollectedToolCalls = finalParsed.ToolCalls;
 
-                if (!string.IsNullOrEmpty(parsed.Content))
+                if (!string.IsNullOrEmpty(finalParsed.Content))
                 {
-                    var contentChunk = new
+                    var flushChunk = new
                     {
                         id = requestId,
                         @object = "chat.completion.chunk",
@@ -976,15 +1082,16 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                             new
                             {
                                 index = 0,
-                                delta = new { role = (string)null, content = parsed.Content },
+                                delta = new { role = (string)null, content = finalParsed.Content },
                                 finish_reason = (string)null
                             }
                         }
                     };
-                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(contentChunk)}\n\n", ctx.RequestAborted);
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(flushChunk)}\n\n", ctx.RequestAborted);
                     await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 }
 
+                string finReason = (oaiCollectedToolCalls != null && oaiCollectedToolCalls.Count > 0) ? "tool_calls" : "stop";
                 var endChunk = new
                 {
                     id = requestId,
@@ -1064,7 +1171,7 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
         }
 
         string rawOutput = sb.ToString();
-        bool useOaiParser = openaiThink || (openaiTools != null && openaiTools.Count > 0);
+        bool useOaiParser = openaiThink || (openaiTools != null && openaiTools.Count > 0) || OutputParserFactory.IsAlwaysRequired(svc.Architecture);
         object responseMessage;
         string finishReason = "stop";
 
@@ -1101,11 +1208,12 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                 function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) }
             }).ToArray();
 
+            string thinkingOut = openaiThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
             responseMessage = new
             {
                 role = "assistant",
                 content = parsed.Content ?? "",
-                thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
+                thinking = thinkingOut,
                 tool_calls = toolCallsList
             };
             if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)

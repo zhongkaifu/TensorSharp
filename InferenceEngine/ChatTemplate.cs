@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 
@@ -257,7 +258,7 @@ namespace InferenceEngine
                     if (!string.IsNullOrEmpty(kv.Value.Description))
                         pDict["description"] = kv.Value.Description;
                     if (kv.Value.Enum != null && kv.Value.Enum.Count > 0)
-                        pDict["enum"] = kv.Value.Enum;
+                        pDict["enum"] = new List<object>(kv.Value.Enum.Select(e => (object)e));
                     props[kv.Key] = pDict;
                 }
             }
@@ -327,17 +328,22 @@ namespace InferenceEngine
                     var preprocessed = InjectMultimodalTokens(messages, architecture);
                     var jinja = new Jinja2Template(template);
                     var context = BuildJinja2Context(preprocessed, addGenerationPrompt, architecture, tools, enableThinking);
-                    string result = jinja.Render(context);
+                    string result = jinja.Render(context).TrimEnd();
                     if (result.Length > 0)
+                    {
+                        Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
                         return result;
+                    }
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering failed for architecture '{architecture}': {ex.Message}");
+                    Console.Error.WriteLine($"[ChatTemplate] Exception: {ex}");
                     Console.Error.WriteLine($"[ChatTemplate] Falling back to hardcoded template.");
                 }
             }
 
+            Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
             return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
         }
 
@@ -350,6 +356,9 @@ namespace InferenceEngine
 
             if (architecture == "gemma4")
                 return RenderGemma4(messages, addGenerationPrompt, tools, enableThinking);
+
+            if (architecture == "gptoss" || architecture == "gpt-oss")
+                return RenderHarmony(messages, addGenerationPrompt);
 
             if (architecture == "qwen35" || architecture == "qwen35moe" || architecture == "qwen3next" ||
                 architecture == "qwen3vl" || architecture == "qwen3vlmoe")
@@ -425,7 +434,7 @@ namespace InferenceEngine
                             if (!string.IsNullOrEmpty(kv.Value.Description))
                                 pDict["description"] = kv.Value.Description;
                             if (kv.Value.Enum != null && kv.Value.Enum.Count > 0)
-                                pDict["enum"] = kv.Value.Enum;
+                                pDict["enum"] = new List<object>(kv.Value.Enum.Select(e => (object)e));
                             props[kv.Key] = pDict;
                         }
                     }
@@ -437,9 +446,9 @@ namespace InferenceEngine
                     };
 
                     if (t.Required != null && t.Required.Count > 0)
-                        paramsDict["required"] = t.Required;
+                        paramsDict["required"] = new List<object>(t.Required.Select(r => (object)r));
                     else if (t.Parameters != null && t.Parameters.Count > 0)
-                        paramsDict["required"] = new List<string>(t.Parameters.Keys);
+                        paramsDict["required"] = new List<object>(t.Parameters.Keys.Select(k => (object)k));
 
                     toolList.Add(new Dictionary<string, object>
                     {
@@ -510,6 +519,65 @@ namespace InferenceEngine
                 });
             }
             return result;
+        }
+
+        /// <summary>
+        /// Render GPT OSS / Harmony chat template.
+        /// Matches the GGUF Jinja2 template: system message with model identity / date / channels,
+        /// user/assistant messages with &lt;|start|&gt;role&lt;|message|&gt;content&lt;|end|&gt; framing,
+        /// and a generation prompt of just &lt;|start|&gt;assistant (model generates channel tags).
+        /// </summary>
+        public static string RenderHarmony(List<ChatMessage> messages, bool addGenerationPrompt = true)
+        {
+            var sb = new StringBuilder();
+
+            int startIdx = 0;
+            string developerContent = null;
+            if (messages.Count > 0 && (messages[0].Role == "system" || messages[0].Role == "developer"))
+            {
+                developerContent = messages[0].Content;
+                startIdx = 1;
+            }
+
+            sb.Append("<|start|>system<|message|>");
+            sb.Append("You are ChatGPT, a large language model trained by OpenAI.\n");
+            sb.Append("Knowledge cutoff: 2024-06\n");
+            sb.Append($"Current date: {DateTime.Now:yyyy-MM-dd}\n\n");
+            sb.Append("Reasoning: medium\n\n");
+            sb.Append("# Valid channels: analysis, commentary, final. Channel must be included for every message.");
+            sb.Append("<|end|>");
+
+            if (!string.IsNullOrEmpty(developerContent))
+            {
+                sb.Append("<|start|>developer<|message|>");
+                sb.Append("# Instructions\n\n");
+                sb.Append(developerContent);
+                sb.Append("<|end|>");
+            }
+
+            for (int i = startIdx; i < messages.Count; i++)
+            {
+                var msg = messages[i];
+                if (msg.Role == "assistant")
+                {
+                    sb.Append("<|start|>assistant<|channel|>final<|message|>");
+                    sb.Append(msg.Content ?? "");
+                    sb.Append("<|end|>");
+                }
+                else
+                {
+                    sb.Append("<|start|>");
+                    sb.Append(msg.Role);
+                    sb.Append("<|message|>");
+                    sb.Append(msg.Content ?? "");
+                    sb.Append("<|end|>");
+                }
+            }
+            if (addGenerationPrompt)
+            {
+                sb.Append("<|start|>assistant");
+            }
+            return sb.ToString();
         }
 
         /// <summary>

@@ -140,6 +140,18 @@ namespace InferenceEngine
             }
         }
 
+        public override void TruncateKVCache(int tokenCount)
+        {
+            base.TruncateKVCache(tokenCount);
+            if (_kvCacheK != null)
+            {
+                foreach (var k in _kvCacheK)
+                    InvalidateTensorDeviceCache(k);
+                foreach (var v in _kvCacheV)
+                    InvalidateTensorDeviceCache(v);
+            }
+        }
+
         public void LoadVisionEncoder(string mmProjPath)
         {
             _visionEncoder = new Gemma3VisionEncoder(mmProjPath, _allocator);

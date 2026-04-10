@@ -242,6 +242,23 @@ namespace InferenceEngine
             return result;
         }
 
+        public void AppendTokenBytes(int tokenId, List<byte> buffer)
+        {
+            string token = _vocab[tokenId];
+            if (token.Length == 6 && token.StartsWith("<0x") && token.EndsWith(">"))
+            {
+                if (byte.TryParse(token.Substring(3, 2),
+                    System.Globalization.NumberStyles.HexNumber, null, out byte byteVal))
+                {
+                    buffer.Add(byteVal);
+                    return;
+                }
+            }
+            token = token.Replace(SpaceReplacement, " ");
+            foreach (byte b in Encoding.UTF8.GetBytes(token))
+                buffer.Add(b);
+        }
+
         public string Decode(List<int> ids)
         {
             var sb = new StringBuilder();
