@@ -43,6 +43,11 @@ namespace InferenceEngine
         public int IntermediateSize { get; set; }
         public string ChatTemplate { get; set; }
 
+        public int NumExperts { get; set; }
+        public int NumExpertsUsed { get; set; }
+        public int SlidingWindow { get; set; }
+        public int OriginalContextLength { get; set; }
+
         public int HeadDim => KeyLength > 0 ? KeyLength : (ValueLength > 0 ? ValueLength : HiddenSize / NumHeads);
     }
 
@@ -205,8 +210,9 @@ namespace InferenceEngine
             else
             {
                 var merges = _gguf.GetStringArray("tokenizer.ggml.merges");
+                string preType = _gguf.GetString("tokenizer.ggml.pre", null);
                 Tokenizer = new BpeTokenizer(vocabTokens, tokenTypes, merges,
-                    bosId, eosIds.ToArray(), addBos, addEos);
+                    bosId, eosIds.ToArray(), addBos, addEos, preType);
             }
         }
 
@@ -734,6 +740,24 @@ namespace InferenceEngine
         public abstract void ResetKVCache();
 
         /// <summary>
+        /// Whether this model supports partial KV cache truncation.
+        /// Models with recurrent layers (e.g. Qwen3.5) cannot truncate because
+        /// the running recurrent state cannot be rewound to an earlier position.
+        /// </summary>
+        public virtual bool SupportsKVCacheTruncation => true;
+
+        /// <summary>
+        /// Truncate KV cache to keep only the first <paramref name="tokenCount"/> positions.
+        /// Subsequent Forward calls will append starting at this position.
+        /// Subclasses MUST override to invalidate device (GPU/Metal) caches.
+        /// </summary>
+        public virtual void TruncateKVCache(int tokenCount)
+        {
+            Console.WriteLine($"[KV cache] Truncating from {_cacheSeqLen} to {tokenCount}");
+            _cacheSeqLen = tokenCount;
+        }
+
+        /// <summary>
         /// Check if this model has vision encoder weights (v.* prefix tensors).
         /// </summary>
         public bool HasVisionEncoder()
@@ -821,6 +845,7 @@ namespace InferenceEngine
                 "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend),
                 "gemma3" => new Gemma3Model(ggufPath, backend),
                 "gemma4" => new Gemma4Model(ggufPath, backend),
+                "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

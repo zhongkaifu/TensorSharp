@@ -23,6 +23,7 @@ namespace InferenceEngine
         int VocabSize { get; }
         List<int> Encode(string text, bool addSpecial = true);
         string Decode(List<int> ids);
+        void AppendTokenBytes(int tokenId, List<byte> buffer);
         bool IsEos(int tokenId);
         int LookupToken(string tokenStr);
     }
@@ -45,7 +46,8 @@ namespace InferenceEngine
         public int VocabSize => _vocab.Length;
 
         public BpeTokenizer(string[] vocab, int[] tokenTypes, string[] merges,
-            int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos)
+            int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos,
+            string preTokenizerType = null)
         {
             _vocab = vocab;
             _tokenTypes = tokenTypes;
@@ -62,9 +64,17 @@ namespace InferenceEngine
             for (int i = 0; i < merges.Length; i++)
                 _mergeLookup[merges[i]] = i;
 
-            _pretokenizerRegex = new Regex(
-                @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-                RegexOptions.Compiled);
+            string pattern = preTokenizerType switch
+            {
+                "gpt-4o" =>
+                    @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
+                    @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|" +
+                    @"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+                _ =>
+                    @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            };
+
+            _pretokenizerRegex = new Regex(pattern, RegexOptions.Compiled);
         }
 
         private List<string> GetSpecialTokens()
@@ -272,24 +282,27 @@ namespace InferenceEngine
             return _mergeLookup.TryGetValue(key, out int rank) ? rank : -1;
         }
 
+        public void AppendTokenBytes(int tokenId, List<byte> buffer)
+        {
+            string token = _vocab[tokenId];
+            foreach (char r in token)
+            {
+                if (r == 0x0100) continue;
+                if (r > 0x0100 && r <= 0x0120) { buffer.Add((byte)(r - 0x0100)); continue; }
+                if (r >= 0x0121 && r <= 0x0142) { buffer.Add((byte)(r - 0x00A2)); continue; }
+                if (r == 0x0143) { buffer.Add(0xAD); continue; }
+                if (r == 0x2581) { buffer.Add(0x20); continue; }
+                if (r < 0x100) { buffer.Add((byte)r); continue; }
+                foreach (byte b in Encoding.UTF8.GetBytes(new[] { r }))
+                    buffer.Add(b);
+            }
+        }
+
         public string Decode(List<int> ids)
         {
             var bytes = new List<byte>();
             foreach (int id in ids)
-            {
-                string token = _vocab[id];
-                foreach (char r in token)
-                {
-                    if (r == 0x0100) continue;
-                    if (r > 0x0100 && r <= 0x0120) { bytes.Add((byte)(r - 0x0100)); continue; }
-                    if (r >= 0x0121 && r <= 0x0142) { bytes.Add((byte)(r - 0x00A2)); continue; }
-                    if (r == 0x0143) { bytes.Add(0xAD); continue; }
-                    if (r == 0x2581) { bytes.Add(0x20); continue; }
-                    if (r < 0x100) { bytes.Add((byte)r); continue; }
-                    foreach (byte b in Encoding.UTF8.GetBytes(new[] { r }))
-                        bytes.Add(b);
-                }
-            }
+                AppendTokenBytes(id, bytes);
             return Encoding.UTF8.GetString(bytes.ToArray());
         }
 

@@ -13,27 +13,28 @@ namespace InferenceEngine
 {
     /// <summary>
     /// Configuration for token sampling during inference.
-    /// Default values produce greedy (deterministic) decoding.
+    /// Default values match Ollama defaults (temperature=0.8, top_k=40, top_p=0.9).
     /// </summary>
     public class SamplingConfig
     {
         /// <summary>
         /// Controls randomness. 0 = greedy/deterministic, higher = more random.
-        /// Typical range: 0.0 - 2.0.
+        /// Typical range: 0.0 - 2.0. Default matches Ollama (0.8).
         /// </summary>
-        public float Temperature { get; set; } = 0f;
+        public float Temperature { get; set; } = 0.8f;
 
         /// <summary>
         /// Limits sampling to the top K most probable tokens. 0 = disabled.
+        /// Default matches Ollama (40).
         /// </summary>
-        public int TopK { get; set; } = 0;
+        public int TopK { get; set; } = 40;
 
         /// <summary>
         /// Nucleus sampling: limits sampling to the smallest set of tokens
         /// whose cumulative probability exceeds this value. 1.0 = disabled.
-        /// Typical range: 0.0 - 1.0.
+        /// Typical range: 0.0 - 1.0. Default matches Ollama (0.9).
         /// </summary>
-        public float TopP { get; set; } = 1.0f;
+        public float TopP { get; set; } = 0.9f;
 
         /// <summary>
         /// Minimum probability threshold. Tokens with probability below
@@ -46,9 +47,9 @@ namespace InferenceEngine
         /// Penalizes tokens that have appeared in the generated text.
         /// Applied multiplicatively to logits. 1.0 = no penalty.
         /// Values > 1.0 discourage repetition, &lt; 1.0 encourage it.
-        /// Typical range: 1.0 - 2.0.
+        /// Typical range: 1.0 - 2.0. Default matches Ollama (1.1).
         /// </summary>
-        public float RepetitionPenalty { get; set; } = 1.0f;
+        public float RepetitionPenalty { get; set; } = 1.1f;
 
         /// <summary>
         /// Additive penalty based on whether a token has appeared at all.
@@ -86,9 +87,20 @@ namespace InferenceEngine
         public bool IsGreedy => Temperature <= 0f && TopK <= 0 && TopP >= 1.0f && MinP <= 0f;
 
         /// <summary>
-        /// Default config: greedy decoding.
+        /// Default config: matches Ollama defaults (temperature=0.8, top_k=40, top_p=0.9).
         /// </summary>
-        public static SamplingConfig Greedy => new SamplingConfig();
+        public static SamplingConfig Default => new SamplingConfig();
+
+        /// <summary>
+        /// Greedy (deterministic) decoding: always pick the most probable token.
+        /// </summary>
+        public static SamplingConfig Greedy => new SamplingConfig
+        {
+            Temperature = 0f,
+            TopK = 0,
+            TopP = 1.0f,
+            RepetitionPenalty = 1.0f,
+        };
 
         /// <summary>
         /// Sensible creative defaults (temperature=0.7, top_p=0.9, min_p=0.05).

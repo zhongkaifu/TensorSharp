@@ -1248,7 +1248,7 @@ namespace TensorSharp.Cpu
             }
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, true, src.Sizes);
-            TensorApplyCPU.RoPEEx(writeTarget, src, positions, (int)rows, (int)cols, ropeDim, mode, freqBase, freqScale);
+            TensorApplyCPU.RoPEEx(writeTarget, src, positions, (int)rows, (int)cols, ropeDim, mode, freqBase, freqScale, originalContextLength, extFactor, attnFactor, betaFast, betaSlow);
 
             if (addToResult && result != null)
             {

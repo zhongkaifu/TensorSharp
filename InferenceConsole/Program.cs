@@ -39,8 +39,9 @@ namespace InferenceConsole
             string inputJsonl = null;
             bool enableThinking = false;
             string toolsFile = null;
+            bool dumpPrompt = false;
 
-            var samplingConfig = new SamplingConfig();
+            var samplingConfig = SamplingConfig.Greedy;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -60,6 +61,7 @@ namespace InferenceConsole
                     case "--test-templates": testTemplatesDir = args[++i]; break;
                     case "--think": enableThinking = true; break;
                     case "--tools": toolsFile = args[++i]; break;
+                    case "--dump-prompt": dumpPrompt = true; break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -231,6 +233,25 @@ namespace InferenceConsole
                 audioPaths = new List<string> { audioPath };
                 rawText = "Listen to this audio and describe what you hear.";
                 Console.WriteLine($"Audio: {audioPath} ({new FileInfo(audioPath).Length / 1024} KB)");
+            }
+
+            if (dumpPrompt)
+            {
+                var dumpMessages = new List<ChatMessage>
+                {
+                    new ChatMessage { Role = "user", Content = rawText }
+                };
+                string rendered = ChatTemplate.RenderFromGgufTemplate(
+                    model.Config.ChatTemplate, dumpMessages, addGenerationPrompt: true,
+                    architecture: model.Config.Architecture, tools: tools, enableThinking: enableThinking);
+                Console.WriteLine("=== Rendered Prompt ===");
+                Console.WriteLine(rendered);
+                Console.WriteLine($"=== End ({rendered.Length} chars, ends with: {(rendered.Length > 0 ? $"0x{(int)rendered[rendered.Length-1]:X2}" : "empty")}) ===");
+                var tokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                Console.WriteLine($"Token count: {tokens.Count}");
+                Console.WriteLine($"First 20 tokens: [{string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count)))}]");
+                Console.WriteLine($"Last 10 tokens: [{string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count)))}]");
+                return;
             }
 
             string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
@@ -783,7 +804,8 @@ namespace InferenceConsole
 
             var parser = OutputParserFactory.Create(model.Config.Architecture);
             parser.Init(enableThinking, tools);
-            bool useParser = enableThinking || (tools != null && tools.Count > 0);
+            bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
+            bool showThinking = enableThinking || parser.AlwaysRequired;
             if (useParser)
             {
                 Console.WriteLine($"Output parser: {parser.GetType().Name} (thinking={enableThinking}, tools={tools?.Count ?? 0})");
@@ -812,7 +834,7 @@ namespace InferenceConsole
                         if (useParser)
                         {
                             var finalParsed = parser.Add(trimmed, true);
-                            return FormatParsedResult(finalParsed, enableThinking);
+                            return FormatParsedResult(finalParsed, showThinking);
                         }
                         return trimmed;
                     }
@@ -830,7 +852,7 @@ namespace InferenceConsole
             if (useParser)
             {
                 var parsed = parser.Add(decoded, true);
-                return FormatParsedResult(parsed, enableThinking);
+                return FormatParsedResult(parsed, showThinking);
             }
             return decoded;
         }

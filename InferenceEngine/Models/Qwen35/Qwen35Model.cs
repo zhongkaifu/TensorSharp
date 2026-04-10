@@ -212,6 +212,8 @@ namespace InferenceEngine
             _forwardSw.Reset();
         }
 
+        public override bool SupportsKVCacheTruncation => false;
+
         public override float[] Forward(int[] tokens)
         {
             _forwardSw.Start();

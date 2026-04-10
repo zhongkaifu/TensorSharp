@@ -160,6 +160,16 @@ namespace InferenceEngine
             _forwardSw.Reset();
         }
 
+        public override void TruncateKVCache(int tokenCount)
+        {
+            base.TruncateKVCache(tokenCount);
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+            }
+        }
+
         public override float[] Forward(int[] tokens)
         {
             _forwardSw.Start();

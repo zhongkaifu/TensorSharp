@@ -6,11 +6,11 @@
 
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5
+- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5）
-- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4）
+- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
-- **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
+- **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Linux/NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode（相对逐算子调度约提升 2.6 倍）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
@@ -19,7 +19,7 @@
 - **请求队列** —— FIFO 推理队列确保单请求执行以保障 KV 缓存稳定性，并为客户端提供实时排队位置反馈
 - **批处理** —— 控制台应用支持 JSONL 输入
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout）
-- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）
+- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）和 GPT OSS MoE（例如 gpt-oss-20b）
 - **大文件上传** —— Web 界面支持最大 500 MB 的视频/音频上传
 
 ## 支持的模型架构
@@ -30,6 +30,9 @@
 | Gemma 3 | gemma-3-4b | 图像 | 不支持 | 不支持 |
 | Qwen 3 | Qwen3-4B | 仅文本 | 支持 | 支持 |
 | Qwen 3.5 | Qwen3.5-9B | 图像 | 支持 | 支持 |
+| GPT OSS | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
+
+各架构的详细文档见[模型架构卡片](docs/model_cards_cn.md)。
 
 ## 计算后端
 
@@ -52,6 +55,7 @@ TensorSharp/
 │   ├── Models/
 │   │   ├── Gemma3/
 │   │   ├── Gemma4/              # 视觉编码器、音频编码器、MoE、融合 GPU decode
+│   │   ├── GptOss/              # MoE、注意力沉降、SiLUAlphaLimit、Yarn RoPE
 │   │   ├── Qwen3/
 │   │   └── Qwen35/
 │   ├── GgufReader.cs            # GGUF 文件解析器
@@ -303,10 +307,11 @@ curl http://localhost:5000/api/queue/status
 
 ## 思维链 / 推理模式
 
-支持思维链模式的模型（Qwen 3、Qwen 3.5、Gemma 4）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
+支持思维链模式的模型（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
 
 - **Qwen 3 / Qwen 3.5：** 使用 `<think>...</think>` 标签
 - **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签
+- **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复
 
 通过 `--think`（控制台）、`"think": true`（Ollama API）或 Web 界面中的思维链开关启用。
 

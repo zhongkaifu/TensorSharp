@@ -7156,6 +7156,33 @@ namespace
             sizeof(float);
     }
 
+    constexpr int kFlashAttnKvStride = 256;
+
+    bool flash_attn_requires_masked_padding(int head_dim)
+    {
+        // The custom CUDA kernels added for 512/576-dim attention only support
+        // the grouped-query path, which expects a non-null mask and a KV length
+        // aligned to FATTN_KQ_STRIDE.
+        return head_dim == 512 || head_dim == 576;
+    }
+
+    int flash_attn_kv_length(int valid_len, int cache_size, int head_dim)
+    {
+        if (!flash_attn_requires_masked_padding(head_dim))
+            return valid_len;
+
+        const int padded = ((valid_len + kFlashAttnKvStride - 1) / kFlashAttnKvStride) * kFlashAttnKvStride;
+        return std::min(cache_size, std::max(valid_len, padded));
+    }
+
+    void fill_flash_attn_mask(std::vector<ggml_fp16_t>& mask, int padded_len, int valid_len)
+    {
+        mask.assign(static_cast<std::size_t>(padded_len), ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+        const int unclamped_valid = std::max(valid_len, 0);
+        const int clamped_valid = std::min(unclamped_valid, padded_len);
+        std::fill_n(mask.begin(), clamped_valid, static_cast<ggml_fp16_t>(0));
+    }
+
     ggml_tensor* view_kv_cache_window(
         ggml_context* ctx,
         ggml_tensor* cache,
@@ -7249,6 +7276,8 @@ namespace
         const int kDim = num_kv_heads * head_dim;
         const int totalSeqLen = position + 1;
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int attnKvLen = flash_attn_kv_length(totalSeqLen, max_seq_len, head_dim);
+        std::vector<ggml_fp16_t> attn_mask_data;
 
         PooledContextHandle context;
         if (!context.init(2 * 1024 * 1024))
@@ -7273,6 +7302,12 @@ namespace
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_tensor* k_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
         ggml_tensor* v_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+        ggml_tensor* attn_mask = nullptr;
+        if (flash_attn_requires_masked_padding(head_dim))
+        {
+            attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+            fill_flash_attn_mask(attn_mask_data, attnKvLen, totalSeqLen);
+        }
 
         // Output download targets
         ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
@@ -7322,18 +7357,18 @@ namespace
         ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
         ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
         ggml_tensor* v_write = ggml_cont(ctx, v_perm);
-        ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
-            ctx,
-            k_cache_base,
-            k_write,
-            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
-        ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
-            ctx,
-            v_cache_base,
-            v_write,
-            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
-        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
-        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+        const std::size_t kv_byte_offset =
+            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float);
+        ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_base,
+            head_dim, 1, num_kv_heads,
+            k_cache_base->nb[1], k_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_base,
+            head_dim, 1, num_kv_heads,
+            v_cache_base->nb[1], v_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* k_cache_cpy = ggml_cpy(ctx, k_write, k_dst);
+        ggml_tensor* v_cache_cpy = ggml_cpy(ctx, v_write, v_dst);
+        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
         if (k_full == nullptr || v_full == nullptr)
         {
             set_last_error("Failed to create KV cache views for transformer layer decode.");
@@ -7341,9 +7376,9 @@ namespace
         }
 
         // 7. Flash attention (handles GQA broadcasting automatically)
-        // q: [head_dim, 1, num_heads], k/v: [head_dim, totalSeqLen, num_kv_heads]
+        // q: [head_dim, 1, num_heads], k/v: [head_dim, attnKvLen, num_kv_heads]
         ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
-            q_attn, k_full, v_full, nullptr, scale, 0.0f, 0.0f);
+            q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
         // 8. O projection
         ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
@@ -7384,8 +7419,10 @@ namespace
         ggml_tensor* out_v  = ggml_cpy(ctx, v_flat, v_new_out);
         ggml_set_output(out_v);
 
-        // Build graph
+        // Build graph: add KV cache writes first to ensure they execute before reads
         ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, k_cache_cpy);
+        ggml_build_forward_expand(graph, v_cache_cpy);
         ggml_build_forward_expand(graph, out_hidden);
         ggml_build_forward_expand(graph, out_k);
         ggml_build_forward_expand(graph, out_v);
@@ -7446,6 +7483,8 @@ namespace
         bind_or_mark(k_norm_w,    k_norm_data,    static_cast<std::size_t>(head_dim) * sizeof(float), true);
         bind_or_mark(k_cache_base, k_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         bind_or_mark(v_cache_base, v_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        if (attn_mask != nullptr && !attn_mask_data.empty())
+            bind_or_mark(attn_mask, attn_mask_data.data(), attn_mask_data.size() * sizeof(ggml_fp16_t), false);
 
         // Allocate backend buffer for remaining tensors (intermediates + non-host-ptr tensors)
         BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
@@ -7562,6 +7601,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         const int kDim = num_kv_heads * head_dim;
         const int totalSeqLen = position + 1;
         const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int attnKvLen = flash_attn_kv_length(totalSeqLen, max_seq_len, head_dim);
+        std::vector<ggml_fp16_t> attn_mask_data;
 
         // Large context for all layers
         const std::size_t ctx_size = 16 * 1024 * 1024;
@@ -7576,6 +7617,12 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         // Input tensor (shared across graph)
         ggml_tensor* current = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* attn_mask = nullptr;
+        if (flash_attn_requires_masked_padding(head_dim))
+        {
+            attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+            fill_flash_attn_mask(attn_mask_data, attnKvLen, totalSeqLen);
+        }
 
         // Per-layer weight tensors and KV cache tensors
         struct LayerTensors {
@@ -7593,6 +7640,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_tensor* v_new_out;
             ggml_tensor* out_k_cpy;
             ggml_tensor* out_v_cpy;
+            ggml_tensor* k_cache_cpy;
+            ggml_tensor* v_cache_cpy;
         };
         std::vector<LayerTensors> layers(num_layers);
 
@@ -7655,18 +7704,18 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
             ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
             ggml_tensor* v_write = ggml_cont(ctx, v_perm);
-            ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
-                ctx,
-                lt.k_cache_base,
-                k_write,
-                static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
-            ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
-                ctx,
-                lt.v_cache_base,
-                v_write,
-                static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float));
-            ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_updated, head_dim, max_seq_len, num_kv_heads, 0, totalSeqLen);
+            const std::size_t kv_byte_offset =
+                static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float);
+            ggml_tensor* k_dst = ggml_view_3d(ctx, lt.k_cache_base,
+                head_dim, 1, num_kv_heads,
+                lt.k_cache_base->nb[1], lt.k_cache_base->nb[2], kv_byte_offset);
+            ggml_tensor* v_dst = ggml_view_3d(ctx, lt.v_cache_base,
+                head_dim, 1, num_kv_heads,
+                lt.v_cache_base->nb[1], lt.v_cache_base->nb[2], kv_byte_offset);
+            lt.k_cache_cpy = ggml_cpy(ctx, k_write, k_dst);
+            lt.v_cache_cpy = ggml_cpy(ctx, v_write, v_dst);
+            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Failed to create KV cache views for transformer model decode.");
@@ -7675,7 +7724,7 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
 
             // Flash attention
             ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
-                q_attn, k_full, v_full, nullptr, scale, 0.0f, 0.0f);
+                q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
             // O projection + residual
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
@@ -7713,9 +7762,14 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
         ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
         ggml_set_output(out_hidden);
 
-        // Build graph
+        // Build graph: add KV cache writes first to ensure they execute before reads
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 64 + 256;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        for (int l = 0; l < num_layers; l++)
+        {
+            ggml_build_forward_expand(graph, layers[l].k_cache_cpy);
+            ggml_build_forward_expand(graph, layers[l].v_cache_cpy);
+        }
         ggml_build_forward_expand(graph, out_hidden);
         for (int l = 0; l < num_layers; l++)
         {
@@ -7784,6 +7838,8 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             bind_or_mark(lt.k_cache_base, k_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             bind_or_mark(lt.v_cache_base, v_cache_arr[l], kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }
+        if (attn_mask != nullptr && !attn_mask_data.empty())
+            bind_or_mark(attn_mask, attn_mask_data.data(), attn_mask_data.size() * sizeof(ggml_fp16_t), false);
 
         // Allocate backend buffer for intermediates
         BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
@@ -7965,6 +8021,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_tensor* v_cached_t;
             ggml_tensor* k_new_out;
             ggml_tensor* v_new_out;
+            ggml_tensor* k_cpy;
+            ggml_tensor* v_cpy;
             // PLE
             ggml_tensor* ple_gate_w;
             ggml_tensor* ple_proj_w;
@@ -8010,6 +8068,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 lt.v_cached_t = nullptr;
             }
 
+            lt.k_cpy = nullptr;
+            lt.v_cpy = nullptr;
+
             lt.ple_gate_w = nullptr;
             lt.ple_proj_w = nullptr;
             lt.ple_post_norm_w = nullptr;
@@ -8040,10 +8101,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         // Track the active KV tensors produced by each donor layer.
         std::vector<ggml_tensor*> layer_k_full(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_v_full(num_layers, nullptr);
+        std::vector<ggml_tensor*> layer_attn_mask(num_layers, nullptr);
 
         // Track new K/V tensors produced by non-shared layers for download.
         std::vector<ggml_tensor*> layer_k_new(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_v_new(num_layers, nullptr);
+        std::vector<std::vector<ggml_fp16_t>> layer_attn_mask_data(num_layers);
 
         for (int l = 0; l < num_layers; l++)
         {
@@ -8097,18 +8160,24 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 ggml_tensor* v_write = ggml_cont(ctx, v_perm);
                 const int cachePos = info.isLocal ? (position % info.cacheSize) : position;
                 const int activeStart = info.isLocal ? ((totalSeqLen - info.attendLen) % info.cacheSize) : 0;
-                ggml_tensor* k_cache_updated = ggml_set_1d_inplace(
-                    ctx,
-                    lt.k_cached_t,
-                    k_write,
-                    static_cast<std::size_t>(cachePos) * static_cast<std::size_t>(info.hd) * sizeof(float));
-                ggml_tensor* v_cache_updated = ggml_set_1d_inplace(
-                    ctx,
-                    lt.v_cached_t,
-                    v_write,
-                    static_cast<std::size_t>(cachePos) * static_cast<std::size_t>(info.hd) * sizeof(float));
-                k_full = view_kv_cache_window(ctx, k_cache_updated, info.hd, info.cacheSize, info.kvHeads, activeStart, info.attendLen);
-                v_full = view_kv_cache_window(ctx, v_cache_updated, info.hd, info.cacheSize, info.kvHeads, activeStart, info.attendLen);
+                const int attnKvLen = flash_attn_kv_length(info.attendLen, info.cacheSize, info.hd);
+                const std::size_t kv_byte_offset =
+                    static_cast<std::size_t>(cachePos) * static_cast<std::size_t>(info.hd) * sizeof(float);
+                ggml_tensor* k_dst = ggml_view_3d(ctx, lt.k_cached_t,
+                    info.hd, 1, info.kvHeads,
+                    lt.k_cached_t->nb[1], lt.k_cached_t->nb[2], kv_byte_offset);
+                ggml_tensor* v_dst = ggml_view_3d(ctx, lt.v_cached_t,
+                    info.hd, 1, info.kvHeads,
+                    lt.v_cached_t->nb[1], lt.v_cached_t->nb[2], kv_byte_offset);
+                lt.k_cpy = ggml_cpy(ctx, k_write, k_dst);
+                lt.v_cpy = ggml_cpy(ctx, v_write, v_dst);
+                if (flash_attn_requires_masked_padding(info.hd))
+                {
+                    layer_attn_mask[l] = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+                    fill_flash_attn_mask(layer_attn_mask_data[l], attnKvLen, info.attendLen);
+                }
+                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen);
+                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen);
                 if (k_full == nullptr || v_full == nullptr)
                 {
                     set_last_error("Failed to create Gemma4 KV cache views.");
@@ -8138,6 +8207,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 int donor = info.kvSource;
                 k_full = layer_k_full[donor];
                 v_full = layer_v_full[donor];
+                layer_attn_mask[l] = layer_attn_mask[donor];
                 if (k_full == nullptr || v_full == nullptr)
                 {
                     set_last_error("Shared layer has no KV data available.");
@@ -8148,13 +8218,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             layer_k_full[l] = k_full;
             layer_v_full[l] = v_full;
 
-            // Manual attention: scores = softmax(K^T @ Q), output = V_T @ scores
-            // Gemma4 uses QK-Norm (per-head RMSNorm on Q/K), so no 1/sqrt(d) scaling
+            // Flash attention (scale=1.0 due to QK-Norm, no attention softcap)
             ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-            ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_attn);
-            scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f, 0.0f);
-            ggml_tensor* v_t = ggml_cont(ctx, ggml_transpose(ctx, v_full));
-            ggml_tensor* attn_out = ggml_mul_mat(ctx, v_t, scores);
+            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+                q_attn, k_full, v_full, layer_attn_mask[l], 1.0f, 0.0f, 0.0f);
 
             // 8. O projection
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, 1);
@@ -8229,9 +8296,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
         ggml_set_output(out_hidden);
 
-        // Build graph
+        // Build graph: add KV cache writes first to ensure they execute before reads
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 128 + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        for (int l = 0; l < num_layers; l++)
+        {
+            if (layers[l].k_cpy != nullptr)
+            {
+                ggml_build_forward_expand(graph, layers[l].k_cpy);
+                ggml_build_forward_expand(graph, layers[l].v_cpy);
+            }
+        }
         ggml_build_forward_expand(graph, out_hidden);
         for (int l = 0; l < num_layers; l++)
         {
@@ -8309,6 +8384,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             {
                 bind_or_mark(lt.k_cached_t, k_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 bind_or_mark(lt.v_cached_t, v_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (layer_attn_mask[l] != nullptr && !layer_attn_mask_data[l].empty())
+                    bind_or_mark(layer_attn_mask[l], layer_attn_mask_data[l].data(), layer_attn_mask_data[l].size() * sizeof(ggml_fp16_t), false);
             }
 
             if (lt.ple_gate_w != nullptr)

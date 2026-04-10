@@ -23,7 +23,7 @@ namespace InferenceEngine
 
         public TokenSampler(SamplingConfig config)
         {
-            _config = config ?? SamplingConfig.Greedy;
+            _config = config ?? SamplingConfig.Default;
             _rng = config?.Seed >= 0 ? new Random(config.Seed) : new Random();
         }
 

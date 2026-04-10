@@ -1655,7 +1655,8 @@ namespace TensorSharp
             };
         }
 
-        unsafe static public void RoPEEx(Tensor tOut, Tensor tIn, Tensor positions, int rows, int cols, int ropeDim, int mode, float freqBase, float freqScale)
+        unsafe static public void RoPEEx(Tensor tOut, Tensor tIn, Tensor positions, int rows, int cols, int ropeDim, int mode, float freqBase, float freqScale,
+            int nCtxOrig = 0, float extFactor = 0.0f, float attnFactor = 1.0f, float betaFast = 0.0f, float betaSlow = 0.0f)
         {
             const int GGML_ROPE_TYPE_NEOX = 2;
 
@@ -1676,12 +1677,25 @@ namespace TensorSharp
                 return;
             }
 
+            bool useYarn = extFactor != 0.0f;
+
+            float corrDimLow = 0, corrDimHigh = 0;
+            float mscale = attnFactor;
+            if (useYarn)
+            {
+                YarnCorrDims(activeRopeDim, nCtxOrig, freqBase, betaFast, betaSlow, out corrDimLow, out corrDimHigh);
+                mscale *= 1.0f + 0.1f * MathF.Log(1.0f / freqScale);
+            }
+
+            float[] cosCache = ArrayPool<float>.Shared.Rent(pairCount);
+            float[] sinCache = ArrayPool<float>.Shared.Rent(pairCount);
             float[] invFreqBuffer = ArrayPool<float>.Shared.Rent(pairCount);
             try
             {
+                float thetaScale = MathF.Pow(freqBase, -2.0f / activeRopeDim);
                 for (int i = 0; i < pairCount; i++)
                 {
-                    invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim) * freqScale;
+                    invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim);
                 }
 
                 bool useIntPositions = positions.ElementType == DType.Int32;
@@ -1698,33 +1712,44 @@ namespace TensorSharp
                     }
 
                     int position = useIntPositions ? positionInts[row] : (int)positionFloats[row];
+
+                    for (int i = 0; i < pairCount; i++)
+                    {
+                        float thetaExtrap = position * invFreqBuffer[i];
+                        float cosTheta, sinTheta;
+                        if (useYarn)
+                        {
+                            YarnRoPE(thetaExtrap, freqScale, corrDimLow, corrDimHigh, i, extFactor, mscale, out cosTheta, out sinTheta);
+                        }
+                        else
+                        {
+                            float angle = thetaExtrap * freqScale;
+                            cosTheta = MathF.Cos(angle);
+                            sinTheta = MathF.Sin(angle);
+                        }
+                        cosCache[i] = cosTheta;
+                        sinCache[i] = sinTheta;
+                    }
+
                     if (isNeoX)
                     {
                         int half = pairCount;
                         for (int i = 0; i < half; ++i)
                         {
-                            float angle = invFreqBuffer[i] * position;
-                            float cosTheta = MathF.Cos(angle);
-                            float sinTheta = MathF.Sin(angle);
-
                             float left = srcRow[i];
                             float right = srcRow[i + half];
-                            resultRow[i] = left * cosTheta - right * sinTheta;
-                            resultRow[i + half] = right * cosTheta + left * sinTheta;
+                            resultRow[i] = left * cosCache[i] - right * sinCache[i];
+                            resultRow[i + half] = right * cosCache[i] + left * sinCache[i];
                         }
                     }
                     else
                     {
                         for (int i = 0, pair = 0; i < pairCount; ++i, pair += 2)
                         {
-                            float angle = invFreqBuffer[i] * position;
-                            float cosTheta = MathF.Cos(angle);
-                            float sinTheta = MathF.Sin(angle);
-
                             float left = srcRow[pair];
                             float right = srcRow[pair + 1];
-                            resultRow[pair] = left * cosTheta - right * sinTheta;
-                            resultRow[pair + 1] = right * cosTheta + left * sinTheta;
+                            resultRow[pair] = left * cosCache[i] - right * sinCache[i];
+                            resultRow[pair + 1] = right * cosCache[i] + left * sinCache[i];
                         }
                     }
                 }
@@ -1744,7 +1769,39 @@ namespace TensorSharp
             finally
             {
                 ArrayPool<float>.Shared.Return(invFreqBuffer);
+                ArrayPool<float>.Shared.Return(cosCache);
+                ArrayPool<float>.Shared.Return(sinCache);
             }
+        }
+
+        static private float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
+        {
+            return nDims * MathF.Log(nCtxOrig / (nRot * 2.0f * MathF.PI)) / (2.0f * MathF.Log(freqBase));
+        }
+
+        static private void YarnCorrDims(int nDims, int nCtxOrig, float freqBase, float betaFast, float betaSlow, out float low, out float high)
+        {
+            if (betaFast == 0.0f && betaSlow == 0.0f)
+            {
+                low = float.MaxValue;
+                high = (float)(nDims / 2 - 1);
+            }
+            else
+            {
+                low = MathF.Max(0, MathF.Floor(YarnCorrDim(nDims, nCtxOrig, betaFast, freqBase)));
+                high = MathF.Min(nDims / 2 - 1, MathF.Ceiling(YarnCorrDim(nDims, nCtxOrig, betaSlow, freqBase)));
+            }
+        }
+
+        static private void YarnRoPE(float thetaExtrap, float freqScale, float corrDimLow, float corrDimHigh, int i0, float extFactor, float mscale,
+            out float cosTheta, out float sinTheta)
+        {
+            float thetaInterp = freqScale * thetaExtrap;
+            float rampY = ((float)i0 - corrDimLow) / MathF.Max(0.001f, corrDimHigh - corrDimLow);
+            float rampMix = (1.0f - MathF.Min(1.0f, MathF.Max(0.0f, rampY))) * extFactor;
+            float theta = thetaInterp * (1.0f - rampMix) + thetaExtrap * rampMix;
+            cosTheta = MathF.Cos(theta) * mscale;
+            sinTheta = MathF.Sin(theta) * mscale;
         }
 
 

@@ -109,8 +109,7 @@ namespace InferenceEngine
                     if (end < 0) throw new FormatException("Unclosed comment tag.");
                     bool tb = next + 2 < tmpl.Length && tmpl[next + 2] == '-';
                     bool ta = end >= 2 && tmpl[end - 1] == '-';
-                    if (tb || ta)
-                        segs.Add(new Seg(SegKind.Text, "", tb, ta));
+                    segs.Add(new Seg(SegKind.Text, "", tb, ta));
                     i = end + 2;
                 }
                 else
@@ -816,6 +815,14 @@ namespace InferenceEngine
                 return list;
             }
 
+            // strftime_now(format) function
+            if (expr.StartsWith("strftime_now(") && expr.EndsWith(")"))
+            {
+                string inner = expr.Substring(13, expr.Length - 14).Trim();
+                string fmt = Stringify(EvalExpr(inner, ctx));
+                return ConvertStrftime(fmt);
+            }
+
             // Variable access chain: var.attr['key'][idx].method(args)
             return EvalAccessChain(expr, ctx);
         }
@@ -903,9 +910,27 @@ namespace InferenceEngine
             switch (testName)
             {
                 case "defined":
-                    return ctx.IsDefined(ExtractRootVar(lhsExpr));
+                {
+                    string root = ExtractRootVar(lhsExpr);
+                    if (!ctx.IsDefined(root)) return false;
+                    if (lhsExpr.Contains('.') || lhsExpr.Contains('['))
+                    {
+                        try { return EvalPrimary(lhsExpr, ctx) != null; }
+                        catch { return false; }
+                    }
+                    return true;
+                }
                 case "undefined":
-                    return !ctx.IsDefined(ExtractRootVar(lhsExpr));
+                {
+                    string root = ExtractRootVar(lhsExpr);
+                    if (!ctx.IsDefined(root)) return true;
+                    if (lhsExpr.Contains('.') || lhsExpr.Contains('['))
+                    {
+                        try { return EvalPrimary(lhsExpr, ctx) == null; }
+                        catch { return true; }
+                    }
+                    return false;
+                }
                 case "none":
                     return EvalPrimary(lhsExpr, ctx) == null;
                 case "mapping":
@@ -941,6 +966,42 @@ namespace InferenceEngine
             if (val is bool b) return b ? "True" : "False";
             if (val is string s) return s;
             return Convert.ToString(val, CultureInfo.InvariantCulture);
+        }
+
+        private static string ToJson(object val)
+        {
+            if (val == null) return "null";
+            if (val is bool b) return b ? "true" : "false";
+            if (val is string s) return System.Text.Json.JsonSerializer.Serialize(s);
+            if (val is int i) return i.ToString(CultureInfo.InvariantCulture);
+            if (val is double d) return d.ToString(CultureInfo.InvariantCulture);
+            if (val is IList<object> list)
+            {
+                var sb = new StringBuilder("[");
+                for (int j = 0; j < list.Count; j++)
+                {
+                    if (j > 0) sb.Append(", ");
+                    sb.Append(ToJson(list[j]));
+                }
+                sb.Append(']');
+                return sb.ToString();
+            }
+            if (val is IDictionary<string, object> dict)
+            {
+                var sb = new StringBuilder("{");
+                bool first = true;
+                foreach (var kv in dict)
+                {
+                    if (!first) sb.Append(", ");
+                    first = false;
+                    sb.Append(System.Text.Json.JsonSerializer.Serialize(kv.Key));
+                    sb.Append(": ");
+                    sb.Append(ToJson(kv.Value));
+                }
+                sb.Append('}');
+                return sb.ToString();
+            }
+            return System.Text.Json.JsonSerializer.Serialize(val.ToString());
         }
 
         private static bool Truthy(object val)
@@ -1208,7 +1269,7 @@ namespace InferenceEngine
                     return Stringify(val);
                 }
                 case "tojson" or "tojson(indent=2)" or "tojson()":
-                    return Stringify(val);
+                    return ToJson(val);
                 case "dictsort":
                 {
                     if (val is IDictionary<string, object> dictSort)
@@ -1258,6 +1319,42 @@ namespace InferenceEngine
             if (dot > 0) end = Math.Min(end, dot);
             if (bracket > 0) end = Math.Min(end, bracket);
             return expr.Substring(0, end).Trim();
+        }
+
+        private static string ConvertStrftime(string fmt)
+        {
+            var now = DateTime.Now;
+            var sb = new StringBuilder();
+            for (int i = 0; i < fmt.Length; i++)
+            {
+                if (fmt[i] == '%' && i + 1 < fmt.Length)
+                {
+                    i++;
+                    sb.Append(fmt[i] switch
+                    {
+                        'Y' => now.ToString("yyyy"),
+                        'm' => now.ToString("MM"),
+                        'd' => now.ToString("dd"),
+                        'H' => now.ToString("HH"),
+                        'M' => now.ToString("mm"),
+                        'S' => now.ToString("ss"),
+                        'A' => now.ToString("dddd"),
+                        'B' => now.ToString("MMMM"),
+                        'b' => now.ToString("MMM"),
+                        'a' => now.ToString("ddd"),
+                        'p' => now.ToString("tt"),
+                        'I' => now.ToString("hh"),
+                        'j' => now.DayOfYear.ToString("D3"),
+                        '%' => "%",
+                        _ => "%" + fmt[i],
+                    });
+                }
+                else
+                {
+                    sb.Append(fmt[i]);
+                }
+            }
+            return sb.ToString();
         }
 
         private static string Unescape(string s)

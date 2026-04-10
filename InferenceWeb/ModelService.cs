@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using InferenceEngine;
@@ -28,8 +29,7 @@ namespace InferenceWeb
         private string _loadedMmProjPath;
         private BackendType _backend;
 
-        private string _cachedRenderedText;
-        private string _cachedResponseText;
+        private List<int> _cachedTokens;
 
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
@@ -47,8 +47,7 @@ namespace InferenceWeb
 
         public void InvalidateKVCache()
         {
-            _cachedRenderedText = null;
-            _cachedResponseText = null;
+            _cachedTokens = null;
             _model?.ResetKVCache();
         }
 
@@ -61,8 +60,7 @@ namespace InferenceWeb
             _model = null;
             _loadedModelPath = null;
             _loadedMmProjPath = null;
-            _cachedRenderedText = null;
-            _cachedResponseText = null;
+            _cachedTokens = null;
 
             _backend = backendStr switch
             {
@@ -146,30 +144,40 @@ namespace InferenceWeb
                 _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
+            Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, first 500 chars:");
+            Console.Error.WriteLine(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered);
+
             var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
             bool hasMultimodal = HasMultimodalContent(lastMsg);
 
+            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+            if (lastMsg != null)
+                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+
             float[] logits;
-            if (!hasMultimodal && TryGetCacheSuffix(rendered, out string suffixText))
+            int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
+
+            if (commonPrefix > 0)
             {
-                var suffixTokens = _model.Tokenizer.Encode(suffixText, addSpecial: false);
-                Console.WriteLine($"[KV cache] Reusing cache, forwarding {suffixTokens.Count} new tokens");
-                logits = _model.Forward(suffixTokens.ToArray());
+                _model.TruncateKVCache(commonPrefix);
+                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
+                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
+                logits = _model.Forward(suffixTokens);
             }
             else
             {
-                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-                if (lastMsg != null)
-                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
-                if (_cachedRenderedText != null)
-                    Console.WriteLine("[KV cache] Reset (text mismatch or multimodal)");
+                Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
+                if (_cachedTokens != null)
+                    Console.WriteLine("[KV cache] Reset (no usable common prefix)");
                 _model.ResetKVCache();
                 logits = _model.Forward(inputTokens.ToArray());
             }
 
             var generatedTokens = new List<int>();
-            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
+            var rawBytes = new List<byte>();
+            int prevCharLen = 0;
 
             for (int step = 0; step < maxTokens; step++)
             {
@@ -181,28 +189,26 @@ namespace InferenceWeb
                     break;
 
                 generatedTokens.Add(nextToken);
-                string piece = _model.Tokenizer.Decode(generatedTokens);
-                if (generatedTokens.Count > 1)
-                {
-                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                    piece = piece.Substring(prev.Length);
-                }
+                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
+                int validLen = FindValidUtf8Length(rawBytes);
+                string decoded = Encoding.UTF8.GetString(rawBytes.GetRange(0, validLen).ToArray());
+                string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
+                prevCharLen = decoded.Length;
 
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
-                    string decoded = _model.Tokenizer.Decode(generatedTokens);
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop)
                         break;
                 }
 
-                yield return piece;
+                if (piece.Length > 0)
+                    yield return piece;
 
                 logits = _model.Forward(new[] { nextToken });
             }
 
-            _cachedRenderedText = rendered;
-            _cachedResponseText = _model.Tokenizer.Decode(generatedTokens);
+            SaveTokenCache(inputTokens, generatedTokens);
         }
 
         private List<int> ProcessMultimodal(ChatMessage msg, List<int> inputTokens, string arch)
@@ -417,9 +423,11 @@ namespace InferenceWeb
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             int promptTokenCount = inputTokens.Count;
 
-            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
             var generatedTokens = new List<int>();
+            var rawBytes2 = new List<byte>();
+            int prevCharLen2 = 0;
 
             var evalSw = Stopwatch.StartNew();
             for (int step = 0; step < maxTokens; step++)
@@ -430,21 +438,20 @@ namespace InferenceWeb
                 if (_model.Tokenizer.IsEos(nextToken)) break;
 
                 generatedTokens.Add(nextToken);
-                string piece = _model.Tokenizer.Decode(generatedTokens);
-                if (generatedTokens.Count > 1)
-                {
-                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                    piece = piece.Substring(prev.Length);
-                }
+                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes2);
+                int validLen2 = FindValidUtf8Length(rawBytes2);
+                string decoded = Encoding.UTF8.GetString(rawBytes2.GetRange(0, validLen2).ToArray());
+                string piece = prevCharLen2 < decoded.Length ? decoded.Substring(prevCharLen2) : "";
+                prevCharLen2 = decoded.Length;
 
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
-                    string decoded = _model.Tokenizer.Decode(generatedTokens);
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop) break;
                 }
 
-                yield return (piece, false, 0, 0, 0, 0, 0);
+                if (piece.Length > 0)
+                    yield return (piece, false, 0, 0, 0, 0, 0);
                 logits = _model.Forward(new[] { nextToken });
             }
 
@@ -472,27 +479,34 @@ namespace InferenceWeb
                 _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
                 architecture: arch, tools: tools, enableThinking: enableThinking);
 
+            Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, sampling: temp={samplingConfig?.Temperature ?? 0.8f}, top_k={samplingConfig?.TopK ?? 40}, top_p={samplingConfig?.TopP ?? 0.9f}");
+            Console.Error.WriteLine($"[Prompt] first 500 chars: {(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered)}");
+
             var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
             bool hasMultimodal = HasMultimodalContent(lastMsg);
+
+            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
+            if (lastMsg != null)
+                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
 
             int promptTokenCount;
             var sw = Stopwatch.StartNew();
             float[] logits;
+            int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
 
-            if (!hasMultimodal && TryGetCacheSuffix(rendered, out string suffixText))
+            if (commonPrefix > 0)
             {
-                var suffixTokens = _model.Tokenizer.Encode(suffixText, addSpecial: false);
-                Console.WriteLine($"[KV cache] Reusing cache, forwarding {suffixTokens.Count} new tokens");
-                logits = _model.Forward(suffixTokens.ToArray());
-                promptTokenCount = suffixTokens.Count;
+                _model.TruncateKVCache(commonPrefix);
+                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
+                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
+                logits = _model.Forward(suffixTokens);
+                promptTokenCount = suffixTokens.Length;
             }
             else
             {
-                var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-                if (lastMsg != null)
-                    inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
-                if (_cachedRenderedText != null)
-                    Console.WriteLine("[KV cache] Reset (text mismatch or multimodal)");
+                Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
+                if (_cachedTokens != null)
+                    Console.WriteLine("[KV cache] Reset (no usable common prefix)");
                 _model.ResetKVCache();
                 logits = _model.Forward(inputTokens.ToArray());
                 promptTokenCount = inputTokens.Count;
@@ -500,9 +514,11 @@ namespace InferenceWeb
 
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
 
-            var cfg = samplingConfig ?? SamplingConfig.Greedy;
+            var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
             var generatedTokens = new List<int>();
+            var rawBytes3 = new List<byte>();
+            int prevCharLen3 = 0;
 
             var evalSw = Stopwatch.StartNew();
             for (int step = 0; step < maxTokens; step++)
@@ -513,53 +529,130 @@ namespace InferenceWeb
                 if (_model.Tokenizer.IsEos(nextToken)) break;
 
                 generatedTokens.Add(nextToken);
-                string piece = _model.Tokenizer.Decode(generatedTokens);
-                if (generatedTokens.Count > 1)
-                {
-                    string prev = _model.Tokenizer.Decode(generatedTokens.GetRange(0, generatedTokens.Count - 1));
-                    piece = piece.Substring(prev.Length);
-                }
+                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes3);
+                int validLen3 = FindValidUtf8Length(rawBytes3);
+                string decoded = Encoding.UTF8.GetString(rawBytes3.GetRange(0, validLen3).ToArray());
+                string piece = prevCharLen3 < decoded.Length ? decoded.Substring(prevCharLen3) : "";
+                prevCharLen3 = decoded.Length;
 
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
-                    string decoded = _model.Tokenizer.Decode(generatedTokens);
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop) break;
                 }
 
-                yield return (piece, false, 0, 0, 0, 0, 0);
+                if (piece.Length > 0)
+                    yield return (piece, false, 0, 0, 0, 0, 0);
                 logits = _model.Forward(new[] { nextToken });
             }
 
             long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
 
-            _cachedRenderedText = rendered;
-            _cachedResponseText = _model.Tokenizer.Decode(generatedTokens);
+            SaveTokenCache(inputTokens, generatedTokens);
 
             yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
         }
 
         /// <summary>
-        /// Check if the new rendered prompt starts with the cached rendered text + generated response.
-        /// If so, extract the suffix that needs to be tokenized and forwarded.
-        /// The suffix always begins at a special token boundary (e.g. end-of-turn marker),
-        /// ensuring independent tokenization is correct.
+        /// Find the length of the longest prefix of the byte buffer that forms valid UTF-8.
+        /// Strips any trailing incomplete multi-byte sequence.
         /// </summary>
-        private bool TryGetCacheSuffix(string rendered, out string suffixText)
+        private static int FindValidUtf8Length(List<byte> bytes)
         {
-            suffixText = null;
-            if (_cachedRenderedText == null || _cachedResponseText == null)
-                return false;
+            int len = bytes.Count;
+            if (len == 0) return 0;
 
-            string expectedPrefix = _cachedRenderedText + _cachedResponseText;
-            if (rendered.Length > expectedPrefix.Length && rendered.StartsWith(expectedPrefix, StringComparison.Ordinal))
+            for (int i = 1; i <= Math.Min(4, len); i++)
             {
-                suffixText = rendered.Substring(expectedPrefix.Length);
-                return true;
+                byte b = bytes[len - i];
+                if ((b & 0x80) == 0) return len;
+                if ((b & 0xE0) == 0xC0) return (i >= 2) ? len : len - i;
+                if ((b & 0xF0) == 0xE0) return (i >= 3) ? len : len - i;
+                if ((b & 0xF8) == 0xF0) return (i >= 4) ? len : len - i;
+                if ((b & 0xC0) == 0x80) continue;
+                return len;
+            }
+            return len;
+        }
+
+        /// <summary>
+        /// Compute a usable common prefix length between cached tokens and new input.
+        /// Returns 0 (meaning full reset) when:
+        ///   - No cache exists or multimodal content is present
+        ///   - The model doesn't support KV cache truncation (e.g. Qwen3.5 recurrent layers)
+        ///   - The savings would be less than 10% (not worth the risk)
+        ///   - The common prefix is shorter than 4 tokens
+        /// </summary>
+        private int ComputeUsablePrefix(List<int> inputTokens, bool hasMultimodal)
+        {
+            if (hasMultimodal || !_model.SupportsKVCacheTruncation)
+                return 0;
+
+            int raw = FindTokenPrefixLength(_cachedTokens, inputTokens);
+            if (raw <= 0)
+                return 0;
+
+            int suffixLen = inputTokens.Count - raw;
+
+            if (raw < 4)
+            {
+                Console.WriteLine($"[KV cache] Common prefix too short ({raw} tokens), doing full reset");
+                return 0;
             }
 
-            return false;
+            double savingsRatio = (double)raw / inputTokens.Count;
+            if (savingsRatio < 0.10)
+            {
+                Console.WriteLine($"[KV cache] Savings too small ({raw}/{inputTokens.Count} = {100 * savingsRatio:F0}%), doing full reset");
+                return 0;
+            }
+
+            if (_cachedTokens != null && raw < _cachedTokens.Count)
+            {
+                string cachedTokStr = _cachedTokens.Count > raw ? _cachedTokens[raw].ToString() : "N/A";
+                string newTokStr = inputTokens.Count > raw ? inputTokens[raw].ToString() : "N/A";
+                Console.WriteLine($"[KV cache] Divergence at index {raw}: cached={cachedTokStr}, new={newTokStr} (cached total={_cachedTokens.Count}, new total={inputTokens.Count})");
+            }
+
+            return raw;
+        }
+
+        /// <summary>
+        /// Save the full token sequence (prompt + generated) so the next turn can find
+        /// the longest common prefix and reuse the KV cache up to that point.
+        /// Works correctly for all models including thinking/Harmony because it compares
+        /// actual token IDs rather than re-rendered text.
+        /// </summary>
+        private void SaveTokenCache(List<int> promptTokens, List<int> generatedTokens)
+        {
+            _cachedTokens = new List<int>(promptTokens.Count + generatedTokens.Count);
+            _cachedTokens.AddRange(promptTokens);
+            _cachedTokens.AddRange(generatedTokens);
+        }
+
+        /// <summary>
+        /// Find the length of the longest common prefix between the cached token sequence
+        /// and the new input tokens. Returns 0 if there is no cache or no common prefix.
+        /// </summary>
+        internal static int FindTokenPrefixLength(List<int> cached, List<int> newTokens)
+        {
+            if (cached == null || cached.Count == 0 || newTokens == null || newTokens.Count == 0)
+                return 0;
+
+            int maxLen = Math.Min(cached.Count, newTokens.Count);
+            int common = 0;
+            for (int i = 0; i < maxLen; i++)
+            {
+                if (cached[i] != newTokens[i])
+                    break;
+                common++;
+            }
+
+            if (common == 0 || common >= newTokens.Count)
+                return 0;
+
+            return common;
         }
 
         private static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)

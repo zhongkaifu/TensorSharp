@@ -411,6 +411,92 @@ button.primary:hover { background: var(--accent-hover); }
 
 .model-switcher .switch-indicator.visible { display: inline; }
 
+.reasoning-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--text2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.reasoning-toggle input[type="checkbox"] { display: none; }
+
+.reasoning-toggle .toggle-track {
+  width: 32px;
+  height: 18px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  position: relative;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.reasoning-toggle .toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  background: var(--text2);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.reasoning-toggle input:checked + .toggle-track {
+  background: #1e3a5a;
+  border-color: var(--accent);
+}
+
+.reasoning-toggle input:checked + .toggle-track::after {
+  transform: translateX(14px);
+  background: var(--accent);
+}
+
+.thinking-block {
+  background: #1a1a2a;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+}
+
+.thinking-header:hover { background: #222238; }
+
+.thinking-header .arrow {
+  font-size: 10px;
+  transition: transform 0.2s;
+}
+
+.thinking-header .arrow.expanded { transform: rotate(90deg); }
+
+.thinking-content {
+  padding: 8px 12px 10px;
+  font-size: 13px;
+  color: #aaa;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid #2a2a4a;
+  display: none;
+}
+
+.thinking-content.visible { display: block; }
+
 .attachments {
   display: flex;
   gap: 8px;
@@ -545,6 +631,11 @@ button.primary:hover { background: var(--accent-hover); }
       <label>Model:</label>
       <select id="inline-model-select"><option value="">Loading...</option></select>
       <span class="switch-indicator" id="switch-indicator">will switch model</span>
+      <label class="reasoning-toggle" title="Enable reasoning / chain-of-thought output">
+        <input type="checkbox" id="reasoning-toggle" checked>
+        <span class="toggle-track"></span>
+        <span>Reasoning</span>
+      </label>
     </div>
     <div class="input-row">
       <div class="input-wrapper">
@@ -834,7 +925,8 @@ async function sendMessage() {
 
   try {
     const maxTokens = parseInt(document.getElementById('max-tokens').value) || 200;
-    const chatPayload = { messages: chatHistory, maxTokens };
+    const reasoningOn = document.getElementById('reasoning-toggle').checked;
+    const chatPayload = { messages: chatHistory, maxTokens, think: true };
     if (selectedModel) chatPayload.model = selectedModel;
     const backendSel = document.getElementById('backend-select');
     if (backendSel) chatPayload.backend = backendSel.value;
@@ -907,6 +999,21 @@ async function sendMessage() {
           if (!queueCleared && queueDiv) {
             queueDiv.style.display = 'none';
             queueCleared = true;
+          }
+          if (data.thinking) {
+            let thinkBlock = assistDiv.querySelector('.thinking-block');
+            if (!thinkBlock) {
+              thinkBlock = document.createElement('div');
+              thinkBlock.className = 'thinking-block';
+              const expanded = reasoningOn ? ' expanded' : '';
+              const visible = reasoningOn ? ' visible' : '';
+              const display = reasoningOn ? '' : ' style="display:none"';
+              thinkBlock.innerHTML = `<div class="thinking-header" onclick="toggleThinking(this)"${display}><span class="arrow${expanded}">&#x25B6;</span> Reasoning</div><div class="thinking-content${visible}"></div>`;
+              bubbleText.parentNode.insertBefore(thinkBlock, bubbleText);
+            }
+            const tc = thinkBlock.querySelector('.thinking-content');
+            tc.textContent += data.thinking;
+            if (reasoningOn) chatContainer.scrollTop = chatContainer.scrollHeight;
           }
           if (data.token) {
             fullText += data.token;
@@ -1008,6 +1115,13 @@ function addAssistantBubble() {
   chatContainer.appendChild(div);
   chatContainer.scrollTop = chatContainer.scrollHeight;
   return div;
+}
+
+function toggleThinking(header) {
+  const arrow = header.querySelector('.arrow');
+  const content = header.nextElementSibling;
+  arrow.classList.toggle('expanded');
+  content.classList.toggle('visible');
 }
 
 function escapeHtml(str) {

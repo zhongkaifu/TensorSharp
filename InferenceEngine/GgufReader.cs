@@ -32,6 +32,7 @@ namespace InferenceEngine
         I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28,
         IQ1_M = 29, BF16 = 30,
         TQ1_0 = 34, TQ2_0 = 35,
+        MXFP4 = 39,
     }
 
     public class GgufTensorInfo
@@ -287,6 +288,7 @@ namespace InferenceEngine
                 case GgmlTensorType.Q8_0:
                 case GgmlTensorType.Q8_1:
                 case GgmlTensorType.IQ4_NL:
+                case GgmlTensorType.MXFP4:
                     return 32;
                 default:
                     return 256;
@@ -323,6 +325,7 @@ namespace InferenceEngine
                 case GgmlTensorType.IQ1_M: return 256 / 8 + 256 / 16 + 256 / 32; // 56
                 case GgmlTensorType.TQ1_0: return 2 + 256 / 64 + (256 - 4 * 256 / 64) / 5; // 54
                 case GgmlTensorType.TQ2_0: return 2 + 256 / 4;                 // 66
+                case GgmlTensorType.MXFP4: return 1 + 32 / 2;                  // 17
                 case GgmlTensorType.I8: return 1;
                 case GgmlTensorType.I16: return 2;
                 case GgmlTensorType.I32: return 4;

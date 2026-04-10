@@ -70,6 +70,11 @@ namespace InferenceEngine
         ParsedOutput Add(string text, bool done);
         bool HasThinkingSupport { get; }
         bool HasToolSupport { get; }
+        /// <summary>
+        /// True when the model's wire format always requires parsing (e.g. Harmony
+        /// framing), even if the caller did not request thinking or tool support.
+        /// </summary>
+        bool AlwaysRequired { get; }
     }
 
     // ========================================================================
@@ -87,6 +92,7 @@ namespace InferenceEngine
 
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
+        public bool AlwaysRequired => false;
 
         public void Init(bool enableThinking, List<ToolFunction> tools)
         {
@@ -175,6 +181,11 @@ namespace InferenceEngine
                                 if (emit.Length > 0) thinkingSb.Append(emit);
                                 _buffer.Clear();
                                 _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                            else
+                            {
+                                thinkingSb.Append(buf);
+                                _buffer.Clear();
                             }
                         }
                         break;
@@ -354,6 +365,7 @@ namespace InferenceEngine
 
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
+        public bool AlwaysRequired => false;
 
         public void Init(bool enableThinking, List<ToolFunction> tools)
         {
@@ -466,6 +478,11 @@ namespace InferenceEngine
                                 _buffer.Clear();
                                 _buffer.Append(buf.Substring(buf.Length - hold));
                             }
+                            else
+                            {
+                                if (_thinkingEnabled) thinkingSb.Append(buf);
+                                _buffer.Clear();
+                            }
                         }
                         else
                         {
@@ -574,6 +591,182 @@ namespace InferenceEngine
     }
 
     // ========================================================================
+    // GPT OSS / Harmony Parser
+    // Uses <|start|>...<|end|> message framing with <|message|> header end,
+    // <|channel|>analysis for thinking, <|channel|>final for content
+    // ========================================================================
+
+    public class HarmonyOutputParser : IOutputParser
+    {
+        private enum HState { LookingForStart, ParsingHeader, ParsingContent }
+
+        private HState _state;
+        private readonly StringBuilder _buffer = new();
+        private bool _thinkingEnabled;
+        private string _currentChannel;
+
+        private const string MsgStartTag = "<|start|>";
+        private const string MsgEndTag = "<|end|>";
+        private const string HeaderEndTag = "<|message|>";
+        private const string ChannelTag = "<|channel|>";
+
+        public bool HasThinkingSupport => true;
+        public bool HasToolSupport => false;
+        public bool AlwaysRequired => true;
+
+        public void Init(bool enableThinking, List<ToolFunction> tools)
+        {
+            _buffer.Clear();
+            _thinkingEnabled = enableThinking;
+            _state = HState.LookingForStart;
+            _currentChannel = null;
+
+            _buffer.Append("<|start|>assistant");
+        }
+
+        public ParsedOutput Add(string text, bool done)
+        {
+            _buffer.Append(text);
+            var result = new ParsedOutput();
+            var contentSb = new StringBuilder();
+            var thinkingSb = new StringBuilder();
+
+            bool keepParsing = true;
+            while (keepParsing)
+            {
+                keepParsing = false;
+                string buf = _buffer.ToString();
+                if (buf.Length == 0) break;
+
+                switch (_state)
+                {
+                    case HState.LookingForStart:
+                        int startIdx = buf.IndexOf(MsgStartTag, StringComparison.Ordinal);
+                        if (startIdx >= 0)
+                        {
+                            string after = buf.Substring(startIdx + MsgStartTag.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+                            _state = HState.ParsingHeader;
+                            keepParsing = true;
+                        }
+                        else if (!done)
+                        {
+                            int hold = HoldBack(buf, MsgStartTag);
+                            if (hold > 0)
+                            {
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+
+                    case HState.ParsingHeader:
+                        int headerEnd = buf.IndexOf(HeaderEndTag, StringComparison.Ordinal);
+                        if (headerEnd >= 0)
+                        {
+                            string header = buf.Substring(0, headerEnd);
+                            string after = buf.Substring(headerEnd + HeaderEndTag.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+
+                            int chIdx = header.IndexOf(ChannelTag, StringComparison.Ordinal);
+                            if (chIdx >= 0)
+                            {
+                                string channelPart = header.Substring(chIdx + ChannelTag.Length);
+                                int spaceIdx = channelPart.IndexOfAny(new[] { ' ', '\t', '\n', '\r' });
+                                _currentChannel = spaceIdx >= 0 ? channelPart.Substring(0, spaceIdx) : channelPart;
+                            }
+                            else
+                            {
+                                _currentChannel = "final";
+                            }
+
+                            _state = HState.ParsingContent;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (!done)
+                        {
+                            int hold = HoldBack(buf, HeaderEndTag);
+                            if (hold > 0 && hold < buf.Length)
+                            {
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                        }
+                        break;
+
+                    case HState.ParsingContent:
+                        int endIdx = buf.IndexOf(MsgEndTag, StringComparison.Ordinal);
+                        if (endIdx >= 0)
+                        {
+                            string content = buf.Substring(0, endIdx);
+                            string after = buf.Substring(endIdx + MsgEndTag.Length);
+                            _buffer.Clear();
+                            _buffer.Append(after);
+
+                            EmitContent(content, contentSb, thinkingSb);
+                            _state = HState.LookingForStart;
+                            keepParsing = after.Length > 0;
+                        }
+                        else if (!done)
+                        {
+                            int hold = HoldBack(buf, MsgEndTag, MsgStartTag);
+                            if (hold > 0)
+                            {
+                                string emit = buf.Substring(0, buf.Length - hold);
+                                if (emit.Length > 0) EmitContent(emit, contentSb, thinkingSb);
+                                _buffer.Clear();
+                                _buffer.Append(buf.Substring(buf.Length - hold));
+                            }
+                            else
+                            {
+                                EmitContent(buf, contentSb, thinkingSb);
+                                _buffer.Clear();
+                            }
+                        }
+                        else
+                        {
+                            if (buf.Length > 0) EmitContent(buf, contentSb, thinkingSb);
+                            _buffer.Clear();
+                        }
+                        break;
+                }
+            }
+
+            result.Content = contentSb.ToString();
+            result.Thinking = thinkingSb.ToString();
+            return result;
+        }
+
+        private void EmitContent(string content, StringBuilder contentSb, StringBuilder thinkingSb)
+        {
+            if (_currentChannel == "analysis")
+                thinkingSb.Append(content);
+            else
+                contentSb.Append(content);
+        }
+
+        private static int HoldBack(string buf, params string[] tags)
+        {
+            int maxOverlap = 0;
+            foreach (var tag in tags)
+            {
+                int max = Math.Min(tag.Length, buf.Length);
+                for (int i = max; i > 0; i--)
+                {
+                    if (buf.EndsWith(tag.Substring(0, i), StringComparison.Ordinal))
+                    {
+                        maxOverlap = Math.Max(maxOverlap, i);
+                        break;
+                    }
+                }
+            }
+            return maxOverlap;
+        }
+    }
+
+    // ========================================================================
     // Passthrough parser (no thinking/tool parsing)
     // ========================================================================
 
@@ -581,6 +774,7 @@ namespace InferenceEngine
     {
         public bool HasThinkingSupport => false;
         public bool HasToolSupport => false;
+        public bool AlwaysRequired => false;
 
         public void Init(bool enableThinking, List<ToolFunction> tools) { }
 
@@ -603,8 +797,14 @@ namespace InferenceEngine
                 "gemma4" => new Gemma4OutputParser(),
                 "qwen3" => new Qwen3OutputParser(),
                 "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" => new Qwen35OutputParser(),
+                "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
                 _ => new PassthroughOutputParser()
             };
+        }
+
+        public static bool IsAlwaysRequired(string architecture)
+        {
+            return architecture is "gptoss" or "gpt-oss";
         }
     }
 }
