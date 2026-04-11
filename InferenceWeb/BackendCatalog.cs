@@ -73,8 +73,9 @@ namespace InferenceWeb
         {
             try
             {
-                GgmlBasicOps.EnsureBackendAvailable(backendType);
-                return true;
+                // Backend discovery runs at web-app startup, so it must not claim the
+                // process-wide GGML backend before the user actually loads a model.
+                return GgmlBasicOps.CanInitializeBackend(backendType);
             }
             catch
             {
