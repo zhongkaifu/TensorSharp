@@ -19,6 +19,8 @@
   --danger: #e55;
   --success: #5b5;
   --radius: 12px;
+  --layout-gutter: clamp(12px, 2vw, 20px);
+  --chat-shell-max-width: min(1180px, calc(100vw - 32px));
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -37,6 +39,8 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
   padding: 12px 20px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -51,12 +55,26 @@ header h1 {
   gap: 8px;
 }
 
-header h1 .icon { font-size: 22px; }
+.brand-logo {
+  height: 56px;
+  width: auto;
+  display: block;
+  object-fit: contain;
+  flex-shrink: 0;
+  filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.35));
+}
+
+.brand-text {
+  white-space: nowrap;
+}
 
 .header-controls {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-left: auto;
 }
 
 .status-badge {
@@ -131,7 +149,7 @@ button.primary:hover { background: var(--accent-hover); }
 #chat-container {
   flex: 1;
   overflow-y: auto;
-  padding: 20px;
+  padding: 20px var(--layout-gutter);
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -140,7 +158,7 @@ button.primary:hover { background: var(--accent-hover); }
 .message {
   display: flex;
   gap: 12px;
-  max-width: 800px;
+  max-width: var(--chat-shell-max-width);
   width: 100%;
   margin: 0 auto;
   animation: fadeIn 0.2s ease;
@@ -154,24 +172,40 @@ button.primary:hover { background: var(--accent-hover); }
 .message.user { flex-direction: row-reverse; }
 
 .avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 14px;
   flex-shrink: 0;
   margin-top: 2px;
+  overflow: hidden;
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 
 .message.user .avatar {
   background: var(--accent);
+  color: #fff;
+  font-weight: 600;
 }
 
 .message.assistant .avatar {
-  background: var(--surface2);
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.message.assistant .avatar img {
+  object-position: center top;
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.3));
 }
 
 .bubble {
@@ -280,7 +314,7 @@ button.primary:hover { background: var(--accent-hover); }
 }
 
 #input-area {
-  padding: 16px 20px;
+  padding: 16px var(--layout-gutter);
   background: var(--surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
@@ -289,7 +323,7 @@ button.primary:hover { background: var(--accent-hover); }
 .input-row {
   display: flex;
   gap: 10px;
-  max-width: 800px;
+  max-width: var(--chat-shell-max-width);
   margin: 0 auto;
   align-items: flex-end;
 }
@@ -373,7 +407,7 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 800px;
+  max-width: var(--chat-shell-max-width);
   margin: 0 auto 6px auto;
   font-size: 12px;
   color: var(--text2);
@@ -501,7 +535,7 @@ button.primary:hover { background: var(--accent-hover); }
   display: flex;
   gap: 8px;
   margin-bottom: 8px;
-  max-width: 800px;
+  max-width: var(--chat-shell-max-width);
   margin-left: auto;
   margin-right: auto;
   flex-wrap: wrap;
@@ -545,9 +579,47 @@ button.primary:hover { background: var(--accent-hover); }
   padding: 40px;
 }
 
-.empty-state .big-icon { font-size: 48px; opacity: 0.3; }
+.empty-state .big-logo {
+  width: min(280px, 60vw);
+  height: auto;
+  display: block;
+  filter: drop-shadow(0 14px 28px rgba(0, 0, 0, 0.28));
+}
+
+.empty-state .big-logo.assistant-preview {
+  width: min(220px, 48vw);
+}
 
 .empty-state p { font-size: 14px; max-width: 400px; line-height: 1.6; }
+
+@media (max-width: 720px) {
+  header {
+    padding: 10px 14px;
+  }
+
+  header h1 {
+    font-size: 16px;
+    gap: 10px;
+  }
+
+  .brand-logo {
+    height: 44px;
+  }
+
+  .avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+  }
+
+  .empty-state {
+    padding: 28px 20px;
+  }
+
+  .empty-state .big-logo {
+    width: min(220px, 72vw);
+  }
+}
 
 .modal-overlay {
   display: none;
@@ -607,7 +679,10 @@ button.primary:hover { background: var(--accent-hover); }
 <body>
 
 <header>
-  <h1><span class="icon">&#x2B22;</span> TensorSharp Chat</h1>
+  <h1>
+    <img class="brand-logo" src="/images/banner_1.png" alt="TensorSharp logo">
+    <span class="brand-text">TensorSharp Chat</span>
+  </h1>
   <div class="header-controls">
     <span id="queue-badge" class="status-badge" style="display:none" title="Request queue status"></span>
     <span id="status-badge" class="status-badge">No model loaded</span>
@@ -619,7 +694,7 @@ button.primary:hover { background: var(--accent-hover); }
 <div class="main-area">
   <div id="chat-container">
     <div class="empty-state" id="empty-state">
-      <div class="big-icon">&#x2B22;</div>
+      <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
       <p>Load a model and start chatting. You can attach images, videos, and audio files for multimodal inference.</p>
       <button class="primary" onclick="showSettings()">Load Model</button>
     </div>
@@ -660,15 +735,12 @@ button.primary:hover { background: var(--accent-hover); }
     <div class="field">
       <label>Backend</label>
       <select id="backend-select">
-        <option value="ggml_metal">GGML Metal (GPU)</option>
-        <option value="ggml_cuda">GGML CUDA (GPU)</option>
-        <option value="ggml_cpu">GGML CPU</option>
-        <option value="cpu">CPU</option>
+        <option value="">Loading supported backends...</option>
       </select>
     </div>
     <div class="field">
       <label>Max Tokens</label>
-      <input type="text" id="max-tokens" value="200">
+      <input type="text" id="max-tokens" value="2000">
     </div>
     <div class="actions">
       <button onclick="hideSettings()">Cancel</button>
@@ -681,7 +753,6 @@ button.primary:hover { background: var(--accent-hover); }
 const chatContainer = document.getElementById('chat-container');
 const messageInput = document.getElementById('message-input');
 const statusBadge = document.getElementById('status-badge');
-const emptyState = document.getElementById('empty-state');
 const attachmentsDiv = document.getElementById('attachments');
 
 let chatHistory = [];
@@ -690,6 +761,7 @@ let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
 let availableModels = [];
+let availableBackends = [];
 let needsCacheReset = false;
 
 messageInput.addEventListener('keydown', e => {
@@ -721,12 +793,13 @@ async function fetchModels() {
     const res = await fetch('/api/models');
     const data = await res.json();
     availableModels = data.models || [];
+    populateBackendSelect(data.supportedBackends || [], data.loadedBackend || data.defaultBackend);
 
     const select = document.getElementById('model-select');
     select.innerHTML = '';
     if (availableModels.length === 0) {
       select.innerHTML = '<option>No .gguf files found in model directory</option>';
-      return;
+      return data;
     }
     availableModels.forEach(m => {
       const opt = document.createElement('option');
@@ -738,9 +811,37 @@ async function fetchModels() {
 
     if (data.loaded) currentLoadedModel = data.loaded;
     populateInlineModelSelect();
+    return data;
   } catch (e) {
     console.error('Failed to fetch models:', e);
+    return null;
   }
+}
+
+function populateBackendSelect(backends, preferredBackend) {
+  availableBackends = backends;
+  const select = document.getElementById('backend-select');
+  const currentValue = select.value;
+  select.innerHTML = '';
+
+  if (availableBackends.length === 0) {
+    select.innerHTML = '<option value="">No supported backends</option>';
+    select.disabled = true;
+    return;
+  }
+
+  availableBackends.forEach(backend => {
+    const opt = document.createElement('option');
+    opt.value = backend.value;
+    opt.textContent = backend.label;
+    select.appendChild(opt);
+  });
+
+  select.disabled = false;
+  const selectedValue = availableBackends.some(backend => backend.value === currentValue) ? currentValue :
+    availableBackends.some(backend => backend.value === preferredBackend) ? preferredBackend :
+    availableBackends[0].value;
+  select.value = selectedValue;
 }
 
 function populateInlineModelSelect() {
@@ -776,6 +877,10 @@ function updateSwitchIndicator() {
 async function loadModel() {
   const model = document.getElementById('model-select').value;
   const backend = document.getElementById('backend-select').value;
+  if (!backend) {
+    alert('No supported backend is available on this machine.');
+    return;
+  }
   const btn = document.getElementById('btn-load');
   btn.disabled = true;
   btn.textContent = 'Loading...';
@@ -814,14 +919,14 @@ function clearChat() {
   if (!statusBadge.classList.contains('loaded')) {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
-        <div class="big-icon">&#x2B22;</div>
+        <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
         <p>Load a model and start chatting. You can attach images, videos, and audio files for multimodal inference.</p>
         <button class="primary" onclick="showSettings()">Load Model</button>
       </div>`;
   } else {
     chatContainer.innerHTML = `
       <div class="empty-state">
-        <div class="big-icon">&#x1F4AC;</div>
+        <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
         <p>Start a conversation. You can switch models at any turn using the dropdown below, or attach images, videos, and audio files.</p>
       </div>`;
   }
@@ -921,12 +1026,13 @@ async function sendMessage() {
   const queueDiv = assistDiv.querySelector('.queue-indicator');
 
   let fullText = '';
+  let fullThinking = '';
   let wasAborted = false;
 
   try {
-    const maxTokens = parseInt(document.getElementById('max-tokens').value) || 200;
+    const maxTokens = parseInt(document.getElementById('max-tokens').value) || 2000;
     const reasoningOn = document.getElementById('reasoning-toggle').checked;
-    const chatPayload = { messages: chatHistory, maxTokens, think: true };
+    const chatPayload = { messages: chatHistory, maxTokens, think: reasoningOn };
     if (selectedModel) chatPayload.model = selectedModel;
     const backendSel = document.getElementById('backend-select');
     if (backendSel) chatPayload.backend = backendSel.value;
@@ -1001,6 +1107,7 @@ async function sendMessage() {
             queueCleared = true;
           }
           if (data.thinking) {
+            fullThinking += data.thinking;
             let thinkBlock = assistDiv.querySelector('.thinking-block');
             if (!thinkBlock) {
               thinkBlock = document.createElement('div');
@@ -1035,7 +1142,9 @@ async function sendMessage() {
     }
   } finally {
     if (fullText) {
-      chatHistory.push({ role: 'assistant', content: fullText });
+      const assistantMessage = { role: 'assistant', content: fullText };
+      if (fullThinking) assistantMessage.thinking = fullThinking;
+      chatHistory.push(assistantMessage);
     }
     isGenerating = false;
     currentAbortController = null;
@@ -1104,7 +1213,7 @@ function addAssistantBubble() {
   const selectedModel = document.getElementById('inline-model-select').value || currentLoadedModel || '';
   const modelDisplay = selectedModel.replace(/\.gguf$/i, '');
   div.innerHTML = `
-    <div class="avatar">&#x2B22;</div>
+    <div class="avatar"><img src="/images/assistant_logo.png" alt=""></div>
     <div class="bubble">
       <div class="model-label">${escapeHtml(modelDisplay)}</div>
       <div class="queue-indicator" style="display:none"><div class="queue-spinner"></div><span>Waiting in queue...</span></div>
@@ -1130,15 +1239,13 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-fetchModels().then(() => {
-  fetch('/api/models').then(r => r.json()).then(data => {
-    if (data.loaded) {
-      currentLoadedModel = data.loaded;
-      statusBadge.textContent = data.loaded + ' (' + (data.architecture || '?') + ')';
-      statusBadge.classList.add('loaded');
-      populateInlineModelSelect();
-    }
-  });
+fetchModels().then(data => {
+  if (data && data.loaded) {
+    currentLoadedModel = data.loaded;
+    statusBadge.textContent = data.loaded + ' (' + (data.architecture || '?') + ')';
+    statusBadge.classList.add('loaded');
+    populateInlineModelSelect();
+  }
 });
 
 const queueBadge = document.getElementById('queue-badge');

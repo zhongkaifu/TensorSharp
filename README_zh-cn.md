@@ -1,6 +1,10 @@
 # TensorSharp
 
-[English](README.md) | [中文](readme_cn.md)
+<p align="center">
+  <img src="imgs/banner_1.png" alt="TensorSharp logo" width="320">
+</p>
+
+[English](README.md) | [中文](README_zh-cn.md)
 
 一个用于在本地运行大型语言模型（LLM）的 C# 推理引擎，使用 GGUF 模型文件。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 

@@ -34,6 +34,7 @@ namespace InferenceWeb
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
+        public string LoadedBackend => _model != null ? BackendCatalog.ToBackendValue(_backend) : null;
         public string Architecture => _model?.Config?.Architecture;
         public ModelBase Model => _model;
 
@@ -62,11 +63,11 @@ namespace InferenceWeb
             _loadedMmProjPath = null;
             _cachedTokens = null;
 
-            _backend = backendStr switch
+            _backend = BackendCatalog.Canonicalize(backendStr) switch
             {
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cpu" => BackendType.GgmlCpu,
-                "cuda" or "ggml_cuda" => BackendType.GgmlCuda,
+                "ggml_cuda" => BackendType.GgmlCuda,
                 "cpu" => BackendType.Cpu,
                 _ => BackendType.GgmlCpu
             };
