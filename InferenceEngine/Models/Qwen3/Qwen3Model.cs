@@ -66,7 +66,7 @@ namespace InferenceEngine
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
                     long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                     Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
                     Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
                     Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);

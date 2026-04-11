@@ -101,6 +101,21 @@ class TestRunner:
                     pass
         return items
 
+    def ensure_model_loaded(self):
+        data = json.loads(urlopen(f"{self.base_url}/api/models", timeout=30).read().decode("utf-8"))
+        if data.get("loaded") == self.model:
+            self.log(f"Using already-loaded model: {self.model}")
+            return
+
+        backend = data.get("loadedBackend") or data.get("defaultBackend")
+        if not backend:
+            raise RuntimeError("No supported backend is available to load the test model.")
+
+        self.log(f"Loading model: {self.model} ({backend})")
+        result = self._post_json_body("/api/models/load", {"model": self.model, "backend": backend})
+        if not result.get("ok"):
+            raise RuntimeError(f"Failed to load model: {result}")
+
     def _extract_sse_tokens(self, events):
         """Extract concatenated token text from SSE events."""
         tokens = ""
@@ -145,7 +160,6 @@ class TestRunner:
             events = self._post_sse_collect("/api/chat", {
                 "messages": messages,
                 "maxTokens": self.max_tokens,
-                "model": self.model,
             })
 
             content = self._extract_sse_tokens(events)
@@ -617,6 +631,12 @@ class TestRunner:
             self.log(f"Server version: {json.loads(raw).get('version', '?')}")
         except Exception as e:
             print(f"Error: Cannot connect to {self.base_url}: {e}")
+            sys.exit(1)
+
+        try:
+            self.ensure_model_loaded()
+        except Exception as e:
+            print(f"Error: Cannot load model '{self.model}': {e}")
             sys.exit(1)
 
         tests = [

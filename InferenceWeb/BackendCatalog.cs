@@ -10,12 +10,14 @@ namespace InferenceWeb
 
     internal static class BackendCatalog
     {
+        // InferenceWeb should always expose the two CPU choices distinctly:
+        // `ggml_cpu` is the native GGML CPU backend, while `cpu` is the pure C# backend.
         private static readonly BackendDescriptor[] BackendDescriptors =
         {
             new("ggml_metal", "GGML Metal (GPU)", GgmlBackendType.Metal, AlwaysAvailable: false),
             new("ggml_cuda", "GGML CUDA (GPU)", GgmlBackendType.Cuda, AlwaysAvailable: false),
-            new("ggml_cpu", "GGML CPU", GgmlBackendType.Cpu, AlwaysAvailable: false),
-            new("cpu", "CPU", GgmlBackendType.Cpu, AlwaysAvailable: true),
+            new("ggml_cpu", "GGML CPU", GgmlBackendType.Cpu, AlwaysAvailable: true),
+            new("cpu", "CPU (Pure C#)", GgmlBackendType.Cpu, AlwaysAvailable: true),
         };
 
         internal static IReadOnlyList<BackendOption> GetSupportedBackends(Func<GgmlBackendType, bool> isGgmlBackendAvailable = null)

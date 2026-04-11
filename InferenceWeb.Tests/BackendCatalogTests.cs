@@ -31,20 +31,25 @@ public class BackendCatalogTests
             backend =>
             {
                 Assert.Equal("cpu", backend.Value);
-                Assert.Equal("CPU", backend.Label);
+                Assert.Equal("CPU (Pure C#)", backend.Label);
             });
     }
 
     [Fact]
-    public void GetSupportedBackends_AlwaysIncludesPureCpuBackend()
+    public void GetSupportedBackends_AlwaysIncludesBothCpuBackends()
     {
         var backends = BackendCatalog.GetSupportedBackends(_ => false);
 
         Assert.Collection(backends,
             backend =>
             {
+                Assert.Equal("ggml_cpu", backend.Value);
+                Assert.Equal("GGML CPU", backend.Label);
+            },
+            backend =>
+            {
                 Assert.Equal("cpu", backend.Value);
-                Assert.Equal("CPU", backend.Label);
+                Assert.Equal("CPU (Pure C#)", backend.Label);
             });
     }
 
@@ -68,7 +73,7 @@ public class BackendCatalogTests
         var supportedBackends = new[]
         {
             new BackendOption("ggml_cpu", "GGML CPU"),
-            new BackendOption("cpu", "CPU"),
+            new BackendOption("cpu", "CPU (Pure C#)"),
         };
 
         string backend = BackendCatalog.ResolveDefaultBackend("ggml_metal", supportedBackends);
@@ -84,5 +89,35 @@ public class BackendCatalogTests
     public void ToBackendValue_ReturnsCanonicalBackendString(BackendType backendType, string expected)
     {
         Assert.Equal(expected, BackendCatalog.ToBackendValue(backendType));
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_PureCpuBackendKeepsSupportedWeightsCompressed()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.attn_q.weight",
+            Type = GgmlTensorType.Q8_0,
+            Shape = new ulong[] { 128, 256 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Cpu, info);
+
+        Assert.True(shouldStoreQuantized);
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_GgmlBackendsKeepQuantizedWeights()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.attn_q.weight",
+            Type = GgmlTensorType.Q8_0,
+            Shape = new ulong[] { 128, 256 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.GgmlCpu, info);
+
+        Assert.True(shouldStoreQuantized);
     }
 }

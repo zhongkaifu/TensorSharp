@@ -406,44 +406,52 @@ button.primary:hover { background: var(--accent-hover); }
 .model-switcher {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
   max-width: var(--chat-shell-max-width);
   margin: 0 auto 6px auto;
   font-size: 12px;
   color: var(--text2);
+  flex-wrap: wrap;
 }
 
-.model-switcher label {
-  white-space: nowrap;
-}
-
-.model-switcher select {
-  background: var(--surface2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-size: 12px;
-  flex: 1;
+.model-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
-  max-width: 320px;
-  cursor: pointer;
 }
 
-.model-switcher select:hover { border-color: #444; }
-.model-switcher select:focus { border-color: var(--accent); outline: none; }
-
-.model-switcher .switch-indicator {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: #3a2a1a;
-  color: #fa5;
-  display: none;
+.model-readout-label {
   white-space: nowrap;
 }
 
-.model-switcher .switch-indicator.visible { display: inline; }
+.model-value {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  font-size: 12px;
+  color: var(--text);
+  max-width: min(420px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-value.empty {
+  color: var(--text2);
+}
+
+.settings-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text2);
+  line-height: 1.5;
+}
 
 .reasoning-toggle {
   display: inline-flex;
@@ -703,9 +711,10 @@ button.primary:hover { background: var(--accent-hover); }
   <div id="input-area">
     <div class="attachments" id="attachments"></div>
     <div class="model-switcher" id="model-switcher">
-      <label>Model:</label>
-      <select id="inline-model-select"><option value="">Loading...</option></select>
-      <span class="switch-indicator" id="switch-indicator">will switch model</span>
+      <div class="model-readout">
+        <span class="model-readout-label">Model:</span>
+        <span class="model-value empty" id="inline-model-name">No model loaded</span>
+      </div>
       <label class="reasoning-toggle" title="Enable reasoning / chain-of-thought output">
         <input type="checkbox" id="reasoning-toggle" checked>
         <span class="toggle-track"></span>
@@ -746,6 +755,7 @@ button.primary:hover { background: var(--accent-hover); }
       <button onclick="hideSettings()">Cancel</button>
       <button class="primary" id="btn-load" onclick="loadModel()">Load</button>
     </div>
+    <p class="settings-hint" id="settings-hint">Select a model before starting a chat. The loaded model stays fixed for the conversation.</p>
   </div>
 </div>
 
@@ -781,6 +791,7 @@ document.getElementById('btn-clear').onclick = clearChat;
 
 function showSettings() {
   document.getElementById('settings-modal').classList.add('visible');
+  updateSettingsLockState();
   fetchModels();
 }
 
@@ -793,12 +804,15 @@ async function fetchModels() {
     const res = await fetch('/api/models');
     const data = await res.json();
     availableModels = data.models || [];
+    currentLoadedModel = data.loaded || null;
     populateBackendSelect(data.supportedBackends || [], data.loadedBackend || data.defaultBackend);
 
     const select = document.getElementById('model-select');
     select.innerHTML = '';
     if (availableModels.length === 0) {
       select.innerHTML = '<option>No .gguf files found in model directory</option>';
+      updateInlineModelStatus();
+      updateSettingsLockState();
       return data;
     }
     availableModels.forEach(m => {
@@ -809,8 +823,8 @@ async function fetchModels() {
       select.appendChild(opt);
     });
 
-    if (data.loaded) currentLoadedModel = data.loaded;
-    populateInlineModelSelect();
+    updateInlineModelStatus();
+    updateSettingsLockState();
     return data;
   } catch (e) {
     console.error('Failed to fetch models:', e);
@@ -844,37 +858,54 @@ function populateBackendSelect(backends, preferredBackend) {
   select.value = selectedValue;
 }
 
-function populateInlineModelSelect() {
-  const sel = document.getElementById('inline-model-select');
-  sel.innerHTML = '';
-  if (availableModels.length === 0) {
-    sel.innerHTML = '<option value="">No models</option>';
-    return;
-  }
-  availableModels.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m.replace(/\.gguf$/i, '');
-    if (m === currentLoadedModel) opt.selected = true;
-    sel.appendChild(opt);
-  });
-  updateSwitchIndicator();
+function hasActiveChat() {
+  return chatHistory.length > 0;
 }
 
-document.getElementById('inline-model-select').addEventListener('change', updateSwitchIndicator);
+function updateInlineModelStatus() {
+  const modelName = document.getElementById('inline-model-name');
+  if (!currentLoadedModel) {
+    modelName.textContent = 'No model loaded';
+    modelName.classList.add('empty');
+    return;
+  }
 
-function updateSwitchIndicator() {
-  const sel = document.getElementById('inline-model-select');
-  const indicator = document.getElementById('switch-indicator');
-  const selected = sel.value;
-  if (currentLoadedModel && selected && selected !== currentLoadedModel) {
-    indicator.classList.add('visible');
-  } else {
-    indicator.classList.remove('visible');
+  modelName.textContent = currentLoadedModel.replace(/\.gguf$/i, '');
+  modelName.classList.remove('empty');
+}
+
+function updateSettingsLockState() {
+  const lockModelSelection = hasActiveChat();
+  const modelSelect = document.getElementById('model-select');
+  const backendSelect = document.getElementById('backend-select');
+  const loadButton = document.getElementById('btn-load');
+  const settingsHint = document.getElementById('settings-hint');
+
+  if (settingsHint) {
+    settingsHint.textContent = lockModelSelection
+      ? 'Model changes are locked during a conversation. Start a new chat before loading a different model.'
+      : 'Select a model before starting a chat. The loaded model stays fixed for the conversation.';
+  }
+
+  if (modelSelect) {
+    modelSelect.disabled = lockModelSelection || availableModels.length === 0;
+  }
+
+  if (backendSelect) {
+    backendSelect.disabled = lockModelSelection || availableBackends.length === 0;
+  }
+
+  if (loadButton) {
+    loadButton.disabled = lockModelSelection || availableModels.length === 0 || availableBackends.length === 0;
   }
 }
 
 async function loadModel() {
+  if (hasActiveChat()) {
+    alert('Start a new chat before changing models.');
+    return;
+  }
+
   const model = document.getElementById('model-select').value;
   const backend = document.getElementById('backend-select').value;
   if (!backend) {
@@ -896,7 +927,7 @@ async function loadModel() {
       currentLoadedModel = data.model;
       statusBadge.textContent = data.model + ' (' + (data.architecture || '?') + ')';
       statusBadge.classList.add('loaded');
-      populateInlineModelSelect();
+      updateInlineModelStatus();
       hideSettings();
       clearChat();
     } else {
@@ -916,6 +947,7 @@ function clearChat() {
   attachmentsDiv.innerHTML = '';
   chatContainer.innerHTML = '';
   needsCacheReset = true;
+  updateSettingsLockState();
   if (!statusBadge.classList.contains('loaded')) {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
@@ -927,7 +959,7 @@ function clearChat() {
     chatContainer.innerHTML = `
       <div class="empty-state">
         <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
-        <p>Start a conversation. You can switch models at any turn using the dropdown below, or attach images, videos, and audio files.</p>
+        <p>Start a conversation with the loaded model. To switch models, start a new chat first. You can still attach images, videos, and audio files.</p>
       </div>`;
   }
 }
@@ -977,8 +1009,7 @@ async function sendMessage() {
   if (isGenerating) return;
   const text = messageInput.value.trim();
   if (!text && pendingAttachments.length === 0) return;
-  const selectedModel = document.getElementById('inline-model-select').value;
-  if (!statusBadge.classList.contains('loaded') && !selectedModel) {
+  if (!currentLoadedModel) {
     showSettings();
     return;
   }
@@ -1033,9 +1064,6 @@ async function sendMessage() {
     const maxTokens = parseInt(document.getElementById('max-tokens').value) || 2000;
     const reasoningOn = document.getElementById('reasoning-toggle').checked;
     const chatPayload = { messages: chatHistory, maxTokens, think: reasoningOn };
-    if (selectedModel) chatPayload.model = selectedModel;
-    const backendSel = document.getElementById('backend-select');
-    if (backendSel) chatPayload.backend = backendSel.value;
     if (needsCacheReset) {
       chatPayload.newChat = true;
       needsCacheReset = false;
@@ -1079,27 +1107,6 @@ async function sendMessage() {
               queueDiv.appendChild(txt);
               chatContainer.scrollTop = chatContainer.scrollHeight;
             }
-            continue;
-          }
-          if (data.model_loading) {
-            if (queueDiv) {
-              queueDiv.style.display = 'inline-flex';
-              queueDiv.textContent = '';
-              const spinner = document.createElement('div');
-              spinner.className = 'queue-spinner';
-              queueDiv.appendChild(spinner);
-              const txt = document.createElement('span');
-              txt.textContent = 'Loading model: ' + data.model_loading + '...';
-              queueDiv.appendChild(txt);
-              chatContainer.scrollTop = chatContainer.scrollHeight;
-            }
-            continue;
-          }
-          if (data.model_loaded) {
-            currentLoadedModel = data.model_loaded;
-            statusBadge.textContent = data.model_loaded + ' (' + (data.architecture || '?') + ')';
-            statusBadge.classList.add('loaded');
-            populateInlineModelSelect();
             continue;
           }
           if (!queueCleared && queueDiv) {
@@ -1210,8 +1217,7 @@ function addUserBubble(text, attachments) {
 function addAssistantBubble() {
   const div = document.createElement('div');
   div.className = 'message assistant';
-  const selectedModel = document.getElementById('inline-model-select').value || currentLoadedModel || '';
-  const modelDisplay = selectedModel.replace(/\.gguf$/i, '');
+  const modelDisplay = (currentLoadedModel || '').replace(/\.gguf$/i, '');
   div.innerHTML = `
     <div class="avatar"><img src="/images/assistant_logo.png" alt=""></div>
     <div class="bubble">
@@ -1244,7 +1250,7 @@ fetchModels().then(data => {
     currentLoadedModel = data.loaded;
     statusBadge.textContent = data.loaded + ' (' + (data.architecture || '?') + ')';
     statusBadge.classList.add('loaded');
-    populateInlineModelSelect();
+    updateInlineModelStatus();
   }
 });
 

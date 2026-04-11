@@ -2,6 +2,8 @@
 
 Two test suites that simulate real users having long multi-turn conversations with InferenceWeb across all API surfaces.
 
+For the Web UI flow, the tests load a model once through `/api/models/load` and then send turns to `/api/chat` without per-request model switching.
+
 ## Quick Start
 
 1. Start InferenceWeb:

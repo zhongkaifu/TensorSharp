@@ -6,6 +6,9 @@
     <OutputPath>bin\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\TensorSharp\TensorSharp.csproj" />
     <ProjectReference Include="..\TensorSharp.GGML\TensorSharp.GGML.csproj" />
   </ItemGroup>
