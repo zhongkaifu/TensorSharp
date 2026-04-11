@@ -66,8 +66,44 @@ app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions
 
 string modelDir = Environment.GetEnvironmentVariable("MODEL_DIR")
     ?? Path.Combine(AppContext.BaseDirectory, "models");
-string defaultBackend = Environment.GetEnvironmentVariable("BACKEND")
+string configuredBackend = Environment.GetEnvironmentVariable("BACKEND")
     ?? (OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu");
+var supportedBackends = BackendCatalog.GetSupportedBackends().ToArray();
+var supportedBackendValues = new HashSet<string>(supportedBackends.Select(backend => backend.Value), StringComparer.OrdinalIgnoreCase);
+string defaultBackend = BackendCatalog.ResolveDefaultBackend(configuredBackend, supportedBackends);
+
+if (supportedBackends.Length == 0)
+{
+    Console.WriteLine("Warning: no supported backends detected on this machine.");
+}
+else
+{
+    Console.WriteLine($"Supported backends: {string.Join(", ", supportedBackends.Select(backend => backend.Value))}");
+}
+
+if (!string.Equals(defaultBackend, BackendCatalog.Canonicalize(configuredBackend), StringComparison.OrdinalIgnoreCase) &&
+    !string.IsNullOrWhiteSpace(defaultBackend))
+{
+    Console.WriteLine($"Requested default backend '{configuredBackend}' is unavailable. Falling back to '{defaultBackend}'.");
+}
+
+bool TryResolveSupportedBackend(string requestedBackend, out string resolvedBackend, out string error)
+{
+    resolvedBackend = string.IsNullOrWhiteSpace(requestedBackend)
+        ? defaultBackend
+        : BackendCatalog.Canonicalize(requestedBackend);
+
+    if (string.IsNullOrWhiteSpace(resolvedBackend) || !supportedBackendValues.Contains(resolvedBackend))
+    {
+        error = supportedBackends.Length == 0
+            ? "No supported backend is available on this machine."
+            : $"Backend '{requestedBackend ?? defaultBackend}' is not supported on this machine.";
+        return false;
+    }
+
+    error = null;
+    return true;
+}
 
 // ============================================================
 // Internal Web UI endpoints (original)
@@ -91,6 +127,9 @@ app.MapGet("/api/models", (ModelService svc) =>
     {
         models = files,
         loaded = svc.LoadedModelName,
+        loadedBackend = svc.LoadedBackend,
+        defaultBackend,
+        supportedBackends,
         architecture = svc.Architecture,
         modelDir
     });
@@ -100,8 +139,11 @@ app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelSe
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(req.Body);
     string modelName = body.GetProperty("model").GetString();
-    string backend = body.TryGetProperty("backend", out var b) ? b.GetString() : defaultBackend;
+    string requestedBackend = body.TryGetProperty("backend", out var b) ? b.GetString() : null;
     string mmproj = body.TryGetProperty("mmproj", out var m) ? m.GetString() : null;
+
+    if (!TryResolveSupportedBackend(requestedBackend, out string backend, out string backendError))
+        return Results.BadRequest(new { ok = false, error = backendError });
 
     string modelPath = Path.Combine(modelDir, modelName);
     if (!File.Exists(modelPath))
@@ -233,7 +275,14 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
 
     if (!string.IsNullOrEmpty(switchModel))
     {
-        string backend = switchBackend ?? defaultBackend;
+        if (!TryResolveSupportedBackend(switchBackend, out string backend, out string backendError))
+        {
+            string errData = JsonSerializer.Serialize(new { done = true, error = backendError });
+            await ctx.Response.WriteAsync($"data: {errData}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            return;
+        }
+
         bool wasSwitch = !svc.IsModelAlreadyLoaded(switchModel);
         if (wasSwitch)
         {

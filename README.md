@@ -1,6 +1,10 @@
 # TensorSharp
 
-[English](README.md) | [中文](readme_cn.md)
+<p align="center">
+  <img src="imgs/banner_1.png" alt="TensorSharp logo" width="320">
+</p>
+
+[English](README.md) | [中文](README_zh-cn.md)
 
 A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
