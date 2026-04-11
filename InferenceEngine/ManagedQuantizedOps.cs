@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -127,6 +128,75 @@ namespace InferenceEngine
                 throw new NotSupportedException($"Pure C# backend does not support GGUF tensor type {type}.");
 
             DequantizeToFloat32(type, (byte*)src.ToPointer(), dst, numElements);
+        }
+
+        public static unsafe void DotRowBatchToFloat32(int ggmlType, byte[] src, int srcOffset,
+            float[] inputs, int inputOffset, int inputRowStride, int rowCount, long numElements,
+            float[] outputs, int outputOffset)
+        {
+            var type = (GgmlTensorType)ggmlType;
+            if (!SupportsDequantization(type))
+                throw new NotSupportedException($"Pure C# backend does not support GGUF tensor type {type}.");
+
+            fixed (byte* srcBase = src)
+            fixed (float* inputBase = inputs)
+            fixed (float* outputBase = outputs)
+            {
+                DotRowBatchToFloat32(
+                    ggmlType,
+                    (IntPtr)(srcBase + srcOffset),
+                    inputBase + inputOffset,
+                    inputRowStride,
+                    rowCount,
+                    numElements,
+                    outputBase + outputOffset);
+            }
+        }
+
+        public static unsafe void DotRowBatchToFloat32(int ggmlType, IntPtr src, float* inputs,
+            int inputRowStride, int rowCount, long numElements, float* outputs)
+        {
+            var type = (GgmlTensorType)ggmlType;
+            if (!SupportsDequantization(type))
+                throw new NotSupportedException($"Pure C# backend does not support GGUF tensor type {type}.");
+            if (rowCount < 1)
+                throw new ArgumentOutOfRangeException(nameof(rowCount));
+            if (inputRowStride < numElements)
+                throw new ArgumentOutOfRangeException(nameof(inputRowStride));
+
+            long blockSize = GgufFile.GetBlockSize(type);
+            if (numElements % blockSize != 0)
+                throw new NotSupportedException($"Tensor type {type} requires row length aligned to {blockSize}, got {numElements}.");
+
+            for (int row = 0; row < rowCount; row++)
+                outputs[row] = 0.0f;
+
+            if (type == GgmlTensorType.F32)
+            {
+                float* weight = (float*)src.ToPointer();
+                for (int row = 0; row < rowCount; row++)
+                    outputs[row] = DotFloat(inputs + (long)row * inputRowStride, weight, (int)numElements);
+                return;
+            }
+
+            float* scratch = stackalloc float[QK_K];
+            byte* chunkPtr = (byte*)src.ToPointer();
+            long elementOffset = 0;
+
+            while (elementOffset < numElements)
+            {
+                int chunkElements = GetDotChunkSize(type, numElements - elementOffset);
+                DequantizeToFloat32(type, chunkPtr, scratch, chunkElements);
+
+                float* inputChunk = inputs + elementOffset;
+                for (int row = 0; row < rowCount; row++)
+                {
+                    outputs[row] += DotFloat(inputChunk + (long)row * inputRowStride, scratch, chunkElements);
+                }
+
+                chunkPtr += GetDotChunkBytes(type, chunkElements);
+                elementOffset += chunkElements;
+            }
         }
 
         private static unsafe void DequantizeToFloat32(GgmlTensorType type, byte* src, float* dst, long numElements)
@@ -525,6 +595,65 @@ namespace InferenceEngine
                     y[j + QK_MXFP4 / 2] = d * Mxfp4Values[qs[j] >> 4];
                 }
             }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int GetDotChunkSize(GgmlTensorType type, long remaining)
+        {
+            return type switch
+            {
+                GgmlTensorType.F16 or GgmlTensorType.BF16 or
+                GgmlTensorType.I8 or GgmlTensorType.I16 or GgmlTensorType.I32 or
+                GgmlTensorType.I64 or GgmlTensorType.F64 => (int)Math.Min(remaining, QK_K),
+                _ => (int)Math.Min(remaining, GgufFile.GetBlockSize(type)),
+            };
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int GetDotChunkBytes(GgmlTensorType type, int chunkElements)
+        {
+            return type switch
+            {
+                GgmlTensorType.F32 => chunkElements * sizeof(float),
+                GgmlTensorType.F16 or GgmlTensorType.BF16 => chunkElements * sizeof(ushort),
+                GgmlTensorType.I8 => chunkElements,
+                GgmlTensorType.I16 => chunkElements * sizeof(short),
+                GgmlTensorType.I32 => chunkElements * sizeof(int),
+                GgmlTensorType.I64 or GgmlTensorType.F64 => chunkElements * sizeof(long),
+                _ => (int)GgufFile.GetTypeSize(type),
+            };
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe Vector<float> LoadVec(float* ptr) => Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)ptr);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotFloat(float* lhs, float* rhs, int length)
+        {
+            int vectorSize = Vector<float>.Count;
+            Vector<float> acc0 = Vector<float>.Zero;
+            Vector<float> acc1 = Vector<float>.Zero;
+            int i = 0;
+
+            for (; i <= length - 2 * vectorSize; i += 2 * vectorSize)
+            {
+                acc0 += LoadVec(lhs + i) * LoadVec(rhs + i);
+                acc1 += LoadVec(lhs + i + vectorSize) * LoadVec(rhs + i + vectorSize);
+            }
+
+            Vector<float> acc = acc0 + acc1;
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                acc += LoadVec(lhs + i) * LoadVec(rhs + i);
+            }
+
+            float sum = Vector.Sum(acc);
+            for (; i < length; i++)
+            {
+                sum += lhs[i] * rhs[i];
+            }
+
+            return sum;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
