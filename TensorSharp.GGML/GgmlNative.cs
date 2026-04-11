@@ -215,6 +215,9 @@ internal enum GgmlIndexReductionOp
         private static extern int TSGgml_IsMetalAvailable();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_CanInitializeBackend(int backendType);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_IsBackendAvailable(int backendType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -558,6 +561,32 @@ internal enum GgmlIndexReductionOp
             catch (EntryPointNotFoundException ex)
             {
                 throw new InvalidOperationException("The native GGML bridge is out of date. Rebuild `TensorSharp.GGML.Native`.", ex);
+            }
+        }
+
+        public static bool CanInitialize(GgmlBackendType backendType)
+        {
+            if (backendType == GgmlBackendType.Metal && !OperatingSystem.IsMacOS())
+            {
+                return false;
+            }
+
+            if (backendType == GgmlBackendType.Cuda && !OperatingSystem.IsLinux())
+            {
+                return false;
+            }
+
+            try
+            {
+                return TSGgml_CanInitializeBackend((int)backendType) != 0;
+            }
+            catch (DllNotFoundException)
+            {
+                return false;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return false;
             }
         }
 

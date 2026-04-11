@@ -21,6 +21,8 @@
   --radius: 12px;
   --layout-gutter: clamp(12px, 2vw, 20px);
   --chat-shell-max-width: min(1180px, calc(100vw - 32px));
+  --user-avatar-size: 40px;
+  --assistant-avatar-size: 72px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -172,8 +174,8 @@ button.primary:hover { background: var(--accent-hover); }
 .message.user { flex-direction: row-reverse; }
 
 .avatar {
-  width: 40px;
-  height: 40px;
+  width: var(--user-avatar-size);
+  height: var(--user-avatar-size);
   border-radius: 12px;
   display: flex;
   align-items: center;
@@ -198,14 +200,24 @@ button.primary:hover { background: var(--accent-hover); }
 }
 
 .message.assistant .avatar {
-  background: transparent;
-  border: 0;
-  box-shadow: none;
+  width: var(--assistant-avatar-size);
+  height: var(--assistant-avatar-size);
+  margin-top: 0;
+  padding: 6px;
+  border-radius: 20px;
+  background: radial-gradient(circle at top, #2a3353 0%, #151515 72%);
+  border: 1px solid rgba(140, 166, 255, 0.22);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
 }
 
 .message.assistant .avatar img {
   object-position: center top;
-  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.3));
+  transform: scale(1.05);
+  filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.34)) contrast(1.08) saturate(1.06);
+}
+
+.message.assistant .bubble {
+  max-width: calc(100% - var(--assistant-avatar-size) - 18px);
 }
 
 .bubble {
@@ -618,6 +630,17 @@ button.primary:hover { background: var(--accent-hover); }
     width: 36px;
     height: 36px;
     border-radius: 10px;
+  }
+
+  .message.assistant .avatar {
+    width: 58px;
+    height: 58px;
+    border-radius: 18px;
+    padding: 5px;
+  }
+
+  .message.assistant .bubble {
+    max-width: calc(100% - 58px - 14px);
   }
 
   .empty-state {

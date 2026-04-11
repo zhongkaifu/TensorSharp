@@ -131,6 +131,16 @@ Linux (GGML_CUDA enabled):
 bash build-linux.sh --cuda
 ```
 
+On Linux, `build-linux.sh` now auto-detects the visible NVIDIA GPU compute capability and passes a narrow `CMAKE_CUDA_ARCHITECTURES` value to ggml-cuda (for example `86-real` on an RTX 3080), which cuts CUDA build time substantially. The native build also runs in parallel by default with a conservative job cap so `nvcc` does not overwhelm typical developer machines.
+
+If you want to override the auto-detected architecture list or the default build parallelism, use either environment variables or explicit build flags:
+
+```bash
+TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
+bash build-linux.sh --cuda --cuda-arch='86-real;89-real'
+TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2 bash build-linux.sh --cuda
+```
+
 You can also request a CUDA-enabled native build from `dotnet build`:
 
 ```bash
