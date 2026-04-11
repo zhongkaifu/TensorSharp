@@ -517,18 +517,23 @@ namespace InferenceEngine
             float* resultPtr = GetFloatPtr(result);
             byte* weightBase = (byte*)weight.Data.ToPointer();
 
-            void RunRange(int start, int end, float* scratch)
+            void RunRange(int start, int end, float* sums)
             {
                 for (int col = start; col < end; col++)
                 {
                     byte* rowPtr = weightBase + (long)col * rowBytes;
-                    ManagedQuantizedOps.DequantizeRowToFloat32(weight.GgmlType, (IntPtr)rowPtr, scratch, inDim);
+                    ManagedQuantizedOps.DotRowBatchToFloat32(
+                        weight.GgmlType,
+                        (IntPtr)rowPtr,
+                        inputPtr,
+                        inDim,
+                        seqLen,
+                        inDim,
+                        sums);
+
                     for (int row = 0; row < seqLen; row++)
                     {
-                        resultPtr[(long)row * outDim + col] = VecDot(
-                            inputPtr + (long)row * inDim,
-                            scratch,
-                            inDim);
+                        resultPtr[(long)row * outDim + col] = sums[row];
                     }
                 }
             }
@@ -536,33 +541,33 @@ namespace InferenceEngine
             bool useParallel = outDim >= 128 && seqLen * outDim >= 512 && Environment.ProcessorCount > 1;
             if (!useParallel)
             {
-                float[] scratchArr = ArrayPool<float>.Shared.Rent(inDim);
+                float[] sumsArr = ArrayPool<float>.Shared.Rent(seqLen);
                 try
                 {
-                    fixed (float* scratch = scratchArr)
+                    fixed (float* sums = sumsArr)
                     {
-                        RunRange(0, outDim, scratch);
+                        RunRange(0, outDim, sums);
                     }
                 }
                 finally
                 {
-                    ArrayPool<float>.Shared.Return(scratchArr);
+                    ArrayPool<float>.Shared.Return(sumsArr);
                 }
 
                 return;
             }
 
             Parallel.For(0, outDim,
-                () => ArrayPool<float>.Shared.Rent(inDim),
-                (col, _, scratchArr) =>
+                () => ArrayPool<float>.Shared.Rent(seqLen),
+                (col, _, sumsArr) =>
                 {
-                    fixed (float* scratch = scratchArr)
+                    fixed (float* sums = sumsArr)
                     {
-                        RunRange(col, col + 1, scratch);
+                        RunRange(col, col + 1, sums);
                     }
-                    return scratchArr;
+                    return sumsArr;
                 },
-                scratchArr => ArrayPool<float>.Shared.Return(scratchArr));
+                sumsArr => ArrayPool<float>.Shared.Return(sumsArr));
         }
 
         #region SIMD Helpers
