@@ -148,12 +148,10 @@ namespace InferenceWeb
             Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, first 500 chars:");
             Console.Error.WriteLine(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered);
 
-            var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
-            bool hasMultimodal = HasMultimodalContent(lastMsg);
+            bool hasMultimodal = HasMultimodalContent(preparedHistory);
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            if (lastMsg != null)
-                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+            inputTokens = ProcessMultimodalHistory(preparedHistory, inputTokens, arch);
 
             float[] logits;
             int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
@@ -212,151 +210,213 @@ namespace InferenceWeb
             SaveTokenCache(inputTokens, generatedTokens);
         }
 
-        private List<int> ProcessMultimodal(ChatMessage msg, List<int> inputTokens, string arch)
+        private List<int> ProcessMultimodalHistory(List<ChatMessage> history, List<int> inputTokens, string arch)
         {
-            if (msg.ImagePaths != null && msg.ImagePaths.Count > 0)
-                inputTokens = ProcessImages(msg, inputTokens, arch);
-
-            if (msg.AudioPaths != null && msg.AudioPaths.Count > 0)
-                inputTokens = ProcessAudio(msg, inputTokens, arch);
-
-            return inputTokens;
-        }
-
-        private List<int> ProcessImages(ChatMessage msg, List<int> inputTokens, string arch)
-        {
-            if (arch == "gemma4" && _model is Gemma4Model g4 && g4.VisionEncoder != null)
-            {
-                int imageStartId = _model.Tokenizer.LookupToken("<|image>");
-                int imageEndId = _model.Tokenizer.LookupToken("<image|>");
-                if (imageStartId < 0) imageStartId = 255999;
-                if (imageEndId < 0) imageEndId = 256000;
-
-                var proc = new Gemma4ImageProcessor();
-                int searchFrom = 0;
-                foreach (var imgPath in msg.ImagePaths)
-                {
-                    var (pixels, imgW, imgH) = proc.ProcessImage(imgPath);
-                    var emb = g4.VisionEncoder.Encode(pixels, imgW, imgH);
-                    int numTokens = (int)emb.Sizes[0];
-
-                    int pos = -1;
-                    for (int i = searchFrom; i < inputTokens.Count; i++)
-                    {
-                        if (inputTokens[i] == imageStartId) { pos = i; break; }
-                    }
-
-                    if (pos >= 0)
-                    {
-                        var expanded = new List<int>();
-                        for (int i = 0; i < pos; i++) expanded.Add(inputTokens[i]);
-                        expanded.Add(imageStartId);
-                        for (int i = 0; i < numTokens; i++) expanded.Add(0);
-                        expanded.Add(imageEndId);
-                        for (int i = pos + 1; i < inputTokens.Count; i++) expanded.Add(inputTokens[i]);
-                        inputTokens = expanded;
-
-                        g4.SetVisionEmbeddings(emb, pos + 1);
-                        searchFrom = pos + 1 + numTokens + 1;
-                    }
-                    else
-                    {
-                        emb.Dispose();
-                    }
-                }
-            }
-            else if (arch == "gemma3" && _model is Gemma3Model g3 && g3.VisionEncoder != null)
-            {
-                var proc = new Gemma3ImageProcessor();
-                int startId = _model.Tokenizer.LookupToken("<start_of_image>");
-                if (startId < 0) startId = Gemma3ImageProcessor.StartOfImageToken;
-                int endId = Gemma3ImageProcessor.EndOfImageToken;
-                int nlnlId = Gemma3ImageProcessor.NewlineNewlineToken;
-                int padId = Gemma3ImageProcessor.PadToken;
-
-                inputTokens = ChatTemplate.ExpandGemma3ImageTokens(inputTokens,
-                    startId, endId, nlnlId, padId, proc.TokensPerImage);
-
-                float[] pixels = proc.ProcessImage(msg.ImagePaths[0]);
-                var emb = g3.VisionEncoder.Encode(pixels);
-
-                int tokenStart = -1;
-                for (int i = 0; i < inputTokens.Count; i++)
-                {
-                    if (inputTokens[i] == startId && i + 1 < inputTokens.Count && inputTokens[i + 1] == padId)
-                    { tokenStart = i + 1; break; }
-                }
-                if (tokenStart >= 0) g3.SetVisionEmbeddings(emb, tokenStart);
-                else emb.Dispose();
-            }
-            else if (_model is Qwen35Model q35 && q35.VisionEncoder != null)
-            {
-                int imagePadId = _model.Tokenizer.LookupToken("<|image_pad|>");
-                if (imagePadId >= 0)
-                {
-                    var processor = new Qwen35ImageProcessor(q35.VisionEncoder.PatchSize, q35.VisionEncoder.SpatialMergeSize);
-                    var tokenCounts = new int[msg.ImagePaths.Count];
-                    for (int i = 0; i < msg.ImagePaths.Count; i++)
-                    {
-                        var (w, h) = Qwen35ImageProcessor.ReadImageDimensions(msg.ImagePaths[i]);
-                        tokenCounts[i] = processor.ComputeImageTokenCount(h, w);
-                    }
-                    inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
-
-                    var (px, rH, rW) = processor.ProcessImage(msg.ImagePaths[0]);
-                    var emb = q35.VisionEncoder.Encode(px, rH, rW);
-                    int tokenStart = inputTokens.IndexOf(imagePadId);
-                    if (tokenStart >= 0) q35.SetVisionEmbeddings(emb, tokenStart);
-                    else emb.Dispose();
-                }
-            }
-            return inputTokens;
-        }
-
-        private List<int> ProcessAudio(ChatMessage msg, List<int> inputTokens, string arch)
-        {
-            if (arch != "gemma4" || _model is not Gemma4Model g4a || g4a.AudioEncoder == null)
+            if (!HasMultimodalContent(history))
                 return inputTokens;
+
+            if (arch == "gemma4")
+                return ProcessGemma4History(history, inputTokens);
+            if (arch == "gemma3")
+                return ProcessGemma3History(history, inputTokens);
+            if (_model is Qwen35Model)
+                return ProcessQwen35History(history, inputTokens);
+            return inputTokens;
+        }
+
+        private List<int> ProcessGemma4History(List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (_model is not Gemma4Model g4)
+                return inputTokens;
+
+            int imageStartId = _model.Tokenizer.LookupToken("<|image>");
+            int imageEndId = _model.Tokenizer.LookupToken("<image|>");
+            if (imageStartId < 0) imageStartId = 255999;
+            if (imageEndId < 0) imageEndId = 256000;
 
             int audioStartId = _model.Tokenizer.LookupToken("<|audio>");
             int audioEndId = _model.Tokenizer.LookupToken("<audio|>");
 
-            float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(msg.AudioPaths[0]);
-            if (samples.Length % 128 != 0)
-            {
-                int padded = samples.Length + (128 - samples.Length % 128);
-                Array.Resize(ref samples, padded);
-            }
+            var imageProcessor = g4.VisionEncoder != null ? new Gemma4ImageProcessor() : null;
+            int searchFrom = 0;
 
-            var (melData, numFrames) = Gemma4AudioPreprocessor.ComputeMelSpectrogram(samples);
-            if (melData == null || numFrames == 0) return inputTokens;
-
-            var audioEmb = g4a.AudioEncoder.Encode(melData, numFrames);
-            int numAudioTokens = (int)audioEmb.Sizes[0];
-
-            int audioPos = -1;
-            for (int i = 0; i < inputTokens.Count; i++)
+            foreach (var msg in history)
             {
-                if (inputTokens[i] == audioStartId) { audioPos = i; break; }
-            }
+                if (msg.ImagePaths != null && g4.VisionEncoder != null)
+                {
+                    foreach (var imgPath in msg.ImagePaths)
+                    {
+                        var (pixels, imgW, imgH) = imageProcessor.ProcessImage(imgPath);
+                        var emb = g4.VisionEncoder.Encode(pixels, imgW, imgH);
+                        int numTokens = (int)emb.Sizes[0];
+                        int pos = FindTokenPosition(inputTokens, imageStartId, searchFrom);
 
-            if (audioPos >= 0)
-            {
-                var expanded = new List<int>();
-                for (int i = 0; i < audioPos; i++) expanded.Add(inputTokens[i]);
-                expanded.Add(audioStartId);
-                for (int i = 0; i < numAudioTokens; i++) expanded.Add(0);
-                expanded.Add(audioEndId);
-                for (int i = audioPos + 1; i < inputTokens.Count; i++) expanded.Add(inputTokens[i]);
-                inputTokens = expanded;
-                g4a.SetAudioEmbeddings(audioEmb, audioPos + 1);
-            }
-            else
-            {
-                audioEmb.Dispose();
+                        if (pos >= 0)
+                        {
+                            inputTokens = ExpandSingleTokenPlaceholder(inputTokens, pos, imageStartId, numTokens, imageEndId);
+                            g4.SetVisionEmbeddings(emb, pos + 1);
+                            searchFrom = pos + numTokens + 2;
+                        }
+                        else
+                        {
+                            emb.Dispose();
+                        }
+                    }
+                }
+
+                if (msg.AudioPaths != null && g4.AudioEncoder != null && audioStartId >= 0 && audioEndId >= 0)
+                {
+                    foreach (var audioPath in msg.AudioPaths)
+                    {
+                        float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(audioPath);
+                        if (samples.Length % 128 != 0)
+                        {
+                            int padded = samples.Length + (128 - samples.Length % 128);
+                            Array.Resize(ref samples, padded);
+                        }
+
+                        var (melData, numFrames) = Gemma4AudioPreprocessor.ComputeMelSpectrogram(samples);
+                        if (melData == null || numFrames == 0)
+                            continue;
+
+                        var audioEmb = g4.AudioEncoder.Encode(melData, numFrames);
+                        int numAudioTokens = (int)audioEmb.Sizes[0];
+                        int pos = FindTokenPosition(inputTokens, audioStartId, searchFrom);
+
+                        if (pos >= 0)
+                        {
+                            inputTokens = ExpandSingleTokenPlaceholder(inputTokens, pos, audioStartId, numAudioTokens, audioEndId);
+                            g4.SetAudioEmbeddings(audioEmb, pos + 1);
+                            searchFrom = pos + numAudioTokens + 2;
+                        }
+                        else
+                        {
+                            audioEmb.Dispose();
+                        }
+                    }
+                }
             }
 
             return inputTokens;
+        }
+
+        private List<int> ProcessGemma3History(List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (_model is not Gemma3Model g3 || g3.VisionEncoder == null)
+                return inputTokens;
+
+            var imagePaths = GetImagePathsInPromptOrder(history);
+            if (imagePaths.Count == 0)
+                return inputTokens;
+
+            var processor = new Gemma3ImageProcessor();
+            int startId = _model.Tokenizer.LookupToken("<start_of_image>");
+            if (startId < 0) startId = Gemma3ImageProcessor.StartOfImageToken;
+            int endId = Gemma3ImageProcessor.EndOfImageToken;
+            int nlnlId = Gemma3ImageProcessor.NewlineNewlineToken;
+            int padId = Gemma3ImageProcessor.PadToken;
+
+            inputTokens = ChatTemplate.ExpandGemma3ImageTokens(inputTokens,
+                startId, endId, nlnlId, padId, processor.TokensPerImage);
+
+            int searchFrom = 0;
+            foreach (var imgPath in imagePaths)
+            {
+                float[] pixels = processor.ProcessImage(imgPath);
+                var emb = g3.VisionEncoder.Encode(pixels);
+                int tokenStart = FindGemma3ImageInsertPosition(inputTokens, startId, padId, searchFrom);
+
+                if (tokenStart >= 0)
+                {
+                    g3.SetVisionEmbeddings(emb, tokenStart);
+                    searchFrom = tokenStart + processor.TokensPerImage + 2;
+                }
+                else
+                {
+                    emb.Dispose();
+                }
+            }
+
+            return inputTokens;
+        }
+
+        private List<int> ProcessQwen35History(List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (_model is not Qwen35Model q35 || q35.VisionEncoder == null)
+                return inputTokens;
+
+            var imagePaths = GetImagePathsInPromptOrder(history);
+            if (imagePaths.Count == 0)
+                return inputTokens;
+
+            int imagePadId = _model.Tokenizer.LookupToken("<|image_pad|>");
+            if (imagePadId < 0)
+                return inputTokens;
+
+            var processor = new Qwen35ImageProcessor(q35.VisionEncoder.PatchSize, q35.VisionEncoder.SpatialMergeSize);
+            var tokenCounts = new int[imagePaths.Count];
+            for (int i = 0; i < imagePaths.Count; i++)
+            {
+                var (w, h) = Qwen35ImageProcessor.ReadImageDimensions(imagePaths[i]);
+                tokenCounts[i] = processor.ComputeImageTokenCount(h, w);
+            }
+
+            inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
+
+            int searchFrom = 0;
+            for (int i = 0; i < imagePaths.Count; i++)
+            {
+                var (px, resizedH, resizedW) = processor.ProcessImage(imagePaths[i]);
+                var emb = q35.VisionEncoder.Encode(px, resizedH, resizedW);
+                int tokenStart = FindTokenPosition(inputTokens, imagePadId, searchFrom);
+
+                if (tokenStart >= 0)
+                {
+                    q35.SetVisionEmbeddings(emb, tokenStart);
+                    searchFrom = tokenStart + tokenCounts[i];
+                }
+                else
+                {
+                    emb.Dispose();
+                }
+            }
+
+            return inputTokens;
+        }
+
+        private static List<int> ExpandSingleTokenPlaceholder(
+            List<int> inputTokens, int tokenPosition, int startTokenId, int expandedTokenCount, int endTokenId)
+        {
+            var expanded = new List<int>(inputTokens.Count + expandedTokenCount + 1);
+            for (int i = 0; i < tokenPosition; i++)
+                expanded.Add(inputTokens[i]);
+            expanded.Add(startTokenId);
+            for (int i = 0; i < expandedTokenCount; i++)
+                expanded.Add(0);
+            expanded.Add(endTokenId);
+            for (int i = tokenPosition + 1; i < inputTokens.Count; i++)
+                expanded.Add(inputTokens[i]);
+            return expanded;
+        }
+
+        private static int FindTokenPosition(List<int> tokens, int tokenId, int searchFrom)
+        {
+            for (int i = Math.Max(0, searchFrom); i < tokens.Count; i++)
+            {
+                if (tokens[i] == tokenId)
+                    return i;
+            }
+            return -1;
+        }
+
+        private static int FindGemma3ImageInsertPosition(List<int> tokens, int startTokenId, int padTokenId, int searchFrom)
+        {
+            for (int i = Math.Max(0, searchFrom); i + 1 < tokens.Count; i++)
+            {
+                if (tokens[i] == startTokenId && tokens[i + 1] == padTokenId)
+                    return i + 1;
+            }
+            return -1;
         }
 
         /// <summary>
@@ -413,9 +473,7 @@ namespace InferenceWeb
                 architecture: arch);
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            var lastMsg = preparedMessages[0];
-            if (lastMsg.ImagePaths != null && lastMsg.ImagePaths.Count > 0)
-                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+            inputTokens = ProcessMultimodalHistory(preparedMessages, inputTokens, arch);
 
             InvalidateKVCache();
 
@@ -483,12 +541,10 @@ namespace InferenceWeb
             Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, sampling: temp={samplingConfig?.Temperature ?? 0.8f}, top_k={samplingConfig?.TopK ?? 40}, top_p={samplingConfig?.TopP ?? 0.9f}");
             Console.Error.WriteLine($"[Prompt] first 500 chars: {(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered)}");
 
-            var lastMsg = preparedHistory.LastOrDefault(m => m.Role == "user");
-            bool hasMultimodal = HasMultimodalContent(lastMsg);
+            bool hasMultimodal = HasMultimodalContent(preparedHistory);
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            if (lastMsg != null)
-                inputTokens = ProcessMultimodal(lastMsg, inputTokens, arch);
+            inputTokens = ProcessMultimodalHistory(preparedHistory, inputTokens, arch);
 
             int promptTokenCount;
             var sw = Stopwatch.StartNew();
@@ -656,22 +712,23 @@ namespace InferenceWeb
             return common;
         }
 
-        private static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)
+        internal static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)
         {
             if (history == null || history.Count == 0)
                 return history;
 
-            int lastUserIdx = history.FindLastIndex(m => m.Role == "user");
-            if (lastUserIdx < 0)
-                return history;
+            List<ChatMessage> prepared = null;
+            for (int i = 0; i < history.Count; i++)
+            {
+                var normalized = NormalizeMessageForInference(history[i], arch);
+                if (ReferenceEquals(normalized, history[i]))
+                    continue;
 
-            var normalized = NormalizeMessageForInference(history[lastUserIdx], arch);
-            if (ReferenceEquals(normalized, history[lastUserIdx]))
-                return history;
+                prepared ??= new List<ChatMessage>(history);
+                prepared[i] = normalized;
+            }
 
-            var prepared = new List<ChatMessage>(history);
-            prepared[lastUserIdx] = normalized;
-            return prepared;
+            return prepared ?? history;
         }
 
         private static ChatMessage NormalizeMessageForInference(ChatMessage msg, string arch)
@@ -698,11 +755,40 @@ namespace InferenceWeb
             };
         }
 
-        private static bool HasMultimodalContent(ChatMessage msg)
+        internal static bool HasMultimodalContent(ChatMessage msg)
         {
             if (msg == null) return false;
             return (msg.ImagePaths != null && msg.ImagePaths.Count > 0) ||
                    (msg.AudioPaths != null && msg.AudioPaths.Count > 0);
+        }
+
+        internal static bool HasMultimodalContent(List<ChatMessage> history)
+        {
+            if (history == null || history.Count == 0)
+                return false;
+
+            return history.Any(HasMultimodalContent);
+        }
+
+        internal static List<string> GetImagePathsInPromptOrder(List<ChatMessage> history)
+        {
+            var imagePaths = new List<string>();
+            if (history == null)
+                return imagePaths;
+
+            foreach (var msg in history)
+            {
+                if (msg.ImagePaths == null)
+                    continue;
+
+                foreach (var path in msg.ImagePaths)
+                {
+                    if (!string.IsNullOrEmpty(path))
+                        imagePaths.Add(path);
+                }
+            }
+
+            return imagePaths;
         }
 
         public List<string> ScanModels(string directory)

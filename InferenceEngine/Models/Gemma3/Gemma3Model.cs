@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.GGML;
@@ -44,8 +45,7 @@ namespace InferenceEngine
         private bool _hasTiedOutput;
 
         private Gemma3VisionEncoder _visionEncoder;
-        private Tensor _pendingVisionEmbeddings;
-        private int _imageInsertPosition = -1;
+        private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
 
         public Gemma3Model(string ggufPath, BackendType backend) : base(ggufPath, backend)
         {
@@ -159,9 +159,7 @@ namespace InferenceEngine
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
-            _pendingVisionEmbeddings?.Dispose();
-            _pendingVisionEmbeddings = embeddings;
-            _imageInsertPosition = insertPosition;
+            _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
         }
 
         public Gemma3VisionEncoder VisionEncoder => _visionEncoder;
@@ -178,12 +176,14 @@ namespace InferenceEngine
 
             ScaleEmbedding(hidden);
 
-            if (_pendingVisionEmbeddings != null && _imageInsertPosition >= 0)
+            if (_pendingVisionEmbeddingsList.Count > 0)
             {
-                InjectVisionEmbeddings(hidden, _pendingVisionEmbeddings, _imageInsertPosition);
-                _pendingVisionEmbeddings.Dispose();
-                _pendingVisionEmbeddings = null;
-                _imageInsertPosition = -1;
+                foreach (var (embeddings, position) in _pendingVisionEmbeddingsList)
+                {
+                    InjectVisionEmbeddings(hidden, embeddings, position);
+                    embeddings.Dispose();
+                }
+                _pendingVisionEmbeddingsList.Clear();
             }
 
             bool dumpLayers = Environment.GetEnvironmentVariable("DUMP_LAYERS") == "1";
@@ -657,7 +657,9 @@ namespace InferenceEngine
         public override void Dispose()
         {
             _visionEncoder?.Dispose();
-            _pendingVisionEmbeddings?.Dispose();
+            foreach (var (embeddings, _) in _pendingVisionEmbeddingsList)
+                embeddings?.Dispose();
+            _pendingVisionEmbeddingsList.Clear();
             if (_kvCacheK != null)
                 foreach (var k in _kvCacheK) k?.Dispose();
             if (_kvCacheV != null)

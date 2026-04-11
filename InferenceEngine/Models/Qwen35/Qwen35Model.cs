@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.GGML;
@@ -67,8 +68,7 @@ namespace InferenceEngine
 
         // Vision encoder
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
-        private Tensor _visionEmbeddings;
-        private int _visionEmbedStart = -1;
+        private List<(Tensor embeddings, int position)> _visionEmbeddingsList = new();
 
         public Qwen35Model(string ggufPath, BackendType backend)
             : base(ggufPath, backend)
@@ -224,7 +224,7 @@ namespace InferenceEngine
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
-            if (_visionEmbeddings != null && startPos == 0)
+            if (_visionEmbeddingsList.Count > 0 && startPos == 0)
                 InjectVisionEmbeddings(hidden, seqLen);
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -729,9 +729,7 @@ namespace InferenceEngine
 
         public void SetVisionEmbeddings(Tensor visionEmbeddings, int startPosition)
         {
-            _visionEmbeddings?.Dispose();
-            _visionEmbeddings = visionEmbeddings;
-            _visionEmbedStart = startPosition;
+            _visionEmbeddingsList.Add((visionEmbeddings, startPosition));
         }
 
         /// <summary>
@@ -739,36 +737,42 @@ namespace InferenceEngine
         /// </summary>
         private unsafe void InjectVisionEmbeddings(Tensor textEmbeddings, int seqLen)
         {
-            if (_visionEmbeddings == null || _visionEmbedStart < 0)
+            if (_visionEmbeddingsList.Count == 0)
                 return;
-
-            int startPos = _visionEmbedStart;
-            int numVisionTokens = (int)_visionEmbeddings.Sizes[0];
-            int dim = Config.HiddenSize;
-            int projDim = (int)_visionEmbeddings.Sizes[1];
-
-            if (projDim != dim)
-            {
-                Console.WriteLine($"Warning: Vision embedding dim ({projDim}) != text hidden dim ({dim}). Skipping injection.");
-                return;
-            }
-
-            if (startPos + numVisionTokens > seqLen)
-            {
-                Console.WriteLine($"Warning: Vision tokens ({numVisionTokens}) exceed sequence at position {startPos}. Skipping.");
-                return;
-            }
 
             float* textPtr = GetFloatPtr(textEmbeddings);
-            float* visPtr = GetFloatPtr(_visionEmbeddings);
-            int bytes = numVisionTokens * dim * sizeof(float);
-            Buffer.MemoryCopy(visPtr, textPtr + startPos * dim, bytes, bytes);
+            int dim = Config.HiddenSize;
+            foreach (var (visionEmbeddings, startPos) in _visionEmbeddingsList)
+            {
+                if (visionEmbeddings == null || startPos < 0)
+                    continue;
 
-            Console.WriteLine($"  Injected {numVisionTokens} vision embeddings at position {startPos}");
+                int numVisionTokens = (int)visionEmbeddings.Sizes[0];
+                int projDim = (int)visionEmbeddings.Sizes[1];
 
-            _visionEmbeddings.Dispose();
-            _visionEmbeddings = null;
-            _visionEmbedStart = -1;
+                if (projDim != dim)
+                {
+                    Console.WriteLine($"Warning: Vision embedding dim ({projDim}) != text hidden dim ({dim}). Skipping injection.");
+                    visionEmbeddings.Dispose();
+                    continue;
+                }
+
+                if (startPos + numVisionTokens > seqLen)
+                {
+                    Console.WriteLine($"Warning: Vision tokens ({numVisionTokens}) exceed sequence at position {startPos}. Skipping.");
+                    visionEmbeddings.Dispose();
+                    continue;
+                }
+
+                float* visPtr = GetFloatPtr(visionEmbeddings);
+                int bytes = numVisionTokens * dim * sizeof(float);
+                Buffer.MemoryCopy(visPtr, textPtr + startPos * dim, bytes, bytes);
+
+                Console.WriteLine($"  Injected {numVisionTokens} vision embeddings at position {startPos}");
+                visionEmbeddings.Dispose();
+            }
+
+            _visionEmbeddingsList.Clear();
         }
 
         #endregion
@@ -776,7 +780,9 @@ namespace InferenceEngine
         public override void Dispose()
         {
             VisionEncoder?.Dispose();
-            _visionEmbeddings?.Dispose();
+            foreach (var (visionEmbeddings, _) in _visionEmbeddingsList)
+                visionEmbeddings?.Dispose();
+            _visionEmbeddingsList.Clear();
 
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();

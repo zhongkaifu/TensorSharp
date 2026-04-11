@@ -68,8 +68,7 @@ namespace InferenceEngine
         private Gemma4VisionEncoder _visionEncoder;
         private Gemma4AudioEncoder _audioEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
-        private Tensor _pendingAudioEmbeddings;
-        private int _audioInsertPosition = -1;
+        private List<(Tensor embeddings, int position)> _pendingAudioEmbeddingsList = new();
 
         public Gemma4VisionEncoder VisionEncoder => _visionEncoder;
         public Gemma4AudioEncoder AudioEncoder => _audioEncoder;
@@ -86,9 +85,7 @@ namespace InferenceEngine
 
         public void SetAudioEmbeddings(Tensor embeddings, int insertPosition)
         {
-            _pendingAudioEmbeddings?.Dispose();
-            _pendingAudioEmbeddings = embeddings;
-            _audioInsertPosition = insertPosition;
+            _pendingAudioEmbeddingsList.Add((embeddings, insertPosition));
         }
 
         public Gemma4Model(string ggufPath, BackendType backend) : base(ggufPath, backend)
@@ -407,12 +404,14 @@ namespace InferenceEngine
                 _pendingVisionEmbeddingsList.Clear();
             }
 
-            if (_pendingAudioEmbeddings != null && _audioInsertPosition >= 0)
+            if (_pendingAudioEmbeddingsList.Count > 0)
             {
-                InjectVisionEmbeddings(hidden, _pendingAudioEmbeddings, _audioInsertPosition);
-                _pendingAudioEmbeddings.Dispose();
-                _pendingAudioEmbeddings = null;
-                _audioInsertPosition = -1;
+                foreach (var (emb, pos) in _pendingAudioEmbeddingsList)
+                {
+                    InjectVisionEmbeddings(hidden, emb, pos);
+                    emb.Dispose();
+                }
+                _pendingAudioEmbeddingsList.Clear();
             }
 
             Tensor perLayerInputs = null;
@@ -1744,7 +1743,9 @@ namespace InferenceEngine
             foreach (var (emb, _) in _pendingVisionEmbeddingsList)
                 emb?.Dispose();
             _pendingVisionEmbeddingsList.Clear();
-            _pendingAudioEmbeddings?.Dispose();
+            foreach (var (emb, _) in _pendingAudioEmbeddingsList)
+                emb?.Dispose();
+            _pendingAudioEmbeddingsList.Clear();
             if (_kvCacheK != null)
             {
                 var disposed = new HashSet<int>();
