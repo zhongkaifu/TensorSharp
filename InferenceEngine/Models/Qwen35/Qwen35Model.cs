@@ -56,6 +56,7 @@ namespace InferenceEngine
         // Pre-allocated work buffers for GatedDeltaNet
         private float[] _gdnQ, _gdnK, _gdnV;
         private float[] _gdnQExp, _gdnKExp;
+        private float[] _gdnDelta, _gdnCore;
 
         // Pre-allocated tensor work buffers for GatedDeltaNet state update
         private Tensor _gdnConvOutT;   // [1, qkvDim] for conv1d output + SiLU
@@ -123,21 +124,165 @@ namespace InferenceEngine
             Console.WriteLine($"Layer types: {attnCount} full attention, {recCount} recurrent (GatedDeltaNet)");
 
             LoadWeights();
+            FuseAttentionProjectionWeights();
+            FuseRecurrentInputWeights();
             FuseGateUpWeights();
             InitCaches(4096);
             PrecomputeRoPE();
             InitGDNBuffers();
         }
 
+        private unsafe void FuseAttentionProjectionWeights()
+        {
+            int fused = 0;
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (_isRecurrent[layer])
+                    continue;
+
+                string prefix = $"blk.{layer}.";
+                if (TryFuseWeights(prefix + "attn_qkv.weight",
+                    prefix + "attn_q.weight",
+                    prefix + "attn_k.weight",
+                    prefix + "attn_v.weight"))
+                {
+                    fused++;
+                }
+            }
+
+            if (fused > 0)
+                Console.WriteLine($"  Fused projections: {fused} Q+K+V");
+        }
+
+        private unsafe void FuseRecurrentInputWeights()
+        {
+            int fused = 0;
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (!_isRecurrent[layer])
+                    continue;
+
+                string prefix = $"blk.{layer}.";
+                if (TryFuseWeights(prefix + "ssm_in_proj.weight",
+                    prefix + "attn_qkv.weight",
+                    prefix + "attn_gate.weight",
+                    prefix + "ssm_beta.weight",
+                    prefix + "ssm_alpha.weight"))
+                {
+                    fused++;
+                }
+            }
+
+            if (fused > 0)
+                Console.WriteLine($"  Fused projections: {fused} recurrent input packs");
+        }
+
+        private unsafe bool TryFuseWeights(string fusedName, params string[] weightNames)
+        {
+            if (weightNames == null || weightNames.Length < 2)
+                return false;
+
+            var quantWeights = new QuantizedWeight[weightNames.Length];
+            bool allQuant = true;
+            for (int i = 0; i < weightNames.Length; i++)
+            {
+                if (!_quantWeights.TryGetValue(weightNames[i], out quantWeights[i]))
+                {
+                    allQuant = false;
+                    break;
+                }
+            }
+
+            if (allQuant)
+            {
+                var first = quantWeights[0];
+                long totalBytes = 0;
+                long totalNe1 = 0;
+                for (int i = 0; i < quantWeights.Length; i++)
+                {
+                    var qw = quantWeights[i];
+                    if (qw.GgmlType != first.GgmlType || qw.Ne0 != first.Ne0)
+                        return false;
+
+                    totalBytes += qw.RawBytes;
+                    totalNe1 += qw.Ne1;
+                }
+
+                IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                byte* fusedDst = (byte*)fusedPtr.ToPointer();
+                long offset = 0;
+                for (int i = 0; i < quantWeights.Length; i++)
+                {
+                    var qw = quantWeights[i];
+                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedDst + offset, totalBytes - offset, qw.RawBytes);
+                    offset += qw.RawBytes;
+                }
+
+                _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, first.GgmlType, first.Ne0, totalNe1);
+                for (int i = 0; i < weightNames.Length; i++)
+                {
+                    var name = weightNames[i];
+                    var qw = quantWeights[i];
+                    _quantWeights.Remove(name);
+                    qw.Dispose();
+                }
+
+                return true;
+            }
+
+            var floatWeights = new Tensor[weightNames.Length];
+            for (int i = 0; i < weightNames.Length; i++)
+            {
+                if (!_weights.TryGetValue(weightNames[i], out floatWeights[i]))
+                    return false;
+            }
+
+            int inDim = (int)floatWeights[0].Sizes[1];
+            int totalOutDim = 0;
+            for (int i = 0; i < floatWeights.Length; i++)
+            {
+                var w = floatWeights[i];
+                if ((int)w.Sizes[1] != inDim)
+                    return false;
+
+                totalOutDim += (int)w.Sizes[0];
+            }
+
+            var fusedTensor = new Tensor(_allocator, DType.Float32, totalOutDim, inDim);
+            int outOffset = 0;
+            for (int i = 0; i < floatWeights.Length; i++)
+            {
+                var w = floatWeights[i];
+                int outDim = (int)w.Sizes[0];
+                using var slice = fusedTensor.Narrow(0, outOffset, outDim);
+                Ops.Copy(slice, w);
+                outOffset += outDim;
+            }
+
+            _weights[fusedName] = fusedTensor;
+            for (int i = 0; i < weightNames.Length; i++)
+            {
+                var name = weightNames[i];
+                var w = floatWeights[i];
+                _weights.Remove(name);
+                w.Dispose();
+            }
+
+            return true;
+        }
+
         private void InitGDNBuffers()
         {
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int qkDim = _headKDim * _numKHeads;
+            int vDim = _headVDim * _numVHeads;
             _gdnQ = new float[qkDim];
             _gdnK = new float[qkDim];
-            _gdnV = new float[_headVDim * _numVHeads];
+            _gdnV = new float[vDim];
             _gdnQExp = new float[_headKDim * _numVHeads];
             _gdnKExp = new float[_headKDim * _numVHeads];
+            _gdnDelta = new float[vDim];
+            _gdnCore = new float[vDim];
 
             _gdnConvOutT = new Tensor(_allocator, DType.Float32, 1, qkvDim);
             _gdnKBuf = new Tensor(_allocator, DType.Float32, _numVHeads, _headKDim);
@@ -312,10 +457,40 @@ namespace InferenceEngine
             int numHeads = Config.NumHeads;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
+            int qFullDim = numHeads * headDim * 2;
+            int kvDim = numKVHeads * headDim;
             int totalSeqLen = startPos + seqLen;
 
-            // Q projection: outputs [seqLen, numHeads * headDim * 2] (Q + gate interleaved per head)
-            Tensor qFull = LinearForward(input, prefix + "attn_q.weight");
+            Tensor qFull;
+            Tensor kTensor;
+            Tensor vTensor;
+            Tensor fusedQkv = LinearForward(input, prefix + "attn_qkv.weight");
+            if (fusedQkv != null)
+            {
+                if (seqLen == 1)
+                {
+                    qFull = fusedQkv.Narrow(1, 0, qFullDim);
+                    kTensor = fusedQkv.Narrow(1, qFullDim, kvDim);
+                    vTensor = fusedQkv.Narrow(1, qFullDim + kvDim, kvDim);
+                }
+                else
+                {
+                    using (var qView = fusedQkv.Narrow(1, 0, qFullDim))
+                        qFull = Ops.NewContiguous(qView);
+                    using (var kView = fusedQkv.Narrow(1, qFullDim, kvDim))
+                        kTensor = Ops.NewContiguous(kView);
+                    using (var vView = fusedQkv.Narrow(1, qFullDim + kvDim, kvDim))
+                        vTensor = Ops.NewContiguous(vView);
+                }
+                fusedQkv.Dispose();
+            }
+            else
+            {
+                // Q projection: outputs [seqLen, numHeads * headDim * 2] (Q + gate interleaved per head)
+                qFull = LinearForward(input, prefix + "attn_q.weight");
+                kTensor = LinearForward(input, prefix + "attn_k.weight");
+                vTensor = LinearForward(input, prefix + "attn_v.weight");
+            }
 
             // Deinterleave Q and gate using tensor ops
             Tensor qTensor, gateTensor;
@@ -337,10 +512,6 @@ namespace InferenceEngine
 
                 reshaped.Dispose();
             }
-
-            // K, V projections
-            Tensor kTensor = LinearForward(input, prefix + "attn_k.weight");
-            Tensor vTensor = LinearForward(input, prefix + "attn_v.weight");
 
             // QK norm
             qTensor = ApplyQKNorm(qTensor, prefix + "attn_q_norm.weight", numHeads, seqLen);
@@ -505,9 +676,10 @@ namespace InferenceEngine
         #region Recurrent (GatedDeltaNet) Block
 
         /// <summary>
-        /// GatedDeltaNet recurrent block: SSM conv1d → gated delta net → norm + gate → output.
-        /// Only supports seqLen=1 autoregressive mode for now (chunked prefill is complex).
-        /// Falls back to sequential token-by-token processing for prefill.
+        /// GatedDeltaNet recurrent block: SSM conv1d -> gated delta net -> norm + gate -> output.
+        /// Both decode and prefill use the same recurrent core. Prefill batches the large
+        /// input/output projections across the whole chunk, then walks the recurrent state
+        /// token-by-token in CPU memory.
         /// </summary>
         private Tensor RecurrentBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
@@ -516,27 +688,7 @@ namespace InferenceEngine
 
             Tensor normed = RMSNormOp(hidden, prefix + "attn_norm.weight");
 
-            Tensor attnOut;
-            if (seqLen == 1)
-            {
-                attnOut = GatedDeltaNetDecode(normed, layer, prefix);
-            }
-            else
-            {
-                int dim = Config.HiddenSize;
-                attnOut = new Tensor(_allocator, DType.Float32, seqLen, dim);
-                unsafe
-                {
-                    float* outBase = GetFloatPtr(attnOut);
-                    for (int s = 0; s < seqLen; s++)
-                    {
-                        using var tokenInput = normed.Narrow(0, s, 1);
-                        using var tokenOut = GatedDeltaNetDecode(tokenInput, layer, prefix);
-                        Buffer.MemoryCopy(GetFloatPtr(tokenOut), outBase + (long)s * dim,
-                            dim * sizeof(float), dim * sizeof(float));
-                    }
-                }
-            }
+            Tensor attnOut = GatedDeltaNet(normed, layer, prefix, seqLen);
             normed.Dispose();
 
             // First residual
@@ -556,30 +708,108 @@ namespace InferenceEngine
         }
 
         /// <summary>
-        /// Single-token GatedDeltaNet decode step.
-        /// Uses batched tensor matmul (AddmmBatch) for the recurrent state update
-        /// and tensor ops (RMSNorm, SiLU, Mul) for gated normalization.
+        /// GatedDeltaNet recurrent step with batched input/output projections.
+        /// Prefill projects the whole chunk once, then walks the recurrent state token-by-token.
+        /// Decode follows the same path with seqLen=1, avoiding several tiny GGML dispatches.
         /// </summary>
-        private unsafe Tensor GatedDeltaNetDecode(Tensor input, int layer, string prefix)
+        private unsafe Tensor GatedDeltaNet(Tensor input, int layer, string prefix, int seqLen)
         {
             long t0 = Stopwatch.GetTimestamp();
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int qkDim = _headKDim * _numKHeads;
             int vDim = _headVDim * _numVHeads;
+            int zDim = _headVDim * _numVHeads;
+            int packedDim = qkvDim + zDim + _numVHeads * 2;
 
-            Tensor qkvRaw = LinearForward(input, prefix + "attn_qkv.weight");
-            Tensor zRaw = LinearForward(input, prefix + "attn_gate.weight");
-            Tensor betaRaw = LinearForward(input, prefix + "ssm_beta.weight");
-            Tensor alphaRaw = LinearForward(input, prefix + "ssm_alpha.weight");
+            Tensor packedInput = LinearForward(input, prefix + "ssm_in_proj.weight");
+            Tensor qkvRaw = null;
+            Tensor zRaw = null;
+            Tensor betaRaw = null;
+            Tensor alphaRaw = null;
 
-            float* qkvPtr = GetFloatPtr(qkvRaw);
-            float* betaPtr = GetFloatPtr(betaRaw);
-            float* alphaPtr = GetFloatPtr(alphaRaw);
+            float* packedPtr = null;
+            float* qkvBase = null;
+            float* zBase = null;
+            float* betaBase = null;
+            float* alphaBase = null;
 
-            // Conv1d → write directly to tensor buffer
+            if (packedInput != null)
+            {
+                packedPtr = GetFloatPtr(packedInput);
+            }
+            else
+            {
+                qkvRaw = LinearForward(input, prefix + "attn_qkv.weight");
+                zRaw = LinearForward(input, prefix + "attn_gate.weight");
+                betaRaw = LinearForward(input, prefix + "ssm_beta.weight");
+                alphaRaw = LinearForward(input, prefix + "ssm_alpha.weight");
+
+                qkvBase = GetFloatPtr(qkvRaw);
+                zBase = GetFloatPtr(zRaw);
+                betaBase = GetFloatPtr(betaRaw);
+                alphaBase = GetFloatPtr(alphaRaw);
+            }
+
+            float* convWPtr = GetFloatPtr(_weights[prefix + "ssm_conv1d.weight"]);
+            float* dtBiasPtr = GetFloatPtr(_weights[prefix + "ssm_dt.bias"]);
+            float* aPtr = GetFloatPtr(_weights[prefix + "ssm_a"]);
+            float* ssmNormPtr = GetFloatPtr(_weights[prefix + "ssm_norm.weight"]);
+
+            Tensor gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+            float* gatedBase = GetFloatPtr(gated);
+
+            for (int s = 0; s < seqLen; s++)
+            {
+                float* qkvPtr;
+                float* zPtr;
+                float* betaPtr;
+                float* alphaPtr;
+
+                if (packedPtr != null)
+                {
+                    float* row = packedPtr + (long)s * packedDim;
+                    qkvPtr = row;
+                    zPtr = row + qkvDim;
+                    betaPtr = zPtr + zDim;
+                    alphaPtr = betaPtr + _numVHeads;
+                }
+                else
+                {
+                    qkvPtr = qkvBase + (long)s * qkvDim;
+                    zPtr = zBase + (long)s * zDim;
+                    betaPtr = betaBase + (long)s * _numVHeads;
+                    alphaPtr = alphaBase + (long)s * _numVHeads;
+                }
+
+                GatedDeltaNetStep(qkvPtr, zPtr, betaPtr, alphaPtr,
+                    layer, qkvDim, qkDim, vDim,
+                    convWPtr, dtBiasPtr, aPtr, ssmNormPtr,
+                    gatedBase + (long)s * _ssmDInner);
+            }
+
+            InvalidateTensorDeviceCache(gated);
+            Tensor output = LinearForward(gated, prefix + "ssm_out.weight");
+
+            if (seqLen > 1)
+                gated.Dispose();
+
+            packedInput?.Dispose();
+            qkvRaw?.Dispose();
+            zRaw?.Dispose();
+            betaRaw?.Dispose();
+            alphaRaw?.Dispose();
+
+            _attnTicks += Stopwatch.GetTimestamp() - t0;
+            return output;
+        }
+
+        private unsafe void GatedDeltaNetStep(float* qkvPtr, float* zPtr, float* betaPtr, float* alphaPtr,
+            int layer, int qkvDim, int qkDim, int vDim,
+            float* convWPtr, float* dtBiasPtr, float* aPtr, float* ssmNormPtr,
+            float* gatedOutPtr)
+        {
             int convDim = _convKernel - 1;
             float[] convState = _convState[layer];
-            float* convWPtr = GetFloatPtr(_weights[prefix + "ssm_conv1d.weight"]);
             float* convOutPtr = GetFloatPtr(_gdnConvOutT);
 
             for (int ch = 0; ch < qkvDim; ch++)
@@ -590,7 +820,7 @@ namespace InferenceEngine
                     float stateVal = ki < convDim ? convState[ki * qkvDim + ch] : qkvPtr[ch];
                     sum += stateVal * convWPtr[ch * _convKernel + ki];
                 }
-                convOutPtr[ch] = sum;
+                convOutPtr[ch] = SiLUScalar(sum);
             }
 
             for (int c = 0; c < convDim - 1; c++)
@@ -598,111 +828,72 @@ namespace InferenceEngine
             for (int d = 0; d < qkvDim; d++)
                 convState[(convDim - 1) * qkvDim + d] = qkvPtr[d];
 
-            // SiLU activation via tensor op
-            Ops.SiLU(_gdnConvOutT, _gdnConvOutT);
-
-            // Split Q, K, V from tensor buffer
-            float* siluPtr = GetFloatPtr(_gdnConvOutT);
-            fixed (float* qDst = _gdnQ, kDst = _gdnK, vDst = _gdnV)
+            fixed (float* qBase = _gdnQ, kBase = _gdnK, vBase = _gdnV)
             {
-                Buffer.MemoryCopy(siluPtr, qDst, qkDim * sizeof(float), qkDim * sizeof(float));
-                Buffer.MemoryCopy(siluPtr + qkDim, kDst, qkDim * sizeof(float), qkDim * sizeof(float));
-                Buffer.MemoryCopy(siluPtr + 2 * qkDim, vDst, vDim * sizeof(float), vDim * sizeof(float));
+                Buffer.MemoryCopy(convOutPtr, qBase, qkDim * sizeof(float), qkDim * sizeof(float));
+                Buffer.MemoryCopy(convOutPtr + qkDim, kBase, qkDim * sizeof(float), qkDim * sizeof(float));
+                Buffer.MemoryCopy(convOutPtr + 2 * qkDim, vBase, vDim * sizeof(float), vDim * sizeof(float));
             }
 
-            // Expand Q, K heads if needed
-            float[] qExp, kExp;
+            float[] qActive = _gdnQ;
+            float[] kActive = _gdnK;
             if (_numKHeads != _numVHeads)
             {
-                qExp = _gdnQExp;
-                kExp = _gdnKExp;
+                qActive = _gdnQExp;
+                kActive = _gdnKExp;
                 for (int h = 0; h < _numVHeads; h++)
                 {
                     int srcHead = h % _numKHeads;
-                    Array.Copy(_gdnQ, srcHead * _headKDim, qExp, h * _headKDim, _headKDim);
-                    Array.Copy(_gdnK, srcHead * _headKDim, kExp, h * _headKDim, _headKDim);
+                    Array.Copy(_gdnQ, srcHead * _headKDim, qActive, h * _headKDim, _headKDim);
+                    Array.Copy(_gdnK, srcHead * _headKDim, kActive, h * _headKDim, _headKDim);
                 }
             }
-            else
+
+            L2NormalizePerHead(qActive, _numVHeads, _headKDim);
+            L2NormalizePerHead(kActive, _numVHeads, _headKDim);
+
+            fixed (float* qPtr = qActive, kPtr = kActive, vPtr = _gdnV, deltaPtr = _gdnDelta, corePtr = _gdnCore)
             {
-                qExp = _gdnQ;
-                kExp = _gdnK;
+                VecScale(qPtr, 1.0f / MathF.Sqrt(_headVDim), _numVHeads * _headKDim);
+
+                Tensor state = _deltaStateTensor[layer];
+                float* statePtr = GetFloatPtr(state);
+                int statePerHead = _headVDim * _headKDim;
+                for (int h = 0; h < _numVHeads; h++)
+                {
+                    float* stateHead = statePtr + h * statePerHead;
+                    float* qHead = qPtr + h * _headKDim;
+                    float* kHead = kPtr + h * _headKDim;
+                    float* vHead = vPtr + h * _headVDim;
+                    float* deltaHead = deltaPtr + h * _headVDim;
+                    float* coreHead = corePtr + h * _headVDim;
+                    float* zHead = zPtr + h * _headVDim;
+                    float* gatedHead = gatedOutPtr + h * _headVDim;
+
+                    float alphaBiased = alphaPtr[h] + dtBiasPtr[h];
+                    float gateH = SoftplusScalar(alphaBiased) * aPtr[h];
+                    VecScale(stateHead, MathF.Exp(gateH), statePerHead);
+
+                    float betaH = SigmoidScalar(betaPtr[h]);
+                    for (int row = 0; row < _headVDim; row++)
+                    {
+                        float* stateRow = stateHead + row * _headKDim;
+                        float kvMem = VecDot(stateRow, kHead, _headKDim);
+                        deltaHead[row] = (vHead[row] - kvMem) * betaH;
+                    }
+
+                    for (int row = 0; row < _headVDim; row++)
+                    {
+                        float* stateRow = stateHead + row * _headKDim;
+                        VecScaleAdd(stateRow, kHead, deltaHead[row], _headKDim);
+                        coreHead[row] = VecDot(stateRow, qHead, _headKDim);
+                    }
+
+                    float rmsInv = 1.0f / MathF.Sqrt((VecSumSq(coreHead, _headVDim) / _headVDim) + Config.Eps);
+                    for (int i = 0; i < _headVDim; i++)
+                        gatedHead[i] = coreHead[i] * rmsInv * ssmNormPtr[i] * SiLUScalar(zHead[i]);
+                }
             }
-
-            L2NormalizePerHead(qExp, _numVHeads, _headKDim);
-            L2NormalizePerHead(kExp, _numVHeads, _headKDim);
-
-            // Copy Q, K, V into pre-allocated tensor buffers
-            float* kBufPtr = GetFloatPtr(_gdnKBuf);
-            float* qBufPtr = GetFloatPtr(_gdnQBuf);
-            float* vBufPtr = GetFloatPtr(_gdnVBuf);
-            int kqBytes = _headKDim * _numVHeads * sizeof(float);
-            int vBytes = _headVDim * _numVHeads * sizeof(float);
-            fixed (float* kSrc = kExp, qSrc = qExp, vSrc = _gdnV)
-            {
-                Buffer.MemoryCopy(kSrc, kBufPtr, kqBytes, kqBytes);
-                Buffer.MemoryCopy(qSrc, qBufPtr, kqBytes, kqBytes);
-                Buffer.MemoryCopy(vSrc, vBufPtr, vBytes, vBytes);
-            }
-
-            // Scale Q via tensor op
-            Ops.Mul(_gdnQBuf, _gdnQBuf, 1.0f / MathF.Sqrt(_headVDim));
-
-            // Create views for batched matmul
-            using var k_col = _gdnKBuf.View(_numVHeads, _headKDim, 1);
-            using var k_row = k_col.Transpose(1, 2);  // [numVHeads, 1, headKDim]
-            using var q_col = _gdnQBuf.View(_numVHeads, _headKDim, 1);
-
-            // Recurrent state update using batched tensor operations
-            Tensor state = _deltaStateTensor[layer];
-            float* dtBiasPtr = GetFloatPtr(_weights[prefix + "ssm_dt.bias"]);
-            float* aPtr = GetFloatPtr(_weights[prefix + "ssm_a"]);
-
-            float* statePtr = GetFloatPtr(state);
-            int statePerHead = _headVDim * _headKDim;
-            for (int h = 0; h < _numVHeads; h++)
-            {
-                float alphaBiased = alphaPtr[h] + dtBiasPtr[h];
-                float gateH = MathF.Log(1.0f + MathF.Exp(alphaBiased)) * aPtr[h];
-                VecScale(statePtr + h * statePerHead, MathF.Exp(gateH), statePerHead);
-            }
-
-            // kvMem = state @ k_col → [numVHeads, headVDim, 1]
-            Ops.AddmmBatch(_gdnKvMemBuf, 0, _gdnKvMemBuf, 1.0f, state, k_col);
-
-            // delta = (v - kvMem) * sigmoid(beta), stored in kvMem buffer
-            float* kvMemPtr = GetFloatPtr(_gdnKvMemBuf);
-            for (int h = 0; h < _numVHeads; h++)
-            {
-                float betaH = 1.0f / (1.0f + MathF.Exp(-betaPtr[h]));
-                VecSubScale(kvMemPtr + h * _headVDim, vBufPtr + h * _headVDim,
-                    kvMemPtr + h * _headVDim, betaH, _headVDim);
-            }
-
-            // state += delta @ k^T (batched rank-1 update)
-            Ops.AddmmBatch(state, 1.0f, state, 1.0f, _gdnKvMemBuf, k_row);
-
-            // coreOut = state @ q_col → [numVHeads, headVDim, 1]
-            Ops.AddmmBatch(_gdnCoreOutBuf, 0, _gdnCoreOutBuf, 1.0f, state, q_col);
-
-            // Gated normalization: result = SiLU(z) * RMSNorm(coreOut)
-            using var coreOut2d = _gdnCoreOutBuf.View(_numVHeads, _headVDim);
-            using var gatedOut2d = _gdnGatedOutT.View(_numVHeads, _headVDim);
-            var ssmNormW = _weights[prefix + "ssm_norm.weight"];
-            Ops.RMSNorm(gatedOut2d, coreOut2d, ssmNormW, null, Config.Eps);
-
-            using var zView = zRaw.View(_numVHeads, _headVDim);
-            Ops.SiLUMul(gatedOut2d, zView, gatedOut2d);
-
-            qkvRaw.Dispose();
-            zRaw.Dispose();
-            betaRaw.Dispose();
-            alphaRaw.Dispose();
-
-            Tensor output = LinearForward(_gdnGatedOutT, prefix + "ssm_out.weight");
-
-            _attnTicks += Stopwatch.GetTimestamp() - t0;
-            return output;
         }
 
         private unsafe void L2NormalizePerHead(float[] data, int numHeads, int headDim)
@@ -716,6 +907,29 @@ namespace InferenceEngine
                     VecScale(head, inv, headDim);
                 }
             }
+        }
+
+        private static float SigmoidScalar(float x)
+        {
+            if (x >= 0)
+            {
+                float e = MathF.Exp(-x);
+                return 1.0f / (1.0f + e);
+            }
+
+            float en = MathF.Exp(x);
+            return en / (1.0f + en);
+        }
+
+        private static float SiLUScalar(float x) => x * SigmoidScalar(x);
+
+        private static float SoftplusScalar(float x)
+        {
+            if (x > 20f)
+                return x;
+            if (x < -20f)
+                return MathF.Exp(x);
+            return MathF.Log(1.0f + MathF.Exp(x));
         }
 
         #endregion
