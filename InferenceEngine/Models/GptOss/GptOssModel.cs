@@ -138,7 +138,7 @@ namespace InferenceEngine
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
                         long totalBytes = gw.RawBytes + uw.RawBytes;
-                        IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                         Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
                         Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
                         _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
@@ -199,7 +199,7 @@ namespace InferenceEngine
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
                     long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                     Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
                     Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
                     Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);

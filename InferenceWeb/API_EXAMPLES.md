@@ -5,6 +5,8 @@ InferenceWeb provides three API styles:
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
 - **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`)
 
+For the Web UI flow, choose the model up front with `/api/models/load`. The `/api/chat` endpoint uses the already loaded model and does not support per-turn model switching.
+
 ## Starting the Server
 
 ```bash

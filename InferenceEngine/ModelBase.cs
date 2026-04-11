@@ -8,11 +8,13 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.GGML;
@@ -66,7 +68,7 @@ namespace InferenceEngine
             Ne0 = ne0;
             Ne1 = ne1;
             RawBytes = raw.Length;
-            Data = GgmlBasicOps.AlignedAlloc(raw.Length);
+            Data = AllocateBuffer(raw.Length);
             _aligned = true;
             Marshal.Copy(raw, 0, Data, raw.Length);
         }
@@ -86,10 +88,24 @@ namespace InferenceEngine
             if (Data != IntPtr.Zero)
             {
                 if (_aligned)
-                    GgmlBasicOps.AlignedFree(Data);
+                    FreeBuffer(Data);
                 else
                     Marshal.FreeHGlobal(Data);
             }
+        }
+
+        public static unsafe IntPtr AllocateBuffer(long size)
+        {
+            void* ptr = NativeMemory.AlignedAlloc((nuint)size, 64);
+            if (ptr == null)
+                throw new OutOfMemoryException($"Unable to allocate {size} bytes for quantized weight storage.");
+            return (IntPtr)ptr;
+        }
+
+        public static unsafe void FreeBuffer(IntPtr ptr)
+        {
+            if (ptr != IntPtr.Zero)
+                NativeMemory.AlignedFree(ptr.ToPointer());
         }
     }
 
@@ -152,11 +168,17 @@ namespace InferenceEngine
 
         protected void EnsureQuantBackendAvailable()
         {
-            if (_quantBackendReady)
+            if (_quantBackendReady || !IsGgmlBackend)
                 return;
 
-            if (!IsGgmlBackend)
-                GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cpu);
+            GgmlBackendType backendType = _backend switch
+            {
+                BackendType.GgmlCpu => GgmlBackendType.Cpu,
+                BackendType.GgmlMetal => GgmlBackendType.Metal,
+                BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                _ => throw new InvalidOperationException($"No GGML backend is associated with {_backend}."),
+            };
+            GgmlBasicOps.EnsureBackendAvailable(backendType);
 
             _quantBackendReady = true;
         }
@@ -218,16 +240,21 @@ namespace InferenceEngine
 
         protected virtual bool IsQuantizedLinearWeight(GgufTensorInfo info)
         {
+            return ShouldStoreWeightQuantized(_backend, info);
+        }
+
+        internal static bool ShouldStoreWeightQuantized(BackendType backend, GgufTensorInfo info)
+        {
             if (info.Type == GgmlTensorType.F32)
                 return false;
-            if (!IsGgmlBackend && info.Type == GgmlTensorType.F16)
+
+            if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
                 return false;
+
             if (info.Shape.Length == 2)
                 return true;
-            // 3D tensors: MoE expert weights (ffn_gate_exps, ffn_up_exps, ffn_down_exps)
-            if (info.Shape.Length == 3 && info.Name.Contains("_exps."))
-                return true;
-            return false;
+
+            return info.Shape.Length == 3 && info.Name.Contains("_exps.");
         }
 
         protected void LoadWeights()
@@ -244,7 +271,8 @@ namespace InferenceEngine
 
                 if (IsQuantizedLinearWeight(info))
                 {
-                    EnsureQuantBackendAvailable();
+                    if (IsGgmlBackend)
+                        EnsureQuantBackendAvailable();
 
                     long ne0 = (long)info.Shape[0];
                     long ne1 = (long)info.Shape[1];
@@ -254,7 +282,7 @@ namespace InferenceEngine
                         // 3D MoE expert tensor: split into per-expert 2D quantized weights
                         int numExperts = (int)info.Shape[2];
                         long perExpertBytes = byteCount / numExperts;
-                        IntPtr bulkPtr = GgmlBasicOps.AlignedAlloc(byteCount);
+                        IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
                         _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
 
                         string baseName = info.Name;
@@ -263,7 +291,7 @@ namespace InferenceEngine
 
                         for (int e = 0; e < numExperts; e++)
                         {
-                            IntPtr expertPtr = GgmlBasicOps.AlignedAlloc(perExpertBytes);
+                            IntPtr expertPtr = QuantizedWeight.AllocateBuffer(perExpertBytes);
                             unsafe
                             {
                                 Buffer.MemoryCopy(
@@ -274,13 +302,13 @@ namespace InferenceEngine
                             _quantWeights[$"{baseName}.{e}.weight"] = new QuantizedWeight(expertPtr, perExpertBytes, (int)info.Type, ne0, ne1);
                         }
 
-                        GgmlBasicOps.AlignedFree(bulkPtr);
+                        QuantizedWeight.FreeBuffer(bulkPtr);
                         countQuant += numExperts;
                         totalQuantBytes += byteCount;
                     }
                     else
                     {
-                        IntPtr ptr = GgmlBasicOps.AlignedAlloc(byteCount);
+                        IntPtr ptr = QuantizedWeight.AllocateBuffer(byteCount);
                         _gguf.ReadTensorDataToNative(info, ptr, byteCount);
                         _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
                         countQuant++;
@@ -308,13 +336,13 @@ namespace InferenceEngine
                     }
                     else
                     {
-                        IntPtr tempPtr = GgmlBasicOps.AlignedAlloc(byteCount);
+                        IntPtr tempPtr = QuantizedWeight.AllocateBuffer(byteCount);
                         try
                         {
                             _gguf.ReadTensorDataToNative(info, tempPtr, byteCount);
                             NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
                         }
-                        finally { GgmlBasicOps.AlignedFree(tempPtr); }
+                        finally { QuantizedWeight.FreeBuffer(tempPtr); }
                     }
 
                     _weights[info.Name] = tensor;
@@ -342,7 +370,7 @@ namespace InferenceEngine
                     gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                 {
                     long totalBytes = gw.RawBytes + uw.RawBytes;
-                    IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                     Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
                     Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
                     _quantWeights[guName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
@@ -396,10 +424,15 @@ namespace InferenceEngine
 
             if (_quantWeights.TryGetValue("token_embd.weight", out var qw))
             {
-                var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
-                using var idxTensor = CreateIntTensor(tokens, tokens.Length);
-                GgmlBasicOps.GetRowsQuant(result, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
-                return result;
+                if (IsGgmlBackend)
+                {
+                    var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                    using var idxTensor = CreateIntTensor(tokens, tokens.Length);
+                    GgmlBasicOps.GetRowsQuant(result, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
+                    return result;
+                }
+
+                return EmbeddingManagedQuantized(tokens, qw);
             }
 
             var embWeight = _weights["token_embd.weight"];
@@ -429,7 +462,10 @@ namespace InferenceEngine
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                GgmlBasicOps.AddmmQuant(result, input, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                if (IsGgmlBackend)
+                    GgmlBasicOps.AddmmQuant(result, input, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                else
+                    AddmmQuantManaged(result, input, qw);
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {
@@ -446,6 +482,87 @@ namespace InferenceEngine
 
             _linearTicks += Stopwatch.GetTimestamp() - t0;
             return result;
+        }
+
+        private unsafe Tensor EmbeddingManagedQuantized(int[] tokens, QuantizedWeight weight)
+        {
+            int dim = (int)weight.Ne0;
+            long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
+            var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+            float* dst = GetFloatPtr(result);
+            byte* basePtr = (byte*)weight.Data.ToPointer();
+
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                byte* rowPtr = basePtr + (long)tokens[i] * rowBytes;
+                ManagedQuantizedOps.DequantizeRowToFloat32(weight.GgmlType, (IntPtr)rowPtr, dst + (long)i * dim, dim);
+            }
+
+            return result;
+        }
+
+        private unsafe void AddmmQuantManaged(Tensor result, Tensor input, QuantizedWeight weight)
+        {
+            if (!input.IsContiguous() || !result.IsContiguous())
+                throw new NotSupportedException("Managed quantized matmul requires contiguous input and output tensors.");
+
+            int seqLen = (int)input.Sizes[0];
+            int inDim = (int)weight.Ne0;
+            int outDim = (int)weight.Ne1;
+            if ((int)input.Sizes[1] != inDim)
+                throw new ArgumentException($"Input dim {input.Sizes[1]} does not match quantized weight width {inDim}.");
+
+            long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
+            float* inputPtr = GetFloatPtr(input);
+            float* resultPtr = GetFloatPtr(result);
+            byte* weightBase = (byte*)weight.Data.ToPointer();
+
+            void RunRange(int start, int end, float* scratch)
+            {
+                for (int col = start; col < end; col++)
+                {
+                    byte* rowPtr = weightBase + (long)col * rowBytes;
+                    ManagedQuantizedOps.DequantizeRowToFloat32(weight.GgmlType, (IntPtr)rowPtr, scratch, inDim);
+                    for (int row = 0; row < seqLen; row++)
+                    {
+                        resultPtr[(long)row * outDim + col] = VecDot(
+                            inputPtr + (long)row * inDim,
+                            scratch,
+                            inDim);
+                    }
+                }
+            }
+
+            bool useParallel = outDim >= 128 && seqLen * outDim >= 512 && Environment.ProcessorCount > 1;
+            if (!useParallel)
+            {
+                float[] scratchArr = ArrayPool<float>.Shared.Rent(inDim);
+                try
+                {
+                    fixed (float* scratch = scratchArr)
+                    {
+                        RunRange(0, outDim, scratch);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(scratchArr);
+                }
+
+                return;
+            }
+
+            Parallel.For(0, outDim,
+                () => ArrayPool<float>.Shared.Rent(inDim),
+                (col, _, scratchArr) =>
+                {
+                    fixed (float* scratch = scratchArr)
+                    {
+                        RunRange(col, col + 1, scratch);
+                    }
+                    return scratchArr;
+                },
+                scratchArr => ArrayPool<float>.Shared.Return(scratchArr));
         }
 
         #region SIMD Helpers
@@ -825,7 +942,8 @@ namespace InferenceEngine
                 w.Dispose();
             _weights.Clear();
 
-            GgmlBasicOps.ClearHostBufferCache();
+            if (IsGgmlBackend)
+                GgmlBasicOps.ClearHostBufferCache();
 
             foreach (var qw in _quantWeights.Values)
                 qw.Dispose();

@@ -82,11 +82,27 @@ auto_detect_model() {
 }
 
 load_model() {
+    local models_json
+    models_json=$(curl -sf "$BASE_URL/api/models")
+    local loaded
+    loaded=$(echo "$models_json" | jq -r '.loaded // empty')
+    if [ "$loaded" = "$MODEL" ]; then
+        log "Using already-loaded model: $MODEL"
+        return
+    fi
+
+    local backend
+    backend=$(echo "$models_json" | jq -r '.loadedBackend // .defaultBackend // empty')
+    if [ -z "$backend" ]; then
+        echo "Error: No supported backend is available on this machine."
+        exit 1
+    fi
+
     log "Loading model: $MODEL ..."
     local resp
     resp=$(curl -sf -X POST "$BASE_URL/api/models/load" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"$MODEL\", \"backend\":\"ggml_metal\"}" 2>&1 || true)
+        -d "{\"model\":\"$MODEL\", \"backend\":\"$backend\"}" 2>&1 || true)
     if echo "$resp" | jq -e '.ok == true' &>/dev/null; then
         log "Model loaded successfully."
     else
@@ -133,7 +149,7 @@ test_webui_basic_multiturn() {
         local response
         response=$(curl -sf -X POST "$BASE_URL/api/chat" \
             -H "Content-Type: application/json" \
-            -d "{\"messages\":$messages, \"maxTokens\":100, \"model\":\"$MODEL\"}" 2>&1 || true)
+            -d "{\"messages\":$messages, \"maxTokens\":100}" 2>&1 || true)
 
         local tokens=""
         local done_received=false
@@ -394,7 +410,7 @@ test_webui_system_message_long() {
         local response
         response=$(curl -sf -X POST "$BASE_URL/api/chat" \
             -H "Content-Type: application/json" \
-            -d "{\"messages\":$messages, \"maxTokens\":80, \"model\":\"$MODEL\"}" 2>&1 || true)
+            -d "{\"messages\":$messages, \"maxTokens\":80}" 2>&1 || true)
 
         local tokens=""
         local done_received=false
@@ -455,7 +471,7 @@ test_concurrent_requests() {
     for i in 1 2 3; do
         curl -sf -X POST "$BASE_URL/api/chat" \
             -H "Content-Type: application/json" \
-            -d "{\"messages\":$messages, \"maxTokens\":20, \"model\":\"$MODEL\"}" \
+            -d "{\"messages\":$messages, \"maxTokens\":20}" \
             > "$tmpdir/resp_$i.txt" 2>&1 &
         pids+=($!)
         sleep 0.2
@@ -751,7 +767,7 @@ test_abort_generation() {
 
     curl -sf -X POST "$BASE_URL/api/chat" \
         -H "Content-Type: application/json" \
-        -d "{\"messages\":$messages, \"maxTokens\":500, \"model\":\"$MODEL\"}" \
+        -d "{\"messages\":$messages, \"maxTokens\":500}" \
         > "$tmpfile" 2>&1 &
     local pid=$!
 

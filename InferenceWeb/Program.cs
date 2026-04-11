@@ -216,14 +216,21 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
 {
     var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body);
 
-    string switchModel = body.TryGetProperty("model", out var modelEl) ? modelEl.GetString() : null;
-    string switchBackend = body.TryGetProperty("backend", out var beEl) ? beEl.GetString() : null;
+    string requestedModel = body.TryGetProperty("model", out var modelEl) ? modelEl.GetString() : null;
+    string requestedBackend = body.TryGetProperty("backend", out var beEl) ? beEl.GetString() : null;
     bool newChat = body.TryGetProperty("newChat", out var ncProp) && ncProp.GetBoolean();
+
+    if (!WebUiChatPolicy.TryValidateChatRequest(requestedModel, requestedBackend, out string selectionError))
+    {
+        ctx.Response.StatusCode = 400;
+        await ctx.Response.WriteAsJsonAsync(new { error = selectionError });
+        return;
+    }
 
     if (newChat)
         svc.InvalidateKVCache();
 
-    if (string.IsNullOrEmpty(switchModel) && !svc.IsLoaded)
+    if (!svc.IsLoaded)
     {
         ctx.Response.StatusCode = 400;
         await ctx.Response.WriteAsJsonAsync(new { error = "No model loaded" });
@@ -271,38 +278,6 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
         await ctx.Response.WriteAsync($"data: {queueData}\n\n", ctx.RequestAborted);
         await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
         await ticket.WaitAsync(TimeSpan.FromSeconds(1));
-    }
-
-    if (!string.IsNullOrEmpty(switchModel))
-    {
-        if (!TryResolveSupportedBackend(switchBackend, out string backend, out string backendError))
-        {
-            string errData = JsonSerializer.Serialize(new { done = true, error = backendError });
-            await ctx.Response.WriteAsync($"data: {errData}\n\n", ctx.RequestAborted);
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-            return;
-        }
-
-        bool wasSwitch = !svc.IsModelAlreadyLoaded(switchModel);
-        if (wasSwitch)
-        {
-            string loadingData = JsonSerializer.Serialize(new { model_loading = switchModel });
-            await ctx.Response.WriteAsync($"data: {loadingData}\n\n", ctx.RequestAborted);
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-        }
-        if (!svc.EnsureModelLoaded(switchModel, modelDir, backend))
-        {
-            string errData = JsonSerializer.Serialize(new { done = true, error = $"Model '{switchModel}' not found" });
-            await ctx.Response.WriteAsync($"data: {errData}\n\n", ctx.RequestAborted);
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-            return;
-        }
-        if (wasSwitch)
-        {
-            string loadedData = JsonSerializer.Serialize(new { model_loaded = svc.LoadedModelName, architecture = svc.Architecture });
-            await ctx.Response.WriteAsync($"data: {loadedData}\n\n", ctx.RequestAborted);
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-        }
     }
 
     var writer = ctx.Response.BodyWriter;

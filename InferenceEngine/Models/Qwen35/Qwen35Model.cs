@@ -208,7 +208,7 @@ namespace InferenceEngine
                     totalNe1 += qw.Ne1;
                 }
 
-                IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                 byte* fusedDst = (byte*)fusedPtr.ToPointer();
                 long offset = 0;
                 for (int i = 0; i < quantWeights.Length; i++)

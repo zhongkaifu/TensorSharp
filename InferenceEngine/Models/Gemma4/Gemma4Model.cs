@@ -776,7 +776,22 @@ namespace InferenceEngine
             {
                 pleTokenEmb = new Tensor(_allocator, DType.Float32, seqLen, totalPleDim);
                 using var pleIdx = CreateIntTensor(tokens, seqLen);
-                GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.Data, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
+                if (IsGgmlBackend)
+                {
+                    GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.Data, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
+                }
+                else
+                {
+                    float* pleDst = GetFloatPtr(pleTokenEmb);
+                    byte* pleBase = (byte*)pleQw.Data.ToPointer();
+                    long rowBytes = NativeDequant.RowSize(pleQw.GgmlType, pleQw.Ne0);
+                    for (int i = 0; i < seqLen; i++)
+                    {
+                        int token = tokens[i];
+                        byte* rowPtr = pleBase + (long)token * rowBytes;
+                        ManagedQuantizedOps.DequantizeRowToFloat32(pleQw.GgmlType, (IntPtr)rowPtr, pleDst + (long)i * totalPleDim, totalPleDim);
+                    }
+                }
 
                 float pleScale = MathF.Sqrt(_pleDim);
                 Ops.Mul(pleTokenEmb, pleTokenEmb, pleScale);
@@ -1150,7 +1165,7 @@ namespace InferenceEngine
                         long vBytes = hasQuantV ? vw.RawBytes : kw.RawBytes;
                         long vNe1 = hasQuantV ? vw.Ne1 : kw.Ne1;
                         long totalBytes = qw.RawBytes + kw.RawBytes + vBytes;
-                        IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                         Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
                         Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
                         if (hasQuantV)
@@ -1212,7 +1227,7 @@ namespace InferenceEngine
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
                         long totalBytes = gw.RawBytes + uw.RawBytes;
-                        IntPtr fusedPtr = GgmlBasicOps.AlignedAlloc(totalBytes);
+                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
                         Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
                         Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
                         _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
