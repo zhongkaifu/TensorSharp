@@ -1,6 +1,7 @@
 using System;
 using System.IO;
-using InferenceEngine;
+using TensorSharp.Models;
+using TensorSharp.Runtime;
 
 static BackendType ParseBackend(string backend) => backend.ToLowerInvariant() switch
 {

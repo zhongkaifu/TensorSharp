@@ -1,6 +1,4 @@
-using System.Text.Json;
-using InferenceEngine;
-using InferenceWeb;
+﻿using System.Text.Json;
 
 namespace InferenceWeb.Tests;
 
@@ -206,3 +204,5 @@ public class StructuredOutputTests
         Assert.Equal("""{"item":{"name":"Ada","age":30}}""", normalized.NormalizedContent);
     }
 }
+
+

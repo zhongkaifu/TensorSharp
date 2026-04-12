@@ -1,5 +1,4 @@
-using System.Buffers.Binary;
-using InferenceEngine;
+﻿using System.Buffers.Binary;
 
 namespace InferenceWeb.Tests;
 
@@ -168,3 +167,4 @@ public class ManagedQuantizedOpsTests
         return sum;
     }
 }
+

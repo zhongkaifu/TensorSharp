@@ -1,4 +1,4 @@
-# TensorSharp
+﻿# TensorSharp
 
 <p align="center">
   <img src="imgs/banner_1.png" alt="TensorSharp logo" width="320">
@@ -72,35 +72,36 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 
 ```
 TensorSharp/
-├── TensorSharp/                 # Core tensor library (CPU operations, SIMD)
-├── TensorSharp.GGML/            # GGML backend bindings (Metal/CUDA/CPU via native library)
+├── TensorSharp.Core/            # Core tensor library (Tensor, Ops, memory, device abstraction)
+├── TensorSharp.Runtime/         # GGUF, tokenizers, templates, sampling, protocol parsing
+├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
+├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/CPU via native library)
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps)
-├── AdvUtils/                    # Utility library
-├── InferenceEngine/             # Model loading, tokenization, and inference logic
-│   ├── Models/
-│   │   ├── Gemma3/
-│   │   ├── Gemma4/              # Vision encoder, audio encoder, MoE, fused GPU decode
-│   │   ├── GptOss/              # MoE, attention sinks, SiLUAlphaLimit, Yarn RoPE
-│   │   ├── Nemotron/            # Hybrid Mamba2 SSM + attention + MoE FFN
-│   │   ├── Qwen3/
-│   │   └── Qwen35/
-│   ├── GgufReader.cs            # GGUF file parser
-│   ├── ModelBase.cs             # Base class for all model architectures
-│   ├── ChatTemplate.cs          # Chat template rendering (hardcoded + Jinja2 from GGUF)
-│   ├── Jinja2Template.cs        # Jinja2 template renderer
-│   ├── OutputParser.cs          # Extracts thinking, content, and tool calls from model output
-│   ├── SamplingConfig.cs        # Sampling parameter configuration
-│   ├── TokenSampler.cs          # Token sampling (greedy, top-k, top-p, min-p, penalties)
-│   └── MediaHelper.cs           # Video frame extraction, audio decoding
-├── InferenceConsole/            # CLI application
-├── InferenceWeb/                # Web chatbot + API server (ASP.NET Core)
+├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
 │   ├── ModelService.cs          # Model lifecycle management
 │   ├── InferenceQueue.cs        # FIFO request queue with position tracking
 │   ├── wwwroot/index.html       # Chat UI
 │   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
+├── TensorSharp.Cli/             # CLI application
+├── AdvUtils/                    # Utility library
 └── ExternalProjects/            # Third-party dependencies (ggml)
 ```
+
+## NuGet Packages
+
+The repository is now split along package boundaries so consumers can depend on only the layers they actually need.
+
+| Project | NuGet package | Public namespace | Responsibility |
+|---|---|---|---|
+| `TensorSharp.Core` | `TensorSharp.Core` | `TensorSharp` | Tensor primitives, ops, allocators, storage, and device abstraction |
+| `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF parsing, tokenizers, prompt rendering, sampling, and output protocol parsing |
+| `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`, architecture implementations, multimodal encoders, and model-side execution helpers |
+| `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML-backed execution and native interop |
+| `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core server, OpenAI/Ollama adapters, queueing, and web UI |
+| `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | Console host and debugging / batch tooling |
+
+This split keeps engine users off the web stack, keeps API-layer changes from leaking into core/runtime packages, and makes future benchmark or eval-harness projects easier to publish independently.
 
 ## Prerequisites
 
@@ -121,10 +122,10 @@ dotnet build TensorSharp.slnx
 
 ```bash
 # Console application
-dotnet build InferenceConsole/InferenceConsole.csproj
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj
 
 # Web application
-dotnet build InferenceWeb/InferenceWeb.csproj
+dotnet build TensorSharp.Server/TensorSharp.Server.csproj
 ```
 
 ### Build the native GGML library
@@ -166,7 +167,7 @@ TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2 bash build-linux.sh --cuda
 You can also request a CUDA-enabled native build from `dotnet build`:
 
 ```bash
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceConsole.csproj -c Release
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 ```
 
 On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux, `build-linux.sh` preserves an existing CUDA-enabled build and auto-enables GGML_CUDA when a CUDA toolchain is detected; `build-linux.sh --cuda` and `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` force CUDA explicitly. The build output is automatically copied to the application's output directory.
@@ -176,38 +177,38 @@ On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux, `bui
 ### Console Application
 
 ```bash
-cd InferenceConsole/bin
+cd TensorSharp.Cli/bin
 
 # Text inference
-./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
 
 # Text inference on Linux + NVIDIA GPU
-./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
 # Image inference (Gemma 3/4, Qwen 3.5)
-./InferenceConsole --model <model.gguf> --image photo.png --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
 # Video inference (Gemma 4)
-./InferenceConsole --model <model.gguf> --video clip.mp4 --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --video clip.mp4 --backend ggml_metal
 
 # Audio inference (Gemma 4)
-./InferenceConsole --model <model.gguf> --audio speech.wav --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --audio speech.wav --backend ggml_metal
 
 # Thinking / reasoning mode
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal --think
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
 # Tool calling
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --tools tools.json
 
 # With sampling parameters
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42
 
 # Batch processing (JSONL)
-./InferenceConsole --model <model.gguf> --input-jsonl requests.jsonl \
+./TensorSharp.Cli --model <model.gguf> --input-jsonl requests.jsonl \
     --output results.txt --backend ggml_metal
 ```
 
@@ -253,13 +254,13 @@ Each line is a JSON object with `messages`, optional `prompt`, and optional samp
 ### Web Application
 
 ```bash
-cd InferenceWeb/bin
+cd TensorSharp.Server/bin
 
 # Set environment variables and run
-MODEL_DIR=./models BACKEND=ggml_metal ./InferenceWeb
+MODEL_DIR=./models BACKEND=ggml_metal ./TensorSharp.Server
 
 # Linux + NVIDIA GPU
-MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
+MODEL_DIR=./models BACKEND=ggml_cuda ./TensorSharp.Server
 ```
 
 Open `http://localhost:5000` in your browser. The web interface supports:
@@ -284,7 +285,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 
 ### HTTP APIs
 
-InferenceWeb exposes three API styles. See [API_EXAMPLES.md](InferenceWeb/API_EXAMPLES.md) for full documentation with curl and Python examples.
+TensorSharp.Server exposes three API styles. See [API_EXAMPLES.md](TensorSharp.Server/API_EXAMPLES.md) for full documentation with curl and Python examples.
 
 **Ollama-compatible API:**
 
@@ -407,13 +408,17 @@ These models support image inputs with their respective multimodal projector fil
 
 TensorSharp is structured as a layered system:
 
-1. **TensorSharp** provides the core `Tensor` type, storage abstraction, and an extensible operation registry (`Ops`). CPU implementations use `System.Numerics.Vectors` for SIMD acceleration.
+1. **TensorSharp.Core** provides the core `Tensor` type, storage abstraction, and the extensible operation registry (`Ops`). CPU implementations use `System.Numerics.Vectors` for SIMD acceleration.
 
-2. **TensorSharp.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
+2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, and reusable contracts such as `IModelArchitecture`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, output parsing (thinking extraction, tool-call extraction), and the forward pass for each architecture (including hybrid SSM-Transformer models like Nemotron-H with Mamba2 layers). Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, Qwen 3/3.5, GPT OSS, Nemotron-H). Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
-4. **InferenceConsole** and **InferenceWeb** are application layers that handle I/O and user interaction. InferenceWeb provides Ollama-compatible and OpenAI-compatible REST APIs alongside a browser-based chat UI, with a FIFO inference queue to serialize concurrent requests.
+4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
+
+5. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, and the FIFO inference queue.
+
+6. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, and JSONL batch workflows.
 
 ### Performance Optimizations
 
@@ -426,16 +431,16 @@ TensorSharp is structured as a layered system:
 
 ## Testing
 
-Integration tests for InferenceWeb are in `InferenceWeb/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support.
+Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support.
 
 ```bash
-# Start InferenceWeb, then run:
-python3 InferenceWeb/testdata/test_multiturn.py
+# Start TensorSharp.Server, then run:
+python3 TensorSharp.Server/testdata/test_multiturn.py
 # or
-bash InferenceWeb/testdata/test_multiturn.sh
+bash TensorSharp.Server/testdata/test_multiturn.sh
 ```
 
-See [InferenceWeb/testdata/README.md](InferenceWeb/testdata/README.md) for the full test matrix.
+See [TensorSharp.Server/testdata/README.md](TensorSharp.Server/testdata/README.md) for the full test matrix.
 
 ## Author
 
@@ -444,3 +449,4 @@ Zhongkai Fu
 ## License
 
 See [LICENSE](LICENSE) for details.
+

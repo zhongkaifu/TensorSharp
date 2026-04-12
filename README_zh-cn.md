@@ -1,4 +1,4 @@
-# TensorSharp
+﻿# TensorSharp
 
 <p align="center">
   <img src="imgs/banner_1.png" alt="TensorSharp logo" width="320">
@@ -72,35 +72,36 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 
 ```text
 TensorSharp/
-├── TensorSharp/                 # 核心张量库（CPU 运算、SIMD）
-├── TensorSharp.GGML/            # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
+├── TensorSharp.Core/            # 核心张量库（Tensor、Ops、内存、设备抽象）
+├── TensorSharp.Runtime/         # GGUF、分词器、模板、采样、协议解析
+├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
+├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps）
-├── AdvUtils/                    # 工具库
-├── InferenceEngine/             # 模型加载、分词和推理逻辑
-│   ├── Models/
-│   │   ├── Gemma3/
-│   │   ├── Gemma4/              # 视觉编码器、音频编码器、MoE、融合 GPU decode
-│   │   ├── GptOss/              # MoE、注意力沉降、SiLUAlphaLimit、Yarn RoPE
-│   │   ├── Nemotron/            # 混合 Mamba2 SSM + 注意力 + MoE FFN
-│   │   ├── Qwen3/
-│   │   └── Qwen35/
-│   ├── GgufReader.cs            # GGUF 文件解析器
-│   ├── ModelBase.cs             # 各模型架构基类
-│   ├── ChatTemplate.cs          # 聊天模板渲染（硬编码 + 来自 GGUF 的 Jinja2）
-│   ├── Jinja2Template.cs        # Jinja2 模板渲染器
-│   ├── OutputParser.cs          # 从模型输出中提取思维链、内容和工具调用
-│   ├── SamplingConfig.cs        # 采样参数配置
-│   ├── TokenSampler.cs          # Token 采样（greedy、top-k、top-p、min-p、惩罚项）
-│   └── MediaHelper.cs           # 视频抽帧、音频解码
-├── InferenceConsole/            # CLI 应用
-├── InferenceWeb/                # Web 聊天 + API 服务（ASP.NET Core）
+├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
 │   ├── ModelService.cs          # 模型生命周期管理
-│   ├── InferenceQueue.cs        # 带排队位置追踪的 FIFO 请求队列
+│   ├── InferenceQueue.cs        # 带排队位置跟踪的 FIFO 请求队列
 │   ├── wwwroot/index.html       # 聊天界面
 │   ├── testdata/                # 集成测试套件（bash + Python）
 │   └── API_EXAMPLES.md          # 详细 API 文档
+├── TensorSharp.Cli/             # CLI 应用
+├── AdvUtils/                    # 工具库
 └── ExternalProjects/            # 第三方依赖（ggml）
 ```
+
+## NuGet 包分层
+
+现在仓库按包边界拆成独立层，使用者可以只引用真正需要的部分。
+
+| 项目 | NuGet 包 | 对外 namespace | 职责 |
+|---|---|---|---|
+| `TensorSharp.Core` | `TensorSharp.Core` | `TensorSharp` | Tensor 原语、Ops、分配器、存储与设备抽象 |
+| `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF 解析、分词器、Prompt 渲染、采样与输出协议解析 |
+| `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`、各模型架构、多模态编码器与模型侧执行辅助 |
+| `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML 执行后端与原生互操作 |
+| `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core 服务、OpenAI/Ollama 适配层、队列与 Web UI |
+| `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | 控制台宿主、调试工具与 JSONL 批处理 |
+
+这样的拆分让引擎使用者不必带上 Web 依赖，也能把 API 层改动和核心运行时隔离开，并让后续 benchmark / eval harness 更容易独立发布。
 
 ## 前置要求
 
@@ -121,10 +122,10 @@ dotnet build TensorSharp.slnx
 
 ```bash
 # 控制台应用
-dotnet build InferenceConsole/InferenceConsole.csproj
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj
 
 # Web 应用
-dotnet build InferenceWeb/InferenceWeb.csproj
+dotnet build TensorSharp.Server/TensorSharp.Server.csproj
 ```
 
 ### 构建原生 GGML 库
@@ -156,7 +157,7 @@ bash build-linux.sh --cuda
 也可以在 `dotnet build` 时通过环境变量请求 CUDA 版本的原生库：
 
 ```bash
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceConsole.csproj -c Release
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 ```
 
 在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Linux 上，`build-linux.sh` 会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
@@ -166,38 +167,38 @@ TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build InferenceConsole/InferenceCo
 ### 控制台应用
 
 ```bash
-cd InferenceConsole/bin
+cd TensorSharp.Cli/bin
 
 # 文本推理
-./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
 
 # Linux + NVIDIA GPU 文本推理
-./InferenceConsole --model <model.gguf> --input prompt.txt --output result.txt \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
 # 图像推理（Gemma 3/4，Qwen 3.5）
-./InferenceConsole --model <model.gguf> --image photo.png --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
 # 视频推理（Gemma 4）
-./InferenceConsole --model <model.gguf> --video clip.mp4 --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --video clip.mp4 --backend ggml_metal
 
 # 音频推理（Gemma 4）
-./InferenceConsole --model <model.gguf> --audio speech.wav --backend ggml_metal
+./TensorSharp.Cli --model <model.gguf> --audio speech.wav --backend ggml_metal
 
 # 思维链 / 推理模式
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal --think
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
 # 工具调用
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --tools tools.json
 
 # 使用采样参数
-./InferenceConsole --model <model.gguf> --input prompt.txt --backend ggml_metal \
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42
 
 # 批处理（JSONL）
-./InferenceConsole --model <model.gguf> --input-jsonl requests.jsonl \
+./TensorSharp.Cli --model <model.gguf> --input-jsonl requests.jsonl \
     --output results.txt --backend ggml_metal
 ```
 
@@ -243,13 +244,13 @@ cd InferenceConsole/bin
 ### Web 应用
 
 ```bash
-cd InferenceWeb/bin
+cd TensorSharp.Server/bin
 
 # 设置环境变量并运行
-MODEL_DIR=./models BACKEND=ggml_metal ./InferenceWeb
+MODEL_DIR=./models BACKEND=ggml_metal ./TensorSharp.Server
 
 # Linux + NVIDIA GPU
-MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
+MODEL_DIR=./models BACKEND=ggml_cuda ./TensorSharp.Server
 ```
 
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
@@ -274,7 +275,7 @@ MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
 
 ### HTTP API
 
-InferenceWeb 暴露三种 API 风格。完整文档及 curl/Python 示例见 [API_EXAMPLES.md](InferenceWeb/API_EXAMPLES.md)。
+TensorSharp.Server 暴露三种 API 风格。完整文档及 curl/Python 示例见 [API_EXAMPLES.md](TensorSharp.Server/API_EXAMPLES.md)。
 
 **兼容 Ollama 的 API：**
 
@@ -372,13 +373,17 @@ Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`ge
 
 TensorSharp 采用分层系统结构：
 
-1. **TensorSharp** 提供核心 `Tensor` 类型、存储抽象和可扩展的操作注册表（`Ops`）。CPU 实现使用 `System.Numerics.Vectors` 进行 SIMD 加速。
+1. **TensorSharp.Core** 提供核心 `Tensor` 类型、存储抽象和可扩展的操作注册表（`Ops`）。CPU 实现使用 `System.Numerics.Vectors` 进行 SIMD 加速。
 
-2. **TensorSharp.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
+2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析，以及 `IModelArchitecture`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **InferenceEngine** 实现模型相关逻辑：GGUF 解析、分词（SentencePiece BPE）、聊天模板渲染（来自 GGUF 元数据的 Jinja2 + 硬编码回退）、可配置 token 采样、输出解析（思维链提取、工具调用提取），以及各架构前向计算（包括 Nemotron-H 等混合 SSM-Transformer 模型的 Mamba2 层）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、Qwen 3/3.5、GPT OSS、Nemotron-H）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
-4. **InferenceConsole** 与 **InferenceWeb** 是应用层，负责 I/O 和用户交互。InferenceWeb 同时提供兼容 Ollama 与 OpenAI 的 REST API 以及浏览器聊天 UI，并使用 FIFO 推理队列来串行化并发请求。
+4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
+
+5. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理和 FIFO 推理队列。
+
+6. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查和 JSONL 批处理。
 
 ### 性能优化
 
@@ -391,16 +396,16 @@ TensorSharp 采用分层系统结构：
 
 ## 测试
 
-InferenceWeb 的集成测试位于 `InferenceWeb/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、队列行为、并发请求和中断支持。
+TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、队列行为、并发请求和中断支持。
 
 ```bash
-# 先启动 InferenceWeb，然后运行：
-python3 InferenceWeb/testdata/test_multiturn.py
+# 先启动 TensorSharp.Server，然后运行：
+python3 TensorSharp.Server/testdata/test_multiturn.py
 # 或
-bash InferenceWeb/testdata/test_multiturn.sh
+bash TensorSharp.Server/testdata/test_multiturn.sh
 ```
 
-完整测试矩阵见 [InferenceWeb/testdata/README.md](InferenceWeb/testdata/README.md)。
+完整测试矩阵见 [TensorSharp.Server/testdata/README.md](TensorSharp.Server/testdata/README.md)。
 
 ## 作者
 
@@ -409,3 +414,4 @@ Zhongkai Fu
 ## 许可证
 
 详见 [LICENSE](LICENSE)。
+

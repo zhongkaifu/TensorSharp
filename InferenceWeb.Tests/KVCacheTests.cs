@@ -1,5 +1,4 @@
-using InferenceWeb;
-
+﻿
 namespace InferenceWeb.Tests;
 
 public class KVCacheTests
@@ -129,3 +128,4 @@ public class KVCacheTests
         Assert.Equal(8, common); // Full cached is prefix
     }
 }
+
