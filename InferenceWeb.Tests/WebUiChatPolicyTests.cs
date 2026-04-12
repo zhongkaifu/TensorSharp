@@ -1,5 +1,4 @@
-using InferenceWeb;
-
+﻿
 namespace InferenceWeb.Tests;
 
 public class WebUiChatPolicyTests
@@ -31,3 +30,4 @@ public class WebUiChatPolicyTests
         Assert.Equal(WebUiChatPolicy.ModelSelectionLockedMessage, error);
     }
 }
+

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <Description>Command-line host for TensorSharp model inference and diagnostics.</Description>
+  </PropertyGroup>
+  <PropertyGroup>
+    <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+    <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+  </ItemGroup>
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != '' And Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')">
+    <Copy SourceFiles="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

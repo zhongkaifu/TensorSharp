@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <Description>TensorSharp model architecture implementations and multimodal model utilities.</Description>
+    <PackageTags>tensor;models;llm;multimodal</PackageTags>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NLayer" Version="1.16.0" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.ubuntu.24.04-x64" Version="4.13.0.18" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.osx-arm64" Version="4.13.0.18" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.osx-x64" Version="4.13.0.18" />
+    <PackageReference Include="OneWare.OpenCvSharp4.runtime.win-x64" Version="4.13.0.18" />
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260330" />
+    <PackageReference Include="StbImageSharp" Version="2.30.15" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\LICENSE">
+      <Pack>True</Pack>
+      <PackagePath></PackagePath>
+    </None>
+    <None Include="..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+</Project>

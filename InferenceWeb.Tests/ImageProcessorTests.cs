@@ -1,5 +1,4 @@
-using InferenceEngine;
-
+﻿
 namespace InferenceWeb.Tests;
 
 public class ImageProcessorTests
@@ -95,3 +94,4 @@ public class ImageProcessorTests
         return path;
     }
 }
+

@@ -15,7 +15,8 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\InferenceEngine\InferenceEngine.csproj" />
-    <ProjectReference Include="..\InferenceWeb\InferenceWeb.csproj" />
+    <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+    <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
+    <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
   </ItemGroup>
 </Project>

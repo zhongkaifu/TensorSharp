@@ -1,9 +1,10 @@
 <Solution>
   <Project Path="AdvUtils/AdvUtils.csproj" />
-  <Project Path="InferenceConsole/InferenceConsole.csproj" />
-  <Project Path="InferenceEngine/InferenceEngine.csproj" />
-  <Project Path="InferenceWeb/InferenceWeb.csproj" />
   <Project Path="InferenceWeb.Tests/InferenceWeb.Tests.csproj" />
-  <Project Path="TensorSharp.GGML/TensorSharp.GGML.csproj" />
-  <Project Path="TensorSharp/TensorSharp.csproj" />
+  <Project Path="TensorSharp.Backends.GGML/TensorSharp.Backends.GGML.csproj" />
+  <Project Path="TensorSharp.Cli/TensorSharp.Cli.csproj" />
+  <Project Path="TensorSharp.Core/TensorSharp.Core.csproj" />
+  <Project Path="TensorSharp.Models/TensorSharp.Models.csproj" />
+  <Project Path="TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
+  <Project Path="TensorSharp.Server/TensorSharp.Server.csproj" />
 </Solution>

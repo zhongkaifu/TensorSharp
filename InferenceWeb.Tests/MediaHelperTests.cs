@@ -1,5 +1,4 @@
-using InferenceEngine;
-
+﻿
 namespace InferenceWeb.Tests;
 
 public class MediaHelperTests
@@ -71,3 +70,4 @@ public class MediaHelperTests
         }
     }
 }
+
