@@ -1687,12 +1687,9 @@ namespace TensorSharp
                 mscale *= 1.0f + 0.1f * MathF.Log(1.0f / freqScale);
             }
 
-            float[] cosCache = ArrayPool<float>.Shared.Rent(pairCount);
-            float[] sinCache = ArrayPool<float>.Shared.Rent(pairCount);
             float[] invFreqBuffer = ArrayPool<float>.Shared.Rent(pairCount);
             try
             {
-                float thetaScale = MathF.Pow(freqBase, -2.0f / activeRopeDim);
                 for (int i = 0; i < pairCount; i++)
                 {
                     invFreqBuffer[i] = MathF.Pow(freqBase, -2.0f * i / activeRopeDim);
@@ -1713,43 +1710,49 @@ namespace TensorSharp
 
                     int position = useIntPositions ? positionInts[row] : (int)positionFloats[row];
 
-                    for (int i = 0; i < pairCount; i++)
-                    {
-                        float thetaExtrap = position * invFreqBuffer[i];
-                        float cosTheta, sinTheta;
-                        if (useYarn)
-                        {
-                            YarnRoPE(thetaExtrap, freqScale, corrDimLow, corrDimHigh, i, extFactor, mscale, out cosTheta, out sinTheta);
-                        }
-                        else
-                        {
-                            float angle = thetaExtrap * freqScale;
-                            cosTheta = MathF.Cos(angle);
-                            sinTheta = MathF.Sin(angle);
-                        }
-                        cosCache[i] = cosTheta;
-                        sinCache[i] = sinTheta;
-                    }
-
                     if (isNeoX)
                     {
                         int half = pairCount;
                         for (int i = 0; i < half; ++i)
                         {
+                            float thetaExtrap = position * invFreqBuffer[i];
+                            float cosTheta, sinTheta;
+                            if (useYarn)
+                            {
+                                YarnRoPE(thetaExtrap, freqScale, corrDimLow, corrDimHigh, i, extFactor, mscale, out cosTheta, out sinTheta);
+                            }
+                            else
+                            {
+                                float angle = thetaExtrap * freqScale;
+                                cosTheta = MathF.Cos(angle);
+                                sinTheta = MathF.Sin(angle);
+                            }
                             float left = srcRow[i];
                             float right = srcRow[i + half];
-                            resultRow[i] = left * cosCache[i] - right * sinCache[i];
-                            resultRow[i + half] = right * cosCache[i] + left * sinCache[i];
+                            resultRow[i] = left * cosTheta - right * sinTheta;
+                            resultRow[i + half] = right * cosTheta + left * sinTheta;
                         }
                     }
                     else
                     {
                         for (int i = 0, pair = 0; i < pairCount; ++i, pair += 2)
                         {
+                            float thetaExtrap = position * invFreqBuffer[i];
+                            float cosTheta, sinTheta;
+                            if (useYarn)
+                            {
+                                YarnRoPE(thetaExtrap, freqScale, corrDimLow, corrDimHigh, i, extFactor, mscale, out cosTheta, out sinTheta);
+                            }
+                            else
+                            {
+                                float angle = thetaExtrap * freqScale;
+                                cosTheta = MathF.Cos(angle);
+                                sinTheta = MathF.Sin(angle);
+                            }
                             float left = srcRow[pair];
                             float right = srcRow[pair + 1];
-                            resultRow[pair] = left * cosCache[i] - right * sinCache[i];
-                            resultRow[pair + 1] = right * cosCache[i] + left * sinCache[i];
+                            resultRow[pair] = left * cosTheta - right * sinTheta;
+                            resultRow[pair + 1] = right * cosTheta + left * sinTheta;
                         }
                     }
                 }
@@ -1769,8 +1772,6 @@ namespace TensorSharp
             finally
             {
                 ArrayPool<float>.Shared.Return(invFreqBuffer);
-                ArrayPool<float>.Shared.Return(cosCache);
-                ArrayPool<float>.Shared.Return(sinCache);
             }
         }
 

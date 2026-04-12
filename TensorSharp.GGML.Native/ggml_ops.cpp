@@ -6473,6 +6473,431 @@ TSG_EXPORT int TSGgml_AddmmQuantF32(
     }
 }
 
+// ============================================================================
+// Fused RMSNorm + Quantized MatMul: single GPU dispatch for two ops.
+// result = matmul(rms_norm(input, norm_weight, eps), quant_weight)
+// ============================================================================
+
+int fused_rms_norm_matmul_quant_f32_impl(
+    const TensorView2DDesc& result_desc,
+    const TensorView2DDesc& input_desc,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    const QuantizedWeightDesc& m2_quant)
+{
+    if (!ensure_backend())
+        return 0;
+
+    if (!validate_desc(result_desc, "result") || !validate_desc(input_desc, "input"))
+        return 0;
+
+    if (norm_weight_data == nullptr || norm_weight_count <= 0)
+    {
+        set_last_error("Invalid norm weight data.");
+        return 0;
+    }
+
+    if (m2_quant.data == nullptr || m2_quant.ne0 <= 0 || m2_quant.ne1 <= 0 || m2_quant.raw_bytes <= 0)
+    {
+        set_last_error("Invalid quantized weight descriptor for fused rms_norm_matmul.");
+        return 0;
+    }
+
+    const int rows = input_desc.dim0;
+    const int in_dim = input_desc.dim1;
+    const int out_dim = result_desc.dim1;
+
+    if (result_desc.dim0 != rows)
+    {
+        set_last_error("Size mismatch: result.dim0 != input.dim0 in fused rms_norm_matmul.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 2 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("Failed to create ggml context for fused rms_norm_matmul.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(input_desc);
+
+    TensorBinding result_binding;
+    TensorBinding input_binding;
+    std::vector<float> packed_input;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t result_buf = nullptr;
+        ggml_backend_buffer_t input_buf = nullptr;
+        const bool result_ok = create_binding_from_host_ptr_2d(context.value, g_backend, result_desc, result_binding, result_buf);
+        const bool input_ok = result_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, input_buf);
+
+        if (result_ok && input_ok)
+        {
+            host_ptr_buffers.emplace_back(result_buf);
+            host_ptr_buffers.emplace_back(input_buf);
+        }
+        else
+        {
+            if (input_buf != nullptr) ggml_backend_buffer_free(input_buf);
+            if (result_buf != nullptr) ggml_backend_buffer_free(result_buf);
+            use_zero_copy = false;
+            result_binding = create_standard_binding(context.value, result_desc);
+            input_binding = can_map_standard_view(input_desc)
+                ? create_standard_binding(context.value, input_desc)
+                : create_packed_standard_binding(context.value, input_desc, packed_input);
+        }
+    }
+    else
+    {
+        result_binding = create_standard_binding(context.value, result_desc);
+        input_binding = can_map_standard_view(input_desc)
+            ? create_standard_binding(context.value, input_desc)
+            : create_packed_standard_binding(context.value, input_desc, packed_input);
+    }
+
+    // Norm weight tensor (1D float)
+    ggml_tensor* norm_w_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, norm_weight_count);
+
+    // Quantized weight tensor
+    ggml_type qtype = static_cast<ggml_type>(m2_quant.ggml_type);
+    ggml_tensor* m2_tensor = ggml_new_tensor_2d(context.value, qtype, m2_quant.ne0, m2_quant.ne1);
+    TensorBinding m2_binding = { m2_tensor, m2_tensor, static_cast<std::size_t>(m2_quant.raw_bytes) };
+
+    if (result_binding.storage == nullptr || input_binding.storage == nullptr ||
+        norm_w_tensor == nullptr || m2_tensor == nullptr)
+    {
+        set_last_error("Failed to allocate ggml tensors for fused rms_norm_matmul.");
+        return 0;
+    }
+
+    // Cache quantized weight buffer
+    bool m2_bound = false;
+    bool m2_needs_upload = false;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && m2_quant.raw_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, m2_tensor,
+                    m2_quant.data, static_cast<std::size_t>(m2_quant.raw_bytes),
+                    buf, addr, m2_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, m2_tensor, addr);
+                m2_bound = (st == GGML_STATUS_SUCCESS);
+                if (!m2_bound) invalidate_cached_buffer(m2_quant.data);
+            }
+        }
+    }
+
+    // Cache norm weight buffer
+    bool norm_bound = false;
+    bool norm_needs_upload = false;
+    std::size_t norm_bytes = static_cast<std::size_t>(norm_weight_count) * sizeof(float);
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && norm_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, norm_w_tensor,
+                    norm_weight_data, norm_bytes,
+                    buf, addr, norm_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, norm_w_tensor, addr);
+                norm_bound = (st == GGML_STATUS_SUCCESS);
+                if (!norm_bound) invalidate_cached_buffer(norm_weight_data);
+            }
+        }
+    }
+
+    // Build graph: rms_norm → mul(gamma) → reshape_2d → mul_mat → cpy
+    ggml_tensor* contiguous_input = ggml_cont(context.value, input_binding.tensor);
+    ggml_tensor* normed = ggml_rms_norm(context.value, contiguous_input, eps);
+    ggml_tensor* scaled = ggml_mul(context.value, normed, norm_w_tensor);
+
+    ggml_tensor* scaled_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, scaled, in_dim, 1)
+        : scaled;
+
+    ggml_tensor* mm = ggml_mul_mat(context.value, m2_binding.tensor, scaled_2d);
+    ggml_tensor* output_tensor = ggml_cpy(context.value, mm, result_binding.tensor);
+    ggml_set_output(output_tensor);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    ggml_build_forward_expand(graph, output_tensor);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("Failed to allocate backend buffer for fused rms_norm_matmul.");
+        return 0;
+    }
+
+    // Upload data
+    if (!use_zero_copy)
+    {
+        if (packed_input.empty())
+            upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+        else
+            upload_binding(input_binding, packed_input.data(), input_binding.raw_bytes);
+        if (result_binding.raw_bytes > logical_bytes(result_desc))
+            upload_binding(result_binding, result_desc.data, result_binding.raw_bytes);
+    }
+
+    if (!norm_bound || norm_needs_upload)
+        ggml_backend_tensor_set(norm_w_tensor, norm_weight_data, 0, norm_bytes);
+
+    if (!m2_bound || m2_needs_upload)
+        upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("Graph execution failed for fused rms_norm_matmul.");
+        return 0;
+    }
+    ggml_backend_synchronize(g_backend);
+
+    if (!use_zero_copy)
+        ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_FusedRmsNormMatMulQuantF32(
+    TensorView2DDesc result,
+    TensorView2DDesc input,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    void* m2_data,
+    int m2_ggml_type,
+    std::int64_t m2_ne0,
+    std::int64_t m2_ne1,
+    std::int64_t m2_raw_bytes)
+{
+    try
+    {
+        QuantizedWeightDesc m2_quant;
+        m2_quant.data = m2_data;
+        m2_quant.ggml_type = m2_ggml_type;
+        m2_quant.ne0 = m2_ne0;
+        m2_quant.ne1 = m2_ne1;
+        m2_quant.raw_bytes = m2_raw_bytes;
+        return fused_rms_norm_matmul_quant_f32_impl(result, input, norm_weight_data, norm_weight_count, eps, m2_quant);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused rms_norm_matmul.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused Quantized MatMul + Add: single GPU dispatch.
+// residual += matmul(input, quant_weight)
+// ============================================================================
+
+int fused_matmul_quant_add_f32_impl(
+    const TensorView2DDesc& residual_desc,
+    const TensorView2DDesc& input_desc,
+    const QuantizedWeightDesc& m2_quant)
+{
+    if (!ensure_backend())
+        return 0;
+
+    if (!validate_desc(residual_desc, "residual") || !validate_desc(input_desc, "input"))
+        return 0;
+
+    if (m2_quant.data == nullptr || m2_quant.ne0 <= 0 || m2_quant.ne1 <= 0 || m2_quant.raw_bytes <= 0)
+    {
+        set_last_error("Invalid quantized weight descriptor for fused matmul_add.");
+        return 0;
+    }
+
+    const int rows = input_desc.dim0;
+    const int in_dim = input_desc.dim1;
+    const int out_dim = residual_desc.dim1;
+
+    if (residual_desc.dim0 != rows)
+    {
+        set_last_error("Size mismatch: residual.dim0 != input.dim0 in fused matmul_add.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 2 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("Failed to create ggml context for fused matmul_add.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(input_desc);
+
+    TensorBinding residual_binding;
+    TensorBinding input_binding;
+    std::vector<float> packed_input;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t res_buf = nullptr;
+        ggml_backend_buffer_t inp_buf = nullptr;
+        const bool res_ok = create_binding_from_host_ptr_2d(context.value, g_backend, residual_desc, residual_binding, res_buf);
+        const bool inp_ok = res_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, inp_buf);
+
+        if (res_ok && inp_ok)
+        {
+            host_ptr_buffers.emplace_back(res_buf);
+            host_ptr_buffers.emplace_back(inp_buf);
+        }
+        else
+        {
+            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
+            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            use_zero_copy = false;
+            residual_binding = create_standard_binding(context.value, residual_desc);
+            input_binding = can_map_standard_view(input_desc)
+                ? create_standard_binding(context.value, input_desc)
+                : create_packed_standard_binding(context.value, input_desc, packed_input);
+        }
+    }
+    else
+    {
+        residual_binding = create_standard_binding(context.value, residual_desc);
+        input_binding = can_map_standard_view(input_desc)
+            ? create_standard_binding(context.value, input_desc)
+            : create_packed_standard_binding(context.value, input_desc, packed_input);
+    }
+
+    // Quantized weight tensor
+    ggml_type qtype = static_cast<ggml_type>(m2_quant.ggml_type);
+    ggml_tensor* m2_tensor = ggml_new_tensor_2d(context.value, qtype, m2_quant.ne0, m2_quant.ne1);
+    TensorBinding m2_binding = { m2_tensor, m2_tensor, static_cast<std::size_t>(m2_quant.raw_bytes) };
+
+    if (residual_binding.storage == nullptr || input_binding.storage == nullptr || m2_tensor == nullptr)
+    {
+        set_last_error("Failed to allocate ggml tensors for fused matmul_add.");
+        return 0;
+    }
+
+    // Cache quantized weight
+    bool m2_bound = false;
+    bool m2_needs_upload = false;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && m2_quant.raw_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, m2_tensor,
+                    m2_quant.data, static_cast<std::size_t>(m2_quant.raw_bytes),
+                    buf, addr, m2_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, m2_tensor, addr);
+                m2_bound = (st == GGML_STATUS_SUCCESS);
+                if (!m2_bound) invalidate_cached_buffer(m2_quant.data);
+            }
+        }
+    }
+
+    // Build graph: mul_mat → add(residual) → cpy(back to residual)
+    ggml_tensor* contiguous_input = ggml_cont(context.value, input_binding.tensor);
+    ggml_tensor* contiguous_residual = ggml_cont(context.value, residual_binding.tensor);
+
+    ggml_tensor* input_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, contiguous_input, in_dim, 1)
+        : contiguous_input;
+
+    ggml_tensor* mm = ggml_mul_mat(context.value, m2_binding.tensor, input_2d);
+    ggml_tensor* mm_flat = ggml_reshape_1d(context.value, mm, static_cast<int64_t>(rows) * out_dim);
+    ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * out_dim);
+    ggml_tensor* added = ggml_add(context.value, res_flat, mm_flat);
+    ggml_tensor* output_tensor = ggml_cpy(context.value, added, residual_binding.tensor);
+    ggml_set_output(output_tensor);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    ggml_build_forward_expand(graph, output_tensor);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("Failed to allocate backend buffer for fused matmul_add.");
+        return 0;
+    }
+
+    // Upload data
+    if (!use_zero_copy)
+    {
+        upload_binding(residual_binding, residual_desc.data, residual_binding.raw_bytes);
+        if (packed_input.empty())
+            upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+        else
+            upload_binding(input_binding, packed_input.data(), input_binding.raw_bytes);
+    }
+
+    if (!m2_bound || m2_needs_upload)
+        upload_binding(m2_binding, m2_quant.data, m2_binding.raw_bytes);
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("Graph execution failed for fused matmul_add.");
+        return 0;
+    }
+    ggml_backend_synchronize(g_backend);
+
+    if (!use_zero_copy)
+        ggml_backend_tensor_get(residual_binding.storage, residual_desc.data, 0, residual_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_FusedMatMulQuantAddF32(
+    TensorView2DDesc residual,
+    TensorView2DDesc input,
+    void* m2_data,
+    int m2_ggml_type,
+    std::int64_t m2_ne0,
+    std::int64_t m2_ne1,
+    std::int64_t m2_raw_bytes)
+{
+    try
+    {
+        QuantizedWeightDesc m2_quant;
+        m2_quant.data = m2_data;
+        m2_quant.ggml_type = m2_ggml_type;
+        m2_quant.ne0 = m2_ne0;
+        m2_quant.ne1 = m2_ne1;
+        m2_quant.raw_bytes = m2_raw_bytes;
+        return fused_matmul_quant_add_f32_impl(residual, input, m2_quant);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused matmul_add.");
+        return 0;
+    }
+}
+
 TSG_EXPORT int TSGgml_GetRowsQuantF32(
     TensorView2DDesc result,
     void* src_data,
@@ -6500,6 +6925,188 @@ TSG_EXPORT int TSGgml_GetRowsQuantF32(
     catch (...)
     {
         set_last_error("Unknown ggml get_rows_quant failure.");
+        return 0;
+    }
+}
+
+// Batched MoE expert forward: processes all selected experts in a single GGML graph.
+// For each expert: up_proj -> relu_squared -> down_proj -> scale(route_weight) -> accumulate.
+// This reduces N*2 GPU dispatches to 1 per MoE layer.
+TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
+    TensorView2DDesc result,      // [1, outDim] - accumulated output
+    TensorView2DDesc input,       // [1, inDim]
+    int num_experts,
+    void** up_data_ptrs,          // [num_experts] pointers to up weight data
+    void** down_data_ptrs,        // [num_experts] pointers to down weight data
+    int up_ggml_type,
+    std::int64_t up_ne0,          // up weight: ne0 = inDim
+    std::int64_t up_ne1,          // up weight: ne1 = intermDim
+    std::int64_t up_raw_bytes_each,
+    int down_ggml_type,
+    std::int64_t down_ne0,        // down weight: ne0 = intermDim
+    std::int64_t down_ne1,        // down weight: ne1 = outDim
+    std::int64_t down_raw_bytes_each,
+    float* route_weights)         // [num_experts]
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result, "result") || !validate_desc(input, "input"))
+            return 0;
+
+        if (num_experts <= 0 || num_experts > 16)
+        {
+            set_last_error("MoE: num_experts must be 1..16");
+            return 0;
+        }
+
+        ggml_type up_qtype = static_cast<ggml_type>(up_ggml_type);
+        ggml_type down_qtype = static_cast<ggml_type>(down_ggml_type);
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("MoE: context init failed");
+            return 0;
+        }
+
+        // Input / result bindings (zero-copy or standard)
+        std::vector<BufferHandle> host_bufs;
+        bool zc = can_map_standard_view(input);
+        TensorBinding res_bind, inp_bind;
+
+        if (zc)
+        {
+            ggml_backend_buffer_t rb = nullptr, ib = nullptr;
+            bool rok = create_binding_from_host_ptr_2d(context.value, g_backend, result, res_bind, rb);
+            bool iok = rok && create_binding_from_host_ptr_2d(context.value, g_backend, input, inp_bind, ib);
+            if (rok && iok)
+            {
+                host_bufs.emplace_back(rb);
+                host_bufs.emplace_back(ib);
+            }
+            else
+            {
+                if (ib) ggml_backend_buffer_free(ib);
+                if (rb) ggml_backend_buffer_free(rb);
+                zc = false;
+                res_bind = create_standard_binding(context.value, result);
+                inp_bind = create_standard_binding(context.value, input);
+            }
+        }
+        else
+        {
+            res_bind = create_standard_binding(context.value, result);
+            inp_bind = create_standard_binding(context.value, input);
+        }
+
+        // Weight tensors with caching
+        struct WBind { ggml_tensor* t; std::size_t bytes; bool cached; bool needs_upload; };
+        std::vector<WBind> up_w(num_experts), dn_w(num_experts);
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+
+        for (int e = 0; e < num_experts; e++)
+        {
+            up_w[e].t = ggml_new_tensor_2d(context.value, up_qtype, up_ne0, up_ne1);
+            up_w[e].bytes = static_cast<std::size_t>(up_raw_bytes_each);
+            up_w[e].cached = false;
+            up_w[e].needs_upload = false;
+            if (dev && up_raw_bytes_each >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, up_w[e].t,
+                        up_data_ptrs[e], up_w[e].bytes, buf, addr, up_w[e].needs_upload))
+                {
+                    if (ggml_backend_tensor_alloc(buf, up_w[e].t, addr) == GGML_STATUS_SUCCESS)
+                        up_w[e].cached = true;
+                    else
+                        invalidate_cached_buffer(up_data_ptrs[e]);
+                }
+            }
+
+            dn_w[e].t = ggml_new_tensor_2d(context.value, down_qtype, down_ne0, down_ne1);
+            dn_w[e].bytes = static_cast<std::size_t>(down_raw_bytes_each);
+            dn_w[e].cached = false;
+            dn_w[e].needs_upload = false;
+            if (dev && down_raw_bytes_each >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, dn_w[e].t,
+                        down_data_ptrs[e], dn_w[e].bytes, buf, addr, dn_w[e].needs_upload))
+                {
+                    if (ggml_backend_tensor_alloc(buf, dn_w[e].t, addr) == GGML_STATUS_SUCCESS)
+                        dn_w[e].cached = true;
+                    else
+                        invalidate_cached_buffer(down_data_ptrs[e]);
+                }
+            }
+        }
+
+        // Build computation graph: for each expert, up -> relu -> sqr -> down -> scale -> accumulate
+        ggml_tensor* accum = nullptr;
+        for (int e = 0; e < num_experts; e++)
+        {
+            ggml_tensor* up_out = ggml_mul_mat(context.value, up_w[e].t, inp_bind.tensor);
+            ggml_tensor* relu_out = ggml_relu(context.value, up_out);
+            ggml_tensor* sq_out = ggml_sqr(context.value, relu_out);
+            ggml_tensor* dn_out = ggml_mul_mat(context.value, dn_w[e].t, sq_out);
+            ggml_tensor* scaled = ggml_scale(context.value, dn_out, route_weights[e]);
+            accum = (accum == nullptr) ? scaled : ggml_add(context.value, accum, scaled);
+        }
+
+        ggml_tensor* out = ggml_cpy(context.value, accum, res_bind.tensor);
+        ggml_set_output(out);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        ggml_build_forward_expand(graph, out);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (!buffer.value)
+        {
+            set_last_error("MoE: buffer alloc failed");
+            return 0;
+        }
+
+        // Upload input (if not zero-copy)
+        if (!zc)
+            upload_binding(inp_bind, input.data, inp_bind.raw_bytes);
+
+        // Upload weight data
+        for (int e = 0; e < num_experts; e++)
+        {
+            if (!up_w[e].cached || up_w[e].needs_upload)
+                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+            if (!dn_w[e].cached || dn_w[e].needs_upload)
+                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("MoE: graph compute failed");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        if (!zc)
+            ggml_backend_tensor_get(res_bind.storage, result.data, 0, res_bind.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown MoE experts forward failure.");
         return 0;
     }
 }

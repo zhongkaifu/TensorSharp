@@ -37,6 +37,7 @@ namespace InferenceConsole
             string backendStr = "ggml_cpu";
             string testTemplatesDir = null;
             string inputJsonl = null;
+            string multiTurnJsonl = null;
             bool enableThinking = false;
             string toolsFile = null;
             bool dumpPrompt = false;
@@ -62,6 +63,7 @@ namespace InferenceConsole
                     case "--think": enableThinking = true; break;
                     case "--tools": toolsFile = args[++i]; break;
                     case "--dump-prompt": dumpPrompt = true; break;
+                    case "--multi-turn-jsonl": multiTurnJsonl = args[++i]; break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -179,9 +181,15 @@ namespace InferenceConsole
                 return;
             }
 
+            if (multiTurnJsonl != null)
+            {
+                RunMultiTurnTest(model, multiTurnJsonl, maxTokens, samplingConfig, enableThinking);
+                return;
+            }
+
             if (inputJsonl != null)
             {
-                RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig);
+                RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig, enableThinking);
                 return;
             }
 
@@ -270,8 +278,159 @@ namespace InferenceConsole
             }
         }
 
+        /// <summary>
+        /// Simulate multi-turn chat with KV cache reuse, matching the web UI behavior.
+        /// Reads a JSONL file where each line is a user turn (just the user message).
+        /// Each turn generates a response, uses the output parser to extract content,
+        /// then builds the next turn's messages including previous turns.
+        /// </summary>
+        static void RunMultiTurnTest(ModelBase model, string jsonlPath, int maxTokens,
+            SamplingConfig sampling, bool enableThinking)
+        {
+            if (!File.Exists(jsonlPath))
+            {
+                Console.Error.WriteLine($"File not found: {jsonlPath}");
+                return;
+            }
+
+            string[] lines = File.ReadAllLines(jsonlPath);
+            var history = new List<ChatMessage>();
+            List<int> cachedTokens = null;
+            string arch = model.Config.Architecture;
+            int swa = model.Config.SlidingWindow;
+
+            Console.WriteLine($"Multi-turn test: {lines.Length} turns, thinking={enableThinking}, SWA={swa}");
+            Console.WriteLine(new string('=', 60));
+
+            for (int turn = 0; turn < lines.Length; turn++)
+            {
+                string line = lines[turn].Trim();
+                if (string.IsNullOrEmpty(line)) continue;
+
+                string userMsg;
+                int turnMaxTokens = maxTokens;
+                try
+                {
+                    var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    userMsg = root.TryGetProperty("content", out var c) ? c.GetString() : line;
+                    if (root.TryGetProperty("max_tokens", out var mt))
+                        turnMaxTokens = mt.GetInt32();
+                }
+                catch
+                {
+                    userMsg = line;
+                }
+
+                history.Add(new ChatMessage { Role = "user", Content = userMsg });
+                Console.WriteLine($"\n[Turn {turn + 1}/{lines.Length}] User: {userMsg}");
+
+                string rendered = ChatTemplate.RenderFromGgufTemplate(
+                    model.Config.ChatTemplate, history, addGenerationPrompt: true,
+                    architecture: arch, enableThinking: enableThinking);
+
+                var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                Console.WriteLine($"Prompt: {inputTokens.Count} tokens");
+
+                bool forceReset = false;
+                try
+                {
+                    var doc2 = JsonDocument.Parse(lines[turn].Trim());
+                    forceReset = doc2.RootElement.TryGetProperty("force_reset", out var fr) && fr.GetBoolean();
+                }
+                catch { }
+
+                int commonPrefix = 0;
+                if (!forceReset && cachedTokens != null && model.SupportsKVCacheTruncation)
+                {
+                    int raw = 0;
+                    int maxLen = Math.Min(cachedTokens.Count, inputTokens.Count);
+                    for (int k = 0; k < maxLen; k++)
+                    {
+                        if (cachedTokens[k] != inputTokens[k]) break;
+                        raw++;
+                    }
+
+                    // For SWA models, back up by slidingWindow so the suffix
+                    // re-processes enough tokens to rebuild the SWA cache.
+                    if (swa > 0 && raw > 0)
+                    {
+                        int backed = Math.Max(0, raw - swa);
+                        Console.WriteLine($"[KV cache] SWA back-up: raw prefix {raw} -> {backed} (window={swa})");
+                        raw = backed;
+                    }
+
+                    if (raw >= 4 && (double)raw / inputTokens.Count >= 0.10)
+                    {
+                        commonPrefix = raw;
+                    }
+                }
+
+                float[] logits;
+                if (commonPrefix > 0)
+                {
+                    model.TruncateKVCache(commonPrefix);
+                    var suffix = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
+                    Console.WriteLine($"[KV cache] Reusing {commonPrefix} tokens, forwarding {suffix.Length} new tokens");
+                    logits = model.Forward(suffix);
+                }
+                else
+                {
+                    Console.WriteLine("[KV cache] Full reset");
+                    model.ResetKVCache();
+                    logits = model.Forward(inputTokens.ToArray());
+                }
+
+                var cfg = sampling ?? SamplingConfig.Greedy;
+                var sampler = new TokenSampler(cfg);
+                var generatedTokens = new List<int>();
+                var sb = new StringBuilder();
+
+                for (int step = 0; step < turnMaxTokens; step++)
+                {
+                    int nextToken = sampler.Sample(logits, generatedTokens);
+                    if (model.Tokenizer.IsEos(nextToken)) break;
+                    generatedTokens.Add(nextToken);
+                    string decoded = model.Tokenizer.Decode(generatedTokens);
+                    sb.Clear();
+                    sb.Append(decoded);
+                    logits = model.Forward(new[] { nextToken });
+                }
+
+                cachedTokens = new List<int>(inputTokens.Count + generatedTokens.Count);
+                cachedTokens.AddRange(inputTokens);
+                cachedTokens.AddRange(generatedTokens);
+
+                string rawOutput = sb.ToString();
+
+                var parser = OutputParserFactory.Create(arch);
+                parser.Init(enableThinking, null);
+                var parsed = parser.Add(rawOutput, true);
+                string content = parsed.Content ?? "";
+                string thinking = parsed.Thinking ?? "";
+
+                if (thinking.Length > 0)
+                    Console.WriteLine($"[Thinking] ({thinking.Length} chars): {(thinking.Length > 200 ? thinking.Substring(0, 200) + "..." : thinking)}");
+
+                Console.WriteLine($"[Content] ({content.Length} chars, {generatedTokens.Count} tokens): {(content.Length > 500 ? content.Substring(0, 500) + "..." : content)}");
+
+                bool hasUnused = rawOutput.Contains("<unused");
+                if (hasUnused)
+                {
+                    Console.WriteLine("*** ERROR: Output contains <unused> tokens! ***");
+                    Console.WriteLine($"Raw output (first 500 chars): {rawOutput.Substring(0, Math.Min(500, rawOutput.Length))}");
+                    break;
+                }
+
+                history.Add(new ChatMessage { Role = "assistant", Content = content });
+            }
+
+            Console.WriteLine(new string('=', 60));
+            Console.WriteLine($"Multi-turn test completed: {history.Count / 2} turns");
+        }
+
         static void RunJsonlBatch(ModelBase model, string inputJsonlPath, string outputFile, int defaultMaxTokens,
-            SamplingConfig defaultSampling)
+            SamplingConfig defaultSampling, bool enableThinking = false)
         {
             if (!File.Exists(inputJsonlPath))
             {
@@ -323,11 +482,14 @@ namespace InferenceConsole
 
                     model.ResetKVCache();
 
+                    bool reqThinking = enableThinking ||
+                        (root.TryGetProperty("enable_thinking", out var etProp) && etProp.GetBoolean());
+
                     string rendered = ChatTemplate.RenderFromGgufTemplate(
                         model.Config.ChatTemplate, messages, addGenerationPrompt: true,
-                        architecture: model.Config.Architecture);
+                        architecture: model.Config.Architecture, enableThinking: reqThinking);
 
-                    Console.WriteLine($"Rendered prompt:\n---\n{rendered}\n---");
+                    Console.WriteLine($"Rendered prompt (thinking={reqThinking}):\n---\n{rendered}\n---");
 
                     var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
                     Console.WriteLine($"Input tokens ({inputTokens.Count}): [{string.Join(", ", inputTokens.Take(20))}{(inputTokens.Count > 20 ? ", ..." : "")}]");

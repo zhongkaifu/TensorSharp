@@ -329,6 +329,53 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Fused RMSNorm + quantized MatMul in a single GPU dispatch.
+        /// result = matmul(rms_norm(input, normWeight, eps), quantWeight)
+        /// </summary>
+        public static void FusedRmsNormMatMulQuant(Tensor result, Tensor input, Tensor normWeight, float eps,
+            IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (result.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("FusedRmsNormMatMulQuant requires 2D tensors.");
+            if (input.ElementType != DType.Float32 || result.ElementType != DType.Float32)
+                throw new ArgumentException("FusedRmsNormMatMulQuant requires Float32 tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(result) || !HasNativeBufferStorage(normWeight))
+                throw new ArgumentException("FusedRmsNormMatMulQuant requires native-backed tensors.");
+
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("FusedRmsNormMatMulQuant requires supported layouts.");
+
+            int normCount = (int)normWeight.ElementCount();
+            IntPtr normPtr = GetBufferStart(normWeight);
+
+            GgmlNative.FusedRmsNormMatMulQuant(resultView, inputView, normPtr, normCount, eps,
+                weightData, ggmlType, ne0, ne1, rawBytes);
+        }
+
+        /// <summary>
+        /// Fused quantized MatMul + Add in a single GPU dispatch.
+        /// residual += matmul(input, quantWeight)
+        /// </summary>
+        public static void FusedMatMulQuantAdd(Tensor residual, Tensor input,
+            IntPtr weightData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (residual.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("FusedMatMulQuantAdd requires 2D tensors.");
+            if (input.ElementType != DType.Float32 || residual.ElementType != DType.Float32)
+                throw new ArgumentException("FusedMatMulQuantAdd requires Float32 tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(residual))
+                throw new ArgumentException("FusedMatMulQuantAdd requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("FusedMatMulQuantAdd requires supported layouts.");
+
+            GgmlNative.FusedMatMulQuantAdd(residualView, inputView,
+                weightData, ggmlType, ne0, ne1, rawBytes);
+        }
+
+        /// <summary>
         /// Native row selection (embedding lookup) from a quantized tensor.
         /// Uses GGML's ggml_get_rows which dequantizes on-the-fly (GPU-accelerated on Metal).
         /// </summary>
@@ -346,6 +393,35 @@ namespace TensorSharp.GGML
             }
 
             GgmlNative.GetRowsQuant(resultView, weightData, ggmlType, ne0, ne1, rawBytes, indexTensor);
+        }
+
+        /// <summary>
+        /// Batched MoE expert forward: processes all selected experts in a single GGML graph.
+        /// For each expert: up_proj -> relu_squared -> down_proj -> scale(route_weight) -> accumulate.
+        /// Reduces N*2 GPU dispatches to 1 per MoE layer.
+        /// </summary>
+        public static void MoEExpertsForward(Tensor result, Tensor input,
+            int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights)
+        {
+            if (result.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("MoEExpertsForward requires 2D tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(result))
+                throw new ArgumentException("MoEExpertsForward requires tensors backed by native CPU-accessible storage.");
+
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+            {
+                throw new NotSupportedException("MoEExpertsForward requires tensors with supported row-contiguous layouts.");
+            }
+
+            GgmlNative.MoEExpertsForward(resultView, inputView, numExperts,
+                upDataPtrs, downDataPtrs,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights);
         }
 
         /// <summary>

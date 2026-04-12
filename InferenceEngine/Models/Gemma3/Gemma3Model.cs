@@ -55,6 +55,7 @@ namespace InferenceEngine
             _attnKeyLen = Config.KeyLength > 0 ? Config.KeyLength : 256;
             _attnValLen = Config.ValueLength > 0 ? Config.ValueLength : 256;
             _slidingWindow = (int)_gguf.GetUint32($"{Config.Architecture}.attention.sliding_window", 1024);
+            Config.SlidingWindow = _slidingWindow;
             _ropeLocalBase = _gguf.GetFloat32($"{Config.Architecture}.rope.local.freq_base", 10000f);
             _ropeGlobalBase = Config.RopeBase;
             _ropeScale = Config.RopeScale;

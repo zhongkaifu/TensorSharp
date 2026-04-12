@@ -640,6 +640,11 @@ namespace InferenceWeb
         ///   - The model doesn't support KV cache truncation (e.g. Qwen3.5 recurrent layers)
         ///   - The savings would be less than 10% (not worth the risk)
         ///   - The common prefix is shorter than 4 tokens
+        ///
+        /// For models with sliding window attention (SWA), KV cache truncation is
+        /// disabled because the prefill path reads the SWA ring buffer linearly but
+        /// the entries are not in positional order after truncation, which corrupts
+        /// attention output and causes degenerate tokens.
         /// </summary>
         private int ComputeUsablePrefix(List<int> inputTokens, bool hasMultimodal)
         {
@@ -650,7 +655,15 @@ namespace InferenceWeb
             if (raw <= 0)
                 return 0;
 
-            int suffixLen = inputTokens.Count - raw;
+            // For SWA models, back up by slidingWindow so the suffix re-processes
+            // enough tokens to rebuild the SWA ring buffer with fresh, ordered K/V.
+            int swa = _model.Config.SlidingWindow;
+            if (swa > 0)
+            {
+                int backed = Math.Max(0, raw - swa);
+                Console.WriteLine($"[KV cache] SWA back-up: raw prefix {raw} → {backed} (window={swa})");
+                raw = backed;
+            }
 
             if (raw < 4)
             {

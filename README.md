@@ -10,9 +10,9 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 
 ## Features
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5, GPT OSS
+- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5, GPT OSS, Nemotron-H
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5
-- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS)
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
 - **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Linux/NVIDIA, with fused whole-model GPU dispatch for Gemma 4 decode on Metal (~2.6x speedup over per-op dispatch)
@@ -23,7 +23,9 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Request queue** -- FIFO inference queue ensures single-request execution for KV cache stability, with real-time position tracking for clients
 - **Batch processing** -- JSONL input support in the console application
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console)
-- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b)
+- **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model
+- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Nemotron-H MoE FFN layers
+- **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
 - **Large file uploads** -- supports video/audio uploads up to 500 MB in the web interface
 
 ## Supported Model Architectures
@@ -33,10 +35,29 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Gemma 4 | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
 | Gemma 3 | gemma-3-4b | Image | No | No |
 | Qwen 3 | Qwen3-4B | Text only | Yes | Yes |
-| Qwen 3.5 | Qwen3.5-9B | Image | Yes | Yes |
+| Qwen 3.5 | Qwen3.5-9B, Qwen3.5-35B-A3B | Image | Yes | Yes |
 | GPT OSS | gpt-oss-20b (MoE) | Text only | Yes | No |
+| Nemotron-H | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE) | Text only | Yes | Yes |
 
 See [Model Architecture Cards](docs/model_cards.md) for detailed documentation of each architecture.
+
+## Model Downloads (GGUF)
+
+TensorSharp loads models in GGUF format. Below are Hugging Face links where you can download GGUF files for each supported architecture. Pick a quantization that fits your hardware (Q4_K_M for low memory, Q8_0 for higher quality, etc.).
+
+| Architecture | Model | GGUF Download |
+|---|---|---|
+| Gemma 4 | gemma-4-E4B-it | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) |
+| Gemma 4 | gemma-4-31B-it | [ggml-org/gemma-4-31B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF) |
+| Gemma 4 | gemma-4-26B-A4B-it (MoE) | [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) |
+| Gemma 4 | gemma-4-mmproj (multimodal projector) | Included in the GGUF repos above |
+| Gemma 3 | gemma-3-4b-it | [google/gemma-3-4b-it-qat-q4_0-gguf](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) |
+| Qwen 3 | Qwen3-4B | [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF) |
+| Qwen 3.5 | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
+| Qwen 3.5 | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
+| GPT OSS | gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) |
+| Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
+| Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 
 ## Compute Backends
 
@@ -60,6 +81,7 @@ TensorSharp/
 │   │   ├── Gemma3/
 │   │   ├── Gemma4/              # Vision encoder, audio encoder, MoE, fused GPU decode
 │   │   ├── GptOss/              # MoE, attention sinks, SiLUAlphaLimit, Yarn RoPE
+│   │   ├── Nemotron/            # Hybrid Mamba2 SSM + attention + MoE FFN
 │   │   ├── Qwen3/
 │   │   └── Qwen35/
 │   ├── GgufReader.cs            # GGUF file parser
@@ -196,6 +218,7 @@ cd InferenceConsole/bin
 | `--model <path>` | Path to a GGUF model file (required) |
 | `--input <path>` | Text file containing the user prompt |
 | `--input-jsonl <path>` | JSONL file with batch requests (one JSON per line) |
+| `--multi-turn-jsonl <path>` | JSONL file for multi-turn chat simulation with KV cache reuse |
 | `--output <path>` | Write generated text to this file |
 | `--image <path>` | Image file for vision inference |
 | `--video <path>` | Video file for video inference |
@@ -248,6 +271,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 - Tool calling with function definitions
 - Streaming token generation via Server-Sent Events
 - Request queue with real-time position feedback
+- Message editing and deletion with regeneration from any point in the conversation
 
 **Environment variables:**
 
@@ -346,9 +370,9 @@ curl http://localhost:5000/api/queue/status
 
 ## Thinking / Reasoning Mode
 
-Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
 
-- **Qwen 3 / Qwen 3.5:** uses `<think>...</think>` tags
+- **Qwen 3 / Qwen 3.5 / Nemotron-H:** uses `<think>...</think>` tags
 - **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
 - **GPT OSS:** uses Harmony format with `<|channel|>analysis` for thinking and `<|channel|>final` for the response
 
@@ -360,7 +384,7 @@ Models can invoke user-defined tools and participate in multi-turn tool-call con
 
 Each architecture uses its own wire format for tool calls:
 
-- **Qwen 3 / Qwen 3.5:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Qwen 3.5 / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
 
 The output parser (`OutputParser.cs`) automatically extracts tool calls from the model's raw output regardless of architecture.
@@ -387,7 +411,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
 
-3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, output parsing (thinking extraction, tool-call extraction), and the forward pass for each architecture. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **InferenceEngine** implements model-specific logic: GGUF parsing, tokenization (SentencePiece BPE), chat template rendering (Jinja2 from GGUF metadata with hardcoded fallbacks), configurable token sampling, output parsing (thinking extraction, tool-call extraction), and the forward pass for each architecture (including hybrid SSM-Transformer models like Nemotron-H with Mamba2 layers). Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
 4. **InferenceConsole** and **InferenceWeb** are application layers that handle I/O and user interaction. InferenceWeb provides Ollama-compatible and OpenAI-compatible REST APIs alongside a browser-based chat UI, with a FIFO inference queue to serialize concurrent requests.
 

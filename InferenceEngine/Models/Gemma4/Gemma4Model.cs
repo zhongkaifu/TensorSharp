@@ -47,6 +47,8 @@ namespace InferenceEngine
 
         private int _sharedKVLayers;
         private Dictionary<int, int> _kvDonorMap;
+        private HashSet<int> _swaKVDonorLayers;
+        private Dictionary<int, (Tensor k, Tensor v)> _prefillSWAKV;
 
         private int _pleDim;
 
@@ -97,6 +99,7 @@ namespace InferenceEngine
 
             _slidingWindowPattern = _gguf.GetBoolArray($"{arch}.attention.sliding_window_pattern");
             _slidingWindow = (int)_gguf.GetUint32($"{arch}.attention.sliding_window", 512);
+            Config.SlidingWindow = _slidingWindow;
 
             // Head dimensions: key_length is global head dim, key_length_swa is local head dim
             // Ollama uses a single headDim for Q/K/V per layer type
@@ -205,6 +208,7 @@ namespace InferenceEngine
         private void BuildKVDonorMap()
         {
             _kvDonorMap = new Dictionary<int, int>();
+            _swaKVDonorLayers = new HashSet<int>();
             if (_sharedKVLayers <= 0 || _slidingWindowPattern == null) return;
 
             int firstShared = Config.NumLayers - _sharedKVLayers;
@@ -216,6 +220,8 @@ namespace InferenceEngine
                     if (IsLocalLayer(j) == isLocal)
                     {
                         _kvDonorMap[i] = j;
+                        if (isLocal)
+                            _swaKVDonorLayers.Add(j);
                         break;
                     }
                 }
@@ -426,6 +432,9 @@ namespace InferenceEngine
             }
             else
             {
+                if (seqLen > 1 && startPos > 0 && _swaKVDonorLayers.Count > 0)
+                    _prefillSWAKV = new Dictionary<int, (Tensor, Tensor)>();
+
                 for (int l = 0; l < Config.NumLayers; l++)
                 {
                     Tensor perLayerInput = null;
@@ -436,6 +445,16 @@ namespace InferenceEngine
                     hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput);
 
                     perLayerInput?.Dispose();
+                }
+
+                if (_prefillSWAKV != null)
+                {
+                    foreach (var kv in _prefillSWAKV.Values)
+                    {
+                        kv.k.Dispose();
+                        kv.v.Dispose();
+                    }
+                    _prefillSWAKV = null;
                 }
             }
 
@@ -1442,11 +1461,21 @@ namespace InferenceEngine
 
                 int kvLen;
                 Tensor kExpanded, vExpanded;
-                if (kHeadsForAttn != null && startPos == 0)
+                if (kHeadsForAttn != null && (startPos == 0 || isLocal))
                 {
+                    // Non-shared SWA layers bypass the circular cache for attention;
+                    // use freshly computed K/V in correct sequential order.
                     kvLen = seqLen;
                     kExpanded = ExpandKVHeads(kHeadsForAttn, groupSize, seqLen);
                     vExpanded = ExpandKVHeads(vHeadsForAttn, groupSize, seqLen);
+                }
+                else if (isLocal && startPos > 0 && _prefillSWAKV != null
+                         && _prefillSWAKV.TryGetValue(kvCacheLayer, out var donorKV))
+                {
+                    // Shared SWA layer: reuse donor's saved K/V in sequential order
+                    kvLen = seqLen;
+                    kExpanded = ExpandKVHeads(donorKV.k, groupSize, seqLen);
+                    vExpanded = ExpandKVHeads(donorKV.v, groupSize, seqLen);
                 }
                 else
                 {
@@ -1455,8 +1484,18 @@ namespace InferenceEngine
                     kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, kvLen);
                     vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, kvLen);
                 }
-                kHeadsForAttn?.Dispose();
-                vHeadsForAttn?.Dispose();
+
+                // Save non-shared SWA K/V for shared layers that use this as donor
+                if (isLocal && startPos > 0 && kHeadsForAttn != null
+                    && _swaKVDonorLayers.Contains(layer) && _prefillSWAKV != null)
+                {
+                    _prefillSWAKV[layer] = (kHeadsForAttn, vHeadsForAttn);
+                }
+                else
+                {
+                    kHeadsForAttn?.Dispose();
+                    vHeadsForAttn?.Dispose();
+                }
 
                 using var kT = kExpanded.Transpose(1, 2);
                 var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, kvLen);
@@ -1538,21 +1577,20 @@ namespace InferenceEngine
         private unsafe void ApplyNeoXRoPEDecode(Tensor data, int numHeads, int headDim, int position, float[] freqs)
         {
             float* ptr = GetFloatPtr(data);
-            int halfDim = headDim / 2;
+            int ropeHalf = freqs.Length;
 
             for (int h = 0; h < numHeads; h++)
             {
                 float* head = ptr + h * headDim;
-                int limit = Math.Min(halfDim, freqs.Length);
-                for (int j = 0; j < limit; j++)
+                for (int j = 0; j < ropeHalf; j++)
                 {
                     float angle = position * freqs[j];
                     float cos = MathF.Cos(angle);
                     float sin = MathF.Sin(angle);
                     float x0 = head[j];
-                    float x1 = head[j + halfDim];
+                    float x1 = head[j + ropeHalf];
                     head[j] = x0 * cos - x1 * sin;
-                    head[j + halfDim] = x0 * sin + x1 * cos;
+                    head[j + ropeHalf] = x0 * sin + x1 * cos;
                 }
             }
         }
@@ -1561,8 +1599,7 @@ namespace InferenceEngine
             int seqLen, int startPos, float[] freqs)
         {
             float* ptr = GetFloatPtr(data);
-            int halfDim = headDim / 2;
-            int limit = Math.Min(halfDim, freqs.Length);
+            int ropeHalf = freqs.Length;
 
             for (int s = 0; s < seqLen; s++)
             {
@@ -1570,15 +1607,15 @@ namespace InferenceEngine
                 for (int h = 0; h < numHeads; h++)
                 {
                     float* head = ptr + ((long)s * numHeads + h) * headDim;
-                    for (int j = 0; j < limit; j++)
+                    for (int j = 0; j < ropeHalf; j++)
                     {
                         float angle = position * freqs[j];
                         float cos = MathF.Cos(angle);
                         float sin = MathF.Sin(angle);
                         float x0 = head[j];
-                        float x1 = head[j + halfDim];
+                        float x1 = head[j + ropeHalf];
                         head[j] = x0 * cos - x1 * sin;
-                        head[j + halfDim] = x0 * sin + x1 * cos;
+                        head[j + ropeHalf] = x0 * sin + x1 * cos;
                     }
                 }
             }
