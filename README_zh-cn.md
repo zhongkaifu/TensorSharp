@@ -10,9 +10,9 @@
 
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS
+- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS、Nemotron-H
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5）
-- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS）
+- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Linux/NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode（相对逐算子调度约提升 2.6 倍）
@@ -23,7 +23,9 @@
 - **请求队列** —— FIFO 推理队列确保单请求执行以保障 KV 缓存稳定性，并为客户端提供实时排队位置反馈
 - **批处理** —— 控制台应用支持 JSONL 输入
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout）
-- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）和 GPT OSS MoE（例如 gpt-oss-20b）
+- **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层
+- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Nemotron-H MoE FFN 层
+- **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **大文件上传** —— Web 界面支持最大 500 MB 的视频/音频上传
 
 ## 支持的模型架构
@@ -33,10 +35,29 @@
 | Gemma 4 | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 |
 | Gemma 3 | gemma-3-4b | 图像 | 不支持 | 不支持 |
 | Qwen 3 | Qwen3-4B | 仅文本 | 支持 | 支持 |
-| Qwen 3.5 | Qwen3.5-9B | 图像 | 支持 | 支持 |
+| Qwen 3.5 | Qwen3.5-9B、Qwen3.5-35B-A3B | 图像 | 支持 | 支持 |
 | GPT OSS | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
+| Nemotron-H | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE） | 仅文本 | 支持 | 支持 |
 
 各架构的详细文档见[模型架构卡片](docs/model_cards_cn.md)。
+
+## 模型下载（GGUF）
+
+TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging Face 下载链接。请根据硬件条件选择合适的量化版本（Q4_K_M 适合低内存，Q8_0 适合更高质量等）。
+
+| 架构 | 模型 | GGUF 下载 |
+|---|---|---|
+| Gemma 4 | gemma-4-E4B-it | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) |
+| Gemma 4 | gemma-4-31B-it | [ggml-org/gemma-4-31B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF) |
+| Gemma 4 | gemma-4-26B-A4B-it（MoE） | [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) |
+| Gemma 4 | gemma-4-mmproj（多模态投影器） | 包含在上述 GGUF 仓库中 |
+| Gemma 3 | gemma-3-4b-it | [google/gemma-3-4b-it-qat-q4_0-gguf](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) |
+| Qwen 3 | Qwen3-4B | [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF) |
+| Qwen 3.5 | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
+| Qwen 3.5 | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
+| GPT OSS | gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) |
+| Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
+| Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 
 ## 计算后端
 
@@ -60,6 +81,7 @@ TensorSharp/
 │   │   ├── Gemma3/
 │   │   ├── Gemma4/              # 视觉编码器、音频编码器、MoE、融合 GPU decode
 │   │   ├── GptOss/              # MoE、注意力沉降、SiLUAlphaLimit、Yarn RoPE
+│   │   ├── Nemotron/            # 混合 Mamba2 SSM + 注意力 + MoE FFN
 │   │   ├── Qwen3/
 │   │   └── Qwen35/
 │   ├── GgufReader.cs            # GGUF 文件解析器
@@ -186,6 +208,7 @@ cd InferenceConsole/bin
 | `--model <path>` | GGUF 模型文件路径（必填） |
 | `--input <path>` | 包含用户提示词的文本文件 |
 | `--input-jsonl <path>` | JSONL 批量请求文件（每行一个 JSON） |
+| `--multi-turn-jsonl <path>` | 用于多轮对话模拟（含 KV 缓存复用）的 JSONL 文件 |
 | `--output <path>` | 将生成文本写入该文件 |
 | `--image <path>` | 用于视觉推理的图像文件 |
 | `--video <path>` | 用于视频推理的视频文件 |
@@ -238,6 +261,7 @@ MODEL_DIR=./models BACKEND=ggml_cuda ./InferenceWeb
 - 带函数定义的工具调用
 - 通过 Server-Sent Events 进行流式 token 生成
 - 带实时排队位置反馈的请求队列
+- 消息编辑和删除，支持从对话中任意位置重新生成
 
 **环境变量：**
 
@@ -311,9 +335,9 @@ curl http://localhost:5000/api/queue/status
 
 ## 思维链 / 推理模式
 
-支持思维链模式的模型（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
+支持思维链模式的模型（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
 
-- **Qwen 3 / Qwen 3.5：** 使用 `<think>...</think>` 标签
+- **Qwen 3 / Qwen 3.5 / Nemotron-H：** 使用 `<think>...</think>` 标签
 - **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签
 - **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复
 
@@ -325,7 +349,7 @@ curl http://localhost:5000/api/queue/status
 
 各架构使用各自的工具调用格式：
 
-- **Qwen 3 / Qwen 3.5：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Qwen 3.5 / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4：** `<|tool_call>call:function_name{args}<tool_call|>`
 
 输出解析器（`OutputParser.cs`）会自动从模型原始输出中提取工具调用，与架构无关。
@@ -352,7 +376,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
 
-3. **InferenceEngine** 实现模型相关逻辑：GGUF 解析、分词（SentencePiece BPE）、聊天模板渲染（来自 GGUF 元数据的 Jinja2 + 硬编码回退）、可配置 token 采样、输出解析（思维链提取、工具调用提取），以及各架构前向计算。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **InferenceEngine** 实现模型相关逻辑：GGUF 解析、分词（SentencePiece BPE）、聊天模板渲染（来自 GGUF 元数据的 Jinja2 + 硬编码回退）、可配置 token 采样、输出解析（思维链提取、工具调用提取），以及各架构前向计算（包括 Nemotron-H 等混合 SSM-Transformer 模型的 Mamba2 层）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
 4. **InferenceConsole** 与 **InferenceWeb** 是应用层，负责 I/O 和用户交互。InferenceWeb 同时提供兼容 Ollama 与 OpenAI 的 REST API 以及浏览器聊天 UI，并使用 FIFO 推理队列来串行化并发请求。
 

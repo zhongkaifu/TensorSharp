@@ -705,6 +705,61 @@ button.primary:hover { background: var(--accent-hover); }
   gap: 8px;
   margin-top: 20px;
 }
+
+.msg-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.message:hover .msg-actions { opacity: 1; }
+
+.msg-actions button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+  padding: 2px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.msg-actions button:hover {
+  background: var(--surface2);
+  color: var(--text);
+  border-color: #444;
+}
+
+.msg-actions button.danger:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.edit-textarea {
+  width: 100%;
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 60px;
+  max-height: 300px;
+  line-height: 1.5;
+  outline: none;
+}
+
+.edit-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
 </style>
 </head>
 <body>
@@ -796,6 +851,7 @@ let currentLoadedModel = null;
 let availableModels = [];
 let availableBackends = [];
 let needsCacheReset = false;
+const editOriginalHtml = new Map();
 
 messageInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -1061,7 +1117,7 @@ async function sendMessage() {
   if (isVideo) msg.isVideo = true;
 
   chatHistory.push(msg);
-  addUserBubble(userContent, attachmentsCopy);
+  addUserBubble(userContent, attachmentsCopy, chatHistory.length - 1);
   messageInput.value = '';
   messageInput.style.height = 'auto';
   pendingAttachments = [];
@@ -1069,6 +1125,13 @@ async function sendMessage() {
 
   const empt = chatContainer.querySelector('.empty-state');
   if (empt) empt.remove();
+
+  await requestAssistantResponse();
+}
+
+async function requestAssistantResponse() {
+  if (isGenerating) return;
+  if (!currentLoadedModel) return;
 
   isGenerating = true;
   currentAbortController = new AbortController();
@@ -1175,6 +1238,14 @@ async function sendMessage() {
       const assistantMessage = { role: 'assistant', content: fullText };
       if (fullThinking) assistantMessage.thinking = fullThinking;
       chatHistory.push(assistantMessage);
+
+      const assistIdx = chatHistory.length - 1;
+      assistDiv.dataset.idx = assistIdx;
+      const bubble = assistDiv.querySelector('.bubble');
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'msg-actions';
+      actionsDiv.innerHTML = `<button class="danger" onclick="revertFrom(${assistIdx})" title="Remove this response">&#x21A9; Revert</button>`;
+      bubble.appendChild(actionsDiv);
     }
     isGenerating = false;
     currentAbortController = null;
@@ -1184,6 +1255,106 @@ async function sendMessage() {
     const queueInd = assistDiv.querySelector('.queue-indicator');
     if (queueInd) queueInd.style.display = 'none';
   }
+}
+
+function revertFrom(historyIdx) {
+  if (isGenerating) return;
+
+  chatHistory.splice(historyIdx);
+
+  chatContainer.querySelectorAll('.message').forEach(el => {
+    if (parseInt(el.dataset.idx) >= historyIdx) el.remove();
+  });
+
+  needsCacheReset = true;
+  updateSettingsLockState();
+
+  if (chatHistory.length === 0) {
+    if (statusBadge.classList.contains('loaded')) {
+      chatContainer.innerHTML = `
+        <div class="empty-state">
+          <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
+          <p>Start a conversation with the loaded model. To switch models, start a new chat first.</p>
+        </div>`;
+    } else {
+      chatContainer.innerHTML = `
+        <div class="empty-state" id="empty-state">
+          <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
+          <p>Load a model and start chatting.</p>
+          <button class="primary" onclick="showSettings()">Load Model</button>
+        </div>`;
+    }
+  }
+}
+
+function startEdit(historyIdx) {
+  if (isGenerating) return;
+
+  const msgEl = chatContainer.querySelector(`.message[data-idx="${historyIdx}"]`);
+  if (!msgEl) return;
+
+  const bubble = msgEl.querySelector('.bubble');
+  const originalText = chatHistory[historyIdx].content;
+
+  editOriginalHtml.set(historyIdx, bubble.innerHTML);
+
+  const mediaPreviews = bubble.querySelectorAll('.media-preview');
+  let mediaHtml = '';
+  mediaPreviews.forEach(mp => { mediaHtml += mp.outerHTML; });
+
+  bubble.innerHTML = `${mediaHtml}<textarea class="edit-textarea">${escapeHtml(originalText)}</textarea>
+    <div class="edit-actions">
+      <button onclick="cancelEdit(${historyIdx})">Cancel</button>
+      <button class="primary" onclick="submitEdit(${historyIdx})">Save &amp; Send</button>
+    </div>`;
+
+  const textarea = bubble.querySelector('.edit-textarea');
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function cancelEdit(historyIdx) {
+  const msgEl = chatContainer.querySelector(`.message[data-idx="${historyIdx}"]`);
+  if (!msgEl) return;
+
+  const bubble = msgEl.querySelector('.bubble');
+  const original = editOriginalHtml.get(historyIdx);
+  if (original) {
+    bubble.innerHTML = original;
+    editOriginalHtml.delete(historyIdx);
+  }
+}
+
+async function submitEdit(historyIdx) {
+  const msgEl = chatContainer.querySelector(`.message[data-idx="${historyIdx}"]`);
+  if (!msgEl) return;
+
+  const bubble = msgEl.querySelector('.bubble');
+  const textarea = bubble.querySelector('.edit-textarea');
+  const newText = textarea.value.trim();
+  if (!newText) return;
+
+  editOriginalHtml.delete(historyIdx);
+
+  chatHistory[historyIdx].content = newText;
+  chatHistory.splice(historyIdx + 1);
+
+  chatContainer.querySelectorAll('.message').forEach(el => {
+    if (parseInt(el.dataset.idx) > historyIdx) el.remove();
+  });
+
+  const mediaPreviews = bubble.querySelectorAll('.media-preview');
+  let mediaHtml = '';
+  mediaPreviews.forEach(mp => { mediaHtml += mp.outerHTML; });
+
+  bubble.innerHTML = `${mediaHtml}<span class="bubble-text">${escapeHtml(newText)}</span>
+    <div class="msg-actions">
+      <button onclick="startEdit(${historyIdx})" title="Edit this message">&#x270E; Edit</button>
+      <button class="danger" onclick="revertFrom(${historyIdx})" title="Revert from here">&#x21A9; Revert</button>
+    </div>`;
+
+  needsCacheReset = true;
+  await requestAssistantResponse();
 }
 
 function abortGeneration() {
@@ -1215,9 +1386,10 @@ function describeAttachments() {
   return 'Describe the attached file.';
 }
 
-function addUserBubble(text, attachments) {
+function addUserBubble(text, attachments, historyIdx) {
   const div = document.createElement('div');
   div.className = 'message user';
+  div.dataset.idx = historyIdx;
 
   let mediaHtml = '';
   attachments.forEach(att => {
@@ -1232,7 +1404,12 @@ function addUserBubble(text, attachments) {
 
   div.innerHTML = `
     <div class="avatar">U</div>
-    <div class="bubble">${mediaHtml}${escapeHtml(text)}</div>`;
+    <div class="bubble">${mediaHtml}<span class="bubble-text">${escapeHtml(text)}</span>
+      <div class="msg-actions">
+        <button onclick="startEdit(${historyIdx})" title="Edit this message">&#x270E; Edit</button>
+        <button class="danger" onclick="revertFrom(${historyIdx})" title="Revert from here">&#x21A9; Revert</button>
+      </div>
+    </div>`;
   chatContainer.appendChild(div);
   chatContainer.scrollTop = chatContainer.scrollHeight;
 }

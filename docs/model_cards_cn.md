@@ -2,7 +2,7 @@
 
 [English](model_cards.md) | [中文](model_cards_cn.md)
 
-TensorSharp 支持五种模型架构。本文档面向需要修改、优化或扩展模型实现的工程师。
+TensorSharp 支持六种模型架构。本文档面向需要修改、优化或扩展模型实现的工程师。
 
 所有模型类位于 `InferenceEngine/Models/<Name>/` 目录下，继承自 `ModelBase`（`InferenceEngine/ModelBase.cs`）。`ModelBase` 提供共享基础设施：GGUF 加载、权重存储（`_weights` 存 F32、`_quantWeights` 存量化权重）、KV 缓存辅助方法、嵌入查询、RMSNorm、线性前向、RoPE 工具函数、性能计时，以及 `Forward(int[] tokens) → float[]` 接口。
 
@@ -470,31 +470,184 @@ hidden → RMSNorm(output_norm) → 截取最后 token → LM head → logits
 
 ---
 
+## Nemotron-H
+
+| 属性 | 值 |
+|---|---|
+| 源文件 | `InferenceEngine/Models/Nemotron/NemotronModel.cs` |
+| 提供方 | NVIDIA |
+| GGUF 架构标识 | `nemotron_h`、`nemotron_h_moe` |
+| 示例模型 | Nemotron-H-8B-Reasoning-128K、Nemotron-H-47B-Reasoning-128K |
+| 模态 | 仅文本 |
+| 思维链模式 | 支持（`<think>`）|
+| 工具调用 | 支持（`<tool_call>`）|
+| 输出解析器 | `Qwen3OutputParser` |
+
+### 架构概述
+
+Nemotron-H 是一个混合模型，在单个堆栈中混合三种不同的层类型：Mamba2 SSM 层、纯注意力层和纯 FFN 层（可选 MoE）。逐层类型由 GGUF 元数据数组（`head_count_kv` 和 `feed_forward_length`）决定。
+
+- **层类型分类**：对于每层，`head_count_kv[l]` 和 `feed_forward_length[l]` 决定类型：
+  - Mamba2：`head_count_kv == 0 AND feed_forward_length == 0`
+  - 纯注意力：`head_count_kv > 0 AND feed_forward_length == 0`
+  - 纯 FFN：`feed_forward_length > 0`
+- **Mamba2 SSM 层**：带分组头的选择性状态空间模型。输入通过 `ssm_in.weight` 投影产生 z（门控）、xBC（状态输入）和 dt（时间步）。xBC 经过 conv1d 滑动窗口、SiLU 激活，然后 SSM 扫描步骤计算 `state = state * exp(-softplus(dt) * A) + B * x * dt`，输出 `y = state @ C`。最终 `SiLU(z) * GroupRMSNorm(y)` 通过 `ssm_out.weight` 投影。卷积状态和 SSM 状态在各层跨 token 维护。
+- **注意力层**：标准 GQA，不使用 RoPE。逐层头数和 KV 头数从 GGUF 数组读取。融合 QKV 投影（`attn_qkv.weight`）。注意力缩放因子从 GGUF（`attention.scale`）读取，或默认为 `1/sqrt(headDim)`。
+- **FFN 层**：使用 ReLU-squared 激活函数（`max(0, x)^2`），SIMD 向量化实现。启用 MoE 时，FFN 层使用基于 sigmoid 的路由，可选专家偏置（`exp_probs_b`）、top-K 选择以及可选权重归一化/缩放。支持潜空间瓶颈投影（`ffn_latent_in` / `ffn_latent_out`）和共享专家（`ffn_up_shexp` / `ffn_down_shexp`）。
+- **MoE 路由**：`sigmoid(logits) + bias → TopK → normalize`。与基于 softmax 的路由不同，Nemotron-H 使用逐专家 sigmoid 概率加可选加性偏置进行专家选择。`expert_weights_norm` 将选中权重归一化为和为 1；`expert_weights_scale` 应用全局缩放因子。
+- **归一化**：每块一个 RMSNorm（`attn_norm`），每层共两个 RMSNorm（块前 + 输出）。
+- **聊天模板**：使用 Qwen 3 聊天模板格式（`<|im_start|>` / `<|im_end|>`）。
+- **Decode 优化**：对于 decode（seqLen=1），小型操作（RMSNorm、残差相加、专家和路由器等小矩阵乘法）可在 CPU 上执行，以避免 Metal GPU 调度开销（~1ms+ 每次调度）。大型矩阵乘法（SSM in/out、注意力 QKV/output、LM head）保留在 GPU 上。
+
+### GGUF 元数据键
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `nemotron_h.ssm.conv_kernel` | uint32 | Mamba2 conv1d 核大小 |
+| `nemotron_h.ssm.inner_size` | uint32 | SSM 内部维度（nHead * headDim）|
+| `nemotron_h.ssm.state_size` | uint32 | 每头 SSM 状态维度 |
+| `nemotron_h.ssm.time_step_rank` | uint32 | SSM 头数 |
+| `nemotron_h.ssm.group_count` | uint32 | SSM 分组数 |
+| `nemotron_h.attention.head_count_kv` | uint32[] | 逐层 KV 头数（0 → Mamba2）|
+| `nemotron_h.attention.head_count` | uint32[] | 逐层 Q 头数 |
+| `nemotron_h.feed_forward_length` | uint32[] | 逐层 FFN 大小（0 → 无 FFN）|
+| `nemotron_h.attention.scale` | float32 | 注意力缩放因子（0 = 自动）|
+| `nemotron_h.expert_count` | uint32 | MoE 专家数（0 = 密集）|
+| `nemotron_h.expert_used_count` | uint32 | 每 token TopK 专家数 |
+| `nemotron_h.expert_weights_norm` | bool | 归一化专家权重使和为 1 |
+| `nemotron_h.expert_weights_scale` | float32 | 专家权重全局缩放因子 |
+
+### 权重命名规范
+
+```
+token_embd.weight
+output_norm.weight
+output.weight
+
+# Mamba2 层：
+blk.{L}.attn_norm.weight                  # 块前 RMSNorm
+blk.{L}.ssm_in.weight                     # 输入投影 [hidden → 2*dInner + 2*nGroup*dState + nHead]
+blk.{L}.ssm_conv1d.weight                 # Conv1d 核 [xBCSize, convKernel]
+blk.{L}.ssm_conv1d.bias                   # Conv1d 偏置（可选）
+blk.{L}.ssm_dt.bias                       # 时间步偏置 [nHead]
+blk.{L}.ssm_a                             # A 参数 [nHead]
+blk.{L}.ssm_d                             # D 参数 [nHead]（可选）
+blk.{L}.ssm_norm.weight                   # 分组 RMSNorm [dInner]
+blk.{L}.ssm_out.weight                    # 输出投影 [dInner → hidden]
+
+# 注意力层：
+blk.{L}.attn_norm.weight
+blk.{L}.attn_qkv.weight                   # 融合 Q+K+V（或分别为 attn_q/k/v.weight）
+blk.{L}.attn_output.weight
+
+# FFN 层（密集）：
+blk.{L}.attn_norm.weight
+blk.{L}.ffn_up.weight                     # Up 投影
+blk.{L}.ffn_down.weight                   # Down 投影
+
+# FFN 层（MoE）：
+blk.{L}.attn_norm.weight
+blk.{L}.ffn_gate_inp.weight               # 路由器 [numExperts, hidden]
+blk.{L}.exp_probs_b.bias                  # 路由器偏置（可选）[numExperts]
+blk.{L}.ffn_latent_in.weight              # 潜空间瓶颈输入（可选）
+blk.{L}.ffn_latent_out.weight             # 潜空间瓶颈输出（可选）
+blk.{L}.ffn_up_exps.{E}.weight            # 专家 up 投影
+blk.{L}.ffn_down_exps.{E}.weight          # 专家 down 投影
+blk.{L}.ffn_up_shexp.weight               # 共享专家 up（可选）
+blk.{L}.ffn_down_shexp.weight             # 共享专家 down（可选）
+```
+
+### 前向传播流程（每 token）
+
+```
+tokens → Embedding
+For each layer L:
+  若 Mamba2:
+    hidden → RMSNorm(attn_norm)
+           → ssm_in 投影 → 分拆 z, xBC, dt
+           → Conv1d(xBC) → SiLU → SSM 扫描(dt, A, B, C, state) → y
+           → SiLU(z) * GroupRMSNorm(y) → ssm_out 投影
+           → 残差相加
+  若 注意力:
+    hidden → RMSNorm(attn_norm)
+           → QKV(融合) → 分拆 Q,K,V → 注意力(无 RoPE) → O 投影
+           → 残差相加
+  若 FFN（密集）:
+    hidden → RMSNorm(attn_norm)
+           → Up → ReLU² → Down
+           → 残差相加
+  若 FFN（MoE）:
+    hidden → RMSNorm(attn_norm)
+           → [latent_in] → 路由器(sigmoid+bias) → TopK → 归一化
+           → 对每个专家: Up → ReLU² → Down → 加权求和
+           → [latent_out] → [+ 共享专家] → 残差相加
+hidden → RMSNorm(output_norm) → 截取最后 token → LM head → logits
+```
+
+### 缓存架构
+
+- **注意力层**：标准 KV 缓存 `[numKVHeads, maxSeqLen, headDim]`。
+- **Mamba2 层**：`_convState[layer]` 浮点数组，大小 `(convKernel-1) * (dInner + 2*nGroup*dState)`，用于 conv1d 滑动窗口；`_ssmState[layer]` 浮点数组，大小 `dState * headDim * nHead`，用于 SSM 状态。
+- `ResetKVCache()` 同时将 KV 缓存和 SSM/卷积状态清零。
+- `SupportsKVCacheTruncation` 返回 `false`，因为 SSM 状态是顺序的，无法部分复用。
+
+### 预分配缓冲区
+
+为避免热路径中的逐步分配，以下缓冲区一次性分配：
+
+| 缓冲区 | 大小 | 用途 |
+|---|---|---|
+| `_mamba2ConvOutBuf` | dInner + 2*nGroup*dState | Conv1d 输出 + SiLU |
+| `_mamba2YBuf` | dInner | SSM 扫描输出 |
+| `_moeProbs` / `_moeSelectionProbs` | numExperts | 路由器概率 |
+| `_moeTopExperts` / `_moeRouteW` | numExpertsUsed | 选中的专家及权重 |
+| `_moeLatentAccum` | max(hiddenSize, latentDim) | 潜空间累加器 |
+| `_expertUpResult` / `_expertDownResult` | 最大专家维度 | 可复用的专家 matmul 输出 |
+| `_latentAccumTensor` / `_latentOutResult` | latentDim / hiddenSize | 潜空间瓶颈复用张量 |
+
+### 批量 GPU MoE
+
+在 GGML 后端（Metal/CUDA）上运行时，decode 阶段的 MoE 专家计算被批量合并为一次 `GgmlBasicOps.MoEExpertsForward()` 调用，在单次 GPU 图调度中处理所有选中专家，避免逐专家调度开销。预缓存的 `QuantizedWeight` 引用（`_expertUpQW`、`_expertDownQW`）和预分配的指针数组（`_moeUpPtrs`、`_moeDownPtrs`）消除了热循环中的字典查找和分配。
+
+### 优化空间
+
+- 注意力无 RoPE——位置信息由 SSM 状态隐式跟踪，简化了注意力实现但阻止了跨会话的 KV 缓存复用。
+- Mamba2 SSM 在 prefill 期间逐 token 顺序处理。分块并行 SSM 扫描可提升提示吞吐量。
+- Conv1d 实现为标量循环。SIMD 或原生向量化版本可提升 SSM 层性能。
+- 无原生整模型 decode 路径。将前向传播移至单次原生调用（类似 Qwen 3）可减少托管开销。
+- ReLU-squared 激活已 SIMD 向量化，但专家 FFN 仍按 token 顺序运行。跨专家批处理可带来提升。
+
+---
+
 ## 架构对比
 
-| 特性 | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS |
-|---|---|---|---|---|---|
-| 层类型 | 密集 | 密集 / MoE | 密集 | 混合（注意力 + 循环）| MoE |
-| 注意力 | SWA + 全局 | SWA + 全局 | 全 GQA | 全 GQA + 门控 | 全因果 + 沉降 |
-| FFN 激活 | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit |
-| RoPE 变体 | NeoX（双基数）| NeoX + 比例 | NeoX | NeoX / MRoPE | NeoX + Yarn |
-| QK 归一化 | 有 | 有 | 有 | 有 | 无 |
-| V 归一化 | 无 | 有（无权重）| 无 | 无 | 无 |
-| 投影偏置 | 无 | 无 | 无 | 无 | 有（全部）|
-| 逐层缩放 | 无 | 有 | 无 | 无 | 无 |
-| PLE | 无 | 有 | 无 | 无 | 无 |
-| KV 共享 | 无 | 有 | 无 | 无 | 无 |
-| 注意力沉降 | 无 | 无 | 无 | 无 | 有 |
-| 环形 KV 缓存 | 无 | 有（SWA 层）| 无 | 无 | 无 |
-| 视觉 | 支持 | 支持 | 不支持 | 支持 | 不支持 |
-| 音频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 |
-| 视频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 |
-| 思维链 | 不支持 | 支持 | 支持 | 支持 | 支持（始终开启）|
-| 工具调用 | 不支持 | 支持 | 支持 | 支持 | 不支持 |
-| 融合 QKV | 无 | 有 | 有 | 无 | 无 |
-| 融合 GPU decode | 不支持 | 支持（Metal）| 不支持 | 不支持 | 不支持 |
-| 原生模型 decode | 不支持 | 不支持 | 支持 | 不支持 | 不支持 |
-| 输出解析器 | 直通 | Gemma4 | Qwen3 | Qwen35 | Harmony（始终开启）|
+| 特性 | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H |
+|---|---|---|---|---|---|---|
+| 层类型 | 密集 | 密集 / MoE | 密集 | 混合（注意力 + 循环）| MoE | 混合（Mamba2 + 注意力 + MoE FFN）|
+| 注意力 | SWA + 全局 | SWA + 全局 | 全 GQA | 全 GQA + 门控 | 全因果 + 沉降 | 全 GQA（无 RoPE）|
+| FFN 激活 | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² |
+| RoPE 变体 | NeoX（双基数）| NeoX + 比例 | NeoX | NeoX / MRoPE | NeoX + Yarn | 无 |
+| QK 归一化 | 有 | 有 | 有 | 有 | 无 | 无 |
+| V 归一化 | 无 | 有（无权重）| 无 | 无 | 无 | 无 |
+| 投影偏置 | 无 | 无 | 无 | 无 | 有（全部）| 无 |
+| 逐层缩放 | 无 | 有 | 无 | 无 | 无 | 无 |
+| PLE | 无 | 有 | 无 | 无 | 无 | 无 |
+| KV 共享 | 无 | 有 | 无 | 无 | 无 | 无 |
+| 注意力沉降 | 无 | 无 | 无 | 无 | 有 | 无 |
+| 环形 KV 缓存 | 无 | 有（SWA 层）| 无 | 无 | 无 | 无 |
+| SSM（Mamba2）| 无 | 无 | 无 | 无 | 无 | 有 |
+| 共享专家 | 无 | 无 | 无 | 无 | 无 | 有（可选）|
+| 潜空间瓶颈 | 无 | 无 | 无 | 无 | 无 | 有（可选）|
+| 视觉 | 支持 | 支持 | 不支持 | 支持 | 不支持 | 不支持 |
+| 音频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 视频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 思维链 | 不支持 | 支持 | 支持 | 支持 | 支持（始终开启）| 支持 |
+| 工具调用 | 不支持 | 支持 | 支持 | 支持 | 不支持 | 支持 |
+| 融合 QKV | 无 | 有 | 有 | 无 | 无 | 有 |
+| 融合 GPU decode | 不支持 | 支持（Metal）| 不支持 | 不支持 | 不支持 | 不支持 |
+| 原生模型 decode | 不支持 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 |
+| 批量 GPU MoE | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 | 支持 |
+| 输出解析器 | 直通 | Gemma4 | Qwen3 | Qwen35 | Harmony（始终开启）| Qwen3 |
 
 ---
 

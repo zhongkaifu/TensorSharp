@@ -240,6 +240,29 @@ internal enum GgmlIndexReductionOp
             long m2RawBytes);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedRmsNormMatMulQuantF32(
+            GgmlTensorView2D result,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps,
+            IntPtr m2Data,
+            int m2GgmlType,
+            long m2Ne0,
+            long m2Ne1,
+            long m2RawBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedMatMulQuantAddF32(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D input,
+            IntPtr m2Data,
+            int m2GgmlType,
+            long m2Ne0,
+            long m2Ne1,
+            long m2RawBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetRowsQuantF32(
             GgmlTensorView2D result,
             IntPtr srcData,
@@ -248,6 +271,23 @@ internal enum GgmlIndexReductionOp
             long srcNe1,
             long srcRawBytes,
             GgmlContiguousTensor indices);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MoEExpertsForwardF32(
+            GgmlTensorView2D result,
+            GgmlTensorView2D input,
+            int numExperts,
+            IntPtr[] upDataPtrs,
+            IntPtr[] downDataPtrs,
+            int upGgmlType,
+            long upNe0,
+            long upNe1,
+            long upRawBytesEach,
+            int downGgmlType,
+            long downNe0,
+            long downNe1,
+            long downRawBytesEach,
+            float[] routeWeights);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_AddmmQuantBatchF32(
@@ -600,9 +640,40 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_AddmmQuantF32(result, m1, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "addmm_quant");
         }
 
+        public static void FusedRmsNormMatMulQuant(
+            GgmlTensorView2D result, GgmlTensorView2D input,
+            IntPtr normWeightData, int normWeightCount, float eps,
+            IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
+        {
+            CheckResult(TSGgml_FusedRmsNormMatMulQuantF32(
+                result, input, normWeightData, normWeightCount, eps,
+                m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "fused_rms_norm_matmul_quant");
+        }
+
+        public static void FusedMatMulQuantAdd(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
+        {
+            CheckResult(TSGgml_FusedMatMulQuantAddF32(
+                residual, input, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "fused_matmul_quant_add");
+        }
+
         public static void GetRowsQuant(GgmlTensorView2D result, IntPtr srcData, int srcGgmlType, long srcNe0, long srcNe1, long srcRawBytes, GgmlContiguousTensor indices)
         {
             CheckResult(TSGgml_GetRowsQuantF32(result, srcData, srcGgmlType, srcNe0, srcNe1, srcRawBytes, indices), "get_rows_quant");
+        }
+
+        public static void MoEExpertsForward(GgmlTensorView2D result, GgmlTensorView2D input,
+            int numExperts, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights)
+        {
+            CheckResult(TSGgml_MoEExpertsForwardF32(result, input, numExperts,
+                upDataPtrs, downDataPtrs,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights), "moe_experts_forward");
         }
 
         public static void AddmmQuantBatch(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2RawBytes,

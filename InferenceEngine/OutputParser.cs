@@ -365,7 +365,7 @@ namespace InferenceEngine
 
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
-        public bool AlwaysRequired => false;
+        public bool AlwaysRequired => true;
 
         public void Init(bool enableThinking, List<ToolFunction> tools)
         {
@@ -798,13 +798,14 @@ namespace InferenceEngine
                 "qwen3" => new Qwen3OutputParser(),
                 "qwen35" or "qwen35moe" or "qwen3next" or "qwen3vl" or "qwen3vlmoe" => new Qwen35OutputParser(),
                 "gptoss" or "gpt-oss" => new HarmonyOutputParser(),
+                "nemotron_h" or "nemotron_h_moe" => new Qwen3OutputParser(),
                 _ => new PassthroughOutputParser()
             };
         }
 
         public static bool IsAlwaysRequired(string architecture)
         {
-            return architecture is "gptoss" or "gpt-oss";
+            return architecture is "gptoss" or "gpt-oss" or "gemma4";
         }
     }
 }

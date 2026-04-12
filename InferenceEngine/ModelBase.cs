@@ -501,7 +501,7 @@ namespace InferenceEngine
             return result;
         }
 
-        private unsafe void AddmmQuantManaged(Tensor result, Tensor input, QuantizedWeight weight)
+        protected unsafe void AddmmQuantManaged(Tensor result, Tensor input, QuantizedWeight weight)
         {
             if (!input.IsContiguous() || !result.IsContiguous())
                 throw new NotSupportedException("Managed quantized matmul requires contiguous input and output tensors.");
@@ -969,6 +969,7 @@ namespace InferenceEngine
                 "gemma3" => new Gemma3Model(ggufPath, backend),
                 "gemma4" => new Gemma4Model(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
+                "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

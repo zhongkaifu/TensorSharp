@@ -2,7 +2,7 @@
 
 [English](model_cards.md) | [中文](model_cards_cn.md)
 
-TensorSharp supports five model architectures. This document is a developer reference for engineers who need to modify, optimize, or extend the model implementations.
+TensorSharp supports six model architectures. This document is a developer reference for engineers who need to modify, optimize, or extend the model implementations.
 
 All model classes live under `InferenceEngine/Models/<Name>/` and inherit from `ModelBase` (in `InferenceEngine/ModelBase.cs`). `ModelBase` provides shared primitives: GGUF loading, weight storage (`_weights` for F32, `_quantWeights` for quantized), KV cache helpers, embedding lookup, RMSNorm, linear forward, RoPE utilities, timing instrumentation, and the `Forward(int[] tokens) → float[]` interface.
 
@@ -470,31 +470,184 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 ---
 
+## Nemotron-H
+
+| Property | Value |
+|---|---|
+| Source file | `InferenceEngine/Models/Nemotron/NemotronModel.cs` |
+| Provider | NVIDIA |
+| GGUF architecture key | `nemotron_h`, `nemotron_h_moe` |
+| Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K |
+| Modalities | Text only |
+| Thinking mode | Yes (`<think>`) |
+| Tool calling | Yes (`<tool_call>`) |
+| Output parser | `Qwen3OutputParser` |
+
+### Architecture Overview
+
+Nemotron-H is a hybrid model that mixes three distinct layer types in a single stack: Mamba2 SSM layers, attention-only layers, and FFN-only layers (optionally with MoE). The per-layer type is determined by GGUF metadata arrays (`head_count_kv` and `feed_forward_length`).
+
+- **Layer type classification**: for each layer, `head_count_kv[l]` and `feed_forward_length[l]` determine the type:
+  - Mamba2: `head_count_kv == 0 AND feed_forward_length == 0`
+  - Attention-only: `head_count_kv > 0 AND feed_forward_length == 0`
+  - FFN-only: `feed_forward_length > 0`
+- **Mamba2 SSM layers**: selective state space model with grouped heads. Input is projected via `ssm_in.weight` to produce z (gate), xBC (state input), and dt (time step). xBC passes through a conv1d sliding window, SiLU activation, then the SSM scan step computes `state = state * exp(-softplus(dt) * A) + B * x * dt`, output `y = state @ C`. Finally `SiLU(z) * GroupRMSNorm(y)` is projected via `ssm_out.weight`. The conv state and SSM state are maintained per-layer across tokens.
+- **Attention layers**: standard GQA with no RoPE. Per-layer head counts and KV head counts are read from GGUF arrays. Fused QKV projection (`attn_qkv.weight`). Attention scale is read from GGUF (`attention.scale`) or defaults to `1/sqrt(headDim)`.
+- **FFN layers**: use ReLU-squared activation (`max(0, x)^2`), implemented with SIMD vectorization. When MoE is enabled, FFN layers use sigmoid-based routing with optional expert bias (`exp_probs_b`), top-K selection, and optional weight normalization/scaling. Supports latent bottleneck projections (`ffn_latent_in` / `ffn_latent_out`) and shared experts (`ffn_up_shexp` / `ffn_down_shexp`).
+- **MoE routing**: `sigmoid(logits) + bias → TopK → normalize`. Unlike softmax-based routers, Nemotron-H uses per-expert sigmoid probabilities with optional additive bias for expert selection. `expert_weights_norm` normalizes selected weights to sum to 1; `expert_weights_scale` applies a global scale factor.
+- **Normalization**: single RMSNorm per block (`attn_norm`), two RMSNorm total per layer (pre-block + output).
+- **Chat template**: uses the Qwen 3 chat template format (`<|im_start|>` / `<|im_end|>`).
+- **Decode optimization**: for decode (seqLen=1), small operations (RMSNorm, residual add, small matmuls like expert and router) can be executed on CPU to avoid Metal GPU dispatch overhead (~1ms+ per dispatch). Large matmuls (SSM in/out, attention QKV/output, LM head) remain on GPU.
+
+### GGUF Metadata Keys
+
+| Key | Type | Description |
+|---|---|---|
+| `nemotron_h.ssm.conv_kernel` | uint32 | Mamba2 conv1d kernel size |
+| `nemotron_h.ssm.inner_size` | uint32 | SSM inner dimension (nHead * headDim) |
+| `nemotron_h.ssm.state_size` | uint32 | SSM state dimension per head |
+| `nemotron_h.ssm.time_step_rank` | uint32 | Number of SSM heads |
+| `nemotron_h.ssm.group_count` | uint32 | Number of SSM groups |
+| `nemotron_h.attention.head_count_kv` | uint32[] | Per-layer KV head count (0 → Mamba2) |
+| `nemotron_h.attention.head_count` | uint32[] | Per-layer Q head count |
+| `nemotron_h.feed_forward_length` | uint32[] | Per-layer FFN size (0 → no FFN) |
+| `nemotron_h.attention.scale` | float32 | Attention scale factor (0 = auto) |
+| `nemotron_h.expert_count` | uint32 | MoE expert count (0 = dense) |
+| `nemotron_h.expert_used_count` | uint32 | TopK experts per token |
+| `nemotron_h.expert_weights_norm` | bool | Normalize expert weights to sum=1 |
+| `nemotron_h.expert_weights_scale` | float32 | Global scale for expert weights |
+
+### Weight Naming Convention
+
+```
+token_embd.weight
+output_norm.weight
+output.weight
+
+# Mamba2 layers:
+blk.{L}.attn_norm.weight                  # Pre-block RMSNorm
+blk.{L}.ssm_in.weight                     # Input projection [hidden → 2*dInner + 2*nGroup*dState + nHead]
+blk.{L}.ssm_conv1d.weight                 # Conv1d kernel [xBCSize, convKernel]
+blk.{L}.ssm_conv1d.bias                   # Conv1d bias (optional)
+blk.{L}.ssm_dt.bias                       # Time step bias [nHead]
+blk.{L}.ssm_a                             # A parameter [nHead]
+blk.{L}.ssm_d                             # D parameter [nHead] (optional)
+blk.{L}.ssm_norm.weight                   # Group RMSNorm [dInner]
+blk.{L}.ssm_out.weight                    # Output projection [dInner → hidden]
+
+# Attention layers:
+blk.{L}.attn_norm.weight
+blk.{L}.attn_qkv.weight                   # Fused Q+K+V (or separate attn_q/k/v.weight)
+blk.{L}.attn_output.weight
+
+# FFN layers (dense):
+blk.{L}.attn_norm.weight
+blk.{L}.ffn_up.weight                     # Up projection
+blk.{L}.ffn_down.weight                   # Down projection
+
+# FFN layers (MoE):
+blk.{L}.attn_norm.weight
+blk.{L}.ffn_gate_inp.weight               # Router [numExperts, hidden]
+blk.{L}.exp_probs_b.bias                  # Router bias (optional) [numExperts]
+blk.{L}.ffn_latent_in.weight              # Latent bottleneck in (optional)
+blk.{L}.ffn_latent_out.weight             # Latent bottleneck out (optional)
+blk.{L}.ffn_up_exps.{E}.weight            # Expert up projection
+blk.{L}.ffn_down_exps.{E}.weight          # Expert down projection
+blk.{L}.ffn_up_shexp.weight               # Shared expert up (optional)
+blk.{L}.ffn_down_shexp.weight             # Shared expert down (optional)
+```
+
+### Forward Pass (per token)
+
+```
+tokens → Embedding
+For each layer L:
+  If Mamba2:
+    hidden → RMSNorm(attn_norm)
+           → ssm_in projection → split z, xBC, dt
+           → Conv1d(xBC) → SiLU → SSM scan(dt, A, B, C, state) → y
+           → SiLU(z) * GroupRMSNorm(y) → ssm_out projection
+           → residual add
+  If Attention:
+    hidden → RMSNorm(attn_norm)
+           → QKV(fused) → split Q,K,V → Attention(no RoPE) → O projection
+           → residual add
+  If FFN (dense):
+    hidden → RMSNorm(attn_norm)
+           → Up → ReLU² → Down
+           → residual add
+  If FFN (MoE):
+    hidden → RMSNorm(attn_norm)
+           → [latent_in] → Router(sigmoid+bias) → TopK → normalize
+           → For each expert: Up → ReLU² → Down → weighted sum
+           → [latent_out] → [+ shared_expert] → residual add
+hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
+```
+
+### Cache Architecture
+
+- **Attention layers**: standard KV cache `[numKVHeads, maxSeqLen, headDim]`.
+- **Mamba2 layers**: `_convState[layer]` float array of size `(convKernel-1) * (dInner + 2*nGroup*dState)` for the conv1d sliding window, and `_ssmState[layer]` float array of size `dState * headDim * nHead` for the SSM state.
+- `ResetKVCache()` zeroes both KV caches and SSM/conv states.
+- `SupportsKVCacheTruncation` returns `false` because SSM states are sequential and cannot be partially reused.
+
+### Pre-allocated Buffers
+
+To avoid per-step allocation in hot paths, the following buffers are allocated once:
+
+| Buffer | Size | Purpose |
+|---|---|---|
+| `_mamba2ConvOutBuf` | dInner + 2*nGroup*dState | Conv1d output + SiLU |
+| `_mamba2YBuf` | dInner | SSM scan output |
+| `_moeProbs` / `_moeSelectionProbs` | numExperts | Router probabilities |
+| `_moeTopExperts` / `_moeRouteW` | numExpertsUsed | Selected experts and weights |
+| `_moeLatentAccum` | max(hiddenSize, latentDim) | Latent-space accumulator |
+| `_expertUpResult` / `_expertDownResult` | max expert dims | Reusable expert matmul outputs |
+| `_latentAccumTensor` / `_latentOutResult` | latentDim / hiddenSize | Latent bottleneck reuse tensors |
+
+### Batched GPU MoE
+
+When running on a GGML backend (Metal/CUDA), MoE expert computation during decode is batched into a single `GgmlBasicOps.MoEExpertsForward()` call that processes all selected experts in one GPU graph dispatch, avoiding per-expert dispatch overhead. Pre-cached `QuantizedWeight` references (`_expertUpQW`, `_expertDownQW`) and pre-allocated pointer arrays (`_moeUpPtrs`, `_moeDownPtrs`) eliminate dictionary lookups and allocation in the hot loop.
+
+### Optimization Opportunities
+
+- No RoPE in attention — positions are implicitly tracked by the SSM state, which simplifies the attention implementation but prevents KV cache reuse across sessions.
+- Mamba2 SSM processes tokens sequentially during prefill. Chunked parallel SSM scanning would improve prompt throughput.
+- Conv1d is implemented as a scalar loop. A SIMD or native vectorized version would improve SSM layer performance.
+- No native whole-model decode path. Moving the forward pass to a single native call (like Qwen 3) would reduce managed overhead.
+- ReLU-squared activation is SIMD-vectorized but expert FFN still runs sequentially per token. Batching across experts would help.
+
+---
+
 ## Architecture Comparison
 
-| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS |
-|---|---|---|---|---|---|
-| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) | MoE |
-| Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks |
-| FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit |
-| RoPE variant | NeoX (dual base) | NeoX + proportional | NeoX | NeoX / MRoPE | NeoX + Yarn |
-| QK norm | Yes | Yes | Yes | Yes | No |
-| V norm | No | Yes (unweighted) | No | No | No |
-| Bias in projections | No | No | No | No | Yes (all) |
-| Per-layer scaling | No | Yes | No | No | No |
-| PLE | No | Yes | No | No | No |
-| KV sharing | No | Yes | No | No | No |
-| Attention sinks | No | No | No | No | Yes |
-| Circular KV cache | No | Yes (SWA layers) | No | No | No |
-| Vision | Yes | Yes | No | Yes | No |
-| Audio | No | Yes | No | No | No |
-| Video | No | Yes | No | No | No |
-| Thinking | No | Yes | Yes | Yes | Yes (always) |
-| Tool calling | No | Yes | Yes | Yes | No |
-| Fused QKV | No | Yes | Yes | No | No |
-| Fused GPU decode | No | Yes (Metal) | No | No | No |
-| Native model decode | No | No | Yes | No | No |
-| Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) |
+| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H |
+|---|---|---|---|---|---|---|
+| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) | MoE | Hybrid (Mamba2 + Attn + MoE FFN) |
+| Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks | Full GQA (no RoPE) |
+| FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² |
+| RoPE variant | NeoX (dual base) | NeoX + proportional | NeoX | NeoX / MRoPE | NeoX + Yarn | None |
+| QK norm | Yes | Yes | Yes | Yes | No | No |
+| V norm | No | Yes (unweighted) | No | No | No | No |
+| Bias in projections | No | No | No | No | Yes (all) | No |
+| Per-layer scaling | No | Yes | No | No | No | No |
+| PLE | No | Yes | No | No | No | No |
+| KV sharing | No | Yes | No | No | No | No |
+| Attention sinks | No | No | No | No | Yes | No |
+| Circular KV cache | No | Yes (SWA layers) | No | No | No | No |
+| SSM (Mamba2) | No | No | No | No | No | Yes |
+| Shared experts | No | No | No | No | No | Yes (optional) |
+| Latent bottleneck | No | No | No | No | No | Yes (optional) |
+| Vision | Yes | Yes | No | Yes | No | No |
+| Audio | No | Yes | No | No | No | No |
+| Video | No | Yes | No | No | No | No |
+| Thinking | No | Yes | Yes | Yes | Yes (always) | Yes |
+| Tool calling | No | Yes | Yes | Yes | No | Yes |
+| Fused QKV | No | Yes | Yes | No | No | Yes |
+| Fused GPU decode | No | Yes (Metal) | No | No | No | No |
+| Native model decode | No | No | Yes | No | No | No |
+| Batched GPU MoE | No | No | No | No | No | Yes |
+| Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) | Qwen3 |
 
 ---
 

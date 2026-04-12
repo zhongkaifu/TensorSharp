@@ -174,6 +174,19 @@ namespace InferenceEngine
             return null;
         }
 
+        public uint[] GetUint32Array(string key)
+        {
+            if (!Metadata.TryGetValue(key, out var v)) return null;
+            if (v is uint[] ua) return ua;
+            if (v is int[] ia)
+            {
+                var result = new uint[ia.Length];
+                for (int i = 0; i < ia.Length; i++) result[i] = (uint)ia[i];
+                return result;
+            }
+            return null;
+        }
+
         public byte[] ReadTensorData(GgufTensorInfo tensorInfo)
         {
             long byteCount = GetTensorByteCount(tensorInfo);

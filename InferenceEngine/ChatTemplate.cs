@@ -331,6 +331,8 @@ namespace InferenceEngine
                     string result = jinja.Render(context).TrimEnd();
                     if (result.Length > 0)
                     {
+                        if (architecture == "gemma4" && addGenerationPrompt && !enableThinking)
+                            result = EnsureGemma4ThinkingBlock(result);
                         Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
                         return result;
                     }
@@ -365,6 +367,9 @@ namespace InferenceEngine
             {
                 return RenderQwen35(messages, addGenerationPrompt, enableThinking, tools);
             }
+
+            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe")
+                return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
 
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
@@ -409,11 +414,13 @@ namespace InferenceEngine
                 msgList.Add(dict);
             }
 
+            string bosToken = (architecture == "gemma4") ? "<bos>" : "";
+
             var ctx = new Dictionary<string, object>
             {
                 ["messages"] = msgList,
                 ["add_generation_prompt"] = addGenerationPrompt,
-                ["bos_token"] = "",
+                ["bos_token"] = bosToken,
                 ["eos_token"] = "",
             };
 
@@ -583,11 +590,16 @@ namespace InferenceEngine
         /// <summary>
         /// Render Gemma4 chat template.
         /// Uses &lt;|turn&gt;/&lt;turn|&gt; markers. Images use &lt;|image&gt;.
+        /// Matches the HF Jinja2 template: BOS is explicit, and when thinking is
+        /// disabled the generation prompt includes an empty thinking block
+        /// (&lt;|channel&gt;thought\n&lt;channel|&gt;) so the model skips thinking.
         /// </summary>
         public static string RenderGemma4(List<ChatMessage> messages, bool addGenerationPrompt = true,
             List<ToolFunction> tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
+
+            sb.Append("<bos>");
 
             bool hasTools = tools != null && tools.Count > 0;
             bool hasSystem = messages.Count > 0 && (messages[0].Role == "system" || messages[0].Role == "developer");
@@ -597,7 +609,7 @@ namespace InferenceEngine
             {
                 sb.Append("<|turn>system\n");
                 if (enableThinking)
-                    sb.Append("<|think|>");
+                    sb.Append("<|think|>\n");
                 if (hasSystem)
                 {
                     sb.Append(messages[0].Content?.Trim() ?? "");
@@ -628,6 +640,10 @@ namespace InferenceEngine
                 {
                     sb.Append(msg.Content?.Trim() ?? "");
                 }
+                else if (msg.Role == "assistant")
+                {
+                    sb.Append(StripGemma4Thinking(msg.Content ?? "").Trim());
+                }
                 else
                 {
                     if (msg.ImagePaths != null)
@@ -649,6 +665,8 @@ namespace InferenceEngine
             if (addGenerationPrompt)
             {
                 sb.Append("<|turn>model\n");
+                if (!enableThinking)
+                    sb.Append("<|channel>thought\n<channel|>");
             }
             return sb.ToString();
         }
@@ -791,6 +809,23 @@ namespace InferenceEngine
                 return sb2.ToString();
             }
             return value?.ToString() ?? "null";
+        }
+
+        /// <summary>
+        /// Ensure the Gemma 4 prompt ends with an empty thinking block when thinking
+        /// is disabled. The GGUF Jinja2 template may not produce it, but the model
+        /// expects it to skip the thinking phase and generate content directly.
+        /// </summary>
+        private static string EnsureGemma4ThinkingBlock(string result)
+        {
+            const string emptyThinkBlock = "<|channel>thought\n<channel|>";
+            if (!result.EndsWith(emptyThinkBlock))
+            {
+                if (!result.EndsWith("\n"))
+                    result += "\n";
+                result += emptyThinkBlock;
+            }
+            return result;
         }
 
         private static string StripGemma4Thinking(string text)
