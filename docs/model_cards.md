@@ -1,10 +1,10 @@
-# Model Architecture Cards — Developer Reference
+﻿# Model Architecture Cards — Developer Reference
 
 [English](model_cards.md) | [中文](model_cards_cn.md)
 
 TensorSharp supports six model architectures. This document is a developer reference for engineers who need to modify, optimize, or extend the model implementations.
 
-All model classes live under `InferenceEngine/Models/<Name>/` and inherit from `ModelBase` (in `InferenceEngine/ModelBase.cs`). `ModelBase` provides shared primitives: GGUF loading, weight storage (`_weights` for F32, `_quantWeights` for quantized), KV cache helpers, embedding lookup, RMSNorm, linear forward, RoPE utilities, timing instrumentation, and the `Forward(int[] tokens) → float[]` interface.
+All model classes live under `TensorSharp.Models/Models/<Name>/` and inherit from `ModelBase` (in `TensorSharp.Models/ModelBase.cs`). `ModelBase` provides shared primitives: GGUF loading, weight storage (`_weights` for F32, `_quantWeights` for quantized), KV cache helpers, embedding lookup, RMSNorm, linear forward, RoPE utilities, timing instrumentation, and the `Forward(int[] tokens) → float[]` interface.
 
 ---
 
@@ -12,7 +12,7 @@ All model classes live under `InferenceEngine/Models/<Name>/` and inherit from `
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/Gemma3/Gemma3Model.cs` |
+| Source file | `TensorSharp.Models/Models/Gemma3/Gemma3Model.cs` |
 | Provider | Google |
 | GGUF architecture key | `gemma3` |
 | Example models | gemma-3-4b, gemma-3-12b, gemma-3-27b |
@@ -101,7 +101,7 @@ hidden → RMSNorm(output_norm) → LM head → [softcap] → logits
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/Gemma4/Gemma4Model.cs` |
+| Source file | `TensorSharp.Models/Models/Gemma4/Gemma4Model.cs` |
 | Provider | Google |
 | GGUF architecture key | `gemma4` |
 | Example models | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) |
@@ -218,7 +218,7 @@ Enabled automatically when all layers are dense (no MoE) and all weights are qua
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/Qwen3/Qwen3Model.cs` |
+| Source file | `TensorSharp.Models/Models/Qwen3/Qwen3Model.cs` |
 | Provider | Alibaba |
 | GGUF architecture key | `qwen3` |
 | Example models | Qwen3-4B, Qwen3-8B, Qwen3-14B, Qwen3-32B |
@@ -289,7 +289,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/Qwen35/Qwen35Model.cs` |
+| Source file | `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` |
 | Provider | Alibaba |
 | GGUF architecture key | `qwen35`, `qwen35moe`, `qwen3next` |
 | Example models | Qwen3.5-9B, Qwen3.5-32B |
@@ -387,7 +387,7 @@ To avoid per-step allocation in the hot GDN decode path, the following buffers a
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/GptOss/GptOssModel.cs` |
+| Source file | `TensorSharp.Models/Models/GptOss/GptOssModel.cs` |
 | Provider | OpenAI |
 | GGUF architecture key | `gptoss`, `gpt-oss` |
 | Example models | gpt-oss-20b |
@@ -474,7 +474,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 | Property | Value |
 |---|---|
-| Source file | `InferenceEngine/Models/Nemotron/NemotronModel.cs` |
+| Source file | `TensorSharp.Models/Models/Nemotron/NemotronModel.cs` |
 | Provider | NVIDIA |
 | GGUF architecture key | `nemotron_h`, `nemotron_h_moe` |
 | Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K |
@@ -653,10 +653,11 @@ When running on a GGML backend (Metal/CUDA), MoE expert computation during decod
 
 ## Adding a New Model Architecture
 
-1. Create `InferenceEngine/Models/<Name>/<Name>Model.cs` inheriting `ModelBase`.
+1. Create `TensorSharp.Models/Models/<Name>/<Name>Model.cs` inheriting `ModelBase`.
 2. In the constructor: read GGUF metadata via `_gguf.GetXxx()`, call `ParseBaseConfig()` and `ParseTokenizer()`, call `LoadWeights()`, then fuse weights and init caches.
 3. Implement `Forward(int[] tokens) → float[]`: embedding → transformer blocks → norm → LM head → logits copy.
 4. Implement `ResetKVCache()` and `Dispose()`.
 5. Register in `ModelBase.Create()` switch expression (in `ModelBase.cs`).
 6. Add an `IOutputParser` implementation in `OutputParser.cs` if the model uses a non-standard output format. Register in `OutputParserFactory.Create()`. Set `AlwaysRequired = true` if the model always wraps output in structural tags.
 7. Add chat template support in `ChatTemplate.cs` / `Jinja2Template.cs` if the model uses a novel template format.
+
