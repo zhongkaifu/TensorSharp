@@ -2,7 +2,7 @@
 
 [English](model_cards.md) | [中文](model_cards_cn.md)
 
-TensorSharp supports six model architectures. This document is a developer reference for engineers who need to modify, optimize, or extend the model implementations.
+TensorSharp supports seven model architectures. This document is a developer reference for engineers who need to modify, optimize, or extend the model implementations.
 
 All model classes live under `TensorSharp.Models/Models/<Name>/` and inherit from `ModelBase` (in `TensorSharp.Models/ModelBase.cs`). `ModelBase` provides shared primitives: GGUF loading, weight storage (`_weights` for F32, `_quantWeights` for quantized), KV cache helpers, embedding lookup, RMSNorm, linear forward, RoPE utilities, timing instrumentation, and the `Forward(int[] tokens) → float[]` interface.
 
@@ -619,35 +619,145 @@ When running on a GGML backend (Metal/CUDA), MoE expert computation during decod
 
 ---
 
+## Mistral 3
+
+| Property | Value |
+|---|---|
+| Source file | `TensorSharp.Models/Models/Mistral3/Mistral3Model.cs` |
+| Provider | Mistral AI |
+| GGUF architecture key | `mistral3` |
+| Example models | Mistral-Small-3.1-24B-Instruct |
+| Modalities | Text, Image |
+| Thinking mode | No |
+| Tool calling | No |
+| Output parser | `PassthroughOutputParser` |
+
+### Architecture Overview
+
+Mistral 3 is a standard LLaMA-like dense transformer with several distinctive features.
+
+- **Attention**: GQA with `Config.NumKVHeads < Config.NumHeads`. Supports fused QKV projection into a single `attn_qkv.weight`, with fallback to separate Q/K/V weights.
+- **No QK-norm**: unlike Qwen 3 and Gemma 3/4, Mistral 3 does not apply per-head RMSNorm to Q and K.
+- **RoPE**: GPT-J (norm) style — pairs adjacent elements `(x[2i], x[2i+1])`. Uses YaRN scaling for extended context: frequency correction interpolates between extrapolated and interpolated frequencies based on slow/fast rotation ranges.
+- **Position-dependent Q scaling**: `q *= (1 + beta * log(1 + floor(pos / orig_ctx)))`. Only active when `_ropeOrigCtx > 0`. This scaling helps maintain attention quality at positions beyond the original training context length.
+- **FFN**: SwiGLU — `SiLU(gate) * up` via `Ops.SiLUMul`, then `down`. Uses fused `ffn_gate_up.weight`.
+- **Normalization**: two RMSNorm per block — `attn_norm` and `ffn_norm`.
+- **Output**: tied to `token_embd.weight` when `output.weight` is absent.
+- **Vision**: `Mistral3VisionEncoder` (Pixtral architecture) loaded separately via `LoadVisionEncoder(mmProjPath)`. Features Conv2D patch embedding, RMSNorm, 2D RoPE positional embeddings, SiLU-gated MLP transformer blocks, spatial patch merging, and a multi-modal projector (RMSNorm → PatchMerger → Linear → GELU → Linear). Vision embeddings are injected into the text hidden state at image token positions.
+- **Image processing**: `Mistral3ImageProcessor` composites transparent images over white background, resizes to fit `longest_edge` while preserving aspect ratio, pads to be divisible by `patch_size`, and normalizes with CLIP default mean/std.
+
+### GGUF Metadata Keys
+
+| Key | Type | Description |
+|---|---|---|
+| `mistral3.rope.dimension_count` | uint32 | RoPE dimension count |
+| `mistral3.rope.scaling.type` | string | RoPE scaling type (e.g. `yarn`) |
+| `mistral3.attention.temperature_scale` | float32 | Position-dependent Q scaling beta (default 0.1) |
+| `mistral3.rope.scaling.original_context_length` | uint32 | YaRN original context length |
+| `mistral3.rope.scaling.extrapolation_factor` | float32 | YaRN extrapolation factor (default 1.0) |
+| `mistral3.rope.scaling.yarn_beta_fast` | float32 | YaRN fast rotation threshold (default 32.0) |
+| `mistral3.rope.scaling.yarn_beta_slow` | float32 | YaRN slow rotation threshold (default 1.0) |
+| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale (default 0) |
+| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim (default 0) |
+
+### Weight Naming Convention
+
+```
+token_embd.weight                         # Token embedding [vocab, hidden]
+blk.{L}.attn_norm.weight                  # Pre-attention RMSNorm
+blk.{L}.attn_q.weight                    # Q projection (before fusion)
+blk.{L}.attn_k.weight                    # K projection (before fusion)
+blk.{L}.attn_v.weight                    # V projection (before fusion)
+blk.{L}.attn_qkv.weight                  # Fused Q+K+V (after fusion)
+blk.{L}.attn_output.weight               # Output projection
+blk.{L}.ffn_norm.weight                  # Pre-FFN RMSNorm
+blk.{L}.ffn_gate.weight  }               # Before fusion: separate gate/up
+blk.{L}.ffn_up.weight    }
+blk.{L}.ffn_gate_up.weight               # After fusion: concatenated [2*intermed, hidden]
+blk.{L}.ffn_down.weight                  # FFN down projection
+output_norm.weight                       # Final RMSNorm
+output.weight                            # LM head (optional if tied)
+```
+
+### Vision Encoder Weights (Pixtral)
+
+```
+v.patch_conv.weight                      # Conv2D patch embedding [hidden, C, P, P]
+v.patch_conv.bias                        # Conv2D bias (optional)
+v.encoder_norm.weight                    # Encoder input RMSNorm
+v.blk.{L}.attn_norm.weight              # Pre-attention RMSNorm
+v.blk.{L}.attn_q.weight                 # Q projection
+v.blk.{L}.attn_k.weight                 # K projection
+v.blk.{L}.attn_v.weight                 # V projection
+v.blk.{L}.attn_output.weight            # Output projection
+v.blk.{L}.ffn_norm.weight               # Pre-FFN RMSNorm
+v.blk.{L}.ffn_gate.weight               # SiLU gate
+v.blk.{L}.ffn_up.weight                 # Up projection
+v.blk.{L}.ffn_down.weight               # Down projection
+mm.norm.weight                           # Projector RMSNorm
+mm.patch_merger.merging_layer.weight     # Spatial patch merger
+mm.linear_1.weight                       # Projector linear 1
+mm.linear_2.weight                       # Projector linear 2
+```
+
+### Forward Pass (per token)
+
+```
+tokens → Embedding → [InjectVision]
+For each layer L:
+  hidden → RMSNorm(attn_norm)
+         → QKV (fused or separate) → RoPE(GPT-J style, YaRN) → [PositionScale(Q)]
+         → Attention(full causal) → O projection
+         → residual add
+         → RMSNorm(ffn_norm)
+         → GateUp → SiLU(gate)*up → Down
+         → residual add
+hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
+```
+
+### KV Cache
+
+- Shape: `[numKVHeads, maxSeqLen, headDim]` per layer (separate key/value lengths supported: `_attnKeyLen` and `_attnValLen`).
+- `ResetKVCache()` fills all caches with 0 and calls `InvalidateTensorDeviceCache()` to sync GPU state.
+
+### Optimization Opportunities
+
+- No native decode path. The entire forward pass is managed C# with GGML-backed matmul. A native single-call decode path (like Qwen 3) would reduce managed overhead.
+- No fused GPU decode path. A single-graph approach (like Gemma 4) would significantly improve Metal/CUDA throughput.
+- Vision encoder dequantizes all weights to F32 at load time. Supporting quantized weights directly would reduce memory usage.
+
+---
+
 ## Architecture Comparison
 
-| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H |
-|---|---|---|---|---|---|---|
-| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) | MoE | Hybrid (Mamba2 + Attn + MoE FFN) |
-| Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks | Full GQA (no RoPE) |
-| FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² |
-| RoPE variant | NeoX (dual base) | NeoX + proportional | NeoX | NeoX / MRoPE | NeoX + Yarn | None |
-| QK norm | Yes | Yes | Yes | Yes | No | No |
-| V norm | No | Yes (unweighted) | No | No | No | No |
-| Bias in projections | No | No | No | No | Yes (all) | No |
-| Per-layer scaling | No | Yes | No | No | No | No |
-| PLE | No | Yes | No | No | No | No |
-| KV sharing | No | Yes | No | No | No | No |
-| Attention sinks | No | No | No | No | Yes | No |
-| Circular KV cache | No | Yes (SWA layers) | No | No | No | No |
-| SSM (Mamba2) | No | No | No | No | No | Yes |
-| Shared experts | No | No | No | No | No | Yes (optional) |
-| Latent bottleneck | No | No | No | No | No | Yes (optional) |
-| Vision | Yes | Yes | No | Yes | No | No |
-| Audio | No | Yes | No | No | No | No |
-| Video | No | Yes | No | No | No | No |
-| Thinking | No | Yes | Yes | Yes | Yes (always) | Yes |
-| Tool calling | No | Yes | Yes | Yes | No | Yes |
-| Fused QKV | No | Yes | Yes | No | No | Yes |
-| Fused GPU decode | No | Yes (Metal) | No | No | No | No |
-| Native model decode | No | No | Yes | No | No | No |
-| Batched GPU MoE | No | No | No | No | No | Yes |
-| Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) | Qwen3 |
+| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H | Mistral 3 |
+|---|---|---|---|---|---|---|---|
+| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
+| Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks | Full GQA (no RoPE) | Full GQA |
+| FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² | SwiGLU |
+| RoPE variant | NeoX (dual base) | NeoX + proportional | NeoX | NeoX / MRoPE | NeoX + Yarn | None | GPT-J + YaRN |
+| QK norm | Yes | Yes | Yes | Yes | No | No | No |
+| V norm | No | Yes (unweighted) | No | No | No | No | No |
+| Bias in projections | No | No | No | No | Yes (all) | No | No |
+| Per-layer scaling | No | Yes | No | No | No | No | No |
+| PLE | No | Yes | No | No | No | No | No |
+| KV sharing | No | Yes | No | No | No | No | No |
+| Attention sinks | No | No | No | No | Yes | No | No |
+| Circular KV cache | No | Yes (SWA layers) | No | No | No | No | No |
+| SSM (Mamba2) | No | No | No | No | No | Yes | No |
+| Shared experts | No | No | No | No | No | Yes (optional) | No |
+| Latent bottleneck | No | No | No | No | No | Yes (optional) | No |
+| Position-dependent Q scaling | No | No | No | No | No | No | Yes (YaRN) |
+| Vision | Yes | Yes | No | Yes | No | No | Yes |
+| Audio | No | Yes | No | No | No | No | No |
+| Video | No | Yes | No | No | No | No | No |
+| Thinking | No | Yes | Yes | Yes | Yes (always) | Yes | No |
+| Tool calling | No | Yes | Yes | Yes | No | Yes | No |
+| Fused QKV | No | Yes | Yes | No | No | Yes | Yes |
+| Fused GPU decode | No | Yes (Metal) | No | No | No | No | No |
+| Native model decode | No | No | Yes | No | No | No | No |
+| Batched GPU MoE | No | No | No | No | No | Yes | No |
+| Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) | Qwen3 | Passthrough |
 
 ---
 

@@ -111,6 +111,7 @@ namespace TensorSharp.Models
 
         private void InitKVCache(int maxSeqLen)
         {
+            _maxContextLength = maxSeqLen;
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
 

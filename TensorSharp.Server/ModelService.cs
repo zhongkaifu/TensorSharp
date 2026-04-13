@@ -34,6 +34,7 @@ namespace TensorSharp.Server
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
+        public string LoadedMmProjName => _loadedMmProjPath != null ? Path.GetFileName(_loadedMmProjPath) : null;
         public string LoadedBackend => _model != null ? BackendCatalog.ToBackendValue(_backend) : null;
         public string Architecture => _model?.Config?.Architecture;
         public ModelBase Model => _model;
@@ -54,6 +55,7 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Load a model. Must be called within the InferenceQueue to prevent concurrent access.
+        /// When mmProjPath is null, auto-detection is used. Pass empty string to skip mmproj loading.
         /// </summary>
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
@@ -78,7 +80,7 @@ namespace TensorSharp.Server
             if (mmProjPath == null)
                 mmProjPath = AutoDetectMmProj(modelPath);
 
-            if (mmProjPath != null && File.Exists(mmProjPath))
+            if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))
             {
                 LoadEncoders(mmProjPath);
                 _loadedMmProjPath = mmProjPath;
@@ -140,6 +142,20 @@ namespace TensorSharp.Server
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
+
+            int maxCtx = _model.MaxContextLength;
+            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
+            {
+                int available = maxCtx - maxTokens;
+                if (available < 1)
+                    throw new InvalidOperationException(
+                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                        "Please shorten the input or reduce attached file size.");
+
+                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
+                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
+                _cachedTokens = null;
+            }
 
             float[] logits;
             int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
@@ -463,6 +479,19 @@ namespace TensorSharp.Server
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedMessages, inputTokens);
 
+            int maxCtx = _model.MaxContextLength;
+            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
+            {
+                int available = maxCtx - maxTokens;
+                if (available < 1)
+                    throw new InvalidOperationException(
+                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                        "Please shorten the input or reduce attached file size.");
+
+                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
+                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
+            }
+
             InvalidateKVCache();
 
             var sw = Stopwatch.StartNew();
@@ -533,6 +562,20 @@ namespace TensorSharp.Server
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
+
+            int maxCtx = _model.MaxContextLength;
+            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
+            {
+                int available = maxCtx - maxTokens;
+                if (available < 1)
+                    throw new InvalidOperationException(
+                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                        "Please shorten the input or reduce attached file size.");
+
+                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
+                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
+                _cachedTokens = null;
+            }
 
             int promptTokenCount;
             var sw = Stopwatch.StartNew();
@@ -760,8 +803,24 @@ namespace TensorSharp.Server
             if (!Directory.Exists(directory)) return new List<string>();
             return Directory.GetFiles(directory, "*.gguf")
                 .Select(Path.GetFileName)
+                .Where(f => !IsMmProjFile(f))
                 .OrderBy(f => f)
                 .ToList();
+        }
+
+        public List<string> ScanMmProjModels(string directory)
+        {
+            if (!Directory.Exists(directory)) return new List<string>();
+            return Directory.GetFiles(directory, "*.gguf")
+                .Select(Path.GetFileName)
+                .Where(IsMmProjFile)
+                .OrderBy(f => f)
+                .ToList();
+        }
+
+        private static bool IsMmProjFile(string fileName)
+        {
+            return fileName.IndexOf("mmproj", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         public void Dispose()

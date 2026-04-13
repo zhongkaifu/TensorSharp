@@ -280,6 +280,7 @@ namespace TensorSharp.Models
 
         private void InitCaches(int maxSeqLen)
         {
+            _maxContextLength = maxSeqLen;
             int numLayers = Config.NumLayers;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
