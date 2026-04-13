@@ -39,6 +39,9 @@ namespace TensorSharp.Models
                 case Qwen35Model q35:
                     q35.LoadVisionEncoder(mmProjPath);
                     break;
+                case Mistral3Model m3:
+                    m3.LoadVisionEncoder(mmProjPath);
+                    break;
             }
         }
 
@@ -53,6 +56,8 @@ namespace TensorSharp.Models
                 return ProcessGemma3History(g3, history, inputTokens);
             if (_model is Qwen35Model q35)
                 return ProcessQwen35History(q35, history, inputTokens);
+            if (_model is Mistral3Model m3)
+                return ProcessMistral3History(m3, history, inputTokens);
 
             return inputTokens;
         }
@@ -214,6 +219,65 @@ namespace TensorSharp.Models
                 {
                     embeddings.Dispose();
                 }
+            }
+
+            return inputTokens;
+        }
+
+        private List<int> ProcessMistral3History(Mistral3Model model, List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (model.VisionEncoder == null)
+                return inputTokens;
+
+            var imagePaths = GetImagePathsInPromptOrder(history);
+            if (imagePaths.Count == 0)
+                return inputTokens;
+
+            var processor = new Mistral3ImageProcessor(
+                model.VisionEncoder.ImageSize,
+                model.VisionEncoder.PatchSize);
+
+            int searchFrom = 0;
+            foreach (var imagePath in imagePaths)
+            {
+                var (pixels, imgW, imgH) = processor.ProcessImage(imagePath);
+                var embeddings = model.VisionEncoder.Encode(pixels, imgW, imgH);
+                int numRows = imgH / model.VisionEncoder.PatchSize / model.VisionEncoder.SpatialMergeSize;
+                int numCols = imgW / model.VisionEncoder.PatchSize / model.VisionEncoder.SpatialMergeSize;
+
+                // Find [IMG] token position
+                int tokenPosition = FindTokenPosition(inputTokens, Mistral3ImageProcessor.ImgTokenId, searchFrom);
+                if (tokenPosition < 0)
+                {
+                    embeddings.Dispose();
+                    continue;
+                }
+
+                // Expand: for each row, insert numCols [IMG] tokens, then [IMG_BREAK] or [IMG_END]
+                var expanded = new List<int>();
+                for (int i = 0; i < tokenPosition; i++)
+                    expanded.Add(inputTokens[i]);
+
+                int embedOffset = 0;
+                for (int row = 0; row < numRows; row++)
+                {
+                    for (int col = 0; col < numCols; col++)
+                    {
+                        expanded.Add(Mistral3ImageProcessor.ImgTokenId);
+                        embedOffset++;
+                    }
+                    if (row == numRows - 1)
+                        expanded.Add(Mistral3ImageProcessor.ImgEndTokenId);
+                    else
+                        expanded.Add(Mistral3ImageProcessor.ImgBreakTokenId);
+                }
+
+                for (int i = tokenPosition + 1; i < inputTokens.Count; i++)
+                    expanded.Add(inputTokens[i]);
+
+                model.SetVisionEmbeddings(embeddings, tokenPosition);
+                inputTokens = expanded;
+                searchFrom = tokenPosition + numRows * numCols + numRows;
             }
 
             return inputTokens;

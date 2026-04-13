@@ -241,6 +241,10 @@ namespace TensorSharp.Models
             var result = new Tensor(_allocator, DType.Float32, postAttnNormed.Sizes);
             Ops.Add(result, postAttnNormed, postFfnNormed);
 
+            string scaleKey = $"v.blk.{blockIdx}.out_scale.weight";
+            if (_weights.TryGetValue(scaleKey, out var scaleTensor))
+                Ops.Mul(result, result, scaleTensor);
+
             return result;
         }
 
@@ -460,6 +464,14 @@ namespace TensorSharp.Models
             // Scale by sqrt(hiddenSize)
             float scale = MathF.Sqrt(_hiddenSize);
             Ops.Mul(pooled, pooled, scale);
+
+            // Vision standardization before projection (matches Ollama)
+            if (_weights.TryGetValue("v.std_bias", out var stdBias) &&
+                _weights.TryGetValue("v.std_scale", out var stdScale))
+            {
+                Ops.Sub(pooled, pooled, stdBias);
+                Ops.Mul(pooled, pooled, stdScale);
+            }
 
             // Project to text dimension + unweighted RMSNorm
             var projected = LinearProjection(pooled, "mm.input_projection.weight");

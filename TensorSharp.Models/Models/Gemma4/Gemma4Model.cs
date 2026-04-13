@@ -320,6 +320,7 @@ namespace TensorSharp.Models
 
         private void InitKVCache(int maxSeqLen)
         {
+            _maxContextLength = maxSeqLen;
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             _kvCacheSize = new int[Config.NumLayers];
@@ -400,10 +401,16 @@ namespace TensorSharp.Models
 
             ScaleEmbedding(hidden);
 
+            HashSet<int> exceptPositions = null;
+
             if (_pendingVisionEmbeddingsList.Count > 0)
             {
+                exceptPositions = new HashSet<int>();
                 foreach (var (emb, pos) in _pendingVisionEmbeddingsList)
                 {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -412,8 +419,12 @@ namespace TensorSharp.Models
 
             if (_pendingAudioEmbeddingsList.Count > 0)
             {
+                exceptPositions ??= new HashSet<int>();
                 foreach (var (emb, pos) in _pendingAudioEmbeddingsList)
                 {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -442,7 +453,7 @@ namespace TensorSharp.Models
                         perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
 
                     bool isShared = _kvDonorMap.ContainsKey(l);
-                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput);
+                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
 
                     perLayerInput?.Dispose();
                 }
@@ -901,13 +912,13 @@ namespace TensorSharp.Models
         }
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
-            bool isShared, Tensor perLayerInput)
+            bool isShared, Tensor perLayerInput, HashSet<int> exceptPositions = null)
         {
             string prefix = $"blk.{layer}";
 
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
 
-            using var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared);
+            using var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared, exceptPositions);
 
             using var postAttnNormed = RMSNormOp(attnOut, $"{prefix}.post_attention_norm.weight");
 
@@ -1305,7 +1316,7 @@ namespace TensorSharp.Models
 
         #region Attention
 
-        private Tensor Attention(Tensor input, int layer, string prefix, int seqLen, int startPos, bool isShared)
+        private Tensor Attention(Tensor input, int layer, string prefix, int seqLen, int startPos, bool isShared, HashSet<int> exceptPositions = null)
         {
             long t0 = Stopwatch.GetTimestamp();
             bool isLocal = IsLocalLayer(layer);
@@ -1504,7 +1515,8 @@ namespace TensorSharp.Models
                 kExpanded.Dispose();
 
                 int windowSize = isLocal ? _slidingWindow : 0;
-                ApplyCausalMask(scores, seqLen, kvLen, windowSize);
+                HashSet<int> maskExcept = isLocal ? null : exceptPositions;
+                ApplyCausalMask(scores, seqLen, kvLen, windowSize, maskExcept);
                 Ops.Softmax(scores, scores);
 
                 var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
@@ -1756,10 +1768,38 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(cache);
         }
 
-        private unsafe void ApplyCausalMask(Tensor scores, int queryLen, int totalKVLen, int windowSize)
+        private unsafe void ApplyCausalMask(Tensor scores, int queryLen, int totalKVLen, int windowSize,
+            HashSet<int> exceptPositions = null)
         {
             int startPos = totalKVLen - queryLen;
-            Ops.AddCausalMask(scores, queryLen, startPos, float.NegativeInfinity);
+
+            if (exceptPositions != null && exceptPositions.Count > 0)
+            {
+                float* sPtr = GetFloatPtr(scores);
+                int numHeads = (int)scores.Sizes[0];
+                int rowStride = queryLen * totalKVLen;
+
+                for (int h = 0; h < numHeads; h++)
+                {
+                    float* headScores = sPtr + h * rowStride;
+                    for (int q = 0; q < queryLen; q++)
+                    {
+                        int queryAbsPos = startPos + q;
+                        bool queryIsExcept = exceptPositions.Contains(queryAbsPos);
+                        float* row = headScores + q * totalKVLen;
+                        for (int kv = queryAbsPos + 1; kv < totalKVLen; kv++)
+                        {
+                            if (!queryIsExcept && !exceptPositions.Contains(kv))
+                                row[kv] = float.NegativeInfinity;
+                        }
+                    }
+                }
+                InvalidateTensorDeviceCache(scores);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, queryLen, startPos, float.NegativeInfinity);
+            }
 
             if (windowSize > 0)
             {
@@ -1782,6 +1822,7 @@ namespace TensorSharp.Models
                         }
                     }
                 }
+                InvalidateTensorDeviceCache(scores);
             }
         }
 

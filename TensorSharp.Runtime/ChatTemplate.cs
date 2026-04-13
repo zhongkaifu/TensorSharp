@@ -321,6 +321,9 @@ namespace TensorSharp.Runtime
             if (IsQwen35Family(architecture) && !enableThinking)
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
 
+            if (architecture == "mistral3")
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
@@ -370,6 +373,9 @@ namespace TensorSharp.Runtime
 
             if (architecture == "nemotron_h" || architecture == "nemotron_h_moe")
                 return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+
+            if (architecture == "mistral3")
+                return RenderMistral3(messages, addGenerationPrompt);
 
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
@@ -513,6 +519,12 @@ namespace TensorSharp.Runtime
                         foreach (var _ in msg.ImagePaths)
                             sb.Append("<|vision_start|><|image_pad|><|vision_end|>");
                 }
+                else if (architecture == "mistral3")
+                {
+                    if (msg.ImagePaths != null)
+                        foreach (var _ in msg.ImagePaths)
+                            sb.Append("[IMG]");
+                }
 
                 sb.Append(msg.Content ?? "");
 
@@ -526,6 +538,42 @@ namespace TensorSharp.Runtime
                 });
             }
             return result;
+        }
+
+        /// <summary>
+        /// Render Mistral 3 chat template.
+        /// Uses [SYSTEM_PROMPT]...[/SYSTEM_PROMPT] for system messages
+        /// and [INST]...[/INST] for user messages.
+        /// </summary>
+        public static string RenderMistral3(List<ChatMessage> messages, bool addGenerationPrompt = true)
+        {
+            var sb = new StringBuilder();
+            int startIdx = 0;
+
+            if (messages.Count > 0 && messages[0].Role == "system")
+            {
+                sb.Append("[SYSTEM_PROMPT]");
+                sb.Append(messages[0].Content);
+                sb.Append("[/SYSTEM_PROMPT]");
+                startIdx = 1;
+            }
+
+            for (int i = startIdx; i < messages.Count; i++)
+            {
+                var msg = messages[i];
+                if (msg.Role == "user")
+                {
+                    sb.Append("[INST]");
+                    sb.Append(msg.Content);
+                    sb.Append("[/INST]");
+                }
+                else if (msg.Role == "assistant")
+                {
+                    sb.Append(msg.Content);
+                }
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>

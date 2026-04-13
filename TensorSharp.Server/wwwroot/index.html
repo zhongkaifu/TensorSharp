@@ -781,7 +781,7 @@ button.primary:hover { background: var(--accent-hover); }
   <div id="chat-container">
     <div class="empty-state" id="empty-state">
       <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
-      <p>Load a model and start chatting. You can attach images, videos, and audio files for multimodal inference.</p>
+      <p>Load a model and start chatting. You can attach images, videos, audio, and text files for multimodal inference.</p>
       <button class="primary" onclick="showSettings()">Load Model</button>
     </div>
   </div>
@@ -808,7 +808,7 @@ button.primary:hover { background: var(--accent-hover); }
         </div>
       </div>
     </div>
-    <input type="file" id="file-input" accept="image/*,video/*,audio/*" onchange="handleFileSelect(event)">
+    <input type="file" id="file-input" accept="image/*,video/*,audio/*,.txt,.csv,.json,.xml,.md,.log,.py,.js,.ts,.cs,.java,.cpp,.c,.h,.html,.css,.yaml,.yml,.toml,.ini,.cfg,.sh,.bat,.ps1,.rb,.go,.rs,.swift,.kt,.sql,.r,.m,.tex,.rtf" onchange="handleFileSelect(event)">
   </div>
 </div>
 
@@ -818,6 +818,12 @@ button.primary:hover { background: var(--accent-hover); }
     <div class="field">
       <label>Model</label>
       <select id="model-select"><option>Loading...</option></select>
+    </div>
+    <div class="field">
+      <label>Vision Model (mmproj)</label>
+      <select id="mmproj-select">
+        <option value="auto">Auto-detect</option>
+      </select>
     </div>
     <div class="field">
       <label>Backend</label>
@@ -885,6 +891,7 @@ async function fetchModels() {
     availableModels = data.models || [];
     currentLoadedModel = data.loaded || null;
     populateBackendSelect(data.supportedBackends || [], data.loadedBackend || data.defaultBackend);
+    populateMmProjSelect(data.mmProjModels || [], data.loadedMmProj);
 
     const select = document.getElementById('model-select');
     select.innerHTML = '';
@@ -937,6 +944,37 @@ function populateBackendSelect(backends, preferredBackend) {
   select.value = selectedValue;
 }
 
+function populateMmProjSelect(mmProjModels, loadedMmProj) {
+  const select = document.getElementById('mmproj-select');
+  const currentValue = select.value;
+  select.innerHTML = '';
+
+  const autoOpt = document.createElement('option');
+  autoOpt.value = 'auto';
+  autoOpt.textContent = 'Auto-detect';
+  select.appendChild(autoOpt);
+
+  const noneOpt = document.createElement('option');
+  noneOpt.value = 'none';
+  noneOpt.textContent = 'None (text only)';
+  select.appendChild(noneOpt);
+
+  mmProjModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    select.appendChild(opt);
+  });
+
+  if (loadedMmProj && mmProjModels.includes(loadedMmProj)) {
+    select.value = loadedMmProj;
+  } else if (currentValue && [...select.options].some(o => o.value === currentValue)) {
+    select.value = currentValue;
+  } else {
+    select.value = 'auto';
+  }
+}
+
 function hasActiveChat() {
   return chatHistory.length > 0;
 }
@@ -956,6 +994,7 @@ function updateInlineModelStatus() {
 function updateSettingsLockState() {
   const lockModelSelection = hasActiveChat();
   const modelSelect = document.getElementById('model-select');
+  const mmProjSelect = document.getElementById('mmproj-select');
   const backendSelect = document.getElementById('backend-select');
   const loadButton = document.getElementById('btn-load');
   const settingsHint = document.getElementById('settings-hint');
@@ -968,6 +1007,10 @@ function updateSettingsLockState() {
 
   if (modelSelect) {
     modelSelect.disabled = lockModelSelection || availableModels.length === 0;
+  }
+
+  if (mmProjSelect) {
+    mmProjSelect.disabled = lockModelSelection;
   }
 
   if (backendSelect) {
@@ -986,6 +1029,7 @@ async function loadModel() {
   }
 
   const model = document.getElementById('model-select').value;
+  const mmproj = document.getElementById('mmproj-select').value;
   const backend = document.getElementById('backend-select').value;
   if (!backend) {
     alert('No supported backend is available on this machine.');
@@ -995,16 +1039,27 @@ async function loadModel() {
   btn.disabled = true;
   btn.textContent = 'Loading...';
 
+  const payload = { model, backend };
+  if (mmproj === 'none') {
+    payload.mmproj = 'none';
+  } else if (mmproj !== 'auto') {
+    payload.mmproj = mmproj;
+  }
+
   try {
     const res = await fetch('/api/models/load', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, backend })
+      body: JSON.stringify(payload)
     });
     const data = await res.json();
     if (data.ok) {
       currentLoadedModel = data.model;
-      statusBadge.textContent = data.model + ' (' + (data.architecture || '?') + ')';
+      let statusText = data.model + ' (' + (data.architecture || '?') + ')';
+      if (data.loadedMmProj) {
+        statusText += ' + ' + data.loadedMmProj;
+      }
+      statusBadge.textContent = statusText;
       statusBadge.classList.add('loaded');
       updateInlineModelStatus();
       hideSettings();
@@ -1031,14 +1086,14 @@ function clearChat() {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
         <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
-        <p>Load a model and start chatting. You can attach images, videos, and audio files for multimodal inference.</p>
+        <p>Load a model and start chatting. You can attach images, videos, audio, and text files for multimodal inference.</p>
         <button class="primary" onclick="showSettings()">Load Model</button>
       </div>`;
   } else {
     chatContainer.innerHTML = `
       <div class="empty-state">
         <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
-        <p>Start a conversation with the loaded model. To switch models, start a new chat first. You can still attach images, videos, and audio files.</p>
+        <p>Start a conversation with the loaded model. To switch models, start a new chat first. You can still attach images, videos, audio, and text files.</p>
       </div>`;
   }
 }
@@ -1057,6 +1112,9 @@ async function handleFileSelect(event) {
     if (data.ok) {
       pendingAttachments.push(data);
       renderAttachments();
+      if (data.truncated) {
+        alert(`Note: "${data.fileName}" was truncated to fit within the context limit. Only the first portion of the file will be sent to the model.`);
+      }
     } else {
       alert('Upload failed: ' + data.error);
     }
@@ -1074,6 +1132,7 @@ function renderAttachments() {
     if (att.mediaType === 'image') icon = '&#x1F5BC;';
     else if (att.mediaType === 'video') icon = '&#x1F3AC;';
     else if (att.mediaType === 'audio') icon = '&#x1F3B5;';
+    else if (att.mediaType === 'text') icon = '&#x1F4DD;';
     chip.innerHTML = `${icon} ${att.fileName} <span class="remove" onclick="removeAttachment(${idx})">&times;</span>`;
     attachmentsDiv.appendChild(chip);
   });
@@ -1099,6 +1158,7 @@ async function sendMessage() {
   const imagePaths = [];
   const audioPaths = [];
   let isVideo = false;
+  const textParts = [];
   const attachmentsCopy = [...pendingAttachments];
 
   attachmentsCopy.forEach(att => {
@@ -1109,8 +1169,15 @@ async function sendMessage() {
       if (att.framePaths) att.framePaths.forEach(f => imagePaths.push(f));
     } else if (att.mediaType === 'audio') {
       audioPaths.push(att.path);
+    } else if (att.mediaType === 'text' && att.textContent) {
+      textParts.push(`[File: ${att.fileName}]\n${att.textContent}\n[End of file]`);
     }
   });
+
+  if (textParts.length > 0) {
+    const fileContext = textParts.join('\n\n');
+    msg.content = fileContext + '\n\n' + msg.content;
+  }
 
   if (imagePaths.length > 0) msg.imagePaths = imagePaths;
   if (audioPaths.length > 0) msg.audioPaths = audioPaths;
@@ -1221,7 +1288,12 @@ async function requestAssistantResponse() {
             chatContainer.scrollTop = chatContainer.scrollHeight;
           }
           if (data.done) {
-            statsDiv.textContent = `${data.tokenCount} tokens \u00B7 ${data.elapsed.toFixed(1)}s \u00B7 ${data.tokPerSec.toFixed(1)} tok/s`;
+            if (data.error) {
+              bubbleText.textContent = 'Error: ' + data.error;
+              statsDiv.textContent = 'Inference failed';
+            } else {
+              statsDiv.textContent = `${data.tokenCount} tokens \u00B7 ${data.elapsed.toFixed(1)}s \u00B7 ${data.tokPerSec.toFixed(1)} tok/s`;
+            }
           }
         } catch {}
       }
@@ -1383,6 +1455,7 @@ function describeAttachments() {
   if (types.includes('video')) return 'What is happening in this video?';
   if (types.includes('audio')) return 'Listen to this audio and describe what you hear.';
   if (types.includes('image')) return 'What is in this image?';
+  if (types.includes('text')) return 'Please analyze the attached text file and summarize its content.';
   return 'Describe the attached file.';
 }
 
@@ -1399,6 +1472,8 @@ function addUserBubble(text, attachments, historyIdx) {
       mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3AC; ${att.fileName}</div></div>`;
     } else if (att.mediaType === 'audio') {
       mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3B5; ${att.fileName}</div></div>`;
+    } else if (att.mediaType === 'text') {
+      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F4DD; ${att.fileName}</div></div>`;
     }
   });
 

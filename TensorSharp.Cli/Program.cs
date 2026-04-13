@@ -143,6 +143,15 @@ namespace TensorSharp.Cli
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
+            else if (imagePath != null && model.Config.Architecture == "mistral3")
+            {
+                string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "mistral3-mmproj.gguf");
+                if (File.Exists(autoMmproj))
+                {
+                    Console.WriteLine($"Auto-loading Mistral3 vision encoder: {autoMmproj}");
+                    model.MultimodalInjector.LoadProjectors(autoMmproj);
+                }
+            }
             else if ((imagePath != null || audioPath != null || videoPath != null)
                      && model.Config.Architecture == "gemma4")
             {
@@ -777,6 +786,69 @@ namespace TensorSharp.Cli
                         Console.WriteLine($"Total tokens after image expansion: {inputTokens.Count}");
                     }
                     else if (imagePaths.Count > 0)
+                    {
+                        Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
+                else if (arch == "mistral3")
+                {
+                    if (model is Mistral3Model m3 && m3.VisionEncoder != null)
+                    {
+                        var proc = new Mistral3ImageProcessor(
+                            m3.VisionEncoder.ImageSize,
+                            m3.VisionEncoder.PatchSize);
+
+                        int imgTokenId = Mistral3ImageProcessor.ImgTokenId;
+                        int imgBreakId = Mistral3ImageProcessor.ImgBreakTokenId;
+                        int imgEndId = Mistral3ImageProcessor.ImgEndTokenId;
+
+                        foreach (var imgP in imagePaths)
+                        {
+                            var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
+                            var visionEmb = m3.VisionEncoder.Encode(pixels, imgW, imgH);
+                            int numRows = imgH / m3.VisionEncoder.PatchSize / m3.VisionEncoder.SpatialMergeSize;
+                            int numCols = imgW / m3.VisionEncoder.PatchSize / m3.VisionEncoder.SpatialMergeSize;
+
+                            int tokenPosition = -1;
+                            for (int i = 0; i < inputTokens.Count; i++)
+                            {
+                                if (inputTokens[i] == imgTokenId)
+                                {
+                                    tokenPosition = i;
+                                    break;
+                                }
+                            }
+
+                            if (tokenPosition >= 0)
+                            {
+                                var expanded = new List<int>();
+                                for (int i = 0; i < tokenPosition; i++)
+                                    expanded.Add(inputTokens[i]);
+
+                                for (int row = 0; row < numRows; row++)
+                                {
+                                    for (int col = 0; col < numCols; col++)
+                                        expanded.Add(imgTokenId);
+                                    expanded.Add(row == numRows - 1 ? imgEndId : imgBreakId);
+                                }
+
+                                for (int i = tokenPosition + 1; i < inputTokens.Count; i++)
+                                    expanded.Add(inputTokens[i]);
+
+                                m3.SetVisionEmbeddings(visionEmb, tokenPosition);
+                                inputTokens = expanded;
+                                Console.WriteLine($"Mistral3 vision: {numRows}x{numCols} merged patches, " +
+                                    $"{numRows * numCols + numRows} total tokens at pos {tokenPosition}");
+                            }
+                            else
+                            {
+                                visionEmb.Dispose();
+                                Console.WriteLine("Warning: No [IMG] token found in prompt");
+                            }
+                        }
+                        Console.WriteLine($"Total tokens after image expansion: {inputTokens.Count}");
+                    }
+                    else
                     {
                         Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }

@@ -62,6 +62,11 @@ app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions
     RequestPath = "/uploads"
 });
 
+int maxTextFileChars = 8000;
+string maxTextEnv = Environment.GetEnvironmentVariable("MAX_TEXT_FILE_CHARS");
+if (!string.IsNullOrEmpty(maxTextEnv) && int.TryParse(maxTextEnv, out int envMax) && envMax > 0)
+    maxTextFileChars = envMax;
+
 string modelDir = Environment.GetEnvironmentVariable("MODEL_DIR")
     ?? Path.Combine(AppContext.BaseDirectory, "models");
 string configuredBackend = Environment.GetEnvironmentVariable("BACKEND")
@@ -121,10 +126,13 @@ app.MapGet("/api/queue/status", (InferenceQueue queue) =>
 app.MapGet("/api/models", (ModelService svc) =>
 {
     var files = svc.ScanModels(modelDir);
+    var mmProjFiles = svc.ScanMmProjModels(modelDir);
     return Results.Json(new
     {
         models = files,
+        mmProjModels = mmProjFiles,
         loaded = svc.LoadedModelName,
+        loadedMmProj = svc.LoadedMmProjName,
         loadedBackend = svc.LoadedBackend,
         defaultBackend,
         supportedBackends,
@@ -147,7 +155,23 @@ app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelSe
     if (!File.Exists(modelPath))
         return Results.NotFound(new { error = $"Model not found: {modelName}" });
 
-    string mmProjPath = mmproj != null ? Path.Combine(modelDir, mmproj) : null;
+    // mmproj handling:
+    //   null/absent  -> auto-detect (ModelService default)
+    //   ""/"none"    -> explicitly no mmproj (pass empty string to skip auto-detect)
+    //   "filename"   -> use that specific mmproj file
+    string mmProjPath;
+    if (mmproj == null)
+    {
+        mmProjPath = null; // auto-detect
+    }
+    else if (string.IsNullOrWhiteSpace(mmproj) || string.Equals(mmproj, "none", StringComparison.OrdinalIgnoreCase))
+    {
+        mmProjPath = ""; // explicit skip
+    }
+    else
+    {
+        mmProjPath = Path.Combine(modelDir, mmproj);
+    }
 
     using var ticket = queue.Enqueue(ctx.RequestAborted);
     await ticket.WaitUntilReadyAsync();
@@ -159,6 +183,7 @@ app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelSe
         {
             ok = true,
             model = svc.LoadedModelName,
+            loadedMmProj = svc.LoadedMmProjName,
             architecture = svc.Architecture
         });
     }
@@ -190,6 +215,11 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
         ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp" => "image",
         ".mp4" or ".mov" or ".avi" or ".mkv" or ".webm" => "video",
         ".mp3" or ".wav" or ".ogg" or ".flac" or ".m4a" => "audio",
+        ".txt" or ".csv" or ".json" or ".xml" or ".md" or ".log"
+            or ".py" or ".js" or ".ts" or ".cs" or ".java" or ".cpp" or ".c" or ".h"
+            or ".html" or ".css" or ".yaml" or ".yml" or ".toml" or ".ini" or ".cfg"
+            or ".sh" or ".bat" or ".ps1" or ".rb" or ".go" or ".rs" or ".swift"
+            or ".kt" or ".sql" or ".r" or ".m" or ".tex" or ".rtf" => "text",
         _ => "unknown"
     };
 
@@ -205,6 +235,18 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
             frames = frames.Select(f => Path.GetFileName(f)).ToList(),
             framePaths = frames
         });
+    }
+
+    if (mediaType == "text")
+    {
+        string textContent = await File.ReadAllTextAsync(savePath);
+        bool truncated = false;
+        if (textContent.Length > maxTextFileChars)
+        {
+            textContent = textContent.Substring(0, maxTextFileChars);
+            truncated = true;
+        }
+        return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName, textContent, truncated });
     }
 
     return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName });
@@ -292,6 +334,7 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
     }
 
     bool aborted = false;
+    string inferenceError = null;
     try
     {
         await foreach (var piece in svc.ChatStreamAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
@@ -336,6 +379,11 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
         }
     }
     catch (OperationCanceledException) { aborted = true; }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[Chat error] {ex.Message}");
+        inferenceError = ex.Message;
+    }
 
     try
     {
@@ -372,7 +420,7 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
         sw.Stop();
         double tokPerSec = tokenCount > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
         string done = JsonSerializer.Serialize(new { done = true, tokenCount, elapsed = sw.Elapsed.TotalSeconds, tokPerSec,
-            aborted });
+            aborted, error = inferenceError });
         await ctx.Response.WriteAsync($"data: {done}\n\n");
         await ctx.Response.Body.FlushAsync();
     }

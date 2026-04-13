@@ -10,8 +10,8 @@
 
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS、Nemotron-H
-- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5）
+- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS、Nemotron-H、Mistral 3
+- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5 / Mistral 3）
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
@@ -38,6 +38,7 @@
 | Qwen 3.5 | Qwen3.5-9B、Qwen3.5-35B-A3B | 图像 | 支持 | 支持 |
 | GPT OSS | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
 | Nemotron-H | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE） | 仅文本 | 支持 | 支持 |
+| Mistral 3 | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 |
 
 各架构的详细文档见[模型架构卡片](docs/model_cards_cn.md)。
 
@@ -58,6 +59,8 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | GPT OSS | gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) |
 | Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
+| Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
+| Mistral 3 | mistral3-mmproj（Pixtral 视觉投影器） | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 
 ## 计算后端
 
@@ -369,6 +372,12 @@ Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`ge
 
 这两类模型支持图像输入，并需要对应的多模态投影器文件。
 
+### Mistral 3
+
+Mistral 3 通过 Pixtral 视觉编码器支持图像输入。将多模态投影器（`mistral3-mmproj.gguf`）放在与模型文件相同目录即可自动加载。
+
+- **图像：** PNG、JPEG
+
 ## 架构说明
 
 TensorSharp 采用分层系统结构：
@@ -377,7 +386,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析，以及 `IModelArchitecture`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、Qwen 3/3.5、GPT OSS、Nemotron-H）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
 

@@ -95,7 +95,11 @@ namespace TensorSharp.Models
         private bool _quantBackendReady;
 
         protected int _cacheSeqLen;
+        protected int _maxContextLength;
         protected float[] _logitsBuffer;
+
+        public int MaxContextLength => _maxContextLength;
+        public int CacheSeqLen => _cacheSeqLen;
 
         // Timing
         protected long _linearTicks;
@@ -941,6 +945,7 @@ namespace TensorSharp.Models
                 "gemma4" => new Gemma4Model(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend),
+                "mistral3" => new Mistral3Model(ggufPath, backend),
                 _ => throw new NotSupportedException($"Unsupported architecture: {arch}"),
             };
         }

@@ -2,7 +2,7 @@
 
 [English](model_cards.md) | [中文](model_cards_cn.md)
 
-TensorSharp 支持六种模型架构。本文档面向需要修改、优化或扩展模型实现的工程师。
+TensorSharp 支持七种模型架构。本文档面向需要修改、优化或扩展模型实现的工程师。
 
 所有模型类位于 `TensorSharp.Models/Models/<Name>/` 目录下，继承自 `ModelBase`（`TensorSharp.Models/ModelBase.cs`）。`ModelBase` 提供共享基础设施：GGUF 加载、权重存储（`_weights` 存 F32、`_quantWeights` 存量化权重）、KV 缓存辅助方法、嵌入查询、RMSNorm、线性前向、RoPE 工具函数、性能计时，以及 `Forward(int[] tokens) → float[]` 接口。
 
@@ -619,35 +619,145 @@ hidden → RMSNorm(output_norm) → 截取最后 token → LM head → logits
 
 ---
 
+## Mistral 3
+
+| 属性 | 值 |
+|---|---|
+| 源文件 | `TensorSharp.Models/Models/Mistral3/Mistral3Model.cs` |
+| 提供方 | Mistral AI |
+| GGUF 架构标识 | `mistral3` |
+| 示例模型 | Mistral-Small-3.1-24B-Instruct |
+| 模态 | 文本、图像 |
+| 思维链模式 | 不支持 |
+| 工具调用 | 不支持 |
+| 输出解析器 | `PassthroughOutputParser` |
+
+### 架构概述
+
+Mistral 3 是一个标准的 LLaMA 风格密集型 Transformer，具有几个显著特性。
+
+- **注意力**：GQA，`Config.NumKVHeads < Config.NumHeads`。支持融合 QKV 投影为单个 `attn_qkv.weight`，也可回退到独立的 Q/K/V 权重。
+- **无 QK 归一化**：与 Qwen 3 和 Gemma 3/4 不同，Mistral 3 不对 Q 和 K 应用逐头 RMSNorm。
+- **RoPE**：GPT-J（norm）风格——配对相邻元素 `(x[2i], x[2i+1])`。使用 YaRN 缩放实现扩展上下文：频率校正在外推频率和插值频率之间根据慢/快旋转范围进行插值。
+- **位置依赖的 Q 缩放**：`q *= (1 + beta * log(1 + floor(pos / orig_ctx)))`。仅在 `_ropeOrigCtx > 0` 时启用。此缩放有助于在超出原始训练上下文长度的位置保持注意力质量。
+- **FFN**：SwiGLU——`SiLU(gate) * up`（通过 `Ops.SiLUMul`），然后 `down`。使用融合的 `ffn_gate_up.weight`。
+- **归一化**：每块两个 RMSNorm——`attn_norm` 和 `ffn_norm`。
+- **输出**：当 `output.weight` 不存在时，与 `token_embd.weight` 绑定。
+- **视觉**：`Mistral3VisionEncoder`（Pixtral 架构）通过 `LoadVisionEncoder(mmProjPath)` 单独加载。包含 Conv2D 补丁嵌入、RMSNorm、2D RoPE 位置嵌入、SiLU 门控 MLP Transformer 块、空间补丁合并，以及多模态投影器（RMSNorm → PatchMerger → Linear → GELU → Linear）。视觉嵌入在图像 token 位置注入文本隐状态。
+- **图像处理**：`Mistral3ImageProcessor` 将透明图像合成到白色背景上，按 `longest_edge` 缩放并保持宽高比，填充至可被 `patch_size` 整除，使用 CLIP 默认均值/标准差归一化。
+
+### GGUF 元数据键
+
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `mistral3.rope.dimension_count` | uint32 | RoPE 维度数 |
+| `mistral3.rope.scaling.type` | string | RoPE 缩放类型（如 `yarn`）|
+| `mistral3.attention.temperature_scale` | float32 | 位置依赖 Q 缩放 beta（默认 0.1）|
+| `mistral3.rope.scaling.original_context_length` | uint32 | YaRN 原始上下文长度 |
+| `mistral3.rope.scaling.extrapolation_factor` | float32 | YaRN 外推因子（默认 1.0）|
+| `mistral3.rope.scaling.yarn_beta_fast` | float32 | YaRN 快旋转阈值（默认 32.0）|
+| `mistral3.rope.scaling.yarn_beta_slow` | float32 | YaRN 慢旋转阈值（默认 1.0）|
+| `mistral3.rope.scaling.mscale` | float32 | YaRN mscale（默认 0）|
+| `mistral3.rope.scaling.mscale_all_dim` | float32 | YaRN mscale_all_dim（默认 0）|
+
+### 权重命名规范
+
+```
+token_embd.weight                         # Token 嵌入 [vocab, hidden]
+blk.{L}.attn_norm.weight                  # 注意力前 RMSNorm
+blk.{L}.attn_q.weight                    # Q 投影（融合前）
+blk.{L}.attn_k.weight                    # K 投影（融合前）
+blk.{L}.attn_v.weight                    # V 投影（融合前）
+blk.{L}.attn_qkv.weight                  # 融合 Q+K+V（融合后）
+blk.{L}.attn_output.weight               # 输出投影
+blk.{L}.ffn_norm.weight                  # FFN 前 RMSNorm
+blk.{L}.ffn_gate.weight  }               # 融合前：独立 gate/up
+blk.{L}.ffn_up.weight    }
+blk.{L}.ffn_gate_up.weight               # 融合后：拼接 [2*intermed, hidden]
+blk.{L}.ffn_down.weight                  # FFN down 投影
+output_norm.weight                       # 最终 RMSNorm
+output.weight                            # LM head（绑定时可选）
+```
+
+### 视觉编码器权重（Pixtral）
+
+```
+v.patch_conv.weight                      # Conv2D 补丁嵌入 [hidden, C, P, P]
+v.patch_conv.bias                        # Conv2D 偏置（可选）
+v.encoder_norm.weight                    # 编码器输入 RMSNorm
+v.blk.{L}.attn_norm.weight              # 注意力前 RMSNorm
+v.blk.{L}.attn_q.weight                 # Q 投影
+v.blk.{L}.attn_k.weight                 # K 投影
+v.blk.{L}.attn_v.weight                 # V 投影
+v.blk.{L}.attn_output.weight            # 输出投影
+v.blk.{L}.ffn_norm.weight               # FFN 前 RMSNorm
+v.blk.{L}.ffn_gate.weight               # SiLU 门控
+v.blk.{L}.ffn_up.weight                 # Up 投影
+v.blk.{L}.ffn_down.weight               # Down 投影
+mm.norm.weight                           # 投影器 RMSNorm
+mm.patch_merger.merging_layer.weight     # 空间补丁合并
+mm.linear_1.weight                       # 投影器 Linear 1
+mm.linear_2.weight                       # 投影器 Linear 2
+```
+
+### 前向传播流程（每 token）
+
+```
+tokens → Embedding → [注入视觉]
+For each layer L:
+  hidden → RMSNorm(attn_norm)
+         → QKV（融合或独立）→ RoPE(GPT-J 风格, YaRN) → [位置缩放(Q)]
+         → 注意力(全因果) → O 投影
+         → 残差相加
+         → RMSNorm(ffn_norm)
+         → GateUp → SiLU(gate)*up → Down
+         → 残差相加
+hidden → RMSNorm(output_norm) → 截取最后 token → LM head → logits
+```
+
+### KV 缓存
+
+- 形状：每层 `[numKVHeads, maxSeqLen, headDim]`（支持独立的 key/value 长度：`_attnKeyLen` 和 `_attnValLen`）。
+- `ResetKVCache()` 将所有缓存填零并调用 `InvalidateTensorDeviceCache()` 同步 GPU 状态。
+
+### 优化空间
+
+- 无原生 decode 路径。整个前向传播为托管 C# 加 GGML 支持的 matmul。原生单调用 decode 路径（类似 Qwen 3）可减少托管开销。
+- 无融合 GPU decode 路径。单图方法（类似 Gemma 4）可显著提升 Metal/CUDA 吞吐量。
+- 视觉编码器在加载时将所有权重反量化为 F32。直接支持量化权重可减少内存占用。
+
+---
+
 ## 架构对比
 
-| 特性 | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H |
-|---|---|---|---|---|---|---|
-| 层类型 | 密集 | 密集 / MoE | 密集 | 混合（注意力 + 循环）| MoE | 混合（Mamba2 + 注意力 + MoE FFN）|
-| 注意力 | SWA + 全局 | SWA + 全局 | 全 GQA | 全 GQA + 门控 | 全因果 + 沉降 | 全 GQA（无 RoPE）|
-| FFN 激活 | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² |
-| RoPE 变体 | NeoX（双基数）| NeoX + 比例 | NeoX | NeoX / MRoPE | NeoX + Yarn | 无 |
-| QK 归一化 | 有 | 有 | 有 | 有 | 无 | 无 |
-| V 归一化 | 无 | 有（无权重）| 无 | 无 | 无 | 无 |
-| 投影偏置 | 无 | 无 | 无 | 无 | 有（全部）| 无 |
-| 逐层缩放 | 无 | 有 | 无 | 无 | 无 | 无 |
-| PLE | 无 | 有 | 无 | 无 | 无 | 无 |
-| KV 共享 | 无 | 有 | 无 | 无 | 无 | 无 |
-| 注意力沉降 | 无 | 无 | 无 | 无 | 有 | 无 |
-| 环形 KV 缓存 | 无 | 有（SWA 层）| 无 | 无 | 无 | 无 |
-| SSM（Mamba2）| 无 | 无 | 无 | 无 | 无 | 有 |
-| 共享专家 | 无 | 无 | 无 | 无 | 无 | 有（可选）|
-| 潜空间瓶颈 | 无 | 无 | 无 | 无 | 无 | 有（可选）|
-| 视觉 | 支持 | 支持 | 不支持 | 支持 | 不支持 | 不支持 |
-| 音频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 视频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 思维链 | 不支持 | 支持 | 支持 | 支持 | 支持（始终开启）| 支持 |
-| 工具调用 | 不支持 | 支持 | 支持 | 支持 | 不支持 | 支持 |
-| 融合 QKV | 无 | 有 | 有 | 无 | 无 | 有 |
-| 融合 GPU decode | 不支持 | 支持（Metal）| 不支持 | 不支持 | 不支持 | 不支持 |
-| 原生模型 decode | 不支持 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 |
-| 批量 GPU MoE | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 | 支持 |
-| 输出解析器 | 直通 | Gemma4 | Qwen3 | Qwen35 | Harmony（始终开启）| Qwen3 |
+| 特性 | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H | Mistral 3 |
+|---|---|---|---|---|---|---|---|
+| 层类型 | 密集 | 密集 / MoE | 密集 | 混合（注意力 + 循环）| MoE | 混合（Mamba2 + 注意力 + MoE FFN）| 密集 |
+| 注意力 | SWA + 全局 | SWA + 全局 | 全 GQA | 全 GQA + 门控 | 全因果 + 沉降 | 全 GQA（无 RoPE）| 全 GQA |
+| FFN 激活 | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² | SwiGLU |
+| RoPE 变体 | NeoX（双基数）| NeoX + 比例 | NeoX | NeoX / MRoPE | NeoX + Yarn | 无 | GPT-J + YaRN |
+| QK 归一化 | 有 | 有 | 有 | 有 | 无 | 无 | 无 |
+| V 归一化 | 无 | 有（无权重）| 无 | 无 | 无 | 无 | 无 |
+| 投影偏置 | 无 | 无 | 无 | 无 | 有（全部）| 无 | 无 |
+| 逐层缩放 | 无 | 有 | 无 | 无 | 无 | 无 | 无 |
+| PLE | 无 | 有 | 无 | 无 | 无 | 无 | 无 |
+| KV 共享 | 无 | 有 | 无 | 无 | 无 | 无 | 无 |
+| 注意力沉降 | 无 | 无 | 无 | 无 | 有 | 无 | 无 |
+| 环形 KV 缓存 | 无 | 有（SWA 层）| 无 | 无 | 无 | 无 | 无 |
+| SSM（Mamba2）| 无 | 无 | 无 | 无 | 无 | 有 | 无 |
+| 共享专家 | 无 | 无 | 无 | 无 | 无 | 有（可选）| 无 |
+| 潜空间瓶颈 | 无 | 无 | 无 | 无 | 无 | 有（可选）| 无 |
+| 位置依赖 Q 缩放 | 无 | 无 | 无 | 无 | 无 | 无 | 有（YaRN）|
+| 视觉 | 支持 | 支持 | 不支持 | 支持 | 不支持 | 不支持 | 支持 |
+| 音频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 视频 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 思维链 | 不支持 | 支持 | 支持 | 支持 | 支持（始终开启）| 支持 | 不支持 |
+| 工具调用 | 不支持 | 支持 | 支持 | 支持 | 不支持 | 支持 | 不支持 |
+| 融合 QKV | 无 | 有 | 有 | 无 | 无 | 有 | 有 |
+| 融合 GPU decode | 不支持 | 支持（Metal）| 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 原生模型 decode | 不支持 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 批量 GPU MoE | 不支持 | 不支持 | 不支持 | 不支持 | 不支持 | 支持 | 不支持 |
+| 输出解析器 | 直通 | Gemma4 | Qwen3 | Qwen35 | Harmony（始终开启）| Qwen3 | 直通 |
 
 ---
 

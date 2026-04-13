@@ -337,6 +337,7 @@ namespace TensorSharp.Models
 
         private void InitKVCache(int maxSeqLen)
         {
+            _maxContextLength = maxSeqLen;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
             _kvCacheK = new Tensor[Config.NumLayers];
