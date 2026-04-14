@@ -193,7 +193,7 @@ app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelSe
     }
 });
 
-app.MapPost("/api/upload", async (HttpRequest req) =>
+app.MapPost("/api/upload", async (HttpRequest req, ModelService svc) =>
 {
     if (!req.HasFormContentType)
         return Results.BadRequest(new { error = "Expected multipart form data" });
@@ -240,13 +240,26 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     if (mediaType == "text")
     {
         string textContent = await File.ReadAllTextAsync(savePath);
-        bool truncated = false;
-        if (textContent.Length > maxTextFileChars)
+        var prepared = TextUploadHelper.PrepareTextContent(
+            textContent,
+            svc.Model?.Tokenizer,
+            svc.Model?.MaxContextLength ?? 0,
+            maxTextFileChars);
+
+        return Results.Json(new
         {
-            textContent = textContent.Substring(0, maxTextFileChars);
-            truncated = true;
-        }
-        return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName, textContent, truncated });
+            ok = true,
+            path = savePath,
+            mediaType,
+            fileName = file.FileName,
+            textContent = prepared.TextContent,
+            truncated = prepared.Truncated,
+            truncateLimit = prepared.TruncateLimit,
+            truncateUnit = prepared.TruncateUnit,
+            modelContextLimit = prepared.ModelContextLimit,
+            originalTokenCount = prepared.OriginalTokenCount,
+            returnedTokenCount = prepared.ReturnedTokenCount
+        });
     }
 
     return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName });
@@ -1663,6 +1676,5 @@ Console.WriteLine("  POST /api/chat                  - Chat (Web UI SSE)");
 Console.WriteLine("  POST /api/models/load           - Load model (Web UI)");
 Console.WriteLine("  GET  /api/models                - List models (Web UI)");
 app.Run("http://0.0.0.0:5000");
-
 
 

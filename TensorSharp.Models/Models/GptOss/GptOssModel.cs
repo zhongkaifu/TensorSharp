@@ -85,7 +85,7 @@ namespace TensorSharp.Models
             SplitExpertBiases();
             FuseExpertGateUpWeights();
             FuseQKVWeights();
-            InitKVCache(4096);
+            InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
         }
 
@@ -1015,4 +1015,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

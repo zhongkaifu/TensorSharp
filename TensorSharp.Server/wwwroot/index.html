@@ -1113,7 +1113,13 @@ async function handleFileSelect(event) {
       pendingAttachments.push(data);
       renderAttachments();
       if (data.truncated) {
-        alert(`Note: "${data.fileName}" was truncated to fit within the context limit. Only the first portion of the file will be sent to the model.`);
+        let detail = 'Only the first portion of the file will be sent to the model.';
+        if (data.truncateUnit === 'tokens' && data.truncateLimit && data.modelContextLimit) {
+          detail = `It was limited to the first ${data.truncateLimit} tokens (1/2 of the loaded model context ${data.modelContextLimit}).`;
+        } else if (data.truncateUnit === 'characters' && data.truncateLimit) {
+          detail = `It was limited to the first ${data.truncateLimit} characters because no model context limit was available yet.`;
+        }
+        alert(`Note: "${data.fileName}" was truncated. ${detail}`);
       }
     } else {
       alert('Upload failed: ' + data.error);

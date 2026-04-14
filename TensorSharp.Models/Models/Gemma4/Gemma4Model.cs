@@ -184,11 +184,7 @@ namespace TensorSharp.Models
             FuseGateUpWeights();
             FuseExpertGateUpWeights();
             PrecomputeRoPE();
-            int maxCtx = 4096;
-            string ctxEnv = Environment.GetEnvironmentVariable("MAX_CONTEXT");
-            if (!string.IsNullOrEmpty(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
-                maxCtx = envCtx;
-            InitKVCache(maxCtx);
+            InitKVCache(ResolveConfiguredContextLength());
             BuildGemma4DecodeArrays();
         }
 
@@ -1855,4 +1851,3 @@ namespace TensorSharp.Models
         }
     }
 }
-
