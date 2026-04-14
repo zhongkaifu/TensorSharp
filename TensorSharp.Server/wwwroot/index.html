@@ -848,6 +848,7 @@ const chatContainer = document.getElementById('chat-container');
 const messageInput = document.getElementById('message-input');
 const statusBadge = document.getElementById('status-badge');
 const attachmentsDiv = document.getElementById('attachments');
+const autoScrollThreshold = 32;
 
 let chatHistory = [];
 let pendingAttachments = [];
@@ -857,7 +858,25 @@ let currentLoadedModel = null;
 let availableModels = [];
 let availableBackends = [];
 let needsCacheReset = false;
+let shouldAutoScroll = true;
 const editOriginalHtml = new Map();
+
+function isChatNearBottom() {
+  return chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight <= autoScrollThreshold;
+}
+
+function updateAutoScrollState() {
+  shouldAutoScroll = isChatNearBottom();
+}
+
+function scrollChatToBottom(force = false) {
+  if (force || shouldAutoScroll) {
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+    shouldAutoScroll = true;
+  }
+}
+
+chatContainer.addEventListener('scroll', updateAutoScrollState);
 
 messageInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -1081,6 +1100,7 @@ function clearChat() {
   attachmentsDiv.innerHTML = '';
   chatContainer.innerHTML = '';
   needsCacheReset = true;
+  shouldAutoScroll = true;
   updateSettingsLockState();
   if (!statusBadge.classList.contains('loaded')) {
     chatContainer.innerHTML = `
@@ -1264,7 +1284,7 @@ async function requestAssistantResponse() {
                 ? 'Next in queue (1 request ahead)'
                 : `Position ${data.queue_position} in queue (${data.queue_position} requests ahead)`;
               queueDiv.appendChild(txt);
-              chatContainer.scrollTop = chatContainer.scrollHeight;
+              scrollChatToBottom();
             }
             continue;
           }
@@ -1286,12 +1306,12 @@ async function requestAssistantResponse() {
             }
             const tc = thinkBlock.querySelector('.thinking-content');
             tc.textContent += data.thinking;
-            if (reasoningOn) chatContainer.scrollTop = chatContainer.scrollHeight;
+            if (reasoningOn) scrollChatToBottom();
           }
           if (data.token) {
             fullText += data.token;
             bubbleText.textContent = fullText;
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            scrollChatToBottom();
           }
           if (data.done) {
             if (data.error) {
@@ -1492,7 +1512,7 @@ function addUserBubble(text, attachments, historyIdx) {
       </div>
     </div>`;
   chatContainer.appendChild(div);
-  chatContainer.scrollTop = chatContainer.scrollHeight;
+  scrollChatToBottom();
 }
 
 function addAssistantBubble() {
@@ -1509,7 +1529,7 @@ function addAssistantBubble() {
       <div class="stats"></div>
     </div>`;
   chatContainer.appendChild(div);
-  chatContainer.scrollTop = chatContainer.scrollHeight;
+  scrollChatToBottom();
   return div;
 }
 
