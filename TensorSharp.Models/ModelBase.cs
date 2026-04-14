@@ -175,6 +175,125 @@ namespace TensorSharp.Models
             Config.IntermediateSize = (int)_gguf.GetUint32($"{arch}.feed_forward_length", 0);
         }
 
+        protected int ResolveConfiguredContextLength(int fallback = 4096)
+        {
+            int? explicitOverride = null;
+            string source;
+            string ctxEnv = Environment.GetEnvironmentVariable("MAX_CONTEXT");
+            if (!string.IsNullOrWhiteSpace(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
+                explicitOverride = envCtx;
+
+            int resolved = ResolveConfiguredContextLength(
+                Config?.Architecture ?? _gguf.GetString("general.architecture") ?? string.Empty,
+                _gguf.Metadata,
+                fallback,
+                explicitOverride,
+                out source);
+
+            if (explicitOverride.HasValue)
+                Console.WriteLine($"Context length: using MAX_CONTEXT={resolved}.");
+            else if (source == "fallback")
+                Console.WriteLine($"Context length: metadata missing, falling back to {resolved} tokens.");
+            else
+                Console.WriteLine($"Context length: using GGUF metadata {source}={resolved}.");
+
+            return resolved;
+        }
+
+        internal static int ResolveConfiguredContextLength(
+            string architecture,
+            IReadOnlyDictionary<string, object> metadata,
+            int fallback,
+            int? explicitOverride,
+            out string source)
+        {
+            if (explicitOverride.HasValue && explicitOverride.Value > 0)
+            {
+                source = "MAX_CONTEXT";
+                return explicitOverride.Value;
+            }
+
+            foreach (string key in GetContextLengthMetadataKeys(architecture))
+            {
+                if (TryGetPositiveInt(metadata, key, out int contextLength))
+                {
+                    source = key;
+                    return contextLength;
+                }
+            }
+
+            source = "fallback";
+            return fallback;
+        }
+
+        private static IEnumerable<string> GetContextLengthMetadataKeys(string architecture)
+        {
+            if (!string.IsNullOrWhiteSpace(architecture))
+            {
+                yield return $"{architecture}.context_length";
+                yield return $"{architecture}.attention.context_length";
+                yield return $"{architecture}.max_position_embeddings";
+                yield return $"{architecture}.max_sequence_length";
+                yield return $"{architecture}.sequence_length";
+                yield return $"{architecture}.seq_length";
+                yield return $"{architecture}.n_ctx";
+                yield return $"{architecture}.rope.scaling.original_context_length";
+            }
+
+            yield return "context_length";
+            yield return "max_position_embeddings";
+            yield return "max_sequence_length";
+            yield return "sequence_length";
+            yield return "seq_length";
+            yield return "n_ctx";
+        }
+
+        private static bool TryGetPositiveInt(IReadOnlyDictionary<string, object> metadata, string key, out int value)
+        {
+            value = 0;
+            if (metadata == null || string.IsNullOrWhiteSpace(key) || !metadata.TryGetValue(key, out var raw) || raw == null)
+                return false;
+
+            try
+            {
+                switch (raw)
+                {
+                    case int i when i > 0:
+                        value = i;
+                        return true;
+                    case uint ui when ui > 0:
+                        value = (int)ui;
+                        return true;
+                    case long l when l > 0 && l <= int.MaxValue:
+                        value = (int)l;
+                        return true;
+                    case ulong ul when ul > 0 && ul <= int.MaxValue:
+                        value = (int)ul;
+                        return true;
+                    case int[] ia when ia.Length > 0 && ia[0] > 0:
+                        value = ia[0];
+                        return true;
+                    case uint[] ua when ua.Length > 0 && ua[0] > 0 && ua[0] <= int.MaxValue:
+                        value = (int)ua[0];
+                        return true;
+                    case long[] la when la.Length > 0 && la[0] > 0 && la[0] <= int.MaxValue:
+                        value = (int)la[0];
+                        return true;
+                    case ulong[] ula when ula.Length > 0 && ula[0] > 0 && ula[0] <= int.MaxValue:
+                        value = (int)ula[0];
+                        return true;
+                    default:
+                        value = Convert.ToInt32(raw);
+                        return value > 0;
+                }
+            }
+            catch
+            {
+                value = 0;
+                return false;
+            }
+        }
+
         protected void ParseTokenizer()
         {
             var vocabTokens = _gguf.GetStringArray("tokenizer.ggml.tokens");
@@ -951,4 +1070,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

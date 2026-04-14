@@ -88,12 +88,7 @@ namespace TensorSharp.Models
             FuseQKVWeights();
             FuseGateUpWeights();
 
-            int maxCtx = 4096;
-            string ctxEnv = Environment.GetEnvironmentVariable("MAX_CONTEXT");
-            if (!string.IsNullOrEmpty(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
-                maxCtx = envCtx;
-
-            InitKVCache(maxCtx);
+            InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
         }
 

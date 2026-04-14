@@ -127,7 +127,7 @@ namespace TensorSharp.Models
             FuseAttentionProjectionWeights();
             FuseRecurrentInputWeights();
             FuseGateUpWeights();
-            InitCaches(4096);
+            InitCaches(ResolveConfiguredContextLength());
             PrecomputeRoPE();
             InitGDNBuffers();
         }
@@ -1018,4 +1018,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

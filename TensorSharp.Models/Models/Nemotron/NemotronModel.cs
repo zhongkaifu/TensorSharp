@@ -207,7 +207,7 @@ namespace TensorSharp.Models
                 FuseFFNWeights();
             FuseQKVWeights();
 
-            InitCaches(4096);
+            InitCaches(ResolveConfiguredContextLength());
             InitMamba2Buffers();
             InitLayerInfo();
             InitMoEBuffers();
@@ -1380,4 +1380,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

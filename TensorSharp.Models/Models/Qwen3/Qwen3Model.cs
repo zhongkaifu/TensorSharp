@@ -44,7 +44,7 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
-            InitKVCache(4096);
+            InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
             BuildModelDecodeArrays();
         }
@@ -558,4 +558,3 @@ namespace TensorSharp.Models
         }
     }
 }
-
