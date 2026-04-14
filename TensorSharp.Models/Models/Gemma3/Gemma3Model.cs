@@ -197,41 +197,39 @@ namespace TensorSharp.Models
                     DumpHiddenState(hidden, seqLen, l);
             }
 
-            using var normed = RMSNormOp(hidden, "output_norm.weight");
+            Tensor normed = RMSNormOp(hidden, "output_norm.weight");
             hidden.Dispose();
+
+            Tensor lastHidden;
+            if (seqLen > 1)
+            {
+                using var lastRow = normed.Narrow(0, seqLen - 1, 1);
+                lastHidden = Ops.NewContiguous(lastRow);
+            }
+            else
+            {
+                lastHidden = normed.CopyRef();
+            }
+            normed.Dispose();
 
             t0 = Stopwatch.GetTimestamp();
             string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
-            Tensor logitsTensor = LinearForward(normed, outputWeight);
+            Tensor logitsTensor = LinearForward(lastHidden, outputWeight);
             _lmHeadTicks += Stopwatch.GetTimestamp() - t0;
+            lastHidden.Dispose();
 
             if (_finalLogitSoftcap > 0f)
                 ApplyLogitSoftcap(logitsTensor);
 
             t0 = Stopwatch.GetTimestamp();
-            int lastTokenIdx = seqLen - 1;
             if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                 _logitsBuffer = new float[Config.VocabSize];
 
-            if (seqLen == 1)
+            unsafe
             {
-                unsafe
-                {
-                    float* ptr = GetFloatPtr(logitsTensor);
-                    fixed (float* dst = _logitsBuffer)
-                        Buffer.MemoryCopy(ptr, dst, Config.VocabSize * 4, Config.VocabSize * 4);
-                }
-            }
-            else
-            {
-                using var lastRow = logitsTensor.Narrow(0, lastTokenIdx, 1);
-                using var contiguous = Ops.NewContiguous(lastRow);
-                unsafe
-                {
-                    float* ptr = GetFloatPtr(contiguous);
-                    fixed (float* dst = _logitsBuffer)
-                        Buffer.MemoryCopy(ptr, dst, Config.VocabSize * 4, Config.VocabSize * 4);
-                }
+                float* ptr = GetFloatPtr(logitsTensor);
+                fixed (float* dst = _logitsBuffer)
+                    Buffer.MemoryCopy(ptr, dst, Config.VocabSize * 4, Config.VocabSize * 4);
             }
             logitsTensor.Dispose();
             _logitsCopyTicks += Stopwatch.GetTimestamp() - t0;
