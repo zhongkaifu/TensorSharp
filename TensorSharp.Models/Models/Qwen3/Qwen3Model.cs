@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.GGML;
@@ -25,6 +26,8 @@ namespace TensorSharp.Models
         private float[] _ropeFreqs;
 
         private ModelDecodeArrays _modelDecodeArrays;
+        private bool _canUseNativeLayerDecode;
+        private bool _kvCacheHostDirty;
 
         public Qwen3Model(string ggufPath, BackendType backend)
             : base(ggufPath, backend)
@@ -44,9 +47,11 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
+            PrepareCudaQuantizedWeightsForInference();
             InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
             BuildModelDecodeArrays();
+            DetermineNativeLayerDecodeAvailability();
         }
 
         private unsafe void FuseQKVWeights()
@@ -65,12 +70,7 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
-                    Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
-                    Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);
-                    _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vw.Ne1);
+                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -140,8 +140,8 @@ namespace TensorSharp.Models
             {
                 _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
                 _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
+                InitializeCacheTensor(_kvCacheK[l]);
+                InitializeCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
         }
@@ -150,12 +150,11 @@ namespace TensorSharp.Models
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
+            _kvCacheHostDirty = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
             _forwardSw.Reset();
@@ -163,12 +162,14 @@ namespace TensorSharp.Models
 
         public override void TruncateKVCache(int tokenCount)
         {
+            EnsureKvCacheHostSynchronized();
             base.TruncateKVCache(tokenCount);
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 InvalidateTensorDeviceCache(_kvCacheK[l]);
                 InvalidateTensorDeviceCache(_kvCacheV[l]);
             }
+            _kvCacheHostDirty = false;
         }
 
         public override float[] Forward(int[] tokens)
@@ -176,16 +177,22 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+            bool useNativeModelDecode = seqLen == 1 && IsGgmlBackend && _modelDecodeArrays != null;
+            bool useNativeDecode = seqLen == 1 && IsGgmlBackend && (_modelDecodeArrays != null || _canUseNativeLayerDecode);
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
-            if (seqLen == 1 && IsGgmlBackend && _modelDecodeArrays != null)
+            if (!useNativeDecode)
+                EnsureKvCacheHostSynchronized();
+
+            if (useNativeModelDecode)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 NativeTransformerModelDecode(hidden, startPos);
                 _linearTicks += Stopwatch.GetTimestamp() - t0;
+                _kvCacheHostDirty = true;
             }
             else
             {
@@ -228,6 +235,55 @@ namespace TensorSharp.Models
             return _logitsBuffer;
         }
 
+        public override float[] ForwardRefill(int[] tokens)
+        {
+            if (tokens == null || tokens.Length <= 1 || !IsGgmlBackend || _modelDecodeArrays == null)
+                return Forward(tokens);
+
+            int prefixLen = tokens.Length - 1;
+            var prefixTokens = new int[prefixLen];
+            Array.Copy(tokens, prefixTokens, prefixLen);
+
+            PrefillWithoutLogits(prefixTokens);
+            return Forward(new[] { tokens[prefixLen] });
+        }
+
+        private void PrefillWithoutLogits(int[] tokens)
+        {
+            if (tokens == null || tokens.Length == 0)
+                return;
+
+            _forwardSw.Start();
+            int seqLen = tokens.Length;
+            int startPos = _cacheSeqLen;
+            bool useNativeModelDecode = seqLen == 1 && IsGgmlBackend && _modelDecodeArrays != null;
+            bool useNativeDecode = seqLen == 1 && IsGgmlBackend && (_modelDecodeArrays != null || _canUseNativeLayerDecode);
+
+            long t1 = Stopwatch.GetTimestamp();
+            Tensor hidden = Embedding(tokens);
+            _embTicks += Stopwatch.GetTimestamp() - t1;
+
+            if (!useNativeDecode)
+                EnsureKvCacheHostSynchronized();
+
+            if (useNativeModelDecode)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                NativeTransformerModelDecode(hidden, startPos);
+                _linearTicks += Stopwatch.GetTimestamp() - t0;
+                _kvCacheHostDirty = true;
+            }
+            else
+            {
+                for (int layer = 0; layer < Config.NumLayers; layer++)
+                    hidden = TransformerBlock(hidden, layer, seqLen, startPos);
+            }
+
+            hidden.Dispose();
+            _cacheSeqLen += seqLen;
+            _forwardSw.Stop();
+        }
+
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
             string[] wn = _layerWeightNames[layer];
@@ -237,6 +293,7 @@ namespace TensorSharp.Models
                 long t0 = Stopwatch.GetTimestamp();
                 NativeTransformerLayerDecode(hidden, layer, wn, startPos);
                 _linearTicks += Stopwatch.GetTimestamp() - t0;
+                _kvCacheHostDirty = true;
                 return hidden;
             }
 
@@ -454,12 +511,12 @@ namespace TensorSharp.Models
             GgmlBasicOps.TransformerLayerDecode(
                 (IntPtr)hiddenPtr, hiddenSize,
                 (IntPtr)GetFloatPtr(attnNormW),
-                qkvW.Data, qkvW.GgmlType, qkvW.Ne0, qkvW.Ne1, qkvW.RawBytes,
+                qkvW.CacheKey, qkvW.GgmlType, qkvW.Ne0, qkvW.Ne1, qkvW.RawBytes,
                 (IntPtr)GetFloatPtr(qNormW), (IntPtr)GetFloatPtr(kNormW), Config.HeadDim,
-                oW.Data, oW.GgmlType, oW.Ne0, oW.Ne1, oW.RawBytes,
+                oW.CacheKey, oW.GgmlType, oW.Ne0, oW.Ne1, oW.RawBytes,
                 (IntPtr)GetFloatPtr(ffnNormW),
-                guW.Data, guW.GgmlType, guW.Ne0, guW.Ne1, guW.RawBytes,
-                downW.Data, downW.GgmlType, downW.Ne0, downW.Ne1, downW.RawBytes,
+                guW.CacheKey, guW.GgmlType, guW.Ne0, guW.Ne1, guW.RawBytes,
+                downW.CacheKey, downW.GgmlType, downW.Ne0, downW.Ne1, downW.RawBytes,
                 (IntPtr)GetFloatPtr(_kvCacheK[layer]), (IntPtr)GetFloatPtr(_kvCacheV[layer]),
                 Config.NumHeads, Config.NumKVHeads,
                 maxSeqLen, startPos,
@@ -510,18 +567,55 @@ namespace TensorSharp.Models
             {
                 string[] wn = _layerWeightNames[l];
                 arr.AttnNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[0]]);
-                arr.Qkv[l] = _quantWeights[wn[1]].Data;
+                arr.Qkv[l] = _quantWeights[wn[1]].CacheKey;
                 arr.QNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[2]]);
                 arr.KNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[3]]);
-                arr.O[l] = _quantWeights[wn[4]].Data;
+                arr.O[l] = _quantWeights[wn[4]].CacheKey;
                 arr.FfnNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[5]]);
-                arr.Gu[l] = _quantWeights[wn[6]].Data;
-                arr.Down[l] = _quantWeights[wn[7]].Data;
+                arr.Gu[l] = _quantWeights[wn[6]].CacheKey;
+                arr.Down[l] = _quantWeights[wn[7]].CacheKey;
                 arr.KCache[l] = (IntPtr)GetFloatPtr(_kvCacheK[l]);
                 arr.VCache[l] = (IntPtr)GetFloatPtr(_kvCacheV[l]);
             }
 
             _modelDecodeArrays = arr;
+        }
+
+        private void DetermineNativeLayerDecodeAvailability()
+        {
+            _canUseNativeLayerDecode = IsGgmlBackend;
+            if (!_canUseNativeLayerDecode || _layerWeightNames == null)
+                return;
+
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                string[] wn = _layerWeightNames[l];
+                if (!_quantWeights.ContainsKey(wn[1]) ||
+                    !_quantWeights.ContainsKey(wn[4]) ||
+                    !_quantWeights.ContainsKey(wn[6]) ||
+                    !_quantWeights.ContainsKey(wn[7]))
+                {
+                    _canUseNativeLayerDecode = false;
+                    return;
+                }
+            }
+        }
+
+        private void EnsureKvCacheHostSynchronized()
+        {
+            if (!_kvCacheHostDirty || !IsGgmlBackend)
+                return;
+
+            var seen = new HashSet<Storage>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvCacheK[l] != null && seen.Add(_kvCacheK[l].Storage))
+                    SyncTensorHostCache(_kvCacheK[l]);
+                if (_kvCacheV[l] != null && seen.Add(_kvCacheV[l].Storage))
+                    SyncTensorHostCache(_kvCacheV[l]);
+            }
+
+            _kvCacheHostDirty = false;
         }
 
         private unsafe void NativeTransformerModelDecode(Tensor hidden, int startPos)

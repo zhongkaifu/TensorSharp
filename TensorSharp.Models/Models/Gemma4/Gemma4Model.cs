@@ -65,6 +65,7 @@ namespace TensorSharp.Models
         private int _numExpertsUsed;
 
         private bool _canUseFusedDecode;
+        private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
         private Gemma4VisionEncoder _visionEncoder;
@@ -183,6 +184,7 @@ namespace TensorSharp.Models
             FuseQKVWeights();
             FuseGateUpWeights();
             FuseExpertGateUpWeights();
+            PrepareCudaQuantizedWeightsForInference();
             PrecomputeRoPE();
             InitKVCache(ResolveConfiguredContextLength());
             BuildGemma4DecodeArrays();
@@ -332,8 +334,8 @@ namespace TensorSharp.Models
                 _kvCacheSize[l] = cacheLen;
                 _kvCacheK[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
                 _kvCacheV[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
-                Ops.Fill(_kvCacheK[l], 0f);
-                Ops.Fill(_kvCacheV[l], 0f);
+                InitializeCacheTensor(_kvCacheK[l]);
+                InitializeCacheTensor(_kvCacheV[l]);
                 totalCacheBytes += (long)kvHeads * cacheLen * hd * 4 * 2;
             }
 
@@ -351,23 +353,24 @@ namespace TensorSharp.Models
         public override void ResetKVCache()
         {
             _cacheSeqLen = 0;
+            _kvCacheHostDirty = false;
             if (_kvCacheK == null) return;
             var cleared = new HashSet<int>();
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (cleared.Contains(l)) continue;
                 if (_kvDonorMap.ContainsKey(l)) continue;
-                Ops.Fill(_kvCacheK[l], 0f);
-                Ops.Fill(_kvCacheV[l], 0f);
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
                 cleared.Add(l);
             }
         }
 
         public override void TruncateKVCache(int tokenCount)
         {
+            EnsureKvCacheHostSynchronized();
             base.TruncateKVCache(tokenCount);
+            _kvCacheHostDirty = false;
             if (_kvCacheK == null) return;
             var invalidated = new HashSet<int>();
             for (int l = 0; l < Config.NumLayers; l++)
@@ -390,6 +393,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+            bool useFusedDecode = seqLen == 1 && _canUseFusedDecode;
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -431,11 +435,15 @@ namespace TensorSharp.Models
             if (_pleDim > 0)
                 perLayerInputs = ComputePLE(tokens, hidden, seqLen);
 
-            if (seqLen == 1 && _canUseFusedDecode)
+            if (!useFusedDecode)
+                EnsureKvCacheHostSynchronized();
+
+            if (useFusedDecode)
             {
                 long tFused = Stopwatch.GetTimestamp();
                 NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
                 _linearTicks += Stopwatch.GetTimestamp() - tFused;
+                _kvCacheHostDirty = true;
             }
             else
             {
@@ -509,6 +517,114 @@ namespace TensorSharp.Models
             _forwardCount++;
             _forwardSw.Stop();
             return _logitsBuffer;
+        }
+
+        public override float[] ForwardRefill(int[] tokens)
+        {
+            if (tokens == null || tokens.Length <= 1 || !_canUseFusedDecode)
+                return Forward(tokens);
+
+            int prefixLen = tokens.Length - 1;
+            var prefixTokens = new int[prefixLen];
+            Array.Copy(tokens, prefixTokens, prefixLen);
+
+            PrefillWithoutLogits(prefixTokens);
+            return Forward(new[] { tokens[prefixLen] });
+        }
+
+        private void PrefillWithoutLogits(int[] tokens)
+        {
+            if (tokens == null || tokens.Length == 0)
+                return;
+
+            _forwardSw.Start();
+            int seqLen = tokens.Length;
+            int startPos = _cacheSeqLen;
+            bool useFusedDecode = seqLen == 1 && _canUseFusedDecode;
+
+            long t0 = Stopwatch.GetTimestamp();
+            Tensor hidden = Embedding(tokens);
+            _embTicks += Stopwatch.GetTimestamp() - t0;
+
+            ScaleEmbedding(hidden);
+
+            HashSet<int> exceptPositions = null;
+
+            if (_pendingVisionEmbeddingsList.Count > 0)
+            {
+                exceptPositions = new HashSet<int>();
+                foreach (var (emb, pos) in _pendingVisionEmbeddingsList)
+                {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(pos + i);
+                    InjectVisionEmbeddings(hidden, emb, pos);
+                    emb.Dispose();
+                }
+                _pendingVisionEmbeddingsList.Clear();
+            }
+
+            if (_pendingAudioEmbeddingsList.Count > 0)
+            {
+                exceptPositions ??= new HashSet<int>();
+                foreach (var (emb, pos) in _pendingAudioEmbeddingsList)
+                {
+                    int numTokens = (int)emb.Sizes[0];
+                    for (int i = 0; i < numTokens; i++)
+                        exceptPositions.Add(pos + i);
+                    InjectVisionEmbeddings(hidden, emb, pos);
+                    emb.Dispose();
+                }
+                _pendingAudioEmbeddingsList.Clear();
+            }
+
+            Tensor perLayerInputs = null;
+            if (_pleDim > 0)
+                perLayerInputs = ComputePLE(tokens, hidden, seqLen);
+
+            if (!useFusedDecode)
+                EnsureKvCacheHostSynchronized();
+
+            if (useFusedDecode)
+            {
+                long tFused = Stopwatch.GetTimestamp();
+                NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
+                _linearTicks += Stopwatch.GetTimestamp() - tFused;
+                _kvCacheHostDirty = true;
+            }
+            else
+            {
+                if (seqLen > 1 && startPos > 0 && _swaKVDonorLayers.Count > 0)
+                    _prefillSWAKV = new Dictionary<int, (Tensor, Tensor)>();
+
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    Tensor perLayerInput = null;
+                    if (perLayerInputs != null)
+                        perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
+
+                    bool isShared = _kvDonorMap.ContainsKey(l);
+                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
+
+                    perLayerInput?.Dispose();
+                }
+
+                if (_prefillSWAKV != null)
+                {
+                    foreach (var kv in _prefillSWAKV.Values)
+                    {
+                        kv.k.Dispose();
+                        kv.v.Dispose();
+                    }
+                    _prefillSWAKV = null;
+                }
+            }
+
+            perLayerInputs?.Dispose();
+            hidden.Dispose();
+
+            _cacheSeqLen += seqLen;
+            _forwardSw.Stop();
         }
 
         private void ScaleEmbedding(Tensor hidden)
@@ -645,7 +761,7 @@ namespace TensorSharp.Models
                     string qName = $"{prefix}.attn_q.weight";
                     if (_quantWeights.TryGetValue(qName, out var qW))
                     {
-                        a.Qkv[l] = qW.Data;
+                        a.Qkv[l] = qW.CacheKey;
                         a.QkvType[l] = qW.GgmlType;
                         a.QkvNe0[l] = qW.Ne0;
                         a.QkvNe1[l] = qW.Ne1;
@@ -657,7 +773,7 @@ namespace TensorSharp.Models
                     string qkvName = $"{prefix}.attn_qkv.weight";
                     if (_quantWeights.TryGetValue(qkvName, out var qkvW))
                     {
-                        a.Qkv[l] = qkvW.Data;
+                        a.Qkv[l] = qkvW.CacheKey;
                         a.QkvType[l] = qkvW.GgmlType;
                         a.QkvNe0[l] = qkvW.Ne0;
                         a.QkvNe1[l] = qkvW.Ne1;
@@ -668,7 +784,7 @@ namespace TensorSharp.Models
                 string oName = $"{prefix}.attn_output.weight";
                 if (_quantWeights.TryGetValue(oName, out var oW))
                 {
-                    a.O[l] = oW.Data;
+                    a.O[l] = oW.CacheKey;
                     a.OType[l] = oW.GgmlType;
                     a.ONe0[l] = oW.Ne0;
                     a.ONe1[l] = oW.Ne1;
@@ -678,7 +794,7 @@ namespace TensorSharp.Models
                 string guName = $"{prefix}.ffn_gate_up.weight";
                 if (_quantWeights.TryGetValue(guName, out var guW))
                 {
-                    a.Gu[l] = guW.Data;
+                    a.Gu[l] = guW.CacheKey;
                     a.GuType[l] = guW.GgmlType;
                     a.GuNe0[l] = guW.Ne0;
                     a.GuNe1[l] = guW.Ne1;
@@ -688,7 +804,7 @@ namespace TensorSharp.Models
                 string downName = $"{prefix}.ffn_down.weight";
                 if (_quantWeights.TryGetValue(downName, out var downW))
                 {
-                    a.Down[l] = downW.Data;
+                    a.Down[l] = downW.CacheKey;
                     a.DownType[l] = downW.GgmlType;
                     a.DownNe0[l] = downW.Ne0;
                     a.DownNe1[l] = downW.Ne1;
@@ -700,7 +816,7 @@ namespace TensorSharp.Models
                 bool hasPleGate = false;
                 if (_quantWeights.TryGetValue(pleGateName, out var pleGW))
                 {
-                    a.PleGate[l] = pleGW.Data;
+                    a.PleGate[l] = pleGW.CacheKey;
                     a.PleGateType[l] = pleGW.GgmlType;
                     a.PleGateNe0[l] = pleGW.Ne0;
                     a.PleGateNe1[l] = pleGW.Ne1;
@@ -722,7 +838,7 @@ namespace TensorSharp.Models
                     string pleProjName = $"{prefix}.proj.weight";
                     if (_quantWeights.TryGetValue(pleProjName, out var plePW))
                     {
-                        a.PleProj[l] = plePW.Data;
+                        a.PleProj[l] = plePW.CacheKey;
                         a.PleProjType[l] = plePW.GgmlType;
                         a.PleProjNe0[l] = plePW.Ne0;
                         a.PleProjNe1[l] = plePW.Ne1;
@@ -788,6 +904,26 @@ namespace TensorSharp.Models
                 a.PlePostNorm);
         }
 
+        private void EnsureKvCacheHostSynchronized()
+        {
+            if (!_kvCacheHostDirty || !IsGgmlBackend || _kvCacheK == null)
+                return;
+
+            var seen = new HashSet<Storage>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l))
+                    continue;
+
+                if (_kvCacheK[l] != null && seen.Add(_kvCacheK[l].Storage))
+                    SyncTensorHostCache(_kvCacheK[l]);
+                if (_kvCacheV[l] != null && seen.Add(_kvCacheV[l].Storage))
+                    SyncTensorHostCache(_kvCacheV[l]);
+            }
+
+            _kvCacheHostDirty = false;
+        }
+
         #endregion
 
         #region PLE (Per-Layer Embedding)
@@ -803,7 +939,7 @@ namespace TensorSharp.Models
                 using var pleIdx = CreateIntTensor(tokens, seqLen);
                 if (IsGgmlBackend)
                 {
-                    GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.Data, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
+                    GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.CacheKey, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
                 }
                 else
                 {
@@ -1187,17 +1323,9 @@ namespace TensorSharp.Models
                     if (qw.GgmlType == kw.GgmlType && qw.Ne0 == kw.Ne0 &&
                         (!hasQuantV || (vw.GgmlType == kw.GgmlType && vw.Ne0 == kw.Ne0)))
                     {
-                        long vBytes = hasQuantV ? vw.RawBytes : kw.RawBytes;
-                        long vNe1 = hasQuantV ? vw.Ne1 : kw.Ne1;
-                        long totalBytes = qw.RawBytes + kw.RawBytes + vBytes;
-                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                        Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
-                        Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
-                        if (hasQuantV)
-                            Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), vBytes, vBytes);
-                        else
-                            Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), vBytes, kw.RawBytes);
-                        _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vNe1);
+                        _quantWeights[qkvName] = hasQuantV
+                            ? QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw)
+                            : QuantizedWeight.ConcatOrCreateCopy(qw, kw, kw);
                         _quantWeights.Remove(qName); qw.Dispose();
                         _quantWeights.Remove(kName); kw.Dispose();
                         if (hasQuantV) { _quantWeights.Remove(vName); vw.Dispose(); }
@@ -1251,11 +1379,7 @@ namespace TensorSharp.Models
                         _quantWeights.TryGetValue(upName, out var uw) &&
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
-                        long totalBytes = gw.RawBytes + uw.RawBytes;
-                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                        Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
-                        Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
-                        _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
+                        _quantWeights[fusedName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
                         _quantWeights.Remove(gateName); gw.Dispose();
                         _quantWeights.Remove(upName); uw.Dispose();
                         fused++;

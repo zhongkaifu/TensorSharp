@@ -266,6 +266,8 @@ namespace
     };
     std::mutex g_host_buffer_cache_mutex;
     std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
+    std::mutex g_preloaded_buffer_cache_mutex;
+    std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
 
     void set_last_error(const std::string& message)
     {
@@ -870,13 +872,26 @@ namespace
         if (data == nullptr)
             return;
 
-        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-        auto it = g_host_buffer_cache.find(data);
-        if (it == g_host_buffer_cache.end())
-            return;
+        {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            auto it = g_preloaded_buffer_cache.find(data);
+            if (it != g_preloaded_buffer_cache.end())
+            {
+                ggml_backend_buffer_free(it->second.buffer);
+                g_preloaded_buffer_cache.erase(it);
+                return;
+            }
+        }
 
-        ggml_backend_buffer_free(it->second.buffer);
-        g_host_buffer_cache.erase(it);
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            if (it == g_host_buffer_cache.end())
+                return;
+
+            ggml_backend_buffer_free(it->second.buffer);
+            g_host_buffer_cache.erase(it);
+        }
     }
 
     bool try_get_host_ptr_buffer(
@@ -943,6 +958,25 @@ namespace
         const bool use_device_copy = prefers_device_local_cache(dev);
 
         {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            auto it = g_preloaded_buffer_cache.find(data);
+            if (it != g_preloaded_buffer_cache.end())
+            {
+                const std::size_t required_size = ggml_backend_buffer_get_alloc_size(it->second.buffer, tensor);
+                if (it->second.bytes == bytes &&
+                    required_size <= it->second.buffer_size)
+                {
+                    out_buffer = it->second.buffer;
+                    out_addr = ggml_backend_buffer_get_base(out_buffer);
+                    return true;
+                }
+
+                ggml_backend_buffer_free(it->second.buffer);
+                g_preloaded_buffer_cache.erase(it);
+            }
+        }
+
+        {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             auto it = g_host_buffer_cache.find(data);
             if (it != g_host_buffer_cache.end())
@@ -996,6 +1030,50 @@ namespace
 
         out_addr = data;
 
+        return true;
+    }
+
+    bool sync_cached_buffer_to_host(void* data, std::size_t bytes)
+    {
+        if (data == nullptr || bytes == 0)
+            return true;
+
+        ggml_backend_buffer_t buffer = nullptr;
+        CachedBufferMode mode = CachedBufferMode::HostPtr;
+        {
+            std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+            auto it = g_host_buffer_cache.find(data);
+            if (it == g_host_buffer_cache.end())
+                return true;
+
+            if (bytes > it->second.bytes)
+                return false;
+
+            buffer = it->second.buffer;
+            mode = it->second.mode;
+        }
+
+        if (mode != CachedBufferMode::DeviceCopy || buffer == nullptr)
+            return true;
+
+        PooledContextHandle context;
+        if (!context.init(64 * 1024))
+            return false;
+
+        ggml_tensor* tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_I8, static_cast<std::int64_t>(bytes));
+        if (tensor == nullptr)
+            return false;
+
+        void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr == nullptr)
+            return false;
+
+        ggml_status status = ggml_backend_tensor_alloc(buffer, tensor, addr);
+        if (status != GGML_STATUS_SUCCESS)
+            return false;
+
+        ggml_backend_tensor_get(tensor, data, 0, bytes);
+        ggml_backend_synchronize(g_backend);
         return true;
     }
 
@@ -7729,15 +7807,163 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
-    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-    for (auto& [ptr, cached] : g_host_buffer_cache)
-        ggml_backend_buffer_free(cached.buffer);
-    g_host_buffer_cache.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+        for (auto& [ptr, cached] : g_preloaded_buffer_cache)
+            ggml_backend_buffer_free(cached.buffer);
+        g_preloaded_buffer_cache.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        for (auto& [ptr, cached] : g_host_buffer_cache)
+            ggml_backend_buffer_free(cached.buffer);
+        g_host_buffer_cache.clear();
+    }
 }
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)
 {
     invalidate_cached_buffer(ptr);
+}
+
+TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
+{
+    if (sync_cached_buffer_to_host(ptr, size))
+    {
+        clear_last_error();
+        return 1;
+    }
+
+    set_last_error("Failed to synchronize cached GGML device buffer back to host memory.");
+    return 0;
+}
+
+TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
+    void* cache_key,
+    void* host_data,
+    int ggml_type,
+    int64_t ne0,
+    int64_t ne1,
+    int64_t raw_bytes)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (cache_key == nullptr || host_data == nullptr || ne0 <= 0 || ne1 <= 0 || raw_bytes <= 0)
+        {
+            set_last_error("Invalid arguments for quantized weight preload.");
+            return 0;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr)
+        {
+            set_last_error("No GGML backend device is available for quantized weight preload.");
+            return 0;
+        }
+
+        if (!prefers_device_local_cache(dev))
+        {
+            clear_last_error();
+            return 1;
+        }
+
+        const std::size_t bytes = static_cast<std::size_t>(raw_bytes);
+        const enum ggml_type qtype = static_cast<enum ggml_type>(ggml_type);
+
+        PooledContextHandle context;
+        if (!context.init(64 * 1024))
+        {
+            set_last_error("Failed to create GGML context for quantized weight preload.");
+            return 0;
+        }
+
+        ggml_tensor* tensor = ggml_new_tensor_2d(context.value, qtype, ne0, ne1);
+        if (tensor == nullptr)
+        {
+            set_last_error("Failed to create GGML tensor for quantized weight preload.");
+            return 0;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            auto it = g_preloaded_buffer_cache.find(cache_key);
+            if (it != g_preloaded_buffer_cache.end())
+            {
+                const std::size_t required_size = ggml_backend_buffer_get_alloc_size(it->second.buffer, tensor);
+                if (it->second.bytes == bytes &&
+                    required_size <= it->second.buffer_size)
+                {
+                    clear_last_error();
+                    return 1;
+                }
+
+                ggml_backend_buffer_free(it->second.buffer);
+                g_preloaded_buffer_cache.erase(it);
+            }
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+        if (buft == nullptr)
+        {
+            set_last_error("Failed to get GGML backend buffer type for quantized weight preload.");
+            return 0;
+        }
+
+        const std::size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        if (buffer == nullptr)
+        {
+            set_last_error("Failed to allocate GGML backend buffer for quantized weight preload.");
+            return 0;
+        }
+
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        void* addr = ggml_backend_buffer_get_base(buffer);
+        if (addr == nullptr)
+        {
+            ggml_backend_buffer_free(buffer);
+            set_last_error("Failed to get GGML backend buffer base for quantized weight preload.");
+            return 0;
+        }
+
+        const ggml_status alloc_status = ggml_backend_tensor_alloc(buffer, tensor, addr);
+        if (alloc_status != GGML_STATUS_SUCCESS)
+        {
+            ggml_backend_buffer_free(buffer);
+            set_last_error("Failed to bind GGML tensor to backend buffer during quantized weight preload.");
+            return 0;
+        }
+
+        ggml_backend_tensor_set(tensor, host_data, 0, bytes);
+        ggml_backend_synchronize(g_backend);
+
+        {
+            std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+            g_preloaded_buffer_cache[cache_key] = {
+                buffer,
+                bytes,
+                ggml_backend_buffer_get_size(buffer),
+                CachedBufferMode::DeviceCopy
+            };
+        }
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error while preloading quantized weight.");
+        return 0;
+    }
 }
 
 TSG_EXPORT size_t TSGgml_RowSize(int ggml_type, int64_t ne)
@@ -7879,27 +8105,6 @@ namespace
         return ggml_concat(ctx, tail, head, 1);
     }
 
-    void write_flat_kv_to_host_cache(
-        float* cache_data,
-        const float* flat_data,
-        int kv_heads,
-        int cache_size,
-        int head_dim,
-        int cache_pos)
-    {
-        if (cache_data == nullptr || flat_data == nullptr || kv_heads <= 0 || cache_size <= 0 || head_dim <= 0)
-            return;
-
-        const std::size_t head_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
-        for (int h = 0; h < kv_heads; ++h)
-        {
-            std::memcpy(
-                cache_data + static_cast<std::size_t>(h) * cache_size * head_dim + static_cast<std::size_t>(cache_pos) * head_dim,
-                flat_data + static_cast<std::size_t>(h) * head_dim,
-                head_bytes);
-        }
-    }
-
     int transformer_layer_decode_impl(
         float* hidden_data, int hidden_size,
         float* attn_norm_data,
@@ -7955,10 +8160,8 @@ namespace
             fill_flash_attn_mask(attn_mask_data, attnKvLen, totalSeqLen);
         }
 
-        // Output download targets
+        // Output download target
         ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-        ggml_tensor* k_new_out  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
-        ggml_tensor* v_new_out  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
 
         // === Build computation graph ===
 
@@ -8053,25 +8256,15 @@ namespace
         // 14. Second residual
         ggml_tensor* result = ggml_add(ctx, residual1, down_flat);
 
-        // Mark graph outputs: updated hidden, new K (after RoPE), new V
+        // Mark graph output: updated hidden state
         ggml_tensor* out_hidden = ggml_cpy(ctx, result, hidden_out);
         ggml_set_output(out_hidden);
-
-        ggml_tensor* k_rope_flat = ggml_reshape_1d(ctx, k_rope, kDim);
-        ggml_tensor* out_k = ggml_cpy(ctx, k_rope_flat, k_new_out);
-        ggml_set_output(out_k);
-
-        ggml_tensor* v_flat = ggml_reshape_1d(ctx, v_raw, kDim);
-        ggml_tensor* out_v  = ggml_cpy(ctx, v_flat, v_new_out);
-        ggml_set_output(out_v);
 
         // Build graph: add KV cache writes first to ensure they execute before reads
         ggml_cgraph* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, k_cache_cpy);
         ggml_build_forward_expand(graph, v_cache_cpy);
         ggml_build_forward_expand(graph, out_hidden);
-        ggml_build_forward_expand(graph, out_k);
-        ggml_build_forward_expand(graph, out_v);
 
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
 
@@ -8160,15 +8353,6 @@ namespace
 
         // Download updated hidden state
         ggml_backend_tensor_get(hidden_out, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
-
-        // Download new K/V and write to cache at `position`
-        std::vector<float> k_new_buf(static_cast<std::size_t>(kDim));
-        std::vector<float> v_new_buf(static_cast<std::size_t>(kDim));
-        ggml_backend_tensor_get(k_new_out, k_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
-        ggml_backend_tensor_get(v_new_out, v_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
-
-        write_flat_kv_to_host_cache(k_cache_data, k_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
-        write_flat_kv_to_host_cache(v_cache_data, v_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
 
         clear_last_error();
         return 1;
@@ -8282,10 +8466,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_tensor* down_w;
             ggml_tensor* k_cache_base;
             ggml_tensor* v_cache_base;
-            ggml_tensor* k_new_out;
-            ggml_tensor* v_new_out;
-            ggml_tensor* out_k_cpy;
-            ggml_tensor* out_v_cpy;
             ggml_tensor* k_cache_cpy;
             ggml_tensor* v_cache_cpy;
         };
@@ -8304,8 +8484,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type), down_ne0, down_ne1);
             lt.k_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
             lt.v_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
-            lt.k_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
-            lt.v_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kDim);
         }
 
         // Build computation graph: chain all layers
@@ -8393,14 +8571,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             // Second residual - this becomes 'hidden' for the next layer
             hidden = ggml_add(ctx, residual1, down_flat);
 
-            // Mark KV outputs for this layer
-            ggml_tensor* k_rope_flat = ggml_reshape_1d(ctx, k_rope, kDim);
-            lt.out_k_cpy = ggml_cpy(ctx, k_rope_flat, lt.k_new_out);
-            ggml_set_output(lt.out_k_cpy);
-
-            ggml_tensor* v_flat = ggml_reshape_1d(ctx, v_raw, kDim);
-            lt.out_v_cpy = ggml_cpy(ctx, v_flat, lt.v_new_out);
-            ggml_set_output(lt.out_v_cpy);
         }
 
         // Output: copy hidden state so we can download it
@@ -8417,11 +8587,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             ggml_build_forward_expand(graph, layers[l].v_cache_cpy);
         }
         ggml_build_forward_expand(graph, out_hidden);
-        for (int l = 0; l < num_layers; l++)
-        {
-            ggml_build_forward_expand(graph, layers[l].out_k_cpy);
-            ggml_build_forward_expand(graph, layers[l].out_v_cpy);
-        }
 
         // Bind weights via cached host_ptr
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -8515,18 +8680,6 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
 
         // Download hidden state back to caller
         ggml_backend_tensor_get(hidden_out, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
-
-        // Download new KV and write to caches
-        for (int l = 0; l < num_layers; l++)
-        {
-            std::vector<float> k_new_buf(static_cast<std::size_t>(kDim));
-            std::vector<float> v_new_buf(static_cast<std::size_t>(kDim));
-            ggml_backend_tensor_get(layers[l].k_new_out, k_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
-            ggml_backend_tensor_get(layers[l].v_new_out, v_new_buf.data(), 0, static_cast<std::size_t>(kDim) * sizeof(float));
-
-            write_flat_kv_to_host_cache(static_cast<float*>(k_cache_arr[l]), k_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
-            write_flat_kv_to_host_cache(static_cast<float*>(v_cache_arr[l]), v_new_buf.data(), num_kv_heads, max_seq_len, head_dim, position);
-        }
 
         clear_last_error();
         return 1;
@@ -8665,8 +8818,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_tensor* post_ffn_norm_w;
             ggml_tensor* k_cached_t;
             ggml_tensor* v_cached_t;
-            ggml_tensor* k_new_out;
-            ggml_tensor* v_new_out;
             ggml_tensor* k_cpy;
             ggml_tensor* v_cpy;
             // PLE
@@ -8691,17 +8842,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             lt.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gu_type_arr[l]), gu_ne0_arr[l], gu_ne1_arr[l]);
             lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type_arr[l]), down_ne0_arr[l], down_ne1_arr[l]);
             lt.post_ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-
-            if (!info.isShared)
-            {
-                lt.k_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.kDim);
-                lt.v_new_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.kDim);
-            }
-            else
-            {
-                lt.k_new_out = nullptr;
-                lt.v_new_out = nullptr;
-            }
 
             if (!info.isShared)
             {
@@ -8748,10 +8888,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         std::vector<ggml_tensor*> layer_k_full(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_v_full(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_attn_mask(num_layers, nullptr);
-
-        // Track new K/V tensors produced by non-shared layers for download.
-        std::vector<ggml_tensor*> layer_k_new(num_layers, nullptr);
-        std::vector<ggml_tensor*> layer_v_new(num_layers, nullptr);
         std::vector<std::vector<ggml_fp16_t>> layer_attn_mask_data(num_layers);
 
         for (int l = 0; l < num_layers; l++)
@@ -8831,10 +8967,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 }
                 layer_k_full[l] = k_full;
                 layer_v_full[l] = v_full;
-
-                // Store new K/V refs for KV output
-                layer_k_new[l] = k_rope_t;
-                layer_v_new[l] = ggml_reshape_1d(ctx, v_normed, info.kDim);
             }
             else
             {
@@ -8924,17 +9056,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 residual2 = ggml_scale(ctx, residual2, scalar);
 
             hidden = residual2;
-
-            // Mark KV outputs (only for non-shared layers)
-            if (!info.isShared && lt.k_new_out != nullptr && layer_k_new[l] != nullptr)
-            {
-                ggml_tensor* k_flat = ggml_reshape_1d(ctx, layer_k_new[l], info.kDim);
-                lt.k_new_out = ggml_cpy(ctx, k_flat, lt.k_new_out);
-                ggml_set_output(lt.k_new_out);
-
-                lt.v_new_out = ggml_cpy(ctx, layer_v_new[l], lt.v_new_out);
-                ggml_set_output(lt.v_new_out);
-            }
         }
 
         // Output: copy hidden state
@@ -8954,14 +9075,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
         }
         ggml_build_forward_expand(graph, out_hidden);
-        for (int l = 0; l < num_layers; l++)
-        {
-            if (!li[l].isShared && layers[l].k_new_out != nullptr)
-            {
-                ggml_build_forward_expand(graph, layers[l].k_new_out);
-                ggml_build_forward_expand(graph, layers[l].v_new_out);
-            }
-        }
 
         // Bind weight data
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
@@ -9078,30 +9191,6 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
         // Download hidden state
         ggml_backend_tensor_get(hidden_out, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
-
-        // Download new KV and write to caches (non-shared layers only)
-        for (int l = 0; l < num_layers; l++)
-        {
-            auto& info = li[l];
-            if (info.isShared || layers[l].k_new_out == nullptr)
-                continue;
-
-            std::vector<float> k_new_buf(static_cast<std::size_t>(info.kDim));
-            std::vector<float> v_new_buf(static_cast<std::size_t>(info.kDim));
-            ggml_backend_tensor_get(layers[l].k_new_out, k_new_buf.data(), 0,
-                static_cast<std::size_t>(info.kDim) * sizeof(float));
-            ggml_backend_tensor_get(layers[l].v_new_out, v_new_buf.data(), 0,
-                static_cast<std::size_t>(info.kDim) * sizeof(float));
-
-            int cachePos;
-            if (info.isLocal)
-                cachePos = position % info.cacheSize;
-            else
-                cachePos = position;
-
-            write_flat_kv_to_host_cache(static_cast<float*>(k_cache_arr[l]), k_new_buf.data(), info.kvHeads, info.cacheSize, info.hd, cachePos);
-            write_flat_kv_to_host_cache(static_cast<float*>(v_cache_arr[l]), v_new_buf.data(), info.kvHeads, info.cacheSize, info.hd, cachePos);
-        }
 
         clear_last_error();
         return 1;

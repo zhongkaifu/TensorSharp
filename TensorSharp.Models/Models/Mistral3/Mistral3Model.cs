@@ -87,6 +87,7 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseQKVWeights();
             FuseGateUpWeights();
+            PrepareCudaQuantizedWeightsForInference();
 
             InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
@@ -108,12 +109,7 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
-                    Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
-                    Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);
-                    _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vw.Ne1);
+                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -239,8 +235,8 @@ namespace TensorSharp.Models
             {
                 _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, _attnKeyLen);
                 _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, _attnValLen);
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
+                InitializeCacheTensor(_kvCacheK[l]);
+                InitializeCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
         }
@@ -249,10 +245,8 @@ namespace TensorSharp.Models
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;

@@ -165,7 +165,7 @@ namespace TensorSharp.Server
                 _model.TruncateKVCache(commonPrefix);
                 var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
                 Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
-                logits = _model.Forward(suffixTokens);
+                logits = ForwardPromptPrefill(suffixTokens);
             }
             else
             {
@@ -173,7 +173,7 @@ namespace TensorSharp.Server
                 if (_cachedTokens != null)
                     Console.WriteLine("[KV cache] Reset (no usable common prefix)");
                 _model.ResetKVCache();
-                logits = _model.Forward(inputTokens.ToArray());
+                logits = ForwardPromptPrefill(inputTokens);
             }
 
             var generatedTokens = new List<int>();
@@ -212,6 +212,45 @@ namespace TensorSharp.Server
             }
 
             SaveTokenCache(inputTokens, generatedTokens);
+        }
+
+        private float[] ForwardPromptPrefill(IList<int> tokens)
+        {
+            if (tokens == null || tokens.Count == 0)
+                throw new ArgumentException("Prompt token list cannot be null or empty.", nameof(tokens));
+
+            int chunkSize = ResolvePrefillChunkSize(_backend, tokens.Count);
+            if (chunkSize >= tokens.Count)
+                return _model.ForwardRefill(CopyTokenRange(tokens, 0, tokens.Count));
+
+            Console.WriteLine($"[Prompt] Chunking prefill: {tokens.Count} tokens in blocks of {chunkSize} on {LoadedBackend ?? _backend.ToString()}");
+
+            float[] logits = null;
+            for (int start = 0; start < tokens.Count; start += chunkSize)
+            {
+                int length = Math.Min(chunkSize, tokens.Count - start);
+                logits = _model.ForwardRefill(CopyTokenRange(tokens, start, length));
+            }
+
+            return logits;
+        }
+
+        internal static int ResolvePrefillChunkSize(BackendType backend, int tokenCount)
+        {
+            if (tokenCount <= 0)
+                return 0;
+
+            return backend == BackendType.GgmlCuda
+                ? Math.Min(tokenCount, 5120)
+                : tokenCount;
+        }
+
+        private static int[] CopyTokenRange(IList<int> tokens, int start, int length)
+        {
+            var result = new int[length];
+            for (int i = 0; i < length; i++)
+                result[i] = tokens[start + i];
+            return result;
         }
 
         private List<int> ProcessMultimodalHistory(List<ChatMessage> history, List<int> inputTokens, string arch)
@@ -495,7 +534,7 @@ namespace TensorSharp.Server
             InvalidateKVCache();
 
             var sw = Stopwatch.StartNew();
-            float[] logits = _model.Forward(inputTokens.ToArray());
+            float[] logits = ForwardPromptPrefill(inputTokens);
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             int promptTokenCount = inputTokens.Count;
 
@@ -587,7 +626,7 @@ namespace TensorSharp.Server
                 _model.TruncateKVCache(commonPrefix);
                 var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
                 Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
-                logits = _model.Forward(suffixTokens);
+                logits = ForwardPromptPrefill(suffixTokens);
                 promptTokenCount = suffixTokens.Length;
             }
             else
@@ -596,7 +635,7 @@ namespace TensorSharp.Server
                 if (_cachedTokens != null)
                     Console.WriteLine("[KV cache] Reset (no usable common prefix)");
                 _model.ResetKVCache();
-                logits = _model.Forward(inputTokens.ToArray());
+                logits = ForwardPromptPrefill(inputTokens);
                 promptTokenCount = inputTokens.Count;
             }
 
@@ -830,5 +869,4 @@ namespace TensorSharp.Server
         }
     }
 }
-
 
