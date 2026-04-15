@@ -30,6 +30,7 @@ namespace TensorSharp.Models
         // Full attention KV cache (only for attention layers)
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
+        private int _kvCacheCapacity;
 
         // GatedDeltaNet state (only for recurrent layers)
         private float[][] _convState;  // [layer][convChannels * (convKernelSize-1)]
@@ -127,7 +128,12 @@ namespace TensorSharp.Models
             FuseAttentionProjectionWeights();
             FuseRecurrentInputWeights();
             FuseGateUpWeights();
-            InitCaches(ResolveConfiguredContextLength());
+            PrepareCudaQuantizedWeightsForInference();
+            int maxContextLength = ResolveConfiguredContextLength();
+            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+            if (initialCacheLength < maxContextLength)
+                Console.WriteLine($"Initial CUDA cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
+            InitCaches(initialCacheLength, maxContextLength);
             PrecomputeRoPE();
             InitGDNBuffers();
         }
@@ -208,17 +214,7 @@ namespace TensorSharp.Models
                     totalNe1 += qw.Ne1;
                 }
 
-                IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                byte* fusedDst = (byte*)fusedPtr.ToPointer();
-                long offset = 0;
-                for (int i = 0; i < quantWeights.Length; i++)
-                {
-                    var qw = quantWeights[i];
-                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedDst + offset, totalBytes - offset, qw.RawBytes);
-                    offset += qw.RawBytes;
-                }
-
-                _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, first.GgmlType, first.Ne0, totalNe1);
+                _quantWeights[fusedName] = QuantizedWeight.ConcatOrCreateCopy(quantWeights);
                 for (int i = 0; i < weightNames.Length; i++)
                 {
                     var name = weightNames[i];
@@ -293,9 +289,10 @@ namespace TensorSharp.Models
             _gdnGatedOutT = new Tensor(_allocator, DType.Float32, 1, _ssmDInner);
         }
 
-        private void InitCaches(int maxSeqLen)
+        private void InitCaches(int initialSeqLen, int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            _kvCacheCapacity = initialSeqLen;
             int numLayers = Config.NumLayers;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
@@ -309,10 +306,10 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
-                    _kvCacheK[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, Config.HeadDim);
-                    _kvCacheV[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, Config.HeadDim);
-                    Ops.Fill(_kvCacheK[l], 0);
-                    Ops.Fill(_kvCacheV[l], 0);
+                    _kvCacheK[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, initialSeqLen, Config.HeadDim);
+                    _kvCacheV[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, initialSeqLen, Config.HeadDim);
+                    InitializeCacheTensor(_kvCacheK[l]);
+                    InitializeCacheTensor(_kvCacheV[l]);
                 }
                 else
                 {
@@ -322,6 +319,48 @@ namespace TensorSharp.Models
                 }
             }
             _cacheSeqLen = 0;
+        }
+
+        private void EnsureCacheCapacity(int requiredSeqLen)
+        {
+            if (requiredSeqLen <= _kvCacheCapacity)
+                return;
+            if (requiredSeqLen > _maxContextLength)
+                throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
+
+            int newCapacity = Math.Max(_kvCacheCapacity, 1);
+            while (newCapacity < requiredSeqLen)
+                newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
+
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_isRecurrent[l])
+                    continue;
+
+                var newK = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, newCapacity, Config.HeadDim);
+                var newV = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, newCapacity, Config.HeadDim);
+                InitializeCacheTensor(newK);
+                InitializeCacheTensor(newV);
+
+                if (_cacheSeqLen > 0)
+                {
+                    using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstK = newK.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstK, srcK);
+
+                    using var srcV = _kvCacheV[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstV, srcV);
+                }
+
+                _kvCacheK[l].Dispose();
+                _kvCacheV[l].Dispose();
+                _kvCacheK[l] = newK;
+                _kvCacheV[l] = newV;
+            }
+
+            _kvCacheCapacity = newCapacity;
+            Console.WriteLine($"Expanded Qwen3.5 attention cache to {newCapacity} tokens.");
         }
 
         private void PrecomputeRoPE()
@@ -341,10 +380,8 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
-                    Ops.Fill(_kvCacheK[l], 0);
-                    Ops.Fill(_kvCacheV[l], 0);
-                    InvalidateTensorDeviceCache(_kvCacheK[l]);
-                    InvalidateTensorDeviceCache(_kvCacheV[l]);
+                    ResetCacheTensor(_kvCacheK[l]);
+                    ResetCacheTensor(_kvCacheV[l]);
                 }
                 else
                 {
@@ -365,6 +402,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+            EnsureCacheCapacity(startPos + seqLen);
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);

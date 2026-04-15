@@ -462,6 +462,12 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_InvalidateHostBuffer(IntPtr ptr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_SyncHostBuffer(IntPtr ptr, long byteCount);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern UIntPtr TSGgml_RowSize(int ggmlType, long ne);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -975,6 +981,22 @@ internal enum GgmlIndexReductionOp
         {
             if (ptr != IntPtr.Zero)
                 TSGgml_InvalidateHostBuffer(ptr);
+        }
+
+        public static void SyncHostBuffer(IntPtr ptr, long byteCount)
+        {
+            if (ptr == IntPtr.Zero || byteCount <= 0)
+                return;
+
+            CheckResult(TSGgml_SyncHostBuffer(ptr, byteCount), "sync_host_buffer");
+        }
+
+        public static void PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            if (cacheKey == IntPtr.Zero || hostData == IntPtr.Zero || rawBytes <= 0)
+                throw new ArgumentException("PreloadQuantizedWeight requires valid cache key, host data, and size.");
+
+            CheckResult(TSGgml_PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes), "preload_quantized_weight");
         }
 
         /// <summary>Bytes for one row along ne[0]; 0 if type/shape invalid.</summary>

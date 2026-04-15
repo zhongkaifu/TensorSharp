@@ -29,9 +29,9 @@ namespace TensorSharp.GGML
             }
 
             DeviceId = deviceIds[0];
-            MemoryPool = new GgmlMemoryPool();
-            MemoryPool.EnsureInitialBlocks();
             BackendType = backendType;
+            MemoryPool = new GgmlMemoryPool(backendType);
+            MemoryPool.EnsureInitialBlocks();
             GgmlNative.EnsureAvailable(backendType);
             OpRegistry.RegisterAssembly(Assembly.GetExecutingAssembly());
         }

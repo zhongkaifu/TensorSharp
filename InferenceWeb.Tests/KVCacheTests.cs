@@ -127,5 +127,19 @@ public class KVCacheTests
         int common = ModelService.FindTokenPrefixLength(cached, newTokens);
         Assert.Equal(8, common); // Full cached is prefix
     }
+
+    [Fact]
+    public void ResolvePrefillChunkSize_CudaLongPrompt_UsesSafeChunkSize()
+    {
+        int chunkSize = ModelService.ResolvePrefillChunkSize(TensorSharp.Runtime.BackendType.GgmlCuda, 11573);
+        Assert.Equal(5120, chunkSize);
+    }
+
+    [Fact]
+    public void ResolvePrefillChunkSize_NonCudaPrompt_DoesNotChunk()
+    {
+        int chunkSize = ModelService.ResolvePrefillChunkSize(TensorSharp.Runtime.BackendType.GgmlCpu, 11573);
+        Assert.Equal(11573, chunkSize);
+    }
 }
 

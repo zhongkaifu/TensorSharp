@@ -11,6 +11,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Text;
 
 namespace TensorSharp.Runtime
@@ -62,6 +63,10 @@ namespace TensorSharp.Runtime
 
         private FileStream _stream;
         private string _path;
+        private MemoryMappedFile _mappedFile;
+        private MemoryMappedViewAccessor _mappedView;
+        private unsafe byte* _mappedBase;
+        private bool _mappedPointerAcquired;
 
         public GgufFile(string path)
         {
@@ -263,6 +268,20 @@ namespace TensorSharp.Runtime
             }
         }
 
+        public unsafe bool TryGetTensorDataPointer(GgufTensorInfo tensorInfo, out IntPtr dataPtr)
+        {
+            dataPtr = IntPtr.Zero;
+            if (tensorInfo == null)
+                return false;
+
+            EnsureMappedView();
+            if (_mappedBase == null)
+                return false;
+
+            dataPtr = (IntPtr)(_mappedBase + DataOffset + (long)tensorInfo.Offset);
+            return true;
+        }
+
         public long GetTensorByteCount(GgufTensorInfo tensorInfo)
         {
             long ne0 = (long)tensorInfo.Shape[0];
@@ -462,9 +481,36 @@ namespace TensorSharp.Runtime
             }
         }
 
-        public void Dispose()
+        public unsafe void Dispose()
         {
+            if (_mappedPointerAcquired && _mappedView != null)
+            {
+                _mappedView.SafeMemoryMappedViewHandle.ReleasePointer();
+                _mappedPointerAcquired = false;
+                _mappedBase = null;
+            }
+
+            _mappedView?.Dispose();
+            _mappedView = null;
+            _mappedFile?.Dispose();
+            _mappedFile = null;
             _stream?.Dispose();
+            _stream = null;
+        }
+
+        private unsafe void EnsureMappedView()
+        {
+            if (_mappedBase != null)
+                return;
+
+            _mappedFile ??= MemoryMappedFile.CreateFromFile(_path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            _mappedView ??= _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+
+            byte* viewPtr = null;
+            _mappedView.SafeMemoryMappedViewHandle.AcquirePointer(ref viewPtr);
+            viewPtr += _mappedView.PointerOffset;
+            _mappedBase = viewPtr;
+            _mappedPointerAcquired = true;
         }
     }
 }

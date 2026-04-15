@@ -372,7 +372,7 @@ namespace TensorSharp.Cli
                     model.TruncateKVCache(commonPrefix);
                     var suffix = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
                     Console.WriteLine($"[KV cache] Reusing {commonPrefix} tokens, forwarding {suffix.Length} new tokens");
-                    logits = model.Forward(suffix);
+                    logits = model.ForwardRefill(suffix);
                 }
                 else
                 {
@@ -1445,6 +1445,5 @@ namespace TensorSharp.Cli
         }
     }
 }
-
 
 

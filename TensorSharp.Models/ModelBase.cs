@@ -23,12 +23,20 @@ namespace TensorSharp.Models
 {
     public class QuantizedWeight : IDisposable
     {
-        public IntPtr Data { get; }
+        private IntPtr _data;
+        private GCHandle _cacheKeyHandle;
+
+        public IntPtr Data => _data;
+        public IntPtr CacheKey { get; private set; }
         public int GgmlType { get; }
         public long Ne0 { get; }
         public long Ne1 { get; }
         public long RawBytes { get; }
-        private readonly bool _aligned;
+        private bool _ownsBuffer;
+        private bool _ownsCacheKeyHandle;
+        private object _ownerToken;
+        public bool HasHostData => _data != IntPtr.Zero;
+        public bool HasExternalHostView => _data != IntPtr.Zero && !_ownsBuffer && _ownerToken != null;
 
         public QuantizedWeight(byte[] raw, int ggmlType, long ne0, long ne1)
         {
@@ -36,30 +44,146 @@ namespace TensorSharp.Models
             Ne0 = ne0;
             Ne1 = ne1;
             RawBytes = raw.Length;
-            Data = AllocateBuffer(raw.Length);
-            _aligned = true;
-            Marshal.Copy(raw, 0, Data, raw.Length);
+            _data = AllocateBuffer(raw.Length);
+            CacheKey = _data;
+            _ownsBuffer = true;
+            Marshal.Copy(raw, 0, _data, raw.Length);
         }
 
         public QuantizedWeight(IntPtr data, long rawBytes, int ggmlType, long ne0, long ne1)
+            : this(data, rawBytes, ggmlType, ne0, ne1, true, null)
         {
-            Data = data;
+        }
+
+        private QuantizedWeight(IntPtr data, long rawBytes, int ggmlType, long ne0, long ne1, bool ownsBuffer, object ownerToken)
+        {
+            _data = data;
+            CacheKey = data;
             RawBytes = rawBytes;
             GgmlType = ggmlType;
             Ne0 = ne0;
             Ne1 = ne1;
-            _aligned = true;
+            _ownsBuffer = ownsBuffer;
+            _ownerToken = ownerToken;
         }
 
         public void Dispose()
         {
-            if (Data != IntPtr.Zero)
+            ReleaseHostData();
+
+            if (_ownsCacheKeyHandle)
             {
-                if (_aligned)
-                    FreeBuffer(Data);
-                else
-                    Marshal.FreeHGlobal(Data);
+                _cacheKeyHandle.Free();
+                _ownsCacheKeyHandle = false;
+                CacheKey = IntPtr.Zero;
             }
+        }
+
+        public static QuantizedWeight CreateExternalView(IntPtr data, long rawBytes, int ggmlType, long ne0, long ne1, object ownerToken)
+        {
+            if (data == IntPtr.Zero)
+                throw new ArgumentException("External quantized weight view requires a non-zero data pointer.", nameof(data));
+            if (ownerToken == null)
+                throw new ArgumentNullException(nameof(ownerToken));
+
+            return new QuantizedWeight(data, rawBytes, ggmlType, ne0, ne1, false, ownerToken);
+        }
+
+        public static bool TryCreateConcatenatedView(out QuantizedWeight fused, params QuantizedWeight[] weights)
+        {
+            fused = null;
+            if (weights == null || weights.Length < 2 || weights[0] == null)
+                return false;
+
+            QuantizedWeight first = weights[0];
+            if (!first.HasHostData || first._ownsBuffer || first._ownerToken == null)
+                return false;
+
+            long totalBytes = 0;
+            long totalNe1 = 0;
+            long expectedAddress = first.Data.ToInt64();
+
+            for (int i = 0; i < weights.Length; i++)
+            {
+                QuantizedWeight weight = weights[i];
+                if (weight == null ||
+                    weight._ownsBuffer ||
+                    !ReferenceEquals(weight._ownerToken, first._ownerToken) ||
+                    weight.GgmlType != first.GgmlType ||
+                    weight.Ne0 != first.Ne0 ||
+                    weight.Data.ToInt64() != expectedAddress)
+                {
+                    return false;
+                }
+
+                totalBytes += weight.RawBytes;
+                totalNe1 += weight.Ne1;
+                expectedAddress += weight.RawBytes;
+            }
+
+            fused = new QuantizedWeight(first.Data, totalBytes, first.GgmlType, first.Ne0, totalNe1, false, first._ownerToken);
+            return true;
+        }
+
+        public static unsafe QuantizedWeight ConcatOrCreateCopy(params QuantizedWeight[] weights)
+        {
+            if (weights == null || weights.Length == 0 || weights[0] == null)
+                throw new ArgumentException("At least one quantized weight is required.", nameof(weights));
+
+            if (TryCreateConcatenatedView(out QuantizedWeight fused, weights))
+                return fused;
+
+            QuantizedWeight first = weights[0];
+            long totalBytes = 0;
+            long totalNe1 = 0;
+            for (int i = 0; i < weights.Length; i++)
+            {
+                QuantizedWeight weight = weights[i] ?? throw new ArgumentException("Quantized weight list cannot contain null entries.", nameof(weights));
+                if (!weight.HasHostData)
+                    throw new InvalidOperationException("Cannot concatenate quantized weights after their host storage has been released.");
+                totalBytes += weight.RawBytes;
+                totalNe1 += weight.Ne1;
+            }
+
+            IntPtr fusedPtr = AllocateBuffer(totalBytes);
+            byte* fusedDst = (byte*)fusedPtr.ToPointer();
+            long offset = 0;
+            for (int i = 0; i < weights.Length; i++)
+            {
+                QuantizedWeight weight = weights[i];
+                Buffer.MemoryCopy(weight.Data.ToPointer(), fusedDst + offset, totalBytes - offset, weight.RawBytes);
+                offset += weight.RawBytes;
+            }
+
+            return new QuantizedWeight(fusedPtr, totalBytes, first.GgmlType, first.Ne0, totalNe1);
+        }
+
+        public IntPtr EnsureDeviceCacheKey()
+        {
+            if (_ownsCacheKeyHandle)
+                return CacheKey;
+
+            _cacheKeyHandle = GCHandle.Alloc(this, GCHandleType.Normal);
+            CacheKey = GCHandle.ToIntPtr(_cacheKeyHandle);
+            _ownsCacheKeyHandle = true;
+            return CacheKey;
+        }
+
+        public void ReleaseHostData()
+        {
+            if (_data == IntPtr.Zero)
+                return;
+
+            IntPtr currentData = _data;
+            if (_ownsBuffer)
+                FreeBuffer(currentData);
+
+            if (CacheKey == currentData)
+                CacheKey = IntPtr.Zero;
+
+            _data = IntPtr.Zero;
+            _ownsBuffer = false;
+            _ownerToken = null;
         }
 
         public static unsafe IntPtr AllocateBuffer(long size)
@@ -93,6 +217,7 @@ namespace TensorSharp.Models
         protected readonly Dictionary<string, Tensor> _weights = new();
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
         private bool _quantBackendReady;
+        private bool _cudaQuantWeightsPrepared;
 
         protected int _cacheSeqLen;
         protected int _maxContextLength;
@@ -198,6 +323,36 @@ namespace TensorSharp.Models
                 Console.WriteLine($"Context length: using GGUF metadata {source}={resolved}.");
 
             return resolved;
+        }
+
+        protected int ResolveInitialCacheAllocationLength(int requestedContextLength, int gpuDefault = 8192)
+        {
+            if (_backend == BackendType.GgmlCuda &&
+                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
+            {
+                return Math.Min(requestedContextLength, gpuDefault);
+            }
+
+            return requestedContextLength;
+        }
+
+        protected bool ShouldZeroFillCacheTensors => _backend != BackendType.GgmlCuda;
+
+        protected void InitializeCacheTensor(Tensor tensor)
+        {
+            if (tensor != null && ShouldZeroFillCacheTensors)
+                Ops.Fill(tensor, 0f);
+        }
+
+        protected void ResetCacheTensor(Tensor tensor)
+        {
+            if (tensor == null)
+                return;
+
+            if (ShouldZeroFillCacheTensors)
+                Ops.Fill(tensor, 0f);
+
+            InvalidateTensorDeviceCache(tensor);
         }
 
         internal static int ResolveConfiguredContextLength(
@@ -358,6 +513,7 @@ namespace TensorSharp.Models
             int countQuant = 0;
             long totalQuantBytes = 0;
             long totalF32Bytes = 0;
+            long mappedQuantBytes = 0;
             foreach (var kv in _gguf.Tensors)
             {
                 var info = kv.Value;
@@ -376,35 +532,57 @@ namespace TensorSharp.Models
                         // 3D MoE expert tensor: split into per-expert 2D quantized weights
                         int numExperts = (int)info.Shape[2];
                         long perExpertBytes = byteCount / numExperts;
-                        IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
-                        _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
-
                         string baseName = info.Name;
                         if (baseName.EndsWith(".weight"))
                             baseName = baseName.Substring(0, baseName.Length - 7);
 
-                        for (int e = 0; e < numExperts; e++)
+                        if (_backend == BackendType.GgmlCuda && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
                         {
-                            IntPtr expertPtr = QuantizedWeight.AllocateBuffer(perExpertBytes);
-                            unsafe
+                            for (int e = 0; e < numExperts; e++)
                             {
-                                Buffer.MemoryCopy(
-                                    ((byte*)bulkPtr.ToPointer()) + e * perExpertBytes,
-                                    expertPtr.ToPointer(),
-                                    perExpertBytes, perExpertBytes);
+                                IntPtr expertPtr = new IntPtr(mappedTensorPtr.ToInt64() + e * perExpertBytes);
+                                _quantWeights[$"{baseName}.{e}.weight"] = QuantizedWeight.CreateExternalView(
+                                    expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, _gguf);
                             }
-                            _quantWeights[$"{baseName}.{e}.weight"] = new QuantizedWeight(expertPtr, perExpertBytes, (int)info.Type, ne0, ne1);
+                            mappedQuantBytes += byteCount;
                         }
+                        else
+                        {
+                            IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
+                            _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
 
-                        QuantizedWeight.FreeBuffer(bulkPtr);
+                            for (int e = 0; e < numExperts; e++)
+                            {
+                                IntPtr expertPtr = QuantizedWeight.AllocateBuffer(perExpertBytes);
+                                unsafe
+                                {
+                                    Buffer.MemoryCopy(
+                                        ((byte*)bulkPtr.ToPointer()) + e * perExpertBytes,
+                                        expertPtr.ToPointer(),
+                                        perExpertBytes, perExpertBytes);
+                                }
+                                _quantWeights[$"{baseName}.{e}.weight"] = new QuantizedWeight(expertPtr, perExpertBytes, (int)info.Type, ne0, ne1);
+                            }
+
+                            QuantizedWeight.FreeBuffer(bulkPtr);
+                        }
                         countQuant += numExperts;
                         totalQuantBytes += byteCount;
                     }
                     else
                     {
-                        IntPtr ptr = QuantizedWeight.AllocateBuffer(byteCount);
-                        _gguf.ReadTensorDataToNative(info, ptr, byteCount);
-                        _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
+                        if (_backend == BackendType.GgmlCuda && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
+                        {
+                            _quantWeights[info.Name] = QuantizedWeight.CreateExternalView(
+                                mappedTensorPtr, byteCount, (int)info.Type, ne0, ne1, _gguf);
+                            mappedQuantBytes += byteCount;
+                        }
+                        else
+                        {
+                            IntPtr ptr = QuantizedWeight.AllocateBuffer(byteCount);
+                            _gguf.ReadTensorDataToNative(info, ptr, byteCount);
+                            _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
+                        }
                         countQuant++;
                         totalQuantBytes += byteCount;
                     }
@@ -447,7 +625,55 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($" done ({countF32} F32 tensors, {countQuant} quantized tensors)");
             if (countQuant > 0)
-                Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB, F32: {totalF32Bytes / 1024 / 1024} MB");
+            {
+                if (mappedQuantBytes > 0)
+                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB ({mappedQuantBytes / 1024 / 1024} MB file-backed), F32: {totalF32Bytes / 1024 / 1024} MB");
+                else
+                    Console.WriteLine($"  Quantized: {totalQuantBytes / 1024 / 1024} MB, F32: {totalF32Bytes / 1024 / 1024} MB");
+            }
+        }
+
+        protected void PrepareCudaQuantizedWeightsForInference()
+        {
+            if (_backend != BackendType.GgmlCuda || _cudaQuantWeightsPrepared || _quantWeights.Count == 0)
+                return;
+
+            EnsureQuantBackendAvailable();
+
+            long preloadedBytes = 0;
+            int preloadedCount = 0;
+            int mappedHostViews = 0;
+
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                if (qw.HasExternalHostView)
+                    mappedHostViews++;
+            }
+
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                if (!qw.HasHostData)
+                    continue;
+
+                IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                preloadedBytes += qw.RawBytes;
+                preloadedCount++;
+
+                bool wasMappedView = qw.HasExternalHostView;
+                qw.ReleaseHostData();
+
+                if (wasMappedView && --mappedHostViews == 0)
+                {
+                    _gguf?.Dispose();
+                }
+            }
+
+            _gguf?.Dispose();
+            _cudaQuantWeightsPrepared = true;
+
+            if (preloadedCount > 0)
+                Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
         }
 
         protected unsafe void FuseGateUpWeights()
@@ -463,11 +689,7 @@ namespace TensorSharp.Models
                     _quantWeights.TryGetValue(upName, out var uw) &&
                     gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                 {
-                    long totalBytes = gw.RawBytes + uw.RawBytes;
-                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                    Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
-                    Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
-                    _quantWeights[guName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
+                    _quantWeights[guName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
                     _quantWeights.Remove(gateName); gw.Dispose();
                     _quantWeights.Remove(upName); uw.Dispose();
                     fused++;
@@ -522,7 +744,7 @@ namespace TensorSharp.Models
                 {
                     var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
                     using var idxTensor = CreateIntTensor(tokens, tokens.Length);
-                    GgmlBasicOps.GetRowsQuant(result, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
+                    GgmlBasicOps.GetRowsQuant(result, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
                     return result;
                 }
 
@@ -557,7 +779,7 @@ namespace TensorSharp.Models
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
                 if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 else
                     AddmmQuantManaged(result, input, qw);
             }
@@ -944,6 +1166,15 @@ namespace TensorSharp.Models
             throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
         }
 
+        private static IntPtr GetStorageBasePtr(Tensor t)
+        {
+            if (t.Storage is GgmlStorage gs)
+                return gs.PtrAtElement(0);
+            if (t.Storage is CpuStorage cs)
+                return cs.PtrAtElement(0);
+            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
+        }
+
         protected void InvalidateTensorDeviceCache(Tensor tensor)
         {
             if (!IsGgmlBackend || tensor == null)
@@ -952,7 +1183,16 @@ namespace TensorSharp.Models
             GgmlBasicOps.InvalidateHostBuffer(GetStoragePtr(tensor));
         }
 
+        protected void SyncTensorHostCache(Tensor tensor)
+        {
+            if (!IsGgmlBackend || tensor == null)
+                return;
+
+            GgmlBasicOps.SyncHostBuffer(GetStorageBasePtr(tensor), tensor.Storage.ByteLength);
+        }
+
         public abstract float[] Forward(int[] tokens);
+        public virtual float[] ForwardRefill(int[] tokens) => Forward(tokens);
         public abstract void ResetKVCache();
 
         /// <summary>
