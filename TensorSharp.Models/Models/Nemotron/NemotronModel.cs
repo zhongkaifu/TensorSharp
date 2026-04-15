@@ -206,6 +206,7 @@ namespace TensorSharp.Models
             if (_numExperts == 0)
                 FuseFFNWeights();
             FuseQKVWeights();
+            PrepareCudaQuantizedWeightsForInference();
 
             InitCaches(ResolveConfiguredContextLength());
             InitMamba2Buffers();
@@ -234,12 +235,7 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
-                    Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
-                    Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);
-                    _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vw.Ne1);
+                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -300,8 +296,8 @@ namespace TensorSharp.Models
                         int headDim = Config.HeadDim;
                         _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVH, maxSeqLen, headDim);
                         _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVH, maxSeqLen, headDim);
-                        Ops.Fill(_kvCacheK[l], 0);
-                        Ops.Fill(_kvCacheV[l], 0);
+                        InitializeCacheTensor(_kvCacheK[l]);
+                        InitializeCacheTensor(_kvCacheV[l]);
                         break;
                     case LayerType.Mamba2:
                         _convState[l] = new float[convDim * convChannels];
@@ -417,10 +413,8 @@ namespace TensorSharp.Models
                 switch (_layerTypes[l])
                 {
                     case LayerType.Attention:
-                        Ops.Fill(_kvCacheK[l], 0);
-                        Ops.Fill(_kvCacheV[l], 0);
-                        InvalidateTensorDeviceCache(_kvCacheK[l]);
-                        InvalidateTensorDeviceCache(_kvCacheV[l]);
+                        ResetCacheTensor(_kvCacheK[l]);
+                        ResetCacheTensor(_kvCacheV[l]);
                         break;
                     case LayerType.Mamba2:
                         Array.Clear(_convState[l]);
@@ -544,7 +538,7 @@ namespace TensorSharp.Models
             if (_quantWeights.TryGetValue(weightName, out var qw))
             {
                 if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 else
                     AddmmQuantManaged(result, input, qw);
             }
@@ -913,8 +907,8 @@ namespace TensorSharp.Models
                             for (int k = 0; k < _numExpertsUsed; k++)
                             {
                                 int ei = topExperts[k];
-                                _moeUpPtrs[k] = _expertUpQW[layer][ei].Data;
-                                _moeDownPtrs[k] = _expertDownQW[layer][ei].Data;
+                                _moeUpPtrs[k] = _expertUpQW[layer][ei].CacheKey;
+                                _moeDownPtrs[k] = _expertDownQW[layer][ei].CacheKey;
                             }
 
                             long t0exp = Stopwatch.GetTimestamp();

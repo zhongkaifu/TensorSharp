@@ -85,6 +85,7 @@ namespace TensorSharp.Models
             SplitExpertBiases();
             FuseExpertGateUpWeights();
             FuseQKVWeights();
+            PrepareCudaQuantizedWeightsForInference();
             InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
         }
@@ -137,11 +138,7 @@ namespace TensorSharp.Models
                         _quantWeights.TryGetValue(upName, out var uw) &&
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
-                        long totalBytes = gw.RawBytes + uw.RawBytes;
-                        IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                        Buffer.MemoryCopy(gw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, gw.RawBytes);
-                        Buffer.MemoryCopy(uw.Data.ToPointer(), (fusedPtr + (int)gw.RawBytes).ToPointer(), totalBytes - gw.RawBytes, uw.RawBytes);
-                        _quantWeights[fusedName] = new QuantizedWeight(fusedPtr, totalBytes, gw.GgmlType, gw.Ne0, gw.Ne1 + uw.Ne1);
+                        _quantWeights[fusedName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
                         _quantWeights.Remove(gateName); gw.Dispose();
                         _quantWeights.Remove(upName); uw.Dispose();
                         fused++;
@@ -198,12 +195,7 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    long totalBytes = qw.RawBytes + kw.RawBytes + vw.RawBytes;
-                    IntPtr fusedPtr = QuantizedWeight.AllocateBuffer(totalBytes);
-                    Buffer.MemoryCopy(qw.Data.ToPointer(), fusedPtr.ToPointer(), totalBytes, qw.RawBytes);
-                    Buffer.MemoryCopy(kw.Data.ToPointer(), (fusedPtr + (int)qw.RawBytes).ToPointer(), totalBytes - qw.RawBytes, kw.RawBytes);
-                    Buffer.MemoryCopy(vw.Data.ToPointer(), (fusedPtr + (int)(qw.RawBytes + kw.RawBytes)).ToPointer(), totalBytes - qw.RawBytes - kw.RawBytes, vw.RawBytes);
-                    _quantWeights[qkvName] = new QuantizedWeight(fusedPtr, totalBytes, qw.GgmlType, qw.Ne0, qw.Ne1 + kw.Ne1 + vw.Ne1);
+                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -346,8 +338,8 @@ namespace TensorSharp.Models
             {
                 _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
                 _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
+                InitializeCacheTensor(_kvCacheK[l]);
+                InitializeCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
         }
@@ -356,10 +348,8 @@ namespace TensorSharp.Models
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                Ops.Fill(_kvCacheK[l], 0);
-                Ops.Fill(_kvCacheV[l], 0);
-                InvalidateTensorDeviceCache(_kvCacheK[l]);
-                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                ResetCacheTensor(_kvCacheK[l]);
+                ResetCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;

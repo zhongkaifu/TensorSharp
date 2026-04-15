@@ -444,10 +444,16 @@ namespace TensorSharp.GGML
             GgmlNative.AddmmQuantBatch(resultView, m1View, weightData, ggmlType, ne0, rawBytes, batchCount, weightOffsets, weightNe1Arr);
         }
 
+        public static void PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        {
+            GgmlNative.PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+        }
+
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
+        public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 

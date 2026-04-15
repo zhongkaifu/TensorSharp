@@ -83,6 +83,7 @@ namespace TensorSharp.Models
                 Console.WriteLine("  Output tied to token_embd.weight");
 
             FuseGateUpWeights();
+            PrepareCudaQuantizedWeightsForInference();
             PrecomputeRoPE();
             InitKVCache(ResolveConfiguredContextLength());
         }
@@ -115,8 +116,8 @@ namespace TensorSharp.Models
             {
                 _kvCacheK[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, _attnKeyLen);
                 _kvCacheV[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, _attnValLen);
-                Ops.Fill(_kvCacheK[l], 0f);
-                Ops.Fill(_kvCacheV[l], 0f);
+                InitializeCacheTensor(_kvCacheK[l]);
+                InitializeCacheTensor(_kvCacheV[l]);
             }
         }
 
@@ -127,13 +128,11 @@ namespace TensorSharp.Models
             {
                 foreach (var k in _kvCacheK)
                 {
-                    Ops.Fill(k, 0f);
-                    InvalidateTensorDeviceCache(k);
+                    ResetCacheTensor(k);
                 }
                 foreach (var v in _kvCacheV)
                 {
-                    Ops.Fill(v, 0f);
-                    InvalidateTensorDeviceCache(v);
+                    ResetCacheTensor(v);
                 }
             }
         }
