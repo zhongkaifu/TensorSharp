@@ -13,7 +13,7 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 1. Start TensorSharp.Server:
 
 ```bash
-MODEL_DIR=~/models BACKEND=ggml_metal ./TensorSharp.Server
+./TensorSharp.Server --model ~/models/model.gguf --backend ggml_metal
 ```
 
 2. Run either suite:

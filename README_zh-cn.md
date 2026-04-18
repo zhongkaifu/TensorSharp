@@ -249,17 +249,21 @@ cd TensorSharp.Cli/bin
 ```bash
 cd TensorSharp.Server/bin
 
-# 设置环境变量并运行
-MODEL_DIR=./models BACKEND=ggml_metal ./TensorSharp.Server
+# 通过 --model 指定要托管的模型
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal
 
 # Linux + NVIDIA GPU
-MODEL_DIR=./models BACKEND=ggml_cuda ./TensorSharp.Server
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_cuda
+
+# 多模态模型：同时显式指定投影器
+./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 ```
 
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
 
 - 多轮聊天
-- 从 `MODEL_DIR` 中可用 GGUF 文件列表选择模型
+- 通过 `--model` 显式托管单个 GGUF 模型
+- 在需要时通过 `--mmproj` 显式托管多模态投影器
 - 上传图像、视频和音频进行多模态推理（最大 500 MB）
 - 思维链/推理模式切换
 - 带函数定义的工具调用
@@ -267,11 +271,12 @@ MODEL_DIR=./models BACKEND=ggml_cuda ./TensorSharp.Server
 - 带实时排队位置反馈的请求队列
 - 消息编辑和删除，支持从对话中任意位置重新生成
 
-**环境变量：**
+使用 `--model` 选择要托管的 GGUF 文件，使用 `--mmproj` 选择要托管的投影器文件。`TensorSharp.Server` 不再扫描 `MODEL_DIR`。
+
+**运行时环境变量：**
 
 | 变量 | 说明 |
 |---|---|
-| `MODEL_DIR` | GGUF 模型文件所在目录 |
 | `BACKEND` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
 | `PORT` | HTTP 端口（默认：`5000`） |

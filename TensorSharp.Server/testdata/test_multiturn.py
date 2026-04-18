@@ -876,7 +876,7 @@ class TestRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-turn chat integration tests for TensorSharp.Server")
-    parser.add_argument("--model", type=str, default=None, help="Model filename (auto-detected if omitted)")
+    parser.add_argument("--model", type=str, default=None, help="Hosted model filename (auto-detected if omitted)")
     parser.add_argument("--url", type=str, default="http://localhost:5000", help="TensorSharp.Server base URL")
     parser.add_argument("--max-tokens", type=int, default=80, help="Max tokens per response")
     args = parser.parse_args()
@@ -890,7 +890,7 @@ def main():
             data = json.loads(raw)
             model = data.get("loaded") or (data.get("models", [None])[0])
             if not model:
-                print("Error: No models found. Specify --model or set MODEL_DIR.")
+                print("Error: No hosted model found. Start TensorSharp.Server with --model or pass --model here.")
                 sys.exit(1)
             print(f"Auto-detected model: {model}")
         except Exception as e:
