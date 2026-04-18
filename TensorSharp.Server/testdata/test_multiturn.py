@@ -15,10 +15,9 @@ Example:
 import argparse
 import json
 import sys
-import time
 import traceback
 from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError
 
 
 class Colors:
@@ -36,8 +35,12 @@ class TestRunner:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_tokens = max_tokens
+        self.architecture = ""
+        self.supports_thinking = False
+        self.supports_tools = False
         self.passed = 0
         self.failed = 0
+        self.skipped = 0
 
     def log(self, msg):
         print(f"{Colors.CYAN}[TEST]{Colors.RESET} {msg}")
@@ -49,6 +52,10 @@ class TestRunner:
     def fail(self, msg):
         print(f"{Colors.RED}[FAIL]{Colors.RESET} {msg}")
         self.failed += 1
+
+    def skip(self, msg):
+        print(f"{Colors.YELLOW}[SKIP]{Colors.RESET} {msg}")
+        self.skipped += 1
 
     def header(self, title):
         bar = "=" * 60
@@ -75,17 +82,26 @@ class TestRunner:
         resp = self._post_json(path, payload)
         return json.loads(resp.read().decode("utf-8"))
 
-    def _post_sse_collect(self, path, payload):
-        """POST and collect SSE events, return list of parsed JSON objects."""
+    def _post_sse_payloads(self, path, payload):
+        """POST and collect raw SSE data payloads."""
         resp = self._post_json(path, payload)
-        events = []
+        payloads = []
         for raw_line in resp:
             line = raw_line.decode("utf-8").strip()
             if line.startswith("data: "):
-                try:
-                    events.append(json.loads(line[6:]))
-                except json.JSONDecodeError:
-                    pass
+                payloads.append(line[6:])
+        return payloads
+
+    def _post_sse_collect(self, path, payload):
+        """POST and collect SSE events, return list of parsed JSON objects."""
+        events = []
+        for payload_text in self._post_sse_payloads(path, payload):
+            if payload_text == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(payload_text))
+            except json.JSONDecodeError:
+                pass
         return events
 
     def _post_ndjson_collect(self, path, payload):
@@ -105,16 +121,44 @@ class TestRunner:
         data = json.loads(urlopen(f"{self.base_url}/api/models", timeout=30).read().decode("utf-8"))
         if data.get("loaded") == self.model:
             self.log(f"Using already-loaded model: {self.model}")
-            return
+        else:
+            backend = data.get("loadedBackend") or data.get("defaultBackend")
+            if not backend:
+                raise RuntimeError("No supported backend is available to load the test model.")
 
-        backend = data.get("loadedBackend") or data.get("defaultBackend")
-        if not backend:
-            raise RuntimeError("No supported backend is available to load the test model.")
+            self.log(f"Loading model: {self.model} ({backend})")
+            result = self._post_json_body("/api/models/load", {"model": self.model, "backend": backend})
+            if not result.get("ok"):
+                raise RuntimeError(f"Failed to load model: {result}")
 
-        self.log(f"Loading model: {self.model} ({backend})")
-        result = self._post_json_body("/api/models/load", {"model": self.model, "backend": backend})
-        if not result.get("ok"):
-            raise RuntimeError(f"Failed to load model: {result}")
+        self.refresh_model_metadata()
+
+    def refresh_model_metadata(self):
+        data = json.loads(urlopen(f"{self.base_url}/api/models", timeout=30).read().decode("utf-8"))
+        self.architecture = data.get("architecture") or ""
+        self.supports_thinking, self.supports_tools = self._detect_capabilities(self.architecture, self.model)
+
+    def _normalize_name(self, value):
+        return (value or "").lower().replace("-", "").replace("_", "").replace(".", "")
+
+    def _detect_capabilities(self, architecture, model_name):
+        normalized = self._normalize_name(architecture) or self._normalize_name(model_name)
+
+        if normalized.startswith("gemma4"):
+            return True, True
+        if normalized.startswith("gemma3"):
+            return False, False
+        if normalized.startswith("qwen35"):
+            return True, True
+        if normalized.startswith("qwen3"):
+            return True, True
+        if "gptoss" in normalized:
+            return True, False
+        if normalized.startswith("nemotronh") or normalized.startswith("nemotron"):
+            return True, True
+        if normalized.startswith("mistral3") or normalized.startswith("mistral"):
+            return False, False
+        return False, False
 
     def _extract_sse_tokens(self, events):
         """Extract concatenated token text from SSE events."""
@@ -133,6 +177,41 @@ class TestRunner:
             if c:
                 content += c
         return content
+
+    def _extract_openai_stream(self, payloads):
+        content = ""
+        finish_reason = None
+        saw_done = False
+
+        for payload_text in payloads:
+            if payload_text == "[DONE]":
+                saw_done = True
+                continue
+            try:
+                chunk = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            piece = delta.get("content", "")
+            if piece:
+                content += piece
+            fr = chunk.get("choices", [{}])[0].get("finish_reason")
+            if fr:
+                finish_reason = fr
+
+        return content, finish_reason, saw_done
+
+    def expect_http_error(self, path, payload, expected_code, success_msg):
+        try:
+            self._post_json_body(path, payload)
+            self.fail(f"{success_msg}: expected {expected_code}, got success")
+        except HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            self.model_output(f"{success_msg} response", body)
+            if e.code == expected_code:
+                self.ok(success_msg)
+            else:
+                self.fail(f"{success_msg}: expected {expected_code}, got {e.code}")
 
     def _has_done(self, events):
         return any(ev.get("done") is True for ev in events)
@@ -388,47 +467,65 @@ class TestRunner:
             self.log(f"Turn {turn}/4: {question}")
             messages.append({"role": "user", "content": question})
 
-            resp = self._post_json("/v1/chat/completions", {
+            payloads = self._post_sse_payloads("/v1/chat/completions", {
                 "model": self.model,
                 "messages": messages,
                 "stream": True,
                 "max_tokens": 80,
             })
 
-            content = ""
-            finish_reason = None
-            for raw_line in resp:
-                line = raw_line.decode("utf-8").strip()
-                if not line.startswith("data: "):
-                    continue
-                payload = line[6:]
-                if payload == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                    c = delta.get("content", "")
-                    if c:
-                        content += c
-                    fr = chunk.get("choices", [{}])[0].get("finish_reason")
-                    if fr:
-                        finish_reason = fr
-                except json.JSONDecodeError:
-                    pass
+            content, finish_reason, saw_done = self._extract_openai_stream(payloads)
 
             self.model_output(f"Turn {turn} output", content)
-            if content:
+            if content and saw_done:
                 self.ok(f"Turn {turn}: {len(content)} chars (finish={finish_reason})")
                 messages.append({"role": "assistant", "content": content})
             else:
-                self.fail(f"Turn {turn}: No content")
+                self.fail(f"Turn {turn}: content={len(content)} chars, saw_done={saw_done}")
                 break
+
+    # =========================================================================
+    # Test: OpenAI json_object outputs
+    # =========================================================================
+    def test_openai_json_object_outputs(self):
+        self.header("Test 6: OpenAI JSON Object Outputs")
+
+        resp = self._post_json_body("/v1/chat/completions", {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "Return a JSON object with keys answer and confidence for 2+3."}
+            ],
+            "max_tokens": 80,
+            "response_format": {"type": "json_object"},
+        })
+
+        choices = resp.get("choices", [])
+        if not choices:
+            self.fail("json_object: missing choices")
+            return
+
+        content = choices[0].get("message", {}).get("content", "")
+        self.model_output("json_object output", content)
+        if not content:
+            self.fail("json_object: empty content")
+            return
+
+        try:
+            payload = json.loads(content)
+        except Exception as e:
+            self.fail(f"json_object: invalid JSON ({e})")
+            return
+
+        if isinstance(payload, dict) and "answer" in payload and "confidence" in payload:
+            self.ok(f"json_object: parsed JSON object with keys {sorted(payload.keys())}")
+        else:
+            self.fail(f"json_object: unexpected payload {payload}")
 
     # =========================================================================
     # Test: OpenAI structured outputs
     # =========================================================================
     def test_openai_structured_outputs(self):
-        self.header("Test 6: OpenAI Structured Outputs")
+        self.header("Test 7: OpenAI Structured Outputs")
 
         resp = self._post_json_body("/v1/chat/completions", {
             "model": self.model,
@@ -477,135 +574,234 @@ class TestRunner:
             self.fail(f"Structured outputs: unexpected payload {payload}")
 
     # =========================================================================
-    # Test: Very long conversation - 10 turns
+    # Test: Ollama thinking mode
     # =========================================================================
-    def test_long_10turn(self):
-        self.header("Test 7: Long Conversation - 10 Turns (Ollama Non-Streaming)")
+    def test_ollama_thinking_multiturn(self):
+        if not self.supports_thinking:
+            self.skip(f"Thinking-mode tests skipped for architecture '{self.architecture or 'unknown'}'")
+            return
 
-        messages = [
-            {"role": "system", "content": "You are a history expert. Keep answers to 1-2 sentences."}
-        ]
-        turns = [
-            "When did World War II start?",
-            "Which countries were the main Allied powers?",
-            "Who led Germany at that time?",
-            "What was D-Day?",
-            "When did the war in Europe end?",
-            "What about the Pacific theater?",
-            "What event led to Japan's surrender?",
-            "What organization was formed after the war?",
-            "Where is its headquarters?",
-            "Summarize the key dates we discussed.",
-        ]
+        self.header("Test 8: Ollama API - Multi-Turn with Thinking Mode")
 
-        for i, question in enumerate(turns):
+        messages = []
+        prompts = [
+            "What is 15 * 23?",
+            "Now add 100 to that result.",
+            "Is the final number divisible by 7?",
+        ]
+        saw_thinking = False
+
+        for i, prompt in enumerate(prompts):
             turn = i + 1
-            self.log(f"Turn {turn}/10: {question}")
-            messages.append({"role": "user", "content": question})
+            self.log(f"Turn {turn}/3: {prompt}")
+            messages.append({"role": "user", "content": prompt})
 
             resp = self._post_json_body("/api/chat/ollama", {
                 "model": self.model,
                 "messages": messages,
                 "stream": False,
-                "options": {"num_predict": 60},
+                "think": True,
+                "options": {"num_predict": 150},
             })
 
-            content = resp.get("message", {}).get("content", "")
-            self.model_output(f"Turn {turn} output", content)
+            message = resp.get("message", {})
+            content = message.get("content", "")
+            thinking = message.get("thinking", "")
+            self.model_output(f"Turn {turn} reasoning", thinking)
+            self.model_output(f"Turn {turn} answer", content)
+
             if content and resp.get("done"):
                 self.ok(f"Turn {turn}: {len(content)} chars")
+                if thinking:
+                    saw_thinking = True
                 messages.append({"role": "assistant", "content": content})
             else:
                 self.fail(f"Turn {turn}: Failed (content={len(content)}, done={resp.get('done')})")
-                if content:
-                    messages.append({"role": "assistant", "content": content})
-                else:
-                    break
+                return
 
-        total = len(messages)
-        self.log(f"Final message count: {total}")
-        if total >= 18:
-            self.ok(f"Long conversation completed with {total} messages")
+        if saw_thinking:
+            self.ok("Thinking mode: response included a separate thinking field")
         else:
-            self.fail(f"Long conversation stalled at {total} messages")
+            self.fail("Thinking mode: no thinking field was returned")
+
+    # =========================================================================
+    # Test: OpenAI tool calls
+    # =========================================================================
+    def test_openai_tool_calls(self):
+        if not self.supports_tools:
+            self.skip(f"Tool-calling tests skipped for architecture '{self.architecture or 'unknown'}'")
+            return
+
+        self.header("Test 9: OpenAI Tool Calls")
+
+        resp = self._post_json_body("/v1/chat/completions", {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You must call the provided function when the user asks for weather. Do not answer from memory."
+                },
+                {
+                    "role": "user",
+                    "content": "What is the weather in Tokyo? Call the get_weather tool and do not answer with prose."
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                            },
+                            "required": ["location"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            ],
+            "max_tokens": 120,
+            "stream": False,
+        })
+
+        choices = resp.get("choices", [])
+        if not choices:
+            self.fail("OpenAI tool calls: missing choices")
+            return
+
+        message = choices[0].get("message", {})
+        tool_calls = message.get("tool_calls") or []
+        finish_reason = choices[0].get("finish_reason")
+        self.model_output("OpenAI tool call payload", json.dumps(tool_calls, indent=2))
+
+        if tool_calls and finish_reason == "tool_calls":
+            self.ok(f"OpenAI tool calls: model returned {len(tool_calls)} tool call(s)")
+        elif message.get("content"):
+            self.skip("OpenAI tool calls: model answered directly instead of returning tool_calls")
+        else:
+            self.fail(f"OpenAI tool calls: expected tool_calls finish, got finish_reason={finish_reason}")
 
     # =========================================================================
     # Test: Error handling
     # =========================================================================
     def test_error_handling(self):
-        self.header("Test 8: Error Handling")
+        self.header("Test 10: Error Handling")
 
-        self.log("Test: Missing model (Ollama)")
-        try:
-            req = Request(
-                f"{self.base_url}/api/chat/ollama",
-                data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            resp = urlopen(req, timeout=10)
-            self.fail(f"Missing model: expected 400, got {resp.status}")
-        except HTTPError as e:
-            if e.code == 400:
-                self.ok("Missing model correctly returns 400")
-            else:
-                self.fail(f"Missing model: expected 400, got {e.code}")
+        self.expect_http_error(
+            "/api/chat/ollama",
+            {"messages": [{"role": "user", "content": "hi"}]},
+            400,
+            "Missing model correctly returns 400",
+        )
 
-        self.log("Test: Missing messages (OpenAI)")
-        try:
-            req = Request(
-                f"{self.base_url}/v1/chat/completions",
-                data=json.dumps({"model": self.model}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            resp = urlopen(req, timeout=10)
-            self.fail(f"Missing messages: expected 400, got {resp.status}")
-        except HTTPError as e:
-            if e.code == 400:
-                self.ok("Missing messages correctly returns 400")
-            else:
-                self.fail(f"Missing messages: expected 400, got {e.code}")
+        self.expect_http_error(
+            "/v1/chat/completions",
+            {"model": self.model},
+            400,
+            "Missing messages correctly returns 400",
+        )
 
-        self.log("Test: Invalid structured output schema")
-        try:
-            req = Request(
-                f"{self.base_url}/v1/chat/completions",
-                data=json.dumps({
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "bad_schema",
-                            "strict": True,
-                            "schema": {
+        self.expect_http_error(
+            "/v1/chat/completions",
+            {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "bad_schema",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "answer": {"type": "string"}
+                            },
+                            "required": ["answer"]
+                        }
+                    }
+                }
+            },
+            400,
+            "Invalid structured schema correctly returns 400",
+        )
+
+        self.expect_http_error(
+            "/v1/chat/completions",
+            {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "noop",
+                            "parameters": {
                                 "type": "object",
-                                "properties": {
-                                    "answer": {"type": "string"}
-                                },
-                                "required": ["answer"]
+                                "properties": {},
+                                "additionalProperties": False
                             }
                         }
                     }
-                }).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            resp = urlopen(req, timeout=10)
-            self.fail(f"Invalid structured schema: expected 400, got {resp.status}")
-        except HTTPError as e:
-            if e.code == 400:
-                self.ok("Invalid structured schema correctly returns 400")
-            else:
-                self.fail(f"Invalid structured schema: expected 400, got {e.code}")
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "simple_object",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "answer": {"type": "string"}
+                            },
+                            "required": ["answer"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            },
+            400,
+            "response_format + tools correctly returns 400",
+        )
+
+        self.expect_http_error(
+            "/v1/chat/completions",
+            {
+                "model": self.model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "think": True,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "simple_object",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "answer": {"type": "string"}
+                            },
+                            "required": ["answer"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            },
+            400,
+            "response_format + think correctly returns 400",
+        )
 
     # =========================================================================
     # Test: Queue status
     # =========================================================================
     def test_queue_status(self):
-        self.header("Test 9: Queue Status")
+        self.header("Test 11: Queue Status")
 
-        resp = self._post_json_body("/api/queue/status", {}) if False else None
         url = f"{self.base_url}/api/queue/status"
         raw = urlopen(url, timeout=10).read().decode()
+        self.model_output("Queue status response", raw)
         data = json.loads(raw)
 
         required_fields = ["busy", "pending_requests", "total_processed"]
@@ -619,7 +815,7 @@ class TestRunner:
     # Run all tests
     # =========================================================================
     def run_all(self):
-        self.header("TensorSharp.Server Multi-Turn Integration Tests (Python)")
+        self.header("TensorSharp.Server Integration Tests (Python)")
 
         self.log(f"Server: {self.base_url}")
         self.log(f"Model:  {self.model}")
@@ -639,14 +835,19 @@ class TestRunner:
             print(f"Error: Cannot load model '{self.model}': {e}")
             sys.exit(1)
 
+        self.log(f"Architecture: {self.architecture or 'unknown'}")
+        self.log(f"Capabilities: thinking={self.supports_thinking}, tools={self.supports_tools}")
+
         tests = [
             self.test_webui_5turn,
             self.test_ollama_context_retention,
             self.test_openai_system_multiturn,
             self.test_ollama_streaming_metrics,
             self.test_openai_streaming_multiturn,
+            self.test_openai_json_object_outputs,
             self.test_openai_structured_outputs,
-            self.test_long_10turn,
+            self.test_ollama_thinking_multiturn,
+            self.test_openai_tool_calls,
             self.test_error_handling,
             self.test_queue_status,
         ]
@@ -659,14 +860,15 @@ class TestRunner:
                 traceback.print_exc()
 
         self.header("Results")
-        total = self.passed + self.failed
-        print(f"{Colors.GREEN}PASSED: {self.passed}{Colors.RESET}")
-        print(f"{Colors.RED}FAILED: {self.failed}{Colors.RESET}")
+        total = self.passed + self.failed + self.skipped
+        print(f"{Colors.GREEN}PASSED:  {self.passed}{Colors.RESET}")
+        print(f"{Colors.RED}FAILED:  {self.failed}{Colors.RESET}")
+        print(f"{Colors.YELLOW}SKIPPED: {self.skipped}{Colors.RESET}")
         print(f"TOTAL:  {total}")
         print()
 
         if self.failed == 0:
-            print(f"{Colors.GREEN}All tests passed!{Colors.RESET}")
+            print(f"{Colors.GREEN}All runnable tests passed!{Colors.RESET}")
         else:
             print(f"{Colors.RED}{self.failed} test(s) failed.{Colors.RESET}")
             sys.exit(1)

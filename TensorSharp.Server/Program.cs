@@ -67,10 +67,66 @@ string maxTextEnv = Environment.GetEnvironmentVariable("MAX_TEXT_FILE_CHARS");
 if (!string.IsNullOrEmpty(maxTextEnv) && int.TryParse(maxTextEnv, out int envMax) && envMax > 0)
     maxTextFileChars = envMax;
 
+string configuredModelOption = null;
+string configuredMmProjOption = null;
+string configuredBackendOption = null;
+int? configuredMaxTokensOption = null;
+
+for (int i = 0; i < args.Length; i++)
+{
+    if (TryReadOption(args, ref i, "--model", out string modelOption))
+    {
+        configuredModelOption = modelOption;
+        continue;
+    }
+
+    if (TryReadOption(args, ref i, "--mmproj", out string mmProjOption))
+    {
+        configuredMmProjOption = mmProjOption;
+        continue;
+    }
+
+    if (TryReadOption(args, ref i, "--backend", out string backendOption))
+    {
+        configuredBackendOption = backendOption;
+        continue;
+    }
+
+    if (TryReadOption(args, ref i, "--max-tokens", out string maxTokensOption))
+    {
+        if (!TryParsePositiveInt(maxTokensOption, out int parsedMaxTokens))
+            throw new ArgumentException($"Invalid value for --max-tokens: '{maxTokensOption}'.");
+
+        configuredMaxTokensOption = parsedMaxTokens;
+    }
+}
+
 string modelDir = Environment.GetEnvironmentVariable("MODEL_DIR")
     ?? Path.Combine(AppContext.BaseDirectory, "models");
-string configuredBackend = Environment.GetEnvironmentVariable("BACKEND")
+string configuredBackendInput = configuredBackendOption
+    ?? Environment.GetEnvironmentVariable("BACKEND");
+string configuredBackend = configuredBackendInput
     ?? (OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu");
+string configuredModelInput = configuredModelOption
+    ?? Environment.GetEnvironmentVariable("MODEL_PATH")
+    ?? Environment.GetEnvironmentVariable("MODEL");
+string startupModelPath = ResolveConfiguredFilePath(configuredModelInput, modelDir);
+
+if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MODEL_DIR")) &&
+    !string.IsNullOrWhiteSpace(startupModelPath))
+{
+    string startupModelDir = Path.GetDirectoryName(startupModelPath);
+    if (!string.IsNullOrWhiteSpace(startupModelDir))
+        modelDir = startupModelDir;
+}
+
+string configuredMmProjInput = configuredMmProjOption
+    ?? Environment.GetEnvironmentVariable("MMPROJ_PATH")
+    ?? Environment.GetEnvironmentVariable("MMPROJ");
+string startupMmProjPath = ResolveConfiguredMmProjPath(configuredMmProjInput, startupModelPath, modelDir);
+int defaultWebMaxTokens = configuredMaxTokensOption
+    ?? (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens) ? envMaxTokens : 20000);
+
 var supportedBackends = BackendCatalog.GetSupportedBackends().ToArray();
 var supportedBackendValues = new HashSet<string>(supportedBackends.Select(backend => backend.Value), StringComparer.OrdinalIgnoreCase);
 string defaultBackend = BackendCatalog.ResolveDefaultBackend(configuredBackend, supportedBackends);
@@ -137,7 +193,8 @@ app.MapGet("/api/models", (ModelService svc) =>
         defaultBackend,
         supportedBackends,
         architecture = svc.Architecture,
-        modelDir
+        modelDir,
+        defaultMaxTokens = defaultWebMaxTokens
     });
 });
 
@@ -291,7 +348,7 @@ app.MapPost("/api/chat", async (HttpContext ctx, ModelService svc, InferenceQueu
     }
 
     var messagesEl = body.GetProperty("messages");
-    int maxTokens = body.TryGetProperty("maxTokens", out var mt) ? mt.GetInt32() : 200;
+    int maxTokens = body.TryGetProperty("maxTokens", out var mt) ? mt.GetInt32() : defaultWebMaxTokens;
 
     var samplingConfig = ParseSamplingConfig(body);
     bool uiThink = body.TryGetProperty("think", out var uiThinkProp) && uiThinkProp.GetBoolean();
@@ -1661,7 +1718,107 @@ static string ResolveModelPath(string modelName, string modelDir)
     return match;
 }
 
+static bool TryReadOption(string[] args, ref int index, string option, out string value)
+{
+    string arg = args[index];
+    if (string.Equals(arg, option, StringComparison.OrdinalIgnoreCase))
+    {
+        if (index + 1 >= args.Length)
+            throw new ArgumentException($"Missing value for option '{option}'.");
+
+        value = args[++index];
+        return true;
+    }
+
+    string prefix = option + "=";
+    if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+    {
+        value = arg.Substring(prefix.Length);
+        return true;
+    }
+
+    value = null;
+    return false;
+}
+
+static bool TryParsePositiveInt(string value, out int parsed)
+{
+    if (int.TryParse(value, out parsed) && parsed > 0)
+        return true;
+
+    parsed = 0;
+    return false;
+}
+
+static string ResolveConfiguredFilePath(string configuredPath, string preferredDirectory)
+{
+    if (string.IsNullOrWhiteSpace(configuredPath))
+        return null;
+
+    if (Path.IsPathRooted(configuredPath))
+        return Path.GetFullPath(configuredPath);
+
+    if (configuredPath.IndexOf(Path.DirectorySeparatorChar) >= 0 ||
+        configuredPath.IndexOf(Path.AltDirectorySeparatorChar) >= 0)
+    {
+        return Path.GetFullPath(configuredPath);
+    }
+
+    if (File.Exists(configuredPath))
+        return Path.GetFullPath(configuredPath);
+
+    return string.IsNullOrWhiteSpace(preferredDirectory)
+        ? Path.GetFullPath(configuredPath)
+        : Path.GetFullPath(Path.Combine(preferredDirectory, configuredPath));
+}
+
+static string ResolveConfiguredMmProjPath(string configuredPath, string modelPath, string fallbackDirectory)
+{
+    if (configuredPath == null)
+        return null;
+
+    if (string.IsNullOrWhiteSpace(configuredPath) ||
+        string.Equals(configuredPath, "none", StringComparison.OrdinalIgnoreCase))
+    {
+        return string.Empty;
+    }
+
+    string preferredDirectory = Path.GetDirectoryName(modelPath);
+    if (string.IsNullOrWhiteSpace(preferredDirectory))
+        preferredDirectory = fallbackDirectory;
+
+    return ResolveConfiguredFilePath(configuredPath, preferredDirectory);
+}
+
+if (!string.IsNullOrWhiteSpace(startupModelPath))
+{
+    if (!TryResolveSupportedBackend(configuredBackendInput, out string startupBackend, out string startupBackendError))
+        throw new InvalidOperationException(startupBackendError);
+
+    if (!File.Exists(startupModelPath))
+        throw new FileNotFoundException($"Configured model file not found: {startupModelPath}", startupModelPath);
+
+    if (!string.IsNullOrWhiteSpace(configuredMmProjInput) &&
+        startupMmProjPath != string.Empty &&
+        !File.Exists(startupMmProjPath))
+    {
+        throw new FileNotFoundException($"Configured mmproj file not found: {startupMmProjPath}", startupMmProjPath);
+    }
+
+    var startupModelService = app.Services.GetRequiredService<ModelService>();
+    startupModelService.LoadModel(startupModelPath, startupMmProjPath, startupBackend);
+
+    Console.WriteLine($"Loaded startup model: {startupModelService.LoadedModelName} ({startupModelService.Architecture ?? "unknown"}, {startupModelService.LoadedBackend})");
+    if (!string.IsNullOrWhiteSpace(startupModelService.LoadedMmProjName))
+        Console.WriteLine($"Loaded startup mmproj: {startupModelService.LoadedMmProjName}");
+}
+else
+{
+    Console.WriteLine("No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000] to use the Web UI.");
+}
+
 Console.WriteLine($"Model directory: {modelDir}");
+Console.WriteLine($"Default Web UI max tokens: {defaultWebMaxTokens}");
 Console.WriteLine($"Video max frames: {MediaHelper.GetConfiguredMaxVideoFrames()}");
 Console.WriteLine("Starting TensorSharp.Server on http://localhost:5000");
 Console.WriteLine("API endpoints:");
