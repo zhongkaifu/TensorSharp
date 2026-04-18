@@ -1180,11 +1180,6 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend || tensor == null)
                 return;
 
-            // Metal uses host_ptr-backed shared buffers for mutable tensors, so keeping the
-            // binding alive avoids unnecessary buffer churn while still exposing CPU writes.
-            if (_backend == BackendType.GgmlMetal)
-                return;
-
             GgmlBasicOps.InvalidateHostBuffer(GetStoragePtr(tensor));
         }
 
@@ -1192,10 +1187,7 @@ namespace TensorSharp.Models
         {
             if (!IsGgmlBackend || tensor == null)
                 return;
-
-            if (_backend == BackendType.GgmlMetal)
-                return;
-
+                
             GgmlBasicOps.SyncHostBuffer(GetStorageBasePtr(tensor), tensor.Storage.ByteLength);
         }
 
