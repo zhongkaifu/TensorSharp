@@ -5,12 +5,12 @@ TensorSharp.Server provides three API styles:
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
 - **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`)
 
-For the Web UI flow, choose the model up front with `/api/models/load`. The `/api/chat` endpoint uses the already loaded model and does not support per-turn model switching.
+Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The Web UI and compatibility endpoints expose only that hosted model; `/api/models/load` can reload it, but it does not switch to arbitrary files at runtime.
 
 ## Starting the Server
 
 ```bash
-MODEL_DIR=~/work/model BACKEND=ggml_metal ./TensorSharp.Server
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal
 ```
 
 The server starts on `http://localhost:5000`.

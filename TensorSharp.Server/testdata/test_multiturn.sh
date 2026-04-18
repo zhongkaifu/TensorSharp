@@ -9,7 +9,7 @@
 #
 # Prerequisites:
 #   - TensorSharp.Server running on localhost:5000
-#   - At least one .gguf model available in MODEL_DIR
+#   - TensorSharp.Server started with --model <path.gguf>
 #   - curl and jq installed
 #
 # Usage:
@@ -93,7 +93,7 @@ auto_detect_model() {
     fi
     MODEL=$(echo "$models_json" | jq -r '.models[0] // empty')
     if [ -z "$MODEL" ]; then
-        echo "Error: No models found. Set MODEL_DIR and ensure .gguf files are present."
+        echo "Error: No hosted model found. Start TensorSharp.Server with --model <path.gguf>."
         exit 1
     fi
     log "Auto-detected model: $MODEL"

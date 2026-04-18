@@ -259,17 +259,21 @@ Each line is a JSON object with `messages`, optional `prompt`, and optional samp
 ```bash
 cd TensorSharp.Server/bin
 
-# Set environment variables and run
-MODEL_DIR=./models BACKEND=ggml_metal ./TensorSharp.Server
+# Start the server with the exact hosted model
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal
 
 # Linux + NVIDIA GPU
-MODEL_DIR=./models BACKEND=ggml_cuda ./TensorSharp.Server
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_cuda
+
+# Multimodal models: host an explicit projector too
+./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
 ```
 
 Open `http://localhost:5000` in your browser. The web interface supports:
 
 - Multi-turn chat conversations
-- Model selection from available GGUF files in `MODEL_DIR`
+- A single hosted GGUF selected explicitly with `--model`
+- An explicit hosted multimodal projector via `--mmproj` when needed
 - Image, video, and audio uploads for multimodal inference (up to 500 MB)
 - Thinking/reasoning mode toggle
 - Tool calling with function definitions
@@ -277,11 +281,12 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 - Request queue with real-time position feedback
 - Message editing and deletion with regeneration from any point in the conversation
 
-**Environment variables:**
+Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted projector. `TensorSharp.Server` no longer scans a `MODEL_DIR`.
+
+**Runtime environment variables:**
 
 | Variable | Description |
 |---|---|
-| `MODEL_DIR` | Directory containing GGUF model files |
 | `BACKEND` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
 | `PORT` | HTTP port (default: `5000`) |
@@ -458,4 +463,3 @@ Zhongkai Fu
 ## License
 
 See [LICENSE](LICENSE) for details.
-

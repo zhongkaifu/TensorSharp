@@ -36,6 +36,7 @@ namespace TensorSharp.Server
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
         public string LoadedMmProjName => _loadedMmProjPath != null ? Path.GetFileName(_loadedMmProjPath) : null;
+        public string LoadedMmProjPath => _loadedMmProjPath;
         public string LoadedBackend => _model != null ? BackendCatalog.ToBackendValue(_backend) : null;
         public string Architecture => _model?.Config?.Architecture;
         public ModelBase Model => _model;
@@ -56,8 +57,8 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
-        /// Load a model. Must be called within the InferenceQueue to prevent concurrent access.
-        /// When mmProjPath is null, auto-detection is used. Pass empty string to skip mmproj loading.
+        /// Load a model and optional multimodal projector. Must be called within the
+        /// InferenceQueue to prevent concurrent access.
         /// </summary>
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
@@ -80,40 +81,11 @@ namespace TensorSharp.Server
             _model = ModelBase.Create(modelPath, _backend);
             _loadedModelPath = modelPath;
 
-            if (mmProjPath == null)
-                mmProjPath = AutoDetectMmProj(modelPath);
-
             if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))
             {
                 LoadEncoders(mmProjPath);
                 _loadedMmProjPath = mmProjPath;
             }
-        }
-
-        private string AutoDetectMmProj(string modelPath)
-        {
-            string dir = Path.GetDirectoryName(modelPath);
-            if (dir == null) return null;
-
-            string arch = _model?.Config?.Architecture;
-            string[] candidates = arch switch
-            {
-                "gemma4" => new[] { "gemma-4-mmproj-F16.gguf" },
-                "gemma3" => new[] { "mmproj-gemma3-4b-f16.gguf" },
-                "qwen35" or "qwen35moe" or "qwen3next" => new[] { "Qwen3.5-mmproj-F16.gguf" },
-                _ => Array.Empty<string>()
-            };
-
-            foreach (var c in candidates)
-            {
-                string full = Path.Combine(dir, c);
-                if (File.Exists(full)) return full;
-            }
-
-            foreach (var f in Directory.GetFiles(dir, "*mmproj*"))
-                return f;
-
-            return null;
         }
 
         private void LoadEncoders(string mmProjPath)
@@ -484,37 +456,6 @@ namespace TensorSharp.Server
                     return i + 1;
             }
             return -1;
-        }
-
-        /// <summary>
-        /// Ensure the specified model is loaded. Skips loading if already loaded.
-        /// Must be called within the InferenceQueue to prevent concurrent access.
-        /// Returns false if the model file cannot be found.
-        /// </summary>
-        public bool EnsureModelLoaded(string modelName, string modelDir, string defaultBackend)
-        {
-            if (IsModelAlreadyLoaded(modelName))
-                return true;
-
-            string modelPath = Path.Combine(modelDir, modelName);
-            if (!File.Exists(modelPath))
-            {
-                var match = Directory.GetFiles(modelDir, "*.gguf")
-                    .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f)
-                        .Equals(modelName, StringComparison.OrdinalIgnoreCase));
-                if (match != null) modelPath = match;
-                else
-                {
-                    match = Directory.GetFiles(modelDir, "*.gguf")
-                        .FirstOrDefault(f => Path.GetFileName(f)
-                            .Equals(modelName, StringComparison.OrdinalIgnoreCase));
-                    if (match != null) modelPath = match;
-                    else return false;
-                }
-            }
-
-            LoadModel(modelPath, null, defaultBackend);
-            return _model != null;
         }
 
         /// <summary>

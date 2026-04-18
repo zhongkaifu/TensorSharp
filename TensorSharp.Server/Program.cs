@@ -101,29 +101,18 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-string modelDir = Environment.GetEnvironmentVariable("MODEL_DIR")
-    ?? Path.Combine(AppContext.BaseDirectory, "models");
+if (!string.IsNullOrWhiteSpace(configuredMmProjOption) &&
+    string.IsNullOrWhiteSpace(configuredModelOption))
+{
+    throw new ArgumentException("--mmproj requires --model.");
+}
+
 string configuredBackendInput = configuredBackendOption
     ?? Environment.GetEnvironmentVariable("BACKEND");
 string configuredBackend = configuredBackendInput
     ?? (OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu");
-string configuredModelInput = configuredModelOption
-    ?? Environment.GetEnvironmentVariable("MODEL_PATH")
-    ?? Environment.GetEnvironmentVariable("MODEL");
-string startupModelPath = ResolveConfiguredFilePath(configuredModelInput, modelDir);
-
-if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MODEL_DIR")) &&
-    !string.IsNullOrWhiteSpace(startupModelPath))
-{
-    string startupModelDir = Path.GetDirectoryName(startupModelPath);
-    if (!string.IsNullOrWhiteSpace(startupModelDir))
-        modelDir = startupModelDir;
-}
-
-string configuredMmProjInput = configuredMmProjOption
-    ?? Environment.GetEnvironmentVariable("MMPROJ_PATH")
-    ?? Environment.GetEnvironmentVariable("MMPROJ");
-string startupMmProjPath = ResolveConfiguredMmProjPath(configuredMmProjInput, startupModelPath, modelDir);
+string startupModelPath = ResolveConfiguredModelPath(configuredModelOption);
+string startupMmProjPath = ResolveConfiguredMmProjPath(configuredMmProjOption, startupModelPath);
 int defaultWebMaxTokens = configuredMaxTokensOption
     ?? (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens) ? envMaxTokens : 20000);
 
@@ -181,8 +170,12 @@ app.MapGet("/api/queue/status", (InferenceQueue queue) =>
 
 app.MapGet("/api/models", (ModelService svc) =>
 {
-    var files = svc.ScanModels(modelDir);
-    var mmProjFiles = svc.ScanMmProjModels(modelDir);
+    var files = string.IsNullOrWhiteSpace(startupModelPath)
+        ? new List<string>()
+        : new List<string> { Path.GetFileName(startupModelPath) };
+    var mmProjFiles = string.IsNullOrWhiteSpace(startupMmProjPath)
+        ? new List<string>()
+        : new List<string> { Path.GetFileName(startupMmProjPath) };
     return Results.Json(new
     {
         models = files,
@@ -193,7 +186,8 @@ app.MapGet("/api/models", (ModelService svc) =>
         defaultBackend,
         supportedBackends,
         architecture = svc.Architecture,
-        modelDir,
+        hostedModelPath = startupModelPath,
+        hostedMmProjPath = startupMmProjPath,
         defaultMaxTokens = defaultWebMaxTokens
     });
 });
@@ -208,34 +202,18 @@ app.MapPost("/api/models/load", async (HttpContext ctx, HttpRequest req, ModelSe
     if (!TryResolveSupportedBackend(requestedBackend, out string backend, out string backendError))
         return Results.BadRequest(new { ok = false, error = backendError });
 
-    string modelPath = Path.Combine(modelDir, modelName);
-    if (!File.Exists(modelPath))
-        return Results.NotFound(new { error = $"Model not found: {modelName}" });
+    if (!TryResolveHostedModelRequest(modelName, startupModelPath, out string modelPath, out string modelError))
+        return Results.BadRequest(new { ok = false, error = modelError });
 
-    // mmproj handling:
-    //   null/absent  -> auto-detect (ModelService default)
-    //   ""/"none"    -> explicitly no mmproj (pass empty string to skip auto-detect)
-    //   "filename"   -> use that specific mmproj file
-    string mmProjPath;
-    if (mmproj == null)
-    {
-        mmProjPath = null; // auto-detect
-    }
-    else if (string.IsNullOrWhiteSpace(mmproj) || string.Equals(mmproj, "none", StringComparison.OrdinalIgnoreCase))
-    {
-        mmProjPath = ""; // explicit skip
-    }
-    else
-    {
-        mmProjPath = Path.Combine(modelDir, mmproj);
-    }
+    if (!TryValidateHostedMmProjRequest(mmproj, startupMmProjPath, out string mmProjError))
+        return Results.BadRequest(new { ok = false, error = mmProjError });
 
     using var ticket = queue.Enqueue(ctx.RequestAborted);
     await ticket.WaitUntilReadyAsync();
 
     try
     {
-        svc.LoadModel(modelPath, mmProjPath, backend);
+        svc.LoadModel(modelPath, startupMmProjPath, backend);
         return Results.Json(new
         {
             ok = true,
@@ -506,14 +484,17 @@ app.MapGet("/api/version", () => Results.Json(new { version = "0.1.0" }));
 
 app.MapGet("/api/tags", (ModelService svc) =>
 {
-    var files = svc.ScanModels(modelDir);
-    var models = files.Select(f =>
+    var files = string.IsNullOrWhiteSpace(startupModelPath)
+        ? Enumerable.Empty<string>()
+        : new[] { startupModelPath };
+    var models = files.Select(path =>
     {
-        var fi = new FileInfo(Path.Combine(modelDir, f));
+        var fi = new FileInfo(path);
+        string fileName = Path.GetFileName(path);
         return new Dictionary<string, object>
         {
-            ["name"] = Path.GetFileNameWithoutExtension(f),
-            ["model"] = f,
+            ["name"] = Path.GetFileNameWithoutExtension(fileName),
+            ["model"] = fileName,
             ["size"] = fi.Exists ? fi.Length : 0,
             ["modified_at"] = fi.Exists ? fi.LastWriteTimeUtc.ToString("o") : ""
         };
@@ -532,11 +513,10 @@ app.MapPost("/api/show", async (HttpContext ctx, ModelService svc) =>
     }
 
     string modelName = modelProp.GetString();
-    string modelPath = ResolveModelPath(modelName, modelDir);
-    if (modelPath == null)
+    if (!TryResolveHostedModelRequest(modelName, startupModelPath, out string modelPath, out string modelError))
     {
         ctx.Response.StatusCode = 404;
-        await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
+        await ctx.Response.WriteAsJsonAsync(new { error = modelError });
         return;
     }
 
@@ -597,10 +577,10 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc, Inference
             await ticket.WaitAsync(TimeSpan.FromSeconds(1));
         }
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             var errResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
-                response = "", done = true, done_reason = "error", error = $"model '{modelName}' not found" };
+                response = "", done = true, done_reason = "error", error = loadError };
             await ctx.Response.WriteAsync(JsonSerializer.Serialize(errResp) + "\n", ctx.RequestAborted);
             return;
         }
@@ -644,10 +624,10 @@ app.MapPost("/api/generate", async (HttpContext ctx, ModelService svc, Inference
     {
         await ticket.WaitUntilReadyAsync();
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             ctx.Response.StatusCode = 404;
-            await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
+            await ctx.Response.WriteAsJsonAsync(new { error = loadError });
             return;
         }
 
@@ -731,11 +711,11 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
             await ticket.WaitAsync(TimeSpan.FromSeconds(1));
         }
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             var errResp = new { model = modelName, created_at = DateTime.UtcNow.ToString("o"),
                 message = new { role = "assistant", content = "" }, done = true,
-                done_reason = "error", error = $"model '{modelName}' not found" };
+                done_reason = "error", error = loadError };
             await ctx.Response.WriteAsync(JsonSerializer.Serialize(errResp) + "\n", ctx.RequestAborted);
             return;
         }
@@ -854,10 +834,10 @@ app.MapPost("/api/chat/ollama", async (HttpContext ctx, ModelService svc, Infere
     {
         await ticket.WaitUntilReadyAsync();
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             ctx.Response.StatusCode = 404;
-            await ctx.Response.WriteAsJsonAsync(new { error = $"model '{modelName}' not found" });
+            await ctx.Response.WriteAsJsonAsync(new { error = loadError });
             return;
         }
 
@@ -1030,12 +1010,12 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
             await ticket.WaitUntilReadyAsync();
         }
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             if (structuredStream)
             {
                 ctx.Response.StatusCode = 404;
-                await ctx.Response.WriteAsJsonAsync(new { error = new { message = $"model '{modelName}' not found", type = "invalid_request_error" } });
+                await ctx.Response.WriteAsJsonAsync(new { error = new { message = loadError, type = "invalid_request_error" } });
             }
             else
             {
@@ -1045,7 +1025,7 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
                     @object = "chat.completion.chunk",
                     model = modelName,
                     created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    choices = new[] { new { index = 0, delta = new { content = $"Error: model '{modelName}' not found" }, finish_reason = "stop" } }
+                    choices = new[] { new { index = 0, delta = new { content = $"Error: {loadError}" }, finish_reason = "stop" } }
                 };
                 await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(errChunk)}\n\ndata: [DONE]\n\n", ctx.RequestAborted);
             }
@@ -1291,10 +1271,10 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
     {
         await ticket.WaitUntilReadyAsync();
 
-        if (!svc.EnsureModelLoaded(modelName, modelDir, defaultBackend))
+        if (!TryEnsureHostedModelLoaded(svc, modelName, startupModelPath, startupMmProjPath, defaultBackend, out string loadError))
         {
             ctx.Response.StatusCode = 404;
-            await ctx.Response.WriteAsJsonAsync(new { error = new { message = $"model '{modelName}' not found", type = "invalid_request_error" } });
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = loadError, type = "invalid_request_error" } });
             return;
         }
 
@@ -1392,13 +1372,17 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ModelService svc, In
 
 app.MapGet("/v1/models", (ModelService svc) =>
 {
-    var files = svc.ScanModels(modelDir);
-    var data = files.Select(f => new Dictionary<string, object>
-    {
-        ["id"] = Path.GetFileNameWithoutExtension(f),
-        ["object"] = "model",
-        ["owned_by"] = "local"
-    }).ToList();
+    var data = string.IsNullOrWhiteSpace(startupModelPath)
+        ? new List<Dictionary<string, object>>()
+        : new List<Dictionary<string, object>>
+        {
+            new()
+            {
+                ["id"] = Path.GetFileNameWithoutExtension(startupModelPath),
+                ["object"] = "model",
+                ["owned_by"] = "local"
+            }
+        };
     return Results.Json(new { @object = "list", data });
 });
 
@@ -1704,20 +1688,6 @@ static List<string> DecodeBase64Images(JsonElement body, string uploadDir)
     return paths.Count > 0 ? paths : null;
 }
 
-static string ResolveModelPath(string modelName, string modelDir)
-{
-    string direct = Path.Combine(modelDir, modelName);
-    if (File.Exists(direct)) return direct;
-
-    string withExt = Path.Combine(modelDir, modelName + ".gguf");
-    if (File.Exists(withExt)) return withExt;
-
-    var match = Directory.GetFiles(modelDir, "*.gguf")
-        .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f)
-            .Equals(modelName, StringComparison.OrdinalIgnoreCase));
-    return match;
-}
-
 static bool TryReadOption(string[] args, ref int index, string option, out string value)
 {
     string arg = args[index];
@@ -1750,44 +1720,153 @@ static bool TryParsePositiveInt(string value, out int parsed)
     return false;
 }
 
-static string ResolveConfiguredFilePath(string configuredPath, string preferredDirectory)
+static string ResolveConfiguredModelPath(string configuredPath)
 {
     if (string.IsNullOrWhiteSpace(configuredPath))
         return null;
 
-    if (Path.IsPathRooted(configuredPath))
-        return Path.GetFullPath(configuredPath);
-
-    if (configuredPath.IndexOf(Path.DirectorySeparatorChar) >= 0 ||
-        configuredPath.IndexOf(Path.AltDirectorySeparatorChar) >= 0)
-    {
-        return Path.GetFullPath(configuredPath);
-    }
-
-    if (File.Exists(configuredPath))
-        return Path.GetFullPath(configuredPath);
-
-    return string.IsNullOrWhiteSpace(preferredDirectory)
-        ? Path.GetFullPath(configuredPath)
-        : Path.GetFullPath(Path.Combine(preferredDirectory, configuredPath));
+    return Path.GetFullPath(configuredPath);
 }
 
-static string ResolveConfiguredMmProjPath(string configuredPath, string modelPath, string fallbackDirectory)
+static string ResolveConfiguredMmProjPath(string configuredPath, string modelPath)
 {
-    if (configuredPath == null)
+    if (string.IsNullOrWhiteSpace(configuredPath))
         return null;
 
-    if (string.IsNullOrWhiteSpace(configuredPath) ||
-        string.Equals(configuredPath, "none", StringComparison.OrdinalIgnoreCase))
+    if (string.Equals(configuredPath, "none", StringComparison.OrdinalIgnoreCase))
+        return null;
+
+    if (Path.IsPathRooted(configuredPath) ||
+        configuredPath.IndexOf(Path.DirectorySeparatorChar) >= 0 ||
+        configuredPath.IndexOf(Path.AltDirectorySeparatorChar) >= 0 ||
+        File.Exists(configuredPath))
     {
-        return string.Empty;
+        return Path.GetFullPath(configuredPath);
     }
 
     string preferredDirectory = Path.GetDirectoryName(modelPath);
     if (string.IsNullOrWhiteSpace(preferredDirectory))
-        preferredDirectory = fallbackDirectory;
+        return Path.GetFullPath(configuredPath);
 
-    return ResolveConfiguredFilePath(configuredPath, preferredDirectory);
+    return Path.GetFullPath(Path.Combine(preferredDirectory, configuredPath));
+}
+
+static bool TryResolveHostedModelRequest(string requestedModel, string hostedModelPath, out string resolvedModelPath, out string error)
+{
+    resolvedModelPath = null;
+
+    if (string.IsNullOrWhiteSpace(hostedModelPath))
+    {
+        error = "No model is hosted by this server. Restart TensorSharp.Server with --model <path.gguf>.";
+        return false;
+    }
+
+    if (string.IsNullOrWhiteSpace(requestedModel))
+    {
+        error = "model is required";
+        return false;
+    }
+
+    if (!MatchesHostedFileRequest(requestedModel, hostedModelPath, allowBareModelId: true))
+    {
+        error = $"model '{requestedModel}' is not hosted by this server. Restart TensorSharp.Server with --model <path.gguf> to change it.";
+        return false;
+    }
+
+    resolvedModelPath = hostedModelPath;
+    error = null;
+    return true;
+}
+
+static bool TryValidateHostedMmProjRequest(string requestedMmProj, string hostedMmProjPath, out string error)
+{
+    if (requestedMmProj == null)
+    {
+        error = null;
+        return true;
+    }
+
+    bool requestedNoMmProj = string.IsNullOrWhiteSpace(requestedMmProj) ||
+        string.Equals(requestedMmProj, "none", StringComparison.OrdinalIgnoreCase);
+
+    if (requestedNoMmProj)
+    {
+        if (string.IsNullOrWhiteSpace(hostedMmProjPath))
+        {
+            error = null;
+            return true;
+        }
+
+        error = $"This server was started with mmproj '{Path.GetFileName(hostedMmProjPath)}'. Restart TensorSharp.Server without --mmproj to host no projector.";
+        return false;
+    }
+
+    if (string.IsNullOrWhiteSpace(hostedMmProjPath))
+    {
+        error = "This server was started without --mmproj. Restart TensorSharp.Server with --mmproj <path.gguf> to host a projector.";
+        return false;
+    }
+
+    if (!MatchesHostedFileRequest(requestedMmProj, hostedMmProjPath, allowBareModelId: false))
+    {
+        error = $"mmproj '{requestedMmProj}' is not hosted by this server. Restart TensorSharp.Server with --mmproj <path.gguf> to change it.";
+        return false;
+    }
+
+    error = null;
+    return true;
+}
+
+static bool TryEnsureHostedModelLoaded(ModelService svc, string requestedModel, string hostedModelPath, string hostedMmProjPath, string backend, out string error)
+{
+    error = null;
+
+    if (!TryResolveHostedModelRequest(requestedModel, hostedModelPath, out string resolvedModelPath, out error))
+        return false;
+
+    string canonicalBackend = BackendCatalog.Canonicalize(backend);
+    if (svc.IsLoaded &&
+        string.Equals(svc.LoadedModelPath, resolvedModelPath, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(svc.LoadedMmProjPath ?? string.Empty, hostedMmProjPath ?? string.Empty, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(svc.LoadedBackend, canonicalBackend, StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    svc.LoadModel(resolvedModelPath, hostedMmProjPath, backend);
+    if (!svc.IsLoaded)
+    {
+        error = $"Failed to load hosted model '{Path.GetFileName(resolvedModelPath)}'.";
+        return false;
+    }
+
+    return true;
+}
+
+static bool MatchesHostedFileRequest(string requestedValue, string hostedPath, bool allowBareModelId)
+{
+    if (string.IsNullOrWhiteSpace(requestedValue) || string.IsNullOrWhiteSpace(hostedPath))
+        return false;
+
+    string trimmed = requestedValue.Trim();
+    string hostedFileName = Path.GetFileName(hostedPath);
+    if (string.Equals(trimmed, hostedFileName, StringComparison.OrdinalIgnoreCase))
+        return true;
+
+    if (allowBareModelId &&
+        string.Equals(trimmed, Path.GetFileNameWithoutExtension(hostedPath), StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    if (trimmed.IndexOf(Path.DirectorySeparatorChar) >= 0 ||
+        trimmed.IndexOf(Path.AltDirectorySeparatorChar) >= 0 ||
+        Path.IsPathRooted(trimmed))
+    {
+        return string.Equals(Path.GetFullPath(trimmed), Path.GetFullPath(hostedPath), StringComparison.OrdinalIgnoreCase);
+    }
+
+    return false;
 }
 
 if (!string.IsNullOrWhiteSpace(startupModelPath))
@@ -1798,8 +1877,7 @@ if (!string.IsNullOrWhiteSpace(startupModelPath))
     if (!File.Exists(startupModelPath))
         throw new FileNotFoundException($"Configured model file not found: {startupModelPath}", startupModelPath);
 
-    if (!string.IsNullOrWhiteSpace(configuredMmProjInput) &&
-        startupMmProjPath != string.Empty &&
+    if (!string.IsNullOrWhiteSpace(startupMmProjPath) &&
         !File.Exists(startupMmProjPath))
     {
         throw new FileNotFoundException($"Configured mmproj file not found: {startupMmProjPath}", startupMmProjPath);
@@ -1817,21 +1895,22 @@ else
     Console.WriteLine("No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000] to use the Web UI.");
 }
 
-Console.WriteLine($"Model directory: {modelDir}");
+Console.WriteLine($"Hosted model path: {startupModelPath ?? "(none)"}");
+Console.WriteLine($"Hosted mmproj path: {startupMmProjPath ?? "(none)"}");
 Console.WriteLine($"Default Web UI max tokens: {defaultWebMaxTokens}");
 Console.WriteLine($"Video max frames: {MediaHelper.GetConfiguredMaxVideoFrames()}");
 Console.WriteLine("Starting TensorSharp.Server on http://localhost:5000");
 Console.WriteLine("API endpoints:");
 Console.WriteLine("  GET  /                         - Health check");
-Console.WriteLine("  GET  /api/tags                  - List available models (Ollama)");
+Console.WriteLine("  GET  /api/tags                  - List hosted models (Ollama)");
 Console.WriteLine("  POST /api/show                  - Show model details (Ollama)");
 Console.WriteLine("  POST /api/generate              - Generate text (Ollama)");
 Console.WriteLine("  POST /api/chat/ollama           - Chat completion (Ollama)");
 Console.WriteLine("  POST /v1/chat/completions       - Chat completion (OpenAI)");
-Console.WriteLine("  GET  /v1/models                 - List models (OpenAI)");
+Console.WriteLine("  GET  /v1/models                 - List hosted models (OpenAI)");
 Console.WriteLine("  POST /api/chat                  - Chat (Web UI SSE)");
-Console.WriteLine("  POST /api/models/load           - Load model (Web UI)");
-Console.WriteLine("  GET  /api/models                - List models (Web UI)");
+Console.WriteLine("  POST /api/models/load           - Reload hosted model (Web UI)");
+Console.WriteLine("  GET  /api/models                - Show hosted model state (Web UI)");
 app.Run("http://0.0.0.0:5000");
 
 
