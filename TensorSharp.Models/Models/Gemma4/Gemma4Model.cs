@@ -101,6 +101,7 @@ namespace TensorSharp.Models
             _slidingWindowPattern = _gguf.GetBoolArray($"{arch}.attention.sliding_window_pattern");
             _slidingWindow = (int)_gguf.GetUint32($"{arch}.attention.sliding_window", 512);
             Config.SlidingWindow = _slidingWindow;
+            Config.UsesCircularKvCache = _slidingWindowPattern != null && Array.Exists(_slidingWindowPattern, isLocal => isLocal);
 
             // Head dimensions: key_length is global head dim, key_length_swa is local head dim
             // Ollama uses a single headDim for Q/K/V per layer type

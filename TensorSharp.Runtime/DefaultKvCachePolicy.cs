@@ -18,7 +18,10 @@ namespace TensorSharp.Runtime
 
         public int ComputeReusablePrefix(IModelArchitecture model, List<int> cachedTokens, List<int> inputTokens, bool hasMultimodal)
         {
-            if (model == null || hasMultimodal || !model.SupportsKVCacheTruncation)
+            // Multimodal prompt safety is handled by the injector, which clamps reuse so
+            // we never split an injected media span and only re-queues embeddings for the
+            // suffix that is actually replayed.
+            if (model == null || !model.SupportsKVCacheTruncation)
                 return 0;
             if (cachedTokens == null || cachedTokens.Count == 0 || inputTokens == null || inputTokens.Count == 0)
                 return 0;
@@ -27,18 +30,20 @@ namespace TensorSharp.Runtime
             if (raw <= 0)
                 return 0;
 
-            int slidingWindow = model.Config?.SlidingWindow ?? 0;
-            if (slidingWindow > 0)
-                raw = Math.Max(0, raw - slidingWindow);
-
-            if (raw < 4)
-                return 0;
-
-            double savingsRatio = (double)raw / inputTokens.Count;
-            if (savingsRatio < 0.10)
-                return 0;
+            int replayWindow = GetRequiredReplayWindow(model);
+            if (replayWindow > 0)
+                raw = Math.Max(0, raw - replayWindow);
 
             return raw;
+        }
+
+        private static int GetRequiredReplayWindow(IModelArchitecture model)
+        {
+            var config = model.Config;
+            if (config == null || !config.UsesCircularKvCache)
+                return 0;
+
+            return Math.Max(0, config.SlidingWindow);
         }
 
         private static int FindCommonPrefix(List<int> cachedTokens, List<int> inputTokens)
@@ -51,9 +56,6 @@ namespace TensorSharp.Runtime
                     break;
                 prefix++;
             }
-
-            if (prefix == 0 || prefix >= inputTokens.Count)
-                return 0;
 
             return prefix;
         }

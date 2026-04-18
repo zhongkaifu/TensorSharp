@@ -3,6 +3,21 @@ namespace InferenceWeb.Tests;
 
 public class KVCacheTests
 {
+    private sealed class FakeModelArchitecture : IModelArchitecture
+    {
+        public ModelConfig Config { get; init; } = new();
+        public ITokenizer Tokenizer => throw new NotSupportedException();
+        public IKVCachePolicy KVCachePolicy => DefaultKvCachePolicy.Shared;
+        public IMultimodalInjector MultimodalInjector => throw new NotSupportedException();
+        public IBackendExecutionPlan ExecutionPlan => throw new NotSupportedException();
+        public bool SupportsKVCacheTruncation { get; init; } = true;
+
+        public float[] Forward(int[] tokens) => throw new NotSupportedException();
+        public void ResetKVCache() => throw new NotSupportedException();
+        public void TruncateKVCache(int tokenCount) => throw new NotSupportedException();
+        public void Dispose() { }
+    }
+
     [Fact]
     public void FindTokenPrefixLength_NullCached_ReturnsZero()
     {
@@ -140,6 +155,84 @@ public class KVCacheTests
     {
         int chunkSize = ModelService.ResolvePrefillChunkSize(TensorSharp.Runtime.BackendType.GgmlCpu, 11573);
         Assert.Equal(11573, chunkSize);
+    }
+
+    [Fact]
+    public void DefaultKvCachePolicy_ExactMatch_ReusesFullPrompt()
+    {
+        var model = new FakeModelArchitecture();
+        var cached = new List<int> { 1, 2, 3, 4 };
+        var input = new List<int> { 1, 2, 3, 4 };
+
+        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
+
+        Assert.Equal(4, reusable);
+    }
+
+    [Fact]
+    public void DefaultKvCachePolicy_MultimodalPrompt_CanStillReusePrefix()
+    {
+        var model = new FakeModelArchitecture();
+        var cached = new List<int> { 10, 11, 12, 13 };
+        var input = new List<int> { 10, 11, 12, 13, 14, 15 };
+
+        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: true);
+
+        Assert.Equal(4, reusable);
+    }
+
+    [Fact]
+    public void DefaultKvCachePolicy_NonCircularSlidingWindow_DoesNotBacktrack()
+    {
+        var model = new FakeModelArchitecture
+        {
+            Config = new ModelConfig
+            {
+                Architecture = "gptoss",
+                SlidingWindow = 128,
+                UsesCircularKvCache = false,
+            }
+        };
+
+        var cached = new List<int> { 1, 2, 3, 4, 5 };
+        var input = new List<int> { 1, 2, 3, 4, 5, 6, 7 };
+
+        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
+
+        Assert.Equal(5, reusable);
+    }
+
+    [Fact]
+    public void DefaultKvCachePolicy_CircularSlidingWindow_ReplaysWindow()
+    {
+        var model = new FakeModelArchitecture
+        {
+            Config = new ModelConfig
+            {
+                Architecture = "gemma4",
+                SlidingWindow = 4,
+                UsesCircularKvCache = true,
+            }
+        };
+
+        var cached = new List<int> { 1, 2, 3, 4, 5, 6 };
+        var input = new List<int> { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
+
+        Assert.Equal(2, reusable);
+    }
+
+    [Theory]
+    [InlineData(6, 6, false, 5)]
+    [InlineData(6, 6, true, 6)]
+    [InlineData(4, 6, false, 4)]
+    [InlineData(1, 1, false, 0)]
+    public void ResolveReusablePrefixForInference_MaximizesReuseWithoutLosingLogits(
+        int reusablePrefix, int inputCount, bool hasExactCachedLogits, int expected)
+    {
+        int resolved = ModelService.ResolveReusablePrefixForInference(reusablePrefix, inputCount, hasExactCachedLogits);
+        Assert.Equal(expected, resolved);
     }
 }
 
