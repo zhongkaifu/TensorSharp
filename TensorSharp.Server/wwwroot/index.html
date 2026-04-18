@@ -211,7 +211,8 @@ button.primary:hover { background: var(--accent-hover); }
 }
 
 .message.assistant .avatar img {
-  object-position: center top;
+  object-position: center;
+  transform-origin: center;
   transform: scale(1.05);
   filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.34)) contrast(1.08) saturate(1.06);
 }
@@ -771,8 +772,7 @@ button.primary:hover { background: var(--accent-hover); }
   </h1>
   <div class="header-controls">
     <span id="queue-badge" class="status-badge" style="display:none" title="Request queue status"></span>
-    <span id="status-badge" class="status-badge">No model loaded</span>
-    <button id="btn-settings" title="Settings">&#x2699;</button>
+    <span id="status-badge" class="status-badge">No model configured</span>
     <button id="btn-clear" title="New chat">&#x2795; New Chat</button>
   </div>
 </header>
@@ -781,18 +781,13 @@ button.primary:hover { background: var(--accent-hover); }
   <div id="chat-container">
     <div class="empty-state" id="empty-state">
       <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
-      <p>Load a model and start chatting. You can attach images, videos, audio, and text files for multimodal inference.</p>
-      <button class="primary" onclick="showSettings()">Load Model</button>
+      <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
     </div>
   </div>
 
   <div id="input-area">
     <div class="attachments" id="attachments"></div>
     <div class="model-switcher" id="model-switcher">
-      <div class="model-readout">
-        <span class="model-readout-label">Model:</span>
-        <span class="model-value empty" id="inline-model-name">No model loaded</span>
-      </div>
       <label class="reasoning-toggle" title="Enable reasoning / chain-of-thought output">
         <input type="checkbox" id="reasoning-toggle" checked>
         <span class="toggle-track"></span>
@@ -812,37 +807,6 @@ button.primary:hover { background: var(--accent-hover); }
   </div>
 </div>
 
-<div class="modal-overlay" id="settings-modal">
-  <div class="modal">
-    <h2>Load Model</h2>
-    <div class="field">
-      <label>Model</label>
-      <select id="model-select"><option>Loading...</option></select>
-    </div>
-    <div class="field">
-      <label>Vision Model (mmproj)</label>
-      <select id="mmproj-select">
-        <option value="auto">Auto-detect</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Backend</label>
-      <select id="backend-select">
-        <option value="">Loading supported backends...</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Max Tokens</label>
-      <input type="text" id="max-tokens" value="2000">
-    </div>
-    <div class="actions">
-      <button onclick="hideSettings()">Cancel</button>
-      <button class="primary" id="btn-load" onclick="loadModel()">Load</button>
-    </div>
-    <p class="settings-hint" id="settings-hint">Select a model before starting a chat. The loaded model stays fixed for the conversation.</p>
-  </div>
-</div>
-
 <script>
 const chatContainer = document.getElementById('chat-container');
 const messageInput = document.getElementById('message-input');
@@ -855,10 +819,9 @@ let pendingAttachments = [];
 let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
-let availableModels = [];
-let availableBackends = [];
 let needsCacheReset = false;
 let shouldAutoScroll = true;
+let serverDefaultMaxTokens = 20000;
 const editOriginalHtml = new Map();
 
 function isChatNearBottom() {
@@ -890,207 +853,82 @@ messageInput.addEventListener('input', () => {
   messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
 });
 
-document.getElementById('btn-settings').onclick = showSettings;
 document.getElementById('btn-clear').onclick = clearChat;
 
-function showSettings() {
-  document.getElementById('settings-modal').classList.add('visible');
-  updateSettingsLockState();
-  fetchModels();
+function renderEmptyState() {
+  if (chatHistory.length > 0) {
+    return;
+  }
+
+  if (!currentLoadedModel) {
+    chatContainer.innerHTML = `
+      <div class="empty-state" id="empty-state">
+        <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
+        <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
+      </div>`;
+    return;
+  }
+
+  chatContainer.innerHTML = `
+    <div class="empty-state">
+      <img class="big-logo assistant-preview" src="/images/banner_1.png" alt="Assistant banner">
+      <p>Start a conversation with the configured model. You can attach images, videos, audio, and text files for multimodal inference.</p>
+    </div>`;
 }
 
-function hideSettings() {
-  document.getElementById('settings-modal').classList.remove('visible');
+function legacyStatusBadge(data) {
+  currentLoadedModel = data.loaded || null;
+
+  if (!currentLoadedModel) {
+    statusBadge.textContent = 'No model configured';
+    statusBadge.classList.remove('loaded');
+    return;
+  }
+
+  let statusText = currentLoadedModel + ' (' + (data.architecture || '?') + ')';
+  if (data.loadedBackend) {
+    statusText += ' · ' + data.loadedBackend;
+  }
+  if (data.loadedMmProj) {
+    statusText += ' + ' + data.loadedMmProj;
+  }
+
+  statusBadge.textContent = statusText;
+  statusBadge.classList.add('loaded');
 }
 
-async function fetchModels() {
+function updateStatusBadge(data) {
+  currentLoadedModel = data.loaded || null;
+
+  if (!currentLoadedModel) {
+    statusBadge.textContent = 'No model configured';
+    statusBadge.classList.remove('loaded');
+    return;
+  }
+
+  let statusText = currentLoadedModel + ' (' + (data.architecture || '?') + ')';
+  if (data.loadedBackend) {
+    statusText += ' | ' + data.loadedBackend;
+  }
+  if (data.loadedMmProj) {
+    statusText += ' + ' + data.loadedMmProj;
+  }
+
+  statusBadge.textContent = statusText;
+  statusBadge.classList.add('loaded');
+}
+
+async function fetchServerState() {
   try {
     const res = await fetch('/api/models');
     const data = await res.json();
-    availableModels = data.models || [];
-    currentLoadedModel = data.loaded || null;
-    populateBackendSelect(data.supportedBackends || [], data.loadedBackend || data.defaultBackend);
-    populateMmProjSelect(data.mmProjModels || [], data.loadedMmProj);
-
-    const select = document.getElementById('model-select');
-    select.innerHTML = '';
-    if (availableModels.length === 0) {
-      select.innerHTML = '<option>No .gguf files found in model directory</option>';
-      updateInlineModelStatus();
-      updateSettingsLockState();
-      return data;
-    }
-    availableModels.forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      if (m === data.loaded) opt.selected = true;
-      select.appendChild(opt);
-    });
-
-    updateInlineModelStatus();
-    updateSettingsLockState();
+    serverDefaultMaxTokens = data.defaultMaxTokens || 20000;
+    updateStatusBadge(data);
+    renderEmptyState();
     return data;
   } catch (e) {
-    console.error('Failed to fetch models:', e);
+    console.error('Failed to fetch server state:', e);
     return null;
-  }
-}
-
-function populateBackendSelect(backends, preferredBackend) {
-  availableBackends = backends;
-  const select = document.getElementById('backend-select');
-  const currentValue = select.value;
-  select.innerHTML = '';
-
-  if (availableBackends.length === 0) {
-    select.innerHTML = '<option value="">No supported backends</option>';
-    select.disabled = true;
-    return;
-  }
-
-  availableBackends.forEach(backend => {
-    const opt = document.createElement('option');
-    opt.value = backend.value;
-    opt.textContent = backend.label;
-    select.appendChild(opt);
-  });
-
-  select.disabled = false;
-  const selectedValue = availableBackends.some(backend => backend.value === currentValue) ? currentValue :
-    availableBackends.some(backend => backend.value === preferredBackend) ? preferredBackend :
-    availableBackends[0].value;
-  select.value = selectedValue;
-}
-
-function populateMmProjSelect(mmProjModels, loadedMmProj) {
-  const select = document.getElementById('mmproj-select');
-  const currentValue = select.value;
-  select.innerHTML = '';
-
-  const autoOpt = document.createElement('option');
-  autoOpt.value = 'auto';
-  autoOpt.textContent = 'Auto-detect';
-  select.appendChild(autoOpt);
-
-  const noneOpt = document.createElement('option');
-  noneOpt.value = 'none';
-  noneOpt.textContent = 'None (text only)';
-  select.appendChild(noneOpt);
-
-  mmProjModels.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m;
-    select.appendChild(opt);
-  });
-
-  if (loadedMmProj && mmProjModels.includes(loadedMmProj)) {
-    select.value = loadedMmProj;
-  } else if (currentValue && [...select.options].some(o => o.value === currentValue)) {
-    select.value = currentValue;
-  } else {
-    select.value = 'auto';
-  }
-}
-
-function hasActiveChat() {
-  return chatHistory.length > 0;
-}
-
-function updateInlineModelStatus() {
-  const modelName = document.getElementById('inline-model-name');
-  if (!currentLoadedModel) {
-    modelName.textContent = 'No model loaded';
-    modelName.classList.add('empty');
-    return;
-  }
-
-  modelName.textContent = currentLoadedModel.replace(/\.gguf$/i, '');
-  modelName.classList.remove('empty');
-}
-
-function updateSettingsLockState() {
-  const lockModelSelection = hasActiveChat();
-  const modelSelect = document.getElementById('model-select');
-  const mmProjSelect = document.getElementById('mmproj-select');
-  const backendSelect = document.getElementById('backend-select');
-  const loadButton = document.getElementById('btn-load');
-  const settingsHint = document.getElementById('settings-hint');
-
-  if (settingsHint) {
-    settingsHint.textContent = lockModelSelection
-      ? 'Model changes are locked during a conversation. Start a new chat before loading a different model.'
-      : 'Select a model before starting a chat. The loaded model stays fixed for the conversation.';
-  }
-
-  if (modelSelect) {
-    modelSelect.disabled = lockModelSelection || availableModels.length === 0;
-  }
-
-  if (mmProjSelect) {
-    mmProjSelect.disabled = lockModelSelection;
-  }
-
-  if (backendSelect) {
-    backendSelect.disabled = lockModelSelection || availableBackends.length === 0;
-  }
-
-  if (loadButton) {
-    loadButton.disabled = lockModelSelection || availableModels.length === 0 || availableBackends.length === 0;
-  }
-}
-
-async function loadModel() {
-  if (hasActiveChat()) {
-    alert('Start a new chat before changing models.');
-    return;
-  }
-
-  const model = document.getElementById('model-select').value;
-  const mmproj = document.getElementById('mmproj-select').value;
-  const backend = document.getElementById('backend-select').value;
-  if (!backend) {
-    alert('No supported backend is available on this machine.');
-    return;
-  }
-  const btn = document.getElementById('btn-load');
-  btn.disabled = true;
-  btn.textContent = 'Loading...';
-
-  const payload = { model, backend };
-  if (mmproj === 'none') {
-    payload.mmproj = 'none';
-  } else if (mmproj !== 'auto') {
-    payload.mmproj = mmproj;
-  }
-
-  try {
-    const res = await fetch('/api/models/load', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json();
-    if (data.ok) {
-      currentLoadedModel = data.model;
-      let statusText = data.model + ' (' + (data.architecture || '?') + ')';
-      if (data.loadedMmProj) {
-        statusText += ' + ' + data.loadedMmProj;
-      }
-      statusBadge.textContent = statusText;
-      statusBadge.classList.add('loaded');
-      updateInlineModelStatus();
-      hideSettings();
-      clearChat();
-    } else {
-      alert('Failed to load: ' + data.error);
-    }
-  } catch (e) {
-    alert('Error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Load';
   }
 }
 
@@ -1101,21 +939,7 @@ function clearChat() {
   chatContainer.innerHTML = '';
   needsCacheReset = true;
   shouldAutoScroll = true;
-  updateSettingsLockState();
-  if (!statusBadge.classList.contains('loaded')) {
-    chatContainer.innerHTML = `
-      <div class="empty-state" id="empty-state">
-        <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
-        <p>Load a model and start chatting. You can attach images, videos, audio, and text files for multimodal inference.</p>
-        <button class="primary" onclick="showSettings()">Load Model</button>
-      </div>`;
-  } else {
-    chatContainer.innerHTML = `
-      <div class="empty-state">
-        <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
-        <p>Start a conversation with the loaded model. To switch models, start a new chat first. You can still attach images, videos, audio, and text files.</p>
-      </div>`;
-  }
+  renderEmptyState();
 }
 
 async function handleFileSelect(event) {
@@ -1174,7 +998,7 @@ async function sendMessage() {
   const text = messageInput.value.trim();
   if (!text && pendingAttachments.length === 0) return;
   if (!currentLoadedModel) {
-    showSettings();
+    alert('No model is configured. Restart TensorSharp.Server with --model <path.gguf> --backend <type>.');
     return;
   }
 
@@ -1240,9 +1064,8 @@ async function requestAssistantResponse() {
   let wasAborted = false;
 
   try {
-    const maxTokens = parseInt(document.getElementById('max-tokens').value) || 2000;
     const reasoningOn = document.getElementById('reasoning-toggle').checked;
-    const chatPayload = { messages: chatHistory, maxTokens, think: reasoningOn };
+    const chatPayload = { messages: chatHistory, maxTokens: serverDefaultMaxTokens, think: reasoningOn };
     if (needsCacheReset) {
       chatPayload.newChat = true;
       needsCacheReset = false;
@@ -1365,23 +1188,8 @@ function revertFrom(historyIdx) {
   });
 
   needsCacheReset = true;
-  updateSettingsLockState();
-
   if (chatHistory.length === 0) {
-    if (statusBadge.classList.contains('loaded')) {
-      chatContainer.innerHTML = `
-        <div class="empty-state">
-          <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant icon">
-          <p>Start a conversation with the loaded model. To switch models, start a new chat first.</p>
-        </div>`;
-    } else {
-      chatContainer.innerHTML = `
-        <div class="empty-state" id="empty-state">
-          <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
-          <p>Load a model and start chatting.</p>
-          <button class="primary" onclick="showSettings()">Load Model</button>
-        </div>`;
-    }
+    renderEmptyState();
   }
 }
 
@@ -1518,11 +1326,9 @@ function addUserBubble(text, attachments, historyIdx) {
 function addAssistantBubble() {
   const div = document.createElement('div');
   div.className = 'message assistant';
-  const modelDisplay = (currentLoadedModel || '').replace(/\.gguf$/i, '');
   div.innerHTML = `
-    <div class="avatar"><img src="/images/assistant_logo.png" alt=""></div>
+    <div class="avatar"><img src="/images/banner_1.png" alt=""></div>
     <div class="bubble">
-      <div class="model-label">${escapeHtml(modelDisplay)}</div>
       <div class="queue-indicator" style="display:none"><div class="queue-spinner"></div><span>Waiting in queue...</span></div>
       <span class="bubble-text"></span>
       <div class="typing-indicator"><span></span><span></span><span></span></div>
@@ -1546,14 +1352,7 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-fetchModels().then(data => {
-  if (data && data.loaded) {
-    currentLoadedModel = data.loaded;
-    statusBadge.textContent = data.loaded + ' (' + (data.architecture || '?') + ')';
-    statusBadge.classList.add('loaded');
-    updateInlineModelStatus();
-  }
-});
+fetchServerState();
 
 const queueBadge = document.getElementById('queue-badge');
 

@@ -1,78 +1,98 @@
-﻿# TensorSharp.Server Multi-Turn Chat Integration Tests
+# TensorSharp.Server Integration Tests
 
-Two test suites that simulate real users having long multi-turn conversations with TensorSharp.Server across all API surfaces.
+Two test suites exercise TensorSharp.Server's current public compatibility surface:
 
-For the Web UI flow, the tests load a model once through `/api/models/load` and then send turns to `/api/chat` without per-request model switching.
+- Web UI SSE: `/api/chat`
+- Ollama chat compatibility: `/api/chat/ollama`
+- OpenAI Chat Completions compatibility: `/v1/chat/completions`
+
+The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities.
 
 ## Quick Start
 
 1. Start TensorSharp.Server:
+
 ```bash
 MODEL_DIR=~/models BACKEND=ggml_metal ./TensorSharp.Server
 ```
 
-2. Run tests (pick one):
+2. Run either suite:
+
 ```bash
-# Bash test suite (requires curl + jq)
+# Bash suite (requires curl + jq)
 bash test_multiturn.sh
 
-# Python test suite (no extra dependencies)
+# Python suite (standard library only)
 python3 test_multiturn.py
 ```
 
-## Test Coverage
+## What The Suites Cover
 
-| # | Test | API | Turns | What it verifies |
-|---|------|-----|-------|------------------|
-| 1 | Basic multi-turn | Web UI `/api/chat` | 5 | SSE streaming, token accumulation, done event |
-| 2 | Context retention | Ollama `/api/chat/ollama` | 4-7 | Model remembers facts (names, numbers, cities) across turns |
-| 3 | Non-streaming | Ollama `/api/chat/ollama` | 4 | Non-streaming JSON responses, math follow-ups |
-| 4 | Streaming metrics | Ollama `/api/chat/ollama` | 3 | NDJSON streaming, `done_reason`, `eval_count`, `total_duration` |
-| 5 | OpenAI streaming | `/v1/chat/completions` | 4-5 | SSE chunks, `delta.content`, `finish_reason`, `[DONE]` |
-| 6 | Structured outputs | `/v1/chat/completions` | 1 | `response_format.json_schema`, JSON validation, required keys |
-| 7 | OpenAI non-streaming | `/v1/chat/completions` | 4 | Full JSON response, `choices[0].message.content` |
-| 8 | System message + long | Web UI `/api/chat` | 8 | System prompt persistence over many turns |
-| 9 | Queue status | `/api/queue/status` | - | `busy`, `pending_requests`, `total_processed` fields |
-| 10 | Concurrent requests | Web UI `/api/chat` | - | FIFO queue handles 3 simultaneous requests |
-| 11 | Thinking mode | Ollama `/api/chat/ollama` | 3 | `think: true` parameter, multi-turn with reasoning |
-| 12 | Long conversation | Ollama `/api/chat/ollama` | 12 | Stress test - 25 messages total |
-| 13 | Mixed API | Ollama + OpenAI | 3 | Same conversation across different API formats |
-| 14 | Error handling | All | - | Missing fields return 400, invalid structured schemas rejected |
-| 15 | Tool calls | Ollama `/api/chat/ollama` | 3 | Multi-turn with tool definitions |
-| 16 | Abort | Web UI `/api/chat` | 1 | Mid-generation abort, queue release after abort |
+### Common coverage
 
-## Options
+- Web UI multi-turn SSE streaming and done events
+- Ollama chat multi-turn behavior in streaming and non-streaming modes
+- OpenAI Chat Completions streaming and non-streaming behavior
+- OpenAI structured outputs with both `response_format: {"type":"json_object"}` and `response_format.json_schema`
+- Queue status endpoint shape
+- Error handling for missing required fields
+- Structured-output validation errors and documented request conflicts
 
-### Bash script
+### Capability-gated coverage
+
+- Thinking-mode tests run only on architectures that currently support thinking in TensorSharp:
+  Gemma 4, Qwen 3, Qwen 3.5, GPT OSS, and Nemotron-H
+- Tool-calling tests run only on architectures that currently support tool calling in TensorSharp:
+  Gemma 4, Qwen 3, Qwen 3.5, and Nemotron-H
+
+Unsupported architectures are reported as `SKIP`, not `FAIL`.
+
+### Bash-only operational checks
+
+- System-prompt persistence in the Web UI flow
+- Concurrent requests and FIFO queue behavior
+- Long-conversation stress test
+- Mixed Ollama/OpenAI handoff
+- Abort mid-generation and queue release
+- Ollama tool-call request plumbing
+
+### Python-specific compatibility checks
+
+- Architecture-aware OpenAI tool-call validation
+- Separate pass/fail/skip accounting with per-test payload dumps
+
+## Notes
+
+- The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server currently emulates here.
+- Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` or `think` are expected to return HTTP `400`.
+- The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
+
+## Usage
+
+### Bash
+
 ```bash
 bash test_multiturn.sh [model_name] [base_url]
-
-# Examples:
-bash test_multiturn.sh                                          # auto-detect
-bash test_multiturn.sh gemma-4-E4B-it-Q8_0.gguf                # specific model
-bash test_multiturn.sh gemma-4-E4B-it-Q8_0.gguf http://host:5000  # remote server
 ```
 
-### Python script
+Examples:
+
+```bash
+bash test_multiturn.sh
+bash test_multiturn.sh gemma-4-E4B-it-Q8_0.gguf
+bash test_multiturn.sh gemma-4-E4B-it-Q8_0.gguf http://host:5000
+```
+
+### Python
+
 ```bash
 python3 test_multiturn.py [--model MODEL] [--url URL] [--max-tokens N]
-
-# Examples:
-python3 test_multiturn.py                                       # auto-detect
-python3 test_multiturn.py --model gemma-4-E4B-it-Q8_0.gguf     # specific model
-python3 test_multiturn.py --max-tokens 120                      # longer responses
 ```
 
-## What the tests validate
+Examples:
 
-- **Response structure**: Each API returns data in the correct format (SSE, NDJSON, JSON)
-- **Context retention**: Model remembers facts, names, and numbers from earlier turns
-- **Multi-turn coherence**: Follow-up questions get contextually appropriate answers
-- **Done/finish signals**: Every response properly terminates with done event
-- **Streaming correctness**: Tokens accumulate correctly across chunks
-- **Queue behavior**: Concurrent requests are serialized, queue status is accurate
-- **Error handling**: Invalid requests return proper HTTP error codes
-- **Structured outputs**: OpenAI-style `response_format` schemas are validated and enforced
-- **Abort support**: Mid-generation cancellation works and releases the queue
-- **Metrics**: Timing and token count metrics are present in done events
-
+```bash
+python3 test_multiturn.py
+python3 test_multiturn.py --model gemma-4-E4B-it-Q8_0.gguf
+python3 test_multiturn.py --max-tokens 120
+```

@@ -26,18 +26,36 @@ BASE_URL="${2:-http://localhost:5000}"
 PASS=0
 FAIL=0
 TOTAL=0
+SKIP=0
+ARCHITECTURE=""
+SUPPORTS_THINKING=false
+SUPPORTS_TOOLS=false
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 log()    { echo -e "${CYAN}[TEST]${NC} $*"; }
 pass()   { echo -e "${GREEN}[PASS]${NC} $*"; PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); }
 fail()   { echo -e "${RED}[FAIL]${NC} $*"; FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); }
+skip()   { echo -e "${YELLOW}[SKIP]${NC} $*"; SKIP=$((SKIP+1)); TOTAL=$((TOTAL+1)); }
 warn()   { echo -e "${YELLOW}[WARN]${NC} $*"; }
 header() { echo -e "\n${CYAN}============================================================${NC}"; echo -e "${CYAN} $*${NC}"; echo -e "${CYAN}============================================================${NC}"; }
+model_output() {
+    local label="$1"
+    local content="${2:-}"
+    echo -e "${MAGENTA}[MODEL]${NC} $label"
+    if [ -n "$content" ]; then
+        while IFS= read -r line; do
+            echo "        $line"
+        done <<< "$content"
+    else
+        echo "        <empty>"
+    fi
+}
 
 check_deps() {
     for cmd in curl jq; do
@@ -110,6 +128,34 @@ load_model() {
     fi
 }
 
+detect_capabilities() {
+    local models_json normalized
+    models_json=$(curl -sf "$BASE_URL/api/models")
+    ARCHITECTURE=$(echo "$models_json" | jq -r '.architecture // empty')
+    normalized=$(printf '%s' "${ARCHITECTURE:-$MODEL}" | tr '[:upper:]' '[:lower:]' | tr -d '._-')
+
+    SUPPORTS_THINKING=false
+    SUPPORTS_TOOLS=false
+
+    case "$normalized" in
+        gemma4*|qwen35*|qwen3*|nemotronh*|nemotron*)
+            SUPPORTS_THINKING=true
+            SUPPORTS_TOOLS=true
+            ;;
+        *gptoss*)
+            SUPPORTS_THINKING=true
+            SUPPORTS_TOOLS=false
+            ;;
+        gemma3*|mistral3*|mistral*)
+            SUPPORTS_THINKING=false
+            SUPPORTS_TOOLS=false
+            ;;
+    esac
+
+    log "Architecture: ${ARCHITECTURE:-unknown}"
+    log "Capabilities: thinking=$SUPPORTS_THINKING, tools=$SUPPORTS_TOOLS"
+}
+
 # Parse SSE stream: extract all "data: {...}" lines, return JSON payloads
 parse_sse() {
     grep '^data: ' | sed 's/^data: //' | while read -r line; do
@@ -161,6 +207,7 @@ test_webui_basic_multiturn() {
                 done_received=true
             fi
         done < <(echo "$response" | parse_sse)
+        model_output "Turn $turn output" "$tokens"
 
         if [ -n "$tokens" ] && [ "$done_received" = true ]; then
             pass "Turn $turn: Got response (${#tokens} chars), done event received"
@@ -229,6 +276,7 @@ test_ollama_multiturn_streaming() {
                 done_received=true
             fi
         done < <(echo "$response" | parse_ndjson)
+        model_output "Turn $turn output" "$full_content"
 
         if [ -n "$full_content" ] && [ "$done_received" = true ]; then
             pass "Turn $turn: Got response (${#full_content} chars)"
@@ -278,6 +326,7 @@ test_ollama_multiturn_nonstreaming() {
         content=$(echo "$response" | jq -r '.message.content // empty' 2>/dev/null)
         local is_done
         is_done=$(echo "$response" | jq -r '.done // false' 2>/dev/null)
+        model_output "Turn $turn output" "$content"
 
         if [ -n "$content" ] && [ "$is_done" = "true" ]; then
             pass "Turn $turn: Got response (${#content} chars)"
@@ -332,6 +381,7 @@ test_openai_multiturn_streaming() {
                 finish_reason="$fr"
             fi
         done < <(echo "$response" | grep '^data: ')
+        model_output "Turn $turn output" "$full_content"
 
         if [ -n "$full_content" ]; then
             pass "Turn $turn: Got response (${#full_content} chars, finish=$finish_reason)"
@@ -372,6 +422,7 @@ test_openai_multiturn_nonstreaming() {
         content=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
         local finish
         finish=$(echo "$response" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)
+        model_output "Turn $turn output" "$content"
 
         if [ -n "$content" ]; then
             pass "Turn $turn: Got response (${#content} chars, finish=$finish)"
@@ -383,10 +434,42 @@ test_openai_multiturn_nonstreaming() {
 }
 
 # =============================================================================
-# Test 6: Web UI API - System message + long conversation (8 turns)
+# Test 6: OpenAI API - json_object response_format
+# =============================================================================
+test_openai_json_object() {
+    header "Test 6: OpenAI API - JSON Object Outputs"
+
+    local response
+    response=$(curl -sf -X POST "$BASE_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\":\"$MODEL\",
+            \"messages\":[{\"role\":\"user\",\"content\":\"Return a JSON object with keys answer and confidence for 2+3.\"}],
+            \"response_format\":{\"type\":\"json_object\"},
+            \"max_tokens\":80
+        }" 2>&1 || true)
+
+    local content
+    content=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+    model_output "json_object output" "$content"
+
+    if [ -z "$content" ]; then
+        fail "json_object: empty content"
+        return
+    fi
+
+    if echo "$content" | jq -e 'type == "object" and has("answer") and has("confidence")' &>/dev/null; then
+        pass "json_object: returned a JSON object with answer/confidence"
+    else
+        fail "json_object: unexpected payload: $content"
+    fi
+}
+
+# =============================================================================
+# Test 7: Web UI API - System message + long conversation (8 turns)
 # =============================================================================
 test_webui_system_message_long() {
-    header "Test 6: Web UI API - System Message + 8-Turn Conversation"
+    header "Test 7: Web UI API - System Message + 8-Turn Conversation"
 
     local messages='[{"role":"system","content":"You are a pirate captain named Blackbeard. Always respond in character, using pirate speech."}]'
     local prompts=(
@@ -422,6 +505,7 @@ test_webui_system_message_long() {
                 done_received=true
             fi
         done < <(echo "$response" | parse_sse)
+        model_output "Turn $turn output" "$tokens"
 
         if [ -n "$tokens" ] && [ "$done_received" = true ]; then
             pass "Turn $turn: Got response (${#tokens} chars)"
@@ -442,13 +526,14 @@ test_webui_system_message_long() {
 }
 
 # =============================================================================
-# Test 7: Queue status and concurrent request handling
+# Test 8: Queue status and concurrent request handling
 # =============================================================================
 test_queue_status() {
-    header "Test 7: Queue Status Endpoint"
+    header "Test 8: Queue Status Endpoint"
 
     local status
     status=$(curl -sf "$BASE_URL/api/queue/status" 2>&1 || true)
+    model_output "Queue status" "$status"
     if echo "$status" | jq -e '.busy != null and .pending_requests != null and .total_processed != null' &>/dev/null; then
         pass "Queue status endpoint returns valid structure"
         log "  busy=$(echo "$status" | jq '.busy'), pending=$(echo "$status" | jq '.pending_requests'), processed=$(echo "$status" | jq '.total_processed')"
@@ -458,10 +543,10 @@ test_queue_status() {
 }
 
 # =============================================================================
-# Test 8: Concurrent requests (FIFO ordering)
+# Test 9: Concurrent requests (FIFO ordering)
 # =============================================================================
 test_concurrent_requests() {
-    header "Test 8: Concurrent Requests (FIFO Queue)"
+    header "Test 9: Concurrent Requests (FIFO Queue)"
 
     local messages='[{"role":"user","content":"Say hello in exactly one word."}]'
     local pids=()
@@ -487,6 +572,9 @@ test_concurrent_requests() {
     local success_count=0
     for i in 1 2 3; do
         local resp_file="$tmpdir/resp_$i.txt"
+        if [ -f "$resp_file" ]; then
+            model_output "Concurrent response $i" "$(cat "$resp_file" 2>/dev/null)"
+        fi
         if [ -f "$resp_file" ] && grep -q '"done"' "$resp_file"; then
             success_count=$((success_count+1))
         fi
@@ -502,10 +590,15 @@ test_concurrent_requests() {
 }
 
 # =============================================================================
-# Test 9: Ollama API - Multi-turn with thinking mode
+# Test 10: Ollama API - Multi-turn with thinking mode
 # =============================================================================
 test_ollama_thinking_multiturn() {
-    header "Test 9: Ollama API - Multi-Turn with Thinking Mode (3 Turns)"
+    if [ "$SUPPORTS_THINKING" != "true" ]; then
+        skip "Thinking-mode tests skipped for architecture '${ARCHITECTURE:-unknown}'"
+        return
+    fi
+
+    header "Test 10: Ollama API - Multi-Turn with Thinking Mode (3 Turns)"
 
     local messages='[]'
     local prompts=(
@@ -514,6 +607,7 @@ test_ollama_thinking_multiturn() {
         "Is the final number divisible by 7?"
     )
 
+    local saw_thinking=false
     for i in "${!prompts[@]}"; do
         local turn=$((i+1))
         local prompt="${prompts[$i]}"
@@ -528,23 +622,36 @@ test_ollama_thinking_multiturn() {
 
         local content
         content=$(echo "$response" | jq -r '.message.content // empty' 2>/dev/null)
+        local thinking
+        thinking=$(echo "$response" | jq -r '.message.thinking // empty' 2>/dev/null)
         local is_done
         is_done=$(echo "$response" | jq -r '.done // false' 2>/dev/null)
+        model_output "Turn $turn thinking" "$thinking"
+        model_output "Turn $turn answer" "$content"
 
         if [ -n "$content" ] && [ "$is_done" = "true" ]; then
             pass "Turn $turn: Got response (${#content} chars)"
+            if [ -n "$thinking" ]; then
+                saw_thinking=true
+            fi
             messages=$(echo "$messages" | jq --arg a "$content" '. + [{"role":"assistant","content":$a}]')
         else
             fail "Turn $turn: Bad response"
         fi
     done
+
+    if [ "$saw_thinking" = true ]; then
+        pass "Thinking mode returned a separate thinking field"
+    else
+        fail "Thinking mode did not return a thinking field"
+    fi
 }
 
 # =============================================================================
-# Test 10: Very long conversation (12 turns) - stress test
+# Test 11: Very long conversation (12 turns) - stress test
 # =============================================================================
 test_long_conversation() {
-    header "Test 10: Stress Test - 12-Turn Conversation"
+    header "Test 11: Stress Test - 12-Turn Conversation"
 
     local messages='[{"role":"system","content":"You are a helpful assistant. Keep responses brief (1-2 sentences)."}]'
     local prompts=(
@@ -578,6 +685,7 @@ test_long_conversation() {
         content=$(echo "$response" | jq -r '.message.content // empty' 2>/dev/null)
         local is_done
         is_done=$(echo "$response" | jq -r '.done // false' 2>/dev/null)
+        model_output "Turn $turn output" "$content"
 
         if [ -n "$content" ] && [ "$is_done" = "true" ]; then
             pass "Turn $turn: OK (${#content} chars)"
@@ -603,10 +711,10 @@ test_long_conversation() {
 }
 
 # =============================================================================
-# Test 11: Mixed API - cross-API multi-turn
+# Test 12: Mixed API - cross-API multi-turn
 # =============================================================================
 test_mixed_api_multiturn() {
-    header "Test 11: Mixed API Multi-Turn (Ollama then OpenAI)"
+    header "Test 12: Mixed API Multi-Turn (Ollama then OpenAI)"
 
     local messages='[]'
 
@@ -618,6 +726,7 @@ test_mixed_api_multiturn() {
         -d "{\"model\":\"$MODEL\", \"messages\":$messages, \"stream\":false, \"options\":{\"num_predict\":50}}" 2>&1 || true)
     local c1
     c1=$(echo "$resp1" | jq -r '.message.content // empty' 2>/dev/null)
+    model_output "Turn 1 (Ollama) output" "$c1"
     if [ -n "$c1" ]; then
         pass "Turn 1 (Ollama): Got response"
         messages=$(echo "$messages" | jq --arg a "$c1" '. + [{"role":"assistant","content":$a}]')
@@ -634,6 +743,7 @@ test_mixed_api_multiturn() {
         -d "{\"model\":\"$MODEL\", \"messages\":$messages, \"stream\":false, \"max_tokens\":50}" 2>&1 || true)
     local c2
     c2=$(echo "$resp2" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+    model_output "Turn 2 (OpenAI) output" "$c2"
     if [ -n "$c2" ]; then
         pass "Turn 2 (OpenAI): Got response"
         messages=$(echo "$messages" | jq --arg a "$c2" '. + [{"role":"assistant","content":$a}]')
@@ -650,6 +760,7 @@ test_mixed_api_multiturn() {
         -d "{\"model\":\"$MODEL\", \"messages\":$messages, \"stream\":false, \"options\":{\"num_predict\":60}}" 2>&1 || true)
     local c3
     c3=$(echo "$resp3" | jq -r '.message.content // empty' 2>/dev/null)
+    model_output "Turn 3 (Ollama) output" "$c3"
     if [ -n "$c3" ]; then
         pass "Turn 3 (Ollama): Got response"
     else
@@ -658,10 +769,10 @@ test_mixed_api_multiturn() {
 }
 
 # =============================================================================
-# Test 12: Error handling - missing fields, empty messages
+# Test 13: Error handling - missing fields and documented incompatibilities
 # =============================================================================
 test_error_handling() {
-    header "Test 12: Error Handling"
+    header "Test 13: Error Handling"
 
     log "Test: Missing model field (Ollama API)"
     local resp
@@ -670,6 +781,7 @@ test_error_handling() {
         -d '{"messages":[{"role":"user","content":"hello"}]}' 2>&1 || true)
     local code
     code=$(echo "$resp" | tail -1)
+    model_output "Missing model response" "$resp"
     if [ "$code" = "400" ]; then
         pass "Missing model returns 400"
     else
@@ -681,6 +793,7 @@ test_error_handling() {
         -H "Content-Type: application/json" \
         -d "{\"model\":\"$MODEL\"}" 2>&1 || true)
     code=$(echo "$resp" | tail -1)
+    model_output "Missing messages response" "$resp"
     if [ "$code" = "400" ]; then
         pass "Missing messages returns 400"
     else
@@ -692,10 +805,96 @@ test_error_handling() {
         -H "Content-Type: application/json" \
         -d '{"messages":[{"role":"user","content":"hello"}]}' 2>&1 || true)
     code=$(echo "$resp" | tail -1)
+    model_output "OpenAI missing model response" "$resp"
     if [ "$code" = "400" ]; then
         pass "OpenAI missing model returns 400"
     else
         fail "OpenAI missing model returned $code (expected 400)"
+    fi
+
+    log "Test: Invalid structured output schema"
+    resp=$(curl -sf -w "\n%{http_code}" -X POST "$BASE_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\":\"$MODEL\",
+            \"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],
+            \"response_format\":{
+                \"type\":\"json_schema\",
+                \"json_schema\":{
+                    \"name\":\"bad_schema\",
+                    \"strict\":true,
+                    \"schema\":{
+                        \"type\":\"object\",
+                        \"properties\":{\"answer\":{\"type\":\"string\"}},
+                        \"required\":[\"answer\"]
+                    }
+                }
+            }
+        }" 2>&1 || true)
+    code=$(echo "$resp" | tail -1)
+    model_output "Invalid structured schema response" "$resp"
+    if [ "$code" = "400" ]; then
+        pass "Invalid structured schema returns 400"
+    else
+        fail "Invalid structured schema returned $code (expected 400)"
+    fi
+
+    log "Test: response_format cannot be combined with tools"
+    resp=$(curl -sf -w "\n%{http_code}" -X POST "$BASE_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\":\"$MODEL\",
+            \"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],
+            \"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}}],
+            \"response_format\":{
+                \"type\":\"json_schema\",
+                \"json_schema\":{
+                    \"name\":\"simple_object\",
+                    \"strict\":true,
+                    \"schema\":{
+                        \"type\":\"object\",
+                        \"properties\":{\"answer\":{\"type\":\"string\"}},
+                        \"required\":[\"answer\"],
+                        \"additionalProperties\":false
+                    }
+                }
+            }
+        }" 2>&1 || true)
+    code=$(echo "$resp" | tail -1)
+    model_output "response_format + tools response" "$resp"
+    if [ "$code" = "400" ]; then
+        pass "response_format + tools returns 400"
+    else
+        fail "response_format + tools returned $code (expected 400)"
+    fi
+
+    log "Test: response_format cannot be combined with think"
+    resp=$(curl -sf -w "\n%{http_code}" -X POST "$BASE_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\":\"$MODEL\",
+            \"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],
+            \"think\":true,
+            \"response_format\":{
+                \"type\":\"json_schema\",
+                \"json_schema\":{
+                    \"name\":\"simple_object\",
+                    \"strict\":true,
+                    \"schema\":{
+                        \"type\":\"object\",
+                        \"properties\":{\"answer\":{\"type\":\"string\"}},
+                        \"required\":[\"answer\"],
+                        \"additionalProperties\":false
+                    }
+                }
+            }
+        }" 2>&1 || true)
+    code=$(echo "$resp" | tail -1)
+    model_output "response_format + think response" "$resp"
+    if [ "$code" = "400" ]; then
+        pass "response_format + think returns 400"
+    else
+        fail "response_format + think returned $code (expected 400)"
     fi
 
     log "Test: Empty message content"
@@ -704,6 +903,7 @@ test_error_handling() {
         -d "{\"model\":\"$MODEL\", \"messages\":[{\"role\":\"user\",\"content\":\"\"}], \"stream\":false, \"options\":{\"num_predict\":20}}" 2>&1 || true)
     local empty_done
     empty_done=$(echo "$resp" | jq -r '.done // false' 2>/dev/null)
+    model_output "Empty message response" "$resp"
     if [ "$empty_done" = "true" ]; then
         pass "Empty message handled gracefully"
     else
@@ -714,23 +914,28 @@ test_error_handling() {
 }
 
 # =============================================================================
-# Test 13: Ollama API - Multi-turn with tool calls
+# Test 14: Ollama API - Multi-turn with tool calls
 # =============================================================================
 test_ollama_tool_calls_multiturn() {
-    header "Test 13: Ollama API - Multi-Turn with Tool Calls (3 Turns)"
+    if [ "$SUPPORTS_TOOLS" != "true" ]; then
+        skip "Tool-calling tests skipped for architecture '${ARCHITECTURE:-unknown}'"
+        return
+    fi
+
+    header "Test 14: Ollama API - Multi-Turn with Tool Calls (3 Turns)"
 
     local tools='[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a location","parameters":{"type":"object","properties":{"location":{"type":"string","description":"City name"},"unit":{"type":"string","enum":["celsius","fahrenheit"],"description":"Temperature unit"}},"required":["location"]}}}]'
 
-    local messages='[]'
     local prompts=(
-        "What is the weather like in Tokyo?"
-        "How about in London?"
-        "Which city is warmer based on your information?"
+        "Call get_weather for Tokyo and do not answer from memory."
+        "Call get_weather for London and do not answer from memory."
+        "Call get_weather for Paris and do not answer from memory."
     )
 
     for i in "${!prompts[@]}"; do
         local turn=$((i+1))
         local prompt="${prompts[$i]}"
+        local messages='[]'
         log "Turn $turn/3: $prompt"
 
         messages=$(echo "$messages" | jq --arg q "$prompt" '. + [{"role":"user","content":$q}]')
@@ -744,21 +949,27 @@ test_ollama_tool_calls_multiturn() {
         content=$(echo "$response" | jq -r '.message.content // empty' 2>/dev/null)
         local is_done
         is_done=$(echo "$response" | jq -r '.done // false' 2>/dev/null)
+        local done_reason
+        done_reason=$(echo "$response" | jq -r '.done_reason // empty' 2>/dev/null)
+        local tool_call_count
+        tool_call_count=$(echo "$response" | jq -r '.message.tool_calls | length // 0' 2>/dev/null)
+        model_output "Turn $turn tool-call response" "$response"
 
-        if [ "$is_done" = "true" ]; then
-            pass "Turn $turn: Completed (content=${#content} chars)"
-            [ -n "$content" ] && messages=$(echo "$messages" | jq --arg a "$content" '. + [{"role":"assistant","content":$a}]')
+        if [ "$is_done" = "true" ] && [ "$tool_call_count" -gt 0 ]; then
+            pass "Turn $turn: Completed (content=${#content} chars, done_reason=$done_reason, tool_calls=$tool_call_count)"
+        elif [ "$is_done" = "true" ] && [ -n "$content" ]; then
+            skip "Turn $turn: Model answered directly instead of returning tool_calls"
         else
-            fail "Turn $turn: Not completed"
+            fail "Turn $turn: Expected completion with tool calls when applicable (done=$is_done, reason=$done_reason, tool_calls=$tool_call_count)"
         fi
     done
 }
 
 # =============================================================================
-# Test 14: Web UI API - Abort mid-generation
+# Test 15: Web UI API - Abort mid-generation
 # =============================================================================
 test_abort_generation() {
-    header "Test 14: Abort Mid-Generation"
+    header "Test 15: Abort Mid-Generation"
 
     local messages='[{"role":"user","content":"Write a very long detailed essay about the history of computing, from the abacus to modern quantum computers. Include every detail you can think of."}]'
 
@@ -776,6 +987,7 @@ test_abort_generation() {
     wait "$pid" 2>/dev/null || true
 
     if [ -f "$tmpfile" ] && [ -s "$tmpfile" ]; then
+        model_output "Abort partial response" "$(cat "$tmpfile" 2>/dev/null)"
         local token_count
         token_count=$(grep -c '"token"' "$tmpfile" 2>/dev/null || echo "0")
         if [ "$token_count" -gt 0 ]; then
@@ -799,6 +1011,7 @@ test_abort_generation() {
     status=$(curl -sf "$BASE_URL/api/queue/status" 2>&1 || true)
     local busy
     busy=$(echo "$status" | jq '.busy' 2>/dev/null)
+    model_output "Post-abort queue status" "$status"
     if [ "$busy" = "false" ]; then
         pass "Queue released after abort"
     else
@@ -813,17 +1026,19 @@ test_abort_generation() {
 # =============================================================================
 
 main() {
-    header "TensorSharp.Server Multi-Turn Chat Integration Tests"
+    header "TensorSharp.Server Integration Tests"
     check_deps
     wait_for_server
     auto_detect_model
     load_model
+    detect_capabilities
 
     test_webui_basic_multiturn
     test_ollama_multiturn_streaming
     test_ollama_multiturn_nonstreaming
     test_openai_multiturn_streaming
     test_openai_multiturn_nonstreaming
+    test_openai_json_object
     test_webui_system_message_long
     test_queue_status
     test_concurrent_requests
@@ -837,11 +1052,12 @@ main() {
     header "Test Results"
     echo -e "${GREEN}PASSED: $PASS${NC}"
     echo -e "${RED}FAILED: $FAIL${NC}"
+    echo -e "${YELLOW}SKIPPED: $SKIP${NC}"
     echo -e "TOTAL:  $TOTAL"
     echo ""
 
     if [ "$FAIL" -eq 0 ]; then
-        echo -e "${GREEN}All tests passed!${NC}"
+        echo -e "${GREEN}All runnable tests passed!${NC}"
         exit 0
     else
         echo -e "${RED}$FAIL test(s) failed.${NC}"
