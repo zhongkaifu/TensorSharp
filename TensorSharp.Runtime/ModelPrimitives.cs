@@ -36,6 +36,7 @@ namespace TensorSharp.Runtime
         public int NumExperts { get; set; }
         public int NumExpertsUsed { get; set; }
         public int SlidingWindow { get; set; }
+        public bool UsesCircularKvCache { get; set; }
         public int OriginalContextLength { get; set; }
 
         public int HeadDim => KeyLength > 0 ? KeyLength : (ValueLength > 0 ? ValueLength : HiddenSize / NumHeads);

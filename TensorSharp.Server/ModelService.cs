@@ -30,6 +30,7 @@ namespace TensorSharp.Server
         private BackendType _backend;
 
         private List<int> _cachedTokens;
+        private float[] _cachedNextLogits;
 
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
@@ -50,6 +51,7 @@ namespace TensorSharp.Server
         public void InvalidateKVCache()
         {
             _cachedTokens = null;
+            _cachedNextLogits = null;
             _model?.ResetKVCache();
         }
 
@@ -64,6 +66,7 @@ namespace TensorSharp.Server
             _loadedModelPath = null;
             _loadedMmProjPath = null;
             _cachedTokens = null;
+            _cachedNextLogits = null;
 
             _backend = BackendCatalog.Canonicalize(backendStr) switch
             {
@@ -138,49 +141,19 @@ namespace TensorSharp.Server
             Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, first 500 chars:");
             Console.Error.WriteLine(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered);
 
-            bool hasMultimodal = HasMultimodalContent(preparedHistory);
-
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
-
-            int maxCtx = _model.MaxContextLength;
-            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
-            {
-                int available = maxCtx - maxTokens;
-                if (available < 1)
-                    throw new InvalidOperationException(
-                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
-                        "Please shorten the input or reduce attached file size.");
-
-                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
-                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
-                _cachedTokens = null;
-            }
+            inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
 
             float[] logits;
-            int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
-
-            if (commonPrefix > 0)
-            {
-                _model.TruncateKVCache(commonPrefix);
-                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
-                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
-                logits = ForwardPromptPrefill(suffixTokens);
-            }
-            else
-            {
-                Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
-                if (_cachedTokens != null)
-                    Console.WriteLine("[KV cache] Reset (no usable common prefix)");
-                _model.ResetKVCache();
-                logits = ForwardPromptPrefill(inputTokens);
-            }
+            (_, logits) = PrepareChatPrompt(inputTokens);
 
             var generatedTokens = new List<int>();
             var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
             var rawBytes = new List<byte>();
             int prevCharLen = 0;
+            bool cachedLogitsValid = true;
 
             for (int step = 0; step < maxTokens; step++)
             {
@@ -202,7 +175,10 @@ namespace TensorSharp.Server
                 {
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop)
+                    {
+                        cachedLogitsValid = false;
                         break;
+                    }
                 }
 
                 if (piece.Length > 0)
@@ -211,13 +187,16 @@ namespace TensorSharp.Server
                 logits = _model.Forward(new[] { nextToken });
             }
 
-            SaveTokenCache(inputTokens, generatedTokens);
+            SaveTokenCache(inputTokens, generatedTokens, logits, cachedLogitsValid);
         }
 
-        private float[] ForwardPromptPrefill(IList<int> tokens)
+        private float[] ForwardPromptPrefill(IList<int> tokens, bool allowChunking = true)
         {
             if (tokens == null || tokens.Count == 0)
                 throw new ArgumentException("Prompt token list cannot be null or empty.", nameof(tokens));
+
+            if (!allowChunking)
+                return _model.ForwardRefill(CopyTokenRange(tokens, 0, tokens.Count));
 
             int chunkSize = ResolvePrefillChunkSize(_backend, tokens.Count);
             if (chunkSize >= tokens.Count)
@@ -243,6 +222,51 @@ namespace TensorSharp.Server
             return backend == BackendType.GgmlCuda
                 ? Math.Min(tokenCount, 5120)
                 : tokenCount;
+        }
+
+        internal static int ResolveReusablePrefixForInference(int reusablePrefix, int inputTokenCount, bool hasExactCachedLogits)
+        {
+            if (reusablePrefix <= 0 || inputTokenCount <= 0)
+                return 0;
+
+            if (reusablePrefix < inputTokenCount)
+                return reusablePrefix;
+
+            if (hasExactCachedLogits)
+                return inputTokenCount;
+
+            return inputTokenCount > 1 ? inputTokenCount - 1 : 0;
+        }
+
+        private List<int> TruncatePromptToContext(List<int> inputTokens, int maxTokens)
+        {
+            int maxCtx = _model.MaxContextLength;
+            if (maxCtx <= 0 || inputTokens == null || inputTokens.Count + maxTokens <= maxCtx)
+                return inputTokens;
+
+            int available = maxCtx - maxTokens;
+            if (available < 1)
+            {
+                throw new InvalidOperationException(
+                    $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                    "Please shorten the input or reduce attached file size.");
+            }
+
+            int trimStart = inputTokens.Count - available;
+            trimStart = _model.MultimodalInjector.ClampTrimStart(trimStart);
+            int kept = inputTokens.Count - trimStart;
+            if (kept < 1)
+            {
+                throw new InvalidOperationException(
+                    $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                    "Please shorten the input or reduce attached file size.");
+            }
+
+            Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {kept} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
+            _model.MultimodalInjector.TrimPreparedPrompt(trimStart);
+            _cachedTokens = null;
+            _cachedNextLogits = null;
+            return inputTokens.GetRange(trimStart, kept);
         }
 
         private static int[] CopyTokenRange(IList<int> tokens, int start, int length)
@@ -517,24 +541,13 @@ namespace TensorSharp.Server
 
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedMessages, inputTokens);
-
-            int maxCtx = _model.MaxContextLength;
-            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
-            {
-                int available = maxCtx - maxTokens;
-                if (available < 1)
-                    throw new InvalidOperationException(
-                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
-                        "Please shorten the input or reduce attached file size.");
-
-                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
-                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
-            }
+            inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
 
             InvalidateKVCache();
 
             var sw = Stopwatch.StartNew();
-            float[] logits = ForwardPromptPrefill(inputTokens);
+            bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(0);
+            float[] logits = ForwardPromptPrefill(inputTokens, allowChunking: !queuedPromptEmbeddings);
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             int promptTokenCount = inputTokens.Count;
 
@@ -597,47 +610,14 @@ namespace TensorSharp.Server
             Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, sampling: temp={samplingConfig?.Temperature ?? 0.8f}, top_k={samplingConfig?.TopK ?? 40}, top_p={samplingConfig?.TopP ?? 0.9f}");
             Console.Error.WriteLine($"[Prompt] first 500 chars: {(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered)}");
 
-            bool hasMultimodal = HasMultimodalContent(preparedHistory);
-
             var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
-
-            int maxCtx = _model.MaxContextLength;
-            if (maxCtx > 0 && inputTokens.Count + maxTokens > maxCtx)
-            {
-                int available = maxCtx - maxTokens;
-                if (available < 1)
-                    throw new InvalidOperationException(
-                        $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
-                        "Please shorten the input or reduce attached file size.");
-
-                Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {available} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
-                inputTokens = inputTokens.GetRange(inputTokens.Count - available, available);
-                _cachedTokens = null;
-            }
+            inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
 
             int promptTokenCount;
             var sw = Stopwatch.StartNew();
             float[] logits;
-            int commonPrefix = ComputeUsablePrefix(inputTokens, hasMultimodal);
-
-            if (commonPrefix > 0)
-            {
-                _model.TruncateKVCache(commonPrefix);
-                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
-                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
-                logits = ForwardPromptPrefill(suffixTokens);
-                promptTokenCount = suffixTokens.Length;
-            }
-            else
-            {
-                Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
-                if (_cachedTokens != null)
-                    Console.WriteLine("[KV cache] Reset (no usable common prefix)");
-                _model.ResetKVCache();
-                logits = ForwardPromptPrefill(inputTokens);
-                promptTokenCount = inputTokens.Count;
-            }
+            (promptTokenCount, logits) = PrepareChatPrompt(inputTokens);
 
             long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
 
@@ -646,6 +626,7 @@ namespace TensorSharp.Server
             var generatedTokens = new List<int>();
             var rawBytes3 = new List<byte>();
             int prevCharLen3 = 0;
+            bool cachedLogitsValid = true;
 
             var evalSw = Stopwatch.StartNew();
             for (int step = 0; step < maxTokens; step++)
@@ -665,7 +646,11 @@ namespace TensorSharp.Server
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                    if (shouldStop) break;
+                    if (shouldStop)
+                    {
+                        cachedLogitsValid = false;
+                        break;
+                    }
                 }
 
                 if (piece.Length > 0)
@@ -676,7 +661,7 @@ namespace TensorSharp.Server
             long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
             long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
 
-            SaveTokenCache(inputTokens, generatedTokens);
+            SaveTokenCache(inputTokens, generatedTokens, logits, cachedLogitsValid);
 
             yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
         }
@@ -706,7 +691,7 @@ namespace TensorSharp.Server
         /// <summary>
         /// Compute a usable common prefix length between cached tokens and new input.
         /// Returns 0 (meaning full reset) when:
-        ///   - No cache exists or multimodal content is present
+        ///   - No cache exists
         ///   - The model doesn't support KV cache truncation (e.g. Qwen3.5 recurrent layers)
         ///   - The savings would be less than 10% (not worth the risk)
         ///   - The common prefix is shorter than 4 tokens
@@ -716,9 +701,10 @@ namespace TensorSharp.Server
         /// the entries are not in positional order after truncation, which corrupts
         /// attention output and causes degenerate tokens.
         /// </summary>
-        private int ComputeUsablePrefix(List<int> inputTokens, bool hasMultimodal)
+        private int ComputeUsablePrefix(List<int> inputTokens)
         {
-            return _model?.KVCachePolicy.ComputeReusablePrefix(_model, _cachedTokens, inputTokens, hasMultimodal) ?? 0;
+            int reusablePrefix = _model?.KVCachePolicy.ComputeReusablePrefix(_model, _cachedTokens, inputTokens, hasMultimodal: false) ?? 0;
+            return _model?.MultimodalInjector.ClampReusablePrefix(reusablePrefix) ?? reusablePrefix;
         }
 
         /// <summary>
@@ -727,11 +713,58 @@ namespace TensorSharp.Server
         /// Works correctly for all models including thinking/Harmony because it compares
         /// actual token IDs rather than re-rendered text.
         /// </summary>
-        private void SaveTokenCache(List<int> promptTokens, List<int> generatedTokens)
+        private (int forwardedTokenCount, float[] logits) PrepareChatPrompt(List<int> inputTokens)
+        {
+            if (TryReuseFullPromptLogits(inputTokens, out float[] cachedLogits))
+            {
+                Console.WriteLine($"[KV cache] Reusing {inputTokens.Count} cached tokens, forwarding 0 new tokens (saved 100%)");
+                return (0, cachedLogits);
+            }
+
+            int commonPrefix = ComputeUsablePrefix(inputTokens);
+            commonPrefix = ResolveReusablePrefixForInference(commonPrefix, inputTokens.Count, false);
+            commonPrefix = _model.MultimodalInjector.ClampReusablePrefix(commonPrefix);
+
+            if (commonPrefix > 0)
+            {
+                _model.TruncateKVCache(commonPrefix);
+                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
+                bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(commonPrefix);
+                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
+                return (suffixTokens.Length, ForwardPromptPrefill(suffixTokens, allowChunking: !queuedPromptEmbeddings));
+            }
+
+            Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
+            if (_cachedTokens != null)
+                Console.WriteLine("[KV cache] Reset (no usable common prefix)");
+
+            _model.ResetKVCache();
+            bool queuedFullPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(0);
+            return (inputTokens.Count, ForwardPromptPrefill(inputTokens, allowChunking: !queuedFullPromptEmbeddings));
+        }
+
+        private bool TryReuseFullPromptLogits(List<int> inputTokens, out float[] logits)
+        {
+            logits = null;
+            if (_cachedTokens == null || _cachedNextLogits == null || inputTokens == null || _cachedTokens.Count != inputTokens.Count)
+                return false;
+
+            for (int i = 0; i < inputTokens.Count; i++)
+            {
+                if (_cachedTokens[i] != inputTokens[i])
+                    return false;
+            }
+
+            logits = (float[])_cachedNextLogits.Clone();
+            return true;
+        }
+
+        private void SaveTokenCache(List<int> promptTokens, List<int> generatedTokens, float[] nextLogits, bool nextLogitsValid)
         {
             _cachedTokens = new List<int>(promptTokens.Count + generatedTokens.Count);
             _cachedTokens.AddRange(promptTokens);
             _cachedTokens.AddRange(generatedTokens);
+            _cachedNextLogits = nextLogitsValid && nextLogits != null ? (float[])nextLogits.Clone() : null;
         }
 
         /// <summary>
@@ -866,6 +899,8 @@ namespace TensorSharp.Server
         {
             _model?.Dispose();
             _model = null;
+            _cachedTokens = null;
+            _cachedNextLogits = null;
         }
     }
 }

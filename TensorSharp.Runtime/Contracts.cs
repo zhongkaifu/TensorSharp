@@ -49,6 +49,10 @@ namespace TensorSharp.Runtime
     {
         void LoadProjectors(string mmProjPath);
         List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens);
+        int ClampReusablePrefix(int reusablePrefixTokenCount);
+        int ClampTrimStart(int trimStartTokenCount);
+        void TrimPreparedPrompt(int trimStartTokenCount);
+        bool QueuePromptEmbeddings(int reusablePrefixTokenCount);
     }
 
     public interface IKVCachePolicy
