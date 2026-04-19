@@ -42,6 +42,10 @@ namespace TensorSharp.Cli
             bool enableThinking = false;
             string toolsFile = null;
             bool dumpPrompt = false;
+            bool runBenchmark = false;
+            int benchmarkPrefill = 32;
+            int benchmarkDecode = 64;
+            int benchmarkRuns = 1;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -65,6 +69,10 @@ namespace TensorSharp.Cli
                     case "--tools": toolsFile = args[++i]; break;
                     case "--dump-prompt": dumpPrompt = true; break;
                     case "--multi-turn-jsonl": multiTurnJsonl = args[++i]; break;
+                    case "--benchmark": runBenchmark = true; break;
+                    case "--bench-prefill": benchmarkPrefill = int.Parse(args[++i]); break;
+                    case "--bench-decode": benchmarkDecode = int.Parse(args[++i]); break;
+                    case "--bench-runs": benchmarkRuns = int.Parse(args[++i]); break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -178,6 +186,12 @@ namespace TensorSharp.Cli
             if (runTest)
             {
                 RunTests(model, maxTokens, outputFile);
+                return;
+            }
+
+            if (runBenchmark)
+            {
+                RunBenchmark(model, benchmarkPrefill, benchmarkDecode, benchmarkRuns);
                 return;
             }
 
@@ -1156,6 +1170,98 @@ namespace TensorSharp.Cli
             TestTokenizer(model);
             TestChatTemplate(model);
             TestInferenceWithOllamaComparison(model, maxTokens, outputFile);
+        }
+
+        /// <summary>
+        /// Standalone inference benchmark: measures pure prefill and decode throughput
+        /// without prompt rendering, sampling, or output formatting overhead. Reports the
+        /// best (minimum-time) of `runs` independent runs to filter out warm-up artifacts.
+        /// </summary>
+        static void RunBenchmark(ModelBase model, int prefillTokens, int decodeTokens, int runs)
+        {
+            Console.WriteLine($"=== Inference Benchmark (prefill={prefillTokens} tok, decode={decodeTokens} tok, runs={runs}) ===");
+
+            // Build a synthetic prompt of `prefillTokens` tokens by repeating a stable token.
+            // We pick a token id that's safely inside the vocab (not BOS/EOS/special).
+            int vocab = model.Config.VocabSize;
+            int basisToken = Math.Min(100, vocab - 1);
+            int[] prefillIds = new int[prefillTokens];
+            for (int i = 0; i < prefillTokens; i++)
+                prefillIds[i] = basisToken + (i % 17);
+
+            double bestPrefillMs = double.PositiveInfinity;
+            double bestDecodeMs = double.PositiveInfinity;
+            double bestPrefillTps = 0;
+            double bestDecodeTps = 0;
+            double avgPrefillTps = 0;
+            double avgDecodeTps = 0;
+
+            for (int run = 0; run < runs; run++)
+            {
+                model.ResetKVCache();
+
+                // Prefill timing
+                var prefillSw = Stopwatch.StartNew();
+                float[] logits = model.Forward(prefillIds);
+                prefillSw.Stop();
+                double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
+                double prefillTps = prefillTokens / (prefillMs / 1000.0);
+
+                // Decode timing - greedy sampling on a stable token chain
+                int next = SampleGreedyFromLogits(logits, vocab);
+                var decodeSw = Stopwatch.StartNew();
+                for (int i = 0; i < decodeTokens; i++)
+                {
+                    logits = model.Forward(new[] { next });
+                    next = SampleGreedyFromLogits(logits, vocab);
+                }
+                decodeSw.Stop();
+                double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
+                double decodeTps = decodeTokens / (decodeMs / 1000.0);
+
+                Console.WriteLine($"[run {run + 1}/{runs}] prefill: {prefillMs:F0} ms ({prefillTps:F1} tok/s)   " +
+                    $"decode: {decodeMs:F0} ms ({decodeTps:F1} tok/s, {decodeMs / decodeTokens:F1} ms/tok)");
+
+                if (prefillMs < bestPrefillMs)
+                {
+                    bestPrefillMs = prefillMs;
+                    bestPrefillTps = prefillTps;
+                }
+                if (decodeMs < bestDecodeMs)
+                {
+                    bestDecodeMs = decodeMs;
+                    bestDecodeTps = decodeTps;
+                }
+                avgPrefillTps += prefillTps;
+                avgDecodeTps += decodeTps;
+            }
+
+            avgPrefillTps /= runs;
+            avgDecodeTps /= runs;
+
+            Console.WriteLine();
+            Console.WriteLine($"Best  prefill: {bestPrefillMs:F0} ms  ({bestPrefillTps:F1} tok/s)");
+            Console.WriteLine($"Best  decode:  {bestDecodeMs:F0} ms  ({bestDecodeTps:F1} tok/s, {bestDecodeMs / decodeTokens:F2} ms/tok)");
+            Console.WriteLine($"Avg   prefill: {avgPrefillTps:F1} tok/s");
+            Console.WriteLine($"Avg   decode:  {avgDecodeTps:F1} tok/s");
+            Console.WriteLine();
+            model.PrintTimingStats();
+        }
+
+        static int SampleGreedyFromLogits(float[] logits, int vocab)
+        {
+            int idx = 0;
+            float best = float.NegativeInfinity;
+            int n = Math.Min(vocab, logits.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (logits[i] > best)
+                {
+                    best = logits[i];
+                    idx = i;
+                }
+            }
+            return idx;
         }
 
         static void TestTokenizer(ModelBase model)

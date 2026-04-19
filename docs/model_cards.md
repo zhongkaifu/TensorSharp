@@ -292,7 +292,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Source file | `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` |
 | Provider | Alibaba |
 | GGUF architecture key | `qwen35`, `qwen35moe`, `qwen3next` |
-| Example models | Qwen3.5-9B, Qwen3.5-32B |
+| Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-32B, Qwen3.5-35B-A3B (MoE) |
 | Modalities | Text, Image |
 | Thinking mode | Yes (`<think>`) |
 | Tool calling | Yes (`<tool_call>`) |
@@ -300,7 +300,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 ### Architecture Overview
 
-Qwen 3.5 is a hybrid model mixing full-attention and GatedDeltaNet recurrent layers.
+Qwen 3.5 is a hybrid model mixing full-attention and GatedDeltaNet recurrent layers, with optional Mixture-of-Experts FFN. All variants (`qwen35`, `qwen35moe`, `qwen3next`) load through the same `Qwen35Model` implementation; the MoE variants additionally enable a fused expert kernel.
 
 - **Layer type**: `_isRecurrent[layer]` is true when `(layer + 1) % _fullAttentionInterval != 0` (default interval 4). For 48 layers with interval 4: 36 recurrent + 12 attention.
 - **Full attention layers**: same as Qwen 3 but with **gated Q** — the Q projection outputs `2 * numHeads * headDim`. The output is deinterleaved: first half is Q, second half is a sigmoid gate. Attention output is multiplied by `sigmoid(gate)` via `Ops.SigmoidMul`.
@@ -313,6 +313,11 @@ Qwen 3.5 is a hybrid model mixing full-attention and GatedDeltaNet recurrent lay
   - **Recurrent state update**: `state = exp(gate) * state + sigmoid(beta) * (v - state@k) ⊗ k^T`. Implemented via `Ops.AddmmBatch` for batched rank-1 outer products.
   - **Output**: `SiLU(z) * RMSNorm(state @ q)` via `Ops.SiLUMul` and `Ops.RMSNorm`.
   - **State shape**: `[numVHeads, headVDim, headKDim]` per layer.
+- **Mixture-of-Experts FFN** (`qwen35moe` / `qwen3next`):
+  - Routing: `linear(hidden) → softmax → TopK(_numExpertsUsed)`. When `_normTopKProb` is true, the selected weights are renormalized to sum to 1.
+  - Routed experts use SwiGLU with fused `ffn_gate_up_exps.{E}` + `ffn_down_exps.{E}` weights, intermediate width `_expertFfnLength`.
+  - An optional shared expert (`ffn_gate_up_shexp` + `ffn_down_shexp`, width `_sharedExpertFfnLength`) runs in parallel for every token.
+  - On GGML backends `TryMoEResidualDecode()` invokes the fused `GgmlBasicOps.MoEExpertsSwiGLUResidual` kernel, which performs all routed experts, the shared expert, and the residual add in a single GGML graph dispatch per MoE layer. Pre-cached `QuantizedWeight` references and pointer arrays (`_routedExpertGateUpQW`, `_routedExpertDownQW`, `_sharedExpertGateUpQW`, `_sharedExpertDownQW`) avoid per-token allocations.
 - **Prefill**: recurrent layers process tokens **sequentially** (loop over `seqLen`), while attention layers use batched prefill.
 - **Vision**: `Qwen35VisionEncoder` with dynamic resolution. Vision embeddings injected at `<|image_pad|>` positions.
 
@@ -328,6 +333,11 @@ Qwen 3.5 is a hybrid model mixing full-attention and GatedDeltaNet recurrent lay
 | `qwen35.full_attention_interval` | uint32 | Every Nth layer is full attention (default 4) |
 | `qwen35.rope.dimension_sections` | int32[] | MRoPE section boundaries |
 | `qwen35.rope.dimension_count` | uint32 | RoPE dim count |
+| `qwen35.expert_count` | uint32 | Routed expert count (0 = dense FFN) |
+| `qwen35.expert_used_count` | uint32 | TopK routed experts per token |
+| `qwen35.expert_feed_forward_length` | uint32 | Routed expert FFN width |
+| `qwen35.expert_shared_feed_forward_length` | uint32 | Shared expert FFN width (0 = no shared expert) |
+| `qwen35.expert_weights_norm` | bool | Renormalize TopK weights to sum=1 |
 
 ### Weight Naming Convention
 
@@ -354,6 +364,13 @@ blk.{L}.ssm_norm.weight                   # Output RMSNorm
 blk.{L}.ssm_out.weight                    # Output projection
 blk.{L}.post_attention_norm.weight
 blk.{L}.ffn_gate_up.weight / ffn_down.weight
+
+# MoE FFN layers (qwen35moe / qwen3next only):
+blk.{L}.ffn_gate_inp.weight               # Router [numExperts, hidden]
+blk.{L}.ffn_gate_up_exps.{E}.weight       # Fused expert gate+up
+blk.{L}.ffn_down_exps.{E}.weight          # Expert down
+blk.{L}.ffn_gate_up_shexp.weight          # Shared expert gate+up (optional)
+blk.{L}.ffn_down_shexp.weight             # Shared expert down (optional)
 ```
 
 ### Cache Architecture
@@ -375,11 +392,16 @@ To avoid per-step allocation in the hot GDN decode path, the following buffers a
 | `_gdnCoreOutBuf` | [numVHeads, headVDim, 1] | state@q output |
 | `_gdnGatedOutT` | [1, ssmDInner] | Final gated output |
 
+### Batched GPU MoE
+
+For `qwen35moe` / `qwen3next` variants on a GGML backend, MoE expert computation during decode is collapsed into a single `GgmlBasicOps.MoEExpertsSwiGLUResidual()` call per layer. The kernel performs all routed experts (`SwiGLU(gate * up) * down`), the optional shared expert, and the residual addition in one GGML graph dispatch. Pre-cached `QuantizedWeight` references and pointer arrays (`_routedExpertGateUpQW`, `_routedExpertDownQW`, `_sharedExpertGateUpQW`, `_sharedExpertDownQW`, plus parallel `*Ptrs` arrays) eliminate dictionary lookups and allocation in the hot decode loop.
+
 ### Optimization Opportunities
 
 - Recurrent prefill is sequential (one token at a time). Chunked parallel prefill (processing multiple tokens through the SSM simultaneously) would dramatically improve prompt throughput.
-- No native decode path yet. Moving the GDN decode to native C/CUDA would avoid managed overhead.
+- No native decode path for the GDN scan yet. Moving the GDN decode to native C/CUDA would avoid managed overhead.
 - Conv1d is implemented as a scalar loop. A vectorized SIMD implementation would help.
+- MoE prefill still iterates per token. A batched expert-prefill kernel (analogous to the decode path) would speed up long prompts on MoE variants.
 
 ---
 
@@ -732,7 +754,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 | Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H | Mistral 3 |
 |---|---|---|---|---|---|---|---|
-| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
+| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
 | Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks | Full GQA (no RoPE) | Full GQA |
 | FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit | ReLU² | SwiGLU |
 | RoPE variant | NeoX (dual base) | NeoX + proportional | NeoX | NeoX / MRoPE | NeoX + Yarn | None | GPT-J + YaRN |
@@ -745,7 +767,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Attention sinks | No | No | No | No | Yes | No | No |
 | Circular KV cache | No | Yes (SWA layers) | No | No | No | No | No |
 | SSM (Mamba2) | No | No | No | No | No | Yes | No |
-| Shared experts | No | No | No | No | No | Yes (optional) | No |
+| Shared experts | No | No | No | Yes (qwen35moe) | No | Yes (optional) | No |
 | Latent bottleneck | No | No | No | No | No | Yes (optional) | No |
 | Position-dependent Q scaling | No | No | No | No | No | No | Yes (YaRN) |
 | Vision | Yes | Yes | No | Yes | No | No | Yes |
@@ -753,10 +775,10 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Video | No | Yes | No | No | No | No | No |
 | Thinking | No | Yes | Yes | Yes | Yes (always) | Yes | No |
 | Tool calling | No | Yes | Yes | Yes | No | Yes | No |
-| Fused QKV | No | Yes | Yes | No | No | Yes | Yes |
+| Fused QKV | No | Yes | Yes | No (split Q/K/V or recurrent QKV) | No | Yes | Yes |
 | Fused GPU decode | No | Yes (Metal) | No | No | No | No | No |
 | Native model decode | No | No | Yes | No | No | No | No |
-| Batched GPU MoE | No | No | No | No | No | Yes | No |
+| Batched GPU MoE | No | No | No | Yes (qwen35moe / qwen3next, fused with shared expert + residual) | No | Yes | No |
 | Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) | Qwen3 | Passthrough |
 
 ---

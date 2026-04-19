@@ -1,4 +1,5 @@
-﻿using System.Buffers.Binary;
+using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 
 namespace InferenceWeb.Tests;
 
@@ -64,6 +65,49 @@ public class ManagedQuantizedOpsTests
         Assert.Equal(-0.25f, dst[1], 5);
         Assert.Equal(2.0f, dst[32], 5);
         Assert.Equal(-1.0f, dst[33], 5);
+    }
+
+    [Fact]
+    public void NativeDequant_DequantizesQ4KToUnmanagedBuffer()
+    {
+        byte[] raw = new byte[144];
+        WriteHalf(raw, 0, 0.5f);
+        WriteHalf(raw, 2, 0.25f);
+
+        raw[4] = 2;
+        raw[8] = 1;
+        raw[5] = 3;
+        raw[9] = 4;
+        raw[16] = 0x21;
+
+        IntPtr src = Marshal.AllocHGlobal(raw.Length);
+        IntPtr dst = Marshal.AllocHGlobal(256 * sizeof(float));
+        try
+        {
+            Marshal.Copy(raw, 0, src, raw.Length);
+            NativeDequant.DequantizeToFloat32Native((int)GgmlTensorType.Q4_K, src, dst, 256);
+
+            float[] managed = new float[256];
+            Marshal.Copy(dst, managed, 0, managed.Length);
+
+            Assert.Equal(0.75f, managed[0], 5);
+            Assert.Equal(-0.25f, managed[1], 5);
+            Assert.Equal(2.0f, managed[32], 5);
+            Assert.Equal(-1.0f, managed[33], 5);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(src);
+            Marshal.FreeHGlobal(dst);
+        }
+    }
+
+    [Fact]
+    public void NativeDequant_RowSizeSupportsIq2Xxs()
+    {
+        Assert.Equal(
+            GgufFile.GetTypeSize(GgmlTensorType.IQ2_XXS),
+            NativeDequant.RowSize((int)GgmlTensorType.IQ2_XXS, 256));
     }
 
     [Fact]
@@ -167,4 +211,3 @@ public class ManagedQuantizedOpsTests
         return sum;
     }
 }
-

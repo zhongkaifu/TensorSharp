@@ -7189,6 +7189,437 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
     }
 }
 
+// ============================================================================
+// Batched MoE SwiGLU expert forward: SwiGLU activation pattern (qwen3 / mixtral).
+// For each selected expert e:
+//   gate_e = input @ gate_w[e]        // [interm_dim]
+//   up_e   = input @ up_w[e]          // [interm_dim]
+//   inner  = silu(gate_e) * up_e      // [interm_dim]
+//   out_e  = inner @ down_w[e]        // [out_dim]
+// result = sum_e route_w[e] * out_e   // [out_dim]
+// All expert ops are batched into a single GGML graph, reducing
+// 4 * num_experts GPU dispatches to a single graph submission.
+// ============================================================================
+TSG_EXPORT int TSGgml_MoEExpertsSwiGLUForwardF32(
+    TensorView2DDesc result,            // [1, out_dim] (accumulated output)
+    TensorView2DDesc input,             // [1, in_dim]
+    int num_experts,
+    void** gate_data_ptrs,              // [num_experts] gate weight data
+    void** up_data_ptrs,                // [num_experts] up weight data
+    void** down_data_ptrs,              // [num_experts] down weight data
+    int gate_ggml_type,
+    std::int64_t gate_ne0,              // = in_dim
+    std::int64_t gate_ne1,              // = interm_dim
+    std::int64_t gate_raw_bytes_each,
+    int up_ggml_type,
+    std::int64_t up_ne0,                // = in_dim
+    std::int64_t up_ne1,                // = interm_dim
+    std::int64_t up_raw_bytes_each,
+    int down_ggml_type,
+    std::int64_t down_ne0,              // = interm_dim
+    std::int64_t down_ne1,              // = out_dim
+    std::int64_t down_raw_bytes_each,
+    float* route_weights)               // [num_experts]
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result, "result") || !validate_desc(input, "input"))
+            return 0;
+
+        if (num_experts <= 0 || num_experts > 32)
+        {
+            set_last_error("MoE SwiGLU: num_experts must be 1..32");
+            return 0;
+        }
+
+        ggml_type gate_qtype = static_cast<ggml_type>(gate_ggml_type);
+        ggml_type up_qtype   = static_cast<ggml_type>(up_ggml_type);
+        ggml_type down_qtype = static_cast<ggml_type>(down_ggml_type);
+
+        const std::size_t ctx_size = 8 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("MoE SwiGLU: context init failed");
+            return 0;
+        }
+
+        // Input / result bindings (zero-copy when possible)
+        std::vector<BufferHandle> host_bufs;
+        bool zc = can_map_standard_view(input);
+        TensorBinding res_bind, inp_bind;
+
+        if (zc)
+        {
+            ggml_backend_buffer_t rb = nullptr, ib = nullptr;
+            bool rok = create_binding_from_host_ptr_2d(context.value, g_backend, result, res_bind, rb);
+            bool iok = rok && create_binding_from_host_ptr_2d(context.value, g_backend, input, inp_bind, ib);
+            if (rok && iok)
+            {
+                host_bufs.emplace_back(rb);
+                host_bufs.emplace_back(ib);
+            }
+            else
+            {
+                if (ib) ggml_backend_buffer_free(ib);
+                if (rb) ggml_backend_buffer_free(rb);
+                zc = false;
+                res_bind = create_standard_binding(context.value, result);
+                inp_bind = create_standard_binding(context.value, input);
+            }
+        }
+        else
+        {
+            res_bind = create_standard_binding(context.value, result);
+            inp_bind = create_standard_binding(context.value, input);
+        }
+
+        // Per-expert weight tensors with weight cache attempts.
+        struct WBind { ggml_tensor* t; std::size_t bytes; bool cached; bool needs_upload; };
+        std::vector<WBind> gate_w(num_experts), up_w(num_experts), dn_w(num_experts);
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+
+        auto bind_quant = [&](WBind& wb, ggml_type qtype, std::int64_t ne0, std::int64_t ne1,
+                              std::int64_t raw_bytes, void* data) {
+            wb.t = ggml_new_tensor_2d(context.value, qtype, ne0, ne1);
+            wb.bytes = static_cast<std::size_t>(raw_bytes);
+            wb.cached = false;
+            wb.needs_upload = false;
+            if (dev && raw_bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, wb.t,
+                        data, wb.bytes, buf, addr, wb.needs_upload))
+                {
+                    if (ggml_backend_tensor_alloc(buf, wb.t, addr) == GGML_STATUS_SUCCESS)
+                        wb.cached = true;
+                    else
+                        invalidate_cached_buffer(data);
+                }
+            }
+        };
+
+        for (int e = 0; e < num_experts; e++)
+        {
+            bind_quant(gate_w[e], gate_qtype, gate_ne0, gate_ne1, gate_raw_bytes_each, gate_data_ptrs[e]);
+            bind_quant(up_w[e],   up_qtype,   up_ne0,   up_ne1,   up_raw_bytes_each,   up_data_ptrs[e]);
+            bind_quant(dn_w[e],   down_qtype, down_ne0, down_ne1, down_raw_bytes_each, down_data_ptrs[e]);
+        }
+
+        // Build computation graph: for each expert,
+        //   (silu(input @ gate_w) * (input @ up_w)) @ down_w * route_w  --> accum
+        ggml_tensor* accum = nullptr;
+        for (int e = 0; e < num_experts; e++)
+        {
+            ggml_tensor* gate_out = ggml_mul_mat(context.value, gate_w[e].t, inp_bind.tensor);
+            ggml_tensor* up_out   = ggml_mul_mat(context.value, up_w[e].t,   inp_bind.tensor);
+            ggml_tensor* silu_out = ggml_silu(context.value, gate_out);
+            ggml_tensor* prod     = ggml_mul(context.value, silu_out, up_out);
+            ggml_tensor* dn_out   = ggml_mul_mat(context.value, dn_w[e].t, prod);
+            ggml_tensor* scaled   = ggml_scale(context.value, dn_out, route_weights[e]);
+            accum = (accum == nullptr) ? scaled : ggml_add(context.value, accum, scaled);
+        }
+
+        ggml_tensor* out = ggml_cpy(context.value, accum, res_bind.tensor);
+        ggml_set_output(out);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        ggml_build_forward_expand(graph, out);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (!buffer.value)
+        {
+            set_last_error("MoE SwiGLU: buffer alloc failed");
+            return 0;
+        }
+
+        if (!zc)
+            upload_binding(inp_bind, input.data, inp_bind.raw_bytes);
+
+        for (int e = 0; e < num_experts; e++)
+        {
+            if (!gate_w[e].cached || gate_w[e].needs_upload)
+                ggml_backend_tensor_set(gate_w[e].t, gate_data_ptrs[e], 0, gate_w[e].bytes);
+            if (!up_w[e].cached || up_w[e].needs_upload)
+                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+            if (!dn_w[e].cached || dn_w[e].needs_upload)
+                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("MoE SwiGLU: graph compute failed");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        if (!zc)
+            ggml_backend_tensor_get(res_bind.storage, result.data, 0, res_bind.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown MoE SwiGLU experts forward failure.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Extended MoE SwiGLU forward: routed experts + optional shared expert + fused
+// residual add, all in a single GGML graph submission.
+//
+//   residual += sum_e route_w[e] * down_w[e] * (silu(input @ gate_w[e]) * (input @ up_w[e]))
+//             + (use_shared ? shared_scalar * shared_down @ (silu(input @ shared_gate)
+//                                                            * (input @ shared_up)) : 0)
+//
+// This eliminates ~37 dispatches per MoE layer per token (8*4 routed + 4 shared + 1 add)
+// down to 1.
+// ============================================================================
+TSG_EXPORT int TSGgml_MoEExpertsSwiGLUResidualF32(
+    TensorView2DDesc residual,          // [1, hidden_size] - in/out, accumulated into
+    TensorView2DDesc input,             // [1, hidden_size] - normalized input for MoE
+    int num_experts,
+    void** gate_data_ptrs,              // [num_experts] gate weight data
+    void** up_data_ptrs,                // [num_experts] up weight data
+    void** down_data_ptrs,              // [num_experts] down weight data
+    int gate_ggml_type,
+    std::int64_t gate_ne0,
+    std::int64_t gate_ne1,
+    std::int64_t gate_raw_bytes_each,
+    int up_ggml_type,
+    std::int64_t up_ne0,
+    std::int64_t up_ne1,
+    std::int64_t up_raw_bytes_each,
+    int down_ggml_type,
+    std::int64_t down_ne0,
+    std::int64_t down_ne1,
+    std::int64_t down_raw_bytes_each,
+    float* route_weights,               // [num_experts]
+    int use_shared,                     // 0 / 1
+    void* shared_gate_data,
+    void* shared_up_data,
+    void* shared_down_data,
+    int shared_gate_ggml_type,
+    std::int64_t shared_gate_ne0,
+    std::int64_t shared_gate_ne1,
+    std::int64_t shared_gate_raw_bytes,
+    int shared_up_ggml_type,
+    std::int64_t shared_up_ne0,
+    std::int64_t shared_up_ne1,
+    std::int64_t shared_up_raw_bytes,
+    int shared_down_ggml_type,
+    std::int64_t shared_down_ne0,
+    std::int64_t shared_down_ne1,
+    std::int64_t shared_down_raw_bytes,
+    float shared_scalar)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(residual, "residual") || !validate_desc(input, "input"))
+            return 0;
+
+        if (num_experts <= 0 || num_experts > 32)
+        {
+            set_last_error("MoE SwiGLU residual: num_experts must be 1..32");
+            return 0;
+        }
+
+        ggml_type gate_qtype = static_cast<ggml_type>(gate_ggml_type);
+        ggml_type up_qtype   = static_cast<ggml_type>(up_ggml_type);
+        ggml_type down_qtype = static_cast<ggml_type>(down_ggml_type);
+
+        const std::size_t ctx_size = 12 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("MoE SwiGLU residual: context init failed");
+            return 0;
+        }
+
+        std::vector<BufferHandle> host_bufs;
+        bool zc = can_map_standard_view(input) && can_map_standard_view(residual);
+        TensorBinding res_bind, inp_bind;
+
+        if (zc)
+        {
+            ggml_backend_buffer_t rb = nullptr, ib = nullptr;
+            bool rok = create_binding_from_host_ptr_2d(context.value, g_backend, residual, res_bind, rb);
+            bool iok = rok && create_binding_from_host_ptr_2d(context.value, g_backend, input, inp_bind, ib);
+            if (rok && iok)
+            {
+                host_bufs.emplace_back(rb);
+                host_bufs.emplace_back(ib);
+            }
+            else
+            {
+                if (ib) ggml_backend_buffer_free(ib);
+                if (rb) ggml_backend_buffer_free(rb);
+                zc = false;
+                res_bind = create_standard_binding(context.value, residual);
+                inp_bind = create_standard_binding(context.value, input);
+            }
+        }
+        else
+        {
+            res_bind = create_standard_binding(context.value, residual);
+            inp_bind = create_standard_binding(context.value, input);
+        }
+
+        struct WBind { ggml_tensor* t; std::size_t bytes; bool cached; bool needs_upload; };
+        std::vector<WBind> gate_w(num_experts), up_w(num_experts), dn_w(num_experts);
+        WBind sh_g{}, sh_u{}, sh_d{};
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+
+        auto bind_quant = [&](WBind& wb, ggml_type qtype, std::int64_t ne0, std::int64_t ne1,
+                              std::int64_t raw_bytes, void* data) {
+            wb.t = ggml_new_tensor_2d(context.value, qtype, ne0, ne1);
+            wb.bytes = static_cast<std::size_t>(raw_bytes);
+            wb.cached = false;
+            wb.needs_upload = false;
+            if (dev && raw_bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, wb.t,
+                        data, wb.bytes, buf, addr, wb.needs_upload))
+                {
+                    if (ggml_backend_tensor_alloc(buf, wb.t, addr) == GGML_STATUS_SUCCESS)
+                        wb.cached = true;
+                    else
+                        invalidate_cached_buffer(data);
+                }
+            }
+        };
+
+        for (int e = 0; e < num_experts; e++)
+        {
+            bind_quant(gate_w[e], gate_qtype, gate_ne0, gate_ne1, gate_raw_bytes_each, gate_data_ptrs[e]);
+            bind_quant(up_w[e],   up_qtype,   up_ne0,   up_ne1,   up_raw_bytes_each,   up_data_ptrs[e]);
+            bind_quant(dn_w[e],   down_qtype, down_ne0, down_ne1, down_raw_bytes_each, down_data_ptrs[e]);
+        }
+
+        bool has_shared = (use_shared != 0)
+                       && shared_gate_data != nullptr
+                       && shared_up_data != nullptr
+                       && shared_down_data != nullptr;
+
+        if (has_shared)
+        {
+            bind_quant(sh_g, static_cast<ggml_type>(shared_gate_ggml_type),
+                shared_gate_ne0, shared_gate_ne1, shared_gate_raw_bytes, shared_gate_data);
+            bind_quant(sh_u, static_cast<ggml_type>(shared_up_ggml_type),
+                shared_up_ne0, shared_up_ne1, shared_up_raw_bytes, shared_up_data);
+            bind_quant(sh_d, static_cast<ggml_type>(shared_down_ggml_type),
+                shared_down_ne0, shared_down_ne1, shared_down_raw_bytes, shared_down_data);
+        }
+
+        // Build computation graph: routed experts (silu(gate)*up @ down * route_w) accumulated,
+        // plus optional shared expert (silu(gate)*up @ down * scalar) accumulated, plus residual.
+        ggml_tensor* accum = nullptr;
+        for (int e = 0; e < num_experts; e++)
+        {
+            ggml_tensor* gate_out = ggml_mul_mat(context.value, gate_w[e].t, inp_bind.tensor);
+            ggml_tensor* up_out   = ggml_mul_mat(context.value, up_w[e].t,   inp_bind.tensor);
+            ggml_tensor* silu_out = ggml_silu(context.value, gate_out);
+            ggml_tensor* prod     = ggml_mul(context.value, silu_out, up_out);
+            ggml_tensor* dn_out   = ggml_mul_mat(context.value, dn_w[e].t, prod);
+            ggml_tensor* scaled   = ggml_scale(context.value, dn_out, route_weights[e]);
+            accum = (accum == nullptr) ? scaled : ggml_add(context.value, accum, scaled);
+        }
+
+        if (has_shared)
+        {
+            ggml_tensor* sg_out = ggml_mul_mat(context.value, sh_g.t, inp_bind.tensor);
+            ggml_tensor* su_out = ggml_mul_mat(context.value, sh_u.t, inp_bind.tensor);
+            ggml_tensor* ssilu  = ggml_silu(context.value, sg_out);
+            ggml_tensor* sprod  = ggml_mul(context.value, ssilu, su_out);
+            ggml_tensor* sdn    = ggml_mul_mat(context.value, sh_d.t, sprod);
+            ggml_tensor* sscaled = ggml_scale(context.value, sdn, shared_scalar);
+            accum = (accum == nullptr) ? sscaled : ggml_add(context.value, accum, sscaled);
+        }
+
+        // residual += accum (in place)
+        ggml_tensor* sum = ggml_add(context.value, res_bind.tensor, accum);
+        ggml_tensor* out = ggml_cpy(context.value, sum, res_bind.tensor);
+        ggml_set_output(out);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        ggml_build_forward_expand(graph, out);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (!buffer.value)
+        {
+            set_last_error("MoE SwiGLU residual: buffer alloc failed");
+            return 0;
+        }
+
+        if (!zc)
+        {
+            upload_binding(inp_bind, input.data, inp_bind.raw_bytes);
+            upload_binding(res_bind, residual.data, res_bind.raw_bytes);
+        }
+
+        for (int e = 0; e < num_experts; e++)
+        {
+            if (!gate_w[e].cached || gate_w[e].needs_upload)
+                ggml_backend_tensor_set(gate_w[e].t, gate_data_ptrs[e], 0, gate_w[e].bytes);
+            if (!up_w[e].cached || up_w[e].needs_upload)
+                ggml_backend_tensor_set(up_w[e].t, up_data_ptrs[e], 0, up_w[e].bytes);
+            if (!dn_w[e].cached || dn_w[e].needs_upload)
+                ggml_backend_tensor_set(dn_w[e].t, down_data_ptrs[e], 0, dn_w[e].bytes);
+        }
+
+        if (has_shared)
+        {
+            if (!sh_g.cached || sh_g.needs_upload)
+                ggml_backend_tensor_set(sh_g.t, shared_gate_data, 0, sh_g.bytes);
+            if (!sh_u.cached || sh_u.needs_upload)
+                ggml_backend_tensor_set(sh_u.t, shared_up_data, 0, sh_u.bytes);
+            if (!sh_d.cached || sh_d.needs_upload)
+                ggml_backend_tensor_set(sh_d.t, shared_down_data, 0, sh_d.bytes);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("MoE SwiGLU residual: graph compute failed");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        if (!zc)
+            ggml_backend_tensor_get(res_bind.storage, residual.data, 0, res_bind.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown MoE SwiGLU residual forward failure.");
+        return 0;
+    }
+}
+
 TSG_EXPORT int TSGgml_AddmmQuantBatchF32(
     TensorView2DDesc result,
     TensorView2DDesc m1,
@@ -8105,6 +8536,216 @@ namespace
         return ggml_concat(ctx, tail, head, 1);
     }
 
+    // ============================================================================
+    // Stand-alone flash attention decode kernel.
+    //
+    // Performs (for a single query position):
+    //   1. Append the new K/V vectors to the persistent KV cache at `position`.
+    //   2. Run ggml_flash_attn_ext on the device, which reads Q, the populated
+    //      cache (length = position + 1), and writes the attention result.
+    //
+    // Inputs and the KV cache live in C# memory and are mapped zero-copy where
+    // the backend permits it. Q/K/V here are *already* normalized and RoPE'd by
+    // the C# host: this kernel exists purely to fold the cache append + softmax-
+    // attention + value mix into one GPU graph (instead of the previous CPU-side
+    // SIMD path).
+    //
+    // Used by Qwen3.5 (and other architectures with a custom attention pre-
+    // processing stage that can't be expressed inside ggml_flash_attn_ext).
+    // ============================================================================
+    int flash_attn_decode_impl(
+        const float* q_data,        // [num_heads * head_dim]      Q (post-norm, post-RoPE)
+        const float* k_data,        // [num_kv_heads * head_dim]   K (post-norm, post-RoPE)
+        const float* v_data,        // [num_kv_heads * head_dim]   V
+        float* k_cache_data,        // [num_kv_heads, max_seq_len, head_dim]
+        float* v_cache_data,        // [num_kv_heads, max_seq_len, head_dim]
+        float* out_data,            // [num_heads * head_dim]      (writeable)
+        int num_heads, int num_kv_heads, int head_dim,
+        int max_seq_len, int position,
+        float scale)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (q_data == nullptr || k_data == nullptr || v_data == nullptr ||
+            k_cache_data == nullptr || v_cache_data == nullptr || out_data == nullptr)
+        {
+            set_last_error("Null pointer passed to flash attention decode kernel.");
+            return 0;
+        }
+
+        if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || max_seq_len <= 0 || position < 0)
+        {
+            set_last_error("Invalid dimensions passed to flash attention decode kernel.");
+            return 0;
+        }
+
+        const int q_dim = num_heads * head_dim;
+        const int kv_dim = num_kv_heads * head_dim;
+        const int totalSeqLen = position + 1;
+        const int attnKvLen = flash_attn_kv_length(totalSeqLen, max_seq_len, head_dim);
+        std::vector<ggml_fp16_t> attn_mask_data;
+
+        PooledContextHandle context;
+        if (!context.init(512 * 1024))
+        {
+            set_last_error("Failed to create ggml context for flash attention decode.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        // Inputs (host-side staging; copy in via backend tensor set).
+        ggml_tensor* q_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q_dim);
+        ggml_tensor* k_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kv_dim);
+        ggml_tensor* v_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kv_dim);
+
+        // KV cache (zero-copy bound to C# memory).
+        ggml_tensor* k_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+        ggml_tensor* v_cache_base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+
+        // Output download target.
+        ggml_tensor* attn_result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q_dim);
+
+        // Optional flash-attn mask (only required for some head dims).
+        ggml_tensor* attn_mask = nullptr;
+        if (flash_attn_requires_masked_padding(head_dim))
+        {
+            attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+            fill_flash_attn_mask(attn_mask_data, attnKvLen, totalSeqLen);
+        }
+
+        // === Build computation graph ===
+
+        // 1. Reshape Q to [head_dim, 1, num_heads] for flash_attn_ext.
+        //    (Input layout is contiguous head-major, i.e. h0_d0..h0_dn h1_d0..)
+        ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_in, head_dim, num_heads, 1);
+        ggml_tensor* q_attn = ggml_permute(ctx, q_3d, 0, 2, 1, 3);
+
+        // 2. Reshape K/V and append into the cache at `position`.
+        ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_in, head_dim, num_kv_heads, 1);
+        ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_in, head_dim, num_kv_heads, 1);
+
+        ggml_tensor* k_perm = ggml_permute(ctx, k_3d, 0, 2, 1, 3);
+        ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+        ggml_tensor* k_write = ggml_cont(ctx, k_perm);
+        ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+
+        const std::size_t kv_byte_offset =
+            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float);
+        ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_base,
+            head_dim, 1, num_kv_heads,
+            k_cache_base->nb[1], k_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_base,
+            head_dim, 1, num_kv_heads,
+            v_cache_base->nb[1], v_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* k_cache_cpy = ggml_cpy(ctx, k_write, k_dst);
+        ggml_tensor* v_cache_cpy = ggml_cpy(ctx, v_write, v_dst);
+
+        // 3. Build a view over the populated portion of the cache.
+        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+        if (k_full == nullptr || v_full == nullptr)
+        {
+            set_last_error("Failed to create KV cache views for flash attention decode.");
+            return 0;
+        }
+
+        // 4. Flash attention (handles GQA broadcasting automatically).
+        //    q: [head_dim, 1, num_heads], k/v: [head_dim, attnKvLen, num_kv_heads]
+        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+            q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
+
+        // 5. Reshape back to [num_heads * head_dim] for download.
+        ggml_tensor* attn_flat = ggml_reshape_1d(ctx, attn_out, q_dim);
+        ggml_tensor* result = ggml_cpy(ctx, attn_flat, attn_result);
+        ggml_set_output(result);
+
+        // Build graph: cache writes must execute before flash attention reads.
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, k_cache_cpy);
+        ggml_build_forward_expand(graph, v_cache_cpy);
+        ggml_build_forward_expand(graph, result);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+
+        struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (t == nullptr || data == nullptr)
+                return;
+
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload)
+                            upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+
+                    invalidate_cached_buffer(data);
+                }
+            }
+
+            if (bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cacheable, buf))
+                {
+                    if (!cacheable)
+                        ephemeral_bufs.emplace_back(buf);
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, data);
+                    if (st == GGML_STATUS_SUCCESS)
+                        return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        // Cache buffers are persistent across calls and benefit from the cacheable mapping.
+        bind_or_mark(k_cache_base, k_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        bind_or_mark(v_cache_base, v_cache_data, kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        if (attn_mask != nullptr && !attn_mask_data.empty())
+            bind_or_mark(attn_mask, attn_mask_data.data(), attn_mask_data.size() * sizeof(ggml_fp16_t), false);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for flash attention decode.");
+            return 0;
+        }
+
+        // Upload non-host-ptr tensors.
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        ggml_backend_tensor_set(q_in, q_data, 0, static_cast<std::size_t>(q_dim) * sizeof(float));
+        ggml_backend_tensor_set(k_in, k_data, 0, static_cast<std::size_t>(kv_dim) * sizeof(float));
+        ggml_backend_tensor_set(v_in, v_data, 0, static_cast<std::size_t>(kv_dim) * sizeof(float));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for flash attention decode.");
+            return 0;
+        }
+        ggml_backend_synchronize(g_backend);
+
+        ggml_backend_tensor_get(attn_result, out_data, 0, static_cast<std::size_t>(q_dim) * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+
     int transformer_layer_decode_impl(
         float* hidden_data, int hidden_size,
         float* attn_norm_data,
@@ -8399,6 +9040,45 @@ TSG_EXPORT int TSGgml_TransformerLayerDecode(
     catch (...)
     {
         set_last_error("Unknown error in transformer layer decode.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Flash attention decode (single-token, single-layer).
+//
+// Use this when the surrounding architecture pre-processes Q/K/V (e.g. fused
+// gated projections, sigmoid-gated Q outputs, custom QK normalization) in a
+// way that prevents folding the entire layer into the model-decode kernel.
+// ============================================================================
+TSG_EXPORT int TSGgml_FlashAttnDecodeF32(
+    const float* q_data,
+    const float* k_data,
+    const float* v_data,
+    float* k_cache_data,
+    float* v_cache_data,
+    float* out_data,
+    int num_heads, int num_kv_heads, int head_dim,
+    int max_seq_len, int position,
+    float scale)
+{
+    try
+    {
+        return flash_attn_decode_impl(
+            q_data, k_data, v_data,
+            k_cache_data, v_cache_data,
+            out_data,
+            num_heads, num_kv_heads, head_dim,
+            max_seq_len, position, scale);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in flash attention decode.");
         return 0;
     }
 }

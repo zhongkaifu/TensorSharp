@@ -425,6 +425,82 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Batched MoE expert forward with SwiGLU activation (Qwen3 / Mixtral style).
+        /// For each expert: gate_proj -> silu(gate) * up_proj(input) -> down_proj -> scale(route_weight) -> accumulate.
+        /// Reduces 4*N GPU dispatches to 1 per MoE layer.
+        /// </summary>
+        public static void MoEExpertsSwiGLUForward(Tensor result, Tensor input,
+            int numExperts,
+            IntPtr[] gateDataPtrs, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int gateGgmlType, long gateNe0, long gateNe1, long gateRawBytesEach,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights)
+        {
+            if (result.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("MoEExpertsSwiGLUForward requires 2D tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(result))
+                throw new ArgumentException("MoEExpertsSwiGLUForward requires tensors backed by native CPU-accessible storage.");
+
+            if (!TryCreateStandardView(result, out GgmlTensorView2D resultView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+            {
+                throw new NotSupportedException("MoEExpertsSwiGLUForward requires tensors with supported row-contiguous layouts.");
+            }
+
+            GgmlNative.MoEExpertsSwiGLUForward(resultView, inputView, numExperts,
+                gateDataPtrs, upDataPtrs, downDataPtrs,
+                gateGgmlType, gateNe0, gateNe1, gateRawBytesEach,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights);
+        }
+
+        /// <summary>
+        /// Extended SwiGLU MoE forward that fuses (a) routed expert computation, (b) optional
+        /// shared expert computation, and (c) residual accumulation into one GGML graph dispatch.
+        /// Saves up to 4*N + 4 + 1 dispatches per MoE layer (versus the per-expert path).
+        /// </summary>
+        public static void MoEExpertsSwiGLUResidual(Tensor residual, Tensor input,
+            int numExperts,
+            IntPtr[] gateDataPtrs, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int gateGgmlType, long gateNe0, long gateNe1, long gateRawBytesEach,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights,
+            bool useShared,
+            IntPtr sharedGateData, IntPtr sharedUpData, IntPtr sharedDownData,
+            int sharedGateGgmlType, long sharedGateNe0, long sharedGateNe1, long sharedGateRawBytes,
+            int sharedUpGgmlType, long sharedUpNe0, long sharedUpNe1, long sharedUpRawBytes,
+            int sharedDownGgmlType, long sharedDownNe0, long sharedDownNe1, long sharedDownRawBytes,
+            float sharedScalar)
+        {
+            if (residual.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("MoEExpertsSwiGLUResidual requires 2D tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(residual))
+                throw new ArgumentException("MoEExpertsSwiGLUResidual requires tensors backed by native CPU-accessible storage.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+            {
+                throw new NotSupportedException("MoEExpertsSwiGLUResidual requires tensors with supported row-contiguous layouts.");
+            }
+
+            GgmlNative.MoEExpertsSwiGLUResidual(residualView, inputView, numExperts,
+                gateDataPtrs, upDataPtrs, downDataPtrs,
+                gateGgmlType, gateNe0, gateNe1, gateRawBytesEach,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights,
+                useShared,
+                sharedGateData, sharedUpData, sharedDownData,
+                sharedGateGgmlType, sharedGateNe0, sharedGateNe1, sharedGateRawBytes,
+                sharedUpGgmlType, sharedUpNe0, sharedUpNe1, sharedUpRawBytes,
+                sharedDownGgmlType, sharedDownNe0, sharedDownNe1, sharedDownRawBytes,
+                sharedScalar);
+        }
+
+        /// <summary>
         /// Batched quantized matmul: processes multiple sub-weights at different offsets within a single quantized blob.
         /// </summary>
         public static void AddmmQuantBatch(Tensor result, Tensor m1, IntPtr weightData, int ggmlType, long ne0, long rawBytes,
@@ -519,6 +595,40 @@ namespace TensorSharp.GGML
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
                 intermediateSize, ropeMode);
+        }
+
+        /// <summary>
+        /// Single-token flash attention decode kernel. Reads Q/K/V (post-norm, post-RoPE) for
+        /// the new query position, appends K/V to the persistent KV cache at <paramref name="position"/>,
+        /// and runs ggml_flash_attn_ext on the device against the populated portion of the cache.
+        ///
+        /// All input/output tensors must be F32 contiguous. Q, K, V, and the output are laid out
+        /// as (heads, head_dim) in row-major order (i.e. head-contiguous). The KV caches use the
+        /// usual layout (kv_heads, max_seq_len, head_dim).
+        /// </summary>
+        public static void FlashAttnDecode(Tensor q, Tensor k, Tensor v,
+            Tensor kCache, Tensor vCache, Tensor output,
+            int numHeads, int numKvHeads, int headDim,
+            int maxSeqLen, int position, float scale)
+        {
+            if (q == null || k == null || v == null || kCache == null || vCache == null || output == null)
+                throw new ArgumentNullException("Flash attention decode requires non-null Q/K/V/cache/output tensors.");
+            if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32 ||
+                kCache.ElementType != DType.Float32 || vCache.ElementType != DType.Float32 || output.ElementType != DType.Float32)
+                throw new ArgumentException("Flash attention decode requires F32 tensors.");
+
+            IntPtr qPtr = GetBufferStart(q);
+            IntPtr kPtr = GetBufferStart(k);
+            IntPtr vPtr = GetBufferStart(v);
+            IntPtr kcPtr = GetBufferStart(kCache);
+            IntPtr vcPtr = GetBufferStart(vCache);
+            IntPtr outPtr = GetBufferStart(output);
+
+            GgmlNative.FlashAttnDecode(
+                qPtr, kPtr, vPtr,
+                kcPtr, vcPtr, outPtr,
+                numHeads, numKvHeads, headDim,
+                maxSeqLen, position, scale);
         }
 
         public static void Gemma4ModelDecode(

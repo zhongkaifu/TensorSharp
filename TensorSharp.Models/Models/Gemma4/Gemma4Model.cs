@@ -940,7 +940,18 @@ namespace TensorSharp.Models
                 using var pleIdx = CreateIntTensor(tokens, seqLen);
                 if (IsGgmlBackend)
                 {
-                    GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.CacheKey, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
+                    bool canUseGgmlLookup = CanUseGgmlQuantizedGetRows(pleQw.GgmlType);
+                    if ((!canUseGgmlLookup || seqLen == 1) && pleQw.HasHostData)
+                    {
+                        PopulateQuantizedRows(pleTokenEmb, pleQw, tokens);
+                    }
+                    else
+                    {
+                        if (!canUseGgmlLookup)
+                            throw new InvalidOperationException($"CUDA get_rows does not support GGML tensor type {(GgmlTensorType)pleQw.GgmlType}, and no host copy is available for CPU fallback.");
+
+                        GgmlBasicOps.GetRowsQuant(pleTokenEmb, pleQw.CacheKey, pleQw.GgmlType, pleQw.Ne0, pleQw.Ne1, pleQw.RawBytes, pleIdx);
+                    }
                 }
                 else
                 {

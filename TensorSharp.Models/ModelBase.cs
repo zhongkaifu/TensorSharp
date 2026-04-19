@@ -327,7 +327,12 @@ namespace TensorSharp.Models
 
         protected int ResolveInitialCacheAllocationLength(int requestedContextLength, int gpuDefault = 8192)
         {
-            if (_backend == BackendType.GgmlCuda &&
+            // GPU backends (CUDA, Metal) can be sensitive to allocating a multi-gigabyte KV
+            // cache up-front when the model advertises a 256K+ context window. Cap the initial
+            // allocation and let the cache grow on demand when actual prompts approach the
+            // limit. CPU backends have no such constraint and use the full requested length.
+            bool isGpuBackend = _backend == BackendType.GgmlCuda || _backend == BackendType.GgmlMetal;
+            if (isGpuBackend &&
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
             {
                 return Math.Min(requestedContextLength, gpuDefault);
@@ -650,8 +655,11 @@ namespace TensorSharp.Models
                     mappedHostViews++;
             }
 
-            foreach (QuantizedWeight qw in _quantWeights.Values)
+            foreach (var kv in _quantWeights)
             {
+                string weightName = kv.Key;
+                QuantizedWeight qw = kv.Value;
+
                 if (!qw.HasHostData)
                     continue;
 
@@ -660,20 +668,82 @@ namespace TensorSharp.Models
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
 
-                bool wasMappedView = qw.HasExternalHostView;
-                qw.ReleaseHostData();
-
-                if (wasMappedView && --mappedHostViews == 0)
+                if (!ShouldRetainCudaHostQuantWeight(weightName))
                 {
-                    _gguf?.Dispose();
+                    bool wasMappedView = qw.HasExternalHostView;
+                    qw.ReleaseHostData();
+
+                    if (wasMappedView)
+                        mappedHostViews--;
                 }
             }
 
-            _gguf?.Dispose();
+            if (mappedHostViews == 0)
+                _gguf?.Dispose();
             _cudaQuantWeightsPrepared = true;
 
             if (preloadedCount > 0)
                 Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+        }
+
+        private static bool ShouldRetainCudaHostQuantWeight(string weightName)
+        {
+            return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
+                string.Equals(weightName, "per_layer_token_embd.weight", StringComparison.Ordinal);
+        }
+
+        protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
+        {
+            if (!IsGgmlBackend)
+                return false;
+
+            if (_backend != BackendType.GgmlCuda)
+                return true;
+
+            return ((GgmlTensorType)ggmlType) switch
+            {
+                GgmlTensorType.Q4_0 => true,
+                GgmlTensorType.Q4_1 => true,
+                GgmlTensorType.Q5_0 => true,
+                GgmlTensorType.Q5_1 => true,
+                GgmlTensorType.Q8_0 => true,
+                GgmlTensorType.Q6_K => true,
+                _ => false,
+            };
+        }
+
+        protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices)
+        {
+            if (result == null)
+                throw new ArgumentNullException(nameof(result));
+            if (weight == null)
+                throw new ArgumentNullException(nameof(weight));
+            if (rowIndices == null)
+                throw new ArgumentNullException(nameof(rowIndices));
+            if (!weight.HasHostData)
+                throw new InvalidOperationException("Quantized row lookup requires host-side weight data.");
+
+            int dim = (int)weight.Ne0;
+            if (result.DimensionCount != 2 || result.ElementType != DType.Float32 ||
+                result.Sizes[0] != rowIndices.Length || result.Sizes[1] != dim)
+            {
+                throw new ArgumentException("Result tensor shape must be [rowIndices.Length, weight.Ne0].", nameof(result));
+            }
+
+            long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
+            byte* basePtr = (byte*)weight.Data.ToPointer();
+            float* dst = GetFloatPtr(result);
+            for (int i = 0; i < rowIndices.Length; i++)
+            {
+                byte* rowPtr = basePtr + (long)rowIndices[i] * rowBytes;
+                NativeDequant.DequantizeToFloat32Native(
+                    weight.GgmlType,
+                    (IntPtr)rowPtr,
+                    (IntPtr)(dst + (long)i * dim),
+                    dim);
+            }
+
+            InvalidateTensorDeviceCache(result);
         }
 
         protected unsafe void FuseGateUpWeights()
@@ -742,10 +812,25 @@ namespace TensorSharp.Models
             {
                 if (IsGgmlBackend)
                 {
-                    var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                    bool canUseGgmlLookup = CanUseGgmlQuantizedGetRows(qw.GgmlType);
+
+                    // A direct host dequant is faster for single-token decode, and it is
+                    // also the compatibility path for CUDA quant types whose get_rows
+                    // kernel is not implemented upstream.
+                    if ((tokens.Length == 1 || !canUseGgmlLookup) && qw.HasHostData)
+                    {
+                        var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                        PopulateQuantizedRows(result, qw, tokens);
+                        return result;
+                    }
+
+                    if (!canUseGgmlLookup)
+                        throw new InvalidOperationException($"CUDA get_rows does not support GGML tensor type {(GgmlTensorType)qw.GgmlType}, and no host copy is available for CPU fallback.");
+
+                    var resultMulti = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
                     using var idxTensor = CreateIntTensor(tokens, tokens.Length);
-                    GgmlBasicOps.GetRowsQuant(result, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
-                    return result;
+                    GgmlBasicOps.GetRowsQuant(resultMulti, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes, idxTensor);
+                    return resultMulti;
                 }
 
                 return EmbeddingManagedQuantized(tokens, qw);
@@ -967,6 +1052,81 @@ namespace TensorSharp.Models
                 dst[i] += w * src[i];
         }
 
+        /// <summary>
+        /// Batched dot product: simultaneously compute four independent dot products
+        /// against the same source vector <paramref name="b"/>. Lets the compiler keep
+        /// the vector loads of b in registers and reuse them across the four accumulators,
+        /// effectively cutting the load bandwidth on b by 4x compared to four sequential
+        /// VecDot calls. Used in GQA decode attention where four query heads share a K/V head.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected static unsafe void VecDot4(float* a0, float* a1, float* a2, float* a3,
+            float* b, int n,
+            out float r0, out float r1, out float r2, out float r3)
+        {
+            int vLen = Vector<float>.Count;
+            var acc0 = Vector<float>.Zero;
+            var acc1 = Vector<float>.Zero;
+            var acc2 = Vector<float>.Zero;
+            var acc3 = Vector<float>.Zero;
+            int i = 0;
+            for (; i <= n - vLen; i += vLen)
+            {
+                var vb = LdVec(b + i);
+                acc0 += LdVec(a0 + i) * vb;
+                acc1 += LdVec(a1 + i) * vb;
+                acc2 += LdVec(a2 + i) * vb;
+                acc3 += LdVec(a3 + i) * vb;
+            }
+            float s0 = Vector.Sum(acc0);
+            float s1 = Vector.Sum(acc1);
+            float s2 = Vector.Sum(acc2);
+            float s3 = Vector.Sum(acc3);
+            for (; i < n; i++)
+            {
+                float bi = b[i];
+                s0 += a0[i] * bi;
+                s1 += a1[i] * bi;
+                s2 += a2[i] * bi;
+                s3 += a3[i] * bi;
+            }
+            r0 = s0; r1 = s1; r2 = s2; r3 = s3;
+        }
+
+        /// <summary>
+        /// Batched scale-add: simultaneously update four destination vectors with the
+        /// same source <paramref name="src"/> scaled by four independent weights. The
+        /// hot loop loads each src element exactly once into a register and broadcasts
+        /// it to four FMA-style updates, which is the V-aggregation analog of VecDot4.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected static unsafe void VecScaleAdd4(float* d0, float* d1, float* d2, float* d3,
+            float* src, float w0, float w1, float w2, float w3, int n)
+        {
+            int vLen = Vector<float>.Count;
+            var vw0 = new Vector<float>(w0);
+            var vw1 = new Vector<float>(w1);
+            var vw2 = new Vector<float>(w2);
+            var vw3 = new Vector<float>(w3);
+            int i = 0;
+            for (; i <= n - vLen; i += vLen)
+            {
+                var vs = LdVec(src + i);
+                StVec(d0 + i, LdVec(d0 + i) + vs * vw0);
+                StVec(d1 + i, LdVec(d1 + i) + vs * vw1);
+                StVec(d2 + i, LdVec(d2 + i) + vs * vw2);
+                StVec(d3 + i, LdVec(d3 + i) + vs * vw3);
+            }
+            for (; i < n; i++)
+            {
+                float s = src[i];
+                d0[i] += w0 * s;
+                d1[i] += w1 * s;
+                d2[i] += w2 * s;
+                d3[i] += w3 * s;
+            }
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected static unsafe void VecSubScale(float* dst, float* a, float* b, float scale, int n)
         {
@@ -1046,6 +1206,98 @@ namespace TensorSharp.Models
             Ops.RMSNorm(reshaped, reshaped, alpha, null, eps);
         }
 
+        /// <summary>
+        /// CPU SIMD in-place RMSNorm for the single-row decode hot path. Avoids the GPU
+        /// dispatch overhead of <see cref="RMSNormInPlace"/> for a tiny tensor (e.g. QK
+        /// norm: 16x256 floats). Each "row" (head) is normalized independently using its
+        /// own scale factor and the shared <paramref name="alpha"/> per-element weight.
+        /// Safe only when <paramref name="data"/> and <paramref name="alpha"/> are
+        /// host-accessible (CpuStorage or GGML host-mapped) which is true on Metal/CUDA
+        /// for these intermediate decode tensors.
+        /// </summary>
+        protected unsafe void RMSNormInPlaceCpu(Tensor data, Tensor alpha, int numHeads, int headDim, float eps)
+        {
+            float* dataPtr = GetFloatPtr(data);
+            float* alphaPtr = GetFloatPtr(alpha);
+            float invHeadDim = 1.0f / headDim;
+            int vLen = Vector<float>.Count;
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* row = dataPtr + (long)h * headDim;
+                float ssq = VecSumSq(row, headDim);
+                float invRms = 1.0f / MathF.Sqrt(ssq * invHeadDim + eps);
+                var vScale = new Vector<float>(invRms);
+
+                int i = 0;
+                for (; i <= headDim - vLen; i += vLen)
+                {
+                    var x = LdVec(row + i);
+                    var a = LdVec(alphaPtr + i);
+                    StVec(row + i, x * vScale * a);
+                }
+                for (; i < headDim; i++)
+                    row[i] = row[i] * invRms * alphaPtr[i];
+            }
+
+            InvalidateTensorDeviceCache(data);
+        }
+
+        /// <summary>
+        /// SiLU(gate) * up in place: <c>gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i]</c>.
+        /// For the single-row FFN decode path the GPU dispatch overhead is comparable to
+        /// the actual compute, so doing it on CPU and saving one Metal command buffer
+        /// per FFN layer per token is a net win on Apple unified memory. The inner loop
+        /// is dominated by MathF.Exp which has no vectorized intrinsic, so we keep it
+        /// scalar but allow the JIT to unroll it.
+        /// </summary>
+        protected unsafe void SiLUMulInPlaceCpu(Tensor gate, Tensor up)
+        {
+            float* gPtr = GetFloatPtr(gate);
+            float* uPtr = GetFloatPtr(up);
+            int n = (int)gate.ElementCount();
+
+            for (int i = 0; i < n; i++)
+            {
+                float g = gPtr[i];
+                float silu = g / (1.0f + MathF.Exp(-g));
+                gPtr[i] = silu * uPtr[i];
+            }
+
+            InvalidateTensorDeviceCache(gate);
+        }
+
+        /// <summary>
+        /// CPU SIMD RMSNorm that writes to a separate output tensor (does not modify the
+        /// input). Used for the MoE post-attention norm in the decode hot path where the
+        /// residual must be preserved for the later residual add. Treats <paramref name="input"/>
+        /// as a single row of length <paramref name="dim"/> and applies the per-element
+        /// alpha weight to the normalized output.
+        /// </summary>
+        protected unsafe void RMSNormToBufferCpu(Tensor output, Tensor input, Tensor alpha, int dim, float eps)
+        {
+            float* outPtr = GetFloatPtr(output);
+            float* inPtr = GetFloatPtr(input);
+            float* alphaPtr = GetFloatPtr(alpha);
+            int vLen = Vector<float>.Count;
+
+            float ssq = VecSumSq(inPtr, dim);
+            float invRms = 1.0f / MathF.Sqrt(ssq / dim + eps);
+            var vScale = new Vector<float>(invRms);
+
+            int i = 0;
+            for (; i <= dim - vLen; i += vLen)
+            {
+                var x = LdVec(inPtr + i);
+                var a = LdVec(alphaPtr + i);
+                StVec(outPtr + i, x * vScale * a);
+            }
+            for (; i < dim; i++)
+                outPtr[i] = inPtr[i] * invRms * alphaPtr[i];
+
+            InvalidateTensorDeviceCache(output);
+        }
+
         protected Tensor ReshapeToHeads(Tensor data, int numHeads, int seqLen, int headDim)
         {
             if (seqLen == 1)
@@ -1113,38 +1365,440 @@ namespace TensorSharp.Models
             int maxSeqLen = (int)kCache.Sizes[1];
             int groupSize = numHeads / numKVHeads;
 
-            float* scores = stackalloc float[totalSeqLen];
+            // GQA-aware decode attention. For each KV head we compute attention for the
+            // groupSize query heads that share it, reading K/V from the cache exactly once
+            // per KV head per token instead of groupSize times. On models with GQA this
+            // cuts the per-token K/V cache traffic by groupSize (4x for Qwen3.5), which
+            // is the dominant cost for long-context decode.
+            //
+            // To keep multi-core utilization high we split each KV head into kSplit chunks
+            // along the sequence dimension and merge partial softmax results using the
+            // standard online (log-sum-exp) update. Total parallel tasks = numKVHeads * kSplit.
 
-            for (int h = 0; h < numHeads; h++)
+            // Aim for enough parallel tasks to keep cores busy, but keep per-task work
+            // big enough to amortize Parallel.For dispatch overhead. Each task handles one
+            // (KV head, K-chunk) pair. Empirically, ~512 K-positions per task is the sweet
+            // spot on Apple M-series: smaller chunks lose to scheduler overhead, larger
+            // chunks under-utilize cores at long contexts.
+            int procCount = Environment.ProcessorCount;
+            int kSplit = 1;
+            if (numKVHeads < procCount && totalSeqLen >= 1024)
             {
-                float* qHead = qPtr + h * headDim;
-                int kvHead = h / groupSize;
-                float* kHead = kPtr + kvHead * maxSeqLen * headDim;
-                float* vHead = vPtr + kvHead * maxSeqLen * headDim;
+                int target = (procCount + numKVHeads - 1) / numKVHeads;
+                int maxSplit = Math.Max(1, totalSeqLen / 512);
+                kSplit = Math.Min(target, maxSplit);
+            }
+            int totalTasks = numKVHeads * kSplit;
+            bool useParallel = totalTasks > 1 && (long)numHeads * totalSeqLen >= 4096;
 
-                float maxScore = float.NegativeInfinity;
+            if (useParallel)
+            {
+                long qPtrL = (long)qPtr;
+                long kPtrL = (long)kPtr;
+                long vPtrL = (long)vPtr;
+                long rPtrL = (long)rPtr;
+                int totalSeqLenLocal = totalSeqLen;
+                int headDimLocal = headDim;
+                int maxSeqLenLocal = maxSeqLen;
+                int groupSizeLocal = groupSize;
+                int numKVHeadsLocal = numKVHeads;
+                int kSplitLocal = kSplit;
+                float scaleLocal = scale;
+
+                if (kSplitLocal == 1)
+                {
+                    Parallel.For(0, numKVHeadsLocal, kvHead =>
+                    {
+                        float* qP = (float*)qPtrL;
+                        float* kP = (float*)kPtrL;
+                        float* vP = (float*)vPtrL;
+                        float* rP = (float*)rPtrL;
+                        float* scoresBuf = stackalloc float[groupSizeLocal * totalSeqLenLocal];
+                        AttentionDecodeKVHeadGrouped(kvHead, qP, kP, vP, rP, scoresBuf,
+                            headDimLocal, maxSeqLenLocal, groupSizeLocal,
+                            totalSeqLenLocal, scaleLocal);
+                    });
+                }
+                else
+                {
+                    // Two-pass: partial chunks then merge per KV head. First we compute
+                    // running max and (un-normalized) weighted sum for each chunk, then we
+                    // merge the chunk results into the final per-query-head output.
+                    int chunkSize = (totalSeqLenLocal + kSplitLocal - 1) / kSplitLocal;
+
+                    // Per-chunk partial state: max, sumExp, weighted-V (groupSize * headDim) for each (kvHead, chunk).
+                    int partialFloatsPerChunk = groupSizeLocal * (2 + headDimLocal);
+                    int partialFloatsTotal = numKVHeadsLocal * kSplitLocal * partialFloatsPerChunk;
+
+                    var partialBuf = ArrayPool<float>.Shared.Rent(partialFloatsTotal);
+                    try
+                    {
+                        fixed (float* partialPtr = partialBuf)
+                        {
+                            long partialPtrL = (long)partialPtr;
+
+                            Parallel.For(0, numKVHeadsLocal * kSplitLocal, taskIdx =>
+                            {
+                                int kvHead = taskIdx / kSplitLocal;
+                                int chunkIdx = taskIdx % kSplitLocal;
+                                int kStart = chunkIdx * chunkSize;
+                                int kEnd = Math.Min(kStart + chunkSize, totalSeqLenLocal);
+                                int kLen = kEnd - kStart;
+                                if (kLen <= 0) return;
+
+                                float* qP = (float*)qPtrL;
+                                float* kP = (float*)kPtrL;
+                                float* vP = (float*)vPtrL;
+                                float* part = (float*)partialPtrL +
+                                    (long)taskIdx * partialFloatsPerChunk;
+
+                                float* scoresLocal = stackalloc float[groupSizeLocal * kLen];
+                                AttentionDecodeChunkPartial(kvHead, kStart, kLen, qP, kP, vP,
+                                    part, scoresLocal,
+                                    headDimLocal, maxSeqLenLocal, groupSizeLocal, scaleLocal);
+                            });
+
+                            Parallel.For(0, numKVHeadsLocal, kvHead =>
+                            {
+                                float* rP = (float*)rPtrL;
+                                float* part = (float*)partialPtrL +
+                                    (long)kvHead * kSplitLocal * partialFloatsPerChunk;
+
+                                MergeChunkResults(kvHead, rP, part,
+                                    headDimLocal, groupSizeLocal, kSplitLocal);
+                            });
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(partialBuf);
+                    }
+                }
+            }
+            else
+            {
+                float* scores = stackalloc float[groupSize * totalSeqLen];
+                for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                {
+                    AttentionDecodeKVHeadGrouped(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
+                        headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Compute attention for one KV head against all <paramref name="groupSize"/> query heads
+        /// sharing it. Reads K and V from the cache exactly once per timestep, regardless of
+        /// groupSize. On Qwen3.5-style GQA models this cuts KV-cache memory bandwidth by 4x.
+        /// </summary>
+        private static unsafe void AttentionDecodeKVHeadGrouped(int kvHead,
+            float* qPtr, float* kPtr, float* vPtr, float* rPtr, float* scores,
+            int headDim, int maxSeqLen, int groupSize, int totalSeqLen, float scale)
+        {
+            int hStart = kvHead * groupSize;
+            float* kHead = kPtr + (long)kvHead * maxSeqLen * headDim;
+            float* vHead = vPtr + (long)kvHead * maxSeqLen * headDim;
+
+            // Per-group running max for online numerical stability. We compute scores
+            // per (group, t) into a [groupSize, totalSeqLen] row-major matrix so the
+            // later softmax/normalize steps stay vectorizable.
+            float maxG0 = float.NegativeInfinity;
+            float maxG1 = float.NegativeInfinity;
+            float maxG2 = float.NegativeInfinity;
+            float maxG3 = float.NegativeInfinity;
+
+            // Score generation: K[t] is read once and dot-producted against groupSize Q heads.
+            // Specialize the common groupSize=4 case to keep inner-loop arithmetic tight.
+            if (groupSize == 4)
+            {
+                float* qH0 = qPtr + (long)(hStart + 0) * headDim;
+                float* qH1 = qPtr + (long)(hStart + 1) * headDim;
+                float* qH2 = qPtr + (long)(hStart + 2) * headDim;
+                float* qH3 = qPtr + (long)(hStart + 3) * headDim;
+                float* row0 = scores + 0L * totalSeqLen;
+                float* row1 = scores + 1L * totalSeqLen;
+                float* row2 = scores + 2L * totalSeqLen;
+                float* row3 = scores + 3L * totalSeqLen;
+
                 for (int t = 0; t < totalSeqLen; t++)
                 {
-                    float s = VecDot(qHead, kHead + t * headDim, headDim) * scale;
-                    scores[t] = s;
-                    if (s > maxScore) maxScore = s;
+                    float* kT = kHead + (long)t * headDim;
+                    float s0, s1, s2, s3;
+                    VecDot4(qH0, qH1, qH2, qH3, kT, headDim, out s0, out s1, out s2, out s3);
+                    s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                    row0[t] = s0; row1[t] = s1; row2[t] = s2; row3[t] = s3;
+                    if (s0 > maxG0) maxG0 = s0;
+                    if (s1 > maxG1) maxG1 = s1;
+                    if (s2 > maxG2) maxG2 = s2;
+                    if (s3 > maxG3) maxG3 = s3;
                 }
+            }
+            else
+            {
+                Span<float> maxScoresSpan = stackalloc float[groupSize];
+                for (int g = 0; g < groupSize; g++) maxScoresSpan[g] = float.NegativeInfinity;
 
-                float sumExp = 0;
                 for (int t = 0; t < totalSeqLen; t++)
                 {
-                    float e = MathF.Exp(scores[t] - maxScore);
-                    scores[t] = e;
-                    sumExp += e;
+                    float* kT = kHead + (long)t * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float* qH = qPtr + (long)(hStart + g) * headDim;
+                        float s = VecDot(qH, kT, headDim) * scale;
+                        scores[g * totalSeqLen + t] = s;
+                        if (s > maxScoresSpan[g]) maxScoresSpan[g] = s;
+                    }
                 }
-                float invSum = 1.0f / sumExp;
-                for (int t = 0; t < totalSeqLen; t++)
-                    scores[t] *= invSum;
 
-                float* rHead = rPtr + h * headDim;
-                VecZero(rHead, headDim);
+                if (groupSize >= 1) maxG0 = maxScoresSpan[0];
+                if (groupSize >= 2) maxG1 = maxScoresSpan[1];
+                if (groupSize >= 3) maxG2 = maxScoresSpan[2];
+                if (groupSize >= 4) maxG3 = maxScoresSpan[3];
+            }
+
+            // Softmax (per-group)
+            Span<float> invSums = stackalloc float[groupSize];
+            for (int g = 0; g < groupSize; g++)
+            {
+                float maxS;
+                if (g == 0) maxS = maxG0;
+                else if (g == 1) maxS = maxG1;
+                else if (g == 2) maxS = maxG2;
+                else if (g == 3) maxS = maxG3;
+                else
+                {
+                    maxS = float.NegativeInfinity;
+                    float* rowG0 = scores + (long)g * totalSeqLen;
+                    for (int t = 0; t < totalSeqLen; t++)
+                        if (rowG0[t] > maxS) maxS = rowG0[t];
+                }
+
+                float sum = 0;
+                float* rowG = scores + (long)g * totalSeqLen;
                 for (int t = 0; t < totalSeqLen; t++)
-                    VecScaleAdd(rHead, vHead + t * headDim, scores[t], headDim);
+                {
+                    float e = MathF.Exp(rowG[t] - maxS);
+                    rowG[t] = e;
+                    sum += e;
+                }
+                invSums[g] = 1.0f / sum;
+            }
+            for (int g = 0; g < groupSize; g++)
+            {
+                float invSum = invSums[g];
+                float* rowG = scores + (long)g * totalSeqLen;
+                VecScale(rowG, invSum, totalSeqLen);
+            }
+
+            // Aggregate V: read V[t] once per t, scatter into all groupSize result heads.
+            for (int g = 0; g < groupSize; g++)
+                VecZero(rPtr + (long)(hStart + g) * headDim, headDim);
+
+            if (groupSize == 4)
+            {
+                float* r0 = rPtr + (long)(hStart + 0) * headDim;
+                float* r1 = rPtr + (long)(hStart + 1) * headDim;
+                float* r2 = rPtr + (long)(hStart + 2) * headDim;
+                float* r3 = rPtr + (long)(hStart + 3) * headDim;
+                float* row0 = scores + 0L * totalSeqLen;
+                float* row1 = scores + 1L * totalSeqLen;
+                float* row2 = scores + 2L * totalSeqLen;
+                float* row3 = scores + 3L * totalSeqLen;
+
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    float* vT = vHead + (long)t * headDim;
+                    VecScaleAdd4(r0, r1, r2, r3, vT,
+                        row0[t], row1[t], row2[t], row3[t], headDim);
+                }
+            }
+            else
+            {
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    float* vT = vHead + (long)t * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float w = scores[g * totalSeqLen + t];
+                        float* rH = rPtr + (long)(hStart + g) * headDim;
+                        VecScaleAdd(rH, vT, w, headDim);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Compute partial attention for one (KV head, K-chunk) pair. Writes per-group
+        /// running max, un-normalized exp sum, and un-normalized weighted-V into the
+        /// supplied <paramref name="partial"/> buffer for later cross-chunk merging.
+        ///
+        /// Layout of <paramref name="partial"/> (length = groupSize * (2 + headDim)):
+        ///   [g * (2 + headDim) + 0]            = max for group g
+        ///   [g * (2 + headDim) + 1]            = sumExp for group g
+        ///   [g * (2 + headDim) + 2 .. + headDim+1] = un-normalized weighted V for group g
+        /// </summary>
+        private static unsafe void AttentionDecodeChunkPartial(int kvHead,
+            int kStart, int kLen,
+            float* qPtr, float* kPtr, float* vPtr,
+            float* partial, float* scores,
+            int headDim, int maxSeqLen, int groupSize, float scale)
+        {
+            int hStart = kvHead * groupSize;
+            float* kHead = kPtr + (long)kvHead * maxSeqLen * headDim;
+            float* vHead = vPtr + (long)kvHead * maxSeqLen * headDim;
+            int strideG = 2 + headDim;
+
+            for (int g = 0; g < groupSize; g++)
+                partial[g * strideG] = float.NegativeInfinity;
+
+            float maxG0 = float.NegativeInfinity;
+            float maxG1 = float.NegativeInfinity;
+            float maxG2 = float.NegativeInfinity;
+            float maxG3 = float.NegativeInfinity;
+
+            if (groupSize == 4)
+            {
+                float* qH0 = qPtr + (long)(hStart + 0) * headDim;
+                float* qH1 = qPtr + (long)(hStart + 1) * headDim;
+                float* qH2 = qPtr + (long)(hStart + 2) * headDim;
+                float* qH3 = qPtr + (long)(hStart + 3) * headDim;
+                float* row0 = scores + 0L * kLen;
+                float* row1 = scores + 1L * kLen;
+                float* row2 = scores + 2L * kLen;
+                float* row3 = scores + 3L * kLen;
+
+                for (int t = 0; t < kLen; t++)
+                {
+                    float* kT = kHead + (long)(kStart + t) * headDim;
+                    float s0, s1, s2, s3;
+                    VecDot4(qH0, qH1, qH2, qH3, kT, headDim, out s0, out s1, out s2, out s3);
+                    s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                    row0[t] = s0; row1[t] = s1; row2[t] = s2; row3[t] = s3;
+                    if (s0 > maxG0) maxG0 = s0;
+                    if (s1 > maxG1) maxG1 = s1;
+                    if (s2 > maxG2) maxG2 = s2;
+                    if (s3 > maxG3) maxG3 = s3;
+                }
+            }
+            else
+            {
+                for (int g = 0; g < groupSize; g++)
+                    partial[g * strideG] = float.NegativeInfinity;
+
+                for (int t = 0; t < kLen; t++)
+                {
+                    float* kT = kHead + (long)(kStart + t) * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float* qH = qPtr + (long)(hStart + g) * headDim;
+                        float s = VecDot(qH, kT, headDim) * scale;
+                        scores[g * kLen + t] = s;
+                        if (s > partial[g * strideG]) partial[g * strideG] = s;
+                    }
+                }
+            }
+
+            if (groupSize == 4)
+            {
+                partial[0 * strideG] = maxG0;
+                partial[1 * strideG] = maxG1;
+                partial[2 * strideG] = maxG2;
+                partial[3 * strideG] = maxG3;
+            }
+
+            // Softmax per group (un-normalized) and partial weighted V
+            for (int g = 0; g < groupSize; g++)
+            {
+                float maxS = partial[g * strideG];
+                float sum = 0;
+                float* rowG = scores + (long)g * kLen;
+                for (int t = 0; t < kLen; t++)
+                {
+                    float e = MathF.Exp(rowG[t] - maxS);
+                    rowG[t] = e;
+                    sum += e;
+                }
+                partial[g * strideG + 1] = sum;
+            }
+
+            // Compute weighted V for this chunk
+            for (int g = 0; g < groupSize; g++)
+                VecZero(partial + g * strideG + 2, headDim);
+
+            if (groupSize == 4)
+            {
+                float* w0 = partial + 0 * strideG + 2;
+                float* w1 = partial + 1 * strideG + 2;
+                float* w2 = partial + 2 * strideG + 2;
+                float* w3 = partial + 3 * strideG + 2;
+                float* row0 = scores + 0L * kLen;
+                float* row1 = scores + 1L * kLen;
+                float* row2 = scores + 2L * kLen;
+                float* row3 = scores + 3L * kLen;
+
+                for (int t = 0; t < kLen; t++)
+                {
+                    float* vT = vHead + (long)(kStart + t) * headDim;
+                    VecScaleAdd4(w0, w1, w2, w3, vT,
+                        row0[t], row1[t], row2[t], row3[t], headDim);
+                }
+            }
+            else
+            {
+                for (int t = 0; t < kLen; t++)
+                {
+                    float* vT = vHead + (long)(kStart + t) * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float w = scores[g * kLen + t];
+                        VecScaleAdd(partial + g * strideG + 2, vT, w, headDim);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Combine the per-chunk partial sums into the final attention output for one KV head.
+        /// Uses the standard online softmax merge: M = max(M_a, M_b),
+        ///   sum_new = sum_a*exp(M_a - M) + sum_b*exp(M_b - M),
+        ///   acc_new = acc_a*exp(M_a - M) + acc_b*exp(M_b - M),
+        /// then divide acc_new by sum_new at the end.
+        /// </summary>
+        private static unsafe void MergeChunkResults(int kvHead, float* rPtr, float* partial,
+            int headDim, int groupSize, int kSplit)
+        {
+            int strideG = 2 + headDim;
+            int strideChunk = groupSize * strideG;
+            int hStart = kvHead * groupSize;
+
+            for (int g = 0; g < groupSize; g++)
+            {
+                float globalMax = float.NegativeInfinity;
+                for (int c = 0; c < kSplit; c++)
+                {
+                    float m = partial[c * strideChunk + g * strideG];
+                    if (m > globalMax) globalMax = m;
+                }
+
+                float globalSum = 0;
+                float* rOut = rPtr + (long)(hStart + g) * headDim;
+                VecZero(rOut, headDim);
+
+                for (int c = 0; c < kSplit; c++)
+                {
+                    float* p = partial + c * strideChunk + g * strideG;
+                    float chunkMax = p[0];
+                    float chunkSum = p[1];
+                    if (chunkSum <= 0) continue;
+                    float* chunkAcc = p + 2;
+
+                    float scale = MathF.Exp(chunkMax - globalMax);
+                    globalSum += chunkSum * scale;
+                    VecScaleAdd(rOut, chunkAcc, scale, headDim);
+                }
+
+                if (globalSum > 0)
+                    VecScale(rOut, 1.0f / globalSum, headDim);
             }
         }
 
