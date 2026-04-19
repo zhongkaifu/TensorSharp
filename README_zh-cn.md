@@ -21,24 +21,26 @@
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
 - **聊天模板** —— 从 GGUF 元数据自动加载（Jinja2），并为不同架构提供硬编码回退模板
 - **请求队列** —— FIFO 推理队列确保单请求执行以保障 KV 缓存稳定性，并为客户端提供实时排队位置反馈
-- **批处理** —— 控制台应用支持 JSONL 输入
-- **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout）
+- **批处理** —— 控制台应用支持 JSONL 输入，并内置用于测量 prefill / decode 吞吐的推理基准
+- **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout），并支持中断/停止正在生成的请求
 - **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层
-- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Nemotron-H MoE FFN 层
+- **混合注意力-递归网络** —— Qwen 3.5 在同一模型中混合全注意力层与 GatedDeltaNet 递归层
+- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5 MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
+- **批量 GPU MoE** —— Qwen 3.5 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
-- **大文件上传** —— Web 界面支持最大 500 MB 的视频/音频上传
+- **文本/图像/音频/视频上传** —— Web 界面支持最大 500 MB 的文件上传，对超大文本会按 token 预算自动截断
 
 ## 支持的模型架构
 
-| 架构 | 示例模型 | 多模态 | 思维链 | 工具调用 |
-|---|---|---|---|---|
-| Gemma 4 | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 |
-| Gemma 3 | gemma-3-4b | 图像 | 不支持 | 不支持 |
-| Qwen 3 | Qwen3-4B | 仅文本 | 支持 | 支持 |
-| Qwen 3.5 | Qwen3.5-9B、Qwen3.5-35B-A3B | 图像 | 支持 | 支持 |
-| GPT OSS | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
-| Nemotron-H | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE） | 仅文本 | 支持 | 支持 |
-| Mistral 3 | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 |
+| 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 |
+|---|---|---|---|---|---|
+| Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 |
+| Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 |
+| Qwen 3 | `qwen3` | Qwen3-4B | 仅文本 | 支持 | 支持 |
+| Qwen 3.5 | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B（MoE） | 图像 | 支持 | 支持 |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE） | 仅文本 | 支持 | 支持 |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 |
 
 各架构的详细文档见[模型架构卡片](docs/model_cards_cn.md)。
 
@@ -83,11 +85,15 @@ TensorSharp/
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
 │   ├── ModelService.cs          # 模型生命周期管理
 │   ├── InferenceQueue.cs        # 带排队位置跟踪的 FIFO 请求队列
+│   ├── BackendCatalog.cs        # 可用计算后端的发现
+│   ├── TextUploadHelper.cs      # 按 token 预算截断的文本上传辅助
 │   ├── wwwroot/index.html       # 聊天界面
 │   ├── testdata/                # 集成测试套件（bash + Python）
 │   └── API_EXAMPLES.md          # 详细 API 文档
 ├── TensorSharp.Cli/             # CLI 应用
+├── InferenceWeb.Tests/          # xUnit 单元测试，覆盖算子、KV 缓存与 Web/服务辅助逻辑
 ├── AdvUtils/                    # 工具库
+├── docs/                        # 开发者参考文档（模型卡片，中英）
 └── ExternalProjects/            # 第三方依赖（ggml）
 ```
 
@@ -157,6 +163,16 @@ Linux（启用 GGML_CUDA）：
 bash build-linux.sh --cuda
 ```
 
+在 Linux 上，`build-linux.sh` 现在会自动检测可见 NVIDIA GPU 的 compute capability，并把一个精简的 `CMAKE_CUDA_ARCHITECTURES` 列表传给 ggml-cuda（例如在 RTX 3080 上为 `86-real`），从而显著降低 CUDA 构建时间。原生构建默认还会以受控的并行任务数运行，避免 `nvcc` 拖慢普通开发机器。
+
+如需覆盖自动检测到的架构列表或默认的并行度，可使用以下任一方式：
+
+```bash
+TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
+bash build-linux.sh --cuda --cuda-arch='86-real;89-real'
+TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2 bash build-linux.sh --cuda
+```
+
 也可以在 `dotnet build` 时通过环境变量请求 CUDA 版本的原生库：
 
 ```bash
@@ -203,6 +219,21 @@ cd TensorSharp.Cli/bin
 # 批处理（JSONL）
 ./TensorSharp.Cli --model <model.gguf> --input-jsonl requests.jsonl \
     --output results.txt --backend ggml_metal
+
+# 多轮对话模拟（含 KV 缓存复用，模拟 Web UI 行为）
+./TensorSharp.Cli --model <model.gguf> --multi-turn-jsonl chat.jsonl \
+    --backend ggml_metal --max-tokens 200
+
+# 吞吐基准测试：N 次最优运行的 prefill 和 decode 计时
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 128 --bench-runs 3
+
+# 仅查看渲染后的 prompt 和分词结果（不运行推理）
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --dump-prompt
+
+# 对目录下每个 *.gguf 文件，对比硬编码回退模板与 GGUF 内置 Jinja2 模板
+# （在适配新架构时尤其有用）
+./TensorSharp.Cli --test-templates ~/models
 ```
 
 **命令行参数：**
@@ -231,7 +262,13 @@ cd TensorSharp.Cli/bin
 | `--frequency-penalty <f>` | 频率惩罚（0 = 关闭） |
 | `--seed <N>` | 随机种子（-1 = 非确定性） |
 | `--stop <string>` | 停止序列（可重复指定） |
-| `--test` | 运行内置测试套件 |
+| `--dump-prompt` | 仅渲染 prompt 与分词后退出（不进行推理） |
+| `--benchmark` | 运行合成的 prefill / decode 吞吐基准 |
+| `--bench-prefill <N>` | 合成 prefill 的 token 长度（默认：32） |
+| `--bench-decode <N>` | 合成 decode 的 token 长度（默认：64） |
+| `--bench-runs <N>` | 基准运行次数；输出最佳与平均结果（默认：1） |
+| `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
+| `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
 
 如果把多模态投影器文件放在模型文件同目录并使用可识别命名（例如 `gemma-4-mmproj-F16.gguf`），系统会自动检测。
 
@@ -273,13 +310,24 @@ cd TensorSharp.Server/bin
 
 使用 `--model` 选择要托管的 GGUF 文件，使用 `--mmproj` 选择要托管的投影器文件。`TensorSharp.Server` 不再扫描 `MODEL_DIR`。
 
+**服务命令行参数：**
+
+| 参数 | 说明 |
+|---|---|
+| `--model <path>` | 需要托管的 GGUF 文件（推理时必填；如未指定，服务仍可启动，但 `/api/models/load` 会报告未加载模型） |
+| `--mmproj <path>` | 多模态投影器 GGUF（仅给文件名时按模型目录解析；传 `none` 可显式禁用）。需要先指定 `--model`。 |
+| `--backend <type>` | 默认计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
+| `--max-tokens <N>` | 当请求未携带 max-tokens 时使用的默认上限（默认：`20000`） |
+
 **运行时环境变量：**
 
 | 变量 | 说明 |
 |---|---|
-| `BACKEND` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
+| `BACKEND` | 未传 `--backend` 时使用的默认计算后端（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
+| `MAX_TOKENS` | 当 `--max-tokens` 与请求级上限均未指定时使用的默认生成长度（默认：`20000`） |
+| `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
 | `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
-| `PORT` | HTTP 端口（默认：`5000`） |
+| `PORT` / `ASPNETCORE_URLS` | 标准 ASP.NET Core 监听配置（默认端口：`5000`） |
 
 ### HTTP API
 
@@ -319,6 +367,31 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
+
+# 结构化输出（OpenAI response_format）
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "从“Paris, France”中提取城市与国家。"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "location_extraction",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "country": {"type": "string"},
+            "confidence": {"type": ["string", "null"]}
+          },
+          "required": ["city", "country", "confidence"],
+          "additionalProperties": false
+        }
+      }
+    }
+  }'
 ```
 
 **OpenAI Python SDK：**
@@ -373,9 +446,13 @@ Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`ge
 - **视频：** MP4（使用 OpenCV 以 1 fps 抽取最多 8 帧）
 - **音频：** WAV（16kHz 单声道）、MP3、OGG Vorbis
 
-### Gemma 3 / Qwen 3.5
+### Gemma 3
 
-这两类模型支持图像输入，并需要对应的多模态投影器文件。
+Gemma 3 支持 PNG/JPEG 图像输入。将其多模态投影器（`mmproj-gemma3-4b-f16.gguf`）放在模型文件相同目录即可自动加载。
+
+### Qwen 3.5
+
+所有 Qwen 3.5 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用同一个 `Qwen35Model` 实现。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；将投影器（`Qwen3.5-mmproj-F16.gguf`）放到模型 GGUF 同一目录下即可自动加载。MoE 变体（例如 Qwen3.5-35B-A3B）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
 
 ### Mistral 3
 
@@ -402,15 +479,28 @@ TensorSharp 采用分层系统结构：
 ### 性能优化
 
 - **融合 GPU decode**（Gemma 4）：在 Metal 上将所有 Transformer 层合并为单次 GGML 计算图调度，将每个 token 的 CPU-GPU 往返从数百次降低到一次。相较逐算子调度约提升 2.6 倍。
+- **整模型原生 decode**（Qwen 3）：所有 Transformer 层在一次原生调用（`TransformerModelDecode`）中完成，每层权重指针在加载阶段预解析并缓存，从 decode 热点路径中移除托管循环开销。
 - **融合权重投影**：Q/K/V 投影融合为单次 QKV matmul；gate 与 up 投影融合为单次 gate_up matmul。
-- **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。
+- **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0、MXFP4 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。批量 `AddmmQuantBatch` 内核可在一次调度内完成对同一量化权重块的多个子矩阵 matmul。
+- **批量 GPU MoE**：`MoEExpertsSwiGLUResidual`（Qwen 3.5）和 `MoEExpertsForward`（Nemotron-H）将每个 MoE 层中所有被选中的专家——以及 Qwen 3.5 中可选的 shared expert 与残差加法——合并为一次 GGML 计算图调度。
 - **优化后的纯 C# CPU 路径**：托管 GEMM 快速路径和连续 Float32 内核加速了 decode、softmax、RMSNorm、RoPE、融合激活等热点路径，同时在 CPU 加载时保持量化 GGUF 权重压缩状态。
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
+- **KV 缓存前缀复用**：多轮对话会复用各轮之间最长的匹配 token 前缀。对 SWA 模型，截断会自动按滑动窗口大小回退，使后缀部分可以重建 SWA 上下文。
 - **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管内存分配。
 
 ## 测试
 
-TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、队列行为、并发请求和中断支持。
+### 单元测试（xUnit）
+
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、KV 缓存策略、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、Web UI 聊天策略、模型服务历史、模型上下文长度解析、可用后端发现等。
+
+```bash
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
+```
+
+### 服务端集成测试
+
+TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、结构化输出、队列行为、并发请求和中断支持。架构特定能力（思维链、工具调用）会自动检测，当前模型不支持时会自动跳过。
 
 ```bash
 # 先启动 TensorSharp.Server，然后运行：

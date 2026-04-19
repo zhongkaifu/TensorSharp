@@ -290,6 +290,67 @@ internal enum GgmlIndexReductionOp
             float[] routeWeights);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MoEExpertsSwiGLUForwardF32(
+            GgmlTensorView2D result,
+            GgmlTensorView2D input,
+            int numExperts,
+            IntPtr[] gateDataPtrs,
+            IntPtr[] upDataPtrs,
+            IntPtr[] downDataPtrs,
+            int gateGgmlType,
+            long gateNe0,
+            long gateNe1,
+            long gateRawBytesEach,
+            int upGgmlType,
+            long upNe0,
+            long upNe1,
+            long upRawBytesEach,
+            int downGgmlType,
+            long downNe0,
+            long downNe1,
+            long downRawBytesEach,
+            float[] routeWeights);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MoEExpertsSwiGLUResidualF32(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D input,
+            int numExperts,
+            IntPtr[] gateDataPtrs,
+            IntPtr[] upDataPtrs,
+            IntPtr[] downDataPtrs,
+            int gateGgmlType,
+            long gateNe0,
+            long gateNe1,
+            long gateRawBytesEach,
+            int upGgmlType,
+            long upNe0,
+            long upNe1,
+            long upRawBytesEach,
+            int downGgmlType,
+            long downNe0,
+            long downNe1,
+            long downRawBytesEach,
+            float[] routeWeights,
+            int useShared,
+            IntPtr sharedGateData,
+            IntPtr sharedUpData,
+            IntPtr sharedDownData,
+            int sharedGateGgmlType,
+            long sharedGateNe0,
+            long sharedGateNe1,
+            long sharedGateRawBytes,
+            int sharedUpGgmlType,
+            long sharedUpNe0,
+            long sharedUpNe1,
+            long sharedUpRawBytes,
+            int sharedDownGgmlType,
+            long sharedDownNe0,
+            long sharedDownNe1,
+            long sharedDownRawBytes,
+            float sharedScalar);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_AddmmQuantBatchF32(
             GgmlTensorView2D result,
             GgmlTensorView2D m1,
@@ -410,6 +471,15 @@ internal enum GgmlIndexReductionOp
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
             int intermediateSize, int ropeMode);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FlashAttnDecodeF32(
+            IntPtr qData, IntPtr kData, IntPtr vData,
+            IntPtr kCacheData, IntPtr vCacheData,
+            IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int maxSeqLen, int position,
+            float scale);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_TransformerModelDecode(
@@ -682,6 +752,50 @@ internal enum GgmlIndexReductionOp
                 routeWeights), "moe_experts_forward");
         }
 
+        public static void MoEExpertsSwiGLUForward(GgmlTensorView2D result, GgmlTensorView2D input,
+            int numExperts,
+            IntPtr[] gateDataPtrs, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int gateGgmlType, long gateNe0, long gateNe1, long gateRawBytesEach,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights)
+        {
+            CheckResult(TSGgml_MoEExpertsSwiGLUForwardF32(result, input, numExperts,
+                gateDataPtrs, upDataPtrs, downDataPtrs,
+                gateGgmlType, gateNe0, gateNe1, gateRawBytesEach,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights), "moe_experts_swiglu_forward");
+        }
+
+        public static void MoEExpertsSwiGLUResidual(GgmlTensorView2D residual, GgmlTensorView2D input,
+            int numExperts,
+            IntPtr[] gateDataPtrs, IntPtr[] upDataPtrs, IntPtr[] downDataPtrs,
+            int gateGgmlType, long gateNe0, long gateNe1, long gateRawBytesEach,
+            int upGgmlType, long upNe0, long upNe1, long upRawBytesEach,
+            int downGgmlType, long downNe0, long downNe1, long downRawBytesEach,
+            float[] routeWeights,
+            bool useShared,
+            IntPtr sharedGateData, IntPtr sharedUpData, IntPtr sharedDownData,
+            int sharedGateGgmlType, long sharedGateNe0, long sharedGateNe1, long sharedGateRawBytes,
+            int sharedUpGgmlType, long sharedUpNe0, long sharedUpNe1, long sharedUpRawBytes,
+            int sharedDownGgmlType, long sharedDownNe0, long sharedDownNe1, long sharedDownRawBytes,
+            float sharedScalar)
+        {
+            CheckResult(TSGgml_MoEExpertsSwiGLUResidualF32(residual, input, numExperts,
+                gateDataPtrs, upDataPtrs, downDataPtrs,
+                gateGgmlType, gateNe0, gateNe1, gateRawBytesEach,
+                upGgmlType, upNe0, upNe1, upRawBytesEach,
+                downGgmlType, downNe0, downNe1, downRawBytesEach,
+                routeWeights,
+                useShared ? 1 : 0,
+                sharedGateData, sharedUpData, sharedDownData,
+                sharedGateGgmlType, sharedGateNe0, sharedGateNe1, sharedGateRawBytes,
+                sharedUpGgmlType, sharedUpNe0, sharedUpNe1, sharedUpRawBytes,
+                sharedDownGgmlType, sharedDownNe0, sharedDownNe1, sharedDownRawBytes,
+                sharedScalar), "moe_experts_swiglu_residual");
+        }
+
         public static void AddmmQuantBatch(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2RawBytes,
             int batchCount, long[] weightOffsets, long[] weightNe1Arr)
         {
@@ -882,6 +996,28 @@ internal enum GgmlIndexReductionOp
                 intermediateSize, ropeMode), "transformer_layer_decode");
         }
 
+        /// <summary>
+        /// Single-token flash attention decode kernel. Appends the new K/V to the persistent
+        /// KV cache at <paramref name="position"/>, then runs <c>ggml_flash_attn_ext</c> on the
+        /// device against the populated portion of the cache. Q, K, V, and the output buffer
+        /// must point to F32 contiguous memory in (heads, head_dim) row-major layout.
+        /// </summary>
+        public static void FlashAttnDecode(
+            IntPtr qData, IntPtr kData, IntPtr vData,
+            IntPtr kCacheData, IntPtr vCacheData,
+            IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int maxSeqLen, int position,
+            float scale)
+        {
+            CheckResult(TSGgml_FlashAttnDecodeF32(
+                qData, kData, vData,
+                kCacheData, vCacheData,
+                outData,
+                numHeads, numKvHeads, headDim,
+                maxSeqLen, position, scale), "flash_attn_decode");
+        }
+
         public static void TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -1047,6 +1183,26 @@ internal enum GgmlIndexReductionOp
                 {
                     hDst.Free();
                 }
+            }
+        }
+
+        internal static void DequantizeGgufTensorToFloat32Native(int ggmlType, IntPtr src, IntPtr dst, long numElements)
+        {
+            if (src == IntPtr.Zero || dst == IntPtr.Zero || numElements < 0)
+            {
+                throw new ArgumentException("Invalid src/dst pointers or element count for dequantization.");
+            }
+
+            int r = TSGgml_DequantizeToF32(ggmlType, src, numElements, dst);
+            if (r == -1)
+            {
+                throw new ArgumentException("Dequantization failed (invalid arguments).");
+            }
+
+            if (r == -2)
+            {
+                throw new NotSupportedException(
+                    $"GGML tensor type {ggmlType} cannot be dequantized to float32.");
             }
         }
 

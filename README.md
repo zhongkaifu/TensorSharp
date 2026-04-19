@@ -21,24 +21,26 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
 - **Request queue** -- FIFO inference queue ensures single-request execution for KV cache stability, with real-time position tracking for clients
-- **Batch processing** -- JSONL input support in the console application
-- **Streaming** -- token-by-token output via SSE (web) or stdout (console)
+- **Batch processing** -- JSONL input support in the console application, plus a built-in inference benchmark for prefill/decode throughput
+- **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
 - **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model
-- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Nemotron-H MoE FFN layers
+- **Hybrid Attention-Recurrent** -- Qwen 3.5 mixes full-attention layers with GatedDeltaNet recurrent layers
+- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5 MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
+- **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5 and Nemotron-H decode, eliminating per-expert round-trips
 - **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
-- **Large file uploads** -- supports video/audio uploads up to 500 MB in the web interface
+- **Text/Image/Audio/Video uploads** -- the web UI accepts file uploads up to 500 MB, with automatic token-budget-aware truncation for large text files
 
 ## Supported Model Architectures
 
-| Architecture | Example Models | Multimodal | Thinking | Tool Calling |
-|---|---|---|---|---|
-| Gemma 4 | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
-| Gemma 3 | gemma-3-4b | Image | No | No |
-| Qwen 3 | Qwen3-4B | Text only | Yes | Yes |
-| Qwen 3.5 | Qwen3.5-9B, Qwen3.5-35B-A3B | Image | Yes | Yes |
-| GPT OSS | gpt-oss-20b (MoE) | Text only | Yes | No |
-| Nemotron-H | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE) | Text only | Yes | Yes |
-| Mistral 3 | Mistral-Small-3.1-24B-Instruct | Image | No | No |
+| Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tool Calling |
+|---|---|---|---|---|---|
+| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
+| Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No |
+| Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes |
+| Qwen 3.5 | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B (MoE) | Image | Yes | Yes |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes | No |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE) | Text only | Yes | Yes |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No |
 
 See [Model Architecture Cards](docs/model_cards.md) for detailed documentation of each architecture.
 
@@ -83,11 +85,15 @@ TensorSharp/
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
 │   ├── ModelService.cs          # Model lifecycle management
 │   ├── InferenceQueue.cs        # FIFO request queue with position tracking
+│   ├── BackendCatalog.cs        # Discovery of available compute backends
+│   ├── TextUploadHelper.cs      # Token-budget-aware text-file truncation
 │   ├── wwwroot/index.html       # Chat UI
 │   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
 ├── TensorSharp.Cli/             # CLI application
+├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, web/server helpers
 ├── AdvUtils/                    # Utility library
+├── docs/                        # Developer reference (model cards, EN + 中文)
 └── ExternalProjects/            # Third-party dependencies (ggml)
 ```
 
@@ -213,6 +219,21 @@ cd TensorSharp.Cli/bin
 # Batch processing (JSONL)
 ./TensorSharp.Cli --model <model.gguf> --input-jsonl requests.jsonl \
     --output results.txt --backend ggml_metal
+
+# Multi-turn chat simulation with KV-cache reuse (mirrors the web UI behavior)
+./TensorSharp.Cli --model <model.gguf> --multi-turn-jsonl chat.jsonl \
+    --backend ggml_metal --max-tokens 200
+
+# Throughput benchmark: best-of-N prefill and decode timing
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 128 --bench-runs 3
+
+# Inspect the rendered prompt and tokenization without running inference
+./TensorSharp.Cli --model <model.gguf> --input prompt.txt --dump-prompt
+
+# Compare hardcoded fallback templates against GGUF Jinja2 templates for every
+# *.gguf file in a directory (useful when adding new architectures)
+./TensorSharp.Cli --test-templates ~/models
 ```
 
 **Command-line options:**
@@ -241,7 +262,13 @@ cd TensorSharp.Cli/bin
 | `--frequency-penalty <f>` | Frequency penalty (0 = disabled) |
 | `--seed <N>` | Random seed (-1 = non-deterministic) |
 | `--stop <string>` | Stop sequence (can be repeated) |
-| `--test` | Run built-in test suite |
+| `--dump-prompt` | Render the prompt + tokenization and exit (no generation) |
+| `--benchmark` | Run a synthetic prefill/decode throughput benchmark |
+| `--bench-prefill <N>` | Synthetic prefill length in tokens (default: 32) |
+| `--bench-decode <N>` | Synthetic decode length in tokens (default: 64) |
+| `--bench-runs <N>` | Number of benchmark runs; reports best and average (default: 1) |
+| `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
+| `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
 
 The multimodal projector file is auto-detected if placed alongside the model file with a recognized name (e.g., `gemma-4-mmproj-F16.gguf`).
 
@@ -283,13 +310,24 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 
 Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted projector. `TensorSharp.Server` no longer scans a `MODEL_DIR`.
 
+**Server command-line options:**
+
+| Option | Description |
+|---|---|
+| `--model <path>` | GGUF file to host (required for inference; if omitted, the server starts but `/api/models/load` will report no hosted model) |
+| `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
+| `--backend <type>` | Default compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
+
 **Runtime environment variables:**
 
 | Variable | Description |
 |---|---|
-| `BACKEND` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `BACKEND` | Default compute backend, used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
+| `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
-| `PORT` | HTTP port (default: `5000`) |
+| `PORT` / `ASPNETCORE_URLS` | Standard ASP.NET Core listener configuration (default port: `5000`) |
 
 ### HTTP APIs
 
@@ -408,9 +446,13 @@ Gemma 4 models support image, video, and audio inputs. Place the multimodal proj
 - **Video:** MP4 (extracts up to 8 frames at 1 fps using OpenCV)
 - **Audio:** WAV (16kHz mono), MP3, OGG Vorbis
 
-### Gemma 3 / Qwen 3.5
+### Gemma 3
 
-These models support image inputs with their respective multimodal projector files.
+Gemma 3 supports PNG/JPEG image inputs. Place its multimodal projector (`mmproj-gemma3-4b-f16.gguf`) next to the model file for automatic loading.
+
+### Qwen 3.5
+
+All Qwen 3.5 variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the same `Qwen35Model` implementation. Image inputs are supported via the dynamic-resolution `Qwen35VisionEncoder`; place the projector (`Qwen3.5-mmproj-F16.gguf`) next to the model GGUF for automatic loading. The MoE variants (e.g. Qwen3.5-35B-A3B) additionally enable a fused `MoEExpertsSwiGLUResidual` GGML kernel during decode that runs all selected experts, the optional shared expert, and the residual add in a single GPU graph dispatch.
 
 ### Mistral 3
 
@@ -437,15 +479,28 @@ TensorSharp is structured as a layered system:
 ### Performance Optimizations
 
 - **Fused GPU decode** (Gemma 4): all transformer layers are executed in a single GGML compute graph dispatch on Metal, reducing CPU-GPU round-trips from hundreds per token to one. This achieves ~2.6x speedup over per-operation dispatch.
+- **Native whole-model decode** (Qwen 3): all transformer layers run in one native call (`TransformerModelDecode`) with pre-resolved per-layer weight pointers cached at load time, removing managed-loop overhead from the decode hot path.
 - **Fused weight projections**: Q/K/V projections are fused into a single QKV matmul; gate and up projections are fused into a single gate_up matmul.
-- **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth.
+- **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, MXFP4, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth. A batched `AddmmQuantBatch` kernel handles multiple sub-weight matmuls against a single quantized blob in one dispatch.
+- **Batched GPU MoE**: `MoEExpertsSwiGLUResidual` (Qwen 3.5) and `MoEExpertsForward` (Nemotron-H) collapse all selected experts -- and, for Qwen 3.5, the optional shared expert and the residual add -- into a single GGML graph dispatch per MoE layer.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
+- **KV-cache prefix reuse**: multi-turn conversations reuse the longest matching token prefix across turns. Truncation is automatically backed off by the sliding-window size for SWA models so the suffix can rebuild the SWA context.
 - **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations.
 
 ## Testing
 
-Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support.
+### Unit tests (xUnit)
+
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, KV cache policies, image preprocessing, media helpers, structured-output validation, text-upload helpers, web UI chat policy, model service history, model context length parsing, and backend catalog resolution.
+
+```bash
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
+```
+
+### Server integration tests
+
+Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support. Architecture-specific features (thinking, tool calling) are auto-detected and skipped when the active model does not support them.
 
 ```bash
 # Start TensorSharp.Server, then run:

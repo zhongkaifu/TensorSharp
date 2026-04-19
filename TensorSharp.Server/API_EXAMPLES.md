@@ -1,19 +1,28 @@
 ﻿# TensorSharp.Server API Examples
 
-TensorSharp.Server provides three API styles:
+TensorSharp.Server provides three API styles plus a few utility endpoints:
 - **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
-- **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`)
+- **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`, `/api/upload`)
+- **Utilities** (`/api/version`, `/api/queue/status`)
 
 Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The Web UI and compatibility endpoints expose only that hosted model; `/api/models/load` can reload it, but it does not switch to arbitrary files at runtime.
 
 ## Starting the Server
 
 ```bash
+# Text-only model
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal
+
+# Multimodal model (explicit projector)
+./TensorSharp.Server --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
+    --mmproj ~/work/model/gemma-4-mmproj-F16.gguf --backend ggml_metal
+
+# Override default request budget (used when a request omits max_tokens / num_predict)
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-The server starts on `http://localhost:5000`.
+The server starts on `http://localhost:5000` (override with the standard ASP.NET Core `PORT` / `ASPNETCORE_URLS` environment variables).
 
 ---
 
@@ -192,6 +201,87 @@ curl -X POST http://localhost:5000/api/chat/ollama \
     \"options\": {\"num_predict\": 200}
   }"
 ```
+
+### Chat with Thinking / Reasoning Mode
+
+Thinking-capable architectures (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H) accept `"think": true` and split chain-of-thought from the visible response:
+
+```bash
+curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Solve 17 * 23 step by step."}],
+    "think": true,
+    "stream": false,
+    "options": {"num_predict": 200}
+  }'
+```
+
+The response carries the chain-of-thought separately in `message.thinking`:
+
+```json
+{
+  "message": {
+    "role": "assistant",
+    "content": "17 * 23 = 391.",
+    "thinking": "17 * 20 = 340. 17 * 3 = 51. 340 + 51 = 391."
+  },
+  "done": true,
+  "done_reason": "stop"
+}
+```
+
+### Chat with Tool Calling
+
+Define tools in the same shape as Ollama's tool API. The server detects the architecture's wire format (e.g. `<tool_call>...</tool_call>` for Qwen / Nemotron-H, `<|tool_call>...<tool_call|>` for Gemma 4) and parses them into structured `tool_calls`:
+
+```bash
+curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city":  {"type": "string", "description": "Target city"},
+            "units": {"type": "string", "enum": ["c", "f"]}
+          },
+          "required": ["city"]
+        }
+      }
+    }],
+    "stream": false,
+    "options": {"num_predict": 200}
+  }'
+```
+
+The response shape (when the model decides to call the tool):
+
+```json
+{
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [{
+      "function": {
+        "name": "get_weather",
+        "arguments": {"city": "Paris", "units": "c"}
+      }
+    }]
+  },
+  "done": true,
+  "done_reason": "tool_calls"
+}
+```
+
+Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again.
 
 ---
 
@@ -372,6 +462,72 @@ curl -X POST http://localhost:5000/v1/chat/completions \
     \"max_tokens\": 200
   }"
 ```
+
+### Chat Completions with Tool Calling
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city":  {"type": "string"},
+            "units": {"type": "string", "enum": ["c", "f"]}
+          },
+          "required": ["city"]
+        }
+      }
+    }],
+    "max_tokens": 200
+  }'
+```
+
+When the model emits a tool call the response uses OpenAI-style fields:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Paris\",\"units\":\"c\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_id": "...", "content": "..."}` message to continue the loop.
+
+### Utilities
+
+```bash
+# Inference queue snapshot (busy flag, pending requests, total processed)
+curl http://localhost:5000/api/queue/status
+
+# Server version
+curl http://localhost:5000/api/version
+
+# Hosted model + supported backends + default settings
+curl http://localhost:5000/api/models
+```
+
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`.
 
 ---
 
