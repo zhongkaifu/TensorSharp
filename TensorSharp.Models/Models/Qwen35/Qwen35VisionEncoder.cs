@@ -9,6 +9,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.GGML;
@@ -188,54 +191,111 @@ namespace TensorSharp.Models
         /// <summary>
         /// Conv2D patch embedding with combined temporal weights.
         /// Output in raster (row-major) order: [numPatches, hiddenSize].
+        ///
+        /// Reformulated as a GEMM (im2col + matmul) so the heavy compute can run on the GPU
+        /// when available. The im2col packing itself is parallelised on the CPU using SIMD
+        /// per-channel row copies. This is dramatically faster than the original quintuple
+        /// nested loop (single-threaded scalar) implementation, especially on Apple Silicon
+        /// where matmul saturates the unified-memory bandwidth.
         /// </summary>
         private unsafe Tensor PatchEmbed(float[] pixelValues, int imgH, int imgW, int gridH, int gridW)
         {
             int numPatches = gridH * gridW;
-            var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
-            float* dst = GetFloatPtr(result);
+            int C = 3;
+            int P = _patchSize;
+            int patchStride = C * P * P;
 
             string wName = _weights.ContainsKey("v.patch_embd.combined")
                 ? "v.patch_embd.combined" : "v.patch_embd.weight";
             var convWeight = _weights[wName];
-            float* wPtr = GetFloatPtr(convWeight);
-            float* biasPtr = _weights.ContainsKey("v.patch_embd.bias")
-                ? GetFloatPtr(_weights["v.patch_embd.bias"]) : null;
+            // convWeight shape (post-load reverse): [hiddenSize, C, P, P]. We view it as a
+            // 2D matrix [hiddenSize, patchStride] for the matmul. This relies on the weight
+            // being stored row-major in C * P * P element order per output channel, which is
+            // how PyTorch / GGUF lay out conv2d weights.
+            string biasName = "v.patch_embd.bias";
 
-            int C = 3;
-            int P = _patchSize;
+            Tensor weightView2D = GetOrCreatePatchEmbedWeight2D(convWeight, wName, patchStride);
+            Tensor weightT = GetOrCreatePatchEmbedTransposed(weightView2D, wName);
 
-            for (int py = 0; py < gridH; py++)
+            // Build im2col matrix [numPatches, patchStride] in parallel.
+            var im2col = new Tensor(_allocator, DType.Float32, numPatches, patchStride);
+            float* im2colPtr = GetFloatPtr(im2col);
+
+            // Capture pointer locally since pixelValues is a managed array - we pin once
+            // via fixed at the top so the inner Parallel.For lambda can share the address.
+            fixed (float* pixSrc = pixelValues)
             {
-                for (int px = 0; px < gridW; px++)
+                long pixSrcL = (long)pixSrc;
+                Parallel.For(0, gridH, py =>
                 {
-                    int patchIdx = py * gridW + px;
-                    float* outPatch = dst + patchIdx * _hiddenSize;
-
-                    for (int f = 0; f < _hiddenSize; f++)
+                    float* pixSrcLocal = (float*)pixSrcL;
+                    for (int px = 0; px < gridW; px++)
                     {
-                        float sum = biasPtr != null ? biasPtr[f] : 0f;
+                        int patchIdx = py * gridW + px;
+                        float* outRow = im2colPtr + (long)patchIdx * patchStride;
+                        int yBase = py * P;
+                        int xBase = px * P;
 
                         for (int c = 0; c < C; c++)
                         {
+                            long imgChannelOffset = (long)c * imgH * imgW;
+                            long outChannelOffset = (long)c * P * P;
                             for (int ky = 0; ky < P; ky++)
                             {
-                                for (int kx = 0; kx < P; kx++)
-                                {
-                                    int imgY = py * P + ky;
-                                    int imgX = px * P + kx;
-                                    float pixel = pixelValues[c * imgH * imgW + imgY * imgW + imgX];
-                                    int wIdx = f * C * P * P + c * P * P + ky * P + kx;
-                                    sum += pixel * wPtr[wIdx];
-                                }
+                                int imgY = yBase + ky;
+                                long srcOffset = imgChannelOffset + (long)imgY * imgW + xBase;
+                                long dstOffset = outChannelOffset + (long)ky * P;
+                                Buffer.MemoryCopy(pixSrcLocal + srcOffset, outRow + dstOffset,
+                                    P * sizeof(float), P * sizeof(float));
                             }
                         }
-
-                        outPatch[f] = sum;
                     }
-                }
+                });
             }
 
+            // result = im2col @ weight^T  (+ bias if present)
+            int outDim = (int)weightView2D.Sizes[0];
+            var result = new Tensor(_allocator, DType.Float32, numPatches, outDim);
+            Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
+            im2col.Dispose();
+
+            if (_weights.TryGetValue(biasName, out var bias))
+                Ops.Add(result, result, bias);
+
+            return result;
+        }
+
+        private Tensor GetOrCreatePatchEmbedWeight2D(Tensor convWeight, string weightName, int patchStride)
+        {
+            string key = weightName + ".2d";
+            if (_transposedWeights.TryGetValue(key, out var cached))
+                return cached;
+
+            int outDim = (int)convWeight.Sizes[0];
+            // Reshape the 4D conv weight [outDim, C, P, P] into a 2D matrix [outDim, patchStride]
+            // through a contiguous copy. This is a one-time allocation.
+            Tensor flat = new Tensor(_allocator, DType.Float32, outDim, patchStride);
+            unsafe
+            {
+                float* src = GetFloatPtr(convWeight);
+                float* dst = GetFloatPtr(flat);
+                long bytes = (long)outDim * patchStride * sizeof(float);
+                Buffer.MemoryCopy(src, dst, bytes, bytes);
+            }
+
+            _transposedWeights[key] = flat;
+            return flat;
+        }
+
+        private Tensor GetOrCreatePatchEmbedTransposed(Tensor weight2D, string weightName)
+        {
+            string key = weightName + ".2d.T";
+            if (_transposedWeights.TryGetValue(key, out var cached))
+                return cached;
+
+            using var t = weight2D.Transpose();
+            var result = Ops.NewContiguous(t);
+            _transposedWeights[key] = result;
             return result;
         }
 

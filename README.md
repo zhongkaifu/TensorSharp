@@ -68,9 +68,9 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 
 | Backend | Flag | Description |
 |---|---|---|
-| GGML Metal | `--backend ggml_metal` | GPU-accelerated via Apple Metal (macOS). Recommended for Apple Silicon. |
-| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Linux with an NVIDIA GPU. |
-| GGML CPU | `--backend ggml_cpu` | CPU inference using native GGML with optimized kernels. |
+| GGML Metal | `--backend ggml_metal` | GPU-accelerated via Apple Metal (macOS). Recommended for Apple Silicon. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
+| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Linux with an NVIDIA GPU. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
+| GGML CPU | `--backend ggml_cpu` | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
 | Pure C# CPU | `--backend cpu` | Portable CPU inference with no native dependencies. |
 
 ## Project Structure
@@ -480,13 +480,41 @@ TensorSharp is structured as a layered system:
 
 - **Fused GPU decode** (Gemma 4): all transformer layers are executed in a single GGML compute graph dispatch on Metal, reducing CPU-GPU round-trips from hundreds per token to one. This achieves ~2.6x speedup over per-operation dispatch.
 - **Native whole-model decode** (Qwen 3): all transformer layers run in one native call (`TransformerModelDecode`) with pre-resolved per-layer weight pointers cached at load time, removing managed-loop overhead from the decode hot path.
+- **Fused Qwen 3.5 attention layer decode**: a single GGML graph performs RMSNorm + fused QKV + Q/gate deinterleave + per-head QK norm + RoPE + KV cache append + flash attention + sigmoid-gated mix + output projection + residual add for each FullAttention layer. Replaces ~2 standalone GGML calls and ~6 small CPU/GPU sync points per attention layer. Engages once the cached sequence length exceeds 4096 tokens (override with `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N`).
 - **Fused weight projections**: Q/K/V projections are fused into a single QKV matmul; gate and up projections are fused into a single gate_up matmul.
-- **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, MXFP4, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth. A batched `AddmmQuantBatch` kernel handles multiple sub-weight matmuls against a single quantized blob in one dispatch.
+- **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, IQ2_XXS, MXFP4, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth. A batched `AddmmQuantBatch` kernel handles multiple sub-weight matmuls against a single quantized blob in one dispatch.
 - **Batched GPU MoE**: `MoEExpertsSwiGLUResidual` (Qwen 3.5) and `MoEExpertsForward` (Nemotron-H) collapse all selected experts -- and, for Qwen 3.5, the optional shared expert and the residual add -- into a single GGML graph dispatch per MoE layer.
+- **GEMM-based vision patch embedding** (Qwen 3.5): the patch embedding step is reformulated as parallel im2col + matrix multiplication, replacing a single-threaded scalar quintuple-nested loop with a GPU-accelerated matmul.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **KV-cache prefix reuse**: multi-turn conversations reuse the longest matching token prefix across turns. Truncation is automatically backed off by the sliding-window size for SWA models so the suffix can rebuild the SWA context.
-- **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations.
+
+### Memory Optimizations
+
+- **Zero-copy file-mapped quantized weights** (CUDA, Metal, GGML CPU): the GGUF model file is memory-mapped and quantized tensors are bound directly into native ops via host-pointer buffers. This removes the per-tensor copy from disk into a freshly-allocated native heap buffer that previously roughly doubled the resident set on Apple Silicon for large quantized models. For example, `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) now runs with ~7 GB peak working memory under Metal instead of ~17 GB. The OS keeps the mapped file in its page cache and pages it out under memory pressure without any inference penalty on Apple Silicon (unified memory).
+- **Best-fit memory pool**: the GGML host allocator uses a best-fit search across pooled blocks instead of first-fit, which avoids handing out a large scratch block to satisfy a tiny intermediate-tensor request and keeps the working-set tightly bounded across long-running inference.
+- **Bounded pool retention**: the integrated-GPU / CPU memory pool now caps individual retained blocks at 64 MB and the total pool at 32 blocks. Combined with mmap-backed weights, this keeps short-lived intermediate tensors recycled fast while bounding the peak resident set.
+- **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations. F32 weights and norms still load on demand; quantized weights are mmap-backed when supported by the backend.
+
+## Benchmarks
+
+Reference numbers measured on `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` (~10 GB on disk, 256 routed experts of which 8 are active per token, with 12 full attention + 30 GatedDeltaNet recurrent layers) on an Apple M4 Pro with 24 GB unified memory:
+
+| Metric | Before (`v1` baseline) | After (this branch) | Change |
+|---|---|---|---|
+| Process peak memory footprint | ~17 GB | **~8 GB** | **-52%** |
+| TensorSharp.Server resident set after load | ~20 GB | **~8 GB** | **-60%** |
+| Decode throughput (warm, 256 prefill / 64 decode, M4 Pro) | ~3.8 tok/s | **~10.8 tok/s** | **+2.85x** |
+| Decode latency (warm, 256 prefill / 64 decode, M4 Pro) | ~264 ms/token | **~92 ms/token** | **-65%** |
+
+Reproduce with:
+
+```bash
+./TensorSharp.Cli --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 64 --bench-runs 3
+```
+
+The memory reduction comes primarily from no longer copying the GGUF file into a separate native heap buffer (the file is now mmap-bound zero-copy into Metal command buffers). The decode throughput increase is largely a side effect of removing that ~10 GB duplicate working set, which was previously triggering OS-level memory pressure on machines with 24 GB or less of physical RAM.
 
 ## Testing
 

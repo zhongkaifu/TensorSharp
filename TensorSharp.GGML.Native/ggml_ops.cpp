@@ -9045,6 +9045,358 @@ TSG_EXPORT int TSGgml_TransformerLayerDecode(
 }
 
 // ============================================================================
+// Qwen3.5 attention layer decode kernel (single token, single layer).
+//
+// Performs the full Qwen3.5 FullAttention block in a single GGML graph:
+//   1. RMSNorm(hidden) * attn_norm_w
+//   2. fused QKV matmul -> [Q_with_gate_interleaved (2*qDim), K (kvDim), V (kvDim)]
+//   3. deinterleave Q and gate (each [num_heads, head_dim])
+//   4. RMSNorm(Q) * q_norm_w  per head
+//      RMSNorm(K) * k_norm_w  per head
+//   5. RoPE on Q and K at `position`
+//   6. append K, V into the persistent KV cache at `position`
+//   7. flash attention against the populated KV cache window -> attn_out
+//   8. attn_out *= sigmoid(gate)
+//   9. residual += matmul(attn_out_flat, output_w)
+//
+// Replaces:
+//   - 1 FusedRmsNormMatMulQuant call (norm + qkv)
+//   - ~6 small CPU ops between (QK norm, RoPE, sigmoid gate, KV cache write)
+//   - 1 FusedMatMulQuantAdd call (output + residual)
+// with a single graph dispatch. Eliminates ~2 Metal command buffer dispatches
+// + several CPU/GPU sync points per attention layer per decode token.
+//
+// All weights and the KV cache are bound zero-copy via host-pointer buffers
+// when supported (Apple Silicon Metal, GGML CPU backend, integrated GPUs).
+// ============================================================================
+namespace
+{
+    int qwen35_attn_layer_decode_impl(
+        float* residual_data, int hidden_size,
+        float* attn_norm_data,
+        void* qkv_data, int qkv_type,
+        std::int64_t qkv_ne0, std::int64_t qkv_ne1, std::int64_t qkv_bytes,
+        float* q_norm_data, float* k_norm_data, int head_dim,
+        void* o_data, int o_type,
+        std::int64_t o_ne0, std::int64_t o_ne1, std::int64_t o_bytes,
+        float* k_cache_data, float* v_cache_data,
+        int num_heads, int num_kv_heads,
+        int max_seq_len, int position,
+        float eps, float rope_base, float rope_freq_scale,
+        int rope_mode)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (residual_data == nullptr || attn_norm_data == nullptr ||
+            qkv_data == nullptr || q_norm_data == nullptr || k_norm_data == nullptr ||
+            o_data == nullptr || k_cache_data == nullptr || v_cache_data == nullptr)
+        {
+            set_last_error("Null pointer passed to Qwen3.5 attention layer decode kernel.");
+            return 0;
+        }
+        if (num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || max_seq_len <= 0 || position < 0)
+        {
+            set_last_error("Invalid dimensions passed to Qwen3.5 attention layer decode kernel.");
+            return 0;
+        }
+
+        const int qDim = num_heads * head_dim;          // post-deinterleave Q dim
+        const int qFullDim = qDim * 2;                  // pre-deinterleave Q+gate dim
+        const int kDim = num_kv_heads * head_dim;
+        const int totalSeqLen = position + 1;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const int attnKvLen = flash_attn_kv_length(totalSeqLen, max_seq_len, head_dim);
+        std::vector<ggml_fp16_t> attn_mask_data;
+
+        const std::size_t ctx_size = 2 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for Qwen3.5 attention layer decode.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        // Inputs / outputs
+        ggml_tensor* residual_in   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* attn_norm_w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* q_norm_w      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* k_norm_w      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* qkv_w         = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type), qkv_ne0, qkv_ne1);
+        ggml_tensor* o_w           = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type), o_ne0, o_ne1);
+        ggml_tensor* pos_tensor    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* k_cache_base  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+        ggml_tensor* v_cache_base  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, max_seq_len, num_kv_heads);
+        ggml_tensor* residual_out  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+        ggml_tensor* attn_mask = nullptr;
+        if (flash_attn_requires_masked_padding(head_dim))
+        {
+            attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+            fill_flash_attn_mask(attn_mask_data, attnKvLen, totalSeqLen);
+        }
+
+        if (residual_in == nullptr || attn_norm_w == nullptr || q_norm_w == nullptr ||
+            k_norm_w == nullptr || qkv_w == nullptr || o_w == nullptr || pos_tensor == nullptr ||
+            k_cache_base == nullptr || v_cache_base == nullptr || residual_out == nullptr)
+        {
+            set_last_error("Failed to allocate ggml tensors for Qwen3.5 attention layer decode.");
+            return 0;
+        }
+
+        // === Build computation graph ===
+
+        // 1. Attention norm: RMSNorm + element-wise scale
+        ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual_in, eps), attn_norm_w);
+
+        // 2. Fused QKV projection: [hidden] -> [qFullDim + 2*kvDim]
+        ggml_tensor* normed_2d = ggml_reshape_2d(ctx, normed, hidden_size, 1);
+        ggml_tensor* qkv_flat  = ggml_reshape_1d(
+            ctx,
+            ggml_mul_mat(ctx, qkv_w, normed_2d),
+            qFullDim + 2 * kDim);
+
+        // 3. Slice fused QKV into Q+gate, K, V
+        //    The Q part has layout [head0_Q, head0_gate, head1_Q, head1_gate, ...] in memory:
+        //    interpreted as a 3D tensor [head_dim, 2, num_heads] with row-major (C) layout
+        //    where the innermost stride is sizeof(float).
+        ggml_tensor* qg_part = ggml_view_1d(ctx, qkv_flat, qFullDim, 0);
+        ggml_tensor* k_raw   = ggml_view_1d(ctx, qkv_flat, kDim,
+            static_cast<std::size_t>(qFullDim) * sizeof(float));
+        ggml_tensor* v_raw   = ggml_view_1d(ctx, qkv_flat, kDim,
+            static_cast<std::size_t>(qFullDim + kDim) * sizeof(float));
+
+        ggml_tensor* qg_3d = ggml_reshape_3d(ctx, qg_part, head_dim, 2, num_heads);
+
+        // Q view: [head_dim, num_heads] strided (skip the gate half)
+        ggml_tensor* q_view = ggml_view_2d(
+            ctx, qg_3d, head_dim, num_heads,
+            qg_3d->nb[2], 0);
+        ggml_tensor* gate_view = ggml_view_2d(
+            ctx, qg_3d, head_dim, num_heads,
+            qg_3d->nb[2], qg_3d->nb[1]);
+
+        // We need contiguous Q for the per-head RMSNorm + RoPE that follow.
+        ggml_tensor* q_2d_raw = ggml_cont(ctx, q_view);
+        ggml_tensor* k_2d_raw = ggml_reshape_2d(ctx, k_raw, head_dim, num_kv_heads);
+
+        // 4. Per-head QK norm
+        ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d_raw, eps), q_norm_w);
+        ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d_raw, eps), k_norm_w);
+
+        // 5. RoPE (NeoX style for Qwen3.5)
+        ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, head_dim, num_heads, 1);
+        ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_normed, head_dim, num_kv_heads, 1);
+
+        ggml_tensor* q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, nullptr,
+            head_dim, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+        ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, nullptr,
+            head_dim, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+
+        // 6. Append K, V into the persistent cache at `position`
+        // q_rope: [head_dim, num_heads, 1] -> q_attn: [head_dim, 1, num_heads]
+        ggml_tensor* q_attn       = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
+        ggml_tensor* k_rope_perm  = ggml_permute(ctx, k_rope, 0, 2, 1, 3);
+        ggml_tensor* v_3d         = ggml_reshape_3d(ctx, v_raw, head_dim, num_kv_heads, 1);
+        ggml_tensor* v_perm       = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+        ggml_tensor* k_write      = ggml_cont(ctx, k_rope_perm);
+        ggml_tensor* v_write      = ggml_cont(ctx, v_perm);
+        const std::size_t kv_byte_offset =
+            static_cast<std::size_t>(position) * static_cast<std::size_t>(head_dim) * sizeof(float);
+        ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_base,
+            head_dim, 1, num_kv_heads,
+            k_cache_base->nb[1], k_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_base,
+            head_dim, 1, num_kv_heads,
+            v_cache_base->nb[1], v_cache_base->nb[2], kv_byte_offset);
+        ggml_tensor* k_cache_cpy = ggml_cpy(ctx, k_write, k_dst);
+        ggml_tensor* v_cache_cpy = ggml_cpy(ctx, v_write, v_dst);
+
+        ggml_tensor* k_full = view_kv_cache_window(ctx, k_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+        ggml_tensor* v_full = view_kv_cache_window(ctx, v_cache_base, head_dim, max_seq_len, num_kv_heads, 0, attnKvLen);
+        if (k_full == nullptr || v_full == nullptr)
+        {
+            set_last_error("Failed to create KV cache views for Qwen3.5 attention layer decode.");
+            return 0;
+        }
+
+        // 7. Flash attention (handles GQA broadcasting)
+        ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx,
+            q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
+
+        // attn_out_4d: [head_dim, num_heads, 1] -> reshape to [head_dim, num_heads]
+        ggml_tensor* attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
+
+        // 8. Sigmoid-gated mix: attn_out *= sigmoid(gate)
+        // gate_view is the strided view into the QKV output; need it contiguous for elementwise mul.
+        ggml_tensor* gate_2d = ggml_cont(ctx, gate_view);
+        ggml_tensor* gate_sig = ggml_sigmoid(ctx, gate_2d);
+        ggml_tensor* attn_gated = ggml_mul(ctx, attn_out_2d, gate_sig);
+
+        // 9. Output projection + residual: residual += matmul(attn_gated_flat, o_w)
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_gated, qDim, 1);
+        ggml_tensor* o_flat    = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, o_w, attn_flat), hidden_size);
+        ggml_tensor* result    = ggml_add(ctx, residual_in, o_flat);
+
+        ggml_tensor* out_residual = ggml_cpy(ctx, result, residual_out);
+        ggml_set_output(out_residual);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, k_cache_cpy);
+        ggml_build_forward_expand(graph, v_cache_cpy);
+        ggml_build_forward_expand(graph, out_residual);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (t == nullptr || data == nullptr)
+                return;
+
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload)
+                            upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+                    invalidate_cached_buffer(data);
+                }
+            }
+
+            if (bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cacheable, buf))
+                {
+                    if (!cacheable)
+                        ephemeral_bufs.emplace_back(buf);
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, data);
+                    if (st == GGML_STATUS_SUCCESS)
+                        return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        bind_or_mark(qkv_w,        qkv_data,        static_cast<std::size_t>(qkv_bytes), true);
+        bind_or_mark(o_w,          o_data,          static_cast<std::size_t>(o_bytes),   true);
+        bind_or_mark(attn_norm_w,  attn_norm_data,  static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+        bind_or_mark(q_norm_w,     q_norm_data,     static_cast<std::size_t>(head_dim)    * sizeof(float), true);
+        bind_or_mark(k_norm_w,     k_norm_data,     static_cast<std::size_t>(head_dim)    * sizeof(float), true);
+        bind_or_mark(k_cache_base, k_cache_data,    kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        bind_or_mark(v_cache_base, v_cache_data,    kv_cache_bytes(num_kv_heads, max_seq_len, head_dim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        if (attn_mask != nullptr && !attn_mask_data.empty())
+            bind_or_mark(attn_mask, attn_mask_data.data(), attn_mask_data.size() * sizeof(ggml_fp16_t), false);
+
+        // Bind the input residual buffer directly so that the output write goes
+        // back into the caller's memory without an explicit download. Falls back
+        // to upload+download when the host pointer is not cacheable.
+        ggml_backend_buffer_t res_in_buf = nullptr;
+        bool residual_zero_copy = try_get_host_ptr_buffer(g_backend, dev, residual_data,
+            static_cast<std::size_t>(hidden_size) * sizeof(float), false, res_in_buf);
+        if (residual_zero_copy)
+        {
+            ephemeral_bufs.emplace_back(res_in_buf);
+            ggml_status st = ggml_backend_tensor_alloc(res_in_buf, residual_in, residual_data);
+            if (st != GGML_STATUS_SUCCESS)
+                residual_zero_copy = false;
+        }
+
+        ggml_backend_buffer_t res_out_buf = nullptr;
+        bool residual_out_zero_copy = try_get_host_ptr_buffer(g_backend, dev, residual_data,
+            static_cast<std::size_t>(hidden_size) * sizeof(float), false, res_out_buf);
+        if (residual_out_zero_copy)
+        {
+            ephemeral_bufs.emplace_back(res_out_buf);
+            ggml_status st = ggml_backend_tensor_alloc(res_out_buf, residual_out, residual_data);
+            if (st != GGML_STATUS_SUCCESS)
+                residual_out_zero_copy = false;
+        }
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for Qwen3.5 attention layer decode.");
+            return 0;
+        }
+
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        if (!residual_zero_copy)
+            ggml_backend_tensor_set(residual_in, residual_data,
+                0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+
+        std::int32_t pos_val = position;
+        ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for Qwen3.5 attention layer decode.");
+            return 0;
+        }
+        ggml_backend_synchronize(g_backend);
+
+        if (!residual_out_zero_copy)
+            ggml_backend_tensor_get(residual_out, residual_data,
+                0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+}
+
+TSG_EXPORT int TSGgml_Qwen35AttentionLayerDecode(
+    float* residual_data, int hidden_size,
+    float* attn_norm_data,
+    void* qkv_data, int qkv_type, std::int64_t qkv_ne0, std::int64_t qkv_ne1, std::int64_t qkv_bytes,
+    float* q_norm_data, float* k_norm_data, int head_dim,
+    void* o_data, int o_type, std::int64_t o_ne0, std::int64_t o_ne1, std::int64_t o_bytes,
+    float* k_cache_data, float* v_cache_data,
+    int num_heads, int num_kv_heads,
+    int max_seq_len, int position,
+    float eps, float rope_base, float rope_freq_scale,
+    int rope_mode)
+{
+    try
+    {
+        return qwen35_attn_layer_decode_impl(
+            residual_data, hidden_size,
+            attn_norm_data,
+            qkv_data, qkv_type, qkv_ne0, qkv_ne1, qkv_bytes,
+            q_norm_data, k_norm_data, head_dim,
+            o_data, o_type, o_ne0, o_ne1, o_bytes,
+            k_cache_data, v_cache_data,
+            num_heads, num_kv_heads,
+            max_seq_len, position,
+            eps, rope_base, rope_freq_scale, rope_mode);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Qwen3.5 attention layer decode.");
+        return 0;
+    }
+}
+
+// ============================================================================
 // Flash attention decode (single-token, single-layer).
 //
 // Use this when the surrounding architecture pre-processes Q/K/V (e.g. fused

@@ -1,238 +1,412 @@
-﻿
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+
 namespace InferenceWeb.Tests;
 
+/// <summary>
+/// Unit tests for the conversation-level <see cref="KVCache"/> bookkeeping object.
+/// These tests intentionally exercise only the pure-data behaviour: prefix matching,
+/// truncation, append, and reuse-plan generation. They do not touch any model.
+/// </summary>
 public class KVCacheTests
 {
-    private sealed class FakeModelArchitecture : IModelArchitecture
+    [Fact]
+    public void NewCache_IsEmpty()
     {
-        public ModelConfig Config { get; init; } = new();
-        public ITokenizer Tokenizer => throw new NotSupportedException();
-        public IKVCachePolicy KVCachePolicy => DefaultKvCachePolicy.Shared;
-        public IMultimodalInjector MultimodalInjector => throw new NotSupportedException();
-        public IBackendExecutionPlan ExecutionPlan => throw new NotSupportedException();
-        public bool SupportsKVCacheTruncation { get; init; } = true;
+        var cache = new KVCache();
 
-        public float[] Forward(int[] tokens) => throw new NotSupportedException();
-        public void ResetKVCache() => throw new NotSupportedException();
-        public void TruncateKVCache(int tokenCount) => throw new NotSupportedException();
-        public void Dispose() { }
+        Assert.True(cache.IsEmpty);
+        Assert.Equal(0, cache.Count);
+        Assert.Empty(cache.Tokens);
+        Assert.Null(cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_NullCached_ReturnsZero()
+    public void RecordAppend_SingleToken_StoresTokenAndLogits()
     {
-        var newTokens = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(null, newTokens));
+        var cache = new KVCache();
+        var logits = new float[] { 0.1f, 0.2f, 0.3f };
+
+        cache.RecordAppend(42, logits);
+
+        Assert.Equal(1, cache.Count);
+        Assert.Equal(new[] { 42 }, cache.Tokens);
+        Assert.Same(logits, cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_EmptyCached_ReturnsZero()
+    public void RecordAppend_TokenList_StoresAllTokensAndLatestLogits()
     {
-        var cached = new List<int>();
-        var newTokens = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+        cache.RecordAppend(new[] { 4, 5 }, new float[] { 0.7f });
+
+        Assert.Equal(5, cache.Count);
+        Assert.Equal(new[] { 1, 2, 3, 4, 5 }, cache.Tokens);
+        Assert.Equal(new float[] { 0.7f }, cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_NullNewTokens_ReturnsZero()
+    public void RecordAppend_NullTokens_IsNoOp()
     {
-        var cached = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, null));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2 }, new float[] { 0.0f });
+
+        cache.RecordAppend((IReadOnlyList<int>?)null, new float[] { 1.0f });
+
+        Assert.Equal(2, cache.Count);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_NoCommonPrefix_ReturnsZero()
+    public void RecordAppend_NullLogits_ClearsCachedLogits()
     {
-        var cached = new List<int> { 1, 2, 3 };
-        var newTokens = new List<int> { 4, 5, 6 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(1, new float[] { 0.1f });
+        Assert.NotNull(cache.NextLogits);
+
+        cache.RecordAppend(2, null);
+
+        Assert.Equal(2, cache.Count);
+        Assert.Null(cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_IdenticalSequences_ReturnsZero()
+    public void Reset_ClearsTokensAndLogits()
     {
-        // If new tokens == cached tokens exactly, there's nothing new to forward
-        var cached = new List<int> { 1, 2, 3 };
-        var newTokens = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        cache.Reset();
+
+        Assert.True(cache.IsEmpty);
+        Assert.Null(cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_NewIsPrefixOfCached_ReturnsZero()
+    public void TruncateTo_ShorterLength_DropsTrailingTokensAndLogits()
     {
-        // New tokens are a subset of cached — nothing new to forward
-        var cached = new List<int> { 1, 2, 3, 4, 5 };
-        var newTokens = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, new float[] { 0.5f });
+
+        cache.TruncateTo(3);
+
+        Assert.Equal(3, cache.Count);
+        Assert.Equal(new[] { 1, 2, 3 }, cache.Tokens);
+        Assert.Null(cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_CachedIsPrefixOfNew_ReturnsCachedLength()
+    public void TruncateTo_SameLength_KeepsLogits()
     {
-        // Typical multi-turn: cached=[prompt1+response1], new=[prompt1+response1+user2+genPrompt]
-        var cached = new List<int> { 1, 2, 3, 4, 5 };
-        var newTokens = new List<int> { 1, 2, 3, 4, 5, 6, 7 };
-        Assert.Equal(5, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        var logits = new float[] { 0.5f };
+        cache.RecordAppend(new[] { 1, 2, 3 }, logits);
+
+        cache.TruncateTo(3);
+
+        Assert.Equal(3, cache.Count);
+        Assert.Same(logits, cache.NextLogits);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_PartialMatch_ReturnsCommonLength()
+    public void TruncateTo_Zero_EmptiesCache()
     {
-        // Cached and new diverge partway through (e.g., different template rendering)
-        var cached = new List<int> { 1, 2, 3, 10, 11 };
-        var newTokens = new List<int> { 1, 2, 3, 20, 21, 22 };
-        Assert.Equal(3, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        cache.TruncateTo(0);
+
+        Assert.True(cache.IsEmpty);
     }
 
     [Fact]
-    public void FindTokenPrefixLength_SingleTokenDifference_ReturnsZero()
+    public void TruncateTo_Negative_Throws()
     {
-        // First token differs (e.g., different BOS)
-        var cached = new List<int> { 99, 2, 3 };
-        var newTokens = new List<int> { 1, 2, 3 };
-        Assert.Equal(0, ModelService.FindTokenPrefixLength(cached, newTokens));
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2 }, null);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.TruncateTo(-1));
     }
 
     [Fact]
-    public void FindTokenPrefixLength_SimulatesMultiTurnConversation()
+    public void TruncateTo_BeyondCount_Throws()
     {
-        // Turn 1: prompt tokens [BOS=1, sys, user1, genPrompt] + generated [resp1, resp2]
-        var turn1Prompt = new List<int> { 1, 100, 200, 300 };
-        var turn1Generated = new List<int> { 500, 501 };
-        var cached = new List<int>(turn1Prompt);
-        cached.AddRange(turn1Generated);
-        // cached = [1, 100, 200, 300, 500, 501]
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2 }, null);
 
-        // Turn 2: re-tokenized prompt includes turn1 + assistant response + user2 + genPrompt
-        // The tokenizer processes the full rendered text including the assistant's raw output
-        var turn2Tokens = new List<int> { 1, 100, 200, 300, 500, 501, 600, 700, 800 };
-        // [BOS, sys, user1, genPrompt, resp1, resp2, closingTag, user2Content, genPrompt2]
-
-        int common = ModelService.FindTokenPrefixLength(cached, turn2Tokens);
-        Assert.Equal(6, common); // All of cached is a prefix
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.TruncateTo(3));
     }
 
     [Fact]
-    public void FindTokenPrefixLength_ThinkingModel_PartialMatch()
+    public void CommonPrefixLength_NoOverlap_ReturnsZero()
     {
-        // For thinking models: raw output includes <think> tags that template drops
-        // Turn 1 cached: [BOS, sys, user1, genPrompt, thinkStart, thinking, thinkEnd, content]
-        var cached = new List<int> { 1, 100, 200, 300, 50, 51, 52, 53 };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
 
-        // Turn 2 re-rendered: template renders assistant without thinking tags
-        // [BOS, sys, user1, genPrompt(which is now assistant msg opening), content, closingTag, user2, genPrompt2]
-        // The tokens diverge at position 4 (where thinking was vs where content starts)
-        var newTokens = new List<int> { 1, 100, 200, 300, 53, 600, 700, 800 };
-
-        int common = ModelService.FindTokenPrefixLength(cached, newTokens);
-        // Common prefix is 4 tokens: [1, 100, 200, 300]
-        Assert.Equal(4, common);
+        Assert.Equal(0, cache.CommonPrefixLength(new[] { 4, 5, 6 }));
     }
 
     [Fact]
-    public void FindTokenPrefixLength_ThinkingModelWithContentInContext()
+    public void CommonPrefixLength_PartialMatch_ReturnsCommonLength()
     {
-        // If we include thinking in the context, the template renders the full output
-        // Turn 1 cached: [BOS, sys, user1, genPrompt, thinkStart, thinking, thinkEnd, content]
-        var cached = new List<int> { 1, 100, 200, 300, 50, 51, 52, 53 };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, null);
 
-        // Turn 2 re-rendered with thinking in context: same tokens up to the end of cached
-        var newTokens = new List<int> { 1, 100, 200, 300, 50, 51, 52, 53, 600, 700, 800 };
-
-        int common = ModelService.FindTokenPrefixLength(cached, newTokens);
-        Assert.Equal(8, common); // Full cached is prefix
+        Assert.Equal(3, cache.CommonPrefixLength(new[] { 1, 2, 3, 99, 100 }));
     }
 
     [Fact]
-    public void ResolvePrefillChunkSize_CudaLongPrompt_UsesSafeChunkSize()
+    public void CommonPrefixLength_NewIsLonger_ReturnsCacheLength()
     {
-        int chunkSize = ModelService.ResolvePrefillChunkSize(TensorSharp.Runtime.BackendType.GgmlCuda, 11573);
-        Assert.Equal(5120, chunkSize);
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
+
+        Assert.Equal(3, cache.CommonPrefixLength(new[] { 1, 2, 3, 4, 5 }));
     }
 
     [Fact]
-    public void ResolvePrefillChunkSize_NonCudaPrompt_DoesNotChunk()
+    public void CommonPrefixLength_NewIsShorter_ReturnsNewLength()
     {
-        int chunkSize = ModelService.ResolvePrefillChunkSize(TensorSharp.Runtime.BackendType.GgmlCpu, 11573);
-        Assert.Equal(11573, chunkSize);
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, null);
+
+        Assert.Equal(2, cache.CommonPrefixLength(new[] { 1, 2 }));
     }
 
     [Fact]
-    public void DefaultKvCachePolicy_ExactMatch_ReusesFullPrompt()
+    public void CommonPrefixLength_NullOrEmpty_ReturnsZero()
     {
-        var model = new FakeModelArchitecture();
-        var cached = new List<int> { 1, 2, 3, 4 };
-        var input = new List<int> { 1, 2, 3, 4 };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
 
-        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
-
-        Assert.Equal(4, reusable);
+        Assert.Equal(0, cache.CommonPrefixLength(null));
+        Assert.Equal(0, cache.CommonPrefixLength(Array.Empty<int>()));
     }
 
     [Fact]
-    public void DefaultKvCachePolicy_MultimodalPrompt_CanStillReusePrefix()
+    public void IsPrefixOf_ExactMatch_ReturnsTrue()
     {
-        var model = new FakeModelArchitecture();
-        var cached = new List<int> { 10, 11, 12, 13 };
-        var input = new List<int> { 10, 11, 12, 13, 14, 15 };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
 
-        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: true);
-
-        Assert.Equal(4, reusable);
+        Assert.True(cache.IsPrefixOf(new[] { 1, 2, 3 }));
     }
 
     [Fact]
-    public void DefaultKvCachePolicy_NonCircularSlidingWindow_DoesNotBacktrack()
+    public void IsPrefixOf_CacheIsPrefix_ReturnsTrue()
     {
-        var model = new FakeModelArchitecture
-        {
-            Config = new ModelConfig
-            {
-                Architecture = "gptoss",
-                SlidingWindow = 128,
-                UsesCircularKvCache = false,
-            }
-        };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2 }, null);
 
-        var cached = new List<int> { 1, 2, 3, 4, 5 };
-        var input = new List<int> { 1, 2, 3, 4, 5, 6, 7 };
-
-        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
-
-        Assert.Equal(5, reusable);
+        Assert.True(cache.IsPrefixOf(new[] { 1, 2, 3, 4 }));
     }
 
     [Fact]
-    public void DefaultKvCachePolicy_CircularSlidingWindow_ReplaysWindow()
+    public void IsPrefixOf_DifferentTokens_ReturnsFalse()
     {
-        var model = new FakeModelArchitecture
-        {
-            Config = new ModelConfig
-            {
-                Architecture = "gemma4",
-                SlidingWindow = 4,
-                UsesCircularKvCache = true,
-            }
-        };
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
 
-        var cached = new List<int> { 1, 2, 3, 4, 5, 6 };
-        var input = new List<int> { 1, 2, 3, 4, 5, 6, 7, 8 };
-
-        int reusable = DefaultKvCachePolicy.Shared.ComputeReusablePrefix(model, cached, input, hasMultimodal: false);
-
-        Assert.Equal(2, reusable);
+        Assert.False(cache.IsPrefixOf(new[] { 1, 99, 3 }));
     }
 
-    [Theory]
-    [InlineData(6, 6, false, 5)]
-    [InlineData(6, 6, true, 6)]
-    [InlineData(4, 6, false, 4)]
-    [InlineData(1, 1, false, 0)]
-    public void ResolveReusablePrefixForInference_MaximizesReuseWithoutLosingLogits(
-        int reusablePrefix, int inputCount, bool hasExactCachedLogits, int expected)
+    [Fact]
+    public void IsPrefixOf_InputShorter_ReturnsFalse()
     {
-        int resolved = ModelService.ResolveReusablePrefixForInference(reusablePrefix, inputCount, hasExactCachedLogits);
-        Assert.Equal(expected, resolved);
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4 }, null);
+
+        Assert.False(cache.IsPrefixOf(new[] { 1, 2 }));
+    }
+
+    [Fact]
+    public void TryGetExactMatchLogits_ExactMatch_ReturnsLogitsCopy()
+    {
+        var cache = new KVCache();
+        var stored = new float[] { 1.0f, 2.0f };
+        cache.RecordAppend(new[] { 1, 2, 3 }, stored);
+
+        bool ok = cache.TryGetExactMatchLogits(new[] { 1, 2, 3 }, out float[] logits);
+
+        Assert.True(ok);
+        Assert.Equal(stored, logits);
+        // Returned array should be an independent copy so caller mutations don't poison the cache.
+        logits[0] = 999f;
+        Assert.Equal(1.0f, stored[0]);
+    }
+
+    [Fact]
+    public void TryGetExactMatchLogits_NoLogitsCached_ReturnsFalse()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
+
+        Assert.False(cache.TryGetExactMatchLogits(new[] { 1, 2, 3 }, out _));
+    }
+
+    [Fact]
+    public void TryGetExactMatchLogits_DifferentLength_ReturnsFalse()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        Assert.False(cache.TryGetExactMatchLogits(new[] { 1, 2 }, out _));
+        Assert.False(cache.TryGetExactMatchLogits(new[] { 1, 2, 3, 4 }, out _));
+    }
+
+    [Fact]
+    public void PlanReuse_EmptyCache_ReturnsResetForFullPrompt()
+    {
+        var cache = new KVCache();
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3, 4 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.Reset, plan.Kind);
+        Assert.Equal(4, plan.TokensToForward);
+        Assert.Equal(0, plan.ReusedPrefixLength);
+        Assert.Null(plan.CachedLogits);
+    }
+
+    [Fact]
+    public void PlanReuse_EmptyInput_ReturnsResetWithZeroForward()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(Array.Empty<int>(), supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.Reset, plan.Kind);
+        Assert.Equal(0, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_ExactMatchWithLogits_ReturnsExactMatch()
+    {
+        var cache = new KVCache();
+        var logits = new float[] { 0.5f, 0.3f };
+        cache.RecordAppend(new[] { 1, 2, 3 }, logits);
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.ExactMatch, plan.Kind);
+        Assert.Equal(0, plan.TokensToForward);
+        Assert.Equal(logits, plan.CachedLogits);
+    }
+
+    [Fact]
+    public void PlanReuse_ExactMatchWithoutLogits_ForwardsLastTokenForFreshLogits()
+    {
+        var cache = new KVCache();
+        // Logits not cached: last RecordAppend passed null
+        cache.RecordAppend(new[] { 1, 2, 3 }, null);
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.PartialReuse, plan.Kind);
+        Assert.Equal(2, plan.ReusedPrefixLength);
+        Assert.Equal(1, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_PartialMatch_TruncatableModel_ReturnsPartialReuse()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3, 99, 100 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.PartialReuse, plan.Kind);
+        Assert.Equal(3, plan.ReusedPrefixLength);
+        Assert.Equal(2, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_CacheIsPrefixOfInput_ReusesCacheLength()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3, 4, 5 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.PartialReuse, plan.Kind);
+        Assert.Equal(3, plan.ReusedPrefixLength);
+        Assert.Equal(2, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_PartialMatch_NonTruncatableModel_ReturnsReset()
+    {
+        // For recurrent / SSM models (Qwen3.5, Nemotron-H) we cannot rewind state to an
+        // earlier position, so any divergence forces a full reset.
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3, 99, 100 }, supportsTruncation: false);
+
+        Assert.Equal(ReusePlanKind.Reset, plan.Kind);
+        Assert.Equal(5, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_CacheIsPrefixOfInput_NonTruncatableModel_ReusesCache()
+    {
+        // Recurrent models can still reuse the cache when the new input is an EXTENSION
+        // of the cached prefix (no rewind required).
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3, 4, 5, 6 }, supportsTruncation: false);
+
+        Assert.Equal(ReusePlanKind.PartialReuse, plan.Kind);
+        Assert.Equal(3, plan.ReusedPrefixLength);
+        Assert.Equal(3, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_NoCommonPrefix_ReturnsReset()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 99, 100 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.Reset, plan.Kind);
+        Assert.Equal(2, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_FirstTokenDiffers_ReturnsReset()
+    {
+        // Different BOS / system prompt → no usable prefix at all.
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 99, 2, 3, 4 }, supportsTruncation: true);
+
+        Assert.Equal(ReusePlanKind.Reset, plan.Kind);
+        Assert.Equal(4, plan.TokensToForward);
+    }
+
+    [Fact]
+    public void PlanReuse_NewInputShorterThanCache_TruncatableTreatsAsPartialReuse()
+    {
+        var cache = new KVCache();
+        cache.RecordAppend(new[] { 1, 2, 3, 4, 5 }, new float[] { 0.5f });
+
+        var plan = cache.PlanReuse(new[] { 1, 2, 3 }, supportsTruncation: true);
+
+        // Input matches the first 3 tokens of cache. Since input == 3 tokens and cache
+        // has matching tokens for the entire input, common == input.Count. We back off
+        // by one to ensure we forward at least one token to get fresh logits.
+        Assert.Equal(ReusePlanKind.PartialReuse, plan.Kind);
+        Assert.Equal(2, plan.ReusedPrefixLength);
+        Assert.Equal(1, plan.TokensToForward);
     }
 }
-

@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -39,6 +39,18 @@ namespace TensorSharp.Runtime
         /// Thinking/reasoning content produced by the model in this message.
         /// </summary>
         public string Thinking { get; set; }
+        /// <summary>
+        /// Raw output tokens produced directly by the model when this assistant message
+        /// was generated (in generation order, INCLUDING any thinking/reasoning tokens
+        /// and EXCLUDING the EOS token that terminated generation).
+        ///
+        /// When present, the KV cache prompt renderer splices these tokens directly into
+        /// the rendered token sequence instead of re-tokenizing the assistant content.
+        /// This guarantees that re-rendering the conversation produces a token sequence
+        /// whose prefix exactly matches what the model previously generated, enabling
+        /// reliable KV cache reuse across turns.
+        /// </summary>
+        public List<int> RawOutputTokens { get; set; }
     }
 
     public static class ChatTemplate

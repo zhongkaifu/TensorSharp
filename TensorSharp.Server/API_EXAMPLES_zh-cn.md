@@ -1,42 +1,42 @@
-﻿# TensorSharp.Server API Examples
+# TensorSharp.Server API 示例
 
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
-TensorSharp.Server provides three API styles plus a few utility endpoints:
-- **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
-- **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
-- **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`, `/api/upload`)
-- **Utilities** (`/api/version`, `/api/queue/status`)
+TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
+- **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`）
+- **兼容 OpenAI**（`/v1/chat/completions`、`/v1/models`）
+- **Web UI**（`/api/chat`、`/api/models`、`/api/models/load`、`/api/upload`）
+- **工具型接口**（`/api/version`、`/api/queue/status`）
 
-Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The Web UI and compatibility endpoints expose only that hosted model; `/api/models/load` can reload it, but it does not switch to arbitrary files at runtime.
+启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` 指定多模态投影器。Web UI 与兼容接口仅暴露这一个承载模型；`/api/models/load` 可以重新加载它，但不会在运行时切换到任意其他文件。
 
-## Starting the Server
+## 启动服务
 
 ```bash
-# Text-only model
+# 仅文本模型
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal
 
-# Multimodal model (explicit projector)
+# 多模态模型（显式指定投影器）
 ./TensorSharp.Server --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
     --mmproj ~/work/model/gemma-4-mmproj-F16.gguf --backend ggml_metal
 
-# Override default request budget (used when a request omits max_tokens / num_predict)
+# 覆盖默认请求 token 上限（请求未提供 max_tokens / num_predict 时使用）
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-The server starts on `http://localhost:5000` (override with the standard ASP.NET Core `PORT` / `ASPNETCORE_URLS` environment variables).
+服务默认监听 `http://localhost:5000`（可通过 ASP.NET Core 标准的 `PORT` / `ASPNETCORE_URLS` 环境变量覆盖）。
 
 ---
 
-## 1. Ollama-compatible API
+## 1. 兼容 Ollama 的 API
 
-### List Models
+### 列出模型
 
 ```bash
 curl http://localhost:5000/api/tags
 ```
 
-Response:
+响应：
 ```json
 {
   "models": [
@@ -45,7 +45,7 @@ Response:
 }
 ```
 
-### Show Model Info
+### 查看模型信息
 
 ```bash
 curl -X POST http://localhost:5000/api/show \
@@ -53,7 +53,7 @@ curl -X POST http://localhost:5000/api/show \
   -d '{"model": "Qwen3-4B-Q8_0.gguf"}'
 ```
 
-### Generate (non-streaming)
+### 生成（非流式）
 
 ```bash
 curl -X POST http://localhost:5000/api/generate \
@@ -70,7 +70,7 @@ curl -X POST http://localhost:5000/api/generate \
   }'
 ```
 
-Response:
+响应：
 ```json
 {
   "model": "Qwen3-4B-Q8_0.gguf",
@@ -86,7 +86,7 @@ Response:
 }
 ```
 
-### Generate (streaming)
+### 生成（流式）
 
 ```bash
 curl -X POST http://localhost:5000/api/generate \
@@ -99,7 +99,7 @@ curl -X POST http://localhost:5000/api/generate \
   }'
 ```
 
-Each line is a JSON object (newline-delimited JSON):
+每一行都是一条 JSON（newline-delimited JSON）：
 ```
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"Why","done":false}
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":" did","done":false}
@@ -107,9 +107,9 @@ Each line is a JSON object (newline-delimited JSON):
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"","done":true,"done_reason":"stop","total_duration":...,"eval_count":...}
 ```
 
-### Generate with Image (multimodal)
+### 带图片的生成（多模态）
 
-Images are sent as base64-encoded bytes in the `images` array:
+图片以 base64 字节序列传入 `images` 数组：
 
 ```bash
 IMG_B64=$(base64 < photo.png)
@@ -124,7 +124,7 @@ curl -X POST http://localhost:5000/api/generate \
   }"
 ```
 
-### Chat (non-streaming)
+### 聊天（非流式）
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -140,7 +140,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }'
 ```
 
-Response:
+响应：
 ```json
 {
   "model": "Qwen3-4B-Q8_0.gguf",
@@ -156,7 +156,7 @@ Response:
 }
 ```
 
-### Chat (streaming)
+### 聊天（流式）
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -169,7 +169,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }'
 ```
 
-### Chat with Multi-turn History
+### 多轮聊天
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -186,7 +186,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }'
 ```
 
-### Chat with Image (multimodal)
+### 带图片的聊天（多模态）
 
 ```bash
 IMG_B64=$(base64 < photo.png)
@@ -204,9 +204,9 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }"
 ```
 
-### Chat with Thinking / Reasoning Mode
+### 聊天 + 思维链 / 推理模式
 
-Thinking-capable architectures (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H) accept `"think": true` and split chain-of-thought from the visible response:
+支持思维链的架构（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）可接受 `"think": true`，并将思考过程与可见回答分开返回：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -220,7 +220,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }'
 ```
 
-The response carries the chain-of-thought separately in `message.thinking`:
+响应中思维过程位于 `message.thinking`：
 
 ```json
 {
@@ -234,9 +234,9 @@ The response carries the chain-of-thought separately in `message.thinking`:
 }
 ```
 
-### Chat with Tool Calling
+### 聊天 + 工具调用
 
-Define tools in the same shape as Ollama's tool API. The server detects the architecture's wire format (e.g. `<tool_call>...</tool_call>` for Qwen / Nemotron-H, `<|tool_call>...<tool_call|>` for Gemma 4) and parses them into structured `tool_calls`:
+工具按 Ollama tool API 的形式定义。服务端会根据当前架构识别工具调用的线协议（如 Qwen / Nemotron-H 使用 `<tool_call>...</tool_call>`，Gemma 4 使用 `<|tool_call>...<tool_call|>`），并解析为结构化的 `tool_calls`：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -248,11 +248,11 @@ curl -X POST http://localhost:5000/api/chat/ollama \
       "type": "function",
       "function": {
         "name": "get_weather",
-        "description": "Get current weather for a city.",
+        "description": "获取某城市的当前天气。",
         "parameters": {
           "type": "object",
           "properties": {
-            "city":  {"type": "string", "description": "Target city"},
+            "city":  {"type": "string", "description": "目标城市"},
             "units": {"type": "string", "enum": ["c", "f"]}
           },
           "required": ["city"]
@@ -264,7 +264,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   }'
 ```
 
-The response shape (when the model decides to call the tool):
+模型决定调用工具时的响应：
 
 ```json
 {
@@ -283,19 +283,19 @@ The response shape (when the model decides to call the tool):
 }
 ```
 
-Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again.
+继续会话时，把 assistant 的 tool call 与一条 `role: "tool"` 的消息（包含函数返回结果）追加到 messages，再次请求 `/api/chat/ollama` 即可。
 
 ---
 
-## 2. OpenAI-compatible API
+## 2. 兼容 OpenAI 的 API
 
-### List Models
+### 列出模型
 
 ```bash
 curl http://localhost:5000/v1/models
 ```
 
-Response:
+响应：
 ```json
 {
   "object": "list",
@@ -305,7 +305,7 @@ Response:
 }
 ```
 
-### Chat Completions (non-streaming)
+### Chat Completions（非流式）
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -321,7 +321,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }'
 ```
 
-Response:
+响应：
 ```json
 {
   "id": "chatcmpl-abc123...",
@@ -341,7 +341,7 @@ Response:
 }
 ```
 
-### Chat Completions (streaming)
+### Chat Completions（流式）
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -354,7 +354,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }'
 ```
 
-Each chunk is sent as SSE:
+每个 chunk 以 SSE 形式发送：
 ```
 data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
 
@@ -365,7 +365,7 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model
 data: [DONE]
 ```
 
-### Chat Completions with JSON mode
+### Chat Completions + JSON 模式
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -380,7 +380,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }'
 ```
 
-Response:
+响应：
 ```json
 {
   "choices": [{
@@ -393,9 +393,9 @@ Response:
 }
 ```
 
-### Chat Completions with Structured Outputs (`json_schema`)
+### Chat Completions + 结构化输出（`json_schema`）
 
-TensorSharp.Server accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, and validates the final output before returning it.
+TensorSharp.Server 接收 OpenAI Chat Completions 的 `response_format` 形式，会向 prompt 中注入严格 JSON 指令，并在返回前对最终输出进行校验。
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -433,7 +433,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }'
 ```
 
-Response:
+响应：
 ```json
 {
   "choices": [{
@@ -446,7 +446,7 @@ Response:
 }
 ```
 
-### Chat Completions with Image (multimodal, OpenAI format)
+### Chat Completions + 图片（多模态，OpenAI 格式）
 
 ```bash
 IMG_B64=$(base64 < photo.png)
@@ -465,7 +465,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }"
 ```
 
-### Chat Completions with Tool Calling
+### Chat Completions + 工具调用
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -477,7 +477,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
       "type": "function",
       "function": {
         "name": "get_weather",
-        "description": "Get current weather for a city.",
+        "description": "获取某城市的当前天气。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -492,7 +492,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }'
 ```
 
-When the model emits a tool call the response uses OpenAI-style fields:
+模型发出工具调用时，响应使用 OpenAI 风格字段：
 
 ```json
 {
@@ -514,60 +514,60 @@ When the model emits a tool call the response uses OpenAI-style fields:
 }
 ```
 
-Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_id": "...", "content": "..."}` message to continue the loop.
+将 assistant 的 `tool_calls` 与一条 `{"role": "tool", "tool_call_id": "...", "content": "..."}` 消息追加到 messages，即可继续工具循环。
 
-### Utilities
+### 工具型接口
 
 ```bash
-# Inference queue snapshot (busy flag, pending requests, total processed)
+# 推理队列快照（busy 标志、待处理请求数、累计处理数）
 curl http://localhost:5000/api/queue/status
 
-# Server version
+# 服务版本
 curl http://localhost:5000/api/version
 
-# Hosted model + supported backends + default settings
+# 承载模型 + 可用后端 + 默认设置
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`.
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。
 
 ---
 
-## 3. Sampling Options
+## 3. 采样选项
 
-### Ollama-style options (inside `options` object)
+### Ollama 风格选项（位于 `options` 对象中）
 
-| Parameter          | Type    | Default | Description                            |
+| 参数               | 类型    | 默认值  | 描述                                   |
 | ------------------ | ------- | ------- | -------------------------------------- |
-| `num_predict`      | int     | 200     | Maximum tokens to generate             |
-| `temperature`      | float   | 0       | Sampling temperature (0 = greedy)      |
-| `top_k`            | int     | 0       | Top-K filtering (0 = disabled)         |
-| `top_p`            | float   | 1.0     | Nucleus sampling threshold             |
-| `min_p`            | float   | 0       | Minimum probability filtering          |
-| `repeat_penalty`   | float   | 1.0     | Repetition penalty                     |
-| `presence_penalty` | float   | 0       | Presence penalty                       |
-| `frequency_penalty`| float   | 0       | Frequency penalty                      |
-| `seed`             | int     | -1      | Random seed (-1 = random)              |
-| `stop`             | array   | null    | Stop sequences                         |
+| `num_predict`      | int     | 200     | 生成的最大 token 数                    |
+| `temperature`      | float   | 0       | 采样温度（0 = 贪心）                   |
+| `top_k`            | int     | 0       | Top-K 过滤（0 = 关闭）                 |
+| `top_p`            | float   | 1.0     | 核采样阈值                             |
+| `min_p`            | float   | 0       | 最小概率过滤                           |
+| `repeat_penalty`   | float   | 1.0     | 重复惩罚                               |
+| `presence_penalty` | float   | 0       | 出现惩罚                               |
+| `frequency_penalty`| float   | 0       | 频率惩罚                               |
+| `seed`             | int     | -1      | 随机种子（-1 = 不指定）                |
+| `stop`             | array   | null    | 停止序列                               |
 
-### OpenAI-style options (top-level)
+### OpenAI 风格选项（位于顶层）
 
-| Parameter           | Type        | Default | Description                        |
-| ------------------- | ----------- | ------- | ---------------------------------- |
-| `max_tokens`        | int         | 200     | Maximum tokens to generate         |
-| `temperature`       | float       | 0       | Sampling temperature               |
-| `top_p`             | float       | 1.0     | Nucleus sampling threshold         |
-| `presence_penalty`  | float       | 0       | Presence penalty                   |
-| `frequency_penalty` | float       | 0       | Frequency penalty                  |
-| `seed`              | int         | -1      | Random seed                        |
-| `stop`              | string/array| null    | Stop sequences                     |
-| `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
+| 参数                | 类型        | 默认值  | 描述                                |
+| ------------------- | ----------- | ------- | ----------------------------------- |
+| `max_tokens`        | int         | 200     | 生成的最大 token 数                 |
+| `temperature`       | float       | 0       | 采样温度                            |
+| `top_p`             | float       | 1.0     | 核采样阈值                          |
+| `presence_penalty`  | float       | 0       | 出现惩罚                            |
+| `frequency_penalty` | float       | 0       | 频率惩罚                            |
+| `seed`              | int         | -1      | 随机种子                            |
+| `stop`              | string/array| null    | 停止序列                            |
+| `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
 
 ---
 
-## 4. Python Client Examples
+## 4. Python 客户端示例
 
-### Using `requests` (Ollama-style)
+### 使用 `requests`（Ollama 风格）
 
 ```python
 import requests
@@ -585,7 +585,7 @@ resp = requests.post(url, json=payload)
 print(resp.json()["response"])
 ```
 
-### Streaming with `requests` (Ollama-style)
+### 使用 `requests` 流式（Ollama 风格）
 
 ```python
 import requests
@@ -609,7 +609,7 @@ with requests.post(url, json=payload, stream=True) as resp:
                 print(f"\n[Done: {data['eval_count']} tokens]")
 ```
 
-### Using `openai` Python SDK
+### 使用 `openai` Python SDK
 
 ```python
 from openai import OpenAI
@@ -629,7 +629,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-### Using `openai` Python SDK with structured outputs
+### 使用 `openai` Python SDK + 结构化输出
 
 ```python
 from openai import OpenAI
@@ -665,7 +665,7 @@ payload = json.loads(response.choices[0].message.content)
 print(payload["city"], payload["country"], payload["confidence"])
 ```
 
-### Streaming with `openai` Python SDK
+### 使用 `openai` Python SDK 流式
 
 ```python
 from openai import OpenAI
@@ -685,17 +685,17 @@ for chunk in stream:
 print()
 ```
 
-Notes:
+注意事项：
 
-- `response_format.type = "json_schema"` currently cannot be combined with `tools` or `think`.
-- Streaming structured-output requests are buffered and validated before chunks are emitted.
-- Invalid schemas return HTTP `400`; model responses that still fail validation return HTTP `422`.
+- `response_format.type = "json_schema"` 当前不能与 `tools` 或 `think` 同时使用。
+- 流式结构化输出请求会先在服务端缓存并校验，再以 chunk 形式发出。
+- 非法 schema 返回 HTTP `400`；模型输出未能通过校验则返回 HTTP `422`。
 
 ---
 
-## 5. Running Test Requests
+## 5. 运行示例请求
 
-The `test_requests.jsonl` file contains sample requests for all endpoints. Run them with:
+`test_requests.jsonl` 文件包含针对所有接口的示例请求。可通过下面的脚本批量运行：
 
 ```bash
 while IFS= read -r line; do
@@ -714,4 +714,3 @@ while IFS= read -r line; do
   echo -e "\n"
 done < test_requests.jsonl
 ```
-
