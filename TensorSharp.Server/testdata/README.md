@@ -1,5 +1,7 @@
 # TensorSharp.Server Integration Tests
 
+[English](README.md) | [中文](README_zh-cn.md)
+
 Two test suites exercise TensorSharp.Server's current public compatibility surface:
 
 - Web UI SSE: `/api/chat`

@@ -482,6 +482,19 @@ internal enum GgmlIndexReductionOp
             float scale);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35AttentionLayerDecode(
+            IntPtr residualData, int hiddenSize,
+            IntPtr attnNormData,
+            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormData, IntPtr kNormData, int headDim,
+            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int numKvHeads,
+            int maxSeqLen, int position,
+            float eps, float ropeBase, float ropeFreqScale,
+            int ropeMode);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -1016,6 +1029,30 @@ internal enum GgmlIndexReductionOp
                 outData,
                 numHeads, numKvHeads, headDim,
                 maxSeqLen, position, scale), "flash_attn_decode");
+        }
+
+        public static void Qwen35AttentionLayerDecode(
+            IntPtr residualData, int hiddenSize,
+            IntPtr attnNormData,
+            IntPtr qkvData, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormData, IntPtr kNormData, int headDim,
+            IntPtr oData, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int numKvHeads,
+            int maxSeqLen, int position,
+            float eps, float ropeBase, float ropeFreqScale,
+            int ropeMode)
+        {
+            CheckResult(TSGgml_Qwen35AttentionLayerDecode(
+                residualData, hiddenSize,
+                attnNormData,
+                qkvData, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qNormData, kNormData, headDim,
+                oData, oType, oNe0, oNe1, oBytes,
+                kCacheData, vCacheData,
+                numHeads, numKvHeads,
+                maxSeqLen, position,
+                eps, ropeBase, ropeFreqScale, ropeMode), "qwen35_attention_layer_decode");
         }
 
         public static void TransformerModelDecode(

@@ -68,9 +68,9 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 
 | 后端 | 参数 | 说明 |
 |---|---|---|
-| GGML Metal | `--backend ggml_metal` | 通过 Apple Metal（macOS）进行 GPU 加速。推荐用于 Apple Silicon。 |
-| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Linux + NVIDIA GPU 上进行加速。 |
-| GGML CPU | `--backend ggml_cpu` | 使用原生 GGML 与优化内核进行 CPU 推理。 |
+| GGML Metal | `--backend ggml_metal` | 通过 Apple Metal（macOS）进行 GPU 加速。推荐用于 Apple Silicon。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
+| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
+| GGML CPU | `--backend ggml_cpu` | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
 | 纯 C# CPU | `--backend cpu` | 无原生依赖的可移植 CPU 推理。 |
 
 ## 项目结构
@@ -480,13 +480,41 @@ TensorSharp 采用分层系统结构：
 
 - **融合 GPU decode**（Gemma 4）：在 Metal 上将所有 Transformer 层合并为单次 GGML 计算图调度，将每个 token 的 CPU-GPU 往返从数百次降低到一次。相较逐算子调度约提升 2.6 倍。
 - **整模型原生 decode**（Qwen 3）：所有 Transformer 层在一次原生调用（`TransformerModelDecode`）中完成，每层权重指针在加载阶段预解析并缓存，从 decode 热点路径中移除托管循环开销。
+- **融合 Qwen 3.5 attention 层 decode**：单次 GGML 计算图为每个 FullAttention 层完成 RMSNorm + 融合 QKV + Q/gate 反交错 + 每头 QK norm + RoPE + KV 缓存追加 + flash attention + sigmoid 门控混合 + 输出投影 + 残差加法。替换了原本每层 ~2 次独立 GGML 调用与 ~6 个小型 CPU/GPU 同步点。当缓存序列长度超过 4096 token 时启用（可通过 `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖）。
 - **融合权重投影**：Q/K/V 投影融合为单次 QKV matmul；gate 与 up 投影融合为单次 gate_up matmul。
-- **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0、MXFP4 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。批量 `AddmmQuantBatch` 内核可在一次调度内完成对同一量化权重块的多个子矩阵 matmul。
+- **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。批量 `AddmmQuantBatch` 内核可在一次调度内完成对同一量化权重块的多个子矩阵 matmul。
 - **批量 GPU MoE**：`MoEExpertsSwiGLUResidual`（Qwen 3.5）和 `MoEExpertsForward`（Nemotron-H）将每个 MoE 层中所有被选中的专家——以及 Qwen 3.5 中可选的 shared expert 与残差加法——合并为一次 GGML 计算图调度。
+- **基于 GEMM 的视觉 patch embedding**（Qwen 3.5）：将 patch embedding 重构为并行 im2col + 矩阵乘法，把单线程标量五重嵌套循环替换为可在 GPU 上加速的 matmul。
 - **优化后的纯 C# CPU 路径**：托管 GEMM 快速路径和连续 Float32 内核加速了 decode、softmax、RMSNorm、RoPE、融合激活等热点路径，同时在 CPU 加载时保持量化 GGUF 权重压缩状态。
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
 - **KV 缓存前缀复用**：多轮对话会复用各轮之间最长的匹配 token 前缀。对 SWA 模型，截断会自动按滑动窗口大小回退，使后缀部分可以重建 SWA 上下文。
-- **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管内存分配。
+
+### 内存优化
+
+- **零拷贝文件映射量化权重**（CUDA、Metal、GGML CPU）：GGUF 模型文件以内存映射方式打开，量化张量通过 host 指针缓冲区直接绑定到原生算子。这样省去了之前每张张量从磁盘复制到新分配原生堆缓冲区的过程——这一过程在 Apple Silicon 上会让大型量化模型的常驻内存几乎翻倍。例如，`Qwen3.5-35B-A3B-IQ2_XXS`（约 10 GB GGUF）在 Metal 后端的实际工作内存峰值从约 17 GB 降至约 7 GB。映射文件由操作系统的页缓存管理，必要时可换出，且在 Apple Silicon（统一内存）上不会带来推理性能损失。
+- **最佳匹配内存池**：GGML 主机分配器使用 best-fit 而非 first-fit 在已池化块中检索可重用空间，避免把大块草稿内存交给小型中间张量请求，从而把工作集严格控制在合理范围内。
+- **有界池保留量**：集成 GPU / CPU 内存池现在将单个保留块上限设为 64 MB，整池上限设为 32 块。结合 mmap 后的权重，可在快速复用短生命中间张量的同时限制峰值常驻内存。
+- **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管分配。F32 权重与 norm 仍按需加载；量化权重在受支持的后端上通过 mmap 方式绑定。
+
+## 性能数据
+
+在 `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`（磁盘约 10 GB；256 个路由专家，每 token 激活 8 个；12 个全注意力层 + 30 个 GatedDeltaNet 循环层）上，Apple M4 Pro（24 GB 统一内存）的参考结果：
+
+| 指标 | 优化前（`v1` 基线） | 优化后（当前分支） | 变化 |
+|---|---|---|---|
+| 进程峰值内存占用 | ~17 GB | **~8 GB** | **-52%** |
+| TensorSharp.Server 加载后常驻内存 | ~20 GB | **~8 GB** | **-60%** |
+| Decode 吞吐（warm，prefill 256 / decode 64，M4 Pro） | ~3.8 tok/s | **~10.8 tok/s** | **+2.85x** |
+| Decode 延迟（warm，prefill 256 / decode 64，M4 Pro） | ~264 ms/token | **~92 ms/token** | **-65%** |
+
+复现命令：
+
+```bash
+./TensorSharp.Cli --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 64 --bench-runs 3
+```
+
+内存节省主要来自不再把 GGUF 模型文件复制到独立的原生堆缓冲区（现在文件是以 mmap 方式零拷贝绑定到 Metal command buffer 中）。Decode 吞吐量提升在很大程度上也是消除约 10 GB 重复工作集的副效应——这部分重复占用此前会在仅有 24 GB 或更少物理内存的机器上触发系统级内存压力。
 
 ## 测试
 

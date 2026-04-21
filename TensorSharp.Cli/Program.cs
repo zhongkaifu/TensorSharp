@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -46,6 +46,8 @@ namespace TensorSharp.Cli
             int benchmarkPrefill = 32;
             int benchmarkDecode = 64;
             int benchmarkRuns = 1;
+            bool runKvCacheBenchmark = false;
+            int kvCacheBenchTurns = 4;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -73,6 +75,8 @@ namespace TensorSharp.Cli
                     case "--bench-prefill": benchmarkPrefill = int.Parse(args[++i]); break;
                     case "--bench-decode": benchmarkDecode = int.Parse(args[++i]); break;
                     case "--bench-runs": benchmarkRuns = int.Parse(args[++i]); break;
+                    case "--bench-kvcache": runKvCacheBenchmark = true; break;
+                    case "--bench-kv-turns": kvCacheBenchTurns = int.Parse(args[++i]); break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -195,6 +199,12 @@ namespace TensorSharp.Cli
                 return;
             }
 
+            if (runKvCacheBenchmark)
+            {
+                RunKvCacheBenchmark(model, kvCacheBenchTurns, maxTokens, samplingConfig, enableThinking);
+                return;
+            }
+
             if (multiTurnJsonl != null)
             {
                 RunMultiTurnTest(model, multiTurnJsonl, maxTokens, samplingConfig, enableThinking);
@@ -309,9 +319,14 @@ namespace TensorSharp.Cli
 
             string[] lines = File.ReadAllLines(jsonlPath);
             var history = new List<ChatMessage>();
-            List<int> cachedTokens = null;
             string arch = model.Config.Architecture;
             int swa = model.Config.SlidingWindow;
+
+            // Conversation cache state - drives KV cache reuse across turns by tracking
+            // the canonical token sequence currently in the model and splicing the raw
+            // output tokens of past assistant turns directly into the rendered prompt.
+            var kvCache = new KVCache();
+            var renderer = new KVCachePromptRenderer(PromptRenderer);
 
             Console.WriteLine($"Multi-turn test: {lines.Length} turns, thinking={enableThinking}, SWA={swa}");
             Console.WriteLine(new string('=', 60));
@@ -323,6 +338,7 @@ namespace TensorSharp.Cli
 
                 string userMsg;
                 int turnMaxTokens = maxTokens;
+                bool forceReset = false;
                 try
                 {
                     var doc = JsonDocument.Parse(line);
@@ -330,6 +346,8 @@ namespace TensorSharp.Cli
                     userMsg = root.TryGetProperty("content", out var c) ? c.GetString() : line;
                     if (root.TryGetProperty("max_tokens", out var mt))
                         turnMaxTokens = mt.GetInt32();
+                    if (root.TryGetProperty("force_reset", out var fr))
+                        forceReset = fr.GetBoolean();
                 }
                 catch
                 {
@@ -339,67 +357,37 @@ namespace TensorSharp.Cli
                 history.Add(new ChatMessage { Role = "user", Content = userMsg });
                 Console.WriteLine($"\n[Turn {turn + 1}/{lines.Length}] User: {userMsg}");
 
-                string rendered = PromptRenderer.Render(
-                    model.Config.ChatTemplate, history, addGenerationPrompt: true,
-                    architecture: arch, enableThinking: enableThinking);
+                if (forceReset)
+                {
+                    Console.WriteLine("[KV cache] Forcing reset (per JSONL force_reset flag)");
+                    kvCache.Reset();
+                    model.ResetKVCache();
+                }
 
-                var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                var inputTokens = renderer.RenderToTokens(
+                    model.Tokenizer,
+                    model.Config.ChatTemplate,
+                    history,
+                    arch,
+                    addGenerationPrompt: true,
+                    enableThinking: enableThinking);
+
                 Console.WriteLine($"Prompt: {inputTokens.Count} tokens");
 
-                bool forceReset = false;
-                try
-                {
-                    var doc2 = JsonDocument.Parse(lines[turn].Trim());
-                    forceReset = doc2.RootElement.TryGetProperty("force_reset", out var fr) && fr.GetBoolean();
-                }
-                catch { }
+                var sw = Stopwatch.StartNew();
+                ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
+                float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens);
+                double prefillMs = sw.Elapsed.TotalMilliseconds;
 
-                int commonPrefix = 0;
-                if (!forceReset && cachedTokens != null && model.SupportsKVCacheTruncation)
-                {
-                    int raw = 0;
-                    int maxLen = Math.Min(cachedTokens.Count, inputTokens.Count);
-                    for (int k = 0; k < maxLen; k++)
-                    {
-                        if (cachedTokens[k] != inputTokens[k]) break;
-                        raw++;
-                    }
-
-                    // For SWA models, back up by slidingWindow so the suffix
-                    // re-processes enough tokens to rebuild the SWA cache.
-                    if (swa > 0 && raw > 0)
-                    {
-                        int backed = Math.Max(0, raw - swa);
-                        Console.WriteLine($"[KV cache] SWA back-up: raw prefix {raw} -> {backed} (window={swa})");
-                        raw = backed;
-                    }
-
-                    if (raw >= 4 && (double)raw / inputTokens.Count >= 0.10)
-                    {
-                        commonPrefix = raw;
-                    }
-                }
-
-                float[] logits;
-                if (commonPrefix > 0)
-                {
-                    model.TruncateKVCache(commonPrefix);
-                    var suffix = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
-                    Console.WriteLine($"[KV cache] Reusing {commonPrefix} tokens, forwarding {suffix.Length} new tokens");
-                    logits = model.ForwardRefill(suffix);
-                }
-                else
-                {
-                    Console.WriteLine("[KV cache] Full reset");
-                    model.ResetKVCache();
-                    logits = model.Forward(inputTokens.ToArray());
-                }
+                Console.WriteLine($"[KV cache] {DescribePlan(plan, inputTokens.Count)}");
+                Console.WriteLine($"Prefill: {prefillMs:F1} ms");
 
                 var cfg = sampling ?? SamplingConfig.Greedy;
                 var sampler = new TokenSampler(cfg);
                 var generatedTokens = new List<int>();
                 var sb = new StringBuilder();
 
+                var decodeSw = Stopwatch.StartNew();
                 for (int step = 0; step < turnMaxTokens; step++)
                 {
                     int nextToken = sampler.Sample(logits, generatedTokens);
@@ -409,11 +397,9 @@ namespace TensorSharp.Cli
                     sb.Clear();
                     sb.Append(decoded);
                     logits = model.Forward(new[] { nextToken });
+                    kvCache.RecordAppend(nextToken, logits);
                 }
-
-                cachedTokens = new List<int>(inputTokens.Count + generatedTokens.Count);
-                cachedTokens.AddRange(inputTokens);
-                cachedTokens.AddRange(generatedTokens);
+                double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
 
                 string rawOutput = sb.ToString();
 
@@ -427,6 +413,7 @@ namespace TensorSharp.Cli
                     Console.WriteLine($"[Thinking] ({thinking.Length} chars): {(thinking.Length > 200 ? thinking.Substring(0, 200) + "..." : thinking)}");
 
                 Console.WriteLine($"[Content] ({content.Length} chars, {generatedTokens.Count} tokens): {(content.Length > 500 ? content.Substring(0, 500) + "..." : content)}");
+                Console.WriteLine($"Decode: {decodeMs:F0} ms ({generatedTokens.Count / (decodeMs / 1000.0):F1} tok/s)");
 
                 bool hasUnused = rawOutput.Contains("<unused");
                 if (hasUnused)
@@ -436,11 +423,69 @@ namespace TensorSharp.Cli
                     break;
                 }
 
-                history.Add(new ChatMessage { Role = "assistant", Content = content });
+                // Append the assistant turn to the history with raw output tokens so the
+                // NEXT turn's renderer can splice them in instead of re-tokenizing.
+                history.Add(new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = content,
+                    Thinking = thinking,
+                    RawOutputTokens = generatedTokens,
+                });
             }
 
             Console.WriteLine(new string('=', 60));
             Console.WriteLine($"Multi-turn test completed: {history.Count / 2} turns");
+        }
+
+        /// <summary>
+        /// Apply a <see cref="ReusePlan"/> to bring the model's KV state up to date and
+        /// return next-token logits. Mirrors the orchestration logic used by ModelService.
+        /// </summary>
+        static float[] ApplyReusePlan(ModelBase model, KVCache kvCache, ReusePlan plan, List<int> inputTokens)
+        {
+            switch (plan.Kind)
+            {
+                case ReusePlanKind.ExactMatch:
+                    return plan.CachedLogits;
+
+                case ReusePlanKind.PartialReuse:
+                {
+                    int reused = plan.ReusedPrefixLength;
+                    int suffixLength = plan.TokensToForward;
+                    model.TruncateKVCache(reused);
+                    kvCache.TruncateTo(reused);
+
+                    var suffix = new int[suffixLength];
+                    for (int i = 0; i < suffixLength; i++)
+                        suffix[i] = inputTokens[reused + i];
+                    float[] logits = model.ForwardRefill(suffix);
+                    kvCache.RecordAppend(suffix, logits);
+                    return logits;
+                }
+
+                case ReusePlanKind.Reset:
+                default:
+                {
+                    model.ResetKVCache();
+                    kvCache.Reset();
+                    var allTokens = inputTokens.ToArray();
+                    float[] logits = model.Forward(allTokens);
+                    kvCache.RecordAppend(allTokens, logits);
+                    return logits;
+                }
+            }
+        }
+
+        static string DescribePlan(ReusePlan plan, int totalTokens)
+        {
+            return plan.Kind switch
+            {
+                ReusePlanKind.ExactMatch => $"Exact match: reusing all {totalTokens} cached tokens (saved 100%)",
+                ReusePlanKind.PartialReuse => $"Partial reuse: keeping {plan.ReusedPrefixLength}/{totalTokens} tokens, forwarding {plan.TokensToForward} new (saved {100.0 * plan.ReusedPrefixLength / totalTokens:F0}%)",
+                ReusePlanKind.Reset => $"Full reset: forwarding {plan.TokensToForward} tokens",
+                _ => "(unknown plan)",
+            };
         }
 
         static void RunJsonlBatch(ModelBase model, string inputJsonlPath, string outputFile, int defaultMaxTokens,
@@ -1262,6 +1307,168 @@ namespace TensorSharp.Cli
                 }
             }
             return idx;
+        }
+
+        /// <summary>
+        /// Multi-turn first-token-latency benchmark.
+        ///
+        /// Simulates a conversation of <paramref name="turns"/> user turns. Each turn
+        /// generates <paramref name="maxTokens"/> tokens. We measure the prefill time of
+        /// each turn under TWO modes back-to-back, on the SAME model and conversation:
+        ///
+        ///   1. With KV cache reuse (the new behavior): tokens from prior turns are
+        ///      kept in the KV cache and only the new (user + generation-prompt + previous
+        ///      assistant raw tokens) suffix is forwarded.
+        ///   2. Without KV cache reuse: the model's KV cache is fully reset between
+        ///      turns and the entire prompt is re-prefilled.
+        ///
+        /// The interesting metric is the prefill latency PER TURN, since that's what the
+        /// user feels as "time to first token". KV cache reuse should bring the per-turn
+        /// prefill from O(prompt_so_far) down to O(new_user_message).
+        /// </summary>
+        static void RunKvCacheBenchmark(ModelBase model, int turns, int maxTokens,
+            SamplingConfig sampling, bool enableThinking)
+        {
+            if (turns < 2)
+                turns = 2;
+
+            string arch = model.Config.Architecture;
+            Console.WriteLine($"=== KV Cache First-Token-Latency Benchmark ({turns} turns, decode budget {maxTokens} tok/turn, arch={arch}) ===");
+
+            // The user turns are designed so that early turns establish a fairly long
+            // running context, then later turns add small follow-up questions. This is
+            // the regime where KV cache reuse pays off the most.
+            string[] userTurns = new[]
+            {
+                "Please write a detailed paragraph about the history and evolution of artificial intelligence, covering symbolic AI, expert systems, machine learning and the deep learning revolution.",
+                "Could you summarize that into three short bullet points?",
+                "Now translate the bullet points into French.",
+                "Add one more bullet point about the role of neural networks.",
+                "Translate the new bullet point into Spanish.",
+                "What was the first bullet point again?",
+                "Combine the first two bullet points into one sentence.",
+                "Explain what an LLM is in one sentence.",
+            };
+
+            int turnLimit = Math.Min(turns, userTurns.Length);
+
+            var samplerCfg = sampling ?? SamplingConfig.Greedy;
+
+            (double[] cached, int[] promptTokensCached) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: true);
+            (double[] noCache, int[] promptTokensNoCache) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: false);
+
+            Console.WriteLine();
+            Console.WriteLine("Per-turn first-token (prefill) latency:");
+            Console.WriteLine($"  {"Turn",-5} {"Prompt tok",-12} {"With KV (ms)",-15} {"No KV (ms)",-15} {"Speedup",-10}");
+            for (int i = 0; i < turnLimit; i++)
+            {
+                double speedup = cached[i] > 0 ? noCache[i] / cached[i] : 0;
+                Console.WriteLine($"  {i + 1,-5} {promptTokensCached[i],-12} {cached[i],-15:F1} {noCache[i],-15:F1} {speedup,-10:F2}x");
+            }
+
+            // Skip turn 1 in the aggregate because both paths do an unavoidable full
+            // prefill on the very first turn (no cache to reuse).
+            if (turnLimit >= 2)
+            {
+                double cachedSum = 0;
+                double noCacheSum = 0;
+                int counted = 0;
+                for (int i = 1; i < turnLimit; i++)
+                {
+                    cachedSum += cached[i];
+                    noCacheSum += noCache[i];
+                    counted++;
+                }
+                double avgCached = cachedSum / counted;
+                double avgNoCache = noCacheSum / counted;
+                Console.WriteLine();
+                Console.WriteLine($"Average prefill (turns 2..{turnLimit}):");
+                Console.WriteLine($"  With KV cache: {avgCached:F1} ms");
+                Console.WriteLine($"  No KV cache:   {avgNoCache:F1} ms");
+                if (avgCached > 0)
+                    Console.WriteLine($"  Speedup:       {avgNoCache / avgCached:F2}x");
+            }
+        }
+
+        /// <summary>
+        /// Run a single benchmark pass through <paramref name="userTurns"/>. Returns the
+        /// per-turn prefill latency in milliseconds (one entry per turn) and the per-turn
+        /// prompt token counts.
+        /// </summary>
+        static (double[] prefillMs, int[] promptTokens) RunBenchmarkPass(
+            ModelBase model, string arch, string[] userTurns, int turnLimit, int maxTokens,
+            SamplingConfig samplerCfg, bool enableThinking, bool useCache)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"--- Benchmark pass: KV cache {(useCache ? "ENABLED" : "DISABLED")} ---");
+
+            model.ResetKVCache();
+            var kvCache = new KVCache();
+            var renderer = new KVCachePromptRenderer(PromptRenderer);
+
+            var history = new List<ChatMessage>();
+            double[] prefillMs = new double[turnLimit];
+            int[] promptTokens = new int[turnLimit];
+
+            for (int turn = 0; turn < turnLimit; turn++)
+            {
+                history.Add(new ChatMessage { Role = "user", Content = userTurns[turn] });
+
+                // Always render with raw token splicing so the cached path can match.
+                var inputTokens = renderer.RenderToTokens(
+                    model.Tokenizer,
+                    model.Config.ChatTemplate,
+                    history,
+                    arch,
+                    addGenerationPrompt: true,
+                    enableThinking: enableThinking);
+
+                promptTokens[turn] = inputTokens.Count;
+
+                if (!useCache)
+                {
+                    model.ResetKVCache();
+                    kvCache.Reset();
+                }
+
+                var sw = Stopwatch.StartNew();
+                ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
+                float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens);
+                prefillMs[turn] = sw.Elapsed.TotalMilliseconds;
+
+                // Generate the assistant response so the cached path has realistic raw
+                // tokens to splice in for subsequent turns. We use greedy sampling for
+                // determinism / reproducibility.
+                var sampler = new TokenSampler(samplerCfg);
+                var generatedTokens = new List<int>();
+                var sb = new StringBuilder();
+
+                for (int step = 0; step < maxTokens; step++)
+                {
+                    int nextToken = sampler.Sample(logits, generatedTokens);
+                    if (model.Tokenizer.IsEos(nextToken)) break;
+                    generatedTokens.Add(nextToken);
+                    sb.Append(model.Tokenizer.Decode(new List<int> { nextToken }));
+                    logits = model.Forward(new[] { nextToken });
+                    kvCache.RecordAppend(nextToken, logits);
+                }
+
+                Console.WriteLine($"  turn {turn + 1}: prompt={inputTokens.Count} tok, prefill={prefillMs[turn]:F1} ms, decode={generatedTokens.Count} tok, plan={plan.Kind}");
+
+                // Append the assistant turn so subsequent renders include it.
+                var parser = OutputParserFactory.Create(arch);
+                parser.Init(enableThinking, null);
+                var parsed = parser.Add(sb.ToString(), true);
+                history.Add(new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = parsed.Content ?? "",
+                    Thinking = parsed.Thinking ?? "",
+                    RawOutputTokens = generatedTokens,
+                });
+            }
+
+            return (prefillMs, promptTokens);
         }
 
         static void TestTokenizer(ModelBase model)

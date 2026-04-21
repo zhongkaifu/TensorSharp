@@ -24,13 +24,24 @@ namespace TensorSharp.Server
     public class ModelService : IDisposable
     {
         private readonly IPromptRenderer _promptRenderer = new GgufPromptRenderer();
+        private readonly KVCachePromptRenderer _kvCacheRenderer;
+        private readonly KVCache _kvCache = new();
+
+        // The conversation that the model's KV state currently corresponds to. Each
+        // assistant message we generated has its raw output tokens attached so the next
+        // turn's render can splice them back in (instead of re-tokenizing the assistant
+        // text, which is lossy for thinking / channel-based models).
+        private readonly List<ChatMessage> _trackedHistory = new();
+
         private ModelBase _model;
         private string _loadedModelPath;
         private string _loadedMmProjPath;
         private BackendType _backend;
 
-        private List<int> _cachedTokens;
-        private float[] _cachedNextLogits;
+        public ModelService()
+        {
+            _kvCacheRenderer = new KVCachePromptRenderer(_promptRenderer);
+        }
 
         public bool IsLoaded => _model != null;
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
@@ -41,9 +52,15 @@ namespace TensorSharp.Server
         public string Architecture => _model?.Config?.Architecture;
         public ModelBase Model => _model;
 
+        /// <summary>Inspection-only view of the conversation cache (for tests / diagnostics).</summary>
+        public KVCache KVCache => _kvCache;
+
         /// <summary>
-        /// Check if the specified model is already loaded (no locking needed, just a name comparison).
+        /// Snapshot of the messages whose tokens are reflected in the current KV cache state.
+        /// Returned as a copy so callers can't mutate internal bookkeeping.
         /// </summary>
+        public IReadOnlyList<ChatMessage> TrackedHistory => _trackedHistory.AsReadOnly();
+
         public bool IsModelAlreadyLoaded(string modelName)
         {
             return _model != null && string.Equals(LoadedModelName, modelName, StringComparison.OrdinalIgnoreCase);
@@ -51,23 +68,19 @@ namespace TensorSharp.Server
 
         public void InvalidateKVCache()
         {
-            _cachedTokens = null;
-            _cachedNextLogits = null;
+            _trackedHistory.Clear();
+            _kvCache.Reset();
             _model?.ResetKVCache();
         }
 
-        /// <summary>
-        /// Load a model and optional multimodal projector. Must be called within the
-        /// InferenceQueue to prevent concurrent access.
-        /// </summary>
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
             _model?.Dispose();
             _model = null;
             _loadedModelPath = null;
             _loadedMmProjPath = null;
-            _cachedTokens = null;
-            _cachedNextLogits = null;
+            _trackedHistory.Clear();
+            _kvCache.Reset();
 
             _backend = BackendCatalog.Canonicalize(backendStr) switch
             {
@@ -95,7 +108,8 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Stream chat inference tokens. Must be called within the InferenceQueue to prevent concurrent access.
-        /// Reuses the KV cache from the previous turn when the rendered text prefix matches.
+        /// Reuses the KV cache from the previous turn by splicing raw output tokens directly into the
+        /// rendered prompt - which guarantees that the cached prefix matches exactly across turns.
         /// </summary>
         public async IAsyncEnumerable<string> ChatStreamAsync(
             List<ChatMessage> history,
@@ -104,28 +118,74 @@ namespace TensorSharp.Server
             SamplingConfig samplingConfig = null,
             List<ToolFunction> tools = null, bool enableThinking = false)
         {
+            await foreach (var (piece, _, _, _, _, _, _) in
+                ChatStreamInternalAsync(history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking, withMetrics: false))
+            {
+                if (!string.IsNullOrEmpty(piece))
+                    yield return piece;
+            }
+        }
+
+        /// <summary>
+        /// Stream chat inference tokens with timing metrics. Must be called within the InferenceQueue.
+        /// Reuses the KV cache from the previous turn when the rendered text prefix matches.
+        /// </summary>
+        public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
+            ChatStreamWithMetricsAsync(
+                List<ChatMessage> history,
+                int maxTokens,
+                CancellationToken cancellationToken,
+                SamplingConfig samplingConfig = null,
+                List<ToolFunction> tools = null, bool enableThinking = false)
+        {
+            return ChatStreamInternalAsync(history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking, withMetrics: true);
+        }
+
+        private async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
+            ChatStreamInternalAsync(
+                List<ChatMessage> history,
+                int maxTokens,
+                [EnumeratorCancellation] CancellationToken cancellationToken,
+                SamplingConfig samplingConfig,
+                List<ToolFunction> tools,
+                bool enableThinking,
+                bool withMetrics)
+        {
             string arch = _model.Config.Architecture;
             var preparedHistory = PrepareHistoryForInference(history, arch);
-            string rendered = _promptRenderer.Render(
-                _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
-                architecture: arch, tools: tools, enableThinking: enableThinking);
 
-            Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, first 500 chars:");
-            Console.Error.WriteLine(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered);
+            // Project the incoming user-visible history onto our tracked conversation so
+            // that any assistant messages we previously generated carry their raw output
+            // tokens forward into the renderer.
+            var renderHistory = AugmentWithCachedRawTokens(preparedHistory);
 
-            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
+            Console.Error.WriteLine($"[Prompt] arch={arch}, sampling: temp={samplingConfig?.Temperature ?? 0.8f}, top_k={samplingConfig?.TopK ?? 40}, top_p={samplingConfig?.TopP ?? 0.9f}");
+
+            var inputTokens = _kvCacheRenderer.RenderToTokens(
+                _model.Tokenizer,
+                _model.Config.ChatTemplate,
+                renderHistory,
+                arch,
+                addGenerationPrompt: true,
+                tools: tools,
+                enableThinking: enableThinking);
+
+            inputTokens = _model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens);
             inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
 
-            float[] logits;
-            (_, logits) = PrepareChatPrompt(inputTokens);
+            int promptTokenCount = inputTokens.Count;
+            var sw = Stopwatch.StartNew();
+            float[] logits = PrepareForGeneration(inputTokens);
+            long promptNs = ToNanos(sw.ElapsedTicks);
 
             var generatedTokens = new List<int>();
             var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
             var rawBytes = new List<byte>();
             int prevCharLen = 0;
-            bool cachedLogitsValid = true;
+
+            var evalSw = Stopwatch.StartNew();
+            bool firstTokenSampled = false;
 
             for (int step = 0; step < maxTokens; step++)
             {
@@ -143,44 +203,244 @@ namespace TensorSharp.Server
                 string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
                 prevCharLen = decoded.Length;
 
+                bool stopRequested = false;
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop)
-                    {
-                        cachedLogitsValid = false;
-                        break;
-                    }
+                        stopRequested = true;
+                }
+
+                if (!firstTokenSampled)
+                {
+                    firstTokenSampled = true;
                 }
 
                 if (piece.Length > 0)
-                    yield return piece;
+                    yield return (piece, false, 0, 0, 0, 0, 0);
+
+                if (stopRequested)
+                    break;
 
                 logits = _model.Forward(new[] { nextToken });
+                _kvCache.RecordAppend(nextToken, logits);
             }
 
-            SaveTokenCache(inputTokens, generatedTokens, logits, cachedLogitsValid);
+            string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
+            // Use the AUGMENTED history (which has raw tokens spliced into prior assistant
+            // turns from our previous tracked history) so that the raw tokens carry forward
+            // for ALL past assistants, not just the immediately-previous one. The plain
+            // user-visible `history` doesn't carry raw tokens (the WebUI never sees them),
+            // so cloning from `history` here would cause the cache to silently re-reset
+            // every other turn as the raw tokens of older assistants fell off the tracked
+            // record.
+            UpdateTrackedHistory(renderHistory, assistantText, generatedTokens);
+
+            if (withMetrics)
+            {
+                long evalNs = ToNanos(evalSw.ElapsedTicks);
+                long totalNs = ToNanos(sw.ElapsedTicks);
+                yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
+            }
         }
 
-        private float[] ForwardPromptPrefill(IList<int> tokens, bool allowChunking = true)
+        /// <summary>
+        /// Walks <paramref name="incoming"/> alongside <see cref="_trackedHistory"/> to
+        /// produce a render-ready history with cached raw output tokens spliced into
+        /// assistant messages.
+        ///
+        /// We CAN'T compare assistant <see cref="ChatMessage.Content"/> directly between the
+        /// incoming history and the tracked one: the streaming output parser used by the
+        /// HTTP layer (for thinking / Harmony / channel-based architectures) strips
+        /// <c>&lt;think&gt;</c> / <c>&lt;|channel|&gt;</c> framing out of the text the UI
+        /// receives, so the UI sends back a SHORTER/parsed version of the content while
+        /// our tracked entry still has the full raw text the model emitted. A naive
+        /// "same content?" check would therefore reject the splice for every cached turn
+        /// and force a full reset on every request - the exact symptom that motivated
+        /// this fix for Qwen 3.5 / 3.6 thinking models.
+        ///
+        /// Instead, we match by USER messages (which the UI never modifies between turns
+        /// unless the user explicitly edits a previous turn). For every leading position
+        /// at which the incoming and tracked histories agree on user content, the
+        /// assistant messages in between MUST have come from our previous generation
+        /// turns - so we splice their tracked raw tokens in. As soon as a user message
+        /// diverges (or roles disagree), we stop splicing for that position and beyond,
+        /// which lets the KV cache reuse logic find a partial prefix match if one exists.
+        /// </summary>
+        internal List<ChatMessage> AugmentWithCachedRawTokens(List<ChatMessage> incoming)
         {
-            if (tokens == null || tokens.Count == 0)
+            if (incoming == null)
+                return null;
+
+            int matchUntil = 0;
+            int max = Math.Min(incoming.Count, _trackedHistory.Count);
+            for (int i = 0; i < max; i++)
+            {
+                ChatMessage src = incoming[i];
+                ChatMessage tracked = _trackedHistory[i];
+
+                if (src.Role != tracked.Role)
+                    break;
+
+                // Compare on Content for non-assistant roles only. Assistant content can be
+                // legitimately altered by the streaming output parser between turns.
+                if (src.Role != "assistant"
+                    && !string.Equals(src.Content ?? string.Empty, tracked.Content ?? string.Empty, StringComparison.Ordinal))
+                    break;
+
+                matchUntil = i + 1;
+            }
+
+            var result = new List<ChatMessage>(incoming.Count);
+            for (int i = 0; i < incoming.Count; i++)
+            {
+                ChatMessage src = incoming[i];
+
+                bool useTracked = i < matchUntil
+                    && _trackedHistory[i].Role == "assistant"
+                    && _trackedHistory[i].RawOutputTokens != null
+                    && _trackedHistory[i].RawOutputTokens.Count > 0
+                    && (src.RawOutputTokens == null || src.RawOutputTokens.Count == 0);
+
+                if (useTracked)
+                {
+                    result.Add(new ChatMessage
+                    {
+                        Role = src.Role,
+                        Content = src.Content,
+                        ImagePaths = src.ImagePaths,
+                        AudioPaths = src.AudioPaths,
+                        IsVideo = src.IsVideo,
+                        ToolCalls = src.ToolCalls,
+                        Thinking = src.Thinking,
+                        RawOutputTokens = _trackedHistory[i].RawOutputTokens,
+                    });
+                }
+                else
+                {
+                    result.Add(src);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Refresh <see cref="_trackedHistory"/> after a generation completes so the next
+        /// turn can locate cached raw tokens by message position. We replace the tracked
+        /// list with the user-visible history (without our internal augmentation) plus the
+        /// new assistant turn (with raw output tokens attached).
+        /// </summary>
+        private void UpdateTrackedHistory(List<ChatMessage> incomingHistory, string assistantText, List<int> generatedTokens)
+        {
+            _trackedHistory.Clear();
+            if (incomingHistory != null)
+            {
+                for (int i = 0; i < incomingHistory.Count; i++)
+                    _trackedHistory.Add(CloneShallow(incomingHistory[i]));
+            }
+
+            _trackedHistory.Add(new ChatMessage
+            {
+                Role = "assistant",
+                Content = assistantText,
+                RawOutputTokens = generatedTokens,
+            });
+        }
+
+        private static ChatMessage CloneShallow(ChatMessage src)
+        {
+            return new ChatMessage
+            {
+                Role = src.Role,
+                Content = src.Content,
+                ImagePaths = src.ImagePaths,
+                AudioPaths = src.AudioPaths,
+                IsVideo = src.IsVideo,
+                ToolCalls = src.ToolCalls,
+                Thinking = src.Thinking,
+                RawOutputTokens = src.RawOutputTokens,
+            };
+        }
+
+        /// <summary>
+        /// Move the model's KV state to one whose contents are exactly <paramref name="inputTokens"/>,
+        /// returning the next-token logits at position <c>inputTokens.Count</c>. Plans the work
+        /// via <see cref="KVCache.PlanReuse"/> and then delegates to either an exact-match,
+        /// partial-reuse, or full-reset path.
+        /// </summary>
+        private float[] PrepareForGeneration(List<int> inputTokens)
+        {
+            ReusePlan plan = _kvCache.PlanReuse(inputTokens, _model.SupportsKVCacheTruncation);
+
+            switch (plan.Kind)
+            {
+                case ReusePlanKind.ExactMatch:
+                {
+                    Console.WriteLine($"[KV cache] Exact match: reusing {inputTokens.Count}/{inputTokens.Count} cached tokens (saved 100%)");
+                    _model.MultimodalInjector.QueuePromptEmbeddings(inputTokens.Count);
+                    return plan.CachedLogits;
+                }
+
+                case ReusePlanKind.PartialReuse:
+                {
+                    int reusedPrefix = plan.ReusedPrefixLength;
+                    int suffixLength = plan.TokensToForward;
+
+                    _model.TruncateKVCache(reusedPrefix);
+                    _kvCache.TruncateTo(reusedPrefix);
+
+                    bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(reusedPrefix);
+                    var suffixTokens = CopyTokenRange(inputTokens, reusedPrefix, suffixLength);
+
+                    Console.WriteLine($"[KV cache] Partial reuse: keeping {reusedPrefix}/{inputTokens.Count} tokens, forwarding {suffixLength} new tokens (saved {100.0 * reusedPrefix / inputTokens.Count:F0}%)");
+                    float[] logits = ForwardPromptPrefill(suffixTokens, allowChunking: !queuedPromptEmbeddings);
+                    _kvCache.RecordAppend(suffixTokens, logits);
+                    return logits;
+                }
+
+                case ReusePlanKind.Reset:
+                default:
+                {
+                    if (!_kvCache.IsEmpty)
+                        Console.WriteLine($"[KV cache] Full reset (cached {_kvCache.Count} tokens, no usable common prefix with {inputTokens.Count}-token prompt)");
+                    else
+                        Console.WriteLine($"[KV cache] Full prompt forward: {inputTokens.Count} tokens");
+
+                    _model.ResetKVCache();
+                    _kvCache.Reset();
+                    bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(0);
+                    var allTokens = inputTokens.ToArray();
+                    float[] logits = ForwardPromptPrefill(allTokens, allowChunking: !queuedPromptEmbeddings);
+                    _kvCache.RecordAppend(allTokens, logits);
+                    return logits;
+                }
+            }
+        }
+
+        private static long ToNanos(long elapsedTicks)
+            => elapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+
+        private float[] ForwardPromptPrefill(int[] tokens, bool allowChunking = true)
+        {
+            if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("Prompt token list cannot be null or empty.", nameof(tokens));
 
             if (!allowChunking)
-                return _model.ForwardRefill(CopyTokenRange(tokens, 0, tokens.Count));
+                return _model.ForwardRefill(tokens);
 
-            int chunkSize = ResolvePrefillChunkSize(_backend, tokens.Count);
-            if (chunkSize >= tokens.Count)
-                return _model.ForwardRefill(CopyTokenRange(tokens, 0, tokens.Count));
+            int chunkSize = ResolvePrefillChunkSize(_backend, tokens.Length);
+            if (chunkSize >= tokens.Length)
+                return _model.ForwardRefill(tokens);
 
-            Console.WriteLine($"[Prompt] Chunking prefill: {tokens.Count} tokens in blocks of {chunkSize} on {LoadedBackend ?? _backend.ToString()}");
+            Console.WriteLine($"[Prompt] Chunking prefill: {tokens.Length} tokens in blocks of {chunkSize} on {LoadedBackend ?? _backend.ToString()}");
 
             float[] logits = null;
-            for (int start = 0; start < tokens.Count; start += chunkSize)
+            for (int start = 0; start < tokens.Length; start += chunkSize)
             {
-                int length = Math.Min(chunkSize, tokens.Count - start);
-                logits = _model.ForwardRefill(CopyTokenRange(tokens, start, length));
+                int length = Math.Min(chunkSize, tokens.Length - start);
+                int[] chunk = new int[length];
+                Array.Copy(tokens, start, chunk, 0, length);
+                logits = _model.ForwardRefill(chunk);
             }
 
             return logits;
@@ -191,23 +451,11 @@ namespace TensorSharp.Server
             if (tokenCount <= 0)
                 return 0;
 
+            // CUDA can OOM on a single huge prefill graph, so we cap the chunk size.
+            // CPU / Metal handle a single big graph fine.
             return backend == BackendType.GgmlCuda
                 ? Math.Min(tokenCount, 5120)
                 : tokenCount;
-        }
-
-        internal static int ResolveReusablePrefixForInference(int reusablePrefix, int inputTokenCount, bool hasExactCachedLogits)
-        {
-            if (reusablePrefix <= 0 || inputTokenCount <= 0)
-                return 0;
-
-            if (reusablePrefix < inputTokenCount)
-                return reusablePrefix;
-
-            if (hasExactCachedLogits)
-                return inputTokenCount;
-
-            return inputTokenCount > 1 ? inputTokenCount - 1 : 0;
         }
 
         private List<int> TruncatePromptToContext(List<int> inputTokens, int maxTokens)
@@ -236,8 +484,11 @@ namespace TensorSharp.Server
 
             Console.WriteLine($"[Context] Truncating prompt from {inputTokens.Count} to {kept} tokens (context limit {maxCtx}, reserving {maxTokens} for generation)");
             _model.MultimodalInjector.TrimPreparedPrompt(trimStart);
-            _cachedTokens = null;
-            _cachedNextLogits = null;
+            // The prompt has been trimmed at the front; the model state (which assumed a
+            // different absolute position) is no longer reusable.
+            _trackedHistory.Clear();
+            _kvCache.Reset();
+            _model.ResetKVCache();
             return inputTokens.GetRange(trimStart, kept);
         }
 
@@ -249,217 +500,9 @@ namespace TensorSharp.Server
             return result;
         }
 
-        private List<int> ProcessMultimodalHistory(List<ChatMessage> history, List<int> inputTokens, string arch)
-        {
-            if (!HasMultimodalContent(history))
-                return inputTokens;
-
-            if (arch == "gemma4")
-                return ProcessGemma4History(history, inputTokens);
-            if (arch == "gemma3")
-                return ProcessGemma3History(history, inputTokens);
-            if (_model is Qwen35Model)
-                return ProcessQwen35History(history, inputTokens);
-            return inputTokens;
-        }
-
-        private List<int> ProcessGemma4History(List<ChatMessage> history, List<int> inputTokens)
-        {
-            if (_model is not Gemma4Model g4)
-                return inputTokens;
-
-            int imageStartId = _model.Tokenizer.LookupToken("<|image>");
-            int imageEndId = _model.Tokenizer.LookupToken("<image|>");
-            if (imageStartId < 0) imageStartId = 255999;
-            if (imageEndId < 0) imageEndId = 256000;
-
-            int audioStartId = _model.Tokenizer.LookupToken("<|audio>");
-            int audioEndId = _model.Tokenizer.LookupToken("<audio|>");
-
-            var imageProcessor = g4.VisionEncoder != null ? new Gemma4ImageProcessor() : null;
-            int searchFrom = 0;
-
-            foreach (var msg in history)
-            {
-                if (msg.ImagePaths != null && g4.VisionEncoder != null)
-                {
-                    foreach (var imgPath in msg.ImagePaths)
-                    {
-                        var (pixels, imgW, imgH) = imageProcessor.ProcessImage(imgPath);
-                        var emb = g4.VisionEncoder.Encode(pixels, imgW, imgH);
-                        int numTokens = (int)emb.Sizes[0];
-                        int pos = FindTokenPosition(inputTokens, imageStartId, searchFrom);
-
-                        if (pos >= 0)
-                        {
-                            inputTokens = ExpandSingleTokenPlaceholder(inputTokens, pos, imageStartId, numTokens, imageEndId);
-                            g4.SetVisionEmbeddings(emb, pos + 1);
-                            searchFrom = pos + numTokens + 2;
-                        }
-                        else
-                        {
-                            emb.Dispose();
-                        }
-                    }
-                }
-
-                if (msg.AudioPaths != null && g4.AudioEncoder != null && audioStartId >= 0 && audioEndId >= 0)
-                {
-                    foreach (var audioPath in msg.AudioPaths)
-                    {
-                        float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(audioPath);
-                        if (samples.Length % 128 != 0)
-                        {
-                            int padded = samples.Length + (128 - samples.Length % 128);
-                            Array.Resize(ref samples, padded);
-                        }
-
-                        var (melData, numFrames) = Gemma4AudioPreprocessor.ComputeMelSpectrogram(samples);
-                        if (melData == null || numFrames == 0)
-                            continue;
-
-                        var audioEmb = g4.AudioEncoder.Encode(melData, numFrames);
-                        int numAudioTokens = (int)audioEmb.Sizes[0];
-                        int pos = FindTokenPosition(inputTokens, audioStartId, searchFrom);
-
-                        if (pos >= 0)
-                        {
-                            inputTokens = ExpandSingleTokenPlaceholder(inputTokens, pos, audioStartId, numAudioTokens, audioEndId);
-                            g4.SetAudioEmbeddings(audioEmb, pos + 1);
-                            searchFrom = pos + numAudioTokens + 2;
-                        }
-                        else
-                        {
-                            audioEmb.Dispose();
-                        }
-                    }
-                }
-            }
-
-            return inputTokens;
-        }
-
-        private List<int> ProcessGemma3History(List<ChatMessage> history, List<int> inputTokens)
-        {
-            if (_model is not Gemma3Model g3 || g3.VisionEncoder == null)
-                return inputTokens;
-
-            var imagePaths = GetImagePathsInPromptOrder(history);
-            if (imagePaths.Count == 0)
-                return inputTokens;
-
-            var processor = new Gemma3ImageProcessor();
-            int startId = _model.Tokenizer.LookupToken("<start_of_image>");
-            if (startId < 0) startId = Gemma3ImageProcessor.StartOfImageToken;
-            int endId = Gemma3ImageProcessor.EndOfImageToken;
-            int nlnlId = Gemma3ImageProcessor.NewlineNewlineToken;
-            int padId = Gemma3ImageProcessor.PadToken;
-
-            inputTokens = ChatTemplate.ExpandGemma3ImageTokens(inputTokens,
-                startId, endId, nlnlId, padId, processor.TokensPerImage);
-
-            int searchFrom = 0;
-            foreach (var imgPath in imagePaths)
-            {
-                float[] pixels = processor.ProcessImage(imgPath);
-                var emb = g3.VisionEncoder.Encode(pixels);
-                int tokenStart = FindGemma3ImageInsertPosition(inputTokens, startId, padId, searchFrom);
-
-                if (tokenStart >= 0)
-                {
-                    g3.SetVisionEmbeddings(emb, tokenStart);
-                    searchFrom = tokenStart + processor.TokensPerImage + 2;
-                }
-                else
-                {
-                    emb.Dispose();
-                }
-            }
-
-            return inputTokens;
-        }
-
-        private List<int> ProcessQwen35History(List<ChatMessage> history, List<int> inputTokens)
-        {
-            if (_model is not Qwen35Model q35 || q35.VisionEncoder == null)
-                return inputTokens;
-
-            var imagePaths = GetImagePathsInPromptOrder(history);
-            if (imagePaths.Count == 0)
-                return inputTokens;
-
-            int imagePadId = _model.Tokenizer.LookupToken("<|image_pad|>");
-            if (imagePadId < 0)
-                return inputTokens;
-
-            var processor = new Qwen35ImageProcessor(q35.VisionEncoder.PatchSize, q35.VisionEncoder.SpatialMergeSize);
-            var tokenCounts = new int[imagePaths.Count];
-            for (int i = 0; i < imagePaths.Count; i++)
-            {
-                var (w, h) = Qwen35ImageProcessor.ReadImageDimensions(imagePaths[i]);
-                tokenCounts[i] = processor.ComputeImageTokenCount(h, w);
-            }
-
-            inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
-
-            int searchFrom = 0;
-            for (int i = 0; i < imagePaths.Count; i++)
-            {
-                var (px, resizedH, resizedW) = processor.ProcessImage(imagePaths[i]);
-                var emb = q35.VisionEncoder.Encode(px, resizedH, resizedW);
-                int tokenStart = FindTokenPosition(inputTokens, imagePadId, searchFrom);
-
-                if (tokenStart >= 0)
-                {
-                    q35.SetVisionEmbeddings(emb, tokenStart);
-                    searchFrom = tokenStart + tokenCounts[i];
-                }
-                else
-                {
-                    emb.Dispose();
-                }
-            }
-
-            return inputTokens;
-        }
-
-        private static List<int> ExpandSingleTokenPlaceholder(
-            List<int> inputTokens, int tokenPosition, int startTokenId, int expandedTokenCount, int endTokenId)
-        {
-            var expanded = new List<int>(inputTokens.Count + expandedTokenCount + 1);
-            for (int i = 0; i < tokenPosition; i++)
-                expanded.Add(inputTokens[i]);
-            expanded.Add(startTokenId);
-            for (int i = 0; i < expandedTokenCount; i++)
-                expanded.Add(0);
-            expanded.Add(endTokenId);
-            for (int i = tokenPosition + 1; i < inputTokens.Count; i++)
-                expanded.Add(inputTokens[i]);
-            return expanded;
-        }
-
-        private static int FindTokenPosition(List<int> tokens, int tokenId, int searchFrom)
-        {
-            for (int i = Math.Max(0, searchFrom); i < tokens.Count; i++)
-            {
-                if (tokens[i] == tokenId)
-                    return i;
-            }
-            return -1;
-        }
-
-        private static int FindGemma3ImageInsertPosition(List<int> tokens, int startTokenId, int padTokenId, int searchFrom)
-        {
-            for (int i = Math.Max(0, searchFrom); i + 1 < tokens.Count; i++)
-            {
-                if (tokens[i] == startTokenId && tokens[i + 1] == padTokenId)
-                    return i + 1;
-            }
-            return -1;
-        }
-
         /// <summary>
         /// Stream generate tokens. Must be called within the InferenceQueue to prevent concurrent access.
+        /// Always resets the KV cache - intended for one-shot completions.
         /// </summary>
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
             GenerateStreamAsync(
@@ -476,11 +519,13 @@ namespace TensorSharp.Server
             };
 
             var preparedMessages = PrepareHistoryForInference(messages, arch);
-            string rendered = _promptRenderer.Render(
-                _model.Config.ChatTemplate, preparedMessages, addGenerationPrompt: true,
-                architecture: arch);
+            var inputTokens = _kvCacheRenderer.RenderToTokens(
+                _model.Tokenizer,
+                _model.Config.ChatTemplate,
+                preparedMessages,
+                arch,
+                addGenerationPrompt: true);
 
-            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
             inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedMessages, inputTokens);
             inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
 
@@ -488,15 +533,17 @@ namespace TensorSharp.Server
 
             var sw = Stopwatch.StartNew();
             bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(0);
-            float[] logits = ForwardPromptPrefill(inputTokens, allowChunking: !queuedPromptEmbeddings);
-            long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
+            var promptArray = inputTokens.ToArray();
+            float[] logits = ForwardPromptPrefill(promptArray, allowChunking: !queuedPromptEmbeddings);
+            _kvCache.RecordAppend(promptArray, logits);
+            long promptNs = ToNanos(sw.ElapsedTicks);
             int promptTokenCount = inputTokens.Count;
 
             var cfg = samplingConfig ?? SamplingConfig.Default;
             var sampler = new TokenSampler(cfg);
             var generatedTokens = new List<int>();
-            var rawBytes2 = new List<byte>();
-            int prevCharLen2 = 0;
+            var rawBytes = new List<byte>();
+            int prevCharLen = 0;
 
             var evalSw = Stopwatch.StartNew();
             for (int step = 0; step < maxTokens; step++)
@@ -507,11 +554,11 @@ namespace TensorSharp.Server
                 if (_model.Tokenizer.IsEos(nextToken)) break;
 
                 generatedTokens.Add(nextToken);
-                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes2);
-                int validLen2 = FindValidUtf8Length(rawBytes2);
-                string decoded = Encoding.UTF8.GetString(rawBytes2.GetRange(0, validLen2).ToArray());
-                string piece = prevCharLen2 < decoded.Length ? decoded.Substring(prevCharLen2) : "";
-                prevCharLen2 = decoded.Length;
+                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
+                int validLen = FindValidUtf8Length(rawBytes);
+                string decoded = Encoding.UTF8.GetString(rawBytes.GetRange(0, validLen).ToArray());
+                string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
+                prevCharLen = decoded.Length;
 
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
@@ -522,87 +569,11 @@ namespace TensorSharp.Server
                 if (piece.Length > 0)
                     yield return (piece, false, 0, 0, 0, 0, 0);
                 logits = _model.Forward(new[] { nextToken });
+                _kvCache.RecordAppend(nextToken, logits);
             }
 
-            long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-            long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-
-            yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
-        }
-
-        /// <summary>
-        /// Stream chat inference tokens with timing metrics. Must be called within the InferenceQueue.
-        /// Reuses the KV cache from the previous turn when the rendered text prefix matches.
-        /// </summary>
-        public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, long totalNs, long promptNs, long evalNs)>
-            ChatStreamWithMetricsAsync(
-                List<ChatMessage> history,
-                int maxTokens,
-                [EnumeratorCancellation] CancellationToken cancellationToken,
-                SamplingConfig samplingConfig = null,
-                List<ToolFunction> tools = null, bool enableThinking = false)
-        {
-            string arch = _model.Config.Architecture;
-            var preparedHistory = PrepareHistoryForInference(history, arch);
-            string rendered = _promptRenderer.Render(
-                _model.Config.ChatTemplate, preparedHistory, addGenerationPrompt: true,
-                architecture: arch, tools: tools, enableThinking: enableThinking);
-
-            Console.Error.WriteLine($"[Prompt] arch={arch}, length={rendered.Length}, sampling: temp={samplingConfig?.Temperature ?? 0.8f}, top_k={samplingConfig?.TopK ?? 40}, top_p={samplingConfig?.TopP ?? 0.9f}");
-            Console.Error.WriteLine($"[Prompt] first 500 chars: {(rendered.Length > 500 ? rendered.Substring(0, 500) + "..." : rendered)}");
-
-            var inputTokens = _model.Tokenizer.Encode(rendered, addSpecial: true);
-            inputTokens = _model.MultimodalInjector.ProcessPromptTokens(preparedHistory, inputTokens);
-            inputTokens = TruncatePromptToContext(inputTokens, maxTokens);
-
-            int promptTokenCount;
-            var sw = Stopwatch.StartNew();
-            float[] logits;
-            (promptTokenCount, logits) = PrepareChatPrompt(inputTokens);
-
-            long promptNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-
-            var cfg = samplingConfig ?? SamplingConfig.Default;
-            var sampler = new TokenSampler(cfg);
-            var generatedTokens = new List<int>();
-            var rawBytes3 = new List<byte>();
-            int prevCharLen3 = 0;
-            bool cachedLogitsValid = true;
-
-            var evalSw = Stopwatch.StartNew();
-            for (int step = 0; step < maxTokens; step++)
-            {
-                if (cancellationToken.IsCancellationRequested) break;
-
-                int nextToken = sampler.Sample(logits, generatedTokens);
-                if (_model.Tokenizer.IsEos(nextToken)) break;
-
-                generatedTokens.Add(nextToken);
-                _model.Tokenizer.AppendTokenBytes(nextToken, rawBytes3);
-                int validLen3 = FindValidUtf8Length(rawBytes3);
-                string decoded = Encoding.UTF8.GetString(rawBytes3.GetRange(0, validLen3).ToArray());
-                string piece = prevCharLen3 < decoded.Length ? decoded.Substring(prevCharLen3) : "";
-                prevCharLen3 = decoded.Length;
-
-                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                {
-                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                    if (shouldStop)
-                    {
-                        cachedLogitsValid = false;
-                        break;
-                    }
-                }
-
-                if (piece.Length > 0)
-                    yield return (piece, false, 0, 0, 0, 0, 0);
-                logits = _model.Forward(new[] { nextToken });
-            }
-
-            long evalNs = evalSw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-            long totalNs = sw.ElapsedTicks * (1_000_000_000L / Stopwatch.Frequency);
-
-            SaveTokenCache(inputTokens, generatedTokens, logits, cachedLogitsValid);
+            long evalNs = ToNanos(evalSw.ElapsedTicks);
+            long totalNs = ToNanos(sw.ElapsedTicks);
 
             yield return ("", true, promptTokenCount, generatedTokens.Count, totalNs, promptNs, evalNs);
         }
@@ -627,109 +598,6 @@ namespace TensorSharp.Server
                 return len;
             }
             return len;
-        }
-
-        /// <summary>
-        /// Compute a usable common prefix length between cached tokens and new input.
-        /// Returns 0 (meaning full reset) when:
-        ///   - No cache exists
-        ///   - The model doesn't support KV cache truncation (e.g. Qwen3.5 recurrent layers)
-        ///   - The savings would be less than 10% (not worth the risk)
-        ///   - The common prefix is shorter than 4 tokens
-        ///
-        /// For models with sliding window attention (SWA), KV cache truncation is
-        /// disabled because the prefill path reads the SWA ring buffer linearly but
-        /// the entries are not in positional order after truncation, which corrupts
-        /// attention output and causes degenerate tokens.
-        /// </summary>
-        private int ComputeUsablePrefix(List<int> inputTokens)
-        {
-            int reusablePrefix = _model?.KVCachePolicy.ComputeReusablePrefix(_model, _cachedTokens, inputTokens, hasMultimodal: false) ?? 0;
-            return _model?.MultimodalInjector.ClampReusablePrefix(reusablePrefix) ?? reusablePrefix;
-        }
-
-        /// <summary>
-        /// Save the full token sequence (prompt + generated) so the next turn can find
-        /// the longest common prefix and reuse the KV cache up to that point.
-        /// Works correctly for all models including thinking/Harmony because it compares
-        /// actual token IDs rather than re-rendered text.
-        /// </summary>
-        private (int forwardedTokenCount, float[] logits) PrepareChatPrompt(List<int> inputTokens)
-        {
-            if (TryReuseFullPromptLogits(inputTokens, out float[] cachedLogits))
-            {
-                Console.WriteLine($"[KV cache] Reusing {inputTokens.Count} cached tokens, forwarding 0 new tokens (saved 100%)");
-                return (0, cachedLogits);
-            }
-
-            int commonPrefix = ComputeUsablePrefix(inputTokens);
-            commonPrefix = ResolveReusablePrefixForInference(commonPrefix, inputTokens.Count, false);
-            commonPrefix = _model.MultimodalInjector.ClampReusablePrefix(commonPrefix);
-
-            if (commonPrefix > 0)
-            {
-                _model.TruncateKVCache(commonPrefix);
-                var suffixTokens = inputTokens.GetRange(commonPrefix, inputTokens.Count - commonPrefix).ToArray();
-                bool queuedPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(commonPrefix);
-                Console.WriteLine($"[KV cache] Reusing {commonPrefix} cached tokens, forwarding {suffixTokens.Length} new tokens (saved {100.0 * commonPrefix / inputTokens.Count:F0}%)");
-                return (suffixTokens.Length, ForwardPromptPrefill(suffixTokens, allowChunking: !queuedPromptEmbeddings));
-            }
-
-            Console.Error.WriteLine($"[Prompt] Encoded to {inputTokens.Count} tokens (full prompt)");
-            if (_cachedTokens != null)
-                Console.WriteLine("[KV cache] Reset (no usable common prefix)");
-
-            _model.ResetKVCache();
-            bool queuedFullPromptEmbeddings = _model.MultimodalInjector.QueuePromptEmbeddings(0);
-            return (inputTokens.Count, ForwardPromptPrefill(inputTokens, allowChunking: !queuedFullPromptEmbeddings));
-        }
-
-        private bool TryReuseFullPromptLogits(List<int> inputTokens, out float[] logits)
-        {
-            logits = null;
-            if (_cachedTokens == null || _cachedNextLogits == null || inputTokens == null || _cachedTokens.Count != inputTokens.Count)
-                return false;
-
-            for (int i = 0; i < inputTokens.Count; i++)
-            {
-                if (_cachedTokens[i] != inputTokens[i])
-                    return false;
-            }
-
-            logits = (float[])_cachedNextLogits.Clone();
-            return true;
-        }
-
-        private void SaveTokenCache(List<int> promptTokens, List<int> generatedTokens, float[] nextLogits, bool nextLogitsValid)
-        {
-            _cachedTokens = new List<int>(promptTokens.Count + generatedTokens.Count);
-            _cachedTokens.AddRange(promptTokens);
-            _cachedTokens.AddRange(generatedTokens);
-            _cachedNextLogits = nextLogitsValid && nextLogits != null ? (float[])nextLogits.Clone() : null;
-        }
-
-        /// <summary>
-        /// Find the length of the longest common prefix between the cached token sequence
-        /// and the new input tokens. Returns 0 if there is no cache or no common prefix.
-        /// </summary>
-        internal static int FindTokenPrefixLength(List<int> cached, List<int> newTokens)
-        {
-            if (cached == null || cached.Count == 0 || newTokens == null || newTokens.Count == 0)
-                return 0;
-
-            int maxLen = Math.Min(cached.Count, newTokens.Count);
-            int common = 0;
-            for (int i = 0; i < maxLen; i++)
-            {
-                if (cached[i] != newTokens[i])
-                    break;
-                common++;
-            }
-
-            if (common == 0 || common >= newTokens.Count)
-                return 0;
-
-            return common;
         }
 
         internal static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)
@@ -771,7 +639,8 @@ namespace TensorSharp.Server
                 AudioPaths = msg.AudioPaths != null ? new List<string>(msg.AudioPaths) : null,
                 IsVideo = msg.IsVideo,
                 ToolCalls = msg.ToolCalls,
-                Thinking = msg.Thinking
+                Thinking = msg.Thinking,
+                RawOutputTokens = msg.RawOutputTokens,
             };
         }
 
@@ -840,9 +709,8 @@ namespace TensorSharp.Server
         {
             _model?.Dispose();
             _model = null;
-            _cachedTokens = null;
-            _cachedNextLogits = null;
+            _trackedHistory.Clear();
+            _kvCache.Reset();
         }
     }
 }
-

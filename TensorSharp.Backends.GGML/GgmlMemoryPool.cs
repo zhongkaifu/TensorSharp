@@ -30,6 +30,16 @@ namespace TensorSharp.GGML
         private const int CudaInitialBlockCount = 0;
         private const int CudaMaxPooledBlocks = 8;
         private const long CudaMaxRetainedBlockSize = 8L * 1024 * 1024;
+        // Apple Silicon (Metal, integrated GPU, unified memory) and the GGML CPU backend
+        // both benefit from short-lived intermediate buffers (KV cache append, attention
+        // scores, FFN gate/up etc.) being recycled. Keeping every block ever freed in the
+        // pool, however, lets pure-decoder workloads grow the pooled footprint to several
+        // GB on long contexts where prefill allocates per-layer score / KV-staging tensors
+        // that decode never reuses. Cap the per-block retention to 64 MB and the total to
+        // 32 blocks: that's >>2 GB of fast turnaround buffers but bounds the retained set
+        // so the resident memory stays close to the model size + KV cache.
+        private const int IntegratedMaxPooledBlocks = 32;
+        private const long IntegratedMaxRetainedBlockSize = 64L * 1024 * 1024;
 
         private readonly object _lock = new object();
         private readonly List<PoolBlock> _available = new List<PoolBlock>();
@@ -58,8 +68,8 @@ namespace TensorSharp.GGML
             else
             {
                 _initialBlockCount = DefaultInitialBlockCount;
-                _maxPooledBlocks = DefaultMaxPooledBlocks;
-                _maxRetainedBlockSize = nuint.MaxValue;
+                _maxPooledBlocks = IntegratedMaxPooledBlocks;
+                _maxRetainedBlockSize = (nuint)IntegratedMaxRetainedBlockSize;
             }
         }
 
@@ -70,14 +80,29 @@ namespace TensorSharp.GGML
 
             lock (_lock)
             {
+                // Best-fit search: find the smallest pooled block that satisfies the
+                // request. Avoids handing out a 64 MB scratch block for a 32 KB
+                // intermediate tensor (which would later force a brand-new allocation
+                // for the next 32 MB request because the only large block is gone).
+                int bestIdx = -1;
+                nuint bestSize = nuint.MaxValue;
                 for (int i = 0; i < _available.Count; i++)
                 {
-                    if (_available[i].Size >= alignedSize)
+                    nuint blockSize = _available[i].Size;
+                    if (blockSize >= alignedSize && blockSize < bestSize)
                     {
-                        PoolBlock block = _available[i];
-                        _available.RemoveAt(i);
-                        return block.Ptr;
+                        bestIdx = i;
+                        bestSize = blockSize;
+                        if (blockSize == alignedSize)
+                            break;
                     }
+                }
+
+                if (bestIdx >= 0)
+                {
+                    PoolBlock block = _available[bestIdx];
+                    _available.RemoveAt(bestIdx);
+                    return block.Ptr;
                 }
             }
 

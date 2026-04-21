@@ -8,6 +8,9 @@
     <PackageTags>tensor;runtime;gguf;tokenizer;sampling</PackageTags>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <None Include="..\LICENSE">
       <Pack>True</Pack>
       <PackagePath></PackagePath>

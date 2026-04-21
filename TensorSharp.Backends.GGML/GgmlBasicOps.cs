@@ -631,6 +631,54 @@ namespace TensorSharp.GGML
                 maxSeqLen, position, scale);
         }
 
+        /// <summary>
+        /// Single-token Qwen3.5 full-attention decode kernel. Performs the entire FullAttention
+        /// block (RMSNorm, fused QKV, deinterleave Q/gate, per-head QK norm, RoPE, KV cache append,
+        /// flash attention, sigmoid-gated mix, output projection + residual add) in a single GGML
+        /// graph dispatch. Reduces ~2 standalone GGML calls + ~6 small CPU/GPU sync points per
+        /// attention layer per decode token to one fused dispatch.
+        /// </summary>
+        public static void Qwen35AttentionLayerDecode(
+            Tensor residual,
+            Tensor attnNorm,
+            IntPtr qkvData, int qkvGgmlType, long qkvNe0, long qkvNe1, long qkvRawBytes,
+            Tensor qNorm, Tensor kNorm, int headDim,
+            IntPtr oData, int oGgmlType, long oNe0, long oNe1, long oRawBytes,
+            Tensor kCache, Tensor vCache,
+            int numHeads, int numKvHeads,
+            int maxSeqLen, int position,
+            float eps, float ropeBase, float ropeFreqScale, int ropeMode)
+        {
+            if (residual == null || attnNorm == null || qNorm == null || kNorm == null ||
+                kCache == null || vCache == null)
+                throw new ArgumentNullException("Qwen3.5 attention layer decode requires non-null tensors.");
+            if (residual.ElementType != DType.Float32 || attnNorm.ElementType != DType.Float32 ||
+                qNorm.ElementType != DType.Float32 || kNorm.ElementType != DType.Float32 ||
+                kCache.ElementType != DType.Float32 || vCache.ElementType != DType.Float32)
+                throw new ArgumentException("Qwen3.5 attention layer decode requires F32 tensors.");
+            if (qkvData == IntPtr.Zero || oData == IntPtr.Zero)
+                throw new ArgumentException("Qwen3.5 attention layer decode requires non-zero quantized weight pointers.");
+
+            IntPtr residualPtr = GetBufferStart(residual);
+            IntPtr attnNormPtr = GetBufferStart(attnNorm);
+            IntPtr qNormPtr = GetBufferStart(qNorm);
+            IntPtr kNormPtr = GetBufferStart(kNorm);
+            IntPtr kCachePtr = GetBufferStart(kCache);
+            IntPtr vCachePtr = GetBufferStart(vCache);
+            int hiddenSize = (int)residual.Sizes[residual.Sizes.Length - 1];
+
+            GgmlNative.Qwen35AttentionLayerDecode(
+                residualPtr, hiddenSize,
+                attnNormPtr,
+                qkvData, qkvGgmlType, qkvNe0, qkvNe1, qkvRawBytes,
+                qNormPtr, kNormPtr, headDim,
+                oData, oGgmlType, oNe0, oNe1, oRawBytes,
+                kCachePtr, vCachePtr,
+                numHeads, numKvHeads,
+                maxSeqLen, position,
+                eps, ropeBase, ropeFreqScale, ropeMode);
+        }
+
         public static void Gemma4ModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,

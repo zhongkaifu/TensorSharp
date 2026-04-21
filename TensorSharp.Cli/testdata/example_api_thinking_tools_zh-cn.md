@@ -1,62 +1,62 @@
-﻿# Thinking Mode and Tool Call Examples
+# 思维链与工具调用示例
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-## Console Application
+## 控制台应用
 
-### Thinking Mode
+### 思维链模式
 
-Enable thinking mode with `--think`. The model will show its reasoning process before giving the final answer.
+通过 `--think` 启用思维链。模型会先输出推理过程，再给出最终答案。
 
 ```bash
-# Basic thinking mode
+# 基础思维链模式
 ./TensorSharp.Cli --model model.gguf --backend ggml_metal \
   --input testdata/input_thinking.txt --think --max-tokens 500
 
-# Thinking mode with sampling
+# 带采样参数的思维链模式
 ./TensorSharp.Cli --model model.gguf --backend ggml_metal \
   --input testdata/input_thinking.txt --think --max-tokens 500 \
   --temperature 0.6 --top-p 0.95
 ```
 
-### Tool Call Mode
+### 工具调用模式
 
-Provide tool definitions via `--tools <file.json>`. The model will output structured tool calls.
+通过 `--tools <file.json>` 提供工具定义。模型会输出结构化的工具调用。
 
 ```bash
-# Weather tool call
+# 天气工具调用
 ./TensorSharp.Cli --model model.gguf --backend ggml_metal \
   --input testdata/input_tool_call.txt \
   --tools testdata/tools_weather.json --max-tokens 300
 
-# Calculator tool call
+# 计算器工具调用
 ./TensorSharp.Cli --model model.gguf --backend ggml_metal \
   --input testdata/input_tool_calc.txt \
   --tools testdata/tools_calculator.json --max-tokens 300
 
-# Combined: thinking + tools
+# 思维链 + 工具组合
 ./TensorSharp.Cli --model model.gguf --backend ggml_metal \
   --input testdata/input_tool_call.txt \
   --tools testdata/tools_weather.json --think --max-tokens 500
 ```
 
-### Tool Definition Format
+### 工具定义格式
 
-Tools are defined in a JSON file as an array of `ToolFunction` objects:
+工具以 JSON 数组形式提供，每个元素是一个 `ToolFunction` 对象：
 
 ```json
 [
   {
     "Name": "function_name",
-    "Description": "What this function does",
+    "Description": "函数功能描述",
     "Parameters": {
       "param1": {
         "Type": "string",
-        "Description": "Parameter description"
+        "Description": "参数描述"
       },
       "param2": {
         "Type": "string",
-        "Description": "Another parameter",
+        "Description": "另一个参数",
         "Enum": ["option1", "option2"]
       }
     },
@@ -65,9 +65,9 @@ Tools are defined in a JSON file as an array of `ToolFunction` objects:
 ]
 ```
 
-## Web API (Ollama-compatible)
+## Web API（兼容 Ollama）
 
-### Thinking Mode via Ollama API
+### 通过 Ollama API 使用思维链
 
 ```bash
 curl -s http://localhost:5000/api/chat/ollama -d '{
@@ -79,7 +79,7 @@ curl -s http://localhost:5000/api/chat/ollama -d '{
 }'
 ```
 
-Response includes `thinking` field in the message:
+返回值的 message 中包含独立的 `thinking` 字段：
 
 ```json
 {
@@ -94,7 +94,7 @@ Response includes `thinking` field in the message:
 }
 ```
 
-### Tool Call via Ollama API
+### 通过 Ollama API 使用工具调用
 
 ```bash
 curl -s http://localhost:5000/api/chat/ollama -d '{
@@ -104,11 +104,11 @@ curl -s http://localhost:5000/api/chat/ollama -d '{
     {
       "function": {
         "name": "get_current_weather",
-        "description": "Get the current weather in a given location",
+        "description": "获取指定位置的当前天气",
         "parameters": {
           "type": "object",
           "properties": {
-            "location": {"type": "string", "description": "City name"},
+            "location": {"type": "string", "description": "城市名"},
             "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
           },
           "required": ["location"]
@@ -121,7 +121,7 @@ curl -s http://localhost:5000/api/chat/ollama -d '{
 }'
 ```
 
-Response includes `tool_calls` when the model decides to use a tool:
+当模型决定调用工具时，响应中会包含 `tool_calls`：
 
 ```json
 {
@@ -143,7 +143,7 @@ Response includes `tool_calls` when the model decides to use a tool:
 }
 ```
 
-### Thinking + Tools via Ollama API
+### 通过 Ollama API 同时使用思维链 + 工具
 
 ```bash
 curl -s http://localhost:5000/api/chat/ollama -d '{
@@ -154,11 +154,11 @@ curl -s http://localhost:5000/api/chat/ollama -d '{
     {
       "function": {
         "name": "get_current_weather",
-        "description": "Get the current weather in a given location",
+        "description": "获取指定位置的当前天气",
         "parameters": {
           "type": "object",
           "properties": {
-            "location": {"type": "string", "description": "City name"}
+            "location": {"type": "string", "description": "城市名"}
           },
           "required": ["location"]
         }
@@ -170,7 +170,7 @@ curl -s http://localhost:5000/api/chat/ollama -d '{
 }'
 ```
 
-Response includes both `thinking` and `tool_calls`:
+返回中同时包含 `thinking` 和 `tool_calls`：
 
 ```json
 {
@@ -178,7 +178,7 @@ Response includes both `thinking` and `tool_calls`:
   "message": {
     "role": "assistant",
     "content": "",
-    "thinking": "The user wants to know the weather in Paris. I should use the get_current_weather function.",
+    "thinking": "用户想知道巴黎的天气。我应该调用 get_current_weather。",
     "tool_calls": [
       {
         "function": {
@@ -193,9 +193,9 @@ Response includes both `thinking` and `tool_calls`:
 }
 ```
 
-## Web API (OpenAI-compatible)
+## Web API（兼容 OpenAI）
 
-### Thinking Mode via OpenAI API
+### 通过 OpenAI API 使用思维链
 
 ```bash
 curl -s http://localhost:5000/v1/chat/completions -d '{
@@ -206,7 +206,7 @@ curl -s http://localhost:5000/v1/chat/completions -d '{
 }'
 ```
 
-### Tool Call via OpenAI API
+### 通过 OpenAI API 使用工具调用
 
 ```bash
 curl -s http://localhost:5000/v1/chat/completions -d '{
@@ -217,11 +217,11 @@ curl -s http://localhost:5000/v1/chat/completions -d '{
       "type": "function",
       "function": {
         "name": "get_weather",
-        "description": "Get weather for a location",
+        "description": "获取指定位置的天气",
         "parameters": {
           "type": "object",
           "properties": {
-            "location": {"type": "string", "description": "City name"},
+            "location": {"type": "string", "description": "城市名"},
             "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
           },
           "required": ["location"]
@@ -233,7 +233,7 @@ curl -s http://localhost:5000/v1/chat/completions -d '{
 }'
 ```
 
-Response (OpenAI format):
+响应（OpenAI 格式）：
 
 ```json
 {
@@ -262,9 +262,9 @@ Response (OpenAI format):
 }
 ```
 
-## Python Examples
+## Python 示例
 
-### Thinking Mode with Python
+### 用 Python 使用思维链
 
 ```python
 import requests
@@ -279,13 +279,13 @@ response = requests.post("http://localhost:5000/api/chat/ollama", json={
 
 data = response.json()
 if data["message"].get("thinking"):
-    print("=== Thinking ===")
+    print("=== 思维过程 ===")
     print(data["message"]["thinking"])
-    print("=== Answer ===")
+    print("=== 最终回答 ===")
 print(data["message"]["content"])
 ```
 
-### Tool Call with Python (OpenAI SDK compatible)
+### 用 Python（OpenAI SDK 兼容）调用工具
 
 ```python
 from openai import OpenAI
@@ -296,7 +296,7 @@ tools = [{
     "type": "function",
     "function": {
         "name": "get_weather",
-        "description": "Get current weather",
+        "description": "获取当前天气",
         "parameters": {
             "type": "object",
             "properties": {
@@ -318,35 +318,34 @@ response = client.chat.completions.create(
 choice = response.choices[0]
 if choice.finish_reason == "tool_calls":
     for tc in choice.message.tool_calls:
-        print(f"Tool: {tc.function.name}")
-        print(f"Args: {tc.function.arguments}")
+        print(f"工具：{tc.function.name}")
+        print(f"参数：{tc.function.arguments}")
 else:
     print(choice.message.content)
 ```
 
-## Supported Model Architectures
+## 支持的模型架构
 
-| Architecture | Thinking Tags | Tool Call Tags |
+| 架构 | 思维标签 | 工具调用标签 |
 |---|---|---|
 | Gemma 4 | `<\|channel>thought\n...<channel\|>` | `<\|tool_call>call:NAME{args}<tool_call\|>` |
 | Qwen 3 | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 | Qwen 3.5 | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
 
-## How It Works
+## 工作原理
 
-### Thinking Mode
+### 思维链模式
 
-When `think: true` is passed:
+当传入 `think: true` 时：
 
-1. **Gemma4**: The template injects `<|think|>` into the system turn. The model then outputs thinking inside `<|channel>thought\n...<channel|>` tags before the actual response.
-2. **Qwen3**: The template appends `<think>\n` to the generation prompt. The model outputs thinking directly, terminated by `</think>`, followed by the answer.
-3. **Qwen3.5**: Same as Qwen3. When thinking is disabled, an empty `<think>\n\n</think>\n\n` block is prepended.
+1. **Gemma4**：模板会在 system 段注入 `<|think|>`。模型会先在 `<|channel>thought\n...<channel|>` 标签内输出思维过程，再给出实际回答。
+2. **Qwen3**：模板会在生成 prompt 末尾追加 `<think>\n`。模型直接输出思维内容，并以 `</think>` 结尾，之后给出答案。
+3. **Qwen3.5**：与 Qwen3 相同。当思维链被禁用时，会在前面插入一个空的 `<think>\n\n</think>\n\n` 块。
 
-### Tool Calls
+### 工具调用
 
-When `tools` are provided:
+当提供 `tools` 时：
 
-1. **Gemma4**: Tool declarations use `<|tool>declaration:NAME{...}<tool|>` format in the system turn. The model outputs calls as `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`.
-2. **Qwen3**: Tool definitions are injected as JSON in the system message. The model outputs calls as `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
-3. **Qwen3.5**: Tool definitions use `<tools>...</tools>` format. The model outputs calls as `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`.
-
+1. **Gemma4**：工具声明在 system 段使用 `<|tool>declaration:NAME{...}<tool|>` 格式。模型输出调用为 `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`。
+2. **Qwen3**：工具定义以 JSON 形式注入到 system message。模型输出调用为 `<tool_call>{"name":"...","arguments":{...}}</tool_call>`。
+3. **Qwen3.5**：工具定义使用 `<tools>...</tools>` 格式。模型输出调用为 `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`。

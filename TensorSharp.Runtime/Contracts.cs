@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -16,11 +16,17 @@ namespace TensorSharp.Runtime
     {
         ModelConfig Config { get; }
         ITokenizer Tokenizer { get; }
-        IKVCachePolicy KVCachePolicy { get; }
         IMultimodalInjector MultimodalInjector { get; }
         IBackendExecutionPlan ExecutionPlan { get; }
         float[] Forward(int[] tokens);
         void ResetKVCache();
+
+        /// <summary>
+        /// Whether this architecture can rewind its KV state to an earlier prefix length.
+        /// Models with recurrent / SSM state (e.g. Qwen3.5 GatedDeltaNet, Nemotron Mamba2)
+        /// cannot truncate because their running state cannot be reversed; for those the
+        /// only valid reuse pattern is "cached prefix is a prefix of the new input".
+        /// </summary>
         bool SupportsKVCacheTruncation { get; }
         void TruncateKVCache(int tokenCount);
     }
@@ -49,15 +55,30 @@ namespace TensorSharp.Runtime
     {
         void LoadProjectors(string mmProjPath);
         List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens);
-        int ClampReusablePrefix(int reusablePrefixTokenCount);
-        int ClampTrimStart(int trimStartTokenCount);
-        void TrimPreparedPrompt(int trimStartTokenCount);
-        bool QueuePromptEmbeddings(int reusablePrefixTokenCount);
-    }
 
-    public interface IKVCachePolicy
-    {
-        int ComputeReusablePrefix(IModelArchitecture model, List<int> cachedTokens, List<int> inputTokens, bool hasMultimodal);
+        /// <summary>
+        /// Queue any media embeddings whose insertion span lies AFTER <paramref name="reusablePrefixTokenCount"/>.
+        /// Returns true if any embedding span overlaps the suffix that will be re-forwarded.
+        /// </summary>
+        bool QueuePromptEmbeddings(int reusablePrefixTokenCount);
+
+        /// <summary>
+        /// Find the largest prefix length &lt;= <paramref name="reusablePrefixTokenCount"/> that does
+        /// not split a multimodal embedding span. The model's KV cache for any such span
+        /// is only valid when the entire span has been forwarded.
+        /// </summary>
+        int ClampReusablePrefix(int reusablePrefixTokenCount);
+
+        /// <summary>
+        /// Find the smallest trim-start position &gt;= <paramref name="trimStartTokenCount"/> that does
+        /// not split a multimodal embedding span (used when truncating prompts that are too long).
+        /// </summary>
+        int ClampTrimStart(int trimStartTokenCount);
+
+        /// <summary>
+        /// Drop / shift queued embedding spans after the prompt has been trimmed at the front.
+        /// </summary>
+        void TrimPreparedPrompt(int trimStartTokenCount);
     }
 
     public interface IBackendExecutionPlan
@@ -67,4 +88,3 @@ namespace TensorSharp.Runtime
         bool ShouldStoreWeightQuantized(GgufTensorInfo info);
     }
 }
-

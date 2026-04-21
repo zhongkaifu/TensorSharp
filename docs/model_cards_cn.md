@@ -396,6 +396,26 @@ blk.{L}.ffn_down_shexp.weight             # 共享专家 down（可选）
 
 对于 `qwen35moe` / `qwen3next` 变体，在 GGML 后端上 decode 时的 MoE 专家计算会被合并为每层一次的 `GgmlBasicOps.MoEExpertsSwiGLUResidual()` 调用。该内核在一次 GGML 计算图调度中完成所有路由专家（`SwiGLU(gate * up) * down`）、可选的共享专家以及残差加法。预先缓存的 `QuantizedWeight` 引用与指针数组（`_routedExpertGateUpQW`、`_routedExpertDownQW`、`_sharedExpertGateUpQW`、`_sharedExpertDownQW` 以及对应的 `*Ptrs` 数组）消除了 decode 热路径上的字典查找和分配。
 
+### Decode 时的融合 attention 层内核
+
+在 GGML 后端上进行 decode（`seqLen == 1`）时，`TryFusedAttnLayerDecode()` 会调用 `GgmlBasicOps.Qwen35AttentionLayerDecode`。这是一个单图内核，将整个 FullAttention block 折叠到一次计算图调度中：
+
+1. RMSNorm(input) * `attn_norm.weight`
+2. 融合 QKV matmul → `[Q+gate (2*qDim), K (kvDim), V (kvDim)]`
+3. 通过 strided view + 连续拷贝拆出 `Q`、`gate`、`K`、`V`
+4. 每头 RMSNorm(Q) * `attn_q_norm.weight`，RMSNorm(K) * `attn_k_norm.weight`
+5. 在当前 `position` 上对 Q、K 做 NeoX 风格 RoPE
+6. 通过 `ggml_cpy` view 把新的 K、V 写入持久化 KV cache
+7. 在已填充的 KV cache 窗口上执行 `ggml_flash_attn_ext`（自动处理 GQA 广播）
+8. `attn_out *= sigmoid(gate)`
+9. 输出投影 + 残差加法 → 通过 host 指针写回更新后的 hidden state
+
+这一步替换了原本的 1 次独立 `FusedRmsNormMatMulQuant` + ~6 个小型 CPU 端算子 + 1 次独立 `FusedMatMulQuantAdd`，把它们合并到一次融合调度中。该内核仅在 `position + 1 >= FusedAttnLayerDecodeMinSeqLen`（默认 4096，可通过 `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖）时启用，因为 GPU flash-attn 路径有固定的初始化开销，只有上下文足够长时才能摊薄。低于该阈值时仍走原本的 `FusedRmsNormMatMulQuant` + CPU-SIMD 注意力 + `FusedMatMulQuantAdd` 路径。
+
+### 文件映射量化权重
+
+当后端支持时（Apple Silicon Metal、GGML CPU、集成 GPU），加载器不再把量化张量复制到全新的原生堆缓冲区，而是通过 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView` 直接绑定 GGUF 文件。结合 GGML 的 host 指针缓冲区映射，Metal command buffer 可以直接从操作系统的页缓存读取权重。`Qwen3.5-35B-A3B-IQ2_XXS`（约 10 GB GGUF）的常驻内存峰值在 M 系列 Mac 上从约 17 GB 降至约 7 GB，且没有任何按 token 的拷贝代价。
+
 ### 优化空间
 
 - 循环层 prefill 是顺序的（逐 token）。分块并行 prefill（同时通过 SSM 处理多个 token）可大幅提升提示吞吐量。

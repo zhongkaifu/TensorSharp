@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -205,7 +205,6 @@ namespace TensorSharp.Models
     {
         public ModelConfig Config { get; protected set; }
         public ITokenizer Tokenizer { get; protected set; }
-        public IKVCachePolicy KVCachePolicy { get; } = DefaultKvCachePolicy.Shared;
         public IMultimodalInjector MultimodalInjector { get; }
         public IBackendExecutionPlan ExecutionPlan { get; }
 
@@ -511,6 +510,25 @@ namespace TensorSharp.Models
             return info.Shape.Length == 3 && info.Name.Contains("_exps.");
         }
 
+        /// <summary>
+        /// Whether quantized weights for this backend can be backed directly by the GGUF file
+        /// via memory mapping instead of being copied into freshly-allocated host buffers.
+        ///
+        /// On Apple Silicon (Metal, integrated GPU, unified memory) and on the GGML CPU backend
+        /// the on-disk layout matches what the kernels consume verbatim, so we can skip the
+        /// per-tensor copy and let the OS page in / out of the file as needed. This roughly
+        /// halves the resident set for large quantized models (e.g. ~10 GB GGUF files no longer
+        /// need a second 10 GB native heap copy).
+        ///
+        /// On discrete CUDA GPUs the kernels still want device-local memory, but the original
+        /// host pointer is needed once at preload time so the device copy is performed via
+        /// <see cref="PrepareCudaQuantizedWeightsForInference"/> from the file-backed view.
+        /// </summary>
+        protected bool CanUseFileMappedQuantizedWeights
+            => _backend == BackendType.GgmlCuda
+            || _backend == BackendType.GgmlMetal
+            || _backend == BackendType.GgmlCpu;
+
         protected void LoadWeights()
         {
             Console.Write("Loading model weights...");
@@ -519,6 +537,7 @@ namespace TensorSharp.Models
             long totalQuantBytes = 0;
             long totalF32Bytes = 0;
             long mappedQuantBytes = 0;
+            bool tryMmap = CanUseFileMappedQuantizedWeights;
             foreach (var kv in _gguf.Tensors)
             {
                 var info = kv.Value;
@@ -541,7 +560,7 @@ namespace TensorSharp.Models
                         if (baseName.EndsWith(".weight"))
                             baseName = baseName.Substring(0, baseName.Length - 7);
 
-                        if (_backend == BackendType.GgmlCuda && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
+                        if (tryMmap && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
                         {
                             for (int e = 0; e < numExperts; e++)
                             {
@@ -576,7 +595,7 @@ namespace TensorSharp.Models
                     }
                     else
                     {
-                        if (_backend == BackendType.GgmlCuda && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
+                        if (tryMmap && _gguf.TryGetTensorDataPointer(info, out IntPtr mappedTensorPtr))
                         {
                             _quantWeights[info.Name] = QuantizedWeight.CreateExternalView(
                                 mappedTensorPtr, byteCount, (int)info.Type, ne0, ne1, _gguf);

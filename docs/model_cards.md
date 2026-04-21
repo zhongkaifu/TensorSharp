@@ -396,6 +396,26 @@ To avoid per-step allocation in the hot GDN decode path, the following buffers a
 
 For `qwen35moe` / `qwen3next` variants on a GGML backend, MoE expert computation during decode is collapsed into a single `GgmlBasicOps.MoEExpertsSwiGLUResidual()` call per layer. The kernel performs all routed experts (`SwiGLU(gate * up) * down`), the optional shared expert, and the residual addition in one GGML graph dispatch. Pre-cached `QuantizedWeight` references and pointer arrays (`_routedExpertGateUpQW`, `_routedExpertDownQW`, `_sharedExpertGateUpQW`, `_sharedExpertDownQW`, plus parallel `*Ptrs` arrays) eliminate dictionary lookups and allocation in the hot decode loop.
 
+### Decode-Time Fused Attention Layer Kernel
+
+For decode (`seqLen == 1`) on a GGML backend, `TryFusedAttnLayerDecode()` invokes `GgmlBasicOps.Qwen35AttentionLayerDecode`, a single-graph kernel that performs the entire FullAttention block in one dispatch:
+
+1. RMSNorm(input) * `attn_norm.weight`
+2. Fused QKV matmul → `[Q+gate (2*qDim), K (kvDim), V (kvDim)]`
+3. Strided view + contiguous copy split for `Q`, `gate`, `K`, `V`
+4. Per-head RMSNorm(Q) * `attn_q_norm.weight`, RMSNorm(K) * `attn_k_norm.weight`
+5. NeoX-style RoPE on Q and K at the current `position`
+6. Append the new K, V into the persistent KV cache via `ggml_cpy` views
+7. `ggml_flash_attn_ext` against the populated KV cache window (handles GQA broadcasting)
+8. `attn_out *= sigmoid(gate)`
+9. Output projection + residual add → updated hidden state written through the host pointer
+
+This replaces 1 standalone `FusedRmsNormMatMulQuant` + ~6 small CPU-side ops + 1 standalone `FusedMatMulQuantAdd` with one fused dispatch. The kernel only engages once `position + 1 >= FusedAttnLayerDecodeMinSeqLen` (default 4096; override via `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N`) because the GPU flash-attn path has a fixed setup cost that only amortizes for long contexts. Below the threshold the existing `FusedRmsNormMatMulQuant` + CPU-SIMD attention + `FusedMatMulQuantAdd` path is retained.
+
+### File-Mapped Quantized Weights
+
+When the backend supports it (Apple Silicon Metal, GGML CPU, integrated GPUs) the loader avoids copying quantized tensors into a fresh native heap buffer and instead binds the GGUF file directly via `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`. Combined with GGML's host-pointer buffer mapping this lets Metal command buffers read the weights straight from the OS page cache. The peak resident set for `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) drops from ~17 GB to ~7 GB on M-series Macs without any per-token copy.
+
 ### Optimization Opportunities
 
 - Recurrent prefill is sequential (one token at a time). Chunked parallel prefill (processing multiple tokens through the SSM simultaneously) would dramatically improve prompt throughput.

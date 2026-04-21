@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -96,11 +96,28 @@ namespace TensorSharp.Models
         // [1, packedDim] - reused fused norm + input proj output for GatedDeltaNet decode.
         private Tensor _gdnDecodePackedBuf;
 
-        // Minimum total sequence length at which the GPU flash attention decode kernel becomes
-        // worthwhile. Below this, per-call Metal command buffer setup dominates the savings vs.
-        // the CPU SIMD path. Tuned empirically on Apple M-series; conservative on purpose so we
-        // never regress short-context decoding. int.MaxValue disables the GPU path entirely.
-        private const int FlashAttnDecodeMinSeqLen = int.MaxValue;
+        // Minimum total sequence length at which the standalone GPU flash attention decode
+        // kernel becomes worthwhile. Below this, per-call Metal command buffer setup dominates
+        // the savings vs. the CPU SIMD path. Tuned empirically on Apple M-series. Once the
+        // fully-fused attention layer kernel is available we prefer it instead (see
+        // <see cref="TryFusedAttnLayerDecode"/>) which avoids the standalone path entirely.
+        private const int FlashAttnDecodeMinSeqLen = 2048;
+
+        // Minimum total sequence length at which the fully-fused per-layer attention decode
+        // kernel beats the existing FusedRmsNormMatMulQuant + CPU-SIMD attention + FusedMatMulQuantAdd
+        // path. The fused kernel folds 6 small CPU-side ops into a single Metal graph dispatch,
+        // but flash_attn_ext on Metal has a fixed setup cost that only amortises when the cached
+        // sequence is long enough. Below this threshold we keep the existing decode path.
+        // Set FUSED_ATTN_LAYER_MIN_SEQ_LEN=N to override at runtime for benchmarking.
+        private static readonly int FusedAttnLayerDecodeMinSeqLen = ResolveFusedAttnLayerMinSeqLen();
+
+        private static int ResolveFusedAttnLayerMinSeqLen()
+        {
+            string env = Environment.GetEnvironmentVariable("FUSED_ATTN_LAYER_MIN_SEQ_LEN");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 4096;
+        }
 
         // Pre-cached layer prefix and weight name strings (avoids string interpolation in hot loops)
         private string[] _layerPrefix;
@@ -988,12 +1005,29 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor AttentionBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
+            // Decode fast path (long context): fold the entire attention block (norm + QKV +
+            // QK-norm + RoPE + KV cache append + flash attention + sigmoid-gated mix + output
+            // projection + residual add) into one fused GGML graph dispatch. This pays off once
+            // the per-layer CPU attention cost (which scales with the cached sequence length)
+            // exceeds the cost of building the fused graph + the GPU flash-attn dispatch. For
+            // short contexts the optimised CPU SIMD attention + 2 small GGML dispatches is
+            // already faster, so we keep the existing path.
+            int totalSeqLen = startPos + seqLen;
+            bool fusedDecodeApplied = false;
+            if (seqLen == 1 && totalSeqLen >= FusedAttnLayerDecodeMinSeqLen
+                && TryFusedAttnLayerDecode(hidden, layer, startPos))
+            {
+                fusedDecodeApplied = true;
+            }
+
             // Fuse:
             //   hidden = hidden + attn_out_proj(attention(rms_norm(hidden)))
             // into the FullAttention call: input norm + QKV is fused inside FullAttention, and
             // when the GGML backend is available the output projection is also fused with the
             // residual add (FusedMatMulQuantAdd) so the residual lives entirely on the GPU.
-            Tensor attnOut = FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos, residual: hidden);
+            Tensor attnOut = fusedDecodeApplied
+                ? null
+                : FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos, residual: hidden);
 
             if (attnOut != null)
             {
@@ -1570,6 +1604,73 @@ namespace TensorSharp.Models
                 // Apple Silicon), but downstream GGML ops still need to know the buffer is
                 // host-fresh so any cached device mirror is reloaded.
                 InvalidateTensorDeviceCache(output);
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Single-token Qwen3.5 attention layer decode in one fused GGML graph. Performs the
+        /// entire FullAttention block (input RMSNorm, fused QKV, deinterleave Q/gate, per-head
+        /// QK norm, RoPE, KV cache append, flash attention, sigmoid-gated mix, output projection,
+        /// residual add) in a single dispatch. Eliminates ~2 standalone GGML calls plus the
+        /// CPU/GPU sync overhead between the QKV and output kernels.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryFusedAttnLayerDecode(Tensor residual, int layer, int position)
+        {
+            if (!IsGgmlBackend)
+                return false;
+            if (residual == null || residual.DimensionCount != 2 || residual.ElementType != DType.Float32)
+                return false;
+            if (residual.Sizes[0] != 1)
+                return false;
+
+            QuantizedWeight qkv = _attnQkvQW[layer];
+            QuantizedWeight oOut = _attnOutputQW[layer];
+            Tensor attnNorm = _attnNormW[layer];
+            Tensor qNorm = _attnQNormW[layer];
+            Tensor kNorm = _attnKNormW[layer];
+            Tensor kCache = _kvCacheK[layer];
+            Tensor vCache = _kvCacheV[layer];
+
+            if (qkv == null || oOut == null || attnNorm == null || qNorm == null || kNorm == null
+                || kCache == null || vCache == null)
+                return false;
+
+            int headDim = Config.HeadDim;
+            int numHeads = Config.NumHeads;
+            int numKVHeads = Config.NumKVHeads;
+            int maxSeqLen = (int)kCache.Sizes[1];
+
+            // The fused kernel uses NeoX RoPE (rope_mode = 2), matching the standalone path.
+            const int ropeMode = 2;
+            float ropeFreqScale = 1.0f / Config.RopeScale;
+
+            try
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                GgmlBasicOps.Qwen35AttentionLayerDecode(
+                    residual,
+                    attnNorm,
+                    qkv.CacheKey, qkv.GgmlType, qkv.Ne0, qkv.Ne1, qkv.RawBytes,
+                    qNorm, kNorm, headDim,
+                    oOut.CacheKey, oOut.GgmlType, oOut.Ne0, oOut.Ne1, oOut.RawBytes,
+                    kCache, vCache,
+                    numHeads, numKVHeads,
+                    maxSeqLen, position,
+                    Config.Eps, Config.RopeBase, ropeFreqScale, ropeMode);
+                _attnTicks += Stopwatch.GetTimestamp() - t0;
+
+                // Output is written through the host pointer (unified memory). Downstream
+                // GGML ops need a fresh device mirror so invalidate the cache for the residual
+                // and the KV cache slabs that we just appended into.
+                InvalidateTensorDeviceCache(residual);
+                InvalidateTensorDeviceCache(kCache);
+                InvalidateTensorDeviceCache(vCache);
                 return true;
             }
             catch (Exception)
