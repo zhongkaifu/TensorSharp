@@ -78,6 +78,8 @@ namespace TensorSharp.Cli
             int benchmarkRuns = 1;
             bool runKvCacheBenchmark = false;
             int kvCacheBenchTurns = 4;
+            bool runInteractive = false;
+            string systemPrompt = null;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -107,6 +109,20 @@ namespace TensorSharp.Cli
                     case "--bench-runs": benchmarkRuns = int.Parse(args[++i]); break;
                     case "--bench-kvcache": runKvCacheBenchmark = true; break;
                     case "--bench-kv-turns": kvCacheBenchTurns = int.Parse(args[++i]); break;
+                    case "-i":
+                    case "--interactive":
+                    case "--chat":
+                        runInteractive = true;
+                        break;
+                    case "--system": systemPrompt = args[++i]; break;
+                    case "--system-file":
+                        {
+                            string spPath = args[++i];
+                            if (!File.Exists(spPath))
+                                throw new FileNotFoundException($"System prompt file not found: {spPath}", spPath);
+                            systemPrompt = File.ReadAllText(spPath);
+                        }
+                        break;
                     case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
                     case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); break;
                     case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
@@ -160,6 +176,10 @@ namespace TensorSharp.Cli
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
                     "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal|ggml_cuda] " +
+                    "[--interactive] [--system <text>] [--system-file <path>] " +
+                    "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
+                    "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
+                    "[--seed N] [--stop <text>] [--think] " +
                     "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
                 return;
             }
@@ -262,6 +282,35 @@ namespace TensorSharp.Cli
             if (inputJsonl != null)
             {
                 RunJsonlBatch(model, inputJsonl, outputFile, maxTokens, samplingConfig, enableThinking);
+                return;
+            }
+
+            if (runInteractive)
+            {
+                _log.LogInformation(LogEventIds.CliStarted,
+                    "Entering interactive chat mode (model={Model}, backend={Backend}, thinking={Thinking})",
+                    Path.GetFileName(modelPath), backend, enableThinking);
+
+                // Apply --system / --system-file by prepending it to the running
+                // history before the loop starts; the user can still override
+                // it inside the session via the /system command. We forward
+                // the model path / backend / mmproj so the session's /info,
+                // /model and /backend commands have something concrete to
+                // reload against.
+                var session = new InteractiveSession(
+                    model,
+                    modelPath,
+                    backend,
+                    mmProjPath,
+                    PromptRenderer,
+                    samplingConfig,
+                    tools,
+                    enableThinking,
+                    maxTokens > 0 ? maxTokens : 512,
+                    _log);
+                if (!string.IsNullOrEmpty(systemPrompt))
+                    session.SetInitialSystemPrompt(systemPrompt);
+                session.Run();
                 return;
             }
 

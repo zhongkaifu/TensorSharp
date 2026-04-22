@@ -135,7 +135,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool stream = true;
             if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
             int maxTokens = 200;
-            var samplingConfig = SamplingConfigParser.ParseOllama(body);
+            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.DefaultSamplingConfig);
             if (body.TryGetProperty("options", out var opts) && opts.TryGetProperty("num_predict", out var np))
                 maxTokens = np.GetInt32();
 
@@ -267,7 +267,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             bool stream = true;
             if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
             int maxTokens = 200;
-            var samplingConfig = SamplingConfigParser.ParseOllama(body);
+            var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.DefaultSamplingConfig);
             if (body.TryGetProperty("options", out var opts) && opts.TryGetProperty("num_predict", out var np))
                 maxTokens = np.GetInt32();
 

@@ -209,6 +209,11 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
+# Interactive turn-by-turn chat (REPL) with KV cache reuse and slash commands
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal --interactive
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal -i \
+    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think
+
 # Image inference (Gemma 3/4, Qwen 3.5)
 ./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
@@ -269,6 +274,9 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
 | `--backend <type>` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
+| `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
+| `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
 | `--think` | Enable thinking/reasoning mode (chain-of-thought) |
 | `--tools <path>` | JSON file with tool/function definitions |
 | `--temperature <f>` | Sampling temperature (0 = greedy) |
@@ -305,6 +313,63 @@ Each line is a JSON object with `messages`, optional `prompt`, and optional samp
 {"id": "q2", "messages": [{"role": "user", "content": "Write a haiku."}], "max_tokens": 100, "temperature": 0.8}
 ```
 
+**Interactive REPL commands:**
+
+Once the CLI is launched with `--interactive` / `-i`, you can drive the running session with slash commands. Type `/help` (or `/?`) inside the REPL for the same list. Anything that does not start with `/` is treated as a user turn.
+
+The prompt header summarizes the current state on every turn — model, backend, architecture, context length, projector, conversation depth, and any attachments queued for the next turn (e.g. `[turn 3 (2 attachments pending)]> `). Press Ctrl+C while generating to interrupt the current reply; press Ctrl+C at the prompt to exit.
+
+Conversation:
+
+| Command | Description |
+|---|---|
+| `/help`, `/?` | Show all interactive commands |
+| `/exit`, `/quit` | Leave the session |
+| `/reset`, `/new` | Clear conversation history and KV cache |
+| `/history` | Print the conversation history |
+| `/save <file>` | Append the current transcript to a UTF-8 file |
+| `/system <text>` | Set the system prompt (empty argument clears it). Resets KV cache. |
+| `/think on\|off` | Toggle thinking/reasoning mode for supported models |
+| `/multiline on\|off` | Toggle multi-line input (terminate the message with a single `.` on its own line) |
+
+Model and runtime:
+
+| Command | Description |
+|---|---|
+| `/info`, `/status` | Show the loaded model, backend, architecture, context/vocab size, projector, conversation depth, and pending attachments |
+| `/model <path>` | Load a different `.gguf` model on the current backend (resets the session) |
+| `/backend <name>` | Reload the current model on a different backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector` |
+
+Sampling (live, persists across turns):
+
+| Command | Description |
+|---|---|
+| `/sampling`, `/show` | Print the current sampling configuration |
+| `/max <N>` | Maximum reply length in tokens |
+| `/temp <float>` | Sampling temperature (0 = greedy) |
+| `/topk <int>` | Top-K filtering (0 = disabled) |
+| `/topp <float>` | Top-P / nucleus threshold (1.0 = disabled) |
+| `/minp <float>` | Min-P filtering (0 = disabled) |
+| `/repeat <float>` | Repetition penalty (1.0 = none) |
+| `/presence <float>` | Presence penalty |
+| `/frequency <float>` | Frequency penalty |
+| `/seed <int>` | Random seed (-1 = non-deterministic) |
+| `/stop <text>` | Add a stop sequence |
+| `/clearstop` | Remove all stop sequences |
+
+Uploads (queued for the next user turn, then auto-cleared after the turn):
+
+| Command | Description |
+|---|---|
+| `/image <path>`, `/img <path>` | Attach an image (vision-capable models only) |
+| `/audio <path>` | Attach an audio file (Gemma 4) |
+| `/video <path>`, `/vid <path>` | Attach a video; frames are extracted automatically (Gemma 4) |
+| `/text <path>`, `/file <path>`, `/txt <path>` | Inline a UTF-8 text/markdown/csv/code file into the next prompt (large files are token-budget truncated) |
+| `/clearattach` | Drop any pending image/audio/video/text attachments without sending a turn |
+
+Quoted paths (single or double quotes) are accepted, so drag-and-drop from a file manager works on macOS. Multimodal commands require a multimodal projector to be loaded — pass `--mmproj` at startup or use `/mmproj <path>` from the REPL.
+
 ### Web Application
 
 ```bash
@@ -318,6 +383,13 @@ cd TensorSharp.Server/bin
 
 # Multimodal models: host an explicit projector too
 ./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
+
+# Configure server-wide default sampling parameters
+# (used whenever a request does not override the value itself)
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
+    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
+    --stop "</s>" --stop "<|endoftext|>"
 ```
 
 Open `http://localhost:5000` in your browser. The web interface supports:
@@ -344,6 +416,20 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
 | `--backend <type>` | Default compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
+| `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
+| `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
+| `--top-p <f>` | Default nucleus sampling threshold when a request does not provide one (`1.0` = disabled) |
+| `--min-p <f>` | Default min-p filtering when a request does not provide one (`0` = disabled) |
+| `--repeat-penalty <f>` | Default repetition penalty when a request does not provide one (`1.0` = none) |
+| `--presence-penalty <f>` | Default presence penalty when a request does not provide one (`0` = disabled) |
+| `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
+| `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
+| `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+
+Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
+`top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
+`frequency_penalty`, `seed`, `stop`/`stop_sequences`) always win over these
+server-wide defaults; the defaults only fill in fields the client omits.
 
 **Runtime environment variables:**
 
@@ -354,9 +440,24 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
 | `PORT` / `ASPNETCORE_URLS` | Standard ASP.NET Core listener configuration (default port: `5000`) |
+| `TENSORSHARP_TEMPERATURE` | Default sampling temperature when neither `--temperature` nor the request body sets one |
+| `TENSORSHARP_TOP_K` | Default top-K when neither `--top-k` nor the request body sets one |
+| `TENSORSHARP_TOP_P` | Default top-P when neither `--top-p` nor the request body sets one |
+| `TENSORSHARP_MIN_P` | Default min-P when neither `--min-p` nor the request body sets one |
+| `TENSORSHARP_REPEAT_PENALTY` | Default repetition penalty when neither `--repeat-penalty` nor the request body sets one |
+| `TENSORSHARP_PRESENCE_PENALTY` | Default presence penalty when neither `--presence-penalty` nor the request body sets one |
+| `TENSORSHARP_FREQUENCY_PENALTY` | Default frequency penalty when neither `--frequency-penalty` nor the request body sets one |
+| `TENSORSHARP_SEED` | Default random seed when neither `--seed` nor the request body sets one |
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
+
+Sampling parameter precedence (highest wins):
+
+1. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`).
+2. Server-wide CLI flags (e.g. `--temperature`, `--top-p`, `--stop`).
+3. `TENSORSHARP_*` environment variables listed above.
+4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
 
 ### Server Logging
 

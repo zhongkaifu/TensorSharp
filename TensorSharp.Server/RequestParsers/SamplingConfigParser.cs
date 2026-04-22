@@ -19,6 +19,15 @@ namespace TensorSharp.Server.RequestParsers
     /// (Web UI snake/camel, Ollama under <c>options</c>, OpenAI flat) into a
     /// single <see cref="SamplingConfig"/>. Kept as static methods because each
     /// call is cheap, stateless, and easy to unit test.
+    ///
+    /// Every overload accepts an optional <c>defaults</c> argument. When supplied,
+    /// the parser starts from a clone of those defaults and only overwrites
+    /// fields that are explicitly present in the request body. This is what lets
+    /// the server expose a global <c>--temperature</c>/<c>--top-k</c>/&hellip;
+    /// CLI surface without forcing every client to repeat the same parameters.
+    /// Passing <c>null</c> (or omitting the argument) keeps the historical
+    /// behaviour where missing fields fall back to the SamplingConfig defaults
+    /// baked into the type (Ollama-compatible: temp=0.8, topK=40, topP=0.9).
     /// </summary>
     internal static class SamplingConfigParser
     {
@@ -26,9 +35,9 @@ namespace TensorSharp.Server.RequestParsers
         /// Parse the Web UI body which accepts both snake_case (kept for API
         /// parity with Ollama/OpenAI) and camelCase (preferred by the JS UI).
         /// </summary>
-        public static SamplingConfig ParseWebUi(JsonElement body)
+        public static SamplingConfig ParseWebUi(JsonElement body, SamplingConfig defaults = null)
         {
-            var cfg = new SamplingConfig();
+            var cfg = SeedFromDefaults(defaults);
             if (body.TryGetProperty("temperature", out var temp))
                 cfg.Temperature = temp.GetSingle();
             if (body.TryGetProperty("top_k", out var tk))
@@ -59,6 +68,9 @@ namespace TensorSharp.Server.RequestParsers
                 cfg.Seed = sd.GetInt32();
             if (body.TryGetProperty("stop", out var stopEl) && stopEl.ValueKind == JsonValueKind.Array)
             {
+                // The "stop" key being present in the request is treated as a
+                // full replacement of any defaults so callers can intentionally
+                // disable a global default by sending an empty array.
                 cfg.StopSequences = new List<string>();
                 foreach (var s in stopEl.EnumerateArray())
                     if (s.GetString() is string sv)
@@ -71,9 +83,9 @@ namespace TensorSharp.Server.RequestParsers
         /// Parse Ollama's body where every sampler value lives inside a nested
         /// <c>options</c> object (e.g. <c>{ "options": { "temperature": 0.7 } }</c>).
         /// </summary>
-        public static SamplingConfig ParseOllama(JsonElement body)
+        public static SamplingConfig ParseOllama(JsonElement body, SamplingConfig defaults = null)
         {
-            var cfg = new SamplingConfig();
+            var cfg = SeedFromDefaults(defaults);
             if (body.TryGetProperty("options", out var opts))
             {
                 if (opts.TryGetProperty("temperature", out var temp)) cfg.Temperature = temp.GetSingle();
@@ -98,9 +110,9 @@ namespace TensorSharp.Server.RequestParsers
         /// Parse OpenAI's flat body. The OpenAI spec also allows <c>stop</c> to
         /// be a single string instead of an array.
         /// </summary>
-        public static SamplingConfig ParseOpenAI(JsonElement body)
+        public static SamplingConfig ParseOpenAI(JsonElement body, SamplingConfig defaults = null)
         {
-            var cfg = new SamplingConfig();
+            var cfg = SeedFromDefaults(defaults);
             if (body.TryGetProperty("temperature", out var temp)) cfg.Temperature = temp.GetSingle();
             if (body.TryGetProperty("top_p", out var tp)) cfg.TopP = tp.GetSingle();
             if (body.TryGetProperty("presence_penalty", out var pp)) cfg.PresencePenalty = pp.GetSingle();
@@ -120,6 +132,19 @@ namespace TensorSharp.Server.RequestParsers
                 }
             }
             return cfg;
+        }
+
+        /// <summary>
+        /// Returns a writable starting point for a parse: a clone of
+        /// <paramref name="defaults"/> when supplied, or a fresh
+        /// <see cref="SamplingConfig"/> with the type's built-in defaults
+        /// otherwise. We always clone (rather than mutate the supplied
+        /// instance) so per-request overrides cannot bleed into the shared
+        /// server-wide defaults singleton.
+        /// </summary>
+        private static SamplingConfig SeedFromDefaults(SamplingConfig defaults)
+        {
+            return defaults != null ? defaults.Clone() : new SamplingConfig();
         }
     }
 }

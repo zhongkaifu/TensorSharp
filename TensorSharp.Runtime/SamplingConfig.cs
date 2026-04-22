@@ -111,6 +111,30 @@ namespace TensorSharp.Runtime
             TopP = 0.9f,
             MinP = 0.05f,
         };
+
+        /// <summary>
+        /// Returns a deep copy of this config. Useful when callers want to seed
+        /// per-request defaults from a shared <see cref="SamplingConfig"/> and
+        /// then override individual fields without mutating the shared instance.
+        /// The <see cref="StopSequences"/> list is duplicated so adding entries
+        /// to the clone does not bleed back into the source config.
+        /// </summary>
+        public SamplingConfig Clone()
+        {
+            return new SamplingConfig
+            {
+                Temperature = Temperature,
+                TopK = TopK,
+                TopP = TopP,
+                MinP = MinP,
+                RepetitionPenalty = RepetitionPenalty,
+                PresencePenalty = PresencePenalty,
+                FrequencyPenalty = FrequencyPenalty,
+                Seed = Seed,
+                MaxTokens = MaxTokens,
+                StopSequences = StopSequences != null ? new List<string>(StopSequences) : null,
+            };
+        }
     }
 }
 

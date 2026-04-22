@@ -351,7 +351,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             var messagesEl = body.GetProperty("messages");
             int maxTokens = body.TryGetProperty("maxTokens", out var mt) ? mt.GetInt32() : _options.DefaultWebMaxTokens;
 
-            var samplingConfig = SamplingConfigParser.ParseWebUi(body);
+            var samplingConfig = SamplingConfigParser.ParseWebUi(body, _options.DefaultSamplingConfig);
             bool uiThink = body.TryGetProperty("think", out var uiThinkProp) && uiThinkProp.GetBoolean();
             List<ToolFunction> uiTools = null;
             if (body.TryGetProperty("tools", out var uiToolsEl) && uiToolsEl.ValueKind == JsonValueKind.Array)

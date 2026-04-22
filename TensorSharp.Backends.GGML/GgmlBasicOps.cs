@@ -376,6 +376,40 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Fully fused dense SwiGLU FFN with residual add in a single GGML graph dispatch.
+        /// residual += down_W^T @ ( silu(gate_part) * up_part ),
+        ///   where [gate_part | up_part] = gate_up_W^T @ rms_norm(input, normW, eps).
+        /// Replaces the previous chain of FusedRmsNormMatMulQuant + SiLUMul(Split) +
+        /// FusedMatMulQuantAdd (3 dispatches) with one, removing the matching number of
+        /// graph builds, allocations and synchronization round trips.
+        /// </summary>
+        public static void FusedFFNSwiGLUQuant(Tensor residual, Tensor input,
+            Tensor normWeight, float eps,
+            IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
+            int halfDim)
+        {
+            if (residual.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("FusedFFNSwiGLUQuant requires 2D residual/input tensors.");
+            if (input.ElementType != DType.Float32 || residual.ElementType != DType.Float32 || normWeight.ElementType != DType.Float32)
+                throw new ArgumentException("FusedFFNSwiGLUQuant requires Float32 tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(residual) || !HasNativeBufferStorage(normWeight))
+                throw new ArgumentException("FusedFFNSwiGLUQuant requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("FusedFFNSwiGLUQuant requires supported tensor layouts.");
+
+            int normCount = (int)normWeight.ElementCount();
+            IntPtr normPtr = GetBufferStart(normWeight);
+
+            GgmlNative.FusedFFNSwiGLUQuant(residualView, inputView, normPtr, normCount, eps,
+                gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
+                downData, downGgmlType, downNe0, downNe1, downRawBytes,
+                halfDim);
+        }
+
+        /// <summary>
         /// Native row selection (embedding lookup) from a quantized tensor.
         /// Uses GGML's ggml_get_rows which dequantizes on-the-fly (GPU-accelerated on Metal).
         /// </summary>
@@ -1106,6 +1140,17 @@ namespace TensorSharp.GGML
         [RegisterOpStorageType("SiLUMul", typeof(GgmlStorage))]
         public static Tensor SiLUMul(Tensor result, Tensor gate, Tensor up) => ExecuteFusedActMul(result, gate, up, GgmlFusedActMulOp.SiLUMul, "SiLUMul");
 
+        /// <summary>
+        /// Fused SiLU(gate) * up where gate and up are stored as the two halves of a single
+        /// contiguous [N, 2H] gate_up tensor. Avoids the two large NewContiguous copies that
+        /// the split + 2-arg path requires for prefill (seqLen &gt; 1).
+        /// gateUp must be Float32 with shape [N, 2*halfDim] and a row-major layout (stride1 == 1).
+        /// Result is allocated/written as [N, halfDim].
+        /// </summary>
+        [RegisterOpStorageType("SiLUMulSplit", typeof(GgmlStorage))]
+        public static Tensor SiLUMulSplit(Tensor result, Tensor gateUp, int halfDim)
+            => ExecuteFusedActMulSplit(result, gateUp, halfDim, GgmlFusedActMulOp.SiLUMul, "SiLUMulSplit");
+
         [RegisterOpStorageType("GELUMul", typeof(GgmlStorage))]
         public static Tensor GELUMul(Tensor result, Tensor gate, Tensor up) => ExecuteFusedActMul(result, gate, up, GgmlFusedActMulOp.GELUMul, "GELUMul");
 
@@ -1503,6 +1548,39 @@ namespace TensorSharp.GGML
             }
 
             GgmlNative.FusedActMul(op, resultView, aView, bView);
+            return writeTarget;
+        }
+
+        private static Tensor ExecuteFusedActMulSplit(Tensor result, Tensor gateUp, int halfDim, GgmlFusedActMulOp op, string opName)
+        {
+            if (gateUp == null)
+                throw new ArgumentNullException(nameof(gateUp));
+            if (halfDim <= 0)
+                throw new ArgumentOutOfRangeException(nameof(halfDim));
+            if (gateUp.ElementType != DType.Float32)
+                throw new InvalidOperationException($"GGML {opName} requires a Float32 gate_up tensor.");
+            if (gateUp.DimensionCount != 2 || gateUp.Sizes[1] != 2L * halfDim)
+                throw new InvalidOperationException($"GGML {opName} requires gate_up shape [N, 2*halfDim].");
+
+            long rows = gateUp.Sizes[0];
+            long[] resultShape = new long[] { rows, halfDim };
+
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, gateUp, false, resultShape);
+            if (!TryCreateRawView(writeTarget, out GgmlTensorView2D resultView)
+                || !TryCreateRawView(gateUp, out GgmlTensorView2D gateUpView))
+            {
+                throw new NotSupportedException($"GGML {opName} requires native-backed Float32 2D tensors.");
+            }
+            if (resultView.Stride1 != 1 || gateUpView.Stride1 != 1)
+            {
+                throw new NotSupportedException($"GGML {opName} requires row-major (stride1==1) tensors.");
+            }
+            if (gateUpView.Stride0 < gateUpView.Dim1)
+            {
+                throw new NotSupportedException($"GGML {opName} requires gate_up.stride0 >= gate_up.dim1.");
+            }
+
+            GgmlNative.FusedActMulSplit(op, resultView, gateUpView, halfDim);
             return writeTarget;
         }
 
