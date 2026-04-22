@@ -533,6 +533,22 @@ internal enum GgmlIndexReductionOp
             IntPtr[] plePostNormArr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GatedDeltaNetChunkedF32(
+            GgmlTensorView3D q,
+            GgmlTensorView3D k,
+            GgmlTensorView3D v,
+            GgmlTensorView3D z,
+            GgmlTensorView2D alpha,
+            GgmlTensorView2D beta,
+            GgmlTensorView3D state,
+            GgmlTensorView3D gatedOut,
+            IntPtr dtBiasData,
+            IntPtr aLogData,
+            IntPtr ssmNormWData,
+            int chunkSize,
+            float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern IntPtr TSGgml_AlignedAlloc(UIntPtr size);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -1127,6 +1143,27 @@ internal enum GgmlIndexReductionOp
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
                 plePostNormArr), "gemma4_model_decode");
+        }
+
+        public static void GatedDeltaNetChunked(
+            GgmlTensorView3D q,
+            GgmlTensorView3D k,
+            GgmlTensorView3D v,
+            GgmlTensorView3D z,
+            GgmlTensorView2D alpha,
+            GgmlTensorView2D beta,
+            GgmlTensorView3D state,
+            GgmlTensorView3D gatedOut,
+            IntPtr dtBiasData,
+            IntPtr aLogData,
+            IntPtr ssmNormWData,
+            int chunkSize,
+            float eps)
+        {
+            CheckResult(TSGgml_GatedDeltaNetChunkedF32(
+                q, k, v, z, alpha, beta, state, gatedOut,
+                dtBiasData, aLogData, ssmNormWData,
+                chunkSize, eps), "gated_delta_net_chunked");
         }
 
         /// <summary>Allocate memory with 16 KB alignment (page-aligned for Metal host_ptr).</summary>

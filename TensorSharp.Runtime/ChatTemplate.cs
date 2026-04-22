@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -27,6 +27,14 @@ namespace TensorSharp.Runtime
         /// Optional list of audio file paths for multimodal messages.
         /// </summary>
         public List<string> AudioPaths { get; set; }
+        /// <summary>
+        /// Optional list of plain-text file paths whose contents have been inlined into
+        /// <see cref="Content"/> (e.g. uploaded .txt / .md / .csv attachments). The paths
+        /// themselves are not consumed by the model - they exist purely so the per-turn
+        /// audit log can record which uploaded files belong to this message even though
+        /// their contents have been folded into the prompt text.
+        /// </summary>
+        public List<string> TextFilePaths { get; set; }
         /// <summary>
         /// True if ImagePaths represent video frames (inserts &lt;|video&gt; before frame &lt;|image&gt; tokens).
         /// </summary>

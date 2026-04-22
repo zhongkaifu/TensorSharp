@@ -5,7 +5,7 @@
 TensorSharp.Server provides three API styles plus a few utility endpoints:
 - **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
-- **Web UI** (`/api/chat`, `/api/models`, `/api/models/load`, `/api/upload`)
+- **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`)
 - **Utilities** (`/api/version`, `/api/queue/status`)
 
 Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The Web UI and compatibility endpoints expose only that hosted model; `/api/models/load` can reload it, but it does not switch to arbitrary files at runtime.
@@ -82,9 +82,16 @@ Response:
   "prompt_eval_count": 15,
   "prompt_eval_duration": 300000000,
   "eval_count": 10,
-  "eval_duration": 1200000000
+  "eval_duration": 1200000000,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
 }
 ```
+
+`prompt_cache_hit_tokens` reports how many of the `prompt_eval_count` tokens
+were served straight from the prior turn's KV cache. `/api/generate` always
+resets the session before prefilling, so this value is always `0`; it is
+non-zero on `/api/chat/ollama` when the prompt prefix matches a previous turn.
 
 ### Generate (streaming)
 
@@ -104,8 +111,11 @@ Each line is a JSON object (newline-delimited JSON):
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"Why","done":false}
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":" did","done":false}
 ...
-{"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"","done":true,"done_reason":"stop","total_duration":...,"eval_count":...}
+{"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"","done":true,"done_reason":"stop","total_duration":...,"eval_count":...,"prompt_cache_hit_tokens":0,"prompt_cache_hit_ratio":0.0}
 ```
+
+The final `done` chunk also carries the same `prompt_cache_hit_tokens` /
+`prompt_cache_hit_ratio` fields as the non-streaming response.
 
 ### Generate with Image (multimodal)
 
@@ -152,9 +162,17 @@ Response:
   "prompt_eval_count": 20,
   "prompt_eval_duration": 500000000,
   "eval_count": 15,
-  "eval_duration": 1500000000
+  "eval_duration": 1500000000,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
 }
 ```
+
+`prompt_cache_hit_tokens` and `prompt_cache_hit_ratio` describe how much of the
+prompt was served from the previous turn's KV cache. On the first turn of a
+fresh conversation both values are zero; on a follow-up turn that reuses the
+prior conversation prefix they grow to (often) close to `prompt_eval_count` /
+`1.0`. The same fields appear on the final NDJSON chunk in streaming mode.
 
 ### Chat (streaming)
 
@@ -336,10 +354,18 @@ Response:
   "usage": {
     "prompt_tokens": 20,
     "completion_tokens": 8,
-    "total_tokens": 28
+    "total_tokens": 28,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
   }
 }
 ```
+
+`usage.prompt_tokens_details.cached_tokens` follows OpenAI's standard
+KV-cache-hit extension. On a follow-up turn that shares the prefix of an
+earlier turn this value approaches `prompt_tokens`, which lets clients reason
+about TTFT savings without enabling Debug logging on the server.
 
 ### Chat Completions (streaming)
 
@@ -360,10 +386,13 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model
 
 data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{...}}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}
 
 data: [DONE]
 ```
+
+The final chunk's `usage` block carries `prompt_tokens_details.cached_tokens`
+just like the non-streaming response.
 
 ### Chat Completions with JSON mode
 
@@ -533,7 +562,76 @@ curl http://localhost:5000/api/models
 
 ---
 
-## 3. Sampling Options
+## 3. Web UI SSE (`/api/chat`)
+
+This is the protocol the bundled chat UI uses; documented here so external Web
+UIs can plug into the same endpoint. Every event is a JSON object delivered as a
+single `data: ...` SSE frame.
+
+### Chat Sessions
+
+The Web UI flow is session-scoped: every browser tab creates its own session at
+load time and attaches the `sessionId` to every `/api/chat` request, so each
+tab gets an isolated KV cache. The Ollama and OpenAI-compatible endpoints
+share a built-in `__default__` session that lives for the lifetime of the
+server.
+
+```bash
+# Create a fresh session (returns its id; only the Web UI flow needs this)
+curl -X POST http://localhost:5000/api/sessions
+# {"sessionId":"a3b1c2..."}
+
+# Dispose a session and release its KV cache state. The default session
+# (__default__) cannot be removed; the call returns 404 if the id is unknown.
+curl -X DELETE http://localhost:5000/api/sessions/a3b1c2...
+```
+
+Reusing the same `sessionId` across `/api/chat` requests lets the server
+splice prior assistant tokens directly into the KV cache prefix on the next
+turn (the `kvReusedTokens` / `kvReusePercent` fields on the terminal SSE frame
+report how much was reused). Pass `sessionId: null` to fall back to the shared
+`__default__` session, or pass `newChat: true` to force a server-side cache
+reset on the next request without disposing the session.
+
+### Streaming Chat
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hi"}],
+    "maxTokens": 50,
+    "sessionId": null,
+    "newChat": false,
+    "think": false,
+    "tools": []
+  }'
+```
+
+Event shapes:
+
+| Event field(s) | When | Meaning |
+|---|---|---|
+| `queue_position`, `queue_pending` | once per second while the request is queued | how many requests are ahead of this one |
+| `token` | each generated token (or parsed content chunk when `think`/`tools` are active) | streaming content |
+| `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
+| `tool_calls` | when the model emits a tool call | array of `{name, arguments}` |
+| `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary |
+
+Sample terminal frame:
+
+```
+data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+```
+
+Use `kvReusedTokens` / `kvReusePercent` in the same way as the Ollama
+`prompt_cache_hit_*` and OpenAI `usage.prompt_tokens_details.cached_tokens`
+fields - they all measure the same thing (prompt tokens served straight from
+the prior turn's KV cache) for the corresponding session.
+
+---
+
+## 4. Sampling Options
 
 ### Ollama-style options (inside `options` object)
 
@@ -565,7 +663,7 @@ curl http://localhost:5000/api/models
 
 ---
 
-## 4. Python Client Examples
+## 5. Python Client Examples
 
 ### Using `requests` (Ollama-style)
 
@@ -693,7 +791,7 @@ Notes:
 
 ---
 
-## 5. Running Test Requests
+## 6. Running Test Requests
 
 The `test_requests.jsonl` file contains sample requests for all endpoints. Run them with:
 

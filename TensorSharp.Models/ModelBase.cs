@@ -1898,7 +1898,7 @@ namespace TensorSharp.Models
             return false;
         }
 
-        public void PrintTimingStats()
+        public virtual void PrintTimingStats()
         {
             if (_forwardCount == 0) return;
             double totalMs = _forwardSw.Elapsed.TotalMilliseconds;

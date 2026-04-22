@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -13,8 +13,13 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
+using TensorSharp.Cli.Logging;
 using TensorSharp.Cpu;
 
 namespace TensorSharp.Cli
@@ -22,10 +27,35 @@ namespace TensorSharp.Cli
     class Program
     {
         private static readonly IPromptRenderer PromptRenderer = new GgufPromptRenderer();
+        private static ILogger _log = NullLogger.Instance;
 
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
+
+            var loggingOptions = CliLoggingSetup.ParseFromArgs(args);
+            using var loggerFactory = CliLoggingSetup.Build(loggingOptions);
+            _log = loggerFactory.CreateLogger("TensorSharp.Cli");
+            _log.LogInformation(LogEventIds.CliStarted,
+                "tensorsharp-cli started: argv={ArgCount} logLevel={LogLevel} logDir={LogDir} fileLogging={FileLogging} consoleLogging={ConsoleLogging}",
+                args.Length, loggingOptions.MinimumLevel, loggingOptions.Directory,
+                loggingOptions.FileEnabled, loggingOptions.ConsoleEnabled);
+
+            try
+            {
+                MainCore(args);
+                _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed");
+            }
+            catch (Exception ex)
+            {
+                _log.LogCritical(LogEventIds.CliFailed, ex,
+                    "tensorsharp-cli aborted with unhandled exception {ExceptionType}", ex.GetType().Name);
+                throw;
+            }
+        }
+
+        static void MainCore(string[] args)
+        {
             string modelPath = null;
             string inputFile = null;
             string outputFile = null;
@@ -97,12 +127,13 @@ namespace TensorSharp.Cli
             {
                 if (!File.Exists(toolsFile))
                 {
-                    Console.Error.WriteLine($"Tools file not found: {toolsFile}");
+                    _log.LogError(LogEventIds.CliFailed, "Tools file not found: {ToolsFile}", toolsFile);
                     return;
                 }
                 tools = JsonSerializer.Deserialize<List<ToolFunction>>(File.ReadAllText(toolsFile),
                     new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-                Console.WriteLine($"Loaded {tools.Count} tool definition(s) from {toolsFile}");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Loaded {ToolCount} tool definition(s) from {ToolsFile}", tools.Count, toolsFile);
             }
 
             if (testTemplatesDir != null)
@@ -124,10 +155,12 @@ namespace TensorSharp.Cli
 
             if (modelPath == null || !File.Exists(modelPath))
             {
-                Console.Error.WriteLine($"Model file not found: {modelPath ?? "(none)"}");
+                _log.LogError(LogEventIds.CliFailed,
+                    "Model file not found: {ModelPath}", modelPath ?? "(none)");
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
-                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal|ggml_cuda]");
+                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal|ggml_cuda] " +
+                    "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
                 return;
             }
 
@@ -140,10 +173,21 @@ namespace TensorSharp.Cli
                 _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, ggml_cpu, ggml_metal, ggml_cuda"),
             };
 
+            _log.LogInformation(LogEventIds.ModelLoadStarted,
+                "Loading model {ModelFile} on backend {Backend} (path={ModelPath})",
+                Path.GetFileName(modelPath), backend, modelPath);
+            var modelLoadSw = Stopwatch.StartNew();
             using var model = ModelBase.Create(modelPath, backend);
+            modelLoadSw.Stop();
+            _log.LogInformation(LogEventIds.ModelLoadCompleted,
+                "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} elapsedMs={ElapsedMs:F1}",
+                Path.GetFileName(modelPath), model.Config.Architecture ?? "(unknown)",
+                model.MaxContextLength, modelLoadSw.Elapsed.TotalMilliseconds);
 
             if (mmProjPath != null)
             {
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Loading mmproj projector from {MmProj}", mmProjPath);
                 model.MultimodalInjector.LoadProjectors(mmProjPath);
             }
             else if (imagePath != null && model.Config.Architecture == "gemma3")
@@ -151,7 +195,8 @@ namespace TensorSharp.Cli
                 string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "mmproj-gemma3-4b-f16.gguf");
                 if (File.Exists(autoMmproj))
                 {
-                    Console.WriteLine($"Auto-loading vision encoder: {autoMmproj}");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
@@ -160,7 +205,8 @@ namespace TensorSharp.Cli
                 string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "mistral3-mmproj.gguf");
                 if (File.Exists(autoMmproj))
                 {
-                    Console.WriteLine($"Auto-loading Mistral3 vision encoder: {autoMmproj}");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading Mistral3 vision encoder: {MmProj}", autoMmproj);
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
@@ -170,7 +216,8 @@ namespace TensorSharp.Cli
                 string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "gemma-4-mmproj-F16.gguf");
                 if (File.Exists(autoMmproj))
                 {
-                    Console.WriteLine($"Auto-loading multimodal encoder: {autoMmproj}");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
@@ -182,7 +229,8 @@ namespace TensorSharp.Cli
                 string autoMmproj = Path.Combine(Path.GetDirectoryName(modelPath), "Qwen3.5-mmproj-F16.gguf");
                 if (File.Exists(autoMmproj))
                 {
-                    Console.WriteLine($"Auto-loading vision encoder: {autoMmproj}");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading vision encoder: {MmProj}", autoMmproj);
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
@@ -221,11 +269,14 @@ namespace TensorSharp.Cli
             if (inputFile != null && File.Exists(inputFile))
             {
                 rawText = File.ReadAllText(inputFile).TrimEnd();
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Loaded input from {InputFile} ({Chars} chars)", inputFile, rawText.Length);
             }
             else
             {
                 rawText = "What is 1+1?";
-                Console.WriteLine($"No input file specified, using default: \"{rawText}\"");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "No input file specified; using default prompt: \"{Prompt}\"", rawText);
             }
 
             List<string> imagePaths = null;
@@ -235,36 +286,43 @@ namespace TensorSharp.Cli
             {
                 if (!File.Exists(videoPath))
                 {
-                    Console.Error.WriteLine($"Video file not found: {videoPath}");
+                    _log.LogError(LogEventIds.CliFailed, "Video file not found: {VideoPath}", videoPath);
                     return;
                 }
-                Console.WriteLine($"Video: {videoPath} ({new FileInfo(videoPath).Length / 1024} KB)");
+                _log.LogInformation(LogEventIds.UploadReceived,
+                    "Video input: {VideoPath} ({Bytes})",
+                    videoPath, LoggingExtensions.FormatBytes(new FileInfo(videoPath).Length));
                 imagePaths = MediaHelper.ExtractVideoFrames(videoPath);
-                Console.WriteLine($"Extracted {imagePaths.Count} frames from video");
+                _log.LogInformation(LogEventIds.VideoFrameDownsample,
+                    "Extracted {FrameCount} frames from video", imagePaths.Count);
                 rawText = "What is happening in this video? Please describe it.";
             }
             else if (imagePath != null)
             {
                 if (!File.Exists(imagePath))
                 {
-                    Console.Error.WriteLine($"Image file not found: {imagePath}");
+                    _log.LogError(LogEventIds.CliFailed, "Image file not found: {ImagePath}", imagePath);
                     return;
                 }
                 imagePaths = new List<string> { imagePath };
                 rawText = "What is in this image? Please describe it.";
-                Console.WriteLine($"Image: {imagePath} ({new FileInfo(imagePath).Length / 1024} KB)");
+                _log.LogInformation(LogEventIds.UploadReceived,
+                    "Image input: {ImagePath} ({Bytes})",
+                    imagePath, LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
             }
 
             if (audioPath != null)
             {
                 if (!File.Exists(audioPath))
                 {
-                    Console.Error.WriteLine($"Audio file not found: {audioPath}");
+                    _log.LogError(LogEventIds.CliFailed, "Audio file not found: {AudioPath}", audioPath);
                     return;
                 }
                 audioPaths = new List<string> { audioPath };
                 rawText = "Listen to this audio and describe what you hear.";
-                Console.WriteLine($"Audio: {audioPath} ({new FileInfo(audioPath).Length / 1024} KB)");
+                _log.LogInformation(LogEventIds.UploadReceived,
+                    "Audio input: {AudioPath} ({Bytes})",
+                    audioPath, LoggingExtensions.FormatBytes(new FileInfo(audioPath).Length));
             }
 
             if (dumpPrompt)
@@ -276,23 +334,50 @@ namespace TensorSharp.Cli
                 string rendered = PromptRenderer.Render(
                     model.Config.ChatTemplate, dumpMessages, addGenerationPrompt: true,
                     architecture: model.Config.Architecture, tools: tools, enableThinking: enableThinking);
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Dumped rendered prompt ({Chars} chars)", rendered.Length);
+                // Prompt dump is a developer tool; emit the rendered text on stdout so
+                // it remains easy to pipe/copy regardless of log routing.
                 Console.WriteLine("=== Rendered Prompt ===");
                 Console.WriteLine(rendered);
                 Console.WriteLine($"=== End ({rendered.Length} chars, ends with: {(rendered.Length > 0 ? $"0x{(int)rendered[rendered.Length-1]:X2}" : "empty")}) ===");
                 var tokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Tokenized prompt: count={TokenCount} first20=[{First20}] last10=[{Last10}]",
+                    tokens.Count,
+                    string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count))),
+                    string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count))));
                 Console.WriteLine($"Token count: {tokens.Count}");
                 Console.WriteLine($"First 20 tokens: [{string.Join(", ", tokens.GetRange(0, Math.Min(20, tokens.Count)))}]");
                 Console.WriteLine($"Last 10 tokens: [{string.Join(", ", tokens.GetRange(Math.Max(0, tokens.Count - 10), Math.Min(10, tokens.Count)))}]");
                 return;
             }
 
+            // Per-turn upload manifest: include the path AND saved filename of every
+            // attachment for this turn so the CLI inference log carries the same
+            // upload audit trail as the server's chat.start line.
+            string cliTurnUploads = FormatUploadsForCli(imagePaths, audioPaths, videoPath);
+
+            _log.LogInformation(LogEventIds.ChatStarted,
+                "cli.inference.start tokensRequested={MaxTokens} thinking={Thinking} tools={ToolCount} input=\"{Input}\" images={ImageCount} audio={AudioCount} video={Video} uploads={Uploads}",
+                maxTokens, enableThinking, tools?.Count ?? 0,
+                LoggingExtensions.SanitizeForLog(rawText), imagePaths?.Count ?? 0,
+                audioPaths?.Count ?? 0, videoPath != null, cliTurnUploads);
+
             string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: videoPath != null, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools);
 
+            _log.LogInformation(LogEventIds.ChatCompleted,
+                "cli.inference.complete chars={Chars} preview=\"{Preview}\"",
+                result?.Length ?? 0, LoggingExtensions.SanitizeForLog(result ?? string.Empty, maxLength: 480));
+
             if (outputFile != null)
             {
                 File.WriteAllText(outputFile, result);
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Output written to {OutputFile} ({Chars} chars)",
+                    outputFile, result?.Length ?? 0);
                 Console.WriteLine($"Output written to {outputFile}");
             }
             else
@@ -313,7 +398,7 @@ namespace TensorSharp.Cli
         {
             if (!File.Exists(jsonlPath))
             {
-                Console.Error.WriteLine($"File not found: {jsonlPath}");
+                _log.LogError(LogEventIds.CliFailed, "Multi-turn jsonl not found: {File}", jsonlPath);
                 return;
             }
 
@@ -328,8 +413,9 @@ namespace TensorSharp.Cli
             var kvCache = new KVCache();
             var renderer = new KVCachePromptRenderer(PromptRenderer);
 
-            Console.WriteLine($"Multi-turn test: {lines.Length} turns, thinking={enableThinking}, SWA={swa}");
-            Console.WriteLine(new string('=', 60));
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "multi-turn test starting: turns={Turns} thinking={Thinking} swa={SWA} arch={Architecture}",
+                lines.Length, enableThinking, swa, arch);
 
             for (int turn = 0; turn < lines.Length; turn++)
             {
@@ -355,11 +441,14 @@ namespace TensorSharp.Cli
                 }
 
                 history.Add(new ChatMessage { Role = "user", Content = userMsg });
-                Console.WriteLine($"\n[Turn {turn + 1}/{lines.Length}] User: {userMsg}");
+                _log.LogInformation(LogEventIds.ChatStarted,
+                    "multi-turn turn={Turn}/{TotalTurns} user=\"{User}\"",
+                    turn + 1, lines.Length, LoggingExtensions.SanitizeForLog(userMsg));
 
                 if (forceReset)
                 {
-                    Console.WriteLine("[KV cache] Forcing reset (per JSONL force_reset flag)");
+                    _log.LogInformation(LogEventIds.SessionReset,
+                        "multi-turn forcing KV cache reset (per JSONL force_reset flag)");
                     kvCache.Reset();
                     model.ResetKVCache();
                 }
@@ -372,15 +461,17 @@ namespace TensorSharp.Cli
                     addGenerationPrompt: true,
                     enableThinking: enableThinking);
 
-                Console.WriteLine($"Prompt: {inputTokens.Count} tokens");
+                _log.LogInformation(LogEventIds.ChatStarted,
+                    "multi-turn prompt tokens={PromptTokens}", inputTokens.Count);
 
                 var sw = Stopwatch.StartNew();
                 ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
                 float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens);
                 double prefillMs = sw.Elapsed.TotalMilliseconds;
 
-                Console.WriteLine($"[KV cache] {DescribePlan(plan, inputTokens.Count)}");
-                Console.WriteLine($"Prefill: {prefillMs:F1} ms");
+                _log.LogInformation(LogEventIds.KvCacheReusePlan,
+                    "kv plan={Plan} prefillMs={PrefillMs:F1} description={Description}",
+                    plan.Kind, prefillMs, DescribePlan(plan, inputTokens.Count));
 
                 var cfg = sampling ?? SamplingConfig.Greedy;
                 var sampler = new TokenSampler(cfg);
@@ -410,16 +501,22 @@ namespace TensorSharp.Cli
                 string thinking = parsed.Thinking ?? "";
 
                 if (thinking.Length > 0)
-                    Console.WriteLine($"[Thinking] ({thinking.Length} chars): {(thinking.Length > 200 ? thinking.Substring(0, 200) + "..." : thinking)}");
+                    _log.LogInformation(LogEventIds.ChatCompleted,
+                        "multi-turn thinking ({ThinkingChars} chars): {ThinkingPreview}",
+                        thinking.Length, LoggingExtensions.SanitizeForLog(thinking));
 
-                Console.WriteLine($"[Content] ({content.Length} chars, {generatedTokens.Count} tokens): {(content.Length > 500 ? content.Substring(0, 500) + "..." : content)}");
-                Console.WriteLine($"Decode: {decodeMs:F0} ms ({generatedTokens.Count / (decodeMs / 1000.0):F1} tok/s)");
+                _log.LogInformation(LogEventIds.ChatCompleted,
+                    "multi-turn content chars={ContentChars} tokens={Tokens} decodeMs={DecodeMs:F0} tokPerSec={TokensPerSec:F1} preview={ContentPreview}",
+                    content.Length, generatedTokens.Count, decodeMs,
+                    generatedTokens.Count / (decodeMs / 1000.0),
+                    LoggingExtensions.SanitizeForLog(content, maxLength: 480));
 
                 bool hasUnused = rawOutput.Contains("<unused");
                 if (hasUnused)
                 {
-                    Console.WriteLine("*** ERROR: Output contains <unused> tokens! ***");
-                    Console.WriteLine($"Raw output (first 500 chars): {rawOutput.Substring(0, Math.Min(500, rawOutput.Length))}");
+                    _log.LogError(LogEventIds.ChatFailed,
+                        "multi-turn output contains <unused> tokens; first 500 chars: {RawPreview}",
+                        rawOutput.Substring(0, Math.Min(500, rawOutput.Length)));
                     break;
                 }
 
@@ -434,8 +531,8 @@ namespace TensorSharp.Cli
                 });
             }
 
-            Console.WriteLine(new string('=', 60));
-            Console.WriteLine($"Multi-turn test completed: {history.Count / 2} turns");
+            _log.LogInformation(LogEventIds.CliCompleted,
+                "multi-turn test completed: {Turns} turns", history.Count / 2);
         }
 
         /// <summary>
@@ -493,7 +590,7 @@ namespace TensorSharp.Cli
         {
             if (!File.Exists(inputJsonlPath))
             {
-                Console.Error.WriteLine($"JSONL file not found: {inputJsonlPath}");
+                _log.LogError(LogEventIds.CliFailed, "JSONL file not found: {File}", inputJsonlPath);
                 return;
             }
 
@@ -502,8 +599,9 @@ namespace TensorSharp.Cli
             int total = lines.Length;
             int completed = 0;
 
-            Console.WriteLine($"Processing {total} requests from {inputJsonlPath}");
-            Console.WriteLine(new string('=', 60));
+            _log.LogInformation(LogEventIds.CliBatchProgress,
+                "jsonl batch starting: total={Total} source={Source}",
+                total, inputJsonlPath);
 
             var totalSw = Stopwatch.StartNew();
 
@@ -519,7 +617,8 @@ namespace TensorSharp.Cli
                 }
                 catch (JsonException ex)
                 {
-                    Console.Error.WriteLine($"[Line {lineIdx + 1}] Invalid JSON: {ex.Message}");
+                    _log.LogError(LogEventIds.CliFailed,
+                        "jsonl batch line {LineNumber} invalid JSON: {Error}", lineIdx + 1, ex.Message);
                     results.Add(JsonSerializer.Serialize(new { line = lineIdx + 1, error = $"Invalid JSON: {ex.Message}" }));
                     continue;
                 }
@@ -527,7 +626,9 @@ namespace TensorSharp.Cli
                 var root = doc.RootElement;
                 string id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() : $"request_{lineIdx + 1}";
 
-                Console.WriteLine($"\n[{lineIdx + 1}/{total}] Processing request: {id}");
+                _log.LogInformation(LogEventIds.CliBatchProgress,
+                    "jsonl batch [{Index}/{Total}] processing request: {RequestId}",
+                    lineIdx + 1, total, id);
 
                 try
                 {
@@ -548,10 +649,14 @@ namespace TensorSharp.Cli
                         model.Config.ChatTemplate, messages, addGenerationPrompt: true,
                         architecture: model.Config.Architecture, enableThinking: reqThinking);
 
-                    Console.WriteLine($"Rendered prompt (thinking={reqThinking}):\n---\n{rendered}\n---");
+                    _log.LogDebug(LogEventIds.ChatStarted,
+                        "jsonl batch [{RequestId}] rendered prompt thinking={Thinking} preview={Preview}",
+                        id, reqThinking, LoggingExtensions.SanitizeForLog(rendered, maxLength: 320));
 
                     var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
-                    Console.WriteLine($"Input tokens ({inputTokens.Count}): [{string.Join(", ", inputTokens.Take(20))}{(inputTokens.Count > 20 ? ", ..." : "")}]");
+                    _log.LogDebug(LogEventIds.ChatStarted,
+                        "jsonl batch [{RequestId}] inputTokens={TokenCount} first20=[{First20}]",
+                        id, inputTokens.Count, string.Join(", ", inputTokens.Take(20)));
 
                     var sw = Stopwatch.StartNew();
                     float[] logits = model.Forward(inputTokens.ToArray());
@@ -590,7 +695,10 @@ namespace TensorSharp.Cli
                     string output = sb.ToString();
                     double tokPerSec = generatedTokens.Count / (totalMs / 1000.0);
 
-                    Console.WriteLine($"Output ({generatedTokens.Count} tokens, {tokPerSec:F1} tok/s): {output}");
+                    _log.LogInformation(LogEventIds.ChatCompleted,
+                        "jsonl batch [{RequestId}] tokens={Tokens} tokPerSec={TokensPerSec:F1} totalMs={TotalMs:F1} output={OutputPreview}",
+                        id, generatedTokens.Count, tokPerSec, totalMs,
+                        LoggingExtensions.SanitizeForLog(output, maxLength: 320));
 
                     var resultObj = new Dictionary<string, object>
                     {
@@ -606,7 +714,9 @@ namespace TensorSharp.Cli
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"[Line {lineIdx + 1}] Error: {ex.Message}");
+                    _log.LogError(LogEventIds.ChatFailed, ex,
+                        "jsonl batch line {LineNumber} request {RequestId} failed: {Error}",
+                        lineIdx + 1, id, ex.Message);
                     var errorObj = new Dictionary<string, object>
                     {
                         ["id"] = id,
@@ -618,13 +728,15 @@ namespace TensorSharp.Cli
 
             totalSw.Stop();
 
-            Console.WriteLine(new string('=', 60));
-            Console.WriteLine($"Completed {completed}/{total} requests in {totalSw.Elapsed.TotalSeconds:F1}s");
+            _log.LogInformation(LogEventIds.CliBatchProgress,
+                "jsonl batch completed {Completed}/{Total} requests in {ElapsedSec:F1}s",
+                completed, total, totalSw.Elapsed.TotalSeconds);
 
             if (outputFile != null)
             {
                 File.WriteAllLines(outputFile, results);
-                Console.WriteLine($"Results written to {outputFile}");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Results written to {OutputFile} ({ResultCount} results)", outputFile, results.Count);
             }
             else
             {
@@ -719,7 +831,9 @@ namespace TensorSharp.Cli
                 architecture: model.Config.Architecture,
                 tools: tools, enableThinking: enableThinking);
 
-            Console.WriteLine($"Rendered prompt:\n---\n{rendered}\n---");
+            _log.LogDebug(LogEventIds.ChatStarted,
+                "cli.inference rendered prompt chars={Chars} preview={Preview}",
+                rendered.Length, LoggingExtensions.SanitizeForLog(rendered, maxLength: 480));
 
             var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
 
@@ -739,17 +853,19 @@ namespace TensorSharp.Cli
                     inputTokens = ChatTemplate.ExpandGemma3ImageTokens(inputTokens,
                         startId, endId, nlnlId, padId, proc.TokensPerImage);
 
-                    Console.WriteLine($"Gemma3 vision: {proc.TokensPerImage} tokens per image, " +
-                        $"start={startId}, end={endId}");
-                    Console.WriteLine($"Total tokens after image expansion: {inputTokens.Count}");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Gemma3 vision: tokensPerImage={TokensPerImage} start={Start} end={End} totalTokens={TotalTokens}",
+                        proc.TokensPerImage, startId, endId, inputTokens.Count);
 
                     if (model is Gemma3Model g3 && g3.VisionEncoder != null)
                     {
-                        Console.Write("Processing image through vision encoder...");
+                        _log.LogDebug(LogEventIds.HostConfiguration,
+                            "Processing image through Gemma3 vision encoder");
                         float[] pixels = proc.ProcessImage(imagePaths[0]);
-                        Console.Write(" pixels ready...");
                         var visionEmbeddings = g3.VisionEncoder.Encode(pixels);
-                        Console.WriteLine($" done ({visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]})");
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Gemma3 vision embeddings: {EmbeddingShape}",
+                            $"{visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]}");
 
                         int imageTokenStart = -1;
                         for (int i = 0; i < inputTokens.Count; i++)
@@ -764,17 +880,20 @@ namespace TensorSharp.Cli
                         if (imageTokenStart >= 0)
                         {
                             g3.SetVisionEmbeddings(visionEmbeddings, imageTokenStart);
-                            Console.WriteLine($"Vision embeddings will be injected at token position {imageTokenStart}");
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Gemma3 vision embeddings injection position={Position}", imageTokenStart);
                         }
                         else
                         {
-                            Console.WriteLine("Warning: Could not find image placeholder position");
+                            _log.LogWarning(LogEventIds.HostConfiguration,
+                                "Gemma3 vision: could not find image placeholder position");
                             visionEmbeddings.Dispose();
                         }
                     }
                     else
                     {
-                        Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }
                 }
                 else if (arch == "gemma4")
@@ -791,11 +910,11 @@ namespace TensorSharp.Cli
 
                         foreach (var imgP in imagePaths)
                         {
-                            Console.Write($"Processing frame through Gemma4 vision encoder...");
                             var (pixels, imgW, imgH) = proc.ProcessImage(imgP);
-                            Console.Write($" pixels ready ({imgW}x{imgH})...");
                             var visionEmb = g4.VisionEncoder.Encode(pixels, imgW, imgH);
-                            Console.WriteLine($" done ({visionEmb.Sizes[0]}x{visionEmb.Sizes[1]})");
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Gemma4 vision frame: source={Source} resolution={Width}x{Height} embeddings={EmbeddingShape}",
+                                imgP, imgW, imgH, $"{visionEmb.Sizes[0]}x{visionEmb.Sizes[1]}");
                             allVisionEmbeddings.Add(visionEmb);
                         }
 
@@ -832,21 +951,26 @@ namespace TensorSharp.Cli
 
                                 int insertPos = imageTokenPos + 1;
                                 g4.SetVisionEmbeddings(visionEmbeddings, insertPos);
-                                Console.WriteLine($"Gemma4 vision frame {imgIdx}: {numVisionTokens} tokens at pos {insertPos}");
+                                _log.LogInformation(LogEventIds.HostConfiguration,
+                                    "Gemma4 vision frame {FrameIndex}: {VisionTokens} tokens at position {InsertPos}",
+                                    imgIdx, numVisionTokens, insertPos);
 
                                 searchFrom = imageTokenPos + 1 + numVisionTokens + 1;
                             }
                             else
                             {
-                                Console.WriteLine($"Warning: No more <|image> tokens for frame {imgIdx}");
+                                _log.LogWarning(LogEventIds.HostConfiguration,
+                                    "Gemma4 vision: no more <|image> tokens for frame {FrameIndex}", imgIdx);
                                 visionEmbeddings.Dispose();
                             }
                         }
-                        Console.WriteLine($"Total tokens after image expansion: {inputTokens.Count}");
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Total tokens after Gemma4 image expansion: {TotalTokens}", inputTokens.Count);
                     }
                     else if (imagePaths.Count > 0)
                     {
-                        Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }
                 }
                 else if (arch == "mistral3")
@@ -896,20 +1020,24 @@ namespace TensorSharp.Cli
 
                                 m3.SetVisionEmbeddings(visionEmb, tokenPosition);
                                 inputTokens = expanded;
-                                Console.WriteLine($"Mistral3 vision: {numRows}x{numCols} merged patches, " +
-                                    $"{numRows * numCols + numRows} total tokens at pos {tokenPosition}");
+                                _log.LogInformation(LogEventIds.HostConfiguration,
+                                    "Mistral3 vision: rows={Rows} cols={Cols} totalTokens={TotalTokens} position={Position}",
+                                    numRows, numCols, numRows * numCols + numRows, tokenPosition);
                             }
                             else
                             {
                                 visionEmb.Dispose();
-                                Console.WriteLine("Warning: No [IMG] token found in prompt");
+                                _log.LogWarning(LogEventIds.HostConfiguration,
+                                    "Mistral3 vision: no [IMG] token found in prompt");
                             }
                         }
-                        Console.WriteLine($"Total tokens after image expansion: {inputTokens.Count}");
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Total tokens after Mistral3 image expansion: {TotalTokens}", inputTokens.Count);
                     }
                     else
                     {
-                        Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                     }
                 }
                 else
@@ -917,7 +1045,8 @@ namespace TensorSharp.Cli
                     int imagePadId = model.Tokenizer.LookupToken("<|image_pad|>");
                     if (imagePadId < 0)
                     {
-                        Console.Error.WriteLine("Warning: <|image_pad|> token not found in vocabulary");
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "<|image_pad|> token not found in vocabulary");
                     }
                     else
                     {
@@ -937,24 +1066,27 @@ namespace TensorSharp.Cli
                             tokenCounts[i] = processor.ComputeImageTokenCount(height, width);
                             var (gridH, gridW) = processor.GetPatchGrid(height, width);
                             var (resizedH, resizedW) = processor.SmartResize(height, width);
-                            Console.WriteLine($"Image {i}: {width}x{height} -> resize {resizedW}x{resizedH} -> " +
-                                $"grid {gridW}x{gridH} -> {tokenCounts[i]} vision tokens " +
-                                $"(merged {gridW / processor.MergeSize}x{gridH / processor.MergeSize})");
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Image {Index}: source={Source}x{SourceH} resized={ResizedW}x{ResizedH} grid={GridW}x{GridH} visionTokens={VisionTokens} merged={MergedW}x{MergedH}",
+                                i, width, height, resizedW, resizedH, gridW, gridH, tokenCounts[i],
+                                gridW / processor.MergeSize, gridH / processor.MergeSize);
                         }
 
                         inputTokens = ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts);
 
                         int visionStartId = model.Tokenizer.LookupToken("<|vision_start|>");
                         int visionEndId = model.Tokenizer.LookupToken("<|vision_end|>");
-                        Console.WriteLine($"Vision token IDs: start={visionStartId}, pad={imagePadId}, end={visionEndId}");
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Vision token IDs: start={Start} pad={Pad} end={End}",
+                            visionStartId, imagePadId, visionEndId);
 
                         if (model is Qwen35Model q35 && q35.VisionEncoder != null)
                         {
-                            Console.Write("Processing image through Qwen3.5 vision encoder...");
                             var (pixels, resH, resW) = processor.ProcessImage(imagePaths[0]);
-                            Console.Write($" pixels ready ({resW}x{resH})...");
                             var visionEmbeddings = q35.VisionEncoder.Encode(pixels, resH, resW);
-                            Console.WriteLine($" done ({visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]})");
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Qwen3.5 vision embeddings: resolution={Width}x{Height} shape={EmbeddingShape}",
+                                resW, resH, $"{visionEmbeddings.Sizes[0]}x{visionEmbeddings.Sizes[1]}");
 
                             int imageTokenStart = -1;
                             for (int i = 0; i < inputTokens.Count; i++)
@@ -969,17 +1101,20 @@ namespace TensorSharp.Cli
                             if (imageTokenStart >= 0)
                             {
                                 q35.SetVisionEmbeddings(visionEmbeddings, imageTokenStart);
-                                Console.WriteLine($"Vision embeddings will be injected at token position {imageTokenStart}");
+                                _log.LogInformation(LogEventIds.HostConfiguration,
+                                    "Qwen3.5 vision embeddings injection position={Position}", imageTokenStart);
                             }
                             else
                             {
-                                Console.WriteLine("Warning: Could not find image placeholder position");
+                                _log.LogWarning(LogEventIds.HostConfiguration,
+                                    "Qwen3.5 vision: could not find image placeholder position");
                                 visionEmbeddings.Dispose();
                             }
                         }
                         else if (!model.HasVisionEncoder())
                         {
-                            Console.WriteLine("Note: No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                            _log.LogWarning(LogEventIds.HostConfiguration,
+                                "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
                         }
                     }
                 }
@@ -993,9 +1128,10 @@ namespace TensorSharp.Cli
 
                 if (model is Gemma4Model g4a && g4a.AudioEncoder != null)
                 {
-                    Console.Write("Decoding audio...");
                     float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(audioPaths[0]);
-                    Console.WriteLine($" {samples.Length} samples ({(double)samples.Length / 16000:F1}s)");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Audio decoded: samples={Samples} durationSec={DurationSec:F1}",
+                        samples.Length, (double)samples.Length / 16000);
 
                     if (samples.Length % 128 != 0)
                     {
@@ -1003,15 +1139,17 @@ namespace TensorSharp.Cli
                         Array.Resize(ref samples, padded);
                     }
 
-                    Console.Write("Computing mel spectrogram...");
                     var (melData, numFrames) = Gemma4AudioPreprocessor.ComputeMelSpectrogram(samples);
-                    Console.WriteLine($" {numFrames} frames");
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Mel spectrogram computed: frames={Frames}", numFrames);
 
                     if (melData != null && numFrames > 0)
                     {
                         var audioEmbeddings = g4a.AudioEncoder.Encode(melData, numFrames);
                         int numAudioTokens = (int)audioEmbeddings.Sizes[0];
-                        Console.WriteLine($"Audio embeddings: [{audioEmbeddings.Sizes[0]}x{audioEmbeddings.Sizes[1]}]");
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Audio embeddings shape={EmbeddingShape}",
+                            $"{audioEmbeddings.Sizes[0]}x{audioEmbeddings.Sizes[1]}");
 
                         int audioTokenPos = -1;
                         for (int i = 0; i < inputTokens.Count; i++)
@@ -1038,24 +1176,30 @@ namespace TensorSharp.Cli
 
                             int insertPos = audioTokenPos + 1;
                             g4a.SetAudioEmbeddings(audioEmbeddings, insertPos);
-                            Console.WriteLine($"Gemma4 audio: {numAudioTokens} tokens at position {insertPos}");
-                            Console.WriteLine($"Total tokens after audio expansion: {inputTokens.Count}");
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Gemma4 audio: tokens={Tokens} position={Position} totalTokensAfter={TotalTokens}",
+                                numAudioTokens, insertPos, inputTokens.Count);
                         }
                         else
                         {
-                            Console.WriteLine("Warning: Could not find <|audio> token in prompt");
+                            _log.LogWarning(LogEventIds.HostConfiguration,
+                                "Gemma4 audio: could not find <|audio> token in prompt");
                             audioEmbeddings.Dispose();
                         }
                     }
                 }
                 else
                 {
-                    Console.WriteLine("Note: No audio encoder loaded. Use --mmproj to specify the multimodal GGUF.");
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "No audio encoder loaded. Use --mmproj to specify the multimodal GGUF.");
                 }
             }
 
-            Console.WriteLine($"Input tokens ({inputTokens.Count}): [{string.Join(", ", inputTokens.Take(30))}" +
-                (inputTokens.Count > 30 ? $"... ({inputTokens.Count} total)" : "") + "]");
+            _log.LogInformation(LogEventIds.ChatStarted,
+                "cli.inference inputTokens={InputTokens} preview=[{First30}{TruncationSuffix}]",
+                inputTokens.Count,
+                string.Join(", ", inputTokens.Take(30)),
+                inputTokens.Count > 30 ? $"... ({inputTokens.Count} total)" : string.Empty);
 
             model.ResetKVCache();
 
@@ -1063,7 +1207,7 @@ namespace TensorSharp.Cli
             float[] logits;
             if (tokenByToken)
             {
-                Console.WriteLine("*** TOKEN-BY-TOKEN MODE ***");
+                _log.LogInformation(LogEventIds.HostConfiguration, "TOKEN_BY_TOKEN prefill mode enabled");
                 logits = null;
                 for (int i = 0; i < inputTokens.Count; i++)
                     logits = model.Forward(new[] { inputTokens[i] });
@@ -1074,16 +1218,17 @@ namespace TensorSharp.Cli
             }
             var generatedTokens = new List<int>();
 
-            PrintTopLogits(logits, model, "prefill");
+            LogTopLogits(logits, model, "prefill");
 
             var cfg = samplingConfig ?? SamplingConfig.Greedy;
             var sampler = new TokenSampler(cfg);
 
             if (!cfg.IsGreedy)
             {
-                Console.WriteLine($"Sampling: temp={cfg.Temperature}, top_k={cfg.TopK}, top_p={cfg.TopP}, " +
-                    $"min_p={cfg.MinP}, rep_pen={cfg.RepetitionPenalty}, pres_pen={cfg.PresencePenalty}, " +
-                    $"freq_pen={cfg.FrequencyPenalty}, seed={cfg.Seed}");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Sampling config: temperature={Temperature} topK={TopK} topP={TopP} minP={MinP} repPen={RepPenalty} presPen={PresPenalty} freqPen={FreqPenalty} seed={Seed}",
+                    cfg.Temperature, cfg.TopK, cfg.TopP, cfg.MinP, cfg.RepetitionPenalty,
+                    cfg.PresencePenalty, cfg.FrequencyPenalty, cfg.Seed);
             }
 
             var parser = OutputParserFactory.Create(model.Config.Architecture);
@@ -1092,17 +1237,22 @@ namespace TensorSharp.Cli
             bool showThinking = enableThinking || parser.AlwaysRequired;
             if (useParser)
             {
-                Console.WriteLine($"Output parser: {parser.GetType().Name} (thinking={enableThinking}, tools={tools?.Count ?? 0})");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Output parser={Parser} thinking={Thinking} tools={ToolCount}",
+                    parser.GetType().Name, enableThinking, tools?.Count ?? 0);
             }
 
+            string finishReason = "max_tokens";
             for (int step = 0; step < maxTokens; step++)
             {
                 int nextToken = sampler.Sample(logits, generatedTokens);
-                Console.Write($"[{nextToken}:{model.Tokenizer.Vocab[nextToken]}]");
+                _log.LogTrace(LogEventIds.GenerationProgress,
+                    "step={Step} token={TokenId} text={TokenText}",
+                    step, nextToken, model.Tokenizer.Vocab[nextToken]);
 
                 if (model.Tokenizer.IsEos(nextToken))
                 {
-                    Console.WriteLine(" <EOS>");
+                    finishReason = "eos";
                     break;
                 }
 
@@ -1114,7 +1264,10 @@ namespace TensorSharp.Cli
                     var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
                     if (shouldStop)
                     {
-                        Console.WriteLine(" <STOP>");
+                        finishReason = "stop_sequence";
+                        _log.LogInformation(LogEventIds.ChatCompleted,
+                            "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                            finishReason, generatedTokens.Count);
                         if (useParser)
                         {
                             var finalParsed = parser.Add(trimmed, true);
@@ -1126,10 +1279,12 @@ namespace TensorSharp.Cli
 
                 logits = model.Forward(new[] { nextToken });
                 if (step < 3)
-                    PrintTopLogits(logits, model, $"decode_{step}");
+                    LogTopLogits(logits, model, $"decode_{step}");
             }
 
-            Console.WriteLine();
+            _log.LogInformation(LogEventIds.ChatCompleted,
+                "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                finishReason, generatedTokens.Count);
             model.PrintTimingStats();
             string decoded = model.Tokenizer.Decode(generatedTokens);
 
@@ -1140,6 +1295,61 @@ namespace TensorSharp.Cli
             }
             return decoded;
         }
+
+        // Per-turn upload manifest used by cli.inference.start. Each entry records
+        // the saved file path, the saved filename (the path's leaf, which is the
+        // unique identifier inside the upload directory) and the kind of media. The
+        // shape mirrors TensorSharp.Server.ModelService.SerializeUploadsForLog so
+        // operators see a uniform format whether they're inspecting CLI or server
+        // logs.
+        static string FormatUploadsForCli(List<string> imagePaths, List<string> audioPaths, string videoPath)
+        {
+            var entries = new List<object>();
+
+            // When a video is supplied, imagePaths actually holds the per-frame images
+            // extracted from the video. We tag those frames as "video_frame" and add a
+            // separate "video" entry pointing at the original media file so the audit
+            // trail captures both the source upload and its frame decomposition.
+            bool isVideo = !string.IsNullOrEmpty(videoPath);
+            if (isVideo)
+            {
+                entries.Add(new
+                {
+                    path = videoPath,
+                    name = Path.GetFileName(videoPath),
+                    mediaType = "video",
+                });
+            }
+
+            string imageMediaType = isVideo ? "video_frame" : "image";
+            AppendCliUploads(entries, imagePaths, imageMediaType);
+            AppendCliUploads(entries, audioPaths, "audio");
+
+            return entries.Count == 0
+                ? "[]"
+                : JsonSerializer.Serialize(entries, _cliUploadJsonOptions);
+        }
+
+        private static void AppendCliUploads(List<object> sink, List<string> paths, string mediaType)
+        {
+            if (paths == null || paths.Count == 0)
+                return;
+
+            foreach (var p in paths)
+            {
+                if (string.IsNullOrEmpty(p))
+                    continue;
+                sink.Add(new { path = p, name = Path.GetFileName(p), mediaType });
+            }
+        }
+
+        // Keeps non-ASCII filenames readable in the log instead of expanding to
+        // \uXXXX escapes; control characters are still escaped by JsonSerializer.
+        private static readonly JsonSerializerOptions _cliUploadJsonOptions = new()
+        {
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
 
         static string FormatParsedResult(ParsedOutput parsed, bool showThinking)
         {
@@ -1199,18 +1409,22 @@ namespace TensorSharp.Cli
             throw new NotSupportedException();
         }
 
-        static void PrintTopLogits(float[] logits, ModelBase model, string label)
+        static void LogTopLogits(float[] logits, ModelBase model, string label)
         {
+            if (!_log.IsEnabled(LogLevel.Debug))
+                return;
+
             var indexed = logits.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(10).ToArray();
-            Console.Write($"  Top logits [{label}]: ");
+            var sb = new StringBuilder();
             foreach (var (v, i) in indexed)
-                Console.Write($"{i}({model.Tokenizer.Vocab[i]})={v:F4} ");
-            Console.WriteLine();
+                sb.Append($"{i}({model.Tokenizer.Vocab[i]})={v:F4} ");
+            _log.LogDebug(LogEventIds.GenerationProgress,
+                "topLogits[{Label}] {TopList}", label, sb.ToString().TrimEnd());
         }
 
         static void RunTests(ModelBase model, int maxTokens, string outputFile)
         {
-            Console.WriteLine("=== Running Verification Tests ===\n");
+            _log.LogInformation(LogEventIds.CliBenchmark, "Running verification tests");
 
             TestTokenizer(model);
             TestChatTemplate(model);
@@ -1221,10 +1435,16 @@ namespace TensorSharp.Cli
         /// Standalone inference benchmark: measures pure prefill and decode throughput
         /// without prompt rendering, sampling, or output formatting overhead. Reports the
         /// best (minimum-time) of `runs` independent runs to filter out warm-up artifacts.
+        ///
+        /// Optionally captures the first decode tokens after each prefill so the same
+        /// benchmark can be run twice (e.g. with and without GDN_DISABLE_CHUNKED_PREFILL=1)
+        /// and the outputs compared.
         /// </summary>
         static void RunBenchmark(ModelBase model, int prefillTokens, int decodeTokens, int runs)
         {
-            Console.WriteLine($"=== Inference Benchmark (prefill={prefillTokens} tok, decode={decodeTokens} tok, runs={runs}) ===");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs}",
+                prefillTokens, decodeTokens, runs);
 
             // Build a synthetic prompt of `prefillTokens` tokens by repeating a stable token.
             // We pick a token id that's safely inside the vocab (not BOS/EOS/special).
@@ -1241,6 +1461,9 @@ namespace TensorSharp.Cli
             double avgPrefillTps = 0;
             double avgDecodeTps = 0;
 
+            int[] firstRunDecodeTokens = null;
+            int firstRunPrefillTopToken = -1;
+
             for (int run = 0; run < runs; run++)
             {
                 model.ResetKVCache();
@@ -1254,18 +1477,26 @@ namespace TensorSharp.Cli
 
                 // Decode timing - greedy sampling on a stable token chain
                 int next = SampleGreedyFromLogits(logits, vocab);
+                if (run == 0)
+                {
+                    firstRunPrefillTopToken = next;
+                    firstRunDecodeTokens = new int[decodeTokens];
+                }
                 var decodeSw = Stopwatch.StartNew();
                 for (int i = 0; i < decodeTokens; i++)
                 {
                     logits = model.Forward(new[] { next });
                     next = SampleGreedyFromLogits(logits, vocab);
+                    if (run == 0)
+                        firstRunDecodeTokens[i] = next;
                 }
                 decodeSw.Stop();
                 double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
                 double decodeTps = decodeTokens / (decodeMs / 1000.0);
 
-                Console.WriteLine($"[run {run + 1}/{runs}] prefill: {prefillMs:F0} ms ({prefillTps:F1} tok/s)   " +
-                    $"decode: {decodeMs:F0} ms ({decodeTps:F1} tok/s, {decodeMs / decodeTokens:F1} ms/tok)");
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark run {Run}/{Runs}: prefillMs={PrefillMs:F0} prefillTps={PrefillTps:F1} decodeMs={DecodeMs:F0} decodeTps={DecodeTps:F1} msPerTok={MsPerTok:F1}",
+                    run + 1, runs, prefillMs, prefillTps, decodeMs, decodeTps, decodeMs / decodeTokens);
 
                 if (prefillMs < bestPrefillMs)
                 {
@@ -1284,12 +1515,17 @@ namespace TensorSharp.Cli
             avgPrefillTps /= runs;
             avgDecodeTps /= runs;
 
-            Console.WriteLine();
-            Console.WriteLine($"Best  prefill: {bestPrefillMs:F0} ms  ({bestPrefillTps:F1} tok/s)");
-            Console.WriteLine($"Best  decode:  {bestDecodeMs:F0} ms  ({bestDecodeTps:F1} tok/s, {bestDecodeMs / decodeTokens:F2} ms/tok)");
-            Console.WriteLine($"Avg   prefill: {avgPrefillTps:F1} tok/s");
-            Console.WriteLine($"Avg   decode:  {avgDecodeTps:F1} tok/s");
-            Console.WriteLine();
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "benchmark summary: bestPrefillMs={BestPrefillMs:F0} bestPrefillTps={BestPrefillTps:F1} bestDecodeMs={BestDecodeMs:F0} bestDecodeTps={BestDecodeTps:F1} bestDecodeMsPerTok={BestDecodeMsPerTok:F2} avgPrefillTps={AvgPrefillTps:F1} avgDecodeTps={AvgDecodeTps:F1}",
+                bestPrefillMs, bestPrefillTps, bestDecodeMs, bestDecodeTps,
+                bestDecodeMs / decodeTokens, avgPrefillTps, avgDecodeTps);
+
+            if (firstRunDecodeTokens != null)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark sampled tokens (run1): prefillTopToken={Prefill} decode={Decode}",
+                    firstRunPrefillTopToken, string.Join(",", firstRunDecodeTokens));
+            }
             model.PrintTimingStats();
         }
 
@@ -1333,7 +1569,9 @@ namespace TensorSharp.Cli
                 turns = 2;
 
             string arch = model.Config.Architecture;
-            Console.WriteLine($"=== KV Cache First-Token-Latency Benchmark ({turns} turns, decode budget {maxTokens} tok/turn, arch={arch}) ===");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "kv cache benchmark starting: turns={Turns} decodeBudget={MaxTokens} architecture={Architecture}",
+                turns, maxTokens, arch);
 
             // The user turns are designed so that early turns establish a fairly long
             // running context, then later turns add small follow-up questions. This is
@@ -1357,13 +1595,12 @@ namespace TensorSharp.Cli
             (double[] cached, int[] promptTokensCached) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: true);
             (double[] noCache, int[] promptTokensNoCache) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: false);
 
-            Console.WriteLine();
-            Console.WriteLine("Per-turn first-token (prefill) latency:");
-            Console.WriteLine($"  {"Turn",-5} {"Prompt tok",-12} {"With KV (ms)",-15} {"No KV (ms)",-15} {"Speedup",-10}");
             for (int i = 0; i < turnLimit; i++)
             {
                 double speedup = cached[i] > 0 ? noCache[i] / cached[i] : 0;
-                Console.WriteLine($"  {i + 1,-5} {promptTokensCached[i],-12} {cached[i],-15:F1} {noCache[i],-15:F1} {speedup,-10:F2}x");
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "kv benchmark turn {Turn}: promptTokens={PromptTokens} withKvMs={WithKvMs:F1} noKvMs={NoKvMs:F1} speedup={Speedup:F2}",
+                    i + 1, promptTokensCached[i], cached[i], noCache[i], speedup);
             }
 
             // Skip turn 1 in the aggregate because both paths do an unavoidable full
@@ -1381,12 +1618,10 @@ namespace TensorSharp.Cli
                 }
                 double avgCached = cachedSum / counted;
                 double avgNoCache = noCacheSum / counted;
-                Console.WriteLine();
-                Console.WriteLine($"Average prefill (turns 2..{turnLimit}):");
-                Console.WriteLine($"  With KV cache: {avgCached:F1} ms");
-                Console.WriteLine($"  No KV cache:   {avgNoCache:F1} ms");
-                if (avgCached > 0)
-                    Console.WriteLine($"  Speedup:       {avgNoCache / avgCached:F2}x");
+                double avgSpeedup = avgCached > 0 ? avgNoCache / avgCached : 0;
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "kv benchmark average prefill (turns 2..{TurnLimit}): withKvMs={AvgCached:F1} noKvMs={AvgNoCache:F1} speedup={AvgSpeedup:F2}",
+                    turnLimit, avgCached, avgNoCache, avgSpeedup);
             }
         }
 
@@ -1399,8 +1634,9 @@ namespace TensorSharp.Cli
             ModelBase model, string arch, string[] userTurns, int turnLimit, int maxTokens,
             SamplingConfig samplerCfg, bool enableThinking, bool useCache)
         {
-            Console.WriteLine();
-            Console.WriteLine($"--- Benchmark pass: KV cache {(useCache ? "ENABLED" : "DISABLED")} ---");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "benchmark pass: kvCache={KvCacheEnabled}",
+                useCache ? "enabled" : "disabled");
 
             model.ResetKVCache();
             var kvCache = new KVCache();
@@ -1453,7 +1689,9 @@ namespace TensorSharp.Cli
                     kvCache.RecordAppend(nextToken, logits);
                 }
 
-                Console.WriteLine($"  turn {turn + 1}: prompt={inputTokens.Count} tok, prefill={prefillMs[turn]:F1} ms, decode={generatedTokens.Count} tok, plan={plan.Kind}");
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "benchmark turn {Turn}: promptTokens={PromptTokens} prefillMs={PrefillMs:F1} decodeTokens={DecodeTokens} plan={Plan}",
+                    turn + 1, inputTokens.Count, prefillMs[turn], generatedTokens.Count, plan.Kind);
 
                 // Append the assistant turn so subsequent renders include it.
                 var parser = OutputParserFactory.Create(arch);
@@ -1473,7 +1711,7 @@ namespace TensorSharp.Cli
 
         static void TestTokenizer(ModelBase model)
         {
-            Console.WriteLine("--- Tokenizer Test ---");
+            _log.LogInformation(LogEventIds.CliBenchmark, "tokenizer test starting");
 
             string[] testInputs = new[]
             {
@@ -1487,17 +1725,16 @@ namespace TensorSharp.Cli
                 var tokens = model.Tokenizer.Encode(input, addSpecial: false);
                 string decoded = model.Tokenizer.Decode(tokens);
                 bool match = decoded == input;
-                Console.WriteLine($"  Input: \"{input}\"");
-                Console.WriteLine($"  Tokens: [{string.Join(", ", tokens)}]");
-                Console.WriteLine($"  Decoded: \"{decoded}\"");
-                Console.WriteLine($"  Roundtrip match: {match}");
-                Console.WriteLine();
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "tokenizer test input=\"{Input}\" tokens=[{Tokens}] decoded=\"{Decoded}\" roundtripMatch={Match}",
+                    LoggingExtensions.SanitizeForLog(input), string.Join(", ", tokens),
+                    LoggingExtensions.SanitizeForLog(decoded), match);
             }
         }
 
         static void TestChatTemplate(ModelBase model)
         {
-            Console.WriteLine("--- Chat Template Test ---");
+            _log.LogInformation(LogEventIds.CliBenchmark, "chat template test starting");
 
             var messages = new List<ChatMessage>
             {
@@ -1505,16 +1742,17 @@ namespace TensorSharp.Cli
             };
 
             string rendered = ChatTemplate.RenderQwen3(messages, true);
-            Console.WriteLine($"  Rendered: \"{rendered}\"");
             string expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
-            Console.WriteLine($"  Expected: \"{expected}\"");
-            Console.WriteLine($"  Match: {rendered == expected}");
-            Console.WriteLine();
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "chat template test rendered=\"{Rendered}\" expected=\"{Expected}\" match={Match}",
+                LoggingExtensions.SanitizeForLog(rendered),
+                LoggingExtensions.SanitizeForLog(expected),
+                rendered == expected);
         }
 
         static void TestInferenceWithOllamaComparison(ModelBase model, int maxTokens, string outputFile)
         {
-            Console.WriteLine("--- Inference Comparison Test ---");
+            _log.LogInformation(LogEventIds.CliBenchmark, "inference comparison test starting");
             string testInput = "What is 1+1?";
 
             var messages = new List<ChatMessage>
@@ -1524,34 +1762,37 @@ namespace TensorSharp.Cli
             string rendered = ChatTemplate.RenderQwen3(messages, true);
 
             var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
-            Console.WriteLine($"Input tokens ({inputTokens.Count}): [{string.Join(", ", inputTokens)}]");
+            _log.LogDebug(LogEventIds.CliBenchmark,
+                "comparison test inputTokens count={Count} list=[{Tokens}]",
+                inputTokens.Count, string.Join(", ", inputTokens));
 
             model.ResetKVCache();
             float[] logits = model.Forward(inputTokens.ToArray());
             var engineTokens = new List<int>();
 
-            Console.Write("Engine tokens: ");
             for (int step = 0; step < maxTokens; step++)
             {
                 int nextToken = model.SampleGreedy(logits);
-                Console.Write($"{nextToken} ");
-
                 if (model.Tokenizer.IsEos(nextToken)) break;
                 engineTokens.Add(nextToken);
                 logits = model.Forward(new[] { nextToken });
             }
-            Console.WriteLine();
 
             string engineText = model.Tokenizer.Decode(engineTokens);
-            Console.WriteLine($"Engine output: \"{engineText}\"");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "comparison test engine output: tokens={EngineTokens} text=\"{EngineText}\"",
+                engineTokens.Count, LoggingExtensions.SanitizeForLog(engineText));
 
-            Console.WriteLine("\nQuerying ollama for comparison...");
+            _log.LogInformation(LogEventIds.CliBenchmark, "querying ollama for comparison");
             string ollamaResponse = QueryOllama(rendered, maxTokens);
-            Console.WriteLine($"Ollama output: \"{ollamaResponse}\"");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "comparison test ollama output: text=\"{OllamaText}\"",
+                LoggingExtensions.SanitizeForLog(ollamaResponse));
 
             var ollamaTokens = model.Tokenizer.Encode(ollamaResponse, addSpecial: false);
-            Console.WriteLine($"\nEngine tokens: [{string.Join(", ", engineTokens)}]");
-            Console.WriteLine($"Ollama tokens: [{string.Join(", ", ollamaTokens)}]");
+            _log.LogDebug(LogEventIds.CliBenchmark,
+                "comparison test engineTokens=[{EngineTokens}] ollamaTokens=[{OllamaTokens}]",
+                string.Join(", ", engineTokens), string.Join(", ", ollamaTokens));
 
             int matchCount = 0;
             int compareLen = Math.Min(engineTokens.Count, ollamaTokens.Count);
@@ -1561,18 +1802,25 @@ namespace TensorSharp.Cli
                     matchCount++;
                 else
                 {
-                    Console.WriteLine($"MISMATCH at position {i}: engine={engineTokens[i]}({model.Tokenizer.Vocab[engineTokens[i]]}) vs ollama={ollamaTokens[i]}({model.Tokenizer.Vocab[ollamaTokens[i]]})");
+                    _log.LogWarning(LogEventIds.CliBenchmark,
+                        "comparison test mismatch at position {Position}: engine={EngineToken}({EngineVocab}) ollama={OllamaToken}({OllamaVocab})",
+                        i, engineTokens[i], model.Tokenizer.Vocab[engineTokens[i]],
+                        ollamaTokens[i], model.Tokenizer.Vocab[ollamaTokens[i]]);
                     break;
                 }
             }
-            Console.WriteLine($"\nToken match: {matchCount}/{compareLen} ({(compareLen > 0 ? 100.0 * matchCount / compareLen : 0):F1}%)");
             bool match = engineText == ollamaResponse;
-            Console.WriteLine($"Text match: {match}");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "comparison test result: tokenMatch={MatchCount}/{CompareLen} ({MatchPercent:F1}%) textMatch={TextMatch}",
+                matchCount, compareLen,
+                compareLen > 0 ? 100.0 * matchCount / compareLen : 0,
+                match);
 
             if (outputFile != null)
             {
                 File.WriteAllText(outputFile, $"Engine: {engineText}\nOllama: {ollamaResponse}\nMatch: {match}\n");
-                Console.WriteLine($"Output written to: {outputFile}");
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "comparison test output written to {OutputFile}", outputFile);
             }
         }
 
@@ -1603,15 +1851,16 @@ namespace TensorSharp.Cli
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Failed to query ollama: {ex.Message}");
+                _log.LogError(LogEventIds.CliFailed, ex,
+                    "Failed to query ollama: {Error}", ex.Message);
                 return "";
             }
         }
 
         static void TestChatTemplates(string modelDir)
         {
-            Console.WriteLine($"=== Chat Template Test ===");
-            Console.WriteLine($"Scanning: {modelDir}\n");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "chat template scan starting: directory={Directory}", modelDir);
 
             var ggufFiles = Directory.GetFiles(modelDir, "*.gguf")
                 .Where(f => !Path.GetFileName(f).Contains("mmproj", StringComparison.OrdinalIgnoreCase))
@@ -1620,7 +1869,8 @@ namespace TensorSharp.Cli
 
             if (ggufFiles.Length == 0)
             {
-                Console.WriteLine("No GGUF model files found.");
+                _log.LogWarning(LogEventIds.CliBenchmark,
+                    "chat template scan: no GGUF files found in {Directory}", modelDir);
                 return;
             }
 
@@ -1646,7 +1896,6 @@ namespace TensorSharp.Cli
             foreach (string file in ggufFiles)
             {
                 string fileName = Path.GetFileName(file);
-                Console.WriteLine($"--- {fileName} ---");
 
                 try
                 {
@@ -1654,12 +1903,14 @@ namespace TensorSharp.Cli
                     string arch = gguf.GetString("general.architecture");
                     string template = gguf.GetString("tokenizer.chat_template");
 
-                    Console.WriteLine($"  Architecture: {arch}");
-                    Console.WriteLine($"  Template: {(template != null ? $"{template.Length} chars" : "(none)")}");
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "chat template scan {File}: architecture={Architecture} templateChars={TemplateChars}",
+                        fileName, arch, template?.Length ?? 0);
 
                     if (template == null)
                     {
-                        Console.WriteLine($"  SKIP: No chat template in GGUF metadata\n");
+                        _log.LogWarning(LogEventIds.CliBenchmark,
+                            "chat template scan {File}: SKIP no chat template in GGUF metadata", fileName);
                         skipped++;
                         continue;
                     }
@@ -1695,7 +1946,9 @@ namespace TensorSharp.Cli
 
                         if (jinja2Error != null)
                         {
-                            Console.WriteLine($"  [{name}] FAIL - Jinja2 error: {jinja2Error.Message}");
+                            _log.LogError(LogEventIds.CliFailed, jinja2Error,
+                                "chat template scan {File} [{Scenario}] FAIL Jinja2 error",
+                                fileName, name);
                             allPassed = false;
                             continue;
                         }
@@ -1706,13 +1959,15 @@ namespace TensorSharp.Cli
 
                         if (match)
                         {
-                            Console.WriteLine($"  [{name}] PASS - Jinja2 matches hardcoded ({j2.Length} chars)");
+                            _log.LogInformation(LogEventIds.CliBenchmark,
+                                "chat template scan {File} [{Scenario}] PASS chars={Chars}",
+                                fileName, name, j2.Length);
                         }
                         else
                         {
-                            Console.WriteLine($"  [{name}] MISMATCH");
-                            Console.WriteLine($"    Jinja2    ({j2.Length} chars): {Escape(j2)}");
-                            Console.WriteLine($"    Hardcoded ({hc.Length} chars): {Escape(hc)}");
+                            _log.LogWarning(LogEventIds.CliBenchmark,
+                                "chat template scan {File} [{Scenario}] MISMATCH jinja2Chars={J2Chars} hardcodedChars={HcChars} jinja2Sample={J2Sample} hardcodedSample={HcSample}",
+                                fileName, name, j2.Length, hc.Length, Escape(j2), Escape(hc));
                             allPassed = false;
                         }
                     }
@@ -1721,14 +1976,15 @@ namespace TensorSharp.Cli
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"  ERROR: {ex.Message}");
+                    _log.LogError(LogEventIds.CliFailed, ex,
+                        "chat template scan {File} ERROR: {Error}", fileName, ex.Message);
                     failed++;
                 }
-
-                Console.WriteLine();
             }
 
-            Console.WriteLine($"=== Results: {passed} passed, {failed} failed, {skipped} skipped out of {ggufFiles.Length} models ===");
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "chat template scan results: passed={Passed} failed={Failed} skipped={Skipped} total={Total}",
+                passed, failed, skipped, ggufFiles.Length);
         }
 
         static Dictionary<string, object> BuildTemplateTestContext(List<ChatMessage> messages, bool addGenerationPrompt)

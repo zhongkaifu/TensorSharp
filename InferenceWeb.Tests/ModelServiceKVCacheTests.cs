@@ -43,13 +43,13 @@ public class ModelServiceKVCacheTests
     public void AugmentWithCachedRawTokens_FreshService_ReturnsIncomingUnchanged()
     {
         // Without prior turns we can't augment anything.
-        var svc = new ModelService();
+        var tracked = new List<ChatMessage>();
         var incoming = new List<ChatMessage>
         {
             new() { Role = "user", Content = "hi" },
         };
 
-        var result = svc.AugmentWithCachedRawTokens(incoming);
+        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
 
         Assert.Single(result);
         Assert.Equal("hi", result[0].Content);
@@ -59,8 +59,7 @@ public class ModelServiceKVCacheTests
     [Fact]
     public void AugmentWithCachedRawTokens_NullInput_ReturnsNull()
     {
-        var svc = new ModelService();
-        Assert.Null(svc.AugmentWithCachedRawTokens(null));
+        Assert.Null(ModelService.AugmentWithCachedRawTokens(null, new List<ChatMessage>()));
     }
 
     [Fact]
@@ -68,7 +67,7 @@ public class ModelServiceKVCacheTests
     {
         // If the caller already attached raw tokens (e.g. test harness), the service must
         // not overwrite them with stale tracked values.
-        var svc = new ModelService();
+        var tracked = new List<ChatMessage>();
         var explicitTokens = new List<int> { 9001, 9002 };
         var incoming = new List<ChatMessage>
         {
@@ -77,7 +76,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "user", Content = "u2" },
         };
 
-        var result = svc.AugmentWithCachedRawTokens(incoming);
+        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
 
         Assert.Same(explicitTokens, result[1].RawOutputTokens);
     }
@@ -94,24 +93,21 @@ public class ModelServiceKVCacheTests
     [Fact]
     public void AugmentWithCachedRawTokens_WebUIParsedContentMismatch_StillSplicesRawTokens()
     {
-        var svc = new ModelService();
-
         // Simulate the result of UpdateTrackedHistory() after a previous turn:
         //   - User asked "What is 1+1?"
         //   - Model raw-emitted "<think>let me think</think>1+1=2" (raw bytes from token decoding)
         //   - Tracked content holds the FULL raw text; raw output tokens are the model's bytes.
-        var tracked = svc.GetType()
-            .GetField("_trackedHistory", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-            .GetValue(svc) as List<ChatMessage>;
-        Assert.NotNull(tracked);
         var rawTokens = new List<int> { 11, 22, 33, 44, 55 };
-        tracked!.Add(new ChatMessage { Role = "user", Content = "What is 1+1?" });
-        tracked.Add(new ChatMessage
+        var tracked = new List<ChatMessage>
         {
-            Role = "assistant",
-            Content = "<think>let me think</think>1+1=2",  // RAW text the model emitted
-            RawOutputTokens = rawTokens,
-        });
+            new() { Role = "user", Content = "What is 1+1?" },
+            new()
+            {
+                Role = "assistant",
+                Content = "<think>let me think</think>1+1=2",  // RAW text the model emitted
+                RawOutputTokens = rawTokens,
+            },
+        };
 
         // Simulate what the WebUI sends back on the SECOND turn: the OutputParser stripped
         // the thinking block, so Content is just "1+1=2" (plus an optional Thinking field).
@@ -122,7 +118,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "user", Content = "What is 2+2?" },
         };
 
-        var result = svc.AugmentWithCachedRawTokens(incoming);
+        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
 
         Assert.Equal(3, result.Count);
         Assert.Same(rawTokens, result[1].RawOutputTokens);
@@ -133,19 +129,16 @@ public class ModelServiceKVCacheTests
     {
         // When the user edits an earlier message, the conversation diverges at that
         // position and no later assistant message corresponds to anything we have cached.
-        var svc = new ModelService();
-
-        var tracked = svc.GetType()
-            .GetField("_trackedHistory", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-            .GetValue(svc) as List<ChatMessage>;
-        Assert.NotNull(tracked);
-        tracked!.Add(new ChatMessage { Role = "user", Content = "ORIGINAL" });
-        tracked.Add(new ChatMessage
+        var tracked = new List<ChatMessage>
         {
-            Role = "assistant",
-            Content = "<think>x</think>response_to_original",
-            RawOutputTokens = new List<int> { 1, 2, 3 },
-        });
+            new() { Role = "user", Content = "ORIGINAL" },
+            new()
+            {
+                Role = "assistant",
+                Content = "<think>x</think>response_to_original",
+                RawOutputTokens = new List<int> { 1, 2, 3 },
+            },
+        };
 
         // User edited the first message to "EDITED" - the assistant message is no longer
         // a continuation of anything we have raw tokens for.
@@ -156,7 +149,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "user", Content = "follow-up" },
         };
 
-        var result = svc.AugmentWithCachedRawTokens(incoming);
+        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
 
         // No augmentation should have happened: the assistant message keeps its caller-set
         // RawOutputTokens (null) since the user message before it diverged.
@@ -178,16 +171,12 @@ public class ModelServiceKVCacheTests
     [Fact]
     public void AugmentWithCachedRawTokens_ThreeTurnsViaWebUIFlow_AllPriorAssistantsCarryRawTokens()
     {
-        var svc = new ModelService();
-        var trackedField = svc.GetType()
-            .GetField("_trackedHistory", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        var tracked = (List<ChatMessage>)trackedField.GetValue(svc)!;
+        var tracked = new List<ChatMessage>();
 
         var raw1 = new List<int> { 11, 12, 13 };
         var raw2 = new List<int> { 21, 22, 23, 24 };
 
         // Simulate state after turn 1 generation (UpdateTrackedHistory was called).
-        tracked.Clear();
         tracked.Add(new ChatMessage { Role = "user", Content = "Q1" });
         tracked.Add(new ChatMessage
         {
@@ -203,7 +192,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "assistant", Content = "PARSED1" },
             new() { Role = "user", Content = "Q2" },
         };
-        var turn2Augmented = svc.AugmentWithCachedRawTokens(turn2Incoming);
+        var turn2Augmented = ModelService.AugmentWithCachedRawTokens(turn2Incoming, tracked);
         Assert.Same(raw1, turn2Augmented[1].RawOutputTokens);
 
         // Simulate state AFTER turn 2 generation: tracked is rebuilt FROM THE AUGMENTED
@@ -223,7 +212,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "assistant", Content = "PARSED2" },
             new() { Role = "user", Content = "Q3" },
         };
-        var turn3Augmented = svc.AugmentWithCachedRawTokens(turn3Incoming);
+        var turn3Augmented = ModelService.AugmentWithCachedRawTokens(turn3Incoming, tracked);
 
         Assert.Same(raw1, turn3Augmented[1].RawOutputTokens);
         Assert.Same(raw2, turn3Augmented[3].RawOutputTokens);
@@ -232,15 +221,11 @@ public class ModelServiceKVCacheTests
     [Fact]
     public void AugmentWithCachedRawTokens_ThreeTurnConversation_SplicesAllPriorAssistantsByPosition()
     {
-        var svc = new ModelService();
-        var tracked = svc.GetType()
-            .GetField("_trackedHistory", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-            .GetValue(svc) as List<ChatMessage>;
-        Assert.NotNull(tracked);
+        var tracked = new List<ChatMessage>();
 
         var raw1 = new List<int> { 100, 101 };
         var raw2 = new List<int> { 200, 201, 202 };
-        tracked!.Add(new ChatMessage { Role = "user", Content = "u1" });
+        tracked.Add(new ChatMessage { Role = "user", Content = "u1" });
         tracked.Add(new ChatMessage { Role = "assistant", Content = "<think>...</think>a1raw", RawOutputTokens = raw1 });
         tracked.Add(new ChatMessage { Role = "user", Content = "u2" });
         tracked.Add(new ChatMessage { Role = "assistant", Content = "<think>...</think>a2raw", RawOutputTokens = raw2 });
@@ -254,7 +239,7 @@ public class ModelServiceKVCacheTests
             new() { Role = "user", Content = "u3" },             // new
         };
 
-        var result = svc.AugmentWithCachedRawTokens(incoming);
+        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
 
         Assert.Same(raw1, result[1].RawOutputTokens);
         Assert.Same(raw2, result[3].RawOutputTokens);
