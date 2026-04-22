@@ -331,6 +331,8 @@ else:
 | Gemma 4 | `<\|channel>thought\n...<channel\|>` | `<\|tool_call>call:NAME{args}<tool_call\|>` |
 | Qwen 3 | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 | Qwen 3.5 | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
+| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final` (Harmony) | not supported |
+| Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 
 ## How It Works
 
@@ -341,6 +343,8 @@ When `think: true` is passed:
 1. **Gemma4**: The template injects `<|think|>` into the system turn. The model then outputs thinking inside `<|channel>thought\n...<channel|>` tags before the actual response.
 2. **Qwen3**: The template appends `<think>\n` to the generation prompt. The model outputs thinking directly, terminated by `</think>`, followed by the answer.
 3. **Qwen3.5**: Same as Qwen3. When thinking is disabled, an empty `<think>\n\n</think>\n\n` block is prepended.
+4. **GPT OSS**: The Harmony-format template always emits structured channel framing: `<|channel|>analysis ... <|channel|>final`. The output parser is always on for this architecture, so thinking content is split out whether or not `think: true` is passed.
+5. **Nemotron-H**: Uses the Qwen3-style `<think>...</think>` framing.
 
 ### Tool Calls
 
@@ -349,4 +353,6 @@ When `tools` are provided:
 1. **Gemma4**: Tool declarations use `<|tool>declaration:NAME{...}<tool|>` format in the system turn. The model outputs calls as `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`.
 2. **Qwen3**: Tool definitions are injected as JSON in the system message. The model outputs calls as `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
 3. **Qwen3.5**: Tool definitions use `<tools>...</tools>` format. The model outputs calls as `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`.
+4. **Nemotron-H**: Uses the same `<tool_call>{"name":"...","arguments":{...}}</tool_call>` wire format as Qwen3.
+5. **GPT OSS**: tool-calling is not currently supported.
 

@@ -119,6 +119,26 @@ namespace TensorSharp.Models
             return 4096;
         }
 
+        // Minimum prefill length at which the fused chunked GatedDeltaNet GGML kernel
+        // beats the per-token CPU loop. The chunked kernel pads to a multiple of
+        // GdnChunkSize (64) and dispatches once per layer; for very short prefills the
+        // padding overhead and the host->device copies dominate. Set
+        // GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N to override (e.g. =1 to always use it,
+        // =1000000 to disable).
+        private static readonly int GdnChunkedPrefillMinSeqLenEnv = ResolveGdnChunkedPrefillMinSeqLen();
+
+        private static int ResolveGdnChunkedPrefillMinSeqLen()
+        {
+            string env = Environment.GetEnvironmentVariable("GDN_CHUNK_PREFILL_MIN_SEQ_LEN");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return GdnChunkSize;
+        }
+
+        private static readonly bool GdnChunkedPrefillDisabledEnv =
+            string.Equals(Environment.GetEnvironmentVariable("GDN_DISABLE_CHUNKED_PREFILL"), "1",
+                StringComparison.Ordinal);
+
         // Pre-cached layer prefix and weight name strings (avoids string interpolation in hot loops)
         private string[] _layerPrefix;
         private string[] _attnNormKey;
@@ -244,6 +264,37 @@ namespace TensorSharp.Models
         // _gdnConvOutBuf is a managed scratch array (no GGML allocation needed).
         private float[] _gdnConvOutBuf; // [qkvDim]
         private Tensor _gdnGatedOutT;   // [1, ssmDInner] (passed to LinearForward, must be a Tensor)
+
+        // Chunked GatedDeltaNet (prefill) acceleration. The chunked path runs the entire
+        // recurrent block as a single fused GGML graph dispatch per layer (via
+        // GgmlBasicOps.GatedDeltaNetChunked) which moves L2Norm / mul_mat / triangular solve
+        // / RMSNorm onto the GPU backend. CPU-side conv1d runs upstream and writes Q/K/V into
+        // these reusable [seqLen, H, D] staging buffers.
+        //
+        // The path is enabled only when:
+        //   * the runtime backend is GGML (Metal/CUDA/CPU)
+        //   * headKDim == headVDim (chunked kernel pre-condition)
+        //   * seqLen >= _gdnChunkPrefillThreshold
+        //   * the kernel has not previously failed for this run (kill switch)
+        private const int GdnChunkSize = 64;
+        private int _gdnChunkPrefillThreshold = GdnChunkedPrefillMinSeqLenEnv;
+        private bool _gdnDisableChunkedPrefill = GdnChunkedPrefillDisabledEnv;
+        private long _gdnChunkedTicks;       // Total time spent in the chunked path
+        private long _gdnPerTokenTicks;      // Total time spent in the per-token path (prefill only)
+        private int _gdnChunkedCalls;        // Number of times the chunked path has been used
+
+        // Reusable staging buffers for the chunked prefill path. These are sized for the
+        // largest seqLen we have seen so far; subsequent calls reuse the same memory and
+        // build a transient sub-view at the actual seqLen, avoiding (numLayers) allocator
+        // round-trips per forward pass.
+        private Tensor _gdnChunkedQBuf;
+        private Tensor _gdnChunkedKBuf;
+        private Tensor _gdnChunkedVBuf;
+        private Tensor _gdnChunkedZBuf;
+        private Tensor _gdnChunkedAlphaBuf;
+        private Tensor _gdnChunkedBetaBuf;
+        private int _gdnChunkedBufCapacity; // SeqLen capacity covered by the staging buffers
+        private int _gdnPerTokenCalls;       // Number of times the per-token path has been used (excluding decode)
 
         // Vision encoder
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
@@ -1933,33 +1984,63 @@ namespace TensorSharp.Models
 
             float[] convWT = _gdnConvWT[layer];
 
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* qkvPtr;
-                float* zPtr;
-                float* betaPtr;
-                float* alphaPtr;
+            // Prefer the fused chunked GGML kernel when running on a GGML backend with
+            // sufficient sequence length and matching K/V head dims. The chunked kernel
+            // packs the entire delta-net block (L2Norm, mul_mat, triangular solve, RMSNorm,
+            // gating) into a single GPU dispatch per layer, drastically reducing CPU work
+            // during prefill.
+            bool useChunked = !_gdnDisableChunkedPrefill
+                && IsGgmlBackend
+                && seqLen >= _gdnChunkPrefillThreshold
+                && _headKDim == _headVDim
+                && _ssmDtBiasW[layer] != null
+                && _ssmAW[layer] != null
+                && _ssmNormW[layer] != null;
 
-                if (packedPtr != null)
+            if (useChunked)
+            {
+                long tChunk = Stopwatch.GetTimestamp();
+                bool chunkedOk = false;
+                try
                 {
-                    float* row = packedPtr + (long)s * packedDim;
-                    qkvPtr = row;
-                    zPtr = row + qkvDim;
-                    betaPtr = zPtr + zDim;
-                    alphaPtr = betaPtr + _numVHeads;
+                    GatedDeltaNetChunkedPrefill(
+                        packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                        layer, seqLen, qkvDim, qkDim, zDim, packedDim, gated);
+                    chunkedOk = true;
+                }
+                catch (Exception ex)
+                {
+                    // First failure trips the kill switch so subsequent layers / forwards
+                    // do not pay the same overhead twice. Fall back to the per-token loop.
+                    _gdnDisableChunkedPrefill = true;
+                    Console.WriteLine($"[Qwen35] GatedDeltaNetChunked disabled (layer {layer}, seqLen {seqLen}): {ex.Message}");
+                }
+
+                if (chunkedOk)
+                {
+                    _gdnChunkedTicks += Stopwatch.GetTimestamp() - tChunk;
+                    _gdnChunkedCalls++;
                 }
                 else
                 {
-                    qkvPtr = qkvBase + (long)s * qkvDim;
-                    zPtr = zBase + (long)s * zDim;
-                    betaPtr = betaBase + (long)s * _numVHeads;
-                    alphaPtr = alphaBase + (long)s * _numVHeads;
+                    // Fall back: clean state was already mutated only inside the helper. Run
+                    // the per-token path on the same gated buffer.
+                    long tFallback = Stopwatch.GetTimestamp();
+                    RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                        layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                        convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
+                    _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tFallback;
+                    if (seqLen > 1) _gdnPerTokenCalls++;
                 }
-
-                GatedDeltaNetStep(qkvPtr, zPtr, betaPtr, alphaPtr,
-                    layer, qkvDim, qkDim, vDim,
-                    convWT, dtBiasPtr, aPtr, ssmNormPtr,
-                    gatedBase + (long)s * _ssmDInner);
+            }
+            else
+            {
+                long tLoop = Stopwatch.GetTimestamp();
+                RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                    layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                    convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
+                _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tLoop;
+                if (seqLen > 1) _gdnPerTokenCalls++;
             }
 
             InvalidateTensorDeviceCache(gated);
@@ -1994,6 +2075,238 @@ namespace TensorSharp.Models
 
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             return fusedAdd ? null : output;
+        }
+
+        /// <summary>
+        /// Per-token recurrent loop that walks the chunk one input at a time. Used both
+        /// for decode (seqLen=1) and as the chunked-path fallback for prefill.
+        /// </summary>
+        private unsafe void RunPerTokenLoop(
+            float* packedPtr, float* qkvBase, float* zBase, float* betaBase, float* alphaBase,
+            int layer, int seqLen, int qkvDim, int qkDim, int vDim, int zDim, int packedDim,
+            float[] convWT, float* dtBiasPtr, float* aPtr, float* ssmNormPtr, float* gatedBase)
+        {
+            for (int s = 0; s < seqLen; s++)
+            {
+                float* qkvPtr;
+                float* zPtr;
+                float* betaPtr;
+                float* alphaPtr;
+
+                if (packedPtr != null)
+                {
+                    float* row = packedPtr + (long)s * packedDim;
+                    qkvPtr = row;
+                    zPtr = row + qkvDim;
+                    betaPtr = zPtr + zDim;
+                    alphaPtr = betaPtr + _numVHeads;
+                }
+                else
+                {
+                    qkvPtr = qkvBase + (long)s * qkvDim;
+                    zPtr = zBase + (long)s * zDim;
+                    betaPtr = betaBase + (long)s * _numVHeads;
+                    alphaPtr = alphaBase + (long)s * _numVHeads;
+                }
+
+                GatedDeltaNetStep(qkvPtr, zPtr, betaPtr, alphaPtr,
+                    layer, qkvDim, qkDim, vDim,
+                    convWT, dtBiasPtr, aPtr, ssmNormPtr,
+                    gatedBase + (long)s * _ssmDInner);
+            }
+        }
+
+        /// <summary>
+        /// Chunked GatedDeltaNet prefill path.
+        ///
+        /// Runs the conv1d step token-by-token on CPU (so the recurrent ring state is
+        /// updated correctly), packs the per-token Q/K/V/Z/alpha/beta into row-major
+        /// [seqLen, H, D] (or [seqLen, H]) tensors, and dispatches a single fused GGML
+        /// graph that does L2Norm, Q-scale, sigmoid(beta), softplus(alpha), per-chunk
+        /// (k @ q) attention with triangular solve, RMSNorm, and silu(z) gating - all on
+        /// the GGML backend (Metal / CUDA when available).
+        ///
+        /// The recurrent state tensor (_deltaStateTensor[layer], shape [H, D, D]) is
+        /// passed in as input/output. The kernel updates it in place on the device and
+        /// downloads the new value back to the host buffer.
+        /// </summary>
+        private unsafe void GatedDeltaNetChunkedPrefill(
+            float* packedPtr, float* qkvBase, float* zBase, float* betaBase, float* alphaBase,
+            int layer, int seqLen, int qkvDim, int qkDim, int zDim, int packedDim,
+            Tensor gated)
+        {
+            int H = _numVHeads;
+            int Dk = _headKDim;
+            int Dv = _headVDim;
+            int hKDim = H * Dk;
+            int hVDim = H * Dv;
+
+            EnsureChunkedStagingBuffers(seqLen, H, Dk, Dv);
+
+            // The staging tensors are sized for the largest seqLen seen so far. We work
+            // on sub-views at the actual seqLen so the native kernel sees the correct shape.
+            Tensor qBuf = _gdnChunkedQBuf.Narrow(0, 0, seqLen);
+            Tensor kBuf = _gdnChunkedKBuf.Narrow(0, 0, seqLen);
+            Tensor vBuf = _gdnChunkedVBuf.Narrow(0, 0, seqLen);
+            Tensor zBuf = _gdnChunkedZBuf.Narrow(0, 0, seqLen);
+            Tensor alphaBuf = _gdnChunkedAlphaBuf.Narrow(0, 0, seqLen);
+            Tensor betaBuf = _gdnChunkedBetaBuf.Narrow(0, 0, seqLen);
+
+            try
+            {
+                float* qPtr = GetFloatPtr(qBuf);
+                float* kPtr = GetFloatPtr(kBuf);
+                float* vPtr = GetFloatPtr(vBuf);
+                float* zPtr = GetFloatPtr(zBuf);
+                float* alphaPtr = GetFloatPtr(alphaBuf);
+                float* betaPtr = GetFloatPtr(betaBuf);
+
+                int convDim = _convKernel - 1;
+                float[] convState = _convState[layer];
+                float[] convWT = _gdnConvWT[layer];
+                int writeIdx = _convStateWriteIdx[layer];
+
+                fixed (float* convOutPtr = _gdnConvOutBuf)
+                fixed (float* statePtr = convState)
+                {
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        float* qkvSrc;
+                        float* zSrc;
+                        float* betaSrc;
+                        float* alphaSrc;
+
+                        if (packedPtr != null)
+                        {
+                            float* row = packedPtr + (long)s * packedDim;
+                            qkvSrc = row;
+                            zSrc = row + qkvDim;
+                            betaSrc = zSrc + zDim;
+                            alphaSrc = betaSrc + _numVHeads;
+                        }
+                        else
+                        {
+                            qkvSrc = qkvBase + (long)s * qkvDim;
+                            zSrc = zBase + (long)s * zDim;
+                            betaSrc = betaBase + (long)s * _numVHeads;
+                            alphaSrc = alphaBase + (long)s * _numVHeads;
+                        }
+
+                        ComputeConv1DStep(qkvSrc, qkvDim, convDim, writeIdx, convState, convWT, convOutPtr);
+
+                        if (convDim > 0)
+                        {
+                            Buffer.MemoryCopy(qkvSrc, statePtr + writeIdx * qkvDim,
+                                qkvDim * sizeof(float), qkvDim * sizeof(float));
+                            writeIdx = (writeIdx + 1) % convDim;
+                        }
+
+                        long vBytes = (long)hVDim * sizeof(float);
+                        Buffer.MemoryCopy(convOutPtr + 2 * qkDim, vPtr + (long)s * hVDim, vBytes, vBytes);
+                        Buffer.MemoryCopy(zSrc,                   zPtr + (long)s * hVDim, vBytes, vBytes);
+
+                        long aBytes = (long)H * sizeof(float);
+                        Buffer.MemoryCopy(alphaSrc, alphaPtr + (long)s * H, aBytes, aBytes);
+                        Buffer.MemoryCopy(betaSrc,  betaPtr  + (long)s * H, aBytes, aBytes);
+
+                        if (_numKHeads == _numVHeads)
+                        {
+                            long kBytes = (long)hKDim * sizeof(float);
+                            Buffer.MemoryCopy(convOutPtr,         qPtr + (long)s * hKDim, kBytes, kBytes);
+                            Buffer.MemoryCopy(convOutPtr + qkDim, kPtr + (long)s * hKDim, kBytes, kBytes);
+                        }
+                        else
+                        {
+                            float* qDst = qPtr + (long)s * hKDim;
+                            float* kDst = kPtr + (long)s * hKDim;
+                            long perHeadBytes = (long)Dk * sizeof(float);
+                            for (int h = 0; h < H; h++)
+                            {
+                                int srcHead = h % _numKHeads;
+                                Buffer.MemoryCopy(convOutPtr + srcHead * Dk, qDst + h * Dk, perHeadBytes, perHeadBytes);
+                                Buffer.MemoryCopy(convOutPtr + qkDim + srcHead * Dk, kDst + h * Dk, perHeadBytes, perHeadBytes);
+                            }
+                        }
+                    }
+                }
+                _convStateWriteIdx[layer] = writeIdx;
+
+                // Tell the GGML host-buffer cache that the staging buffers were written
+                // on host. The chunked kernel uses backend_tensor_set internally so this
+                // is a no-op safety belt for any other consumer that may read these.
+                InvalidateTensorDeviceCache(qBuf);
+                InvalidateTensorDeviceCache(kBuf);
+                InvalidateTensorDeviceCache(vBuf);
+                InvalidateTensorDeviceCache(zBuf);
+                InvalidateTensorDeviceCache(alphaBuf);
+                InvalidateTensorDeviceCache(betaBuf);
+
+                Tensor state = _deltaStateTensor[layer];
+                InvalidateTensorDeviceCache(state);
+
+                // The GGML kernel writes [T, H, D] - same memory as gated[T, H*D].
+                Tensor gated3D = gated.View(seqLen, H, Dv);
+                try
+                {
+                    GgmlBasicOps.GatedDeltaNetChunked(
+                        qBuf, kBuf, vBuf, zBuf,
+                        alphaBuf, betaBuf,
+                        state, gated3D,
+                        new IntPtr(GetFloatPtr(_ssmDtBiasW[layer])),
+                        new IntPtr(GetFloatPtr(_ssmAW[layer])),
+                        new IntPtr(GetFloatPtr(_ssmNormW[layer])),
+                        chunkSize: GdnChunkSize, eps: Config.Eps);
+                }
+                finally
+                {
+                    gated3D.Dispose();
+                }
+
+                // The kernel downloaded fresh state and gated bytes back to the host
+                // buffer; downstream GGML kernels need to re-upload those bytes.
+                InvalidateTensorDeviceCache(state);
+                InvalidateTensorDeviceCache(gated);
+            }
+            finally
+            {
+                // Sub-views increment the underlying storage refcount; dispose them so
+                // we don't leak. The persistent backing tensors (_gdnChunked*Buf) are
+                // released in Dispose().
+                qBuf.Dispose();
+                kBuf.Dispose();
+                vBuf.Dispose();
+                zBuf.Dispose();
+                alphaBuf.Dispose();
+                betaBuf.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Lazily (re)allocate the chunked-prefill staging tensors so they cover at least
+        /// <paramref name="seqLen"/> rows. The buffers are sized to the largest seqLen we
+        /// have seen and reused for every layer in the same forward pass and every
+        /// subsequent forward pass with seqLen <= capacity.
+        /// </summary>
+        private void EnsureChunkedStagingBuffers(int seqLen, int H, int Dk, int Dv)
+        {
+            if (_gdnChunkedQBuf != null && _gdnChunkedBufCapacity >= seqLen)
+                return;
+
+            // Free old buffers (if any) before resizing upward.
+            _gdnChunkedQBuf?.Dispose();
+            _gdnChunkedKBuf?.Dispose();
+            _gdnChunkedVBuf?.Dispose();
+            _gdnChunkedZBuf?.Dispose();
+            _gdnChunkedAlphaBuf?.Dispose();
+            _gdnChunkedBetaBuf?.Dispose();
+
+            _gdnChunkedQBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dk);
+            _gdnChunkedKBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dk);
+            _gdnChunkedVBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dv);
+            _gdnChunkedZBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dv);
+            _gdnChunkedAlphaBuf = new Tensor(_allocator, DType.Float32, seqLen, H);
+            _gdnChunkedBetaBuf  = new Tensor(_allocator, DType.Float32, seqLen, H);
+            _gdnChunkedBufCapacity = seqLen;
         }
 
         /// <summary>
@@ -2877,6 +3190,28 @@ namespace TensorSharp.Models
 
         #endregion
 
+        public override void PrintTimingStats()
+        {
+            base.PrintTimingStats();
+
+            double msPerTick = 1000.0 / Stopwatch.Frequency;
+            double chunkedMs = _gdnChunkedTicks * msPerTick;
+            double perTokenMs = _gdnPerTokenTicks * msPerTick;
+
+            if (_gdnChunkedCalls == 0 && _gdnPerTokenCalls == 0)
+                return;
+
+            Console.WriteLine($"  GatedDeltaNet:");
+            Console.WriteLine($"    chunked path:   {_gdnChunkedCalls} calls, {chunkedMs:F0} ms total" +
+                (_gdnChunkedCalls > 0 ? $", {chunkedMs / _gdnChunkedCalls:F2} ms/call" : ""));
+            Console.WriteLine($"    per-token path: {_gdnPerTokenCalls} prefill calls, {perTokenMs:F0} ms total" +
+                (_gdnPerTokenCalls > 0 ? $", {perTokenMs / _gdnPerTokenCalls:F2} ms/call" : ""));
+            if (_gdnDisableChunkedPrefill)
+                Console.WriteLine($"    (chunked path disabled at runtime)");
+            else
+                Console.WriteLine($"    (chunked threshold: seqLen >= {_gdnChunkPrefillThreshold}, chunkSize {GdnChunkSize})");
+        }
+
         public override void Dispose()
         {
             VisionEncoder?.Dispose();
@@ -2892,6 +3227,12 @@ namespace TensorSharp.Models
                 foreach (var t in _deltaStateTensor) t?.Dispose();
 
             _gdnGatedOutT?.Dispose();
+            _gdnChunkedQBuf?.Dispose();
+            _gdnChunkedKBuf?.Dispose();
+            _gdnChunkedVBuf?.Dispose();
+            _gdnChunkedZBuf?.Dispose();
+            _gdnChunkedAlphaBuf?.Dispose();
+            _gdnChunkedBetaBuf?.Dispose();
 
             _moeTokenInput?.Dispose();
             _moeGateBuf?.Dispose();

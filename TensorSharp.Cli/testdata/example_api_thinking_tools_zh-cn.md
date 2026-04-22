@@ -331,6 +331,8 @@ else:
 | Gemma 4 | `<\|channel>thought\n...<channel\|>` | `<\|tool_call>call:NAME{args}<tool_call\|>` |
 | Qwen 3 | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 | Qwen 3.5 | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
+| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final`（Harmony 格式） | 暂不支持 |
+| Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 
 ## 工作原理
 
@@ -341,6 +343,8 @@ else:
 1. **Gemma4**：模板会在 system 段注入 `<|think|>`。模型会先在 `<|channel>thought\n...<channel|>` 标签内输出思维过程，再给出实际回答。
 2. **Qwen3**：模板会在生成 prompt 末尾追加 `<think>\n`。模型直接输出思维内容，并以 `</think>` 结尾，之后给出答案。
 3. **Qwen3.5**：与 Qwen3 相同。当思维链被禁用时，会在前面插入一个空的 `<think>\n\n</think>\n\n` 块。
+4. **GPT OSS**：Harmony 模板始终输出结构化的 channel 框架：`<|channel|>analysis ... <|channel|>final`。该架构的输出解析器始终启用，无论是否传入 `think: true`，都会拆出思维内容。
+5. **Nemotron-H**：使用与 Qwen3 一致的 `<think>...</think>` 框架。
 
 ### 工具调用
 
@@ -349,3 +353,5 @@ else:
 1. **Gemma4**：工具声明在 system 段使用 `<|tool>declaration:NAME{...}<tool|>` 格式。模型输出调用为 `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>`。
 2. **Qwen3**：工具定义以 JSON 形式注入到 system message。模型输出调用为 `<tool_call>{"name":"...","arguments":{...}}</tool_call>`。
 3. **Qwen3.5**：工具定义使用 `<tools>...</tools>` 格式。模型输出调用为 `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`。
+4. **Nemotron-H**：与 Qwen3 共用相同的 `<tool_call>{"name":"...","arguments":{...}}</tool_call>` 线协议。
+5. **GPT OSS**：当前未支持工具调用。

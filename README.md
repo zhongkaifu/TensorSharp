@@ -29,6 +29,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5 and Nemotron-H decode, eliminating per-expert round-trips
 - **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
 - **Text/Image/Audio/Video uploads** -- the web UI accepts file uploads up to 500 MB, with automatic token-budget-aware truncation for large text files
+- **Per-turn observability** -- structured logs capture the full user input and the full raw assistant output (both `<think>` reasoning and the final result) plus the KV cache hit ratio. The same cache-hit stats are surfaced through every API: `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio` (Ollama), `usage.prompt_tokens_details.cached_tokens` (OpenAI), and `promptTokens` / `kvReusedTokens` / `kvReusePercent` in the Web UI SSE `done` event
 
 ## Supported Model Architectures
 
@@ -83,10 +84,22 @@ TensorSharp/
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/CPU via native library)
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps)
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
-│   ├── ModelService.cs          # Model lifecycle management
+│   ├── Program.cs               # Slim bootstrap: DI wiring, middleware, endpoint mapping
+│   ├── ModelService.cs          # Model lifecycle, KV cache reuse, chat/generate streams + per-turn metrics
+│   ├── ChatSession.cs           # Per-conversation KV cache + tracked history
+│   ├── SessionManager.cs        # Thread-safe session registry (default + per-tab sessions)
 │   ├── InferenceQueue.cs        # FIFO request queue with position tracking
 │   ├── BackendCatalog.cs        # Discovery of available compute backends
 │   ├── TextUploadHelper.cs      # Token-budget-aware text-file truncation
+│   ├── WebUiChatPolicy.cs       # Web UI chat request validation
+│   ├── OpenAIResponseFormatParser.cs  # OpenAI response_format (json_object / json_schema) parsing
+│   ├── Hosting/                 # Startup-time concerns: options, backend resolution, logging, web root
+│   ├── RequestParsers/          # JSON request parsing (sampling, chat messages, tool functions)
+│   ├── ResponseSerializers/     # Per-protocol response shape factories (Ollama, OpenAI, Web UI)
+│   ├── StreamingWriters/        # SSE + NDJSON wire-format helpers
+│   ├── ProtocolAdapters/        # Per-protocol request handlers (WebUiAdapter, OllamaAdapter, OpenAIChatAdapter)
+│   ├── Endpoints/               # ASP.NET Core endpoint mapping (one extension method per protocol)
+│   ├── Logging/                 # Request logging middleware + low-noise path support
 │   ├── wwwroot/index.html       # Chat UI
 │   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
@@ -228,6 +241,11 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
     --benchmark --bench-prefill 256 --bench-decode 128 --bench-runs 3
 
+# KV-cache reuse benchmark: measure prefill speedup across multiple chat turns
+# (compares with-cache vs forced-reset prefill latency for an 8-turn conversation)
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
+    --bench-kvcache --bench-kv-turns 4 --max-tokens 64
+
 # Inspect the rendered prompt and tokenization without running inference
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --dump-prompt
 
@@ -267,8 +285,14 @@ cd TensorSharp.Cli/bin
 | `--bench-prefill <N>` | Synthetic prefill length in tokens (default: 32) |
 | `--bench-decode <N>` | Synthetic decode length in tokens (default: 64) |
 | `--bench-runs <N>` | Number of benchmark runs; reports best and average (default: 1) |
+| `--bench-kvcache` | Run a multi-turn KV-cache reuse benchmark (with-cache vs forced-reset prefill) |
+| `--bench-kv-turns <N>` | Number of conversation turns for `--bench-kvcache` (default: 4, max: 8) |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
 | `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
+| `--log-level <lvl>` | Console + file logger level: `trace`, `debug`, `info`, `warning`, `error`, `critical`, `off` |
+| `--log-dir <path>` | Directory for the JSON-line file logger (default: `<binDir>/logs`) |
+| `--log-file <0\|1>` | Disable (`0`) or enable (`1`) the file logger (default: enabled) |
+| `--log-console <0\|1>` | Disable (`0`) or enable (`1`) the console logger (default: enabled) |
 
 The multimodal projector file is auto-detected if placed alongside the model file with a recognized name (e.g., `gemma-4-mmproj-F16.gguf`).
 
@@ -299,6 +323,7 @@ cd TensorSharp.Server/bin
 Open `http://localhost:5000` in your browser. The web interface supports:
 
 - Multi-turn chat conversations
+- Per-tab chat sessions: each browser tab owns its own KV cache; clicking "New Chat" disposes the current session server-side so its cache is released
 - A single hosted GGUF selected explicitly with `--model`
 - An explicit hosted multimodal projector via `--mmproj` when needed
 - Image, video, and audio uploads for multimodal inference (up to 500 MB)
@@ -307,6 +332,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 - Streaming token generation via Server-Sent Events
 - Request queue with real-time position feedback
 - Message editing and deletion with regeneration from any point in the conversation
+- Free scrolling: scroll up to read earlier replies while new tokens stream in; the chat auto-scrolls again as soon as the user scrolls back to the bottom
 
 Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted projector. `TensorSharp.Server` no longer scans a `MODEL_DIR`.
 
@@ -328,6 +354,53 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
 | `PORT` / `ASPNETCORE_URLS` | Standard ASP.NET Core listener configuration (default port: `5000`) |
+| `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
+| `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
+| `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
+
+### Server Logging
+
+The server emits one structured Information-level entry at the start and end of
+every chat / generate turn, so a single grep over the log file reproduces the
+full request-response audit trail without replaying any traffic.
+
+| Event id | Emitted on | Carries |
+|---|---|---|
+| `ChatStarted` (1500) | `chat.start`, `generate.start`, plus per-protocol request banners | sampling config, message + attachment counts, `userInput=` (full latest user message), `fullInput=` (JSON-encoded array of EVERY message in the request: system prompts + all prior user/assistant turns + the new user message, with attachment counts), or the full prompt for `/api/generate` |
+| `ChatCompleted` (1502) | `chat.complete`, `generate.complete` | token counts, KV cache reuse (`kvReused`, `kvReusePercent`), TTFT, elapsed, throughput, finish reason, full raw assistant output (reasoning + result) |
+| `ChatAborted` (1503) | client disconnected mid-stream | partial output, KV reuse fraction at the time of abort |
+| `KvCacheReusePlan` (1510) | per-prefix-reuse decision | `Debug`-level fine-grained breakdown (exact match / partial / full reset) |
+| `HttpRequestStarted/Completed` (1100/1101) | every HTTP request | method, path, remote IP, status, duration; `/api/queue/status` is demoted to `Debug` so high-frequency UI polling does not drown out the per-turn entries |
+
+The raw assistant output captures `<think>...</think>`, `<|channel|>analysis`,
+and any other inline framing the model emits, so the log line for a single turn
+contains both reasoning and the user-visible result. Combined with the
+`fullInput=` field on `chat.start`, every turn is fully reproducible from the
+log file alone (request inputs + raw model output). Long uploads or long
+reasoning traces can produce multi-kilobyte log lines; raise the log level
+(`TENSORSHARP_LOG_LEVEL=Warning`) to suppress them while still keeping the start
+banner and error logs.
+
+Sample `fullInput` payload (formatted for readability; it is emitted as a
+single line in the actual log):
+
+```json
+[
+  {"role":"system","content":"You are a helpful assistant."},
+  {"role":"user","content":"What is the tallest mountain?"},
+  {"role":"assistant","content":"Mount Everest."},
+  {"role":"user","content":"How tall is it?","images":1}
+]
+```
+
+The same per-turn KV cache reuse stats are surfaced through every API:
+
+- **Web UI SSE** (`POST /api/chat`) - the `done` event carries `promptTokens`, `kvReusedTokens`, and `kvReusePercent`.
+- **Ollama NDJSON** (`POST /api/generate`, `POST /api/chat/ollama`) - the final chunk and the non-streaming response carry `prompt_cache_hit_tokens` (int) and `prompt_cache_hit_ratio` (0..1).
+- **OpenAI** (`POST /v1/chat/completions`) - the `usage` block carries `prompt_tokens_details.cached_tokens`, matching the OpenAI extension that existing SDKs already understand.
+
+The Web UI footer line under each assistant message also surfaces the cache hit
+inline (e.g. `187 tokens · 2.1s · 87.2 tok/s · KV 420/512 (82%)`).
 
 ### HTTP APIs
 
@@ -442,13 +515,13 @@ The output parser (`OutputParser.cs`) automatically extracts tool calls from the
 
 Gemma 4 models support image, video, and audio inputs. Place the multimodal projector (`gemma-4-mmproj-F16.gguf`) in the same directory as the model file for automatic loading.
 
-- **Images:** PNG, JPEG
+- **Images:** PNG, JPEG, HEIC/HEIF
 - **Video:** MP4 (extracts up to 8 frames at 1 fps using OpenCV)
 - **Audio:** WAV (16kHz mono), MP3, OGG Vorbis
 
 ### Gemma 3
 
-Gemma 3 supports PNG/JPEG image inputs. Place its multimodal projector (`mmproj-gemma3-4b-f16.gguf`) next to the model file for automatic loading.
+Gemma 3 supports PNG, JPEG, and HEIC/HEIF image inputs. Place its multimodal projector (`mmproj-gemma3-4b-f16.gguf`) next to the model file for automatic loading.
 
 ### Qwen 3.5
 
@@ -458,7 +531,7 @@ All Qwen 3.5 variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the 
 
 Mistral 3 supports image inputs via the Pixtral vision encoder. Place the multimodal projector (`mistral3-mmproj.gguf`) in the same directory as the model file for automatic loading.
 
-- **Images:** PNG, JPEG
+- **Images:** PNG, JPEG, HEIC/HEIF
 
 ## Architecture
 
@@ -520,7 +593,7 @@ The memory reduction comes primarily from no longer copying the GGUF file into a
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, KV cache policies, image preprocessing, media helpers, structured-output validation, text-upload helpers, web UI chat policy, model service history, model context length parsing, and backend catalog resolution.
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, and backend catalog resolution.
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

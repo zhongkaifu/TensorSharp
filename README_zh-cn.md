@@ -29,6 +29,7 @@
 - **批量 GPU MoE** —— Qwen 3.5 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **文本/图像/音频/视频上传** —— Web 界面支持最大 500 MB 的文件上传，对超大文本会按 token 预算自动截断
+- **每轮可观测性** —— 结构化日志会完整保留用户输入与模型原始输出（包括 `<think>` 思维链和最终结果），并记录 KV 缓存命中率。同样的命中率指标通过所有 API 透出：Ollama 的 `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio`、OpenAI 的 `usage.prompt_tokens_details.cached_tokens`，以及 Web UI SSE `done` 事件中的 `promptTokens` / `kvReusedTokens` / `kvReusePercent`
 
 ## 支持的模型架构
 
@@ -83,10 +84,22 @@ TensorSharp/
 ├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps）
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
-│   ├── ModelService.cs          # 模型生命周期管理
+│   ├── Program.cs               # 精简启动：DI 注册、中间件、端点映射
+│   ├── ModelService.cs          # 模型生命周期、KV 缓存复用、聊天/生成流式输出与每轮指标
+│   ├── ChatSession.cs           # 单会话 KV 缓存与历史跟踪
+│   ├── SessionManager.cs        # 线程安全的会话注册（默认会话 + 每个 UI Tab 的会话）
 │   ├── InferenceQueue.cs        # 带排队位置跟踪的 FIFO 请求队列
 │   ├── BackendCatalog.cs        # 可用计算后端的发现
 │   ├── TextUploadHelper.cs      # 按 token 预算截断的文本上传辅助
+│   ├── WebUiChatPolicy.cs       # Web UI 聊天请求合法性校验
+│   ├── OpenAIResponseFormatParser.cs  # OpenAI response_format（json_object / json_schema）解析
+│   ├── Hosting/                 # 启动期相关：选项装配、后端选择、日志、wwwroot 解析
+│   ├── RequestParsers/          # JSON 请求解析（采样配置、聊天消息、工具函数）
+│   ├── ResponseSerializers/     # 各协议响应形状构造（Ollama / OpenAI / Web UI）
+│   ├── StreamingWriters/        # SSE 与 NDJSON 线协议辅助
+│   ├── ProtocolAdapters/        # 各协议的请求处理器（WebUiAdapter、OllamaAdapter、OpenAIChatAdapter）
+│   ├── Endpoints/               # ASP.NET Core 路由映射（每协议一个扩展方法）
+│   ├── Logging/                 # 请求日志中间件 + 低噪声路径支持
 │   ├── wwwroot/index.html       # 聊天界面
 │   ├── testdata/                # 集成测试套件（bash + Python）
 │   └── API_EXAMPLES.md          # 详细 API 文档
@@ -228,6 +241,11 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
     --benchmark --bench-prefill 256 --bench-decode 128 --bench-runs 3
 
+# KV 缓存复用基准：在多轮对话中比较启用与禁用缓存的 prefill 时延
+# （以一个 8 轮的对话为例，对比有缓存与强制重置的 prefill 延迟差异）
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal \
+    --bench-kvcache --bench-kv-turns 4 --max-tokens 64
+
 # 仅查看渲染后的 prompt 和分词结果（不运行推理）
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --dump-prompt
 
@@ -267,8 +285,14 @@ cd TensorSharp.Cli/bin
 | `--bench-prefill <N>` | 合成 prefill 的 token 长度（默认：32） |
 | `--bench-decode <N>` | 合成 decode 的 token 长度（默认：64） |
 | `--bench-runs <N>` | 基准运行次数；输出最佳与平均结果（默认：1） |
+| `--bench-kvcache` | 运行多轮 KV 缓存复用基准（对比启用缓存与强制重置时的 prefill 延迟） |
+| `--bench-kv-turns <N>` | `--bench-kvcache` 使用的对话轮数（默认：4，最多 8） |
 | `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
 | `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
+| `--log-level <lvl>` | 控制台与文件日志级别：`trace`、`debug`、`info`、`warning`、`error`、`critical`、`off` |
+| `--log-dir <path>` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`） |
+| `--log-file <0\|1>` | 关闭（`0`）或开启（`1`）文件日志（默认：开启） |
+| `--log-console <0\|1>` | 关闭（`0`）或开启（`1`）控制台日志（默认：开启） |
 
 如果把多模态投影器文件放在模型文件同目录并使用可识别命名（例如 `gemma-4-mmproj-F16.gguf`），系统会自动检测。
 
@@ -299,6 +323,7 @@ cd TensorSharp.Server/bin
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
 
 - 多轮聊天
+- 每个浏览器 Tab 独立的会话：每个 Tab 拥有自己的 KV 缓存；点击「New Chat」会在服务端释放当前会话及其缓存
 - 通过 `--model` 显式托管单个 GGUF 模型
 - 在需要时通过 `--mmproj` 显式托管多模态投影器
 - 上传图像、视频和音频进行多模态推理（最大 500 MB）
@@ -307,6 +332,7 @@ cd TensorSharp.Server/bin
 - 通过 Server-Sent Events 进行流式 token 生成
 - 带实时排队位置反馈的请求队列
 - 消息编辑和删除，支持从对话中任意位置重新生成
+- 自由滚动：在生成过程中可向上滚动查看历史消息；只要重新滚回底部，新内容会继续自动跟随
 
 使用 `--model` 选择要托管的 GGUF 文件，使用 `--mmproj` 选择要托管的投影器文件。`TensorSharp.Server` 不再扫描 `MODEL_DIR`。
 
@@ -328,6 +354,48 @@ cd TensorSharp.Server/bin
 | `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
 | `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
 | `PORT` / `ASPNETCORE_URLS` | 标准 ASP.NET Core 监听配置（默认端口：`5000`） |
+| `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
+| `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
+| `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+
+### 服务端日志
+
+每一轮 chat / generate 请求开始与结束时，服务都会打出一条结构化的
+Information 级别日志。只需对日志文件做一次 grep 即可还原完整的请求—响应审计
+轨迹，无需重放任何流量。
+
+| 事件 ID | 触发位置 | 字段 |
+|---|---|---|
+| `ChatStarted`（1500） | `chat.start`、`generate.start` 以及各协议的请求横幅 | 采样配置、消息与附件计数、`userInput=`（完整的最近一条用户消息）、`fullInput=`（本轮请求中**全部**消息的 JSON 数组：system 提示 + 历史 user/assistant + 本轮新消息 + 附件计数），`/api/generate` 则为完整 prompt |
+| `ChatCompleted`（1502） | `chat.complete`、`generate.complete` | token 数、KV 缓存复用（`kvReused`、`kvReusePercent`）、TTFT、耗时、吞吐、终止原因，以及完整的模型原始输出（思维链 + 结果） |
+| `ChatAborted`（1503） | 客户端中途断开 | 已生成的部分输出、当时的 KV 复用占比 |
+| `KvCacheReusePlan`（1510） | 每次前缀复用判断 | `Debug` 级的细粒度分支信息（精确匹配 / 部分复用 / 完整重置） |
+| `HttpRequestStarted/Completed`（1100/1101） | 每个 HTTP 请求 | method、path、远端 IP、状态码、耗时；`/api/queue/status` 被降级到 `Debug`，避免 UI 高频轮询淹没每轮日志 |
+
+模型原始输出会保留 `<think>...</think>`、`<|channel|>analysis` 等内联标记，因
+此单条日志即可看到推理过程与最终用户可见结果。配合 `chat.start` 上的
+`fullInput=` 字段，每一轮的请求输入和模型原始输出都可以**只**通过日志文件完
+整复现。长上传或长思维链可能产生数 KB 的日志；如需控制噪声可调高级别（例如
+`TENSORSHARP_LOG_LEVEL=Warning`），仍会保留启动横幅与错误日志。
+
+`fullInput` 字段示例（为便于阅读做了缩进，实际日志为单行）：
+
+```json
+[
+  {"role":"system","content":"你是一个有帮助的助手。"},
+  {"role":"user","content":"世界上最高的山是哪座？"},
+  {"role":"assistant","content":"珠穆朗玛峰。"},
+  {"role":"user","content":"它有多高？","images":1}
+]
+```
+
+同样的 KV 缓存复用统计会通过所有 API 透出：
+
+- **Web UI SSE**（`POST /api/chat`） —— `done` 事件携带 `promptTokens`、`kvReusedTokens`、`kvReusePercent`。
+- **Ollama NDJSON**（`POST /api/generate`、`POST /api/chat/ollama`） —— 流式末尾 chunk 与非流式响应均携带 `prompt_cache_hit_tokens`（int）和 `prompt_cache_hit_ratio`（0..1）。
+- **OpenAI**（`POST /v1/chat/completions`） —— `usage` 块携带 `prompt_tokens_details.cached_tokens`，与 OpenAI 标准扩展一致，现有 SDK 可直接读取。
+
+Web UI 中每条助手消息下方的统计行也会展示命中率（例如 `187 tokens · 2.1s · 87.2 tok/s · KV 420/512 (82%)`）。
 
 ### HTTP API
 
@@ -442,13 +510,13 @@ curl http://localhost:5000/api/queue/status
 
 Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`gemma-4-mmproj-F16.gguf`）放在与模型文件相同目录即可自动加载。
 
-- **图像：** PNG、JPEG
+- **图像：** PNG、JPEG、HEIC/HEIF
 - **视频：** MP4（使用 OpenCV 以 1 fps 抽取最多 8 帧）
 - **音频：** WAV（16kHz 单声道）、MP3、OGG Vorbis
 
 ### Gemma 3
 
-Gemma 3 支持 PNG/JPEG 图像输入。将其多模态投影器（`mmproj-gemma3-4b-f16.gguf`）放在模型文件相同目录即可自动加载。
+Gemma 3 支持 PNG、JPEG 与 HEIC/HEIF 图像输入。将其多模态投影器（`mmproj-gemma3-4b-f16.gguf`）放在模型文件相同目录即可自动加载。
 
 ### Qwen 3.5
 
@@ -458,7 +526,7 @@ Gemma 3 支持 PNG/JPEG 图像输入。将其多模态投影器（`mmproj-gemma3
 
 Mistral 3 通过 Pixtral 视觉编码器支持图像输入。将多模态投影器（`mistral3-mmproj.gguf`）放在与模型文件相同目录即可自动加载。
 
-- **图像：** PNG、JPEG
+- **图像：** PNG、JPEG、HEIC/HEIF
 
 ## 架构说明
 
@@ -520,7 +588,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、KV 缓存策略、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、Web UI 聊天策略、模型服务历史、模型上下文长度解析、可用后端发现等。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史与 KV 缓存联动、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现等。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

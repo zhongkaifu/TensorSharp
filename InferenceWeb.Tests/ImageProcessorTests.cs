@@ -1,4 +1,5 @@
-﻿
+﻿using ImageMagick;
+
 namespace InferenceWeb.Tests;
 
 public class ImageProcessorTests
@@ -87,11 +88,97 @@ public class ImageProcessorTests
         Assert.Equal(3 * width * height, gemma4Pixels.Length);
     }
 
+    [Fact]
+    public void Gemma3ImageProcessorProcessImageSupportsHeic()
+    {
+        string? heicPath = TryWriteSyntheticHeic(64, 64);
+        if (heicPath == null)
+            return; // libheif/x265 encoder not present in this Magick.NET build
+
+        try
+        {
+            var processor = new Gemma3ImageProcessor(imageSize: 32);
+            float[] pixels = processor.ProcessImage(heicPath);
+
+            Assert.Equal(3 * 32 * 32, pixels.Length);
+            Assert.All(pixels, value => Assert.InRange(value, -1f, 1f));
+        }
+        finally
+        {
+            File.Delete(heicPath);
+        }
+    }
+
+    [Fact]
+    public void Qwen35ImageProcessorReadDimensionsSupportsHeic()
+    {
+        string? heicPath = TryWriteSyntheticHeic(80, 48);
+        if (heicPath == null)
+            return;
+
+        try
+        {
+            var (width, height) = Qwen35ImageProcessor.ReadImageDimensions(heicPath);
+            Assert.Equal(80, width);
+            Assert.Equal(48, height);
+        }
+        finally
+        {
+            File.Delete(heicPath);
+        }
+    }
+
+    [Fact]
+    public void UserSuppliedHeicSmokeTestWhenConfigured()
+    {
+        string? path = Environment.GetEnvironmentVariable("TENSORSHARP_HEIC_SMOKE_PATH");
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return;
+
+        var gemma3 = new Gemma3ImageProcessor(imageSize: 32);
+        float[] gemma3Pixels = gemma3.ProcessImage(path);
+
+        var (width, height) = Qwen35ImageProcessor.ReadImageDimensions(path);
+
+        Assert.Equal(3 * 32 * 32, gemma3Pixels.Length);
+        Assert.All(gemma3Pixels, value => Assert.InRange(value, -1f, 1f));
+        Assert.True(width > 0);
+        Assert.True(height > 0);
+    }
+
     private static string WriteEmbeddedJpeg()
     {
         string path = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.jpg");
         File.WriteAllBytes(path, Convert.FromBase64String(EmbeddedJpegBase64));
         return path;
+    }
+
+    // Synthesize a HEIC file on disk so the round-trip exercise does not require
+    // a vendored binary blob. Returns null when the bundled Magick.NET native
+    // binaries cannot encode HEIC on this platform (e.g. when x265 is not
+    // available), which keeps the test environment-resilient.
+    private static string? TryWriteSyntheticHeic(uint width, uint height)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.heic");
+        try
+        {
+            using var image = new MagickImage(MagickColors.Crimson, width, height);
+            image.Format = MagickFormat.Heic;
+            image.Write(path);
+
+            if (!File.Exists(path) || new FileInfo(path).Length == 0)
+            {
+                if (File.Exists(path)) File.Delete(path);
+                return null;
+            }
+
+            return path;
+        }
+        catch
+        {
+            if (File.Exists(path)) File.Delete(path);
+            return null;
+        }
     }
 }
 

@@ -679,6 +679,56 @@ namespace TensorSharp.GGML
                 eps, ropeBase, ropeFreqScale, ropeMode);
         }
 
+        /// <summary>
+        /// Fused chunked GatedDeltaNet for Qwen3.5/Qwen3-Next. Runs the prefill recurrent
+        /// path entirely on the GGML backend (Metal/CUDA) so the per-token CPU loop in
+        /// <see cref="GgmlBasicOps"/> consumers is replaced by a single graph dispatch.
+        /// </summary>
+        /// <param name="q">Q tensor [seqLen, numVHeads, headDim] (after K-head expansion).</param>
+        /// <param name="k">K tensor [seqLen, numVHeads, headDim] (after K-head expansion).</param>
+        /// <param name="v">V tensor [seqLen, numVHeads, headDim].</param>
+        /// <param name="z">Pre-output gate tensor [seqLen, numVHeads, headDim].</param>
+        /// <param name="alpha">Raw alpha [seqLen, numVHeads] (before bias and softplus).</param>
+        /// <param name="beta">Raw beta [seqLen, numVHeads] (before sigmoid).</param>
+        /// <param name="state">Recurrent state [numVHeads, headDim, headDim], updated in place.</param>
+        /// <param name="gatedOut">Output [seqLen, numVHeads, headDim], written into.</param>
+        /// <param name="dtBiasData">Per-head bias for alpha [numVHeads].</param>
+        /// <param name="aLogData">Per-head -A_log [numVHeads].</param>
+        /// <param name="ssmNormWData">Per-D RMSNorm weights [headDim].</param>
+        /// <param name="chunkSize">Chunk size (must be a positive power of two).</param>
+        /// <param name="eps">Epsilon used for L2Norm and RMSNorm.</param>
+        public static void GatedDeltaNetChunked(
+            Tensor q, Tensor k, Tensor v, Tensor z,
+            Tensor alpha, Tensor beta,
+            Tensor state, Tensor gatedOut,
+            IntPtr dtBiasData, IntPtr aLogData, IntPtr ssmNormWData,
+            int chunkSize, float eps)
+        {
+            if (q == null || k == null || v == null || z == null
+                || alpha == null || beta == null || state == null || gatedOut == null)
+                throw new ArgumentNullException(nameof(q), "All tensor arguments must be non-null.");
+            if (dtBiasData == IntPtr.Zero || aLogData == IntPtr.Zero || ssmNormWData == IntPtr.Zero)
+                throw new ArgumentException("dt_bias, a_log, ssm_norm_w must be non-null pointers.");
+
+            if (!TryCreateStandardView(q, out GgmlTensorView3D qView)
+                || !TryCreateStandardView(k, out GgmlTensorView3D kView)
+                || !TryCreateStandardView(v, out GgmlTensorView3D vView)
+                || !TryCreateStandardView(z, out GgmlTensorView3D zView)
+                || !TryCreateStandardView(alpha, out GgmlTensorView2D alphaView)
+                || !TryCreateStandardView(beta, out GgmlTensorView2D betaView)
+                || !TryCreateStandardView(state, out GgmlTensorView3D stateView)
+                || !TryCreateStandardView(gatedOut, out GgmlTensorView3D gatedOutView))
+            {
+                throw new NotSupportedException("GatedDeltaNetChunked requires Float32 tensors with row-contiguous layouts.");
+            }
+
+            GgmlNative.GatedDeltaNetChunked(
+                qView, kView, vView, zView,
+                alphaView, betaView, stateView, gatedOutView,
+                dtBiasData, aLogData, ssmNormWData,
+                chunkSize, eps);
+        }
+
         public static void Gemma4ModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,

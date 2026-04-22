@@ -16,6 +16,7 @@
     <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="Magick.NET-Q8-AnyCPU" Version="14.12.0" />
     <PackageReference Include="NLayer" Version="1.16.0" />
     <PackageReference Include="NVorbis" Version="0.10.5" />
     <PackageReference Include="OneWare.OpenCvSharp4.runtime.ubuntu.24.04-x64" Version="4.13.0.18" />

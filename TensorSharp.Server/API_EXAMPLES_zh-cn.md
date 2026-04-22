@@ -5,7 +5,7 @@
 TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 - **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`）
 - **兼容 OpenAI**（`/v1/chat/completions`、`/v1/models`）
-- **Web UI**（`/api/chat`、`/api/models`、`/api/models/load`、`/api/upload`）
+- **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`）
 - **工具型接口**（`/api/version`、`/api/queue/status`）
 
 启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` 指定多模态投影器。Web UI 与兼容接口仅暴露这一个承载模型；`/api/models/load` 可以重新加载它，但不会在运行时切换到任意其他文件。
@@ -82,9 +82,16 @@ curl -X POST http://localhost:5000/api/generate \
   "prompt_eval_count": 15,
   "prompt_eval_duration": 300000000,
   "eval_count": 10,
-  "eval_duration": 1200000000
+  "eval_duration": 1200000000,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
 }
 ```
+
+`prompt_cache_hit_tokens` 表示在 `prompt_eval_count` 个 token 中，有多少 token
+是直接从上一轮的 KV 缓存中读取的。`/api/generate` 在每次 prefill 之前都会重置
+会话，因此该字段始终为 `0`；在 `/api/chat/ollama` 上，当本次请求的 prompt 前
+缀与上一轮匹配时，该字段会变为非 0。
 
 ### 生成（流式）
 
@@ -104,8 +111,11 @@ curl -X POST http://localhost:5000/api/generate \
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"Why","done":false}
 {"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":" did","done":false}
 ...
-{"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"","done":true,"done_reason":"stop","total_duration":...,"eval_count":...}
+{"model":"Qwen3-4B-Q8_0.gguf","created_at":"...","response":"","done":true,"done_reason":"stop","total_duration":...,"eval_count":...,"prompt_cache_hit_tokens":0,"prompt_cache_hit_ratio":0.0}
 ```
+
+末尾的 `done` chunk 与非流式响应一样，也会携带 `prompt_cache_hit_tokens` /
+`prompt_cache_hit_ratio` 字段。
 
 ### 带图片的生成（多模态）
 
@@ -152,9 +162,16 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   "prompt_eval_count": 20,
   "prompt_eval_duration": 500000000,
   "eval_count": 15,
-  "eval_duration": 1500000000
+  "eval_duration": 1500000000,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
 }
 ```
+
+`prompt_cache_hit_tokens` 与 `prompt_cache_hit_ratio` 表示有多少 prompt token
+是直接复用了上一轮的 KV 缓存。新会话的第一轮两个值都是 0；在复用上一轮
+prefix 的后续轮次中，它们会接近 `prompt_eval_count` / `1.0`。流式模式下末尾
+chunk 同样携带这些字段。
 
 ### 聊天（流式）
 
@@ -336,10 +353,17 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   "usage": {
     "prompt_tokens": 20,
     "completion_tokens": 8,
-    "total_tokens": 28
+    "total_tokens": 28,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
   }
 }
 ```
+
+`usage.prompt_tokens_details.cached_tokens` 与 OpenAI 官方的 KV 缓存命中扩展字
+段一致：当后续轮次复用了上一轮的 prompt 前缀时，该值会接近 `prompt_tokens`，
+客户端可由此判断本轮 TTFT 节省的程度，无需打开服务端的 Debug 日志。
 
 ### Chat Completions（流式）
 
@@ -360,10 +384,13 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model
 
 data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{...}}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9,"prompt_tokens_details":{"cached_tokens":0}}}
 
 data: [DONE]
 ```
+
+末尾 chunk 的 `usage` 块同样会携带 `prompt_tokens_details.cached_tokens`，与
+非流式响应保持一致。
 
 ### Chat Completions + JSON 模式
 
@@ -533,7 +560,72 @@ curl http://localhost:5000/api/models
 
 ---
 
-## 3. 采样选项
+## 3. Web UI SSE（`/api/chat`）
+
+这是内置聊天界面使用的协议，单独列在这里方便外部 Web UI 接入同一接口。每个事
+件都是一个 JSON 对象，通过单条 `data: ...` SSE 帧下发。
+
+### 聊天会话
+
+Web UI 流程是按会话隔离的：每个浏览器 Tab 在加载时会创建自己的会话，并在每次
+`/api/chat` 请求中携带该 `sessionId`，因此每个 Tab 都拥有独立的 KV 缓存。
+Ollama 与 OpenAI 兼容接口共享一个内置的 `__default__` 会话，该会话在服务器生命
+周期内常驻。
+
+```bash
+# 创建一个新的会话（返回 id；只有 Web UI 流程需要该步骤）
+curl -X POST http://localhost:5000/api/sessions
+# {"sessionId":"a3b1c2..."}
+
+# 销毁会话并释放对应的 KV 缓存。默认会话（__default__）不可删除；
+# 当 id 不存在时返回 404。
+curl -X DELETE http://localhost:5000/api/sessions/a3b1c2...
+```
+
+只要在 `/api/chat` 之间复用同一个 `sessionId`，服务器就能在新一轮请求时把上一轮
+助手的原始 token 直接拼接到 KV 缓存前缀里（终态 SSE 帧的 `kvReusedTokens` /
+`kvReusePercent` 字段会指出复用了多少）。传入 `sessionId: null` 可使用共享的
+`__default__` 会话；传入 `newChat: true` 可在不销毁会话的前提下，在下一轮强制
+重置该会话的服务端 KV 缓存。
+
+### 流式聊天
+
+```bash
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hi"}],
+    "maxTokens": 50,
+    "sessionId": null,
+    "newChat": false,
+    "think": false,
+    "tools": []
+  }'
+```
+
+事件字段：
+
+| 事件字段 | 触发时机 | 含义 |
+|---|---|---|
+| `queue_position`、`queue_pending` | 排队期间每秒一次 | 当前请求排在队列中的位置 |
+| `token` | 每个生成的 token（启用 `think` / `tools` 时为解析后的内容片段） | 流式正文 |
+| `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
+| `tool_calls` | 模型输出工具调用 | `{name, arguments}` 数组 |
+| `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总 |
+
+末尾帧示例：
+
+```
+data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+```
+
+`kvReusedTokens` / `kvReusePercent` 与 Ollama 的 `prompt_cache_hit_*` 以及
+OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 含义一致 —— 都表示有多
+少 prompt token 直接复用了对应会话上一轮的 KV 缓存。
+
+---
+
+## 4. 采样选项
 
 ### Ollama 风格选项（位于 `options` 对象中）
 
@@ -565,7 +657,7 @@ curl http://localhost:5000/api/models
 
 ---
 
-## 4. Python 客户端示例
+## 5. Python 客户端示例
 
 ### 使用 `requests`（Ollama 风格）
 
@@ -693,7 +785,7 @@ print()
 
 ---
 
-## 5. 运行示例请求
+## 6. 运行示例请求
 
 `test_requests.jsonl` 文件包含针对所有接口的示例请求。可通过下面的脚本批量运行：
 

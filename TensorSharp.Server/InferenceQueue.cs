@@ -10,8 +10,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server
 {
@@ -24,9 +28,20 @@ namespace TensorSharp.Server
     {
         private readonly object _sync = new();
         private readonly LinkedList<QueueTicket> _waiters = new();
+        private readonly ILogger<InferenceQueue> _logger;
         private bool _busy;
         private long _totalProcessed;
         private string _currentRequestId;
+
+        public InferenceQueue()
+            : this(NullLogger<InferenceQueue>.Instance)
+        {
+        }
+
+        public InferenceQueue(ILogger<InferenceQueue> logger)
+        {
+            _logger = logger ?? NullLogger<InferenceQueue>.Instance;
+        }
 
         public int PendingCount { get { lock (_sync) return _waiters.Count; } }
         public long TotalProcessed => Interlocked.Read(ref _totalProcessed);
@@ -43,11 +58,17 @@ namespace TensorSharp.Server
                     _currentRequestId = requestId;
                     ticket.SetPosition(0);
                     ticket.MarkReady();
+                    _logger.LogDebug(LogEventIds.QueueReady,
+                        "Inference slot acquired immediately for request {RequestId}",
+                        requestId ?? "(none)");
                     return ticket;
                 }
                 var node = _waiters.AddLast(ticket);
                 ticket.Node = node;
                 ticket.SetPosition(_waiters.Count);
+                _logger.LogInformation(LogEventIds.QueueEnqueued,
+                    "Request {RequestId} queued at position {Position} (pending={PendingCount}, current={CurrentRequestId})",
+                    requestId ?? "(none)", _waiters.Count, _waiters.Count, _currentRequestId ?? "(none)");
                 return ticket;
             }
         }
@@ -62,6 +83,9 @@ namespace TensorSharp.Server
                     _waiters.Remove(completed.Node);
                     completed.Node = null;
                 }
+                _logger.LogDebug(LogEventIds.QueueReleased,
+                    "Inference slot released for request {RequestId} (totalProcessed={TotalProcessed}, pending={PendingCount})",
+                    completed.RequestId ?? "(none)", _totalProcessed, _waiters.Count);
                 ActivateNext();
             }
         }
@@ -75,6 +99,9 @@ namespace TensorSharp.Server
                     _waiters.Remove(ticket.Node);
                     ticket.Node = null;
                     UpdatePositions();
+                    _logger.LogInformation(LogEventIds.QueueCancelled,
+                        "Cancelled queued request {RequestId} (pending={PendingCount})",
+                        ticket.RequestId ?? "(none)", _waiters.Count);
                 }
             }
         }
@@ -89,12 +116,20 @@ namespace TensorSharp.Server
                 next.Node = null;
 
                 if (next.IsCancelled)
+                {
+                    _logger.LogDebug(LogEventIds.QueueCancelled,
+                        "Skipping cancelled queued request {RequestId}",
+                        next.RequestId ?? "(none)");
                     continue;
+                }
 
                 _currentRequestId = next.RequestId;
                 next.SetPosition(0);
                 next.MarkReady();
                 UpdatePositions();
+                _logger.LogInformation(LogEventIds.QueueReady,
+                    "Activated queued request {RequestId} (pending={PendingCount})",
+                    next.RequestId ?? "(none)", _waiters.Count);
                 return;
             }
             _busy = false;

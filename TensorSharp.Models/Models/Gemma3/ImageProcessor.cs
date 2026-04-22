@@ -10,6 +10,7 @@
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using ImageMagick;
 using StbImageSharp;
 
 namespace TensorSharp.Models
@@ -55,7 +56,10 @@ namespace TensorSharp.Models
             if (IsJpeg(fileBytes))
                 return DecodeJPEG(fileBytes, out width, out height);
 
-            throw new NotSupportedException("Only PNG and JPEG image formats are supported");
+            if (IsHeic(fileBytes))
+                return DecodeHEIC(fileBytes, out width, out height);
+
+            throw new NotSupportedException("Only PNG, JPEG, and HEIC/HEIF image formats are supported");
         }
 
         internal static (int width, int height) ReadImageDimensions(string imagePath)
@@ -71,7 +75,10 @@ namespace TensorSharp.Models
                 return (width, height);
             }
 
-            throw new NotSupportedException("Only PNG and JPEG image formats are supported");
+            if (IsHeic(fileBytes))
+                return ReadHeicDimensions(fileBytes);
+
+            throw new NotSupportedException("Only PNG, JPEG, and HEIC/HEIF image formats are supported");
         }
 
         private static bool IsPng(byte[] fileBytes) =>
@@ -85,6 +92,54 @@ namespace TensorSharp.Models
             fileBytes.Length >= 2 &&
             fileBytes[0] == 0xFF &&
             fileBytes[1] == 0xD8;
+
+        // HEIC/HEIF files use the ISOBMFF container: a leading "ftyp" box whose
+        // major_brand (offset 8..11) or compatible_brands (offsets 16, 20, 24, ...
+        // up to the box size) carry the HEIF/HEIC marker. Detect the major brand
+        // first and then scan the compatible_brands list so files authored with a
+        // generic major_brand (e.g. "mif1") but a HEIC/HEIF compatible brand are
+        // still recognised.
+        private static bool IsHeic(byte[] fileBytes)
+        {
+            if (fileBytes.Length < 12)
+                return false;
+
+            if (fileBytes[4] != (byte)'f' || fileBytes[5] != (byte)'t' ||
+                fileBytes[6] != (byte)'y' || fileBytes[7] != (byte)'p')
+            {
+                return false;
+            }
+
+            int boxSize = (fileBytes[0] << 24) | (fileBytes[1] << 16) | (fileBytes[2] << 8) | fileBytes[3];
+            if (boxSize <= 0 || boxSize > fileBytes.Length)
+                boxSize = fileBytes.Length;
+
+            if (IsHeifBrand(fileBytes, 8))
+                return true;
+
+            for (int offset = 16; offset + 4 <= boxSize; offset += 4)
+            {
+                if (IsHeifBrand(fileBytes, offset))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsHeifBrand(byte[] data, int offset)
+        {
+            if (offset < 0 || offset + 4 > data.Length)
+                return false;
+
+            string brand = System.Text.Encoding.ASCII.GetString(data, offset, 4);
+            return brand switch
+            {
+                "heic" or "heix" or "heim" or "heis" or
+                "hevc" or "hevx" or "hevm" or "hevs" or
+                "mif1" or "msf1" or "heif" => true,
+                _ => false,
+            };
+        }
 
         private static byte[] DecodePNG(byte[] data, out int width, out int height)
         {
@@ -241,6 +296,50 @@ namespace TensorSharp.Models
             catch (Exception ex)
             {
                 throw new InvalidDataException("Failed to decode JPEG image.", ex);
+            }
+        }
+
+        // HEIC/HEIF decoding is delegated to ImageMagick, which bundles libheif in the
+        // Magick.NET-Q8-AnyCPU package. The Q8 build uses byte-sized quanta which
+        // matches the rest of this pipeline (8-bit RGBA), so Magick.NET will tonemap
+        // 10/12-bit HEIC sources down to 8-bit automatically.
+        private static byte[] DecodeHEIC(byte[] data, out int width, out int height)
+        {
+            try
+            {
+                using var image = new MagickImage(data);
+                if (image.ColorSpace != ColorSpace.sRGB)
+                    image.ColorSpace = ColorSpace.sRGB;
+                if (!image.HasAlpha)
+                    image.Alpha(AlphaOption.Set);
+
+                width = (int)image.Width;
+                height = (int)image.Height;
+
+                using var pixels = image.GetPixels();
+                byte[] rgba = pixels.ToByteArray(0, 0, image.Width, image.Height, "RGBA");
+                if (rgba == null || rgba.Length != width * height * 4)
+                    throw new InvalidDataException("HEIC decoder returned an unexpected pixel buffer.");
+                return rgba;
+            }
+            catch (Exception ex) when (ex is not InvalidDataException)
+            {
+                throw new InvalidDataException(
+                    "Failed to decode HEIC/HEIF image. Ensure the Magick.NET native binaries with libheif support are available.",
+                    ex);
+            }
+        }
+
+        private static (int width, int height) ReadHeicDimensions(byte[] data)
+        {
+            try
+            {
+                var info = new MagickImageInfo(data);
+                return ((int)info.Width, (int)info.Height);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidDataException("Failed to read HEIC/HEIF image dimensions.", ex);
             }
         }
 

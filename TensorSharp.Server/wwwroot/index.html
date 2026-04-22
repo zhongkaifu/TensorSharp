@@ -803,7 +803,7 @@ button.primary:hover { background: var(--accent-hover); }
         </div>
       </div>
     </div>
-    <input type="file" id="file-input" accept="image/*,video/*,audio/*,.txt,.csv,.json,.xml,.md,.log,.py,.js,.ts,.cs,.java,.cpp,.c,.h,.html,.css,.yaml,.yml,.toml,.ini,.cfg,.sh,.bat,.ps1,.rb,.go,.rs,.swift,.kt,.sql,.r,.m,.tex,.rtf" onchange="handleFileSelect(event)">
+    <input type="file" id="file-input" accept="image/*,video/*,audio/*,.heic,.heif,.txt,.csv,.json,.xml,.md,.log,.py,.js,.ts,.cs,.java,.cpp,.c,.h,.html,.css,.yaml,.yml,.toml,.ini,.cfg,.sh,.bat,.ps1,.rb,.go,.rs,.swift,.kt,.sql,.r,.m,.tex,.rtf" onchange="handleFileSelect(event)">
   </div>
 </div>
 
@@ -822,6 +822,10 @@ let currentLoadedModel = null;
 let needsCacheReset = false;
 let shouldAutoScroll = true;
 let serverDefaultMaxTokens = 20000;
+// Each chat has a dedicated session on the server. The session owns its KV cache;
+// starting a new chat disposes the server-side session so its KV state is freed.
+const DEFAULT_SESSION_ID = '__default__';
+let currentSessionId = null;
 const editOriginalHtml = new Map();
 
 function isChatNearBottom() {
@@ -925,6 +929,7 @@ async function fetchServerState() {
     serverDefaultMaxTokens = data.defaultMaxTokens || 20000;
     updateStatusBadge(data);
     renderEmptyState();
+    await createSession();
     return data;
   } catch (e) {
     console.error('Failed to fetch server state:', e);
@@ -932,13 +937,50 @@ async function fetchServerState() {
   }
 }
 
-function clearChat() {
+window.addEventListener('beforeunload', () => {
+  if (currentSessionId && currentSessionId !== DEFAULT_SESSION_ID) {
+    const id = currentSessionId;
+    currentSessionId = null;
+    try {
+      fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE', keepalive: true });
+    } catch {}
+  }
+});
+
+async function createSession() {
+  try {
+    const res = await fetch('/api/sessions', { method: 'POST' });
+    const data = await res.json();
+    if (data && data.sessionId) {
+      currentSessionId = data.sessionId;
+    }
+  } catch (e) {
+    console.error('Failed to create chat session:', e);
+    currentSessionId = null;
+  }
+}
+
+async function disposeCurrentSession() {
+  if (!currentSessionId) return;
+  const id = currentSessionId;
+  currentSessionId = null;
+  if (id === DEFAULT_SESSION_ID) return;
+  try {
+    await fetch('/api/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+  } catch (e) {
+    console.warn('Failed to dispose chat session:', e);
+  }
+}
+
+async function clearChat() {
   chatHistory = [];
   pendingAttachments = [];
   attachmentsDiv.innerHTML = '';
   chatContainer.innerHTML = '';
-  needsCacheReset = true;
+  needsCacheReset = false;
   shouldAutoScroll = true;
+  await disposeCurrentSession();
+  await createSession();
   renderEmptyState();
 }
 
@@ -1007,6 +1049,7 @@ async function sendMessage() {
 
   const imagePaths = [];
   const audioPaths = [];
+  const textFilePaths = [];
   let isVideo = false;
   const textParts = [];
   const attachmentsCopy = [...pendingAttachments];
@@ -1021,6 +1064,7 @@ async function sendMessage() {
       audioPaths.push(att.path);
     } else if (att.mediaType === 'text' && att.textContent) {
       textParts.push(`[File: ${att.fileName}]\n${att.textContent}\n[End of file]`);
+      if (att.path) textFilePaths.push(att.path);
     }
   });
 
@@ -1031,6 +1075,7 @@ async function sendMessage() {
 
   if (imagePaths.length > 0) msg.imagePaths = imagePaths;
   if (audioPaths.length > 0) msg.audioPaths = audioPaths;
+  if (textFilePaths.length > 0) msg.textFilePaths = textFilePaths;
   if (isVideo) msg.isVideo = true;
 
   chatHistory.push(msg);
@@ -1064,19 +1109,42 @@ async function requestAssistantResponse() {
   let wasAborted = false;
 
   try {
+    if (!currentSessionId) {
+      await createSession();
+    }
+
     const reasoningOn = document.getElementById('reasoning-toggle').checked;
     const chatPayload = { messages: chatHistory, maxTokens: serverDefaultMaxTokens, think: reasoningOn };
+    if (currentSessionId) {
+      chatPayload.sessionId = currentSessionId;
+    }
     if (needsCacheReset) {
       chatPayload.newChat = true;
       needsCacheReset = false;
     }
 
-    const res = await fetch('/api/chat', {
+    let res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(chatPayload),
       signal: currentAbortController.signal
     });
+
+    if (res.status === 404 && chatPayload.sessionId) {
+      // Session vanished on the server (e.g. restart); recreate and retry once.
+      currentSessionId = null;
+      await createSession();
+      if (currentSessionId) {
+        chatPayload.sessionId = currentSessionId;
+        chatPayload.newChat = true;
+        res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(chatPayload),
+          signal: currentAbortController.signal
+        });
+      }
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1137,11 +1205,20 @@ async function requestAssistantResponse() {
             scrollChatToBottom();
           }
           if (data.done) {
+            if (data.sessionId) currentSessionId = data.sessionId;
             if (data.error) {
               bubbleText.textContent = 'Error: ' + data.error;
               statsDiv.textContent = 'Inference failed';
             } else {
-              statsDiv.textContent = `${data.tokenCount} tokens \u00B7 ${data.elapsed.toFixed(1)}s \u00B7 ${data.tokPerSec.toFixed(1)} tok/s`;
+              let stats = `${data.tokenCount} tokens \u00B7 ${data.elapsed.toFixed(1)}s \u00B7 ${data.tokPerSec.toFixed(1)} tok/s`;
+              if (typeof data.promptTokens === 'number' && data.promptTokens > 0) {
+                const reused = typeof data.kvReusedTokens === 'number' ? data.kvReusedTokens : 0;
+                const pct = typeof data.kvReusePercent === 'number'
+                  ? data.kvReusePercent
+                  : (100 * reused / data.promptTokens);
+                stats += ` \u00B7 KV ${reused}/${data.promptTokens} (${pct.toFixed(0)}%)`;
+              }
+              statsDiv.textContent = stats;
             }
           }
         } catch {}
