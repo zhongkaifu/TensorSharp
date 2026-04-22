@@ -213,7 +213,7 @@ button.primary:hover { background: var(--accent-hover); }
 .message.assistant .avatar img {
   object-position: center;
   transform-origin: center;
-  transform: scale(1.05);
+  transform: scale(1);
   filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.34)) contrast(1.08) saturate(1.06);
 }
 
@@ -875,7 +875,7 @@ function renderEmptyState() {
 
   chatContainer.innerHTML = `
     <div class="empty-state">
-      <img class="big-logo assistant-preview" src="/images/banner_1.png" alt="Assistant banner">
+      <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant banner">
       <p>Start a conversation with the configured model. You can attach images, videos, audio, and text files for multimodal inference.</p>
     </div>`;
 }
@@ -1404,7 +1404,7 @@ function addAssistantBubble() {
   const div = document.createElement('div');
   div.className = 'message assistant';
   div.innerHTML = `
-    <div class="avatar"><img src="/images/banner_1.png" alt=""></div>
+    <div class="avatar"><img src="/images/assistant_logo.png" alt=""></div>
     <div class="bubble">
       <div class="queue-indicator" style="display:none"><div class="queue-spinner"></div><span>Waiting in queue...</span></div>
       <span class="bubble-text"></span>
