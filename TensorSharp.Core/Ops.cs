@@ -73,6 +73,7 @@ namespace TensorSharp
         public static Tensor GELU(Tensor result, Tensor src) { return (Tensor)OpRegistry.Invoke("GELU", result, src); }
 
         public static Tensor SiLUMul(Tensor result, Tensor gate, Tensor up) { return (Tensor)OpRegistry.Invoke("SiLUMul", result, gate, up); }
+        public static Tensor SiLUMulSplit(Tensor result, Tensor gateUp, int halfDim) { return (Tensor)OpRegistry.Invoke("SiLUMulSplit", result, gateUp, halfDim); }
         public static Tensor GELUMul(Tensor result, Tensor gate, Tensor up) { return (Tensor)OpRegistry.Invoke("GELUMul", result, gate, up); }
         public static Tensor SigmoidMul(Tensor result, Tensor x, Tensor gate) { return (Tensor)OpRegistry.Invoke("SigmoidMul", result, x, gate); }
 

@@ -37,7 +37,9 @@ namespace TensorSharp.Server.Hosting
             if (string.IsNullOrWhiteSpace(options.StartupModelPath))
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000] to use the Web UI.");
+                    "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000]" +
+                    " [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--repeat-penalty F]" +
+                    " [--presence-penalty F] [--frequency-penalty F] [--seed N] [--stop <text>] to use the Web UI.");
                 return;
             }
 

@@ -10,6 +10,7 @@
 
 using System;
 using System.Collections.Generic;
+using TensorSharp.Runtime;
 
 namespace TensorSharp.Server.Hosting
 {
@@ -30,7 +31,8 @@ namespace TensorSharp.Server.Hosting
             int maxTextFileChars,
             string uploadDirectory,
             string logDirectory,
-            bool fileLoggingEnabled)
+            bool fileLoggingEnabled,
+            SamplingConfig defaultSamplingConfig)
         {
             StartupModelPath = startupModelPath;
             StartupMmProjPath = startupMmProjPath;
@@ -44,6 +46,7 @@ namespace TensorSharp.Server.Hosting
             UploadDirectory = uploadDirectory;
             LogDirectory = logDirectory;
             FileLoggingEnabled = fileLoggingEnabled;
+            DefaultSamplingConfig = defaultSamplingConfig ?? new SamplingConfig();
         }
 
         /// <summary>Absolute path of the model the server was launched with, or null when no model is hosted.</summary>
@@ -75,5 +78,15 @@ namespace TensorSharp.Server.Hosting
 
         /// <summary>True when the file logger should be wired in.</summary>
         public bool FileLoggingEnabled { get; }
+
+        /// <summary>
+        /// Default sampling parameters resolved from CLI flags / environment.
+        /// Adapters seed per-request configs from this object so unspecified
+        /// fields take the operator-configured defaults instead of the
+        /// hard-coded library defaults.
+        /// Never null; returns a fresh <see cref="SamplingConfig"/> when no
+        /// overrides were supplied.
+        /// </summary>
+        public SamplingConfig DefaultSamplingConfig { get; }
     }
 }

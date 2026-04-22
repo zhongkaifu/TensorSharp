@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Globalization;
 using System.Linq;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Logging;
@@ -60,6 +61,25 @@ namespace TensorSharp.Server.Hosting
                 options.DefaultWebMaxTokens,
                 MediaHelper.GetConfiguredMaxVideoFrames(),
                 listenAddress);
+
+            // Surface the resolved sampling defaults so operators can confirm
+            // the CLI flags / env vars they passed actually took effect.
+            // We log the structured fields (rather than just one big string)
+            // so log scrapers can pull individual values.
+            var sampling = options.DefaultSamplingConfig;
+            logger.LogInformation(LogEventIds.HostConfiguration,
+                "Default sampling: temperature={Temperature} topK={TopK} topP={TopP} minP={MinP} repeatPenalty={RepeatPenalty} presencePenalty={PresencePenalty} frequencyPenalty={FrequencyPenalty} seed={Seed} stopSequences={StopSequences}",
+                sampling.Temperature.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.TopK,
+                sampling.TopP.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.MinP.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.RepetitionPenalty.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.PresencePenalty.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.FrequencyPenalty.ToString("0.###", CultureInfo.InvariantCulture),
+                sampling.Seed,
+                sampling.StopSequences != null && sampling.StopSequences.Count > 0
+                    ? "[" + string.Join(", ", sampling.StopSequences.Select(s => "\"" + s + "\"")) + "]"
+                    : "(none)");
 
             logger.LogInformation(LogEventIds.HostStarting,
                 "Starting TensorSharp.Server on {ListenAddress}", listenAddress);

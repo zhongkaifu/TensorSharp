@@ -8,9 +8,11 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
@@ -27,7 +29,7 @@ namespace TensorSharp.Models
     /// (gate+up + down) or a Mixture-of-Experts SwiGLU (router + top-K SwiGLU experts +
     /// optional shared SwiGLU expert gated by sigmoid), depending on which weights are present.
     /// </summary>
-    public class Qwen35Model : ModelBase
+    public partial class Qwen35Model : ModelBase
     {
         private bool[] _isRecurrent;
         private int _fullAttentionInterval;
@@ -93,9 +95,6 @@ namespace TensorSharp.Models
         private Tensor _attnDecodeQkvBuf;
         // [1, 2 * intermediateSize] - reused fused gate_up output for dense FFN decode.
         private Tensor _ffnDecodeGateUpBuf;
-        // [1, packedDim] - reused fused norm + input proj output for GatedDeltaNet decode.
-        private Tensor _gdnDecodePackedBuf;
-
         // Minimum total sequence length at which the standalone GPU flash attention decode
         // kernel becomes worthwhile. Below this, per-call Metal command buffer setup dominates
         // the savings vs. the CPU SIMD path. Tuned empirically on Apple M-series. Once the
@@ -119,26 +118,6 @@ namespace TensorSharp.Models
             return 4096;
         }
 
-        // Minimum prefill length at which the fused chunked GatedDeltaNet GGML kernel
-        // beats the per-token CPU loop. The chunked kernel pads to a multiple of
-        // GdnChunkSize (64) and dispatches once per layer; for very short prefills the
-        // padding overhead and the host->device copies dominate. Set
-        // GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N to override (e.g. =1 to always use it,
-        // =1000000 to disable).
-        private static readonly int GdnChunkedPrefillMinSeqLenEnv = ResolveGdnChunkedPrefillMinSeqLen();
-
-        private static int ResolveGdnChunkedPrefillMinSeqLen()
-        {
-            string env = Environment.GetEnvironmentVariable("GDN_CHUNK_PREFILL_MIN_SEQ_LEN");
-            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
-                return v;
-            return GdnChunkSize;
-        }
-
-        private static readonly bool GdnChunkedPrefillDisabledEnv =
-            string.Equals(Environment.GetEnvironmentVariable("GDN_DISABLE_CHUNKED_PREFILL"), "1",
-                StringComparison.Ordinal);
-
         // Pre-cached layer prefix and weight name strings (avoids string interpolation in hot loops)
         private string[] _layerPrefix;
         private string[] _attnNormKey;
@@ -157,22 +136,8 @@ namespace TensorSharp.Models
         private string[] _ffnUpShexpKey;
         private string[] _ffnDownShexpKey;
         private string[] _ffnGateInpShexpKey;
-        private string[] _ssmInProjKey;
-        private string[] _attnQkvRecKey;
-        private string[] _attnGateRecKey;
-        private string[] _ssmBetaKey;
-        private string[] _ssmAlphaKey;
-        private string[] _ssmConv1dKey;
-        private string[] _ssmDtBiasKey;
-        private string[] _ssmAKey;
-        private string[] _ssmNormKey;
-        private string[] _ssmOutKey;
 
-        // Pre-cached pointers/tensors for recurrent layers
-        private Tensor[] _ssmConv1dW;
-        private Tensor[] _ssmDtBiasW;
-        private Tensor[] _ssmAW;
-        private Tensor[] _ssmNormW;
+        // (GDN-only key arrays and weight tensors live in Qwen35Model.GatedDeltaNet.cs)
 
         // Pre-resolved weight references for FullAttention linear projections.
         // QK-norm weights are also cached here as F32 tensors (always F32 in GGUF).
@@ -204,43 +169,13 @@ namespace TensorSharp.Models
         private QuantizedWeight[] _ffnDownQW;
         private Tensor[] _ffnDownF32;
 
-        // Pre-resolved weight references for GatedDeltaNet linear projections.
-        // These eliminate dictionary lookups in the per-layer hot path during decode.
-        private QuantizedWeight[] _ssmInProjQW;
-        private Tensor[] _ssmInProjF32;
-        private QuantizedWeight[] _attnQkvRecQW;
-        private Tensor[] _attnQkvRecF32;
-        private QuantizedWeight[] _attnGateRecQW;
-        private Tensor[] _attnGateRecF32;
-        private QuantizedWeight[] _ssmBetaQW;
-        private Tensor[] _ssmBetaF32;
-        private QuantizedWeight[] _ssmAlphaQW;
-        private Tensor[] _ssmAlphaF32;
-        private QuantizedWeight[] _ssmOutQW;
-        private Tensor[] _ssmOutF32;
-
         // Full attention KV cache (only for attention layers)
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
         private int _kvCacheCapacity;
 
-        // GatedDeltaNet state (only for recurrent layers).
-        // _convState uses a circular buffer indexed by _convStateWriteIdx[layer] to avoid
-        // O(convDim*qkvDim) Array.Copy per token in the recurrent step.
-        private float[][] _convState;  // [layer][convChannels * (convKernelSize-1)]
-        private int[] _convStateWriteIdx;
-        private Tensor[] _deltaStateTensor; // [layer]: Tensor[numVHeads, headVDim, headKDim]
-
-        // SSM dimensions
-        private int _ssmDInner;   // headVDim * numVHeads
-        private int _ssmDState;   // headKDim
-        private int _ssmNGroup;   // numKHeads
-        private int _ssmDtRank;   // numVHeads
-        private int _convKernel;
-        private int _headVDim;
-        private int _headKDim;
-        private int _numVHeads;
-        private int _numKHeads;
+        // GatedDeltaNet recurrent state, dimensions and projection weights live in
+        // Qwen35Model.GatedDeltaNet.cs (also a partial of this class).
         private int _ropeDimCount;
 
         // MRoPE sections
@@ -249,56 +184,45 @@ namespace TensorSharp.Models
         // Pre-computed RoPE frequency table
         private float[] _ropeFreqs;
 
-        // Pre-allocated work buffers for GatedDeltaNet
-        private float[] _gdnQ, _gdnK, _gdnV;
-        private float[] _gdnQExp, _gdnKExp;
-        private float[] _gdnDelta, _gdnCore;
-
-        // Transposed convolution weights laid out [kernelSize, qkvDim] for cache-friendly SIMD
-        // access along the channel dimension while iterating over kernel taps.
-        private float[][] _gdnConvWT;
-        // Whether to use parallel per-head update in GatedDeltaNetStep.
-        private bool _gdnParallelHeads;
-
-        // Pre-allocated tensor work buffers for GatedDeltaNet state update.
-        // _gdnConvOutBuf is a managed scratch array (no GGML allocation needed).
-        private float[] _gdnConvOutBuf; // [qkvDim]
-        private Tensor _gdnGatedOutT;   // [1, ssmDInner] (passed to LinearForward, must be a Tensor)
-
-        // Chunked GatedDeltaNet (prefill) acceleration. The chunked path runs the entire
-        // recurrent block as a single fused GGML graph dispatch per layer (via
-        // GgmlBasicOps.GatedDeltaNetChunked) which moves L2Norm / mul_mat / triangular solve
-        // / RMSNorm onto the GPU backend. CPU-side conv1d runs upstream and writes Q/K/V into
-        // these reusable [seqLen, H, D] staging buffers.
-        //
-        // The path is enabled only when:
-        //   * the runtime backend is GGML (Metal/CUDA/CPU)
-        //   * headKDim == headVDim (chunked kernel pre-condition)
-        //   * seqLen >= _gdnChunkPrefillThreshold
-        //   * the kernel has not previously failed for this run (kill switch)
-        private const int GdnChunkSize = 64;
-        private int _gdnChunkPrefillThreshold = GdnChunkedPrefillMinSeqLenEnv;
-        private bool _gdnDisableChunkedPrefill = GdnChunkedPrefillDisabledEnv;
-        private long _gdnChunkedTicks;       // Total time spent in the chunked path
-        private long _gdnPerTokenTicks;      // Total time spent in the per-token path (prefill only)
-        private int _gdnChunkedCalls;        // Number of times the chunked path has been used
-
-        // Reusable staging buffers for the chunked prefill path. These are sized for the
-        // largest seqLen we have seen so far; subsequent calls reuse the same memory and
-        // build a transient sub-view at the actual seqLen, avoiding (numLayers) allocator
-        // round-trips per forward pass.
-        private Tensor _gdnChunkedQBuf;
-        private Tensor _gdnChunkedKBuf;
-        private Tensor _gdnChunkedVBuf;
-        private Tensor _gdnChunkedZBuf;
-        private Tensor _gdnChunkedAlphaBuf;
-        private Tensor _gdnChunkedBetaBuf;
-        private int _gdnChunkedBufCapacity; // SeqLen capacity covered by the staging buffers
-        private int _gdnPerTokenCalls;       // Number of times the per-token path has been used (excluding decode)
+        // (GDN scratch buffers, chunked-prefill staging, and timing counters live in
+        // Qwen35Model.GatedDeltaNet.cs.)
 
         // Vision encoder
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
         private List<(Tensor embeddings, int position)> _visionEmbeddingsList = new();
+
+        // Detailed prefill-only profiling counters. Set the QWEN35_PREFILL_PROFILE
+        // environment variable to "1" to populate these so PrintTimingStats prints a
+        // fine-grained breakdown of where the prefill seconds go. Off by default to
+        // avoid the timer overhead in normal runs.
+        private static readonly bool _profilePrefillStages =
+            string.Equals(Environment.GetEnvironmentVariable("QWEN35_PREFILL_PROFILE"), "1", StringComparison.Ordinal);
+
+        // Set QWEN35_DISABLE_FUSED_FFN=1 to disable the fully fused dense FFN graph
+        // dispatch in FFNCachedFused (useful for A/B benchmarking against the legacy
+        // 3-dispatch path: FusedRmsNormMatMul + SiLUMul + FusedMatMulQuantAdd).
+        private static readonly bool _useFusedFfnPrefill =
+            !string.Equals(Environment.GetEnvironmentVariable("QWEN35_DISABLE_FUSED_FFN"), "1", StringComparison.Ordinal);
+        private long _prefillEmbedTicks;
+        private long _prefillAttnBlockTicks;
+        private long _prefillRecBlockTicks;
+        private long _prefillFinalLmHeadTicks;
+        private long _prefillAttnQkvTicks;
+        private long _prefillAttnDeinterleaveTicks;
+        private long _prefillAttnQknormTicks;
+        private long _prefillAttnRopeTicks;
+        private long _prefillAttnReshapeTicks;
+        private long _prefillAttnCacheCopyTicks;
+        private long _prefillAttnExpandKvTicks;
+        private long _prefillAttnComputeTicks;
+        private long _prefillAttnGateTicks;
+        private long _prefillAttnOutputTicks;
+        private long _prefillAttnFfnTicks;
+        private long _prefillRecInputProjTicks;
+        private long _prefillRecCoreTicks;
+        private long _prefillRecOutputTicks;
+        private long _prefillRecFfnTicks;
+        private int _prefillTokenCount;
 
         public Qwen35Model(string ggufPath, BackendType backend)
             : base(ggufPath, backend)
@@ -313,18 +237,9 @@ namespace TensorSharp.Models
             else
                 Config.NumKVHeads = Config.NumHeads;
 
-            // SSM config
-            _ssmDInner = (int)_gguf.GetUint32($"{arch}.ssm.inner_size");
-            _ssmDState = (int)_gguf.GetUint32($"{arch}.ssm.state_size");
-            _ssmNGroup = (int)_gguf.GetUint32($"{arch}.ssm.group_count");
-            _ssmDtRank = (int)_gguf.GetUint32($"{arch}.ssm.time_step_rank");
-            _convKernel = (int)_gguf.GetUint32($"{arch}.ssm.conv_kernel");
+            // SSM config (GDN-specific dimensions are parsed inside the GDN partial)
+            ParseGdnConfig(arch);
             _fullAttentionInterval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
-
-            _numVHeads = _ssmDtRank;
-            _numKHeads = _ssmNGroup;
-            _headVDim = _ssmDInner / _numVHeads;
-            _headKDim = _ssmDState;
 
             // MRoPE sections
             var sections = _gguf.GetInt32Array($"{arch}.rope.dimension_sections");
@@ -382,10 +297,6 @@ namespace TensorSharp.Models
             PrecomputeRoPE();
             InitGDNBuffers();
             CacheRecurrentWeights();
-
-            // Heuristic: only parallelize per-head GDN work for models with many V-heads
-            // (where the per-head work amortizes the parallel dispatch overhead).
-            _gdnParallelHeads = _numVHeads >= 16 && Environment.ProcessorCount > 1;
         }
 
         private unsafe void FuseAttentionProjectionWeights()
@@ -658,29 +569,6 @@ namespace TensorSharp.Models
             }
         }
 
-        private void InitGDNBuffers()
-        {
-            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
-            int qkDim = _headKDim * _numKHeads;
-            int vDim = _headVDim * _numVHeads;
-            _gdnQ = new float[qkDim];
-            _gdnK = new float[qkDim];
-            _gdnV = new float[vDim];
-            _gdnQExp = new float[_headKDim * _numVHeads];
-            _gdnKExp = new float[_headKDim * _numVHeads];
-            _gdnDelta = new float[vDim];
-            _gdnCore = new float[vDim];
-
-            _gdnConvOutBuf = new float[qkvDim];
-            _gdnGatedOutT = new Tensor(_allocator, DType.Float32, 1, _ssmDInner);
-
-            // Pre-allocated fused norm + input projection output for GatedDeltaNet decode.
-            // Shape matches the packed projection used in the recurrent block hot path.
-            int packedDim = qkvDim + (_headVDim * _numVHeads) + _numVHeads * 2;
-            if (packedDim > 0)
-                _gdnDecodePackedBuf = new Tensor(_allocator, DType.Float32, 1, packedDim);
-        }
-
         /// <summary>
         /// Pre-cache layer-prefix and weight name strings for every layer so the hot Forward()
         /// path never executes string interpolation. This eliminates dozens of allocations per
@@ -706,16 +594,7 @@ namespace TensorSharp.Models
             _ffnUpShexpKey = new string[n];
             _ffnDownShexpKey = new string[n];
             _ffnGateInpShexpKey = new string[n];
-            _ssmInProjKey = new string[n];
-            _attnQkvRecKey = new string[n];
-            _attnGateRecKey = new string[n];
-            _ssmBetaKey = new string[n];
-            _ssmAlphaKey = new string[n];
-            _ssmConv1dKey = new string[n];
-            _ssmDtBiasKey = new string[n];
-            _ssmAKey = new string[n];
-            _ssmNormKey = new string[n];
-            _ssmOutKey = new string[n];
+            InitGdnLayerKeyArrays(n);
 
             for (int l = 0; l < n; l++)
             {
@@ -737,16 +616,7 @@ namespace TensorSharp.Models
                 _ffnUpShexpKey[l] = p + "ffn_up_shexp.weight";
                 _ffnDownShexpKey[l] = p + "ffn_down_shexp.weight";
                 _ffnGateInpShexpKey[l] = p + "ffn_gate_inp_shexp.weight";
-                _ssmInProjKey[l] = p + "ssm_in_proj.weight";
-                _attnQkvRecKey[l] = p + "attn_qkv.weight";
-                _attnGateRecKey[l] = p + "attn_gate.weight";
-                _ssmBetaKey[l] = p + "ssm_beta.weight";
-                _ssmAlphaKey[l] = p + "ssm_alpha.weight";
-                _ssmConv1dKey[l] = p + "ssm_conv1d.weight";
-                _ssmDtBiasKey[l] = p + "ssm_dt.bias";
-                _ssmAKey[l] = p + "ssm_a";
-                _ssmNormKey[l] = p + "ssm_norm.weight";
-                _ssmOutKey[l] = p + "ssm_out.weight";
+                SetGdnLayerKeys(l, p);
             }
         }
 
@@ -757,11 +627,8 @@ namespace TensorSharp.Models
         private unsafe void CacheRecurrentWeights()
         {
             int n = Config.NumLayers;
-            _ssmConv1dW = new Tensor[n];
-            _ssmDtBiasW = new Tensor[n];
-            _ssmAW = new Tensor[n];
-            _ssmNormW = new Tensor[n];
-            _gdnConvWT = new float[n][];
+            InitGdnWeightArrays(n);
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
 
             _attnQkvQW = new QuantizedWeight[n];
             _attnQkvF32 = new Tensor[n];
@@ -783,21 +650,6 @@ namespace TensorSharp.Models
             _ffnDownQW = new QuantizedWeight[n];
             _ffnDownF32 = new Tensor[n];
 
-            _ssmInProjQW = new QuantizedWeight[n];
-            _ssmInProjF32 = new Tensor[n];
-            _attnQkvRecQW = new QuantizedWeight[n];
-            _attnQkvRecF32 = new Tensor[n];
-            _attnGateRecQW = new QuantizedWeight[n];
-            _attnGateRecF32 = new Tensor[n];
-            _ssmBetaQW = new QuantizedWeight[n];
-            _ssmBetaF32 = new Tensor[n];
-            _ssmAlphaQW = new QuantizedWeight[n];
-            _ssmAlphaF32 = new Tensor[n];
-            _ssmOutQW = new QuantizedWeight[n];
-            _ssmOutF32 = new Tensor[n];
-
-            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
-
             // Final layer norm + LM head (vocab projection). Tied embedding weights fall
             // back to token_embd.weight when output.weight is not present.
             _weights.TryGetValue("output_norm.weight", out _finalNormW);
@@ -818,36 +670,7 @@ namespace TensorSharp.Models
 
                 if (_isRecurrent[l])
                 {
-                    _weights.TryGetValue(_ssmConv1dKey[l], out _ssmConv1dW[l]);
-                    _weights.TryGetValue(_ssmDtBiasKey[l], out _ssmDtBiasW[l]);
-                    _weights.TryGetValue(_ssmAKey[l], out _ssmAW[l]);
-                    _weights.TryGetValue(_ssmNormKey[l], out _ssmNormW[l]);
-
-                    _quantWeights.TryGetValue(_ssmInProjKey[l], out _ssmInProjQW[l]);
-                    _weights.TryGetValue(_ssmInProjKey[l], out _ssmInProjF32[l]);
-                    _quantWeights.TryGetValue(_attnQkvRecKey[l], out _attnQkvRecQW[l]);
-                    _weights.TryGetValue(_attnQkvRecKey[l], out _attnQkvRecF32[l]);
-                    _quantWeights.TryGetValue(_attnGateRecKey[l], out _attnGateRecQW[l]);
-                    _weights.TryGetValue(_attnGateRecKey[l], out _attnGateRecF32[l]);
-                    _quantWeights.TryGetValue(_ssmBetaKey[l], out _ssmBetaQW[l]);
-                    _weights.TryGetValue(_ssmBetaKey[l], out _ssmBetaF32[l]);
-                    _quantWeights.TryGetValue(_ssmAlphaKey[l], out _ssmAlphaQW[l]);
-                    _weights.TryGetValue(_ssmAlphaKey[l], out _ssmAlphaF32[l]);
-                    _quantWeights.TryGetValue(_ssmOutKey[l], out _ssmOutQW[l]);
-                    _weights.TryGetValue(_ssmOutKey[l], out _ssmOutF32[l]);
-
-                    if (_ssmConv1dW[l] != null)
-                    {
-                        // Stored as [qkvDim, kernelSize] (each row = filter for one channel).
-                        // Transpose to [kernelSize, qkvDim] so that for a fixed kernel tap ki we
-                        // access a contiguous block of channel weights, enabling SIMD across ch.
-                        float* src = GetFloatPtr(_ssmConv1dW[l]);
-                        var wt = new float[_convKernel * qkvDim];
-                        for (int ch = 0; ch < qkvDim; ch++)
-                            for (int ki = 0; ki < _convKernel; ki++)
-                                wt[ki * qkvDim + ch] = src[ch * _convKernel + ki];
-                        _gdnConvWT[l] = wt;
-                    }
+                    CacheRecurrentLayerWeights(l, qkvDim);
                 }
                 else
                 {
@@ -874,11 +697,8 @@ namespace TensorSharp.Models
             int numLayers = Config.NumLayers;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
-            _convState = new float[numLayers][];
-            _convStateWriteIdx = new int[numLayers];
-            _deltaStateTensor = new Tensor[numLayers];
 
-            int convDim = _convKernel - 1;
+            InitGdnCacheArrays(numLayers);
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
 
             for (int l = 0; l < numLayers; l++)
@@ -892,10 +712,7 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    _convState[l] = new float[convDim * qkvDim];
-                    _convStateWriteIdx[l] = 0;
-                    _deltaStateTensor[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
-                    Ops.Fill(_deltaStateTensor[l], 0);
+                    InitGdnLayerCache(l, qkvDim);
                 }
             }
             _cacheSeqLen = 0;
@@ -965,15 +782,22 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    Array.Clear(_convState[l]);
-                    _convStateWriteIdx[l] = 0;
-                    Ops.Fill(_deltaStateTensor[l], 0);
+                    ResetGdnLayerCache(l);
                 }
             }
             _cacheSeqLen = 0;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _forwardCount = 0;
+            ResetGdnTimingCounters();
             _forwardSw.Reset();
+
+            _prefillEmbedTicks = _prefillAttnBlockTicks = _prefillRecBlockTicks = _prefillFinalLmHeadTicks = 0;
+            _prefillAttnQkvTicks = _prefillAttnDeinterleaveTicks = _prefillAttnQknormTicks = 0;
+            _prefillAttnRopeTicks = _prefillAttnReshapeTicks = _prefillAttnCacheCopyTicks = 0;
+            _prefillAttnExpandKvTicks = _prefillAttnComputeTicks = _prefillAttnGateTicks = 0;
+            _prefillAttnOutputTicks = _prefillAttnFfnTicks = 0;
+            _prefillRecInputProjTicks = _prefillRecCoreTicks = _prefillRecOutputTicks = _prefillRecFfnTicks = 0;
+            _prefillTokenCount = 0;
         }
 
         public override bool SupportsKVCacheTruncation => false;
@@ -984,20 +808,42 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             EnsureCacheCapacity(startPos + seqLen);
+            bool profilePrefill = _profilePrefillStages && seqLen > 1;
+            if (profilePrefill)
+                _prefillTokenCount += seqLen;
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
-            _embTicks += Stopwatch.GetTimestamp() - t1;
+            long embEnd = Stopwatch.GetTimestamp();
+            _embTicks += embEnd - t1;
+            if (profilePrefill)
+                _prefillEmbedTicks += embEnd - t1;
 
-            if (_visionEmbeddingsList.Count > 0 && startPos == 0)
+            // Inject any vision embeddings queued for this Forward call. The
+            // queued positions are already expressed relative to the current
+            // tokens slice (see ModelMultimodalInjector.QueuePreparedVisionEmbeddings),
+            // so this works for both a fresh prefill (startPos == 0) and a
+            // multi-turn refill that re-uses the prior KV cache (startPos > 0).
+            // The latter is the path taken when a user uploads a second image
+            // in the same chat session - gating on startPos == 0 here used to
+            // silently drop the second image's vision embeddings and turn its
+            // <|image_pad|> tokens into garbage.
+            if (_visionEmbeddingsList.Count > 0)
                 InjectVisionEmbeddings(hidden, seqLen);
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
+                long blkStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
                 if (_isRecurrent[layer])
                     hidden = RecurrentBlock(hidden, layer, seqLen, startPos);
                 else
                     hidden = AttentionBlock(hidden, layer, seqLen, startPos);
+                if (profilePrefill)
+                {
+                    long elapsed = Stopwatch.GetTimestamp() - blkStart;
+                    if (_isRecurrent[layer]) _prefillRecBlockTicks += elapsed;
+                    else _prefillAttnBlockTicks += elapsed;
+                }
             }
 
             // Pick out the last token's hidden state BEFORE the final norm so we can
@@ -1027,7 +873,10 @@ namespace TensorSharp.Models
                 logitsTensor = LinearForwardCached(lastNormed, _lmHeadQW, _lmHeadF32);
                 lastNormed.Dispose();
             }
-            _lmHeadTicks += Stopwatch.GetTimestamp() - t2;
+            long lmHeadEnd = Stopwatch.GetTimestamp();
+            _lmHeadTicks += lmHeadEnd - t2;
+            if (profilePrefill)
+                _prefillFinalLmHeadTicks += lmHeadEnd - t2;
             lastHiddenRaw.Dispose();
 
             long t3 = Stopwatch.GetTimestamp();
@@ -1086,6 +935,9 @@ namespace TensorSharp.Models
                 attnOut.Dispose();
             }
 
+            bool profilePrefill = _profilePrefillStages && seqLen > 1;
+            long ffnStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+
             // Fuse post-attn norm + first FFN/MoE projection. For MoE this fusion is not yet
             // applicable to the batched MoE kernel so we keep the explicit norm; for dense FFN
             // we route through FFNCachedFused which fuses norm + gate.
@@ -1135,6 +987,9 @@ namespace TensorSharp.Models
                 ffnOut.Dispose();
             }
 
+            if (profilePrefill)
+                _prefillAttnFfnTicks += Stopwatch.GetTimestamp() - ffnStart;
+
             return hidden;
         }
 
@@ -1147,6 +1002,8 @@ namespace TensorSharp.Models
             int qFullDim = numHeads * headDim * 2;
             int kvDim = numKVHeads * headDim;
             int totalSeqLen = startPos + seqLen;
+            bool profilePrefill = _profilePrefillStages && seqLen > 1;
+            long stageStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
 
             // Fused norm + QKV when the fused-QKV weight is available; otherwise we have to
             // produce the normalized input separately for the three independent projections.
@@ -1211,14 +1068,17 @@ namespace TensorSharp.Models
                 vTensor = LinearForwardCached(normedInput, _attnVQW[layer], _attnVF32[layer]);
             }
             normedInput?.Dispose();
+            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnQkvTicks += now - stageStart; stageStart = now; }
 
             Tensor qTensor, gateTensor;
             bool ownsQGateBuffers;
             DeinterleaveQGate(qFull, seqLen, numHeads, headDim, out qTensor, out gateTensor, out ownsQGateBuffers);
             qFull.Dispose();
+            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnDeinterleaveTicks += now - stageStart; stageStart = now; }
 
             qTensor = ApplyQKNormCached(qTensor, _attnQNormW[layer], numHeads, seqLen);
             kTensor = ApplyQKNormCached(kTensor, _attnKNormW[layer], numKVHeads, seqLen);
+            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnQknormTicks += now - stageStart; stageStart = now; }
 
             // RoPE - decode path applies Q and K together so the cos/sin table is computed once.
             if (seqLen == 1)
@@ -1230,6 +1090,7 @@ namespace TensorSharp.Models
                 qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
                 kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
             }
+            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnRopeTicks += now - stageStart; stageStart = now; }
 
             long t0 = Stopwatch.GetTimestamp();
 
@@ -1279,15 +1140,18 @@ namespace TensorSharp.Models
                 kTensor.Dispose();
                 Tensor vHeads = ReshapeToHeads(vTensor, numKVHeads, seqLen, headDim);
                 vTensor.Dispose();
+                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnReshapeTicks += now - stageStart; stageStart = now; }
 
                 CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
                 CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
                 kHeads.Dispose();
                 vHeads.Dispose();
+                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnCacheCopyTicks += now - stageStart; stageStart = now; }
 
                 int groupSize = numHeads / numKVHeads;
                 Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
                 Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
+                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnExpandKvTicks += now - stageStart; stageStart = now; }
 
                 using var kT = kExpanded.Transpose(1, 2);
                 var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
@@ -1305,6 +1169,7 @@ namespace TensorSharp.Models
 
                 attnOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, headDim);
                 attnOut.Dispose();
+                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnComputeTicks += now - stageStart; stageStart = now; }
             }
 
             // Decode hot path: do the sigmoid-gated mix on CPU. The data is tiny
@@ -1317,6 +1182,7 @@ namespace TensorSharp.Models
                 ApplySigmoidGate(attnOutput, gateTensor);
             if (ownsQGateBuffers)
                 gateTensor.Dispose();
+            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnGateTicks += now - stageStart; stageStart = now; }
 
             _attnTicks += Stopwatch.GetTimestamp() - t0;
 
@@ -1333,12 +1199,14 @@ namespace TensorSharp.Models
             {
                 if (ownsAttnOutput)
                     attnOutput.Dispose();
+                if (profilePrefill) _prefillAttnOutputTicks += Stopwatch.GetTimestamp() - stageStart;
                 return null;
             }
 
             Tensor output = LinearForwardCached(attnOutput, _attnOutputQW[layer], _attnOutputF32[layer]);
             if (ownsAttnOutput)
                 attnOutput.Dispose();
+            if (profilePrefill) _prefillAttnOutputTicks += Stopwatch.GetTimestamp() - stageStart;
             return output;
         }
 
@@ -1466,6 +1334,42 @@ namespace TensorSharp.Models
         {
             int intermSize = Config.IntermediateSize;
 
+            // Prefill fast path: collapse the entire dense SwiGLU FFN
+            //   residual += down_W^T @ ( silu(gate_part) * up_part )
+            // into a single GGML graph dispatch. Replaces 3 separate dispatches
+            // (FusedRmsNormMatMulQuant + SiLUMulSplit + FusedMatMulQuantAdd)
+            // with one, removing the matched graph builds, allocations and
+            // host<->backend syncs. This is the dominant prefill cost on the
+            // hybrid GatedDeltaNet+Attention Qwen35 architecture. Set
+            // QWEN35_DISABLE_FUSED_FFN=1 to bypass the fast path for A/B
+            // comparison or debugging.
+            if (seqLen > 1
+                && IsGgmlBackend
+                && _useFusedFfnPrefill
+                && postNormW != null
+                && _ffnGateUpQW[layer] != null
+                && _ffnDownQW[layer] != null
+                && residual.DimensionCount == 2
+                && residual.Sizes[0] == seqLen
+                && residual.Sizes[1] == _ffnGateUpQW[layer].Ne0)
+            {
+                int halfDimFused = intermSize > 0 ? intermSize : (int)(_ffnGateUpQW[layer].Ne1 / 2);
+                if (halfDimFused > 0 && _ffnGateUpQW[layer].Ne1 == 2L * halfDimFused
+                    && _ffnDownQW[layer].Ne0 == halfDimFused
+                    && _ffnDownQW[layer].Ne1 == residual.Sizes[1])
+                {
+                    long t0 = Stopwatch.GetTimestamp();
+                    GgmlBasicOps.FusedFFNSwiGLUQuant(residual, residual, postNormW, Config.Eps,
+                        _ffnGateUpQW[layer].CacheKey, _ffnGateUpQW[layer].GgmlType,
+                        _ffnGateUpQW[layer].Ne0, _ffnGateUpQW[layer].Ne1, _ffnGateUpQW[layer].RawBytes,
+                        _ffnDownQW[layer].CacheKey, _ffnDownQW[layer].GgmlType,
+                        _ffnDownQW[layer].Ne0, _ffnDownQW[layer].Ne1, _ffnDownQW[layer].RawBytes,
+                        halfDimFused);
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return null;
+                }
+            }
+
             // Fused norm + gate_up projection. Decode reuses a pre-allocated [1, 2*intermSize]
             // buffer to avoid one tensor allocation per layer per token.
             Tensor gateUp = null;
@@ -1493,30 +1397,38 @@ namespace TensorSharp.Models
 
             int halfDim = intermSize > 0 ? intermSize : (int)(gateUp.Sizes[1] / 2);
 
-            Tensor gate, up;
+            Tensor gate;
             if (seqLen == 1)
             {
-                gate = gateUp.Narrow(1, 0, halfDim);
-                up = gateUp.Narrow(1, halfDim, halfDim);
+                Tensor gView = gateUp.Narrow(1, 0, halfDim);
+                Tensor uView = gateUp.Narrow(1, halfDim, halfDim);
+                if (IsGgmlBackend)
+                    SiLUMulInPlaceCpu(gView, uView);
+                else
+                    Ops.SiLUMul(gView, gView, uView);
+                uView.Dispose();
+                gate = gView;
+            }
+            else if (IsGgmlBackend && ownsGateUp)
+            {
+                // Fused split path: silu(gate_up[:, :H]) * gate_up[:, H:] in a single GGML
+                // dispatch with no intermediate copies. The two halves are exposed as
+                // strided ggml_view_2d on the same gate_up buffer, which removes the two
+                // huge NewContiguous calls the legacy split path required.
+                gate = new Tensor(gateUp.Allocator, DType.Float32, gateUp.Sizes[0], halfDim);
+                Ops.SiLUMulSplit(gate, gateUp, halfDim);
             }
             else
             {
                 using (var gView = gateUp.Narrow(1, 0, halfDim))
                     gate = Ops.NewContiguous(gView);
                 using (var uView = gateUp.Narrow(1, halfDim, halfDim))
-                    up = Ops.NewContiguous(uView);
+                {
+                    Ops.SiLUMul(gate, gate, uView);
+                }
             }
             if (ownsGateUp)
                 gateUp.Dispose();
-
-            // Decode hot path: do SiLU * up on CPU. The data is small enough that a
-            // single GPU dispatch costs more than the compute; eliminating one Metal
-            // command buffer per FFN layer per token saves a few percent of decode time.
-            if (seqLen == 1 && IsGgmlBackend)
-                SiLUMulInPlaceCpu(gate, up);
-            else
-                Ops.SiLUMul(gate, gate, up);
-            up.Dispose();
 
             // Fused down + residual add.
             if (residual.DimensionCount == 2
@@ -1840,757 +1752,6 @@ namespace TensorSharp.Models
 
         #endregion
 
-        #region Recurrent (GatedDeltaNet) Block
-
-        /// <summary>
-        /// GatedDeltaNet recurrent block: SSM conv1d -> gated delta net -> norm + gate -> output.
-        /// Both decode and prefill use the same recurrent core. Prefill batches the large
-        /// input/output projections across the whole chunk, then walks the recurrent state
-        /// token-by-token in CPU memory.
-        /// </summary>
-        private Tensor RecurrentBlock(Tensor hidden, int layer, int seqLen, int startPos)
-        {
-            // Fused pre-norm + GatedDeltaNet input projection inside GatedDeltaNet, and fused
-            // output projection + residual via TryLinearAddInto when possible.
-            Tensor attnOut = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen, residual: hidden);
-            if (attnOut != null)
-            {
-                Ops.Add(hidden, hidden, attnOut);
-                attnOut.Dispose();
-            }
-
-            Tensor ffnOut;
-            if (_isMoeLayer != null && _isMoeLayer[layer])
-            {
-                // Decode hot path: do RMSNorm on CPU into the pre-allocated input buffer.
-                Tensor normed2;
-                bool ownsNormed2 = true;
-                if (seqLen == 1 && IsGgmlBackend && _moeTokenInput != null
-                    && _moeTokenInput.Sizes[1] == Config.HiddenSize
-                    && _postAttnNormW[layer] != null)
-                {
-                    RMSNormToBufferCpu(_moeTokenInput, hidden, _postAttnNormW[layer], Config.HiddenSize, Config.Eps);
-                    normed2 = _moeTokenInput;
-                    ownsNormed2 = false;
-                }
-                else
-                {
-                    normed2 = RMSNormOpCached(hidden, _postAttnNormW[layer]);
-                }
-
-                if (seqLen == 1 && TryMoEResidualDecode(hidden, normed2, layer))
-                {
-                    ffnOut = null;
-                }
-                else
-                {
-                    ffnOut = MoEForward(normed2, layer, seqLen);
-                }
-                if (ownsNormed2)
-                    normed2.Dispose();
-            }
-            else
-            {
-                ffnOut = FFNCachedFused(hidden, _postAttnNormW[layer], layer, seqLen);
-            }
-
-            if (ffnOut != null)
-            {
-                Ops.Add(hidden, hidden, ffnOut);
-                ffnOut.Dispose();
-            }
-
-            return hidden;
-        }
-
-        /// <summary>
-        /// GatedDeltaNet recurrent step with batched input/output projections.
-        /// Prefill projects the whole chunk once, then walks the recurrent state token-by-token.
-        /// Decode follows the same path with seqLen=1, avoiding several tiny GGML dispatches.
-        /// </summary>
-        private unsafe Tensor GatedDeltaNet(Tensor input, Tensor inputNormW, int layer, int seqLen,
-            Tensor residual = null)
-        {
-            long t0 = Stopwatch.GetTimestamp();
-            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
-            int qkDim = _headKDim * _numKHeads;
-            int vDim = _headVDim * _numVHeads;
-            int zDim = _headVDim * _numVHeads;
-            int packedDim = qkvDim + zDim + _numVHeads * 2;
-
-            // Fused input norm + packed input projection (single GGML kernel). Decode reuses
-            // a pre-allocated [1, packedDim] buffer to avoid one tensor allocation per layer
-            // per token.
-            Tensor packedInput = null;
-            bool ownsPackedInput = true;
-            if (inputNormW != null && _ssmInProjQW[layer] != null && IsGgmlBackend)
-            {
-                if (seqLen == 1 && _gdnDecodePackedBuf != null
-                    && _gdnDecodePackedBuf.Sizes[1] == _ssmInProjQW[layer].Ne1)
-                {
-                    packedInput = TryFusedNormLinearInto(_gdnDecodePackedBuf, input, inputNormW, _ssmInProjQW[layer]);
-                    if (packedInput != null)
-                        ownsPackedInput = false;
-                }
-                if (packedInput == null)
-                    packedInput = FusedNormLinear(input, inputNormW, _ssmInProjQW[layer], _ssmInProjF32[layer]);
-            }
-
-            Tensor normedInput = null;
-            if (packedInput == null)
-            {
-                normedInput = inputNormW != null ? RMSNormOpCached(input, inputNormW) : input.CopyRef();
-                packedInput = LinearForwardCached(normedInput, _ssmInProjQW[layer], _ssmInProjF32[layer]);
-            }
-
-            Tensor qkvRaw = null;
-            Tensor zRaw = null;
-            Tensor betaRaw = null;
-            Tensor alphaRaw = null;
-
-            float* packedPtr = null;
-            float* qkvBase = null;
-            float* zBase = null;
-            float* betaBase = null;
-            float* alphaBase = null;
-
-            if (packedInput != null)
-            {
-                packedPtr = GetFloatPtr(packedInput);
-            }
-            else
-            {
-                if (normedInput == null)
-                    normedInput = inputNormW != null ? RMSNormOpCached(input, inputNormW) : input.CopyRef();
-
-                qkvRaw = LinearForwardCached(normedInput, _attnQkvRecQW[layer], _attnQkvRecF32[layer]);
-                zRaw = LinearForwardCached(normedInput, _attnGateRecQW[layer], _attnGateRecF32[layer]);
-                betaRaw = LinearForwardCached(normedInput, _ssmBetaQW[layer], _ssmBetaF32[layer]);
-                alphaRaw = LinearForwardCached(normedInput, _ssmAlphaQW[layer], _ssmAlphaF32[layer]);
-
-                qkvBase = GetFloatPtr(qkvRaw);
-                zBase = GetFloatPtr(zRaw);
-                betaBase = GetFloatPtr(betaRaw);
-                alphaBase = GetFloatPtr(alphaRaw);
-            }
-
-            // Pre-resolved layer constants (cached at construction; no dictionary lookup here).
-            float* dtBiasPtr = GetFloatPtr(_ssmDtBiasW[layer]);
-            float* aPtr = GetFloatPtr(_ssmAW[layer]);
-            float* ssmNormPtr = GetFloatPtr(_ssmNormW[layer]);
-
-            Tensor gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
-            float* gatedBase = GetFloatPtr(gated);
-
-            float[] convWT = _gdnConvWT[layer];
-
-            // Prefer the fused chunked GGML kernel when running on a GGML backend with
-            // sufficient sequence length and matching K/V head dims. The chunked kernel
-            // packs the entire delta-net block (L2Norm, mul_mat, triangular solve, RMSNorm,
-            // gating) into a single GPU dispatch per layer, drastically reducing CPU work
-            // during prefill.
-            bool useChunked = !_gdnDisableChunkedPrefill
-                && IsGgmlBackend
-                && seqLen >= _gdnChunkPrefillThreshold
-                && _headKDim == _headVDim
-                && _ssmDtBiasW[layer] != null
-                && _ssmAW[layer] != null
-                && _ssmNormW[layer] != null;
-
-            if (useChunked)
-            {
-                long tChunk = Stopwatch.GetTimestamp();
-                bool chunkedOk = false;
-                try
-                {
-                    GatedDeltaNetChunkedPrefill(
-                        packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                        layer, seqLen, qkvDim, qkDim, zDim, packedDim, gated);
-                    chunkedOk = true;
-                }
-                catch (Exception ex)
-                {
-                    // First failure trips the kill switch so subsequent layers / forwards
-                    // do not pay the same overhead twice. Fall back to the per-token loop.
-                    _gdnDisableChunkedPrefill = true;
-                    Console.WriteLine($"[Qwen35] GatedDeltaNetChunked disabled (layer {layer}, seqLen {seqLen}): {ex.Message}");
-                }
-
-                if (chunkedOk)
-                {
-                    _gdnChunkedTicks += Stopwatch.GetTimestamp() - tChunk;
-                    _gdnChunkedCalls++;
-                }
-                else
-                {
-                    // Fall back: clean state was already mutated only inside the helper. Run
-                    // the per-token path on the same gated buffer.
-                    long tFallback = Stopwatch.GetTimestamp();
-                    RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                        layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
-                        convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
-                    _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tFallback;
-                    if (seqLen > 1) _gdnPerTokenCalls++;
-                }
-            }
-            else
-            {
-                long tLoop = Stopwatch.GetTimestamp();
-                RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                    layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
-                    convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
-                _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tLoop;
-                if (seqLen > 1) _gdnPerTokenCalls++;
-            }
-
-            InvalidateTensorDeviceCache(gated);
-
-            // Fast path: fuse SSM output projection with the residual add.
-            Tensor output;
-            bool fusedAdd = false;
-            if (residual != null
-                && _ssmOutQW[layer] != null
-                && residual.DimensionCount == 2
-                && gated.DimensionCount == 2
-                && residual.Sizes[0] == gated.Sizes[0]
-                && TryLinearAddInto(residual, gated, _ssmOutQW[layer]))
-            {
-                output = null;
-                fusedAdd = true;
-            }
-            else
-            {
-                output = LinearForwardCached(gated, _ssmOutQW[layer], _ssmOutF32[layer]);
-            }
-
-            if (seqLen > 1)
-                gated.Dispose();
-
-            normedInput?.Dispose();
-            if (ownsPackedInput) packedInput?.Dispose();
-            qkvRaw?.Dispose();
-            zRaw?.Dispose();
-            betaRaw?.Dispose();
-            alphaRaw?.Dispose();
-
-            _attnTicks += Stopwatch.GetTimestamp() - t0;
-            return fusedAdd ? null : output;
-        }
-
-        /// <summary>
-        /// Per-token recurrent loop that walks the chunk one input at a time. Used both
-        /// for decode (seqLen=1) and as the chunked-path fallback for prefill.
-        /// </summary>
-        private unsafe void RunPerTokenLoop(
-            float* packedPtr, float* qkvBase, float* zBase, float* betaBase, float* alphaBase,
-            int layer, int seqLen, int qkvDim, int qkDim, int vDim, int zDim, int packedDim,
-            float[] convWT, float* dtBiasPtr, float* aPtr, float* ssmNormPtr, float* gatedBase)
-        {
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* qkvPtr;
-                float* zPtr;
-                float* betaPtr;
-                float* alphaPtr;
-
-                if (packedPtr != null)
-                {
-                    float* row = packedPtr + (long)s * packedDim;
-                    qkvPtr = row;
-                    zPtr = row + qkvDim;
-                    betaPtr = zPtr + zDim;
-                    alphaPtr = betaPtr + _numVHeads;
-                }
-                else
-                {
-                    qkvPtr = qkvBase + (long)s * qkvDim;
-                    zPtr = zBase + (long)s * zDim;
-                    betaPtr = betaBase + (long)s * _numVHeads;
-                    alphaPtr = alphaBase + (long)s * _numVHeads;
-                }
-
-                GatedDeltaNetStep(qkvPtr, zPtr, betaPtr, alphaPtr,
-                    layer, qkvDim, qkDim, vDim,
-                    convWT, dtBiasPtr, aPtr, ssmNormPtr,
-                    gatedBase + (long)s * _ssmDInner);
-            }
-        }
-
-        /// <summary>
-        /// Chunked GatedDeltaNet prefill path.
-        ///
-        /// Runs the conv1d step token-by-token on CPU (so the recurrent ring state is
-        /// updated correctly), packs the per-token Q/K/V/Z/alpha/beta into row-major
-        /// [seqLen, H, D] (or [seqLen, H]) tensors, and dispatches a single fused GGML
-        /// graph that does L2Norm, Q-scale, sigmoid(beta), softplus(alpha), per-chunk
-        /// (k @ q) attention with triangular solve, RMSNorm, and silu(z) gating - all on
-        /// the GGML backend (Metal / CUDA when available).
-        ///
-        /// The recurrent state tensor (_deltaStateTensor[layer], shape [H, D, D]) is
-        /// passed in as input/output. The kernel updates it in place on the device and
-        /// downloads the new value back to the host buffer.
-        /// </summary>
-        private unsafe void GatedDeltaNetChunkedPrefill(
-            float* packedPtr, float* qkvBase, float* zBase, float* betaBase, float* alphaBase,
-            int layer, int seqLen, int qkvDim, int qkDim, int zDim, int packedDim,
-            Tensor gated)
-        {
-            int H = _numVHeads;
-            int Dk = _headKDim;
-            int Dv = _headVDim;
-            int hKDim = H * Dk;
-            int hVDim = H * Dv;
-
-            EnsureChunkedStagingBuffers(seqLen, H, Dk, Dv);
-
-            // The staging tensors are sized for the largest seqLen seen so far. We work
-            // on sub-views at the actual seqLen so the native kernel sees the correct shape.
-            Tensor qBuf = _gdnChunkedQBuf.Narrow(0, 0, seqLen);
-            Tensor kBuf = _gdnChunkedKBuf.Narrow(0, 0, seqLen);
-            Tensor vBuf = _gdnChunkedVBuf.Narrow(0, 0, seqLen);
-            Tensor zBuf = _gdnChunkedZBuf.Narrow(0, 0, seqLen);
-            Tensor alphaBuf = _gdnChunkedAlphaBuf.Narrow(0, 0, seqLen);
-            Tensor betaBuf = _gdnChunkedBetaBuf.Narrow(0, 0, seqLen);
-
-            try
-            {
-                float* qPtr = GetFloatPtr(qBuf);
-                float* kPtr = GetFloatPtr(kBuf);
-                float* vPtr = GetFloatPtr(vBuf);
-                float* zPtr = GetFloatPtr(zBuf);
-                float* alphaPtr = GetFloatPtr(alphaBuf);
-                float* betaPtr = GetFloatPtr(betaBuf);
-
-                int convDim = _convKernel - 1;
-                float[] convState = _convState[layer];
-                float[] convWT = _gdnConvWT[layer];
-                int writeIdx = _convStateWriteIdx[layer];
-
-                fixed (float* convOutPtr = _gdnConvOutBuf)
-                fixed (float* statePtr = convState)
-                {
-                    for (int s = 0; s < seqLen; s++)
-                    {
-                        float* qkvSrc;
-                        float* zSrc;
-                        float* betaSrc;
-                        float* alphaSrc;
-
-                        if (packedPtr != null)
-                        {
-                            float* row = packedPtr + (long)s * packedDim;
-                            qkvSrc = row;
-                            zSrc = row + qkvDim;
-                            betaSrc = zSrc + zDim;
-                            alphaSrc = betaSrc + _numVHeads;
-                        }
-                        else
-                        {
-                            qkvSrc = qkvBase + (long)s * qkvDim;
-                            zSrc = zBase + (long)s * zDim;
-                            betaSrc = betaBase + (long)s * _numVHeads;
-                            alphaSrc = alphaBase + (long)s * _numVHeads;
-                        }
-
-                        ComputeConv1DStep(qkvSrc, qkvDim, convDim, writeIdx, convState, convWT, convOutPtr);
-
-                        if (convDim > 0)
-                        {
-                            Buffer.MemoryCopy(qkvSrc, statePtr + writeIdx * qkvDim,
-                                qkvDim * sizeof(float), qkvDim * sizeof(float));
-                            writeIdx = (writeIdx + 1) % convDim;
-                        }
-
-                        long vBytes = (long)hVDim * sizeof(float);
-                        Buffer.MemoryCopy(convOutPtr + 2 * qkDim, vPtr + (long)s * hVDim, vBytes, vBytes);
-                        Buffer.MemoryCopy(zSrc,                   zPtr + (long)s * hVDim, vBytes, vBytes);
-
-                        long aBytes = (long)H * sizeof(float);
-                        Buffer.MemoryCopy(alphaSrc, alphaPtr + (long)s * H, aBytes, aBytes);
-                        Buffer.MemoryCopy(betaSrc,  betaPtr  + (long)s * H, aBytes, aBytes);
-
-                        if (_numKHeads == _numVHeads)
-                        {
-                            long kBytes = (long)hKDim * sizeof(float);
-                            Buffer.MemoryCopy(convOutPtr,         qPtr + (long)s * hKDim, kBytes, kBytes);
-                            Buffer.MemoryCopy(convOutPtr + qkDim, kPtr + (long)s * hKDim, kBytes, kBytes);
-                        }
-                        else
-                        {
-                            float* qDst = qPtr + (long)s * hKDim;
-                            float* kDst = kPtr + (long)s * hKDim;
-                            long perHeadBytes = (long)Dk * sizeof(float);
-                            for (int h = 0; h < H; h++)
-                            {
-                                int srcHead = h % _numKHeads;
-                                Buffer.MemoryCopy(convOutPtr + srcHead * Dk, qDst + h * Dk, perHeadBytes, perHeadBytes);
-                                Buffer.MemoryCopy(convOutPtr + qkDim + srcHead * Dk, kDst + h * Dk, perHeadBytes, perHeadBytes);
-                            }
-                        }
-                    }
-                }
-                _convStateWriteIdx[layer] = writeIdx;
-
-                // Tell the GGML host-buffer cache that the staging buffers were written
-                // on host. The chunked kernel uses backend_tensor_set internally so this
-                // is a no-op safety belt for any other consumer that may read these.
-                InvalidateTensorDeviceCache(qBuf);
-                InvalidateTensorDeviceCache(kBuf);
-                InvalidateTensorDeviceCache(vBuf);
-                InvalidateTensorDeviceCache(zBuf);
-                InvalidateTensorDeviceCache(alphaBuf);
-                InvalidateTensorDeviceCache(betaBuf);
-
-                Tensor state = _deltaStateTensor[layer];
-                InvalidateTensorDeviceCache(state);
-
-                // The GGML kernel writes [T, H, D] - same memory as gated[T, H*D].
-                Tensor gated3D = gated.View(seqLen, H, Dv);
-                try
-                {
-                    GgmlBasicOps.GatedDeltaNetChunked(
-                        qBuf, kBuf, vBuf, zBuf,
-                        alphaBuf, betaBuf,
-                        state, gated3D,
-                        new IntPtr(GetFloatPtr(_ssmDtBiasW[layer])),
-                        new IntPtr(GetFloatPtr(_ssmAW[layer])),
-                        new IntPtr(GetFloatPtr(_ssmNormW[layer])),
-                        chunkSize: GdnChunkSize, eps: Config.Eps);
-                }
-                finally
-                {
-                    gated3D.Dispose();
-                }
-
-                // The kernel downloaded fresh state and gated bytes back to the host
-                // buffer; downstream GGML kernels need to re-upload those bytes.
-                InvalidateTensorDeviceCache(state);
-                InvalidateTensorDeviceCache(gated);
-            }
-            finally
-            {
-                // Sub-views increment the underlying storage refcount; dispose them so
-                // we don't leak. The persistent backing tensors (_gdnChunked*Buf) are
-                // released in Dispose().
-                qBuf.Dispose();
-                kBuf.Dispose();
-                vBuf.Dispose();
-                zBuf.Dispose();
-                alphaBuf.Dispose();
-                betaBuf.Dispose();
-            }
-        }
-
-        /// <summary>
-        /// Lazily (re)allocate the chunked-prefill staging tensors so they cover at least
-        /// <paramref name="seqLen"/> rows. The buffers are sized to the largest seqLen we
-        /// have seen and reused for every layer in the same forward pass and every
-        /// subsequent forward pass with seqLen <= capacity.
-        /// </summary>
-        private void EnsureChunkedStagingBuffers(int seqLen, int H, int Dk, int Dv)
-        {
-            if (_gdnChunkedQBuf != null && _gdnChunkedBufCapacity >= seqLen)
-                return;
-
-            // Free old buffers (if any) before resizing upward.
-            _gdnChunkedQBuf?.Dispose();
-            _gdnChunkedKBuf?.Dispose();
-            _gdnChunkedVBuf?.Dispose();
-            _gdnChunkedZBuf?.Dispose();
-            _gdnChunkedAlphaBuf?.Dispose();
-            _gdnChunkedBetaBuf?.Dispose();
-
-            _gdnChunkedQBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dk);
-            _gdnChunkedKBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dk);
-            _gdnChunkedVBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dv);
-            _gdnChunkedZBuf     = new Tensor(_allocator, DType.Float32, seqLen, H, Dv);
-            _gdnChunkedAlphaBuf = new Tensor(_allocator, DType.Float32, seqLen, H);
-            _gdnChunkedBetaBuf  = new Tensor(_allocator, DType.Float32, seqLen, H);
-            _gdnChunkedBufCapacity = seqLen;
-        }
-
-        /// <summary>
-        /// Single-token GatedDeltaNet step.
-        ///
-        /// Optimizations vs the original implementation:
-        /// 1. Convolution uses a circular buffer keyed by `_convStateWriteIdx[layer]`. This
-        ///    eliminates the O(convDim * qkvDim) `Array.Copy` shift that ran every token; the
-        ///    new step writes the latest input row into one ring slot and reads previous
-        ///    slots in modular order. For convKernel=4 and qkvDim ~ 16k this saves ~50k float
-        ///    copies per token per recurrent layer.
-        /// 2. The conv1d weight is pre-transposed to `[kernelSize, qkvDim]` so the inner
-        ///    SIMD loop accumulates `state_tap * weight_tap` over a whole channel block at
-        ///    once via System.Numerics vectors instead of scalar accumulation per channel.
-        /// 3. SiLU on the conv output uses the SIMD vector helper from VecApplySiLU.
-        /// 4. Per-head state updates can run on a thread pool when `_numVHeads >= 16`, which
-        ///    matches MoE/qwen3-next configurations that use 32 V-heads.
-        /// </summary>
-        private unsafe void GatedDeltaNetStep(float* qkvPtr, float* zPtr, float* betaPtr, float* alphaPtr,
-            int layer, int qkvDim, int qkDim, int vDim,
-            float[] convWT, float* dtBiasPtr, float* aPtr, float* ssmNormPtr,
-            float* gatedOutPtr)
-        {
-            int convDim = _convKernel - 1;
-            float[] convState = _convState[layer];
-            int writeIdx = _convStateWriteIdx[layer];
-
-            fixed (float* convOutPtr = _gdnConvOutBuf)
-            fixed (float* qBase = _gdnQ, kBase = _gdnK, vBase = _gdnV)
-            {
-                ComputeConv1DStep(qkvPtr, qkvDim, convDim, writeIdx, convState, convWT, convOutPtr);
-
-                if (convDim > 0)
-                {
-                    fixed (float* statePtr = convState)
-                    {
-                        Buffer.MemoryCopy(qkvPtr, statePtr + writeIdx * qkvDim,
-                            qkvDim * sizeof(float), qkvDim * sizeof(float));
-                    }
-                    _convStateWriteIdx[layer] = (writeIdx + 1) % convDim;
-                }
-
-                Buffer.MemoryCopy(convOutPtr, qBase, qkDim * sizeof(float), qkDim * sizeof(float));
-                Buffer.MemoryCopy(convOutPtr + qkDim, kBase, qkDim * sizeof(float), qkDim * sizeof(float));
-                Buffer.MemoryCopy(convOutPtr + 2 * qkDim, vBase, vDim * sizeof(float), vDim * sizeof(float));
-            }
-
-            float[] qActive = _gdnQ;
-            float[] kActive = _gdnK;
-            if (_numKHeads != _numVHeads)
-            {
-                qActive = _gdnQExp;
-                kActive = _gdnKExp;
-                for (int h = 0; h < _numVHeads; h++)
-                {
-                    int srcHead = h % _numKHeads;
-                    Array.Copy(_gdnQ, srcHead * _headKDim, qActive, h * _headKDim, _headKDim);
-                    Array.Copy(_gdnK, srcHead * _headKDim, kActive, h * _headKDim, _headKDim);
-                }
-            }
-
-            L2NormalizePerHead(qActive, _numVHeads, _headKDim);
-            L2NormalizePerHead(kActive, _numVHeads, _headKDim);
-
-            float qScale = 1.0f / MathF.Sqrt(_headVDim);
-            int totalQK = _numVHeads * _headKDim;
-            fixed (float* qPtr = qActive)
-                VecScale(qPtr, qScale, totalQK);
-
-            // Capture pointers/values for parallel head update
-            Tensor state = _deltaStateTensor[layer];
-            float* statePtrBase = GetFloatPtr(state);
-            int statePerHead = _headVDim * _headKDim;
-            int headKDim = _headKDim;
-            int headVDim = _headVDim;
-            float eps = Config.Eps;
-
-            fixed (float* qPin = qActive, kPin = kActive, vPin = _gdnV,
-                          deltaPin = _gdnDelta, corePin = _gdnCore)
-            {
-                float* qPtr = qPin;
-                float* kPtr = kPin;
-                float* vPtr = vPin;
-                float* deltaPtr = deltaPin;
-                float* corePtr = corePin;
-
-                if (_gdnParallelHeads)
-                {
-                    // Local copies because pointers cannot be captured by reference in lambdas.
-                    float* qPtrLocal = qPtr;
-                    float* kPtrLocal = kPtr;
-                    float* vPtrLocal = vPtr;
-                    float* deltaPtrLocal = deltaPtr;
-                    float* corePtrLocal = corePtr;
-                    float* statePtrLocal = statePtrBase;
-                    float* zPtrLocal = zPtr;
-                    float* dtBiasPtrLocal = dtBiasPtr;
-                    float* aPtrLocal = aPtr;
-                    float* alphaPtrLocal = alphaPtr;
-                    float* betaPtrLocal = betaPtr;
-                    float* ssmNormPtrLocal = ssmNormPtr;
-                    float* gatedOutPtrLocal = gatedOutPtr;
-
-                    Parallel.For(0, _numVHeads, h =>
-                    {
-                        ProcessHead(h, qPtrLocal, kPtrLocal, vPtrLocal,
-                            deltaPtrLocal, corePtrLocal, statePtrLocal,
-                            zPtrLocal, dtBiasPtrLocal, aPtrLocal,
-                            alphaPtrLocal, betaPtrLocal, ssmNormPtrLocal,
-                            gatedOutPtrLocal,
-                            headKDim, headVDim, statePerHead, eps);
-                    });
-                }
-                else
-                {
-                    for (int h = 0; h < _numVHeads; h++)
-                    {
-                        ProcessHead(h, qPtr, kPtr, vPtr, deltaPtr, corePtr, statePtrBase,
-                            zPtr, dtBiasPtr, aPtr, alphaPtr, betaPtr, ssmNormPtr, gatedOutPtr,
-                            headKDim, headVDim, statePerHead, eps);
-                    }
-                }
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void ProcessHead(int h,
-            float* qPtr, float* kPtr, float* vPtr,
-            float* deltaPtr, float* corePtr, float* statePtrBase,
-            float* zPtr, float* dtBiasPtr, float* aPtr,
-            float* alphaPtr, float* betaPtr, float* ssmNormPtr,
-            float* gatedOutPtr,
-            int headKDim, int headVDim, int statePerHead, float eps)
-        {
-            float* stateHead = statePtrBase + h * statePerHead;
-            float* qHead = qPtr + h * headKDim;
-            float* kHead = kPtr + h * headKDim;
-            float* vHead = vPtr + h * headVDim;
-            float* deltaHead = deltaPtr + h * headVDim;
-            float* coreHead = corePtr + h * headVDim;
-            float* zHead = zPtr + h * headVDim;
-            float* gatedHead = gatedOutPtr + h * headVDim;
-
-            float alphaBiased = alphaPtr[h] + dtBiasPtr[h];
-            float gateH = SoftplusScalar(alphaBiased) * aPtr[h];
-            VecScale(stateHead, MathF.Exp(gateH), statePerHead);
-
-            float betaH = SigmoidScalar(betaPtr[h]);
-
-            // delta_row = (v_row - dot(state_row, k)) * beta
-            for (int row = 0; row < headVDim; row++)
-            {
-                float kvMem = VecDot(stateHead + row * headKDim, kHead, headKDim);
-                deltaHead[row] = (vHead[row] - kvMem) * betaH;
-            }
-
-            // state_row += k * delta_row;  core_row = dot(state_row, q)
-            for (int row = 0; row < headVDim; row++)
-            {
-                float* stateRow = stateHead + row * headKDim;
-                VecScaleAdd(stateRow, kHead, deltaHead[row], headKDim);
-                coreHead[row] = VecDot(stateRow, qHead, headKDim);
-            }
-
-            float rmsInv = 1.0f / MathF.Sqrt((VecSumSq(coreHead, headVDim) / headVDim) + eps);
-            for (int i = 0; i < headVDim; i++)
-                gatedHead[i] = coreHead[i] * rmsInv * ssmNormPtr[i] * SiLUScalar(zHead[i]);
-        }
-
-        /// <summary>
-        /// Vectorized 1D convolution step using a circular state buffer and a transposed
-        /// weight layout. For each channel ch and kernel tap ki, we read the state slot
-        /// from a logical index that wraps around the ring, and multiply by the contiguous
-        /// weight tap row. SIMD vectorization runs along the channel dimension. After the
-        /// reduction, SiLU is applied in-place over the channel vector.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void ComputeConv1DStep(float* qkvPtr, int qkvDim, int convDim,
-            int writeIdx, float[] convState, float[] convWT, float* convOutPtr)
-        {
-            int vLen = Vector<float>.Count;
-
-            VecZero(convOutPtr, qkvDim);
-
-            fixed (float* statePtr = convState, wtPtr = convWT)
-            {
-                // Kernel taps 0..convDim-1 sample from the previous (ring buffered) state.
-                // The element written most recently is at slot ((writeIdx + convDim - 1) % convDim)
-                // and corresponds to the newest historical input (kernel position convDim-1).
-                for (int ki = 0; ki < convDim; ki++)
-                {
-                    int slot = (writeIdx + ki) % convDim;
-                    float* statePos = statePtr + slot * qkvDim;
-                    float* wtPos = wtPtr + ki * qkvDim;
-
-                    int ch = 0;
-                    for (; ch <= qkvDim - vLen; ch += vLen)
-                    {
-                        var acc = LdVecLocal(convOutPtr + ch);
-                        var sv = LdVecLocal(statePos + ch);
-                        var wv = LdVecLocal(wtPos + ch);
-                        StVecLocal(convOutPtr + ch, acc + sv * wv);
-                    }
-                    for (; ch < qkvDim; ch++)
-                        convOutPtr[ch] += statePos[ch] * wtPos[ch];
-                }
-
-                // Final tap reads the new input qkvPtr.
-                {
-                    float* wtPos = wtPtr + convDim * qkvDim;
-                    int ch = 0;
-                    for (; ch <= qkvDim - vLen; ch += vLen)
-                    {
-                        var acc = LdVecLocal(convOutPtr + ch);
-                        var iv = LdVecLocal(qkvPtr + ch);
-                        var wv = LdVecLocal(wtPos + ch);
-                        StVecLocal(convOutPtr + ch, acc + iv * wv);
-                    }
-                    for (; ch < qkvDim; ch++)
-                        convOutPtr[ch] += qkvPtr[ch] * wtPos[ch];
-                }
-            }
-
-            VecApplySiLU(convOutPtr, qkvDim);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe Vector<float> LdVecLocal(float* p) =>
-            Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)p);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void StVecLocal(float* p, Vector<float> v) =>
-            Unsafe.WriteUnaligned(ref *(byte*)p, v);
-
-        /// <summary>
-        /// SIMD-vectorized SiLU(x) = x / (1 + exp(-x)).
-        /// Falls back to scalar when the |x| range trips the saturation guards used by
-        /// SiLUScalar; vector path uses MathF.Exp for the sigmoid since System.Numerics
-        /// does not expose Vector exp.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void VecApplySiLU(float* data, int n)
-        {
-            for (int i = 0; i < n; i++)
-                data[i] = SiLUScalar(data[i]);
-        }
-
-        private unsafe void L2NormalizePerHead(float[] data, int numHeads, int headDim)
-        {
-            fixed (float* ptr = data)
-            {
-                for (int h = 0; h < numHeads; h++)
-                {
-                    float* head = ptr + h * headDim;
-                    float inv = 1.0f / MathF.Sqrt(VecSumSq(head, headDim) + Config.Eps);
-                    VecScale(head, inv, headDim);
-                }
-            }
-        }
-
-        private static float SigmoidScalar(float x)
-        {
-            if (x >= 0)
-            {
-                float e = MathF.Exp(-x);
-                return 1.0f / (1.0f + e);
-            }
-
-            float en = MathF.Exp(x);
-            return en / (1.0f + en);
-        }
-
-        private static float SiLUScalar(float x) => x * SigmoidScalar(x);
-
-        private static float SoftplusScalar(float x)
-        {
-            if (x > 20f)
-                return x;
-            if (x < -20f)
-                return MathF.Exp(x);
-            return MathF.Log(1.0f + MathF.Exp(x));
-        }
-
-        #endregion
 
         #region Mixture-of-Experts FFN
 
@@ -3193,23 +2354,60 @@ namespace TensorSharp.Models
         public override void PrintTimingStats()
         {
             base.PrintTimingStats();
+            PrintGdnTimingStats();
+            PrintPrefillStageStats();
+        }
 
-            double msPerTick = 1000.0 / Stopwatch.Frequency;
-            double chunkedMs = _gdnChunkedTicks * msPerTick;
-            double perTokenMs = _gdnPerTokenTicks * msPerTick;
-
-            if (_gdnChunkedCalls == 0 && _gdnPerTokenCalls == 0)
+        private void PrintPrefillStageStats()
+        {
+            if (!_profilePrefillStages || _prefillTokenCount == 0)
                 return;
 
-            Console.WriteLine($"  GatedDeltaNet:");
-            Console.WriteLine($"    chunked path:   {_gdnChunkedCalls} calls, {chunkedMs:F0} ms total" +
-                (_gdnChunkedCalls > 0 ? $", {chunkedMs / _gdnChunkedCalls:F2} ms/call" : ""));
-            Console.WriteLine($"    per-token path: {_gdnPerTokenCalls} prefill calls, {perTokenMs:F0} ms total" +
-                (_gdnPerTokenCalls > 0 ? $", {perTokenMs / _gdnPerTokenCalls:F2} ms/call" : ""));
-            if (_gdnDisableChunkedPrefill)
-                Console.WriteLine($"    (chunked path disabled at runtime)");
-            else
-                Console.WriteLine($"    (chunked threshold: seqLen >= {_gdnChunkPrefillThreshold}, chunkSize {GdnChunkSize})");
+            double msPerTick = 1000.0 / Stopwatch.Frequency;
+            double embMs = _prefillEmbedTicks * msPerTick;
+            double attnMs = _prefillAttnBlockTicks * msPerTick;
+            double recMs = _prefillRecBlockTicks * msPerTick;
+            double lmHeadMs = _prefillFinalLmHeadTicks * msPerTick;
+
+            double attnQkvMs = _prefillAttnQkvTicks * msPerTick;
+            double attnDeintMs = _prefillAttnDeinterleaveTicks * msPerTick;
+            double attnQknMs = _prefillAttnQknormTicks * msPerTick;
+            double attnRopeMs = _prefillAttnRopeTicks * msPerTick;
+            double attnReshapeMs = _prefillAttnReshapeTicks * msPerTick;
+            double attnCacheCopyMs = _prefillAttnCacheCopyTicks * msPerTick;
+            double attnExpandKvMs = _prefillAttnExpandKvTicks * msPerTick;
+            double attnComputeMs = _prefillAttnComputeTicks * msPerTick;
+            double attnGateMs = _prefillAttnGateTicks * msPerTick;
+            double attnOutputMs = _prefillAttnOutputTicks * msPerTick;
+            double attnFfnMs = _prefillAttnFfnTicks * msPerTick;
+
+            double recInputMs = _prefillRecInputProjTicks * msPerTick;
+            double recCoreMs = _prefillRecCoreTicks * msPerTick;
+            double recOutputMs = _prefillRecOutputTicks * msPerTick;
+            double recFfnMs = _prefillRecFfnTicks * msPerTick;
+
+            double total = embMs + attnMs + recMs + lmHeadMs;
+
+            Console.WriteLine($"Prefill profile ({_prefillTokenCount} tokens, {total:F0} ms total):");
+            Console.WriteLine($"  Embedding:                  {embMs,8:F0} ms ({100 * embMs / total,5:F1}%)");
+            Console.WriteLine($"  Attention block (8 layers): {attnMs,8:F0} ms ({100 * attnMs / total,5:F1}%)");
+            Console.WriteLine($"    QKV proj:                 {attnQkvMs,8:F0} ms");
+            Console.WriteLine($"    Deinterleave Q/gate:      {attnDeintMs,8:F0} ms");
+            Console.WriteLine($"    QK-norm:                  {attnQknMs,8:F0} ms");
+            Console.WriteLine($"    RoPE (Q+K):               {attnRopeMs,8:F0} ms");
+            Console.WriteLine($"    Reshape to heads:         {attnReshapeMs,8:F0} ms");
+            Console.WriteLine($"    Cache copy (K,V):         {attnCacheCopyMs,8:F0} ms");
+            Console.WriteLine($"    Expand KV heads:          {attnExpandKvMs,8:F0} ms");
+            Console.WriteLine($"    Attention compute:        {attnComputeMs,8:F0} ms (QK^T + softmax + V)");
+            Console.WriteLine($"    Sigmoid gate:             {attnGateMs,8:F0} ms");
+            Console.WriteLine($"    Output proj:              {attnOutputMs,8:F0} ms");
+            Console.WriteLine($"    FFN (norm+gate_up+down):  {attnFfnMs,8:F0} ms");
+            Console.WriteLine($"  Recurrent block (24 layers):{recMs,8:F0} ms ({100 * recMs / total,5:F1}%)");
+            Console.WriteLine($"    Input proj (norm+pack):   {recInputMs,8:F0} ms");
+            Console.WriteLine($"    GDN core (conv+chunked):  {recCoreMs,8:F0} ms");
+            Console.WriteLine($"    Output proj:              {recOutputMs,8:F0} ms");
+            Console.WriteLine($"    FFN (norm+gate_up+down):  {recFfnMs,8:F0} ms");
+            Console.WriteLine($"  Final norm + LM head:       {lmHeadMs,8:F0} ms ({100 * lmHeadMs / total,5:F1}%)");
         }
 
         public override void Dispose()
@@ -3223,16 +2421,8 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
-            if (_deltaStateTensor != null)
-                foreach (var t in _deltaStateTensor) t?.Dispose();
 
-            _gdnGatedOutT?.Dispose();
-            _gdnChunkedQBuf?.Dispose();
-            _gdnChunkedKBuf?.Dispose();
-            _gdnChunkedVBuf?.Dispose();
-            _gdnChunkedZBuf?.Dispose();
-            _gdnChunkedAlphaBuf?.Dispose();
-            _gdnChunkedBetaBuf?.Dispose();
+            DisposeGdnState();
 
             _moeTokenInput?.Dispose();
             _moeGateBuf?.Dispose();
@@ -3245,7 +2435,6 @@ namespace TensorSharp.Models
             _attnDecodeOutBuf?.Dispose();
             _attnDecodeQkvBuf?.Dispose();
             _ffnDecodeGateUpBuf?.Dispose();
-            _gdnDecodePackedBuf?.Dispose();
 
             base.Dispose();
         }

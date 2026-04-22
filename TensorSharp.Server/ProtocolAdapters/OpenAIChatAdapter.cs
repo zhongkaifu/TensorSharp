@@ -99,7 +99,7 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             bool stream = body.TryGetProperty("stream", out var streamProp) && streamProp.GetBoolean();
             int maxTokens = body.TryGetProperty("max_tokens", out var mtProp) ? mtProp.GetInt32() : 200;
-            var samplingConfig = SamplingConfigParser.ParseOpenAI(body);
+            var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.DefaultSamplingConfig);
             var messages = ChatMessageParser.ParseOpenAI(messagesEl, _options.UploadDirectory);
             string requestId = OpenAIResponseFactory.NewRequestId();
 

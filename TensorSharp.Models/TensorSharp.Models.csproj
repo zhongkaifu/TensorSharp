@@ -25,6 +25,7 @@
     <PackageReference Include="OneWare.OpenCvSharp4.runtime.win-x64" Version="4.13.0.18" />
     <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260330" />
     <PackageReference Include="StbImageSharp" Version="2.30.15" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.7" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\LICENSE">

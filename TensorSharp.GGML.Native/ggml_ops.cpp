@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -3660,6 +3661,186 @@ namespace
         return 1;
     }
 
+    // Fused activation-multiply on a single contiguous [N, 2H] gate_up tensor.
+    // result[i, j] = act(gate_up[i, j]) * gate_up[i, j + H]   for j in [0, H)
+    //
+    // This avoids the two large NewContiguous copies that the "split + 2 separate
+    // tensors" path would require. Both halves are exposed as ggml_view_2d on the
+    // same underlying gate_up buffer, with byte_offset 0 and H*sizeof(float).
+    int fused_act_mul_split_f32_impl(
+        FusedActMulOpCode op,
+        const TensorView2DDesc& result_desc,
+        const TensorView2DDesc& gate_up_desc,
+        int half_dim)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result_desc, "result") || !validate_desc(gate_up_desc, "gate_up"))
+            return 0;
+
+        if (half_dim <= 0)
+        {
+            set_last_error("fused_act_mul_split: half_dim must be positive.");
+            return 0;
+        }
+        if (result_desc.stride1 != 1 || gate_up_desc.stride1 != 1)
+        {
+            set_last_error("fused_act_mul_split: tensors must be row-major (stride1 == 1).");
+            return 0;
+        }
+        if (result_desc.dim0 != gate_up_desc.dim0
+            || result_desc.dim1 != half_dim
+            || gate_up_desc.dim1 != 2 * half_dim)
+        {
+            set_last_error("fused_act_mul_split: shape mismatch.");
+            return 0;
+        }
+        // The gate_up tensor itself only needs to be row-major; rows can have
+        // padding (stride0 >= 2H). The split offsets are within a single row.
+        if (gate_up_desc.stride0 < gate_up_desc.dim1)
+        {
+            set_last_error("fused_act_mul_split: gate_up row stride must be >= dim1.");
+            return 0;
+        }
+
+        bool use_zero_copy = true;
+        std::vector<BufferHandle> host_ptr_buffers;
+        const std::size_t ctx_size = 1 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context.");
+            return 0;
+        }
+
+        // Promote the 2D descs to 4D so we can reuse the existing zero-copy helper.
+        auto to_4d = [](const TensorView2DDesc& d) {
+            TensorView4DDesc out{};
+            out.data = d.data;
+            out.ne0 = d.dim1;
+            out.ne1 = d.dim0;
+            out.ne2 = 1;
+            out.ne3 = 1;
+            out.nb1 = static_cast<std::int64_t>(d.stride0) * static_cast<std::int64_t>(sizeof(float));
+            out.nb2 = out.nb1 * d.dim0;
+            out.nb3 = out.nb2;
+            out.raw_bytes = d.raw_bytes;
+            return out;
+        };
+
+        TensorView4DDesc result_4d = to_4d(result_desc);
+        TensorView4DDesc gate_up_4d = to_4d(gate_up_desc);
+
+        TensorBinding result_binding, gate_up_binding;
+        if (use_zero_copy)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            if (!create_binding_from_host_ptr_4d(context.value, g_backend, result_4d, result_binding, buf))
+                use_zero_copy = false;
+            else
+                host_ptr_buffers.emplace_back(buf);
+        }
+        if (use_zero_copy)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            if (!create_binding_from_host_ptr_4d(context.value, g_backend, gate_up_4d, gate_up_binding, buf))
+                use_zero_copy = false;
+            else
+                host_ptr_buffers.emplace_back(buf);
+        }
+        if (!use_zero_copy)
+        {
+            // Standard upload path: bind result + a stand-in for the full gate_up.
+            result_binding = create_standard_binding(context.value, result_4d);
+            gate_up_binding = create_standard_binding(context.value, gate_up_4d);
+        }
+        if (result_binding.tensor == nullptr || gate_up_binding.tensor == nullptr)
+        {
+            set_last_error("Failed to allocate ggml tensors for fused_act_mul_split.");
+            return 0;
+        }
+
+        const std::size_t row_bytes = static_cast<std::size_t>(gate_up_desc.stride0) * sizeof(float);
+        const std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
+
+        ggml_tensor* gate_view = ggml_view_2d(context.value, gate_up_binding.tensor,
+            half_dim, gate_up_desc.dim0, row_bytes, 0);
+        ggml_tensor* up_view = ggml_view_2d(context.value, gate_up_binding.tensor,
+            half_dim, gate_up_desc.dim0, row_bytes, half_bytes);
+        if (gate_view == nullptr || up_view == nullptr)
+        {
+            set_last_error("Failed to create gate/up views for fused_act_mul_split.");
+            return 0;
+        }
+
+        // ggml_cont packs each strided half-row into a contiguous tensor inside the
+        // backend graph. This is required for backends (Metal) whose silu kernel only
+        // accepts contiguous inputs. The cont stays GPU/CPU-local within the graph so
+        // it is far cheaper than the host-side double NewContiguous it replaces.
+        ggml_tensor* gate_cont = ggml_cont(context.value, gate_view);
+        ggml_tensor* up_cont = ggml_cont(context.value, up_view);
+        if (gate_cont == nullptr || up_cont == nullptr)
+        {
+            set_last_error("Failed to create gate/up cont nodes for fused_act_mul_split.");
+            return 0;
+        }
+
+        ggml_tensor* value_tensor = make_fused_act_mul_tensor(context.value, op, gate_cont, up_cont);
+        if (value_tensor == nullptr)
+        {
+            if (g_last_error.empty())
+                set_last_error("Failed to create ggml fused_act_mul_split node.");
+            return 0;
+        }
+
+        ggml_tensor* output_tensor = ggml_cpy(context.value, value_tensor, result_binding.tensor);
+        if (output_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml fused_act_mul_split output copy node.");
+            return 0;
+        }
+
+        ggml_set_output(output_tensor);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        if (graph == nullptr)
+        {
+            set_last_error("Failed to create ggml graph for fused_act_mul_split.");
+            return 0;
+        }
+
+        ggml_build_forward_expand(graph, output_tensor);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate ggml backend buffer for fused_act_mul_split.");
+            return 0;
+        }
+
+        if (!use_zero_copy)
+        {
+            upload_binding(gate_up_binding, gate_up_desc.data, gate_up_binding.raw_bytes);
+            if (result_binding.raw_bytes > logical_bytes(result_4d))
+                upload_binding(result_binding, result_desc.data, result_binding.raw_bytes);
+        }
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for fused_act_mul_split.");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        if (!use_zero_copy)
+            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+
     int binary_scalar_f32_impl(
         BinaryScalarOpCode op,
         const TensorView4DDesc& result_desc,
@@ -6945,6 +7126,288 @@ int fused_matmul_quant_add_f32_impl(
     return 1;
 }
 
+// ============================================================================
+// Fully fused dense SwiGLU FFN with residual add: single GGML graph dispatch.
+//
+// residual += down_W ^T @ ( silu(gate_part) * up_part ),
+//   where [gate_part | up_part] = gate_up_W ^T @ rms_norm(input, normW, eps)
+//
+// Combines what was previously 3 separate native dispatches:
+//   1) FusedRmsNormMatMulQuant  (norm + gate_up matmul)
+//   2) SiLUMul / SiLUMulSplit   (activation + multiply)
+//   3) FusedMatMulQuantAdd      (down matmul + residual add)
+// into a single GGML graph. Saves 2 graph builds, 2 backend allocations and
+// 2 host<->backend syncs per FFN per layer per forward call. On Metal this
+// dramatically lowers Metal command-buffer overhead which dominates FFN time
+// for moderate sequence lengths.
+int fused_ffn_swiglu_quant_f32_impl(
+    const TensorView2DDesc& residual_desc,
+    const TensorView2DDesc& input_desc,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    const QuantizedWeightDesc& gate_up_quant,
+    const QuantizedWeightDesc& down_quant,
+    int half_dim)
+{
+    if (!ensure_backend())
+        return 0;
+
+    if (!validate_desc(residual_desc, "residual") || !validate_desc(input_desc, "input"))
+        return 0;
+
+    if (norm_weight_data == nullptr || norm_weight_count <= 0)
+    {
+        set_last_error("fused_ffn_swiglu: invalid norm weight.");
+        return 0;
+    }
+
+    if (gate_up_quant.data == nullptr || gate_up_quant.ne0 <= 0 || gate_up_quant.ne1 <= 0 || gate_up_quant.raw_bytes <= 0)
+    {
+        set_last_error("fused_ffn_swiglu: invalid gate_up weight descriptor.");
+        return 0;
+    }
+    if (down_quant.data == nullptr || down_quant.ne0 <= 0 || down_quant.ne1 <= 0 || down_quant.raw_bytes <= 0)
+    {
+        set_last_error("fused_ffn_swiglu: invalid down weight descriptor.");
+        return 0;
+    }
+
+    const int rows = input_desc.dim0;
+    const int hidden = input_desc.dim1;
+    const int gate_up_out = static_cast<int>(gate_up_quant.ne1);
+    const int down_in = static_cast<int>(down_quant.ne0);
+    const int down_out = static_cast<int>(down_quant.ne1);
+
+    if (residual_desc.dim0 != rows || residual_desc.dim1 != hidden)
+    {
+        set_last_error("fused_ffn_swiglu: residual shape mismatch.");
+        return 0;
+    }
+    if (norm_weight_count != hidden)
+    {
+        set_last_error("fused_ffn_swiglu: norm_weight_count != hidden.");
+        return 0;
+    }
+    if (gate_up_quant.ne0 != hidden)
+    {
+        set_last_error("fused_ffn_swiglu: gate_up.ne0 != hidden.");
+        return 0;
+    }
+    if (gate_up_out != 2 * half_dim)
+    {
+        set_last_error("fused_ffn_swiglu: gate_up.ne1 != 2*half_dim.");
+        return 0;
+    }
+    if (down_in != half_dim || down_out != hidden)
+    {
+        set_last_error("fused_ffn_swiglu: down weight shape mismatch.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 4 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("fused_ffn_swiglu: failed to create ggml context.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(input_desc) && can_map_standard_view(residual_desc);
+
+    TensorBinding residual_binding;
+    TensorBinding input_binding;
+    std::vector<float> packed_input;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t res_buf = nullptr;
+        ggml_backend_buffer_t inp_buf = nullptr;
+        const bool res_ok = create_binding_from_host_ptr_2d(context.value, g_backend, residual_desc, residual_binding, res_buf);
+        const bool inp_ok = res_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, inp_buf);
+
+        if (res_ok && inp_ok)
+        {
+            host_ptr_buffers.emplace_back(res_buf);
+            host_ptr_buffers.emplace_back(inp_buf);
+        }
+        else
+        {
+            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
+            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            use_zero_copy = false;
+            residual_binding = create_standard_binding(context.value, residual_desc);
+            input_binding = can_map_standard_view(input_desc)
+                ? create_standard_binding(context.value, input_desc)
+                : create_packed_standard_binding(context.value, input_desc, packed_input);
+        }
+    }
+    else
+    {
+        residual_binding = create_standard_binding(context.value, residual_desc);
+        input_binding = can_map_standard_view(input_desc)
+            ? create_standard_binding(context.value, input_desc)
+            : create_packed_standard_binding(context.value, input_desc, packed_input);
+    }
+
+    ggml_tensor* norm_w_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, norm_weight_count);
+
+    ggml_type gate_up_type = static_cast<ggml_type>(gate_up_quant.ggml_type);
+    ggml_tensor* gate_up_tensor = ggml_new_tensor_2d(context.value, gate_up_type, gate_up_quant.ne0, gate_up_quant.ne1);
+    TensorBinding gate_up_binding_w = { gate_up_tensor, gate_up_tensor, static_cast<std::size_t>(gate_up_quant.raw_bytes) };
+
+    ggml_type down_type = static_cast<ggml_type>(down_quant.ggml_type);
+    ggml_tensor* down_tensor = ggml_new_tensor_2d(context.value, down_type, down_quant.ne0, down_quant.ne1);
+    TensorBinding down_binding_w = { down_tensor, down_tensor, static_cast<std::size_t>(down_quant.raw_bytes) };
+
+    if (residual_binding.storage == nullptr || input_binding.storage == nullptr ||
+        norm_w_tensor == nullptr || gate_up_tensor == nullptr || down_tensor == nullptr)
+    {
+        set_last_error("fused_ffn_swiglu: failed to allocate ggml tensors.");
+        return 0;
+    }
+
+    auto try_cache_quant = [](ggml_tensor* t, const QuantizedWeightDesc& q, bool& bound, bool& needs_upload) {
+        bound = false;
+        needs_upload = false;
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr || q.raw_bytes < 4096)
+            return;
+        ggml_backend_buffer_t buf = nullptr;
+        void* addr = nullptr;
+        if (try_get_cacheable_tensor_buffer(g_backend, dev, t,
+                q.data, static_cast<std::size_t>(q.raw_bytes),
+                buf, addr, needs_upload))
+        {
+            ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+            bound = (st == GGML_STATUS_SUCCESS);
+            if (!bound) invalidate_cached_buffer(q.data);
+        }
+    };
+
+    bool gate_up_bound = false, gate_up_needs_upload = false;
+    try_cache_quant(gate_up_tensor, gate_up_quant, gate_up_bound, gate_up_needs_upload);
+
+    bool down_bound = false, down_needs_upload = false;
+    try_cache_quant(down_tensor, down_quant, down_bound, down_needs_upload);
+
+    // Norm weight cache.
+    bool norm_bound = false, norm_needs_upload = false;
+    std::size_t norm_bytes = static_cast<std::size_t>(norm_weight_count) * sizeof(float);
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && norm_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, norm_w_tensor,
+                    norm_weight_data, norm_bytes,
+                    buf, addr, norm_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, norm_w_tensor, addr);
+                norm_bound = (st == GGML_STATUS_SUCCESS);
+                if (!norm_bound) invalidate_cached_buffer(norm_weight_data);
+            }
+        }
+    }
+
+    // Build graph.
+    ggml_tensor* contiguous_input = ggml_cont(context.value, input_binding.tensor);
+    ggml_tensor* contiguous_residual = ggml_cont(context.value, residual_binding.tensor);
+
+    ggml_tensor* normed = ggml_rms_norm(context.value, contiguous_input, eps);
+    ggml_tensor* scaled = ggml_mul(context.value, normed, norm_w_tensor);
+
+    ggml_tensor* scaled_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, scaled, hidden, 1)
+        : scaled;
+
+    // gate_up = scaled @ gate_up_W^T -> ggml semantics: ne0=gate_up_out, ne1=rows
+    ggml_tensor* gate_up_mm = ggml_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d);
+
+    const std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
+    const std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
+
+    ggml_tensor* gate_view = ggml_view_2d(context.value, gate_up_mm,
+        half_dim, rows, gu_row_bytes, 0);
+    ggml_tensor* up_view = ggml_view_2d(context.value, gate_up_mm,
+        half_dim, rows, gu_row_bytes, half_bytes);
+
+    ggml_tensor* gate_cont = ggml_cont(context.value, gate_view);
+    ggml_tensor* up_cont = ggml_cont(context.value, up_view);
+
+    ggml_tensor* silu_gate = ggml_silu(context.value, gate_cont);
+    ggml_tensor* swiglu = ggml_mul(context.value, silu_gate, up_cont);
+
+    ggml_tensor* swiglu_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, swiglu, half_dim, 1)
+        : swiglu;
+
+    ggml_tensor* down_mm = ggml_mul_mat(context.value, down_binding_w.tensor, swiglu_2d);
+
+    ggml_tensor* down_flat = ggml_reshape_1d(context.value, down_mm, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* added = ggml_add(context.value, res_flat, down_flat);
+
+    ggml_tensor* output_tensor = ggml_cpy(context.value, added, residual_binding.tensor);
+    if (output_tensor == nullptr)
+    {
+        set_last_error("fused_ffn_swiglu: failed to create output cpy node.");
+        return 0;
+    }
+
+    ggml_set_output(output_tensor);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    if (graph == nullptr)
+    {
+        set_last_error("fused_ffn_swiglu: failed to create graph.");
+        return 0;
+    }
+    ggml_build_forward_expand(graph, output_tensor);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("fused_ffn_swiglu: failed to allocate backend buffer.");
+        return 0;
+    }
+
+    if (!use_zero_copy)
+    {
+        upload_binding(residual_binding, residual_desc.data, residual_binding.raw_bytes);
+        if (packed_input.empty())
+            upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+        else
+            upload_binding(input_binding, packed_input.data(), input_binding.raw_bytes);
+    }
+
+    if (!gate_up_bound || gate_up_needs_upload)
+        upload_binding(gate_up_binding_w, gate_up_quant.data, gate_up_binding_w.raw_bytes);
+    if (!down_bound || down_needs_upload)
+        upload_binding(down_binding_w, down_quant.data, down_binding_w.raw_bytes);
+    if (!norm_bound || norm_needs_upload)
+    {
+        TensorBinding tmp = { norm_w_tensor, norm_w_tensor, norm_bytes };
+        upload_binding(tmp, norm_weight_data, norm_bytes);
+    }
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("fused_ffn_swiglu: graph execution failed.");
+        return 0;
+    }
+    ggml_backend_synchronize(g_backend);
+
+    if (!use_zero_copy)
+        ggml_backend_tensor_get(residual_binding.storage, residual_desc.data, 0, residual_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
 TSG_EXPORT int TSGgml_FusedMatMulQuantAddF32(
     TensorView2DDesc residual,
     TensorView2DDesc input,
@@ -6972,6 +7435,56 @@ TSG_EXPORT int TSGgml_FusedMatMulQuantAddF32(
     catch (...)
     {
         set_last_error("Unknown error in fused matmul_add.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_FusedFFNSwiGLUQuantF32(
+    TensorView2DDesc residual,
+    TensorView2DDesc input,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    void* gate_up_data,
+    int gate_up_ggml_type,
+    std::int64_t gate_up_ne0,
+    std::int64_t gate_up_ne1,
+    std::int64_t gate_up_raw_bytes,
+    void* down_data,
+    int down_ggml_type,
+    std::int64_t down_ne0,
+    std::int64_t down_ne1,
+    std::int64_t down_raw_bytes,
+    int half_dim)
+{
+    try
+    {
+        QuantizedWeightDesc gate_up_quant;
+        gate_up_quant.data = gate_up_data;
+        gate_up_quant.ggml_type = gate_up_ggml_type;
+        gate_up_quant.ne0 = gate_up_ne0;
+        gate_up_quant.ne1 = gate_up_ne1;
+        gate_up_quant.raw_bytes = gate_up_raw_bytes;
+
+        QuantizedWeightDesc down_quant;
+        down_quant.data = down_data;
+        down_quant.ggml_type = down_ggml_type;
+        down_quant.ne0 = down_ne0;
+        down_quant.ne1 = down_ne1;
+        down_quant.raw_bytes = down_raw_bytes;
+
+        return fused_ffn_swiglu_quant_f32_impl(
+            residual, input, norm_weight_data, norm_weight_count, eps,
+            gate_up_quant, down_quant, half_dim);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused FFN swiGLU.");
         return 0;
     }
 }
@@ -7800,6 +8313,28 @@ TSG_EXPORT int TSGgml_FusedActMulF32(
     catch (...)
     {
         set_last_error("Unknown ggml fused activation-multiply failure.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_FusedActMulSplitF32(
+    int op,
+    TensorView2DDesc result,
+    TensorView2DDesc gate_up,
+    int half_dim)
+{
+    try
+    {
+        return fused_act_mul_split_f32_impl(static_cast<FusedActMulOpCode>(op), result, gate_up, half_dim);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml fused activation-multiply-split failure.");
         return 0;
     }
 }
@@ -10240,22 +10775,149 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 }
 
 // ---------------------------------------------------------------------------
+// GatedDeltaNetChunked graph cache
+// ---------------------------------------------------------------------------
+// The chunked GDN kernel is invoked O(num_recurrent_layers * prefill_chunks)
+// times per request, and every call previously rebuilt the full GGML graph,
+// allocated a fresh backend buffer, and re-uploaded constants like the mask
+// scratch. For typical Qwen3.5 traces this dominated the chunked path latency
+// (~150 ms/call out of ~170 ms/call on Metal/CPU).
+//
+// We hash on the shape tuple (T, H, D, chunk_size, eps). For a given shape the
+// graph topology is identical, so we can build it once, retain the backend
+// buffer, and on subsequent calls just rebind input data via
+// ggml_backend_tensor_set / _get. ssm_norm_w is uploaded per call because it
+// is a per-layer constant and our key intentionally ignores layer identity to
+// share entries across all recurrent layers of the same shape.
+//
+// Cache lifetime: entries persist for the process lifetime (cleared on
+// backend reset) since the working set is bounded by the number of distinct
+// (T, chunk_size) pairs the model sees, which is typically just one or two.
+namespace
+{
+    struct GdnChunkedCacheKey
+    {
+        int T;
+        int H;
+        int D;
+        int cS;
+        float eps;
+    };
+
+    struct GdnChunkedCacheKeyEq
+    {
+        bool operator()(const GdnChunkedCacheKey& a, const GdnChunkedCacheKey& b) const noexcept
+        {
+            return a.T == b.T && a.H == b.H && a.D == b.D && a.cS == b.cS && a.eps == b.eps;
+        }
+    };
+
+    struct GdnChunkedCacheKeyHash
+    {
+        std::size_t operator()(const GdnChunkedCacheKey& k) const noexcept
+        {
+            std::size_t h = static_cast<std::size_t>(k.T);
+            h = h * 1315423911u + static_cast<std::size_t>(k.H);
+            h = h * 1315423911u + static_cast<std::size_t>(k.D);
+            h = h * 1315423911u + static_cast<std::size_t>(k.cS);
+            std::uint32_t e_bits;
+            std::memcpy(&e_bits, &k.eps, sizeof(e_bits));
+            h = h * 1315423911u + static_cast<std::size_t>(e_bits);
+            return h;
+        }
+    };
+
+    struct GdnChunkedCacheEntry
+    {
+        // Owns its own metadata buffer so we don't hold a slab from the per-call
+        // pool indefinitely. ggml_init with no_alloc=true lays tensor metadata in
+        // this buffer; backend storage lives in the BufferHandle below.
+        std::unique_ptr<std::uint8_t[]> ctx_buffer;
+        ggml_context* ctx = nullptr;
+        BufferHandle buffer{nullptr};
+        ggml_cgraph* graph = nullptr;
+
+        // Storage tensors (the leaves backing each binding view) - upload targets.
+        ggml_tensor* q_storage = nullptr;
+        ggml_tensor* k_storage = nullptr;
+        ggml_tensor* v_storage = nullptr;
+        ggml_tensor* z_storage = nullptr;
+        ggml_tensor* alpha_storage = nullptr;
+        ggml_tensor* beta_storage = nullptr;
+        ggml_tensor* state_storage = nullptr;
+        ggml_tensor* ssm_norm_storage = nullptr;
+
+        // Output storage for download.
+        ggml_tensor* gated_out_storage = nullptr;
+
+        // Sizes from create_standard_binding (raw_bytes).
+        std::size_t q_bytes = 0;
+        std::size_t k_bytes = 0;
+        std::size_t v_bytes = 0;
+        std::size_t z_bytes = 0;
+        std::size_t alpha_bytes = 0;
+        std::size_t beta_bytes = 0;
+        std::size_t state_bytes = 0;
+        std::size_t ssm_norm_bytes = 0;
+        std::size_t gated_out_bytes = 0;
+
+        // Serialize compute on the same entry so multiple threads using the same
+        // shape don't trample each other's uploads/downloads on the shared graph.
+        std::mutex compute_mutex;
+
+        ~GdnChunkedCacheEntry()
+        {
+            if (ctx != nullptr)
+            {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+        }
+    };
+
+    std::mutex g_gdn_chunked_cache_mutex;
+    std::unordered_map<GdnChunkedCacheKey,
+                       std::unique_ptr<GdnChunkedCacheEntry>,
+                       GdnChunkedCacheKeyHash,
+                       GdnChunkedCacheKeyEq> g_gdn_chunked_cache;
+
+    // Register an atexit handler that frees cached GDN graphs/buffers BEFORE the
+    // Metal device singleton's static destructor runs. atexit handlers fire in
+    // LIFO order interleaved with C++ static destructors, so registering after
+    // the Metal device has been initialized guarantees we tear down GPU
+    // resources first and avoid `[rsets->data count] == 0` assertions.
+    void ensure_gdn_cache_cleanup_registered()
+    {
+        static std::once_flag flag;
+        std::call_once(flag, []() {
+            std::atexit([]() {
+                std::lock_guard<std::mutex> lk(g_gdn_chunked_cache_mutex);
+                g_gdn_chunked_cache.clear();
+            });
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TSGgml_GatedDeltaNetChunkedF32
 // ---------------------------------------------------------------------------
 // Single fused kernel that performs Qwen3.5/Qwen3-Next chunked GatedDeltaNet
-// for one layer. Conv1D is run on CPU upstream and its outputs (Q, K, V) are
-// passed in already (with K-head expansion done upstream so Q/K share H).
+// for one layer. Conv1D, the dt_bias/softplus/mul gate computation and the
+// sigmoid on beta are all run on CPU upstream. Their outputs are uploaded
+// via the alpha / beta staging slots which lets the fused Metal graph skip
+// four trivially-vectorisable ops per layer (~8 ops/call after accounting for
+// dependency fencing) and removes two constant-tensor uploads.
 //
 // Inputs (all C# row-major, F32):
 //   q, k, v   : [seqLen, H, D]
 //   z         : [seqLen, H, D]
-//   alpha_raw : [seqLen, H]              (before dt_bias add and softplus)
-//   beta_raw  : [seqLen, H]              (before sigmoid)
+//   alpha     : [seqLen, H]              pre-computed gate = a_log * softplus(alpha_raw + dt_bias)
+//   beta      : [seqLen, H]              pre-computed beta_sig = sigmoid(beta_raw)
 //   state     : [H, D, D]                in-place updated; D is shared
 //                                       (function asserts headKDim == headVDim)
 //   gated_out : [seqLen, H, D]           output written via copy
-//   dt_bias   : [H]
-//   a_log     : [H]
+//   dt_bias   : [H]                      UNUSED (kept for ABI stability, ignored)
+//   a_log     : [H]                      UNUSED (kept for ABI stability, ignored)
 //   ssm_norm_w: [D]
 //
 // chunk_size is the chunked attention chunk (typ. 64).
@@ -10263,12 +10925,15 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 //
 // The function:
 //   1. L2-normalises Q and K, scales Q by 1/sqrt(D).
-//   2. Computes per-token gate = -A_log * softplus(alpha + dt_bias).
-//   3. Sigmoids beta and applies it to v/k -> v_beta, k_beta.
+//   2. Reads gate (alpha) and beta_sig (beta) directly - no device-side add,
+//      softplus, mul or sigmoid.
+//   3. Applies beta_sig to v/k -> v_beta, k_beta.
 //   4. Pads sequence to a multiple of chunk_size, reshapes into chunks.
 //   5. Builds the per-chunk decay/causal/identity mask system, runs the
 //      triangular solve and combines pre-computed (k @ q) per-chunk attention
-//      with cross-chunk recurrent state propagation.
+//      with cross-chunk recurrent state propagation. qGExp = q * gExp is
+//      pre-computed once over the full chunked layout so the per-chunk loop
+//      body contains four mul_mat / two broadcast mul / two add ops only.
 //   6. Runs RMSNorm and gates by silu(z).
 //   7. Writes the output back to gated_out and the updated recurrent state
 //      back to the state tensor.
@@ -10300,11 +10965,16 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
             return 0;
         }
 
-        if (dt_bias_data == nullptr || a_log_data == nullptr || ssm_norm_w_data == nullptr)
+        if (ssm_norm_w_data == nullptr)
         {
-            set_last_error("GatedDeltaNetChunked: dt_bias/a_log/ssm_norm_w must be non-null.");
+            set_last_error("GatedDeltaNetChunked: ssm_norm_w must be non-null.");
             return 0;
         }
+        // dt_bias_data and a_log_data are unused in this kernel - gate is pre-computed on
+        // the host. We keep the parameters on the C ABI so the existing C# binding keeps
+        // compiling; the values are ignored here.
+        (void)dt_bias_data;
+        (void)a_log_data;
 
         // Shape sanity. Q/K/V share [seqLen, H, D]; state is [H, D, D].
         const int T  = q_desc.dim0;
@@ -10347,302 +11017,349 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
         const int pad = T_padded - T;
         const int nC = T_padded / cS;
 
-        // Estimate tensor metadata budget. Each tensor uses ~256-384 bytes of
-        // metadata; we create roughly (40 + 12 * nC) tensors plus a balanced
-        // concat tree with ~2 * nC nodes.
-        const std::size_t per_tensor_bytes = 384;
-        const std::size_t tensor_count_estimate = 256 + static_cast<std::size_t>(20 * nC);
-        std::size_t ctx_size = tensor_count_estimate * per_tensor_bytes;
-        if (ctx_size < 4 * 1024 * 1024) ctx_size = 4 * 1024 * 1024;
-
-        PooledContextHandle context;
-        if (!context.init(ctx_size))
+        // ----- Cache lookup -----------------------------------------------------
+        GdnChunkedCacheKey cache_key{T, H, D, cS, eps};
+        GdnChunkedCacheEntry* entry = nullptr;
         {
-            set_last_error("GatedDeltaNetChunked: context init failed.");
-            return 0;
-        }
-        ggml_context* ctx = context.value;
-
-        // Bind input/output tensors.
-        TensorBinding q_bind  = create_standard_binding(ctx, q_desc);
-        TensorBinding k_bind  = create_standard_binding(ctx, k_desc);
-        TensorBinding v_bind  = create_standard_binding(ctx, v_desc);
-        TensorBinding z_bind  = create_standard_binding(ctx, z_desc);
-        TensorBinding a_bind  = create_standard_binding(ctx, alpha_desc);
-        TensorBinding b_bind  = create_standard_binding(ctx, beta_desc);
-        TensorBinding st_bind = create_standard_binding(ctx, state_desc);
-        TensorBinding go_bind = create_standard_binding(ctx, gated_out_desc);
-
-        // Constants (per-layer): dt_bias, a_log are [H]; ssm_norm_w is [D].
-        ggml_tensor* dt_bias_t  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-        ggml_tensor* a_log_t    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-        ggml_tensor* ssm_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-
-        // Scratch tensors for masks. ggml_fill needs a contiguous source tensor.
-        ggml_tensor* mask_src    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cS, cS, 1, 1);
-
-        // ----------- Build the graph -----------
-
-        // Reshape alpha/beta from (H, T) to (H, T) - they're already 2D views.
-        // GGML view: ne0=T (innermost), ne1=H. We want (H, T) where H=ne0 for
-        // broadcasting with dt_bias [H].
-        // The standard binding for [seqLen, H] gives ne0=H, ne1=T. ✓ exactly what we want.
-        ggml_tensor* alpha = a_bind.tensor;       // (H, T)
-        ggml_tensor* beta  = b_bind.tensor;       // (H, T)
-
-        // alpha + dt_bias (broadcast on T)
-        ggml_tensor* alpha_biased = ggml_add(ctx, alpha, dt_bias_t);   // (H, T)
-        ggml_tensor* alpha_sp     = ggml_softplus(ctx, alpha_biased);  // (H, T)
-        ggml_tensor* gate_2d      = ggml_mul(ctx, alpha_sp, a_log_t);  // (H, T)
-        ggml_tensor* gate_4d      = ggml_reshape_4d(ctx, gate_2d, 1, H, T, 1);
-
-        // Sigmoid beta and reshape.
-        ggml_tensor* beta_sig = ggml_sigmoid(ctx, beta);
-        ggml_tensor* beta_4d  = ggml_reshape_4d(ctx, beta_sig, 1, H, T, 1);
-
-        // Q/K/V GGML views: ne0=D, ne1=H, ne2=T, ne3=1.
-        ggml_tensor* q = q_bind.tensor;
-        ggml_tensor* k = k_bind.tensor;
-        ggml_tensor* v = v_bind.tensor;
-        ggml_tensor* z = z_bind.tensor;
-
-        // L2 normalize Q, K along D (ne0).
-        ggml_tensor* q_norm = ggml_l2_norm(ctx, q, eps);
-        ggml_tensor* k_norm = ggml_l2_norm(ctx, k, eps);
-
-        // Scale Q by 1/sqrt(D).
-        const float qScale = 1.0f / std::sqrt(static_cast<float>(D));
-        ggml_tensor* q_scaled = ggml_scale(ctx, q_norm, qScale);
-
-        // Permute Q/K/V to (D, T, H, 1) to lay tokens contiguous along ne1.
-        ggml_tensor* q_p = ggml_cont(ctx, ggml_permute(ctx, q_scaled, 0, 2, 1, 3));
-        ggml_tensor* k_p = ggml_cont(ctx, ggml_permute(ctx, k_norm,   0, 2, 1, 3));
-        ggml_tensor* v_p = ggml_cont(ctx, ggml_permute(ctx, v,        0, 2, 1, 3));
-
-        // gate/beta from (1, H, T, 1) -> (1, T, H, 1)
-        ggml_tensor* gate_p = ggml_cont(ctx, ggml_permute(ctx, gate_4d, 0, 2, 1, 3));
-        ggml_tensor* beta_p = ggml_cont(ctx, ggml_permute(ctx, beta_4d, 0, 2, 1, 3));
-
-        // Pad along ne1 (T) by pad zeros.
-        if (pad > 0)
-        {
-            q_p    = ggml_pad(ctx, q_p,    0, pad, 0, 0);
-            k_p    = ggml_pad(ctx, k_p,    0, pad, 0, 0);
-            v_p    = ggml_pad(ctx, v_p,    0, pad, 0, 0);
-            gate_p = ggml_pad(ctx, gate_p, 0, pad, 0, 0);
-            beta_p = ggml_pad(ctx, beta_p, 0, pad, 0, 0);
+            std::lock_guard<std::mutex> lk(g_gdn_chunked_cache_mutex);
+            auto it = g_gdn_chunked_cache.find(cache_key);
+            if (it != g_gdn_chunked_cache.end())
+                entry = it->second.get();
         }
 
-        // v_beta, k_beta = v_p * beta_p, k_p * beta_p (broadcast on D).
-        ggml_tensor* v_beta_full = ggml_mul(ctx, v_p, beta_p);
-        ggml_tensor* k_beta_full = ggml_mul(ctx, k_p, beta_p);
-
-        // Reshape to chunks: (D, cS, nC, H).
-        ggml_tensor* q_chunked      = ggml_reshape_4d(ctx, q_p,         D, cS, nC, H);
-        ggml_tensor* k_chunked      = ggml_reshape_4d(ctx, k_p,         D, cS, nC, H);
-        ggml_tensor* k_beta_chunked = ggml_reshape_4d(ctx, k_beta_full, D, cS, nC, H);
-        ggml_tensor* v_beta_chunked = ggml_reshape_4d(ctx, v_beta_full, D, cS, nC, H);
-        ggml_tensor* gate_chunked   = ggml_reshape_4d(ctx, gate_p,      1, cS, nC, H);
-
-        // gate_chunked: (1, cS, nC, H) -> permute (1,0,2,3) -> (cS, 1, nC, H), then cumsum.
-        ggml_tensor* gate_cs  = ggml_cont(ctx, ggml_permute(ctx, gate_chunked, 1, 0, 2, 3));
-        ggml_tensor* g_cumsum = ggml_cumsum(ctx, gate_cs);  // (cS, 1, nC, H)
-
-        // Build the per-chunk constant masks.
-        ggml_tensor* mask_ones   = ggml_fill(ctx, mask_src, 1.0f);                       // (cS, cS, 1, 1)
-        ggml_tensor* causal_mask = ggml_tri(ctx, mask_ones, GGML_TRI_TYPE_LOWER);        // strict lower
-        ggml_tensor* diag_mask   = ggml_tri(ctx, mask_ones, GGML_TRI_TYPE_LOWER_DIAG);   // lower with diag
-        ggml_tensor* identity_mask = ggml_sub(ctx, diag_mask, causal_mask);              // diagonal only
-
-        // Decay mask: exp((cumsum_j - cumsum_i)) where j>=i (lower triangle).
-        ggml_tensor* gcsJ = ggml_reshape_4d(ctx, g_cumsum, 1, cS, nC, H);
-        ggml_tensor* gcsBroadcast = ggml_repeat_4d(ctx, gcsJ, cS, cS, nC, H);
-        ggml_tensor* decay_mask_raw = ggml_sub(ctx, gcsBroadcast, g_cumsum);
-        ggml_tensor* decay_mask = ggml_mul(ctx, decay_mask_raw, diag_mask);
-        decay_mask = ggml_exp(ctx, decay_mask);
-        decay_mask = ggml_mul(ctx, decay_mask, diag_mask);
-
-        // attn_init = -(k @ k_beta^T) * decay_mask  with strict lower mask applied.
-        ggml_tensor* k_kbeta   = ggml_mul_mat(ctx, k_chunked, k_beta_chunked); // (cS, cS, nC, H)
-        ggml_tensor* k_decay   = ggml_mul(ctx, k_kbeta, decay_mask);
-        ggml_tensor* attn_init = ggml_mul(ctx, ggml_neg(ctx, k_decay), causal_mask);
-
-        // Triangular solve: (I - attn_lower) X = attn_init.
-        ggml_tensor* attn_lower = ggml_mul(ctx, attn_init, causal_mask);
-        ggml_tensor* lhs        = ggml_add(ctx, ggml_neg(ctx, attn_lower), identity_mask);
-        ggml_tensor* attn_solved = ggml_solve_tri(ctx, lhs, attn_init, true, true, false);
-        ggml_tensor* attn_lower2 = ggml_mul(ctx, attn_solved, causal_mask);
-        ggml_tensor* attn        = ggml_add(ctx, attn_lower2, identity_mask);            // (cS, cS, nC, H)
-
-        // v_new = mulmat(v_beta^T, attn) -> (D, cS, nC, H) (D=headVDim under D == K).
-        ggml_tensor* vBetaT = ggml_cont(ctx, ggml_permute(ctx, v_beta_chunked, 1, 0, 2, 3));
-        ggml_tensor* v_new  = ggml_mul_mat(ctx, vBetaT, attn);                          // (D, cS, nC, H)
-
-        // gExp = exp(g_cumsum_T) where g_cumsum_T is (1, cS, nC, H).
-        ggml_tensor* gCumsumT = ggml_cont(ctx, ggml_permute(ctx, g_cumsum, 1, 0, 2, 3));
-        ggml_tensor* gExp     = ggml_exp(ctx, gCumsumT);                                 // (1, cS, nC, H)
-
-        // kBetaGExp = k_beta * gExp (broadcast on D).
-        ggml_tensor* kBetaGExp  = ggml_mul(ctx, k_beta_chunked, gExp);
-        ggml_tensor* kBetaGExpT = ggml_cont(ctx, ggml_permute(ctx, kBetaGExp, 1, 0, 2, 3));
-        ggml_tensor* kCumdecay  = ggml_mul_mat(ctx, attn, kBetaGExpT);                  // (cS, D, nC, H)
-        kCumdecay = ggml_cont(ctx, ggml_permute(ctx, kCumdecay, 1, 0, 2, 3));            // (D, cS, nC, H)
-
-        // attn_kq = (k @ q) * decay * diag.
-        ggml_tensor* attn_kq = ggml_mul_mat(ctx, k_chunked, q_chunked);                  // (cS, cS, nC, H)
-        attn_kq = ggml_mul(ctx, attn_kq, decay_mask);
-        attn_kq = ggml_mul(ctx, attn_kq, diag_mask);
-
-        // gLast = view of last cumsum slot per chunk: (1, 1, nC, H).
-        ggml_tensor* gLast = ggml_view_4d(ctx, g_cumsum, 1, 1, nC, H,
-            g_cumsum->nb[1], g_cumsum->nb[2], g_cumsum->nb[3],
-            static_cast<std::size_t>(cS - 1) * sizeof(float));
-        gLast = ggml_cont(ctx, gLast);                                                   // (1, 1, nC, H)
-        ggml_tensor* gLastExp = ggml_exp(ctx, gLast);
-
-        // gDiff = gLast - g_cumsum, exp, reshape to (1, cS, nC, H).
-        ggml_tensor* gDiff = ggml_add(ctx, ggml_neg(ctx, g_cumsum), gLast);             // (cS, 1, nC, H)
-        ggml_tensor* gDiffExp   = ggml_exp(ctx, gDiff);
-        ggml_tensor* gDiffExpRe = ggml_reshape_4d(ctx, gDiffExp, 1, cS, nC, H);
-
-        // keyGDiff = k_chunked * gDiffExpRe (broadcast on D); transpose to (cS, D, nC, H).
-        ggml_tensor* keyGDiff  = ggml_mul(ctx, k_chunked, gDiffExpRe);
-        ggml_tensor* keyGDiffT = ggml_cont(ctx, ggml_permute(ctx, keyGDiff, 1, 0, 2, 3));
-
-        // vT = transpose v_new for chunked mulmat with attn.
-        ggml_tensor* vT = ggml_cont(ctx, ggml_permute(ctx, v_new, 1, 0, 2, 3));         // (cS, D, nC, H)
-
-        // stateT layout: ne[0]=k_dim, ne[1]=v_dim, ne[2]=1, ne[3]=H (matches Ollama's stateT).
-        // state binding from C# [H, V, K] row-major produces a GGML view with
-        // ne=(K, V, H, 1) where ne[0]=k_dim (innermost), ne[1]=v_dim. That layout
-        // already matches Ollama's stateT semantics, so we only need to reshape
-        // (D, D, H, 1) -> (D, D, 1, H) without permuting axes 0 and 1.
-        ggml_tensor* state_in = st_bind.tensor;                                          // (D, D, H, 1)
-        ggml_tensor* stateT = ggml_reshape_4d(ctx, state_in, D, D, 1, H);                // (D, D, 1, H)
-
-        // Per-chunk recurrence.
-        std::vector<ggml_tensor*> chunk_outputs(nC);
-        auto chunk_view = [&](ggml_tensor* src, int c) -> ggml_tensor* {
-            return ggml_view_4d(ctx, src, src->ne[0], src->ne[1], 1, src->ne[3],
-                src->nb[1], src->nb[2], src->nb[3],
-                static_cast<std::size_t>(c) * src->nb[2]);
-        };
-
-        for (int c = 0; c < nC; c++)
+        // ----- Cache miss: build graph + buffer once for this shape -------------
+        if (entry == nullptr)
         {
-            ggml_tensor* qChunk         = chunk_view(q_chunked,   c);  // (D, cS, 1, H)
-            ggml_tensor* vTChunk        = chunk_view(vT,          c);  // (cS, D, 1, H)
-            ggml_tensor* gExpChunk      = chunk_view(gExp,        c);  // (1, cS, 1, H)
-            ggml_tensor* kCumdecayChunk = chunk_view(kCumdecay,   c);  // (D, cS, 1, H)
-            ggml_tensor* attnChunk      = chunk_view(attn_kq,     c);  // (cS, cS, 1, H)
+            // Estimate tensor metadata budget. Each tensor uses ~256-384 bytes of
+            // metadata; we create roughly (32 + 10 * nC) tensors after hoisting qGExp
+            // out of the per-chunk loop and pre-computing gate/beta_sig on the host.
+            // Includes slack for the balanced concat tree with ~2 * nC nodes.
+            const std::size_t per_tensor_bytes = 384;
+            const std::size_t tensor_count_estimate = 256 + static_cast<std::size_t>(20 * nC);
+            std::size_t ctx_size = tensor_count_estimate * per_tensor_bytes;
+            if (ctx_size < 4 * 1024 * 1024) ctx_size = 4 * 1024 * 1024;
 
-            // v'_t = mulmat(kCumdecay, stateT) -> (cS, D, 1, H)
-            ggml_tensor* vTPrime = ggml_mul_mat(ctx, kCumdecayChunk, stateT);
+            auto new_entry = std::make_unique<GdnChunkedCacheEntry>();
+            new_entry->ctx_buffer = std::make_unique<std::uint8_t[]>(ctx_size);
 
-            // v_t_new = vT - v'_t
-            ggml_tensor* vTNew = ggml_sub(ctx, vTChunk, vTPrime);
-
-            // qGExp = q * gExp; attnInter = mulmat(stateT, qGExp) -> (D, cS, 1, H)
-            ggml_tensor* qGExp     = ggml_mul(ctx, qChunk, gExpChunk);
-            ggml_tensor* attnInter = ggml_mul_mat(ctx, stateT, qGExp);
-
-            // vAttn = mulmat(vTNew, attnChunk) -> (D, cS, 1, H)
-            ggml_tensor* vAttn = ggml_mul_mat(ctx, vTNew, attnChunk);
-
-            chunk_outputs[c] = ggml_add(ctx, attnInter, vAttn);
-
-            // State update.
-            ggml_tensor* gExpLastChunk = chunk_view(gLastExp,  c);  // (1, 1, 1, H)
-            ggml_tensor* kGDiffChunkT  = chunk_view(keyGDiffT, c);  // (cS, D, 1, H)
-            ggml_tensor* kgdMulVNew    = ggml_mul_mat(ctx, kGDiffChunkT, vTNew); // (D, D, 1, H)
-            stateT = ggml_mul(ctx, stateT, gExpLastChunk);
-            stateT = ggml_add(ctx, stateT, kgdMulVNew);
-        }
-
-        // Balanced concat tree along ne2 (chunk axis).
-        std::vector<ggml_tensor*> level = std::move(chunk_outputs);
-        while (level.size() > 1)
-        {
-            std::vector<ggml_tensor*> next;
-            next.reserve((level.size() + 1) / 2);
-            for (std::size_t i = 0; i + 1 < level.size(); i += 2)
+            ggml_init_params params = {};
+            params.mem_size = ctx_size;
+            params.mem_buffer = new_entry->ctx_buffer.get();
+            params.no_alloc = true;
+            new_entry->ctx = ggml_init(params);
+            if (new_entry->ctx == nullptr)
             {
-                next.push_back(ggml_concat(ctx, level[i], level[i + 1], 2));
+                set_last_error("GatedDeltaNetChunked: cached context init failed.");
+                return 0;
             }
-            if (level.size() % 2 == 1)
+            ggml_context* ctx = new_entry->ctx;
+
+            // Bind input/output tensors.
+            TensorBinding q_bind  = create_standard_binding(ctx, q_desc);
+            TensorBinding k_bind  = create_standard_binding(ctx, k_desc);
+            TensorBinding v_bind  = create_standard_binding(ctx, v_desc);
+            TensorBinding z_bind  = create_standard_binding(ctx, z_desc);
+            TensorBinding a_bind  = create_standard_binding(ctx, alpha_desc);
+            TensorBinding b_bind  = create_standard_binding(ctx, beta_desc);
+            TensorBinding st_bind = create_standard_binding(ctx, state_desc);
+            TensorBinding go_bind = create_standard_binding(ctx, gated_out_desc);
+
+            // Constants (per-layer): ssm_norm_w is [D]. dt_bias / a_log are no longer
+            // uploaded - gate is pre-computed on the host.
+            ggml_tensor* ssm_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+
+            // Scratch tensors for masks. ggml_fill needs a contiguous source tensor.
+            ggml_tensor* mask_src    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cS, cS, 1, 1);
+
+            // ----------- Build the graph -----------
+
+            // alpha already holds the pre-computed gate and beta already holds sigmoid(beta_raw),
+            // both in [seqLen, H] row-major which GGML binds as (H, T). Reshape to the (1, H, T, 1)
+            // 4D form expected by the per-chunk broadcasts below - no add/softplus/mul/sigmoid ops.
+            ggml_tensor* alpha = a_bind.tensor;       // (H, T) = gate in place
+            ggml_tensor* beta  = b_bind.tensor;       // (H, T) = beta_sig in place
+
+            ggml_tensor* gate_4d = ggml_reshape_4d(ctx, alpha, 1, H, T, 1);
+            ggml_tensor* beta_4d = ggml_reshape_4d(ctx, beta,  1, H, T, 1);
+
+            // Q/K/V GGML views: ne0=D, ne1=H, ne2=T, ne3=1.
+            ggml_tensor* q = q_bind.tensor;
+            ggml_tensor* k = k_bind.tensor;
+            ggml_tensor* v = v_bind.tensor;
+            ggml_tensor* z = z_bind.tensor;
+
+            // L2 normalize Q, K along D (ne0).
+            ggml_tensor* q_norm = ggml_l2_norm(ctx, q, eps);
+            ggml_tensor* k_norm = ggml_l2_norm(ctx, k, eps);
+
+            // Scale Q by 1/sqrt(D).
+            const float qScale = 1.0f / std::sqrt(static_cast<float>(D));
+            ggml_tensor* q_scaled = ggml_scale(ctx, q_norm, qScale);
+
+            // Permute Q/K/V to (D, T, H, 1) to lay tokens contiguous along ne1.
+            ggml_tensor* q_p = ggml_cont(ctx, ggml_permute(ctx, q_scaled, 0, 2, 1, 3));
+            ggml_tensor* k_p = ggml_cont(ctx, ggml_permute(ctx, k_norm,   0, 2, 1, 3));
+            ggml_tensor* v_p = ggml_cont(ctx, ggml_permute(ctx, v,        0, 2, 1, 3));
+
+            // gate/beta from (1, H, T, 1) -> (1, T, H, 1)
+            ggml_tensor* gate_p = ggml_cont(ctx, ggml_permute(ctx, gate_4d, 0, 2, 1, 3));
+            ggml_tensor* beta_p = ggml_cont(ctx, ggml_permute(ctx, beta_4d, 0, 2, 1, 3));
+
+            // Pad along ne1 (T) by pad zeros.
+            if (pad > 0)
             {
-                next.push_back(level.back());
+                q_p    = ggml_pad(ctx, q_p,    0, pad, 0, 0);
+                k_p    = ggml_pad(ctx, k_p,    0, pad, 0, 0);
+                v_p    = ggml_pad(ctx, v_p,    0, pad, 0, 0);
+                gate_p = ggml_pad(ctx, gate_p, 0, pad, 0, 0);
+                beta_p = ggml_pad(ctx, beta_p, 0, pad, 0, 0);
             }
-            level = std::move(next);
-        }
-        ggml_tensor* concat_result = level[0];                                           // (D, cS, nC, H)
 
-        // Reshape to (D, T_padded, H, 1) and slice off padding.
-        ggml_tensor* core_attn = ggml_reshape_4d(ctx, concat_result, D, cS * nC, H, 1);
-        if (pad > 0)
+            // v_beta, k_beta = v_p * beta_p, k_p * beta_p (broadcast on D).
+            ggml_tensor* v_beta_full = ggml_mul(ctx, v_p, beta_p);
+            ggml_tensor* k_beta_full = ggml_mul(ctx, k_p, beta_p);
+
+            // Reshape to chunks: (D, cS, nC, H).
+            ggml_tensor* q_chunked      = ggml_reshape_4d(ctx, q_p,         D, cS, nC, H);
+            ggml_tensor* k_chunked      = ggml_reshape_4d(ctx, k_p,         D, cS, nC, H);
+            ggml_tensor* k_beta_chunked = ggml_reshape_4d(ctx, k_beta_full, D, cS, nC, H);
+            ggml_tensor* v_beta_chunked = ggml_reshape_4d(ctx, v_beta_full, D, cS, nC, H);
+            ggml_tensor* gate_chunked   = ggml_reshape_4d(ctx, gate_p,      1, cS, nC, H);
+
+            // gate_chunked: (1, cS, nC, H) -> permute (1,0,2,3) -> (cS, 1, nC, H), then cumsum.
+            ggml_tensor* gate_cs  = ggml_cont(ctx, ggml_permute(ctx, gate_chunked, 1, 0, 2, 3));
+            ggml_tensor* g_cumsum = ggml_cumsum(ctx, gate_cs);  // (cS, 1, nC, H)
+
+            // Build the per-chunk constant masks.
+            ggml_tensor* mask_ones   = ggml_fill(ctx, mask_src, 1.0f);                       // (cS, cS, 1, 1)
+            ggml_tensor* causal_mask = ggml_tri(ctx, mask_ones, GGML_TRI_TYPE_LOWER);        // strict lower
+            ggml_tensor* diag_mask   = ggml_tri(ctx, mask_ones, GGML_TRI_TYPE_LOWER_DIAG);   // lower with diag
+            ggml_tensor* identity_mask = ggml_sub(ctx, diag_mask, causal_mask);              // diagonal only
+
+            // Decay mask: exp((cumsum_j - cumsum_i)) where j>=i (lower triangle).
+            ggml_tensor* gcsJ = ggml_reshape_4d(ctx, g_cumsum, 1, cS, nC, H);
+            ggml_tensor* gcsBroadcast = ggml_repeat_4d(ctx, gcsJ, cS, cS, nC, H);
+            ggml_tensor* decay_mask_raw = ggml_sub(ctx, gcsBroadcast, g_cumsum);
+            ggml_tensor* decay_mask = ggml_mul(ctx, decay_mask_raw, diag_mask);
+            decay_mask = ggml_exp(ctx, decay_mask);
+            decay_mask = ggml_mul(ctx, decay_mask, diag_mask);
+
+            // attn_init = -(k @ k_beta^T) * decay_mask  with strict lower mask applied.
+            ggml_tensor* k_kbeta   = ggml_mul_mat(ctx, k_chunked, k_beta_chunked); // (cS, cS, nC, H)
+            ggml_tensor* k_decay   = ggml_mul(ctx, k_kbeta, decay_mask);
+            ggml_tensor* attn_init = ggml_mul(ctx, ggml_neg(ctx, k_decay), causal_mask);
+
+            // Triangular solve: (I - attn_lower) X = attn_init.
+            ggml_tensor* attn_lower = ggml_mul(ctx, attn_init, causal_mask);
+            ggml_tensor* lhs        = ggml_add(ctx, ggml_neg(ctx, attn_lower), identity_mask);
+            ggml_tensor* attn_solved = ggml_solve_tri(ctx, lhs, attn_init, true, true, false);
+            ggml_tensor* attn_lower2 = ggml_mul(ctx, attn_solved, causal_mask);
+            ggml_tensor* attn        = ggml_add(ctx, attn_lower2, identity_mask);            // (cS, cS, nC, H)
+
+            // v_new = mulmat(v_beta^T, attn) -> (D, cS, nC, H) (D=headVDim under D == K).
+            ggml_tensor* vBetaT = ggml_cont(ctx, ggml_permute(ctx, v_beta_chunked, 1, 0, 2, 3));
+            ggml_tensor* v_new  = ggml_mul_mat(ctx, vBetaT, attn);                          // (D, cS, nC, H)
+
+            // gExp = exp(g_cumsum_T) where g_cumsum_T is (1, cS, nC, H).
+            ggml_tensor* gCumsumT = ggml_cont(ctx, ggml_permute(ctx, g_cumsum, 1, 0, 2, 3));
+            ggml_tensor* gExp     = ggml_exp(ctx, gCumsumT);                                 // (1, cS, nC, H)
+
+            // kBetaGExp = k_beta * gExp (broadcast on D).
+            ggml_tensor* kBetaGExp  = ggml_mul(ctx, k_beta_chunked, gExp);
+            ggml_tensor* kBetaGExpT = ggml_cont(ctx, ggml_permute(ctx, kBetaGExp, 1, 0, 2, 3));
+            ggml_tensor* kCumdecay  = ggml_mul_mat(ctx, attn, kBetaGExpT);                  // (cS, D, nC, H)
+            kCumdecay = ggml_cont(ctx, ggml_permute(ctx, kCumdecay, 1, 0, 2, 3));            // (D, cS, nC, H)
+
+            // attn_kq = (k @ q) * decay * diag.
+            ggml_tensor* attn_kq = ggml_mul_mat(ctx, k_chunked, q_chunked);                  // (cS, cS, nC, H)
+            attn_kq = ggml_mul(ctx, attn_kq, decay_mask);
+            attn_kq = ggml_mul(ctx, attn_kq, diag_mask);
+
+            // gLast = view of last cumsum slot per chunk: (1, 1, nC, H).
+            ggml_tensor* gLast = ggml_view_4d(ctx, g_cumsum, 1, 1, nC, H,
+                g_cumsum->nb[1], g_cumsum->nb[2], g_cumsum->nb[3],
+                static_cast<std::size_t>(cS - 1) * sizeof(float));
+            gLast = ggml_cont(ctx, gLast);                                                   // (1, 1, nC, H)
+            ggml_tensor* gLastExp = ggml_exp(ctx, gLast);
+
+            // gDiff = gLast - g_cumsum, exp, reshape to (1, cS, nC, H).
+            ggml_tensor* gDiff = ggml_add(ctx, ggml_neg(ctx, g_cumsum), gLast);             // (cS, 1, nC, H)
+            ggml_tensor* gDiffExp   = ggml_exp(ctx, gDiff);
+            ggml_tensor* gDiffExpRe = ggml_reshape_4d(ctx, gDiffExp, 1, cS, nC, H);
+
+            // keyGDiff = k_chunked * gDiffExpRe (broadcast on D); transpose to (cS, D, nC, H).
+            ggml_tensor* keyGDiff  = ggml_mul(ctx, k_chunked, gDiffExpRe);
+            ggml_tensor* keyGDiffT = ggml_cont(ctx, ggml_permute(ctx, keyGDiff, 1, 0, 2, 3));
+
+            // vT = transpose v_new for chunked mulmat with attn.
+            ggml_tensor* vT = ggml_cont(ctx, ggml_permute(ctx, v_new, 1, 0, 2, 3));         // (cS, D, nC, H)
+
+            // Hoist `q * gExp` out of the per-chunk loop: computing it over the whole
+            // (D, cS, nC, H) layout once is one Metal dispatch instead of `nC` tiny ones.
+            ggml_tensor* qTimesGExp = ggml_mul(ctx, q_chunked, gExp);                        // (D, cS, nC, H)
+
+            // stateT layout: ne[0]=k_dim, ne[1]=v_dim, ne[2]=1, ne[3]=H (matches Ollama's stateT).
+            // state binding from C# [H, V, K] row-major produces a GGML view with
+            // ne=(K, V, H, 1) where ne[0]=k_dim (innermost), ne[1]=v_dim. That layout
+            // already matches Ollama's stateT semantics, so we only need to reshape
+            // (D, D, H, 1) -> (D, D, 1, H) without permuting axes 0 and 1.
+            ggml_tensor* state_in = st_bind.tensor;                                          // (D, D, H, 1)
+            ggml_tensor* stateT = ggml_reshape_4d(ctx, state_in, D, D, 1, H);                // (D, D, 1, H)
+
+            // Per-chunk recurrence.
+            std::vector<ggml_tensor*> chunk_outputs(nC);
+            auto chunk_view = [&](ggml_tensor* src, int c) -> ggml_tensor* {
+                return ggml_view_4d(ctx, src, src->ne[0], src->ne[1], 1, src->ne[3],
+                    src->nb[1], src->nb[2], src->nb[3],
+                    static_cast<std::size_t>(c) * src->nb[2]);
+            };
+
+            for (int c = 0; c < nC; c++)
+            {
+                ggml_tensor* vTChunk        = chunk_view(vT,          c);  // (cS, D, 1, H)
+                ggml_tensor* qGExpChunk     = chunk_view(qTimesGExp,  c);  // (D, cS, 1, H) - pre-hoisted
+                ggml_tensor* kCumdecayChunk = chunk_view(kCumdecay,   c);  // (D, cS, 1, H)
+                ggml_tensor* attnChunk      = chunk_view(attn_kq,     c);  // (cS, cS, 1, H)
+
+                // v'_t = mulmat(kCumdecay, stateT) -> (cS, D, 1, H)
+                ggml_tensor* vTPrime = ggml_mul_mat(ctx, kCumdecayChunk, stateT);
+
+                // v_t_new = vT - v'_t
+                ggml_tensor* vTNew = ggml_sub(ctx, vTChunk, vTPrime);
+
+                // attnInter = mulmat(stateT, qGExp) -> (D, cS, 1, H).
+                ggml_tensor* attnInter = ggml_mul_mat(ctx, stateT, qGExpChunk);
+
+                // vAttn = mulmat(vTNew, attnChunk) -> (D, cS, 1, H)
+                ggml_tensor* vAttn = ggml_mul_mat(ctx, vTNew, attnChunk);
+
+                chunk_outputs[c] = ggml_add(ctx, attnInter, vAttn);
+
+                // State update.
+                ggml_tensor* gExpLastChunk = chunk_view(gLastExp,  c);  // (1, 1, 1, H)
+                ggml_tensor* kGDiffChunkT  = chunk_view(keyGDiffT, c);  // (cS, D, 1, H)
+                ggml_tensor* kgdMulVNew    = ggml_mul_mat(ctx, kGDiffChunkT, vTNew); // (D, D, 1, H)
+                stateT = ggml_mul(ctx, stateT, gExpLastChunk);
+                stateT = ggml_add(ctx, stateT, kgdMulVNew);
+            }
+
+            // Balanced concat tree along ne2 (chunk axis).
+            std::vector<ggml_tensor*> level = std::move(chunk_outputs);
+            while (level.size() > 1)
+            {
+                std::vector<ggml_tensor*> next;
+                next.reserve((level.size() + 1) / 2);
+                for (std::size_t i = 0; i + 1 < level.size(); i += 2)
+                {
+                    next.push_back(ggml_concat(ctx, level[i], level[i + 1], 2));
+                }
+                if (level.size() % 2 == 1)
+                {
+                    next.push_back(level.back());
+                }
+                level = std::move(next);
+            }
+            ggml_tensor* concat_result = level[0];                                           // (D, cS, nC, H)
+
+            // Reshape to (D, T_padded, H, 1) and slice off padding.
+            ggml_tensor* core_attn = ggml_reshape_4d(ctx, concat_result, D, cS * nC, H, 1);
+            if (pad > 0)
+            {
+                ggml_tensor* sliced = ggml_view_4d(ctx, core_attn, D, T, H, 1,
+                    core_attn->nb[1], core_attn->nb[2], core_attn->nb[3], 0);
+                core_attn = ggml_cont(ctx, sliced);
+            }
+
+            // RMSNorm + per-D weight.
+            ggml_tensor* attn_rms = ggml_rms_norm(ctx, core_attn, eps);
+            attn_rms = ggml_mul(ctx, attn_rms, ssm_norm_t);
+
+            // z permute (D, H, T, 1) -> (D, T, H, 1), silu, multiply.
+            ggml_tensor* z_p     = ggml_cont(ctx, ggml_permute(ctx, z, 0, 2, 1, 3));
+            ggml_tensor* z_silu  = ggml_silu(ctx, z_p);
+            ggml_tensor* gated   = ggml_mul(ctx, attn_rms, z_silu);                          // (D, T, H, 1)
+
+            // Permute back to (D, H, T, 1) and copy into output binding.
+            ggml_tensor* gated_out = ggml_cont(ctx, ggml_permute(ctx, gated, 0, 2, 1, 3));
+            ggml_tensor* out_cpy   = ggml_cpy(ctx, gated_out, go_bind.tensor);
+
+            // Write the updated state back. stateT (D=k, D=v, 1, H) is already in the same
+            // semantic layout as state_in, just reshape (D, D, 1, H) -> (D, D, H, 1) and copy.
+            ggml_tensor* stateT_cont = ggml_cont(ctx, stateT);
+            ggml_tensor* state_out_4d = ggml_reshape_4d(ctx, stateT_cont, D, D, H, 1);
+            ggml_tensor* state_cpy = ggml_cpy(ctx, state_out_4d, state_in);
+
+            ggml_set_output(out_cpy);
+            ggml_set_output(state_cpy);
+
+            new_entry->graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
+            ggml_build_forward_expand(new_entry->graph, out_cpy);
+            ggml_build_forward_expand(new_entry->graph, state_cpy);
+
+            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            if (!buffer.value)
+            {
+                set_last_error("GatedDeltaNetChunked: buffer alloc failed.");
+                return 0;
+            }
+            new_entry->buffer = std::move(buffer);
+
+            // Persist storage tensor handles + sizes for the per-call upload/download.
+            new_entry->q_storage = q_bind.storage;
+            new_entry->k_storage = k_bind.storage;
+            new_entry->v_storage = v_bind.storage;
+            new_entry->z_storage = z_bind.storage;
+            new_entry->alpha_storage = a_bind.storage;
+            new_entry->beta_storage  = b_bind.storage;
+            new_entry->state_storage = st_bind.storage;
+            new_entry->ssm_norm_storage = ssm_norm_t;
+            new_entry->gated_out_storage = go_bind.storage;
+
+            new_entry->q_bytes = q_bind.raw_bytes;
+            new_entry->k_bytes = k_bind.raw_bytes;
+            new_entry->v_bytes = v_bind.raw_bytes;
+            new_entry->z_bytes = z_bind.raw_bytes;
+            new_entry->alpha_bytes = a_bind.raw_bytes;
+            new_entry->beta_bytes  = b_bind.raw_bytes;
+            new_entry->state_bytes = st_bind.raw_bytes;
+            new_entry->ssm_norm_bytes = static_cast<std::size_t>(D) * sizeof(float);
+            new_entry->gated_out_bytes = go_bind.raw_bytes;
+
+            // Publish to the cache. If another thread raced us in here we keep the
+            // first published entry (deterministic) and let ours go out of scope.
+            std::lock_guard<std::mutex> lk(g_gdn_chunked_cache_mutex);
+            auto [it, inserted] = g_gdn_chunked_cache.emplace(cache_key, std::move(new_entry));
+            entry = it->second.get();
+            // Register the atexit cleanup hook on first cache insertion. By now the
+            // Metal device singleton is fully initialized (we just allocated a
+            // buffer on it), so our atexit fires before its destructor.
+            ensure_gdn_cache_cleanup_registered();
+        }
+
+        // ----- Cache hit path: rebind data, run, and copy outputs back ----------
         {
-            ggml_tensor* sliced = ggml_view_4d(ctx, core_attn, D, T, H, 1,
-                core_attn->nb[1], core_attn->nb[2], core_attn->nb[3], 0);
-            core_attn = ggml_cont(ctx, sliced);
+            std::lock_guard<std::mutex> entry_lk(entry->compute_mutex);
+
+            ggml_backend_tensor_set(entry->q_storage,    q_desc.data,     0, entry->q_bytes);
+            ggml_backend_tensor_set(entry->k_storage,    k_desc.data,     0, entry->k_bytes);
+            ggml_backend_tensor_set(entry->v_storage,    v_desc.data,     0, entry->v_bytes);
+            ggml_backend_tensor_set(entry->z_storage,    z_desc.data,     0, entry->z_bytes);
+            ggml_backend_tensor_set(entry->alpha_storage, alpha_desc.data, 0, entry->alpha_bytes);
+            ggml_backend_tensor_set(entry->beta_storage,  beta_desc.data,  0, entry->beta_bytes);
+            ggml_backend_tensor_set(entry->state_storage, state_desc.data, 0, entry->state_bytes);
+            ggml_backend_tensor_set(entry->ssm_norm_storage, ssm_norm_w_data, 0, entry->ssm_norm_bytes);
+
+            ggml_status status = ggml_backend_graph_compute(g_backend, entry->graph);
+            if (status != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("GatedDeltaNetChunked: graph compute failed.");
+                return 0;
+            }
+            ggml_backend_synchronize(g_backend);
+
+            ggml_backend_tensor_get(entry->gated_out_storage, gated_out_desc.data, 0, entry->gated_out_bytes);
+            ggml_backend_tensor_get(entry->state_storage,     state_desc.data,     0, entry->state_bytes);
         }
-
-        // RMSNorm + per-D weight.
-        ggml_tensor* attn_rms = ggml_rms_norm(ctx, core_attn, eps);
-        attn_rms = ggml_mul(ctx, attn_rms, ssm_norm_t);
-
-        // z permute (D, H, T, 1) -> (D, T, H, 1), silu, multiply.
-        ggml_tensor* z_p     = ggml_cont(ctx, ggml_permute(ctx, z, 0, 2, 1, 3));
-        ggml_tensor* z_silu  = ggml_silu(ctx, z_p);
-        ggml_tensor* gated   = ggml_mul(ctx, attn_rms, z_silu);                          // (D, T, H, 1)
-
-        // Permute back to (D, H, T, 1) and copy into output binding.
-        ggml_tensor* gated_out = ggml_cont(ctx, ggml_permute(ctx, gated, 0, 2, 1, 3));
-        ggml_tensor* out_cpy   = ggml_cpy(ctx, gated_out, go_bind.tensor);
-
-        // Write the updated state back. stateT (D=k, D=v, 1, H) is already in the same
-        // semantic layout as state_in, just reshape (D, D, 1, H) -> (D, D, H, 1) and copy.
-        ggml_tensor* stateT_cont = ggml_cont(ctx, stateT);
-        ggml_tensor* state_out_4d = ggml_reshape_4d(ctx, stateT_cont, D, D, H, 1);
-        ggml_tensor* state_cpy = ggml_cpy(ctx, state_out_4d, state_in);
-
-        ggml_set_output(out_cpy);
-        ggml_set_output(state_cpy);
-
-        ggml_cgraph* graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
-        ggml_build_forward_expand(graph, out_cpy);
-        ggml_build_forward_expand(graph, state_cpy);
-
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (!buffer.value)
-        {
-            set_last_error("GatedDeltaNetChunked: buffer alloc failed.");
-            return 0;
-        }
-
-        // Upload all input data.
-        upload_binding(q_bind,  q_desc.data,     q_bind.raw_bytes);
-        upload_binding(k_bind,  k_desc.data,     k_bind.raw_bytes);
-        upload_binding(v_bind,  v_desc.data,     v_bind.raw_bytes);
-        upload_binding(z_bind,  z_desc.data,     z_bind.raw_bytes);
-        upload_binding(a_bind,  alpha_desc.data, a_bind.raw_bytes);
-        upload_binding(b_bind,  beta_desc.data,  b_bind.raw_bytes);
-        upload_binding(st_bind, state_desc.data, st_bind.raw_bytes);
-
-        ggml_backend_tensor_set(dt_bias_t,  dt_bias_data,    0, static_cast<std::size_t>(H) * sizeof(float));
-        ggml_backend_tensor_set(a_log_t,    a_log_data,      0, static_cast<std::size_t>(H) * sizeof(float));
-        ggml_backend_tensor_set(ssm_norm_t, ssm_norm_w_data, 0, static_cast<std::size_t>(D) * sizeof(float));
-
-        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS)
-        {
-            set_last_error("GatedDeltaNetChunked: graph compute failed.");
-            return 0;
-        }
-        ggml_backend_synchronize(g_backend);
-
-        // Download outputs.
-        ggml_backend_tensor_get(go_bind.storage, gated_out_desc.data, 0, go_bind.raw_bytes);
-        ggml_backend_tensor_get(st_bind.storage, state_desc.data,     0, st_bind.raw_bytes);
 
         clear_last_error();
         return 1;

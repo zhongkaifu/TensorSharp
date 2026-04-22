@@ -209,6 +209,11 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
+# 交互式逐轮对话（REPL），支持 KV 缓存复用与斜杠命令
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal --interactive
+./TensorSharp.Cli --model <model.gguf> --backend ggml_metal -i \
+    --system "你是一名简洁的助手。" --temperature 0.7 --top-p 0.9 --think
+
 # 图像推理（Gemma 3/4，Qwen 3.5）
 ./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
@@ -269,6 +274,9 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
 | `--backend <type>` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
+| `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
+| `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
+| `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
 | `--think` | 启用思维链/推理模式 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件 |
 | `--temperature <f>` | 采样温度（0 = 贪心） |
@@ -305,6 +313,63 @@ cd TensorSharp.Cli/bin
 {"id": "q2", "messages": [{"role": "user", "content": "Write a haiku."}], "max_tokens": 100, "temperature": 0.8}
 ```
 
+**交互式 REPL 命令：**
+
+通过 `--interactive` / `-i` 启动后，可使用斜杠命令驱动当前会话。在 REPL 中输入 `/help`（或 `/?`）可查看相同的命令列表。任何不以 `/` 开头的输入都会被视为一轮用户消息。
+
+每轮提示符前的状态行会汇总当前状态——模型、后端、架构、上下文长度、投影器、对话深度，以及为下一轮排队的附件数量（例如 `[turn 3 (2 attachments pending)]> `）。生成过程中按 Ctrl+C 可中断当前回复；在提示符处按 Ctrl+C 可退出。
+
+会话控制：
+
+| 命令 | 说明 |
+|---|---|
+| `/help`、`/?` | 显示全部交互命令 |
+| `/exit`、`/quit` | 退出当前会话 |
+| `/reset`、`/new` | 清空对话历史与 KV 缓存 |
+| `/history` | 打印对话历史 |
+| `/save <文件>` | 将当前对话追加写入 UTF-8 文件 |
+| `/system <文本>` | 设置系统提示词（参数为空表示清空），并重置 KV 缓存 |
+| `/think on\|off` | 切换思维链/推理模式（仅对支持的模型生效） |
+| `/multiline on\|off` | 切换多行输入（在单独一行输入 `.` 结束消息） |
+
+模型与运行时：
+
+| 命令 | 说明 |
+|---|---|
+| `/info`、`/status` | 显示当前加载的模型、后端、架构、上下文/词表大小、投影器、对话深度与待发送附件 |
+| `/model <路径>` | 在当前后端上加载另一个 `.gguf` 模型（会重置会话） |
+| `/backend <名称>` | 用其他后端重新加载当前模型：`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` |
+| `/mmproj <路径>` | 为当前模型加载（或替换）多模态投影器。别名：`/projector` |
+
+采样（实时生效，跨多轮持久化）：
+
+| 命令 | 说明 |
+|---|---|
+| `/sampling`、`/show` | 打印当前采样配置 |
+| `/max <N>` | 单次回复最大 token 数 |
+| `/temp <float>` | 采样温度（0 = 贪心） |
+| `/topk <int>` | Top-K 过滤（0 = 关闭） |
+| `/topp <float>` | Top-P / Nucleus 阈值（1.0 = 关闭） |
+| `/minp <float>` | Min-P 过滤（0 = 关闭） |
+| `/repeat <float>` | 重复惩罚（1.0 = 关闭） |
+| `/presence <float>` | 存在惩罚 |
+| `/frequency <float>` | 频率惩罚 |
+| `/seed <int>` | 随机种子（-1 = 非确定性） |
+| `/stop <文本>` | 追加一条停止序列 |
+| `/clearstop` | 清空所有停止序列 |
+
+附件上传（排队到下一轮，发送后自动清空）：
+
+| 命令 | 说明 |
+|---|---|
+| `/image <路径>`、`/img <路径>` | 附加一张图像（仅对视觉模型有效） |
+| `/audio <路径>` | 附加一个音频文件（Gemma 4） |
+| `/video <路径>`、`/vid <路径>` | 附加视频，自动抽取关键帧（Gemma 4） |
+| `/text <路径>`、`/file <路径>`、`/txt <路径>` | 将 UTF-8 文本/Markdown/CSV/代码文件内联到下一轮提示词中（超大文件会按 token 预算自动截断） |
+| `/clearattach` | 清空尚未发送的图像/音频/视频/文本附件 |
+
+路径支持单引号或双引号，因此可以直接在 macOS 上从 Finder 拖拽文件到终端。多模态命令需要先加载多模态投影器——在启动时通过 `--mmproj` 指定，或在 REPL 中用 `/mmproj <路径>` 加载。
+
 ### Web 应用
 
 ```bash
@@ -318,6 +383,12 @@ cd TensorSharp.Server/bin
 
 # 多模态模型：同时显式指定投影器
 ./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda
+
+# 配置服务端默认采样参数（仅在请求未自行覆盖时生效）
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
+    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
+    --stop "</s>" --stop "<|endoftext|>"
 ```
 
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
@@ -344,6 +415,20 @@ cd TensorSharp.Server/bin
 | `--mmproj <path>` | 多模态投影器 GGUF（仅给文件名时按模型目录解析；传 `none` 可显式禁用）。需要先指定 `--model`。 |
 | `--backend <type>` | 默认计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
 | `--max-tokens <N>` | 当请求未携带 max-tokens 时使用的默认上限（默认：`20000`） |
+| `--temperature <f>` | 当请求未提供时使用的默认采样温度（`0` = 贪心） |
+| `--top-k <N>` | 当请求未提供时使用的默认 Top-K 过滤（`0` = 关闭） |
+| `--top-p <f>` | 当请求未提供时使用的默认 Nucleus 采样阈值（`1.0` = 关闭） |
+| `--min-p <f>` | 当请求未提供时使用的默认 min-p 过滤（`0` = 关闭） |
+| `--repeat-penalty <f>` | 当请求未提供时使用的默认重复惩罚（`1.0` = 无） |
+| `--presence-penalty <f>` | 当请求未提供时使用的默认存在惩罚（`0` = 关闭） |
+| `--frequency-penalty <f>` | 当请求未提供时使用的默认频率惩罚（`0` = 关闭） |
+| `--seed <N>` | 当请求未提供时使用的默认随机种子（`-1` = 非确定性） |
+| `--stop <string>` | 默认停止序列（可重复指定）。请求体里的 `stop`/`stop_sequences` 会**完全替换**默认列表，而不是与之合并。 |
+
+请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
+`repeat_penalty`、`presence_penalty`、`frequency_penalty`、`seed`、
+`stop`/`stop_sequences`）始终优先于上述服务端默认值；这些默认值仅
+用于填充客户端未指定的字段。
 
 **运行时环境变量：**
 
@@ -354,9 +439,24 @@ cd TensorSharp.Server/bin
 | `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
 | `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
 | `PORT` / `ASPNETCORE_URLS` | 标准 ASP.NET Core 监听配置（默认端口：`5000`） |
+| `TENSORSHARP_TEMPERATURE` | `--temperature` 与请求体均未指定时的默认采样温度 |
+| `TENSORSHARP_TOP_K` | `--top-k` 与请求体均未指定时的默认 Top-K |
+| `TENSORSHARP_TOP_P` | `--top-p` 与请求体均未指定时的默认 Top-P |
+| `TENSORSHARP_MIN_P` | `--min-p` 与请求体均未指定时的默认 min-P |
+| `TENSORSHARP_REPEAT_PENALTY` | `--repeat-penalty` 与请求体均未指定时的默认重复惩罚 |
+| `TENSORSHARP_PRESENCE_PENALTY` | `--presence-penalty` 与请求体均未指定时的默认存在惩罚 |
+| `TENSORSHARP_FREQUENCY_PENALTY` | `--frequency-penalty` 与请求体均未指定时的默认频率惩罚 |
+| `TENSORSHARP_SEED` | `--seed` 与请求体均未指定时的默认随机种子 |
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+
+采样参数的优先级（从高到低）：
+
+1. API 请求 JSON 中的字段（如 `temperature`、`top_p`、`stop`）。
+2. 服务端命令行参数（如 `--temperature`、`--top-p`、`--stop`）。
+3. 上面列出的 `TENSORSHARP_*` 环境变量。
+4. `SamplingConfig` 内置默认值（`temperature=1.0`、`top_k=0`、`top_p=1.0`、`min_p=0`、`repeat_penalty=1.0`、存在/频率惩罚均为 `0`、`seed=-1`、无停止序列）。
 
 ### 服务端日志
 

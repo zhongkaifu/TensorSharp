@@ -263,6 +263,25 @@ internal enum GgmlIndexReductionOp
             long m2RawBytes);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedFFNSwiGLUQuantF32(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps,
+            IntPtr gateUpData,
+            int gateUpGgmlType,
+            long gateUpNe0,
+            long gateUpNe1,
+            long gateUpRawBytes,
+            IntPtr downData,
+            int downGgmlType,
+            long downNe0,
+            long downNe1,
+            long downRawBytes,
+            int halfDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetRowsQuantF32(
             GgmlTensorView2D result,
             IntPtr srcData,
@@ -598,6 +617,13 @@ internal enum GgmlIndexReductionOp
             GgmlTensorView4D b);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedActMulSplitF32(
+            int op,
+            GgmlTensorView2D result,
+            GgmlTensorView2D gateUp,
+            int halfDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_BinaryScalarF32(
             int op,
             GgmlTensorView4D result,
@@ -763,6 +789,23 @@ internal enum GgmlIndexReductionOp
                 residual, input, m2Data, m2GgmlType, m2Ne0, m2Ne1, m2RawBytes), "fused_matmul_quant_add");
         }
 
+        public static void FusedFFNSwiGLUQuant(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps,
+            IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
+            int halfDim)
+        {
+            CheckResult(TSGgml_FusedFFNSwiGLUQuantF32(
+                residual, input, normWeightData, normWeightCount, eps,
+                gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
+                downData, downGgmlType, downNe0, downNe1, downRawBytes,
+                halfDim), "fused_ffn_swiglu_quant");
+        }
+
         public static void GetRowsQuant(GgmlTensorView2D result, IntPtr srcData, int srcGgmlType, long srcNe0, long srcNe1, long srcRawBytes, GgmlContiguousTensor indices)
         {
             CheckResult(TSGgml_GetRowsQuantF32(result, srcData, srcGgmlType, srcNe0, srcNe1, srcRawBytes, indices), "get_rows_quant");
@@ -917,6 +960,11 @@ internal enum GgmlIndexReductionOp
         public static void FusedActMul(GgmlFusedActMulOp op, GgmlTensorView4D result, GgmlTensorView4D a, GgmlTensorView4D b)
         {
             CheckResult(TSGgml_FusedActMulF32((int)op, result, a, b), op.ToString());
+        }
+
+        public static void FusedActMulSplit(GgmlFusedActMulOp op, GgmlTensorView2D result, GgmlTensorView2D gateUp, int halfDim)
+        {
+            CheckResult(TSGgml_FusedActMulSplitF32((int)op, result, gateUp, halfDim), op.ToString() + "Split");
         }
 
         public static void BinaryScalar(GgmlBinaryScalarOp op, GgmlTensorView4D result, GgmlTensorView4D src, float scalar)
