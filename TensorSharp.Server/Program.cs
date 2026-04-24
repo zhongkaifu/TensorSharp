@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -17,6 +17,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Logging;
+using TensorSharp.Runtime;
 using TensorSharp.Server;
 using TensorSharp.Server.Endpoints;
 using TensorSharp.Server.Hosting;
@@ -25,6 +26,9 @@ using TensorSharp.Server.ProtocolAdapters;
 
 const string ListenAddress = "http://0.0.0.0:5000";
 const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
+
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+ConsoleBanner.Print();
 
 string baseDirectory = AppContext.BaseDirectory;
 ServerHostingOptions hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);

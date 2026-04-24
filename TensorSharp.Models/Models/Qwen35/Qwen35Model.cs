@@ -925,9 +925,69 @@ namespace TensorSharp.Models
             // into the FullAttention call: input norm + QKV is fused inside FullAttention, and
             // when the GGML backend is available the output projection is also fused with the
             // residual add (FusedMatMulQuantAdd) so the residual lives entirely on the GPU.
-            Tensor attnOut = fusedDecodeApplied
-                ? null
-                : FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos, residual: hidden);
+            // Fused outproj+FFN for attention layers: when the fused attention layer
+            // decode is NOT used and the layer is dense FFN (not MoE), fuse the attention
+            // output projection + residual + FFN into one GPU dispatch.
+            bool canFuseAttnOutFFN = !fusedDecodeApplied && IsGgmlBackend
+                && !(_isMoeLayer != null && _isMoeLayer[layer])
+                && _attnOutputQW[layer] != null
+                && _postAttnNormW[layer] != null
+                && _ffnGateUpQW[layer] != null
+                && _ffnDownQW[layer] != null;
+
+            Tensor attnOut;
+            if (canFuseAttnOutFFN)
+                attnOut = FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos,
+                    residual: null, skipOutputProj: true);
+            else
+                attnOut = fusedDecodeApplied ? null
+                    : FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos, residual: hidden);
+
+            bool profilePrefill = _profilePrefillStages && seqLen > 1;
+            long ffnStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+
+            if (canFuseAttnOutFFN && attnOut != null)
+            {
+                int intermSize = Config.IntermediateSize;
+                int halfDim = intermSize > 0 ? intermSize : (int)(_ffnGateUpQW[layer].Ne1 / 2);
+
+                if (halfDim > 0 && hidden.DimensionCount == 2 && attnOut.DimensionCount == 2
+                    && hidden.Sizes[0] == attnOut.Sizes[0])
+                {
+                    try
+                    {
+                        long t0 = Stopwatch.GetTimestamp();
+                        GgmlBasicOps.FusedOutProjFFN(
+                            hidden, attnOut,
+                            _attnOutputQW[layer].CacheKey, _attnOutputQW[layer].GgmlType,
+                            _attnOutputQW[layer].Ne0, _attnOutputQW[layer].Ne1, _attnOutputQW[layer].RawBytes,
+                            _postAttnNormW[layer], Config.Eps,
+                            _ffnGateUpQW[layer].CacheKey, _ffnGateUpQW[layer].GgmlType,
+                            _ffnGateUpQW[layer].Ne0, _ffnGateUpQW[layer].Ne1, _ffnGateUpQW[layer].RawBytes,
+                            _ffnDownQW[layer].CacheKey, _ffnDownQW[layer].GgmlType,
+                            _ffnDownQW[layer].Ne0, _ffnDownQW[layer].Ne1, _ffnDownQW[layer].RawBytes,
+                            halfDim);
+                        _linearTicks += Stopwatch.GetTimestamp() - t0;
+                        attnOut.Dispose();
+                        if (profilePrefill)
+                            _prefillAttnFfnTicks += Stopwatch.GetTimestamp() - ffnStart;
+                        return hidden;
+                    }
+                    catch { /* fall through */ }
+                }
+
+                // Fallback: separate output proj + residual.
+                if (TryLinearAddInto(hidden, attnOut, _attnOutputQW[layer]))
+                    attnOut.Dispose();
+                else
+                {
+                    var o = LinearForwardCached(attnOut, _attnOutputQW[layer], _attnOutputF32[layer]);
+                    attnOut.Dispose();
+                    Ops.Add(hidden, hidden, o);
+                    o.Dispose();
+                }
+                attnOut = null;
+            }
 
             if (attnOut != null)
             {
@@ -935,17 +995,9 @@ namespace TensorSharp.Models
                 attnOut.Dispose();
             }
 
-            bool profilePrefill = _profilePrefillStages && seqLen > 1;
-            long ffnStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
-
-            // Fuse post-attn norm + first FFN/MoE projection. For MoE this fusion is not yet
-            // applicable to the batched MoE kernel so we keep the explicit norm; for dense FFN
-            // we route through FFNCachedFused which fuses norm + gate.
             Tensor ffnOut;
             if (_isMoeLayer != null && _isMoeLayer[layer])
             {
-                // Decode hot path: do RMSNorm on CPU into the pre-allocated input buffer
-                // (saves a Metal command buffer + a tensor allocation per MoE layer per token).
                 Tensor normed2;
                 bool ownsNormed2 = true;
                 if (seqLen == 1 && IsGgmlBackend && _moeTokenInput != null
@@ -957,20 +1009,12 @@ namespace TensorSharp.Models
                     ownsNormed2 = false;
                 }
                 else
-                {
                     normed2 = RMSNormOpCached(hidden, _postAttnNormW[layer]);
-                }
 
-                // Decode hot path: full MoE + shared expert + residual fused into one GGML graph.
                 if (seqLen == 1 && TryMoEResidualDecode(hidden, normed2, layer))
-                {
                     ffnOut = null;
-                }
                 else
-                {
                     ffnOut = MoEForward(normed2, layer, seqLen);
-                }
-
                 if (ownsNormed2)
                     normed2.Dispose();
             }
@@ -979,8 +1023,6 @@ namespace TensorSharp.Models
                 ffnOut = FFNCachedFused(hidden, _postAttnNormW[layer], layer, seqLen);
             }
 
-            // For dense FFN we may have already accumulated into hidden via FusedMatMulQuantAdd;
-            // in that case ffnOut is null.
             if (ffnOut != null)
             {
                 Ops.Add(hidden, hidden, ffnOut);
@@ -994,7 +1036,7 @@ namespace TensorSharp.Models
         }
 
         private unsafe Tensor FullAttention(Tensor input, Tensor inputNormW, int layer, int seqLen, int startPos,
-            Tensor residual = null)
+            Tensor residual = null, bool skipOutputProj = false)
         {
             int numHeads = Config.NumHeads;
             int numKVHeads = Config.NumKVHeads;
@@ -1188,6 +1230,16 @@ namespace TensorSharp.Models
 
             bool ownsAttnOutput = !(seqLen == 1 && _attnDecodeOutBuf != null && ReferenceEquals(attnOutput, _attnDecodeOutBuf));
 
+            // When skipOutputProj is set, return the raw attention output (post sigmoid gate)
+            // so the caller can fuse output_proj + FFN into one dispatch.
+            if (skipOutputProj)
+            {
+                Tensor rawOut = ownsAttnOutput ? attnOutput : Ops.NewContiguous(attnOutput);
+                if (profilePrefill) _prefillAttnOutputTicks += Stopwatch.GetTimestamp() - stageStart;
+                _attnTicks += Stopwatch.GetTimestamp() - t0;
+                return rawOut;
+            }
+
             // Fast path: fuse output projection with the residual add (eliminates the
             // intermediate output tensor and one GPU sync). Only valid for matching shapes.
             if (residual != null
@@ -1274,11 +1326,35 @@ namespace TensorSharp.Models
             float* gDst = GetFloatPtr(gateTensor);
             int headBytes = headDim * sizeof(float);
 
-            for (int s = 0; s < seqLen; s++)
+            if (seqLen > 1)
             {
-                float* srcRow = src + (long)s * numHeads * dimPerHead;
-                float* qRow = qDst + (long)s * totalPerToken;
-                float* gRow = gDst + (long)s * totalPerToken;
+                // Prefill path: parallelize across tokens. Each token's deinterleave
+                // is independent, so this scales linearly with CPU core count.
+                long srcL = (long)src, qDstL = (long)qDst, gDstL = (long)gDst;
+                int capturedNumHeads = numHeads;
+                int capturedDimPerHead = dimPerHead;
+                int capturedTotalPerToken = totalPerToken;
+                int capturedHeadDim = headDim;
+                int capturedHeadBytes = headBytes;
+
+                Parallel.For(0, seqLen, s =>
+                {
+                    float* srcRow = (float*)srcL + (long)s * capturedNumHeads * capturedDimPerHead;
+                    float* qRow = (float*)qDstL + (long)s * capturedTotalPerToken;
+                    float* gRow = (float*)gDstL + (long)s * capturedTotalPerToken;
+                    for (int h = 0; h < capturedNumHeads; h++)
+                    {
+                        float* srcHead = srcRow + h * capturedDimPerHead;
+                        Buffer.MemoryCopy(srcHead, qRow + h * capturedHeadDim, capturedHeadBytes, capturedHeadBytes);
+                        Buffer.MemoryCopy(srcHead + capturedHeadDim, gRow + h * capturedHeadDim, capturedHeadBytes, capturedHeadBytes);
+                    }
+                });
+            }
+            else
+            {
+                float* srcRow = src;
+                float* qRow = qDst;
+                float* gRow = gDst;
                 for (int h = 0; h < numHeads; h++)
                 {
                     float* srcHead = srcRow + h * dimPerHead;
@@ -1918,6 +1994,103 @@ namespace TensorSharp.Models
             return true;
         }
 
+        /// <summary>
+        /// MoE decode with pre-computed router logits (from the fused outproj+norm+router kernel).
+        /// Skips the router projection dispatch since logits are already available.
+        /// </summary>
+        private unsafe bool TryMoEResidualDecodeWithRouter(Tensor residual, Tensor input, Tensor routerLogits, int layer)
+        {
+            if (!IsGgmlBackend || _moeBatchedResult == null || _moeGatePtrs == null
+                || _expertGateQW == null || _expertUpQW == null || _expertDownQW == null
+                || _expertGateQW[layer] == null || _expertUpQW[layer] == null || _expertDownQW[layer] == null)
+                return false;
+
+            int hiddenSize = Config.HiddenSize;
+            float* logits = GetFloatPtr(routerLogits);
+            int[] topExperts = _moeTopExperts;
+            float[] routeW = _moeRouteW;
+            SelectTopKInPlace(logits, _numExperts, _numExpertsUsed, topExperts);
+
+            if (_normTopKProb)
+            {
+                float maxLogit = float.NegativeInfinity;
+                for (int k = 0; k < _numExpertsUsed; k++)
+                    if (logits[topExperts[k]] > maxLogit) maxLogit = logits[topExperts[k]];
+                float wSum = 0f;
+                for (int k = 0; k < _numExpertsUsed; k++)
+                {
+                    float w = MathF.Exp(logits[topExperts[k]] - maxLogit);
+                    routeW[k] = w; wSum += w;
+                }
+                if (wSum > 0f) { float inv = 1.0f / wSum; for (int k = 0; k < _numExpertsUsed; k++) routeW[k] *= inv; }
+            }
+            else
+            {
+                float maxLogit = float.NegativeInfinity;
+                for (int i = 0; i < _numExperts; i++) if (logits[i] > maxLogit) maxLogit = logits[i];
+                float denom = 0f;
+                for (int i = 0; i < _numExperts; i++) denom += MathF.Exp(logits[i] - maxLogit);
+                float invDenom = denom > 0f ? 1.0f / denom : 0f;
+                for (int k = 0; k < _numExpertsUsed; k++) routeW[k] = MathF.Exp(logits[topExperts[k]] - maxLogit) * invDenom;
+            }
+
+            QuantizedWeight gQW0 = null, uQW0 = null, dQW0 = null;
+            for (int k = 0; k < _numExpertsUsed; k++)
+            {
+                int e = topExperts[k];
+                var g = _expertGateQW[layer][e]; var u = _expertUpQW[layer][e]; var d = _expertDownQW[layer][e];
+                if (g == null || u == null || d == null) return false;
+                if (gQW0 == null) { gQW0 = g; uQW0 = u; dQW0 = d; }
+                if (g.GgmlType != gQW0.GgmlType || g.Ne0 != gQW0.Ne0 || g.Ne1 != gQW0.Ne1 ||
+                    u.GgmlType != uQW0.GgmlType || u.Ne0 != uQW0.Ne0 || u.Ne1 != uQW0.Ne1 ||
+                    d.GgmlType != dQW0.GgmlType || d.Ne0 != dQW0.Ne0 || d.Ne1 != dQW0.Ne1) return false;
+                _moeGatePtrs[k] = g.CacheKey; _moeUpPtrs[k] = u.CacheKey; _moeDownPtrs[k] = d.CacheKey;
+            }
+
+            bool useShared = false;
+            IntPtr sgPtr = IntPtr.Zero, suPtr = IntPtr.Zero, sdPtr = IntPtr.Zero;
+            int sgType = 0, suType = 0, sdType = 0;
+            long sgNe0 = 0, sgNe1 = 0, sgBytes = 0, suNe0 = 0, suNe1 = 0, suBytes = 0, sdNe0 = 0, sdNe1 = 0, sdBytes = 0;
+            float sharedScalar = 0f;
+
+            if (_hasSharedExperts != null && _hasSharedExperts[layer]
+                && _ffnGateShexpQW[layer] != null && _ffnUpShexpQW[layer] != null && _ffnDownShexpQW[layer] != null)
+            {
+                var sg = _ffnGateShexpQW[layer]; var su = _ffnUpShexpQW[layer]; var sd = _ffnDownShexpQW[layer];
+                sgPtr = sg.CacheKey; suPtr = su.CacheKey; sdPtr = sd.CacheKey;
+                sgType = sg.GgmlType; suType = su.GgmlType; sdType = sd.GgmlType;
+                sgNe0 = sg.Ne0; sgNe1 = sg.Ne1; sgBytes = sg.RawBytes;
+                suNe0 = su.Ne0; suNe1 = su.Ne1; suBytes = su.RawBytes;
+                sdNe0 = sd.Ne0; sdNe1 = sd.Ne1; sdBytes = sd.RawBytes;
+                sharedScalar = 1.0f;
+                if (_hasSharedExpertGate != null && _hasSharedExpertGate[layer])
+                {
+                    var gateInpVec = _ffnGateInpShexpVec[layer];
+                    if (gateInpVec != null)
+                    {
+                        float* tokenRow = GetFloatPtr(input);
+                        float* gateInpPtr = GetFloatPtr(gateInpVec);
+                        int n = Math.Min((int)gateInpVec.ElementCount(), hiddenSize);
+                        sharedScalar = SigmoidScalar(VecDot(tokenRow, gateInpPtr, n));
+                    }
+                }
+                useShared = true;
+            }
+
+            long t0exp = Stopwatch.GetTimestamp();
+            GgmlBasicOps.MoEExpertsSwiGLUResidual(residual, input,
+                _numExpertsUsed, _moeGatePtrs, _moeUpPtrs, _moeDownPtrs,
+                gQW0.GgmlType, gQW0.Ne0, gQW0.Ne1, gQW0.RawBytes,
+                uQW0.GgmlType, uQW0.Ne0, uQW0.Ne1, uQW0.RawBytes,
+                dQW0.GgmlType, dQW0.Ne0, dQW0.Ne1, dQW0.RawBytes,
+                routeW, useShared, sgPtr, suPtr, sdPtr,
+                sgType, sgNe0, sgNe1, sgBytes, suType, suNe0, suNe1, suBytes,
+                sdType, sdNe0, sdNe1, sdBytes, sharedScalar);
+            _linearTicks += Stopwatch.GetTimestamp() - t0exp;
+            InvalidateTensorDeviceCache(residual);
+            return true;
+        }
+
         private unsafe Tensor MoEForward(Tensor input, int layer, int seqLen)
         {
             int hiddenSize = Config.HiddenSize;
@@ -1967,12 +2140,19 @@ namespace TensorSharp.Models
             float[] routeW = _moeRouteW;
             int[] topExperts = _moeTopExperts;
 
-            // Hot path: for the common decode case (seqLen == 1) we reuse a single set of
-            // scratch tensors across all selected experts and skip the per-expert tensor
-            // allocations. For prefill (seqLen > 1) we keep the per-token scratch path which
-            // matches the original allocation discipline; this keeps the code paths simple
-            // while removing the dominant per-token cost in decode.
-            bool useReusedBuffers = seqLen == 1 && _moeGateBuf != null;
+            // Reuse scratch buffers for both decode and prefill. For prefill (seqLen > 1),
+            // instead of Narrow + NewContiguous per token (which allocates and copies), we
+            // reuse a single [1, hiddenSize] tensor and copy the row data into it with
+            // Buffer.MemoryCopy. This eliminates O(seqLen * numMoELayers) allocations.
+            bool useReusedBuffers = _moeGateBuf != null;
+
+            // For prefill: reuse a single row tensor that we populate via memcpy per token.
+            Tensor prefillRowBuf = null;
+            if (seqLen > 1 && useReusedBuffers && _moeTokenInput != null
+                && _moeTokenInput.Sizes[1] == hiddenSize)
+            {
+                prefillRowBuf = _moeTokenInput;
+            }
 
             for (int s = 0; s < seqLen; s++)
             {
@@ -1994,16 +2174,26 @@ namespace TensorSharp.Models
 
                 Tensor tokenInput;
                 bool disposeTokenInput;
-                if (seqLen > 1)
+                if (seqLen == 1)
+                {
+                    tokenInput = input;
+                    disposeTokenInput = false;
+                }
+                else if (prefillRowBuf != null)
+                {
+                    float* srcRow = inputPtr + (long)s * hiddenSize;
+                    float* dstRow = GetFloatPtr(prefillRowBuf);
+                    long bytes = (long)hiddenSize * sizeof(float);
+                    Buffer.MemoryCopy(srcRow, dstRow, bytes, bytes);
+                    InvalidateTensorDeviceCache(prefillRowBuf);
+                    tokenInput = prefillRowBuf;
+                    disposeTokenInput = false;
+                }
+                else
                 {
                     using var rowView = input.Narrow(0, s, 1);
                     tokenInput = Ops.NewContiguous(rowView);
                     disposeTokenInput = true;
-                }
-                else
-                {
-                    tokenInput = input;
-                    disposeTokenInput = false;
                 }
 
                 float* outRow = outputPtr + (long)s * hiddenSize;

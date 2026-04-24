@@ -412,6 +412,32 @@ For decode (`seqLen == 1`) on a GGML backend, `TryFusedAttnLayerDecode()` invoke
 
 This replaces 1 standalone `FusedRmsNormMatMulQuant` + ~6 small CPU-side ops + 1 standalone `FusedMatMulQuantAdd` with one fused dispatch. The kernel only engages once `position + 1 >= FusedAttnLayerDecodeMinSeqLen` (default 4096; override via `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N`) because the GPU flash-attn path has a fixed setup cost that only amortizes for long contexts. Below the threshold the existing `FusedRmsNormMatMulQuant` + CPU-SIMD attention + `FusedMatMulQuantAdd` path is retained.
 
+### Fused Output-Projection + FFN
+
+For both FullAttention and GatedDeltaNet layers with dense FFN (non-MoE), `FusedOutProjFFN` merges the output projection, residual add, post-attention RMSNorm, and the full SwiGLU FFN (gate_up matmul + SiLU + down matmul + residual) into a single GGML graph dispatch. This replaces two separate GPU round-trips (output projection + FFN) with one, cutting per-layer dispatch overhead in half for dense layers. The kernel engages automatically when all required quantized weights are available and the tensor layout permits fusion; otherwise the standard separate-dispatch path is used as a fallback.
+
+### Fused Output-Projection + Norm + Router (MoE Decode)
+
+For GatedDeltaNet layers followed by MoE FFN during decode, `FusedOutProjNormRouter` merges the GDN output projection, residual add, post-attention RMSNorm, and the MoE router projection into one GGML graph dispatch (3 ops → 1). The pre-computed router logits are then consumed directly by the batched `MoEExpertsSwiGLUResidual` kernel via `TryMoEResidualDecodeWithRouter()`, eliminating a separate router dispatch per MoE layer. This shaves one additional GPU round-trip from every MoE recurrent layer during decode.
+
+### Fused Vision Encoder Blocks
+
+The Qwen 3.5 vision encoder (`Qwen35VisionEncoder`) now uses two fused GPU kernels per encoder block when running on a GGML backend:
+
+- **`FusedVisionAttention`**: merges LayerNorm + QKV projection + bias + 2D RoPE + scaled dot-product attention + output projection + bias + residual into one GGML graph dispatch (~8 separate operations → 1).
+- **`FusedVisionMLP`**: merges LayerNorm + up projection + bias + GELU activation + down projection + bias + residual into one GGML graph dispatch (7 separate operations → 1).
+
+Combined, these reduce the per-block GPU round-trips from ~15 to 2, significantly accelerating vision encoding. On CPU, the encoder falls back to the unfused path automatically. The encoder also now logs a timing breakdown (patch embedding, blocks, projection) at the end of each `Encode()` call.
+
+Additional vision encoder improvements:
+
+- **Parallelized block-order reorder**: `ReorderToBlockOrder()` parallelizes across block rows using `Parallel.For`, so spatial-merge reordering scales with CPU core count.
+- **GPU-aware QKV split**: on GPU backends the QKV split uses `Narrow` + `NewContiguous` to keep data on-device; on CPU it uses a fused parallel `Buffer.MemoryCopy` pass to split Q/K/V in one sweep, eliminating three separate allocation + copy passes.
+
+### Parallelized Q/Gate Deinterleave
+
+The Q + sigmoid-gate deinterleave in `FullAttention` prefill is now parallelized across tokens using `Parallel.For`. Each token's deinterleave is independent, so this scales linearly with CPU core count for long prompts.
+
 ### File-Mapped Quantized Weights
 
 When the backend supports it (Apple Silicon Metal, GGML CPU, integrated GPUs) the loader avoids copying quantized tensors into a fresh native heap buffer and instead binds the GGUF file directly via `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`. Combined with GGML's host-pointer buffer mapping this lets Metal command buffers read the weights straight from the OS page cache. The peak resident set for `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) drops from ~17 GB to ~7 GB on M-series Macs without any per-token copy.
@@ -799,6 +825,9 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Fused GPU decode | No | Yes (Metal) | No | No | No | No | No |
 | Native model decode | No | No | Yes | No | No | No | No |
 | Batched GPU MoE | No | No | No | Yes (qwen35moe / qwen3next, fused with shared expert + residual) | No | Yes | No |
+| Fused outproj+FFN | No | No | No | Yes (dense layers) | No | No | No |
+| Fused outproj+norm+router | No | No | No | Yes (MoE recurrent decode) | No | No | No |
+| Fused vision encoder | No | No | No | Yes (attention + MLP) | No | No | No |
 | Output parser | Passthrough | Gemma4 | Qwen3 | Qwen35 | Harmony (always on) | Qwen3 | Passthrough |
 
 ---

@@ -412,6 +412,32 @@ blk.{L}.ffn_down_shexp.weight             # 共享专家 down（可选）
 
 这一步替换了原本的 1 次独立 `FusedRmsNormMatMulQuant` + ~6 个小型 CPU 端算子 + 1 次独立 `FusedMatMulQuantAdd`，把它们合并到一次融合调度中。该内核仅在 `position + 1 >= FusedAttnLayerDecodeMinSeqLen`（默认 4096，可通过 `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖）时启用，因为 GPU flash-attn 路径有固定的初始化开销，只有上下文足够长时才能摊薄。低于该阈值时仍走原本的 `FusedRmsNormMatMulQuant` + CPU-SIMD 注意力 + `FusedMatMulQuantAdd` 路径。
 
+### 融合输出投影 + FFN
+
+对于 FullAttention 和 GatedDeltaNet 中的 dense FFN 层（非 MoE），`FusedOutProjFFN` 将输出投影、残差加法、post-attention RMSNorm 以及完整的 SwiGLU FFN（gate_up matmul + SiLU + down matmul + 残差加法）合并为单次 GGML 计算图调度。将每层 2 次 GPU 往返减少为 1 次，使密集层的逐层调度开销减半。当所有必需的量化权重可用且张量布局允许融合时自动启用；否则回退到标准的分离调度路径。
+
+### 融合输出投影 + 归一化 + 路由器（MoE Decode）
+
+对于 GatedDeltaNet 层后接 MoE FFN 的 decode 场景，`FusedOutProjNormRouter` 将 GDN 输出投影、残差加法、post-attention RMSNorm 和 MoE 路由器投影合并为一次 GGML 计算图调度（3 个算子 → 1）。预计算的路由器 logits 随后由 `TryMoEResidualDecodeWithRouter()` 直接传给批量 `MoEExpertsSwiGLUResidual` 内核，消除了每个 MoE 层的独立路由器调度。这为每个 MoE 循环层的 decode 减少了一次额外的 GPU 往返。
+
+### 融合视觉编码器块
+
+Qwen 3.5 视觉编码器（`Qwen35VisionEncoder`）在 GGML 后端上现在为每个编码器块使用两个融合 GPU 内核：
+
+- **`FusedVisionAttention`**：将 LayerNorm + QKV 投影 + 偏置 + 2D RoPE + 缩放点积注意力 + 输出投影 + 偏置 + 残差合并为一次 GGML 计算图调度（~8 个独立算子 → 1）。
+- **`FusedVisionMLP`**：将 LayerNorm + up 投影 + 偏置 + GELU 激活 + down 投影 + 偏置 + 残差合并为一次调度（7 个独立算子 → 1）。
+
+两者结合将每个编码器块的 GPU 往返从约 15 次减少到 2 次，显著加速视觉编码。在 CPU 上编码器会自动回退到非融合路径。编码器现在还会在每次 `Encode()` 调用结束时输出耗时分解（patch embedding、编码器块、投影）。
+
+其他视觉编码器改进：
+
+- **并行化块序重排**：`ReorderToBlockOrder()` 使用 `Parallel.For` 按块行并行化，使空间合并重排可随 CPU 核心数扩展。
+- **GPU 感知的 QKV 拆分**：在 GPU 后端上使用 `Narrow` + `NewContiguous` 保持数据在设备端；在 CPU 上使用融合的并行 `Buffer.MemoryCopy` 通道一次性拆分 Q/K/V，消除了三次独立的分配+拷贝。
+
+### 并行化 Q/Gate 反交错
+
+`FullAttention` prefill 中的 Q + sigmoid-gate 反交错现在使用 `Parallel.For` 按 token 并行化。每个 token 的反交错是独立的，因此长 prompt 时可随 CPU 核心数线性扩展。
+
 ### 文件映射量化权重
 
 当后端支持时（Apple Silicon Metal、GGML CPU、集成 GPU），加载器不再把量化张量复制到全新的原生堆缓冲区，而是通过 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView` 直接绑定 GGUF 文件。结合 GGML 的 host 指针缓冲区映射，Metal command buffer 可以直接从操作系统的页缓存读取权重。`Qwen3.5-35B-A3B-IQ2_XXS`（约 10 GB GGUF）的常驻内存峰值在 M 系列 Mac 上从约 17 GB 降至约 7 GB，且没有任何按 token 的拷贝代价。
@@ -799,6 +825,9 @@ hidden → RMSNorm(output_norm) → 截取最后 token → LM head → logits
 | 融合 GPU decode | 不支持 | 支持（Metal）| 不支持 | 不支持 | 不支持 | 不支持 | 不支持 |
 | 原生模型 decode | 不支持 | 不支持 | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
 | 批量 GPU MoE | 不支持 | 不支持 | 不支持 | 支持（qwen35moe / qwen3next，融合共享专家与残差） | 不支持 | 支持 | 不支持 |
+| 融合输出投影+FFN | 不支持 | 不支持 | 不支持 | 支持（密集层）| 不支持 | 不支持 | 不支持 |
+| 融合输出投影+归一化+路由器 | 不支持 | 不支持 | 不支持 | 支持（MoE 循环层 decode）| 不支持 | 不支持 | 不支持 |
+| 融合视觉编码器 | 不支持 | 不支持 | 不支持 | 支持（注意力 + MLP）| 不支持 | 不支持 | 不支持 |
 | 输出解析器 | 直通 | Gemma4 | Qwen3 | Qwen35 | Harmony（始终开启）| Qwen3 | 直通 |
 
 ---

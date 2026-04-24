@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -21,6 +21,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Cpu;
+using TensorSharp.Runtime;
 
 namespace TensorSharp.Cli
 {
@@ -32,6 +33,7 @@ namespace TensorSharp.Cli
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
+            ConsoleBanner.Print();
 
             var loggingOptions = CliLoggingSetup.ParseFromArgs(args);
             using var loggerFactory = CliLoggingSetup.Build(loggingOptions);
