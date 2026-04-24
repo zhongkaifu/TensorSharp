@@ -282,6 +282,45 @@ internal enum GgmlIndexReductionOp
             int halfDim);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedOutProjNormRouterQuantF32(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outBytes,
+            IntPtr normData, int normCount, float eps,
+            GgmlTensorView2D normedOut,
+            IntPtr routerData, int routerType, long routerNe0, long routerNe1, long routerBytes,
+            GgmlTensorView2D routerOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedVisionMLPF32(
+            GgmlTensorView2D hidden,
+            IntPtr lnW, IntPtr lnB, int lnDim, float eps,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr upB, int upBDim,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr downB, int downBDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedOutProjFFNQuantF32(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outRawBytes,
+            IntPtr ffnNormData, int ffnNormCount, float eps,
+            IntPtr guData, int guType, long guNe0, long guNe1, long guRawBytes,
+            IntPtr dnData, int dnType, long dnNe0, long dnNe1, long dnRawBytes,
+            int halfDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedVisionAttentionF32(
+            GgmlTensorView2D hidden,
+            IntPtr lnW, IntPtr lnB, int lnDim, float eps,
+            IntPtr qkvW, int qkvNe0, int qkvNe1, long qkvBytes,
+            IntPtr qkvB, int qkvBDim,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr outB, int outBDim,
+            IntPtr cosTable, IntPtr sinTable,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float attnScale);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetRowsQuantF32(
             GgmlTensorView2D result,
             IntPtr srcData,
@@ -804,6 +843,70 @@ internal enum GgmlIndexReductionOp
                 gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
                 downData, downGgmlType, downNe0, downNe1, downRawBytes,
                 halfDim), "fused_ffn_swiglu_quant");
+        }
+
+        public static void FusedOutProjNormRouter(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outBytes,
+            IntPtr normData, int normCount, float eps,
+            GgmlTensorView2D normedOut,
+            IntPtr routerData, int routerType, long routerNe0, long routerNe1, long routerBytes,
+            GgmlTensorView2D routerOut)
+        {
+            CheckResult(TSGgml_FusedOutProjNormRouterQuantF32(residual, input,
+                outProjData, outProjType, outNe0, outNe1, outBytes,
+                normData, normCount, eps, normedOut,
+                routerData, routerType, routerNe0, routerNe1, routerBytes,
+                routerOut), "fused_outproj_norm_router");
+        }
+
+        public static void FusedOutProjFFN(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outRawBytes,
+            IntPtr ffnNormData, int ffnNormCount, float eps,
+            IntPtr guData, int guType, long guNe0, long guNe1, long guRawBytes,
+            IntPtr dnData, int dnType, long dnNe0, long dnNe1, long dnRawBytes,
+            int halfDim)
+        {
+            CheckResult(TSGgml_FusedOutProjFFNQuantF32(residual, input,
+                outProjData, outProjType, outNe0, outNe1, outRawBytes,
+                ffnNormData, ffnNormCount, eps,
+                guData, guType, guNe0, guNe1, guRawBytes,
+                dnData, dnType, dnNe0, dnNe1, dnRawBytes,
+                halfDim), "fused_outproj_ffn");
+        }
+
+        public static void FusedVisionMLP(
+            GgmlTensorView2D hidden,
+            IntPtr lnW, IntPtr lnB, int lnDim, float eps,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr upB, int upBDim,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr downB, int downBDim)
+        {
+            CheckResult(TSGgml_FusedVisionMLPF32(hidden,
+                lnW, lnB, lnDim, eps,
+                upW, upNe0, upNe1, upBytes, upB, upBDim,
+                downW, downNe0, downNe1, downBytes, downB, downBDim), "fused_vision_mlp");
+        }
+
+        public static void FusedVisionAttention(
+            GgmlTensorView2D hidden,
+            IntPtr lnW, IntPtr lnB, int lnDim, float eps,
+            IntPtr qkvW, int qkvNe0, int qkvNe1, long qkvBytes,
+            IntPtr qkvB, int qkvBDim,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr outB, int outBDim,
+            IntPtr cosTable, IntPtr sinTable,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float attnScale)
+        {
+            CheckResult(TSGgml_FusedVisionAttentionF32(hidden,
+                lnW, lnB, lnDim, eps,
+                qkvW, qkvNe0, qkvNe1, qkvBytes, qkvB, qkvBDim,
+                outW, outNe0, outNe1, outBytes, outB, outBDim,
+                cosTable, sinTable, numPatches, numHeads, headDim, halfDim,
+                attnScale), "fused_vision_attention");
         }
 
         public static void GetRowsQuant(GgmlTensorView2D result, IntPtr srcData, int srcGgmlType, long srcNe0, long srcNe1, long srcRawBytes, GgmlContiguousTensor indices)

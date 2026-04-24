@@ -465,62 +465,177 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor RecurrentBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
-            // Fused pre-norm + GatedDeltaNet input projection inside GatedDeltaNet, and fused
-            // output projection + residual via TryLinearAddInto when possible.
-            Tensor attnOut = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen, residual: hidden);
-            if (attnOut != null)
+            bool isMoeLayer = _isMoeLayer != null && _isMoeLayer[layer];
+            bool profilePrefill = _profilePrefillStages && seqLen > 1;
+
+            // ---- Path A: Fused dense FFN (non-MoE layers) ----
+            bool canFuseDenseFFN = IsGgmlBackend && !isMoeLayer
+                && _ssmOutQW[layer] != null && _postAttnNormW[layer] != null
+                && _ffnGateUpQW[layer] != null && _ffnDownQW[layer] != null;
+
+            if (canFuseDenseFFN)
             {
-                Ops.Add(hidden, hidden, attnOut);
-                attnOut.Dispose();
+                Tensor gated = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen,
+                    residual: null, skipOutputProj: true);
+                if (gated != null)
+                {
+                    long ffnStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+                    int intermSize = Config.IntermediateSize;
+                    int halfDim = intermSize > 0 ? intermSize : (int)(_ffnGateUpQW[layer].Ne1 / 2);
+
+                    if (halfDim > 0 && hidden.DimensionCount == 2 && gated.DimensionCount == 2
+                        && hidden.Sizes[0] == gated.Sizes[0])
+                    {
+                        try
+                        {
+                            long t0 = Stopwatch.GetTimestamp();
+                            GgmlBasicOps.FusedOutProjFFN(hidden, gated,
+                                _ssmOutQW[layer].CacheKey, _ssmOutQW[layer].GgmlType,
+                                _ssmOutQW[layer].Ne0, _ssmOutQW[layer].Ne1, _ssmOutQW[layer].RawBytes,
+                                _postAttnNormW[layer], Config.Eps,
+                                _ffnGateUpQW[layer].CacheKey, _ffnGateUpQW[layer].GgmlType,
+                                _ffnGateUpQW[layer].Ne0, _ffnGateUpQW[layer].Ne1, _ffnGateUpQW[layer].RawBytes,
+                                _ffnDownQW[layer].CacheKey, _ffnDownQW[layer].GgmlType,
+                                _ffnDownQW[layer].Ne0, _ffnDownQW[layer].Ne1, _ffnDownQW[layer].RawBytes,
+                                halfDim);
+                            _linearTicks += Stopwatch.GetTimestamp() - t0;
+                            gated.Dispose();
+                            if (profilePrefill) _prefillRecFfnTicks += Stopwatch.GetTimestamp() - ffnStart;
+                            return hidden;
+                        }
+                        catch { /* fall through */ }
+                    }
+                    // Fallback: do output proj + residual, then standard FFN.
+                    if (TryLinearAddInto(hidden, gated, _ssmOutQW[layer]))
+                        gated.Dispose();
+                    else
+                    {
+                        var o = LinearForwardCached(gated, _ssmOutQW[layer], _ssmOutF32[layer]);
+                        gated.Dispose();
+                        Ops.Add(hidden, hidden, o);
+                        o.Dispose();
+                    }
+                    // Fall through to standard dense FFN below.
+                }
+                else
+                {
+                    // GDN returned null (fused residual add already done).
+                }
+                long ffnStart2 = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+                Tensor ffnOut = FFNCachedFused(hidden, _postAttnNormW[layer], layer, seqLen);
+                if (ffnOut != null) { Ops.Add(hidden, hidden, ffnOut); ffnOut.Dispose(); }
+                if (profilePrefill) _prefillRecFfnTicks += Stopwatch.GetTimestamp() - ffnStart2;
+                return hidden;
             }
 
-            bool profilePrefill = _profilePrefillStages && seqLen > 1;
-            long ffnStart = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+            // ---- Path B: Fused MoE router (MoE decode) ----
+            bool canFuseMoeRouter = IsGgmlBackend && isMoeLayer && seqLen == 1
+                && _ssmOutQW[layer] != null && _postAttnNormW[layer] != null
+                && (_ffnGateInpQW[layer] != null || _ffnGateInpF32[layer] != null)
+                && _moeTokenInput != null && _moeTokenInput.Sizes[1] == Config.HiddenSize;
 
-            Tensor ffnOut;
-            if (_isMoeLayer != null && _isMoeLayer[layer])
+            if (canFuseMoeRouter)
             {
-                // Decode hot path: do RMSNorm on CPU into the pre-allocated input buffer.
-                Tensor normed2;
-                bool ownsNormed2 = true;
+                Tensor gated = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen,
+                    residual: null, skipOutputProj: true);
+                if (gated != null && hidden.DimensionCount == 2 && gated.DimensionCount == 2)
+                {
+                    using var routerBuf = new Tensor(_allocator, DType.Float32, 1, _numExperts);
+                    try
+                    {
+                        // Router weight can be quantized or F32; resolve the appropriate pointer/type.
+                        IntPtr rtPtr; int rtType; long rtNe0, rtNe1, rtBytes;
+                        if (_ffnGateInpQW[layer] != null)
+                        {
+                            var qw = _ffnGateInpQW[layer];
+                            rtPtr = qw.CacheKey; rtType = qw.GgmlType;
+                            rtNe0 = qw.Ne0; rtNe1 = qw.Ne1; rtBytes = qw.RawBytes;
+                        }
+                        else
+                        {
+                            var fw = _ffnGateInpF32[layer];
+                            unsafe { rtPtr = (IntPtr)GetFloatPtr(fw); }
+                            rtType = 0; // GGML_TYPE_F32
+                            rtNe0 = fw.Sizes[fw.DimensionCount - 1];
+                            rtNe1 = fw.Sizes[0];
+                            rtBytes = fw.ElementCount() * 4;
+                        }
+
+                        long t0r = Stopwatch.GetTimestamp();
+                        GgmlBasicOps.FusedOutProjNormRouter(hidden, gated,
+                            _ssmOutQW[layer].CacheKey, _ssmOutQW[layer].GgmlType,
+                            _ssmOutQW[layer].Ne0, _ssmOutQW[layer].Ne1, _ssmOutQW[layer].RawBytes,
+                            _postAttnNormW[layer], Config.Eps,
+                            _moeTokenInput,
+                            rtPtr, rtType, rtNe0, rtNe1, rtBytes,
+                            routerBuf);
+                        _linearTicks += Stopwatch.GetTimestamp() - t0r;
+                        gated.Dispose();
+
+                        InvalidateTensorDeviceCache(_moeTokenInput);
+                        InvalidateTensorDeviceCache(hidden);
+                        InvalidateTensorDeviceCache(routerBuf);
+
+                        if (TryMoEResidualDecodeWithRouter(hidden, _moeTokenInput, routerBuf, layer))
+                            return hidden;
+                    }
+                    catch
+                    {
+                        // Fallback: do output proj separately, fall through to standard MoE.
+                        if (gated != null)
+                        {
+                            if (TryLinearAddInto(hidden, gated, _ssmOutQW[layer]))
+                                gated.Dispose();
+                            else
+                            {
+                                var o = LinearForwardCached(gated, _ssmOutQW[layer], _ssmOutF32[layer]);
+                                gated.Dispose();
+                                Ops.Add(hidden, hidden, o);
+                                o.Dispose();
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // gated was null or shape mismatch - GDN already did output proj + residual
+                    if (gated != null) { Ops.Add(hidden, hidden, gated); gated.Dispose(); }
+                }
+                // Fall through to standard MoE path.
+            }
+
+            // ---- Path C: Standard path (no fusion) ----
+            if (!canFuseDenseFFN && !canFuseMoeRouter)
+            {
+                Tensor attnOut = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen, residual: hidden);
+                if (attnOut != null) { Ops.Add(hidden, hidden, attnOut); attnOut.Dispose(); }
+            }
+
+            long ffnStartC = profilePrefill ? Stopwatch.GetTimestamp() : 0;
+            Tensor ffnOutC;
+            if (isMoeLayer)
+            {
+                Tensor normed2; bool ownsNormed2 = true;
                 if (seqLen == 1 && IsGgmlBackend && _moeTokenInput != null
-                    && _moeTokenInput.Sizes[1] == Config.HiddenSize
-                    && _postAttnNormW[layer] != null)
+                    && _moeTokenInput.Sizes[1] == Config.HiddenSize && _postAttnNormW[layer] != null)
                 {
                     RMSNormToBufferCpu(_moeTokenInput, hidden, _postAttnNormW[layer], Config.HiddenSize, Config.Eps);
-                    normed2 = _moeTokenInput;
-                    ownsNormed2 = false;
+                    normed2 = _moeTokenInput; ownsNormed2 = false;
                 }
-                else
-                {
-                    normed2 = RMSNormOpCached(hidden, _postAttnNormW[layer]);
-                }
+                else normed2 = RMSNormOpCached(hidden, _postAttnNormW[layer]);
 
                 if (seqLen == 1 && TryMoEResidualDecode(hidden, normed2, layer))
-                {
-                    ffnOut = null;
-                }
+                    ffnOutC = null;
                 else
-                {
-                    ffnOut = MoEForward(normed2, layer, seqLen);
-                }
-                if (ownsNormed2)
-                    normed2.Dispose();
+                    ffnOutC = MoEForward(normed2, layer, seqLen);
+                if (ownsNormed2) normed2.Dispose();
             }
             else
             {
-                ffnOut = FFNCachedFused(hidden, _postAttnNormW[layer], layer, seqLen);
+                ffnOutC = FFNCachedFused(hidden, _postAttnNormW[layer], layer, seqLen);
             }
-
-            if (ffnOut != null)
-            {
-                Ops.Add(hidden, hidden, ffnOut);
-                ffnOut.Dispose();
-            }
-
-            if (profilePrefill)
-                _prefillRecFfnTicks += Stopwatch.GetTimestamp() - ffnStart;
-
+            if (ffnOutC != null) { Ops.Add(hidden, hidden, ffnOutC); ffnOutC.Dispose(); }
+            if (profilePrefill) _prefillRecFfnTicks += Stopwatch.GetTimestamp() - ffnStartC;
             return hidden;
         }
 
@@ -530,7 +645,7 @@ namespace TensorSharp.Models
         /// Decode follows the same path with seqLen=1, avoiding several tiny GGML dispatches.
         /// </summary>
         private unsafe Tensor GatedDeltaNet(Tensor input, Tensor inputNormW, int layer, int seqLen,
-            Tensor residual = null)
+            Tensor residual = null, bool skipOutputProj = false)
         {
             long t0 = Stopwatch.GetTimestamp();
             bool profilePrefill = _profilePrefillStages && seqLen > 1;
@@ -670,6 +785,19 @@ namespace TensorSharp.Models
 
             InvalidateTensorDeviceCache(gated);
             if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillRecCoreTicks += now - stageStart; stageStart = now; }
+
+            // When skipOutputProj is set, return the raw gated output so the caller
+            // can fuse output_proj + FFN into a single GPU dispatch.
+            if (skipOutputProj)
+            {
+                Tensor gatedOut = (seqLen == 1) ? gated.CopyRef() : gated;
+                normedInput?.Dispose();
+                if (ownsPackedInput) packedInput?.Dispose();
+                qkvRaw?.Dispose(); zRaw?.Dispose(); betaRaw?.Dispose(); alphaRaw?.Dispose();
+                if (profilePrefill) _prefillRecOutputTicks += Stopwatch.GetTimestamp() - stageStart;
+                _attnTicks += Stopwatch.GetTimestamp() - t0;
+                return gatedOut;
+            }
 
             // Fast path: fuse SSM output projection with the residual add.
             Tensor output;

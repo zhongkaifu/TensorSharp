@@ -72,7 +72,16 @@ endif()
 
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src" ggml-build)
 
-add_library(GgmlOps SHARED ggml_ops.cpp)
+add_library(GgmlOps SHARED
+    ggml_ops_core.cpp
+    ggml_ops_matmul.cpp
+    ggml_ops_elementwise.cpp
+    ggml_ops_norm_attn.cpp
+    ggml_ops_training.cpp
+    ggml_ops_fused.cpp
+    ggml_ops_transformer.cpp
+    ggml_ops_gated_delta_net.cpp
+)
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"

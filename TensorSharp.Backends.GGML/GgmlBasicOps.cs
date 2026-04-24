@@ -410,6 +410,155 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Fused output projection + residual + RMSNorm + router projection in one dispatch.
+        /// For MoE decode: replaces TryLinearAddInto + RMSNorm + LinearForwardCached (3 ops -> 1).
+        /// </summary>
+        public static void FusedOutProjNormRouter(
+            Tensor residual, Tensor input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outRawBytes,
+            Tensor normWeight, float eps,
+            Tensor normedOutput,
+            IntPtr routerData, int routerType, long routerNe0, long routerNe1, long routerRawBytes,
+            Tensor routerOutput)
+        {
+            if (!HasNativeBufferStorage(residual) || !HasNativeBufferStorage(input)
+                || !HasNativeBufferStorage(normWeight) || !HasNativeBufferStorage(normedOutput)
+                || !HasNativeBufferStorage(routerOutput))
+                throw new ArgumentException("FusedOutProjNormRouter requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView)
+                || !TryCreateStandardView(normedOutput, out GgmlTensorView2D normedView)
+                || !TryCreateStandardView(routerOutput, out GgmlTensorView2D routerView))
+                throw new NotSupportedException("FusedOutProjNormRouter requires supported layouts.");
+
+            int normCount = (int)normWeight.ElementCount();
+            IntPtr normPtr = GetBufferStart(normWeight);
+
+            GgmlNative.FusedOutProjNormRouter(residualView, inputView,
+                outProjData, outProjType, outNe0, outNe1, outRawBytes,
+                normPtr, normCount, eps, normedView,
+                routerData, routerType, routerNe0, routerNe1, routerRawBytes,
+                routerView);
+        }
+
+        /// <summary>
+        /// Fused output projection + residual + RMSNorm + FFN SwiGLU + residual in one dispatch.
+        /// Replaces TryLinearAddInto + FusedFFNSwiGLUQuant (2 dispatches -> 1).
+        /// </summary>
+        public static void FusedOutProjFFN(
+            Tensor residual, Tensor input,
+            IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outRawBytes,
+            Tensor ffnNormWeight, float eps,
+            IntPtr guData, int guType, long guNe0, long guNe1, long guRawBytes,
+            IntPtr dnData, int dnType, long dnNe0, long dnNe1, long dnRawBytes,
+            int halfDim)
+        {
+            if (!HasNativeBufferStorage(residual) || !HasNativeBufferStorage(input) || !HasNativeBufferStorage(ffnNormWeight))
+                throw new ArgumentException("FusedOutProjFFN requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("FusedOutProjFFN requires supported layouts.");
+
+            int normCount = (int)ffnNormWeight.ElementCount();
+            IntPtr normPtr = GetBufferStart(ffnNormWeight);
+
+            GgmlNative.FusedOutProjFFN(residualView, inputView,
+                outProjData, outProjType, outNe0, outNe1, outRawBytes,
+                normPtr, normCount, eps,
+                guData, guType, guNe0, guNe1, guRawBytes,
+                dnData, dnType, dnNe0, dnNe1, dnRawBytes,
+                halfDim);
+        }
+
+        /// <summary>
+        /// Fused vision encoder MLP: LayerNorm + up + bias + GELU + down + bias + residual
+        /// as a single GGML graph dispatch. Replaces 7 separate dispatches with 1.
+        /// </summary>
+        public static unsafe void FusedVisionMLP(
+            Tensor hidden, Tensor lnWeight, Tensor lnBias, float eps,
+            Tensor upWeight, Tensor upBias,
+            Tensor downWeight, Tensor downBias)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                throw new ArgumentException("FusedVisionMLP requires native-backed hidden tensor.");
+
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                throw new NotSupportedException("FusedVisionMLP requires standard layout for hidden.");
+
+            IntPtr lnWPtr = GetBufferStart(lnWeight);
+            IntPtr lnBPtr = GetBufferStart(lnBias);
+            int lnDim = (int)lnWeight.ElementCount();
+
+            IntPtr upWPtr = GetBufferStart(upWeight);
+            int upNe0 = (int)upWeight.Sizes[upWeight.DimensionCount - 1];
+            int upNe1 = (int)upWeight.Sizes[0];
+            long upBytes = upWeight.ElementCount() * sizeof(float);
+            IntPtr upBPtr = GetBufferStart(upBias);
+            int upBDim = (int)upBias.ElementCount();
+
+            IntPtr downWPtr = GetBufferStart(downWeight);
+            int downNe0 = (int)downWeight.Sizes[downWeight.DimensionCount - 1];
+            int downNe1 = (int)downWeight.Sizes[0];
+            long downBytes = downWeight.ElementCount() * sizeof(float);
+            IntPtr downBPtr = GetBufferStart(downBias);
+            int downBDim = (int)downBias.ElementCount();
+
+            GgmlNative.FusedVisionMLP(hiddenView,
+                lnWPtr, lnBPtr, lnDim, eps,
+                upWPtr, upNe0, upNe1, upBytes, upBPtr, upBDim,
+                downWPtr, downNe0, downNe1, downBytes, downBPtr, downBDim);
+        }
+
+        /// <summary>
+        /// Fused vision attention: LN + QKV + bias + RoPE + SDPA + out + bias + residual
+        /// as a single GGML graph dispatch. Replaces ~8 separate dispatches with 1.
+        /// </summary>
+        public static unsafe void FusedVisionAttention(
+            Tensor hidden, Tensor lnWeight, Tensor lnBias, float eps,
+            Tensor qkvWeight, Tensor qkvBias,
+            Tensor outWeight, Tensor outBias,
+            float[] cosTable, float[] sinTable,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float attnScale)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                throw new ArgumentException("FusedVisionAttention requires native-backed hidden tensor.");
+
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                throw new NotSupportedException("FusedVisionAttention requires standard layout for hidden.");
+
+            IntPtr lnWPtr = GetBufferStart(lnWeight);
+            IntPtr lnBPtr = GetBufferStart(lnBias);
+            int lnDim = (int)lnWeight.ElementCount();
+
+            IntPtr qkvWPtr = GetBufferStart(qkvWeight);
+            int qkvNe0 = (int)qkvWeight.Sizes[qkvWeight.DimensionCount - 1];
+            int qkvNe1 = (int)qkvWeight.Sizes[0];
+            long qkvBytes = qkvWeight.ElementCount() * sizeof(float);
+            IntPtr qkvBPtr = GetBufferStart(qkvBias);
+            int qkvBDim = (int)qkvBias.ElementCount();
+
+            IntPtr outWPtr = GetBufferStart(outWeight);
+            int outNe0 = (int)outWeight.Sizes[outWeight.DimensionCount - 1];
+            int outNe1 = (int)outWeight.Sizes[0];
+            long outBytes = outWeight.ElementCount() * sizeof(float);
+            IntPtr outBPtr = GetBufferStart(outBias);
+            int outBDim = (int)outBias.ElementCount();
+
+            fixed (float* cosPtr = cosTable, sinPtr = sinTable)
+            {
+                GgmlNative.FusedVisionAttention(hiddenView,
+                    lnWPtr, lnBPtr, lnDim, eps,
+                    qkvWPtr, qkvNe0, qkvNe1, qkvBytes, qkvBPtr, qkvBDim,
+                    outWPtr, outNe0, outNe1, outBytes, outBPtr, outBDim,
+                    (IntPtr)cosPtr, (IntPtr)sinPtr,
+                    numPatches, numHeads, headDim, halfDim, attnScale);
+            }
+        }
+
+        /// <summary>
         /// Native row selection (embedding lookup) from a quantized tensor.
         /// Uses GGML's ggml_get_rows which dequantizes on-the-fly (GPU-accelerated on Metal).
         /// </summary>
