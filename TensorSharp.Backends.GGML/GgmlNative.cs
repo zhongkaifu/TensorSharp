@@ -531,6 +531,73 @@ internal enum GgmlIndexReductionOp
             int intermediateSize, int ropeMode);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4LayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr postAttnNormW,
+            IntPtr ffnNormW,
+            IntPtr guW, int guType, long guNe0, long guNe1, long guBytes,
+            IntPtr downW, int downType, long downNe0, long downNe1, long downBytes,
+            IntPtr postFfnNormW,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isLocal, int slidingWindow,
+            float ropeBase, int ropeDims,
+            IntPtr ropeFreqFactors, int freqFactorsLen,
+            float layerScalar, float eps);
+
+        public static void Gemma4LayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr postAttnNormW,
+            IntPtr ffnNormW,
+            IntPtr guW, int guType, long guNe0, long guNe1, long guBytes,
+            IntPtr downW, int downType, long downNe0, long downNe1, long downBytes,
+            IntPtr postFfnNormW,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isLocal, int slidingWindow,
+            float ropeBase, int ropeDims,
+            IntPtr ropeFreqFactors, int freqFactorsLen,
+            float layerScalar, float eps)
+        {
+            CheckResult(TSGgml_Gemma4LayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qNormW, kNormW,
+                oW, oType, oNe0, oNe1, oBytes,
+                postAttnNormW,
+                ffnNormW,
+                guW, guType, guNe0, guNe1, guBytes,
+                downW, downType, downNe0, downNe1, downBytes,
+                postFfnNormW,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                isLocal, slidingWindow,
+                ropeBase, ropeDims,
+                ropeFreqFactors, freqFactorsLen,
+                layerScalar, eps), "gemma4_layer_prefill");
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedPrefillAttentionF32(
+            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen,
+            int maskStartPos, int slidingWindow,
+            float scale, int inputFormat);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FlashAttnDecodeF32(
             IntPtr qData, IntPtr kData, IntPtr vData,
             IntPtr kCacheData, IntPtr vCacheData,
@@ -1182,6 +1249,20 @@ internal enum GgmlIndexReductionOp
         /// device against the populated portion of the cache. Q, K, V, and the output buffer
         /// must point to F32 contiguous memory in (heads, head_dim) row-major layout.
         /// </summary>
+        public static void FusedPrefillAttention(
+            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen,
+            int maskStartPos, int slidingWindow,
+            float scale, int inputFormat = 0)
+        {
+            CheckResult(TSGgml_FusedPrefillAttentionF32(
+                qData, kData, vData, outData,
+                numHeads, numKvHeads, headDim,
+                seqLen, kvLen,
+                maskStartPos, slidingWindow, scale, inputFormat), "fused_prefill_attention");
+        }
+
         public static void FlashAttnDecode(
             IntPtr qData, IntPtr kData, IntPtr vData,
             IntPtr kCacheData, IntPtr vCacheData,

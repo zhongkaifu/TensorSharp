@@ -1869,6 +1869,27 @@ namespace TensorSharp.Models
         public abstract void ResetKVCache();
 
         /// <summary>
+        /// Run a tiny forward pass to force lazy kernel compilation (Metal pipelines,
+        /// CUDA JIT, memory pool warm-up, etc.) so the first real inference request
+        /// doesn't pay the compilation cost.  Resets KV cache and timing counters
+        /// afterwards so the warmup is invisible to callers.
+        /// </summary>
+        public void WarmUpKernels()
+        {
+            int safeToken = Math.Min(1, Config.VocabSize - 1);
+            Forward(new[] { safeToken });
+            ResetKVCache();
+            _linearTicks = 0;
+            _attnTicks = 0;
+            _normTicks = 0;
+            _embTicks = 0;
+            _lmHeadTicks = 0;
+            _logitsCopyTicks = 0;
+            _forwardCount = 0;
+            _forwardSw.Reset();
+        }
+
+        /// <summary>
         /// Whether this model supports partial KV cache truncation.
         /// Models with recurrent layers (e.g. Qwen3.5) cannot truncate because
         /// the running recurrent state cannot be rewound to an earlier position.

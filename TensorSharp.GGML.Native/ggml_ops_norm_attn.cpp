@@ -1687,6 +1687,202 @@ TSG_EXPORT int TSGgml_RoPEExF32(
     }
 }
 
+// ============================================================================
+// Fused prefill attention: Q*K^T → causal mask → softmax → *V as one GGML
+// graph. Eliminates ~5 separate C# → GGML round trips per layer.
+//
+// C# head-first layout [numHeads, seqLen, headDim] maps naturally to GGML
+// [headDim, seqLen, numHeads] with no permutation.
+//
+// Supports GQA (numHeads != numKVHeads) and optional sliding window.
+// ============================================================================
+TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
+    const float* q_data,      // head-first: [numHeads * seqLen * headDim]  OR  flat: [seqLen * numHeads * headDim]
+    const float* k_data,      // head-first: [numKVHeads * kvLen * headDim] OR  flat: [kvLen * numKVHeads * headDim]
+    const float* v_data,      // same as k_data layout
+    float* out_data,          // always flat: [seqLen * numHeads * headDim]
+    int numHeads,
+    int numKVHeads,
+    int headDim,
+    int seqLen,
+    int kvLen,
+    int maskStartPos,
+    int slidingWindow,
+    float scale,
+    int inputFormat)   // 0 = head-first [numHeads, seqLen, headDim], 1 = flat [seqLen, numHeads*headDim]
+{
+    try
+    {
+        if (!ensure_backend())
+        {
+            return 0;
+        }
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for fused prefill attention.");
+            return 0;
+        }
+
+        auto* ctx = context.value;
+        const int qSize = numHeads * seqLen * headDim;
+        const int kvSize = numKVHeads * kvLen * headDim;
+
+        // Create input tensors matching the C# memory layout
+        ggml_tensor* q_in;
+        ggml_tensor* k_in;
+        ggml_tensor* v_in;
+        if (inputFormat == 1)
+        {
+            // Flat layout: C# [seqLen, numHeads*headDim] == GGML [numHeads*headDim, seqLen]
+            q_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numHeads * headDim, seqLen);
+            k_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numKVHeads * headDim, kvLen);
+            v_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numKVHeads * headDim, kvLen);
+        }
+        else
+        {
+            // Head-first: C# [numHeads, seqLen, headDim] == GGML [headDim, seqLen, numHeads]
+            q_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, seqLen, numHeads);
+            k_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, kvLen, numKVHeads);
+            v_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, kvLen, numKVHeads);
+        }
+        // Output in flat layout [numHeads*headDim, seqLen] (GGML) = [seqLen, numHeads*headDim] (C#)
+        // The permute+cont inside the graph handles the transpose from head-first to flat.
+        ggml_tensor* attn_result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numHeads * headDim, seqLen);
+
+        // Build causal + optional sliding window mask in FP16: [kvLen, seqLen]
+        ggml_tensor* mask_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
+        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * seqLen);
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int q_idx = 0; q_idx < seqLen; q_idx++)
+            {
+                int threshold = maskStartPos + q_idx;
+                int winStart = (slidingWindow > 0) ? std::max(0, threshold - slidingWindow + 1) : 0;
+                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(q_idx) * kvLen];
+                for (int kv_idx = 0; kv_idx < kvLen; kv_idx++)
+                    row[kv_idx] = (kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
+            }
+        }
+
+        if (q_in == nullptr || k_in == nullptr || v_in == nullptr || attn_result == nullptr || mask_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml tensors for fused prefill attention.");
+            return 0;
+        }
+
+        // For flat input format, reshape [dim, seqLen] → [headDim, numHeads, seqLen]
+        // then permute to [headDim, seqLen, numHeads]. These are free graph ops (no data copy).
+        ggml_tensor* q_attn = q_in;
+        ggml_tensor* k_attn = k_in;
+        ggml_tensor* v_attn = v_in;
+        if (inputFormat == 1)
+        {
+            // Q: [numHeads*headDim, seqLen] → [headDim, numHeads, seqLen] → permute(0,2,1,3) → [headDim, seqLen, numHeads]
+            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_in, headDim, numHeads, seqLen);
+            q_attn = ggml_permute(ctx, q_3d, 0, 2, 1, 3);
+            q_attn = ggml_cont(ctx, q_attn);
+            // K: [numKVHeads*headDim, kvLen] → [headDim, numKVHeads, kvLen] → permute → [headDim, kvLen, numKVHeads]
+            ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_in, headDim, numKVHeads, kvLen);
+            k_attn = ggml_permute(ctx, k_3d, 0, 2, 1, 3);
+            k_attn = ggml_cont(ctx, k_attn);
+            // V: same as K
+            ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_in, headDim, numKVHeads, kvLen);
+            v_attn = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+            v_attn = ggml_cont(ctx, v_attn);
+        }
+
+        // mul_mat(K, Q): K=[headDim, kvLen, numKVHeads], Q=[headDim, seqLen, numHeads]
+        // GQA broadcast: numHeads must be a multiple of numKVHeads.
+        ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn);
+        if (scores == nullptr)
+        {
+            set_last_error("Failed to create Q*K^T matmul node.");
+            return 0;
+        }
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+
+        // Softmax with mask: softmax(scores * scale + mask)
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_tensor, scale, 0.0f);
+        if (probs == nullptr)
+        {
+            set_last_error("Failed to create softmax node.");
+            return 0;
+        }
+
+        // V permute for value matmul: [headDim, kvLen, numKVHeads] → [kvLen, headDim, numKVHeads]
+        ggml_tensor* v_perm = ggml_permute(ctx, v_attn, 1, 0, 2, 3);
+        v_perm = ggml_cont(ctx, v_perm);
+
+        // attn = probs * V_perm → [headDim, seqLen, numHeads]
+        ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
+        if (attn_out == nullptr)
+        {
+            set_last_error("Failed to create scores*V matmul node.");
+            return 0;
+        }
+
+        // Permute to flat layout [headDim*numHeads, seqLen] (GGML)
+        // = [seqLen, numHeads*headDim] (C#), skipping the C# ReshapeFromHeadsEx copy.
+        // [headDim, seqLen, numHeads] → permute(0,2,1,3) → [headDim, numHeads, seqLen]
+        // → cont → reshape to [headDim*numHeads, seqLen]
+        ggml_tensor* attn_perm = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
+        ggml_tensor* attn_cont = ggml_cont(ctx, attn_perm);
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_cont, numHeads * headDim, seqLen);
+
+        // Copy result to download target
+        ggml_tensor* output = ggml_cpy(ctx, attn_flat, attn_result);
+        if (output == nullptr)
+        {
+            set_last_error("Failed to create output copy node.");
+            return 0;
+        }
+        ggml_set_output(output);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for fused prefill attention.");
+            return 0;
+        }
+
+        // Upload input data
+        ggml_backend_tensor_set(q_in, q_data, 0, qSize * sizeof(float));
+        ggml_backend_tensor_set(k_in, k_data, 0, kvSize * sizeof(float));
+        ggml_backend_tensor_set(v_in, v_data, 0, kvSize * sizeof(float));
+        ggml_backend_tensor_set(mask_tensor, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml graph compute failed for fused prefill attention.");
+            return 0;
+        }
+
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(attn_result, out_data, 0, qSize * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown fused prefill attention failure.");
+        return 0;
+    }
+}
+
 TSG_EXPORT int TSGgml_ScaledDotProductAttentionF32(
     TensorView4DDesc result,
     TensorView4DDesc query,

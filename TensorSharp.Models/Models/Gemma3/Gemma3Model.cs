@@ -36,6 +36,9 @@ namespace TensorSharp.Models
         private float[] _ropeFreqsLocal;
         private float[] _ropeFreqsGlobal;
         private int _slidingWindow;
+        private int[] _cachedSWAMaskWidths;
+        private int _cachedSWAMaskQueryLen;
+        private int _cachedSWAMaskStartPos = -1;
         private float _ropeLocalBase;
         private float _ropeGlobalBase;
         private float _ropeScale;
@@ -558,33 +561,40 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe void ApplyCausalMask(Tensor scores, int queryLen, int totalKVLen, int windowSize)
         {
-            float* sPtr = GetFloatPtr(scores);
-            int numHeads = (int)scores.Sizes[0];
-            int rowStride = queryLen * totalKVLen;
+            int startPos = totalKVLen - queryLen;
 
-            for (int h = 0; h < numHeads; h++)
+            // Causal mask via native op (upper triangle)
+            Ops.AddCausalMask(scores, queryLen, startPos, float.NegativeInfinity);
+
+            // Sliding window mask with cached per-row widths + vectorized fill
+            if (windowSize > 0)
             {
-                float* headScores = sPtr + h * rowStride;
-                for (int q = 0; q < queryLen; q++)
+                if (_cachedSWAMaskWidths == null ||
+                    _cachedSWAMaskQueryLen != queryLen ||
+                    _cachedSWAMaskStartPos != startPos)
                 {
-                    int queryPos = totalKVLen - queryLen + q;
-                    float* row = headScores + q * totalKVLen;
+                    _cachedSWAMaskWidths = new int[queryLen];
+                    _cachedSWAMaskQueryLen = queryLen;
+                    _cachedSWAMaskStartPos = startPos;
+                    for (int q = 0; q < queryLen; q++)
+                        _cachedSWAMaskWidths[q] = Math.Max(0, startPos + q - windowSize + 1);
+                }
 
-                    // Mask future positions (kv > queryPos)
-                    for (int kv = queryPos + 1; kv < totalKVLen; kv++)
-                        row[kv] = float.NegativeInfinity;
+                float* sPtr = GetFloatPtr(scores);
+                int numHeads = (int)scores.Sizes[0];
+                int rowStride = queryLen * totalKVLen;
 
-                    // Mask positions outside sliding window
-                    if (windowSize > 0)
+                for (int h = 0; h < numHeads; h++)
+                {
+                    float* headScores = sPtr + h * rowStride;
+                    for (int q = 0; q < queryLen; q++)
                     {
-                        int windowStart = queryPos - windowSize + 1;
-                        if (windowStart > 0)
-                        {
-                            for (int kv = 0; kv < windowStart; kv++)
-                                row[kv] = float.NegativeInfinity;
-                        }
+                        int width = _cachedSWAMaskWidths[q];
+                        if (width > 0)
+                            new Span<float>(headScores + q * totalKVLen, width).Fill(float.NegativeInfinity);
                     }
                 }
+                InvalidateTensorDeviceCache(scores);
             }
         }
 

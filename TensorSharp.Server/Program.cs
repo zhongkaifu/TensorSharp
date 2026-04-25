@@ -28,7 +28,8 @@ const string ListenAddress = "http://0.0.0.0:5000";
 const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
-ConsoleBanner.Print();
+bool showSarah = Array.Exists(args, a => a == "--xzf");
+ConsoleBanner.Print(showSarah);
 
 string baseDirectory = AppContext.BaseDirectory;
 ServerHostingOptions hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);

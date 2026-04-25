@@ -24,7 +24,7 @@ namespace TensorSharp.Runtime
     {
         // 74 columns x 42 terminal rows (74x84 half-block pixels)
         // Generated from imgs/assistant_logo_2.png via imgs/convert_to_ascii.py
-        private static readonly string[] GirlArt = new[]
+        private static readonly string[] Sarah = new[]
         {
             "                    \x1b[38;2;58;62;72m\u2584\x1b[38;2;80;87;96m\x1b[48;2;55;50;56m\u2580\x1b[38;2;108;100;96m\x1b[48;2;65;54;55m\u2580\x1b[38;2;181;165;152m\x1b[48;2;78;64;61m\u2580\x1b[38;2;219;205;190m\x1b[48;2;94;77;71m\u2580\x1b[38;2;239;231;216m\x1b[48;2;143;121;107m\u2580\x1b[38;2;229;227;211m\x1b[48;2;216;188;162m\u2580\x1b[38;2;185;201;193m\x1b[48;2;222;204;181m\u2580\x1b[49m\x1b[38;2;225;225;213m\u2584\x1b[38;2;189;207;201m\u2584\x1b[0m                                            \x1b[0m",
             "                  \x1b[38;2;97;115;129m\x1b[48;2;49;54;66m\u2580\x1b[38;2;42;48;56m\x1b[48;2;29;27;32m\u2580\x1b[38;2;34;32;37m\x1b[48;2;40;39;43m\u2580\x1b[38;2;45;40;45m\x1b[48;2;49;45;50m\u2580\x1b[38;2;50;43;48m\x1b[48;2;61;54;58m\u2580\x1b[38;2;46;38;41m\x1b[48;2;69;63;67m\u2580\x1b[38;2;47;39;41m\x1b[48;2;59;52;53m\u2580\x1b[38;2;51;41;40m\x1b[48;2;57;47;47m\u2580\x1b[38;2;96;76;67m\x1b[48;2;48;37;37m\u2580\x1b[38;2;171;144;124m\x1b[48;2;91;74;67m\u2580\x1b[38;2;198;172;152m\x1b[48;2;112;88;76m\u2580\x1b[38;2;240;237;224m\x1b[48;2;202;185;168m\u2580\x1b[38;2;198;213;210m\x1b[48;2;238;242;232m\u2580\x1b[0m                                           \x1b[0m",
@@ -70,7 +70,7 @@ namespace TensorSharp.Runtime
             "                                                \x1b[38;2;36;61;87m\x1b[48;2;34;63;88m\u2580\x1b[38;2;39;68;91m\x1b[48;2;32;61;88m\u2580\x1b[0m   \x1b[38;2;36;57;77m\u2580\x1b[38;2;27;41;55m\x1b[48;2;29;49;67m\u2580\x1b[38;2;21;30;39m\x1b[48;2;25;42;59m\u2580\x1b[38;2;18;26;36m\x1b[48;2;27;41;58m\u2580\x1b[38;2;18;27;37m\x1b[48;2;26;41;58m\u2580\x1b[38;2;19;29;40m\x1b[48;2;26;41;60m\u2580\x1b[38;2;19;30;40m\x1b[48;2;29;49;68m\u2580\x1b[38;2;31;42;55m\x1b[48;2;40;65;84m\u2580\x1b[38;2;57;79;93m\x1b[48;2;94;133;151m\u2580\x1b[0m            \x1b[0m",
         };
 
-        private const int GirlDisplayWidth = 74;
+        private const int SarahDisplayWidth = 74;
 
         private static readonly string[] LogoLines = new[]
         {
@@ -108,7 +108,7 @@ namespace TensorSharp.Runtime
             ("\u25C7",  59, 130, 246),
         };
 
-        public static void Print()
+        public static void Print(bool showSarah = false)
         {
             bool color = !Console.IsOutputRedirected
                          && Environment.GetEnvironmentVariable("NO_COLOR") == null;
@@ -121,7 +121,7 @@ namespace TensorSharp.Runtime
             sb.AppendLine();
 
             if (color)
-                BuildColor(sb, logoWidth);
+                BuildColor(sb, logoWidth, showSarah);
             else
                 BuildPlain(sb, logoWidth);
 
@@ -129,21 +129,23 @@ namespace TensorSharp.Runtime
             Console.Write(sb.ToString());
         }
 
-        private static void BuildColor(StringBuilder sb, int logoWidth)
+        private static void BuildColor(StringBuilder sb, int logoWidth, bool showSarah)
         {
             const string Reset = "\x1b[0m";
 
-            // Girl art on top, centered relative to the logo width
-            int girlPad = Math.Max(0, (logoWidth - GirlDisplayWidth) / 2);
-            string girlIndent = girlPad > 0 ? new string(' ', girlPad) : "";
-
-            foreach (var line in GirlArt)
+            if (showSarah)
             {
-                sb.Append(girlIndent);
-                sb.AppendLine(line);
-            }
+                int sarahPad = Math.Max(0, (logoWidth - SarahDisplayWidth) / 2);
+                string sarahIndent = sarahPad > 0 ? new string(' ', sarahPad) : "";
 
-            sb.AppendLine();
+                foreach (var line in Sarah)
+                {
+                    sb.Append(sarahIndent);
+                    sb.AppendLine(line);
+                }
+
+                sb.AppendLine();
+            }
 
             // Cube decoration
             int cubeSpacing = logoWidth / (Cubes.Length + 1);

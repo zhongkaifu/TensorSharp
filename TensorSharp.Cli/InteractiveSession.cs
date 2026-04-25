@@ -1270,7 +1270,7 @@ namespace TensorSharp.Cli
                     _kvCache.Reset();
                     _model.MultimodalInjector.QueuePromptEmbeddings(0);
                     var allTokens = inputTokens.ToArray();
-                    float[] logits = _model.Forward(allTokens);
+                    float[] logits = _model.ForwardRefill(allTokens);
                     _kvCache.RecordAppend(allTokens, logits);
                     return logits;
                 }
