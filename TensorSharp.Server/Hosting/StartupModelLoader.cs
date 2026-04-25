@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using System.Diagnostics;
 using System.IO;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Logging;
@@ -60,6 +61,15 @@ namespace TensorSharp.Server.Hosting
                 modelService.Architecture ?? "unknown",
                 modelService.LoadedBackend,
                 modelService.LoadedMmProjName ?? "(none)");
+
+            if (modelService.Model != null)
+            {
+                var warmupSw = Stopwatch.StartNew();
+                modelService.Model.WarmUpKernels();
+                warmupSw.Stop();
+                logger.LogInformation(LogEventIds.HostConfiguration,
+                    "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
+            }
         }
     }
 }

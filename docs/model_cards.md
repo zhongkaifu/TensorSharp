@@ -207,9 +207,36 @@ hidden → RMSNorm(output_norm) → LM head → [softcap] → logits
 
 Enabled automatically when all layers are dense (no MoE) and all weights are quantized. `BuildGemma4DecodeArrays()` packs per-layer pointers, types, and dimensions into arrays. `NativeGemma4ModelDecode()` calls `GgmlBasicOps.Gemma4ModelDecode()` — a single native call that processes all layers, PLE, heterogeneous head dims, circular KV cache, and layer scalars in one GPU dispatch.
 
+### Fused GPU Prefill
+
+For dense layers that are eligible (non-MoE, non-shared KV, no PLE or multimodal embeddings), `TryFusedLayerPrefill()` invokes `GgmlBasicOps.Gemma4LayerPrefill()` — a single GGML graph dispatch that performs the entire transformer block during multi-token prefill:
+
+1. RMSNorm(input) * `attn_norm.weight`
+2. Fused QKV matmul → split Q, K, V
+3. Per-head QK RMSNorm, V unweighted RMSNorm
+4. RoPE (local NeoX or global proportional)
+5. Causal attention (SWA or full) with KV cache
+6. Output projection + RMSNorm(post_attn_norm) + residual
+7. GeGLU FFN: RMSNorm(ffn_norm) → gate_up matmul → GELU(gate)*up → down matmul
+8. RMSNorm(post_ffw_norm) + residual + layer scalar
+
+Layers with MoE, KV sharing, or PLE fall back to the standard per-op C# path.
+
+### Chunked Prefill
+
+Long prompts are automatically split into bounded chunks to avoid O(n^2) attention score tensors for SWA layers. The chunk size is `min(2 * slidingWindow, 2048)` tokens. Chunking engages when the prompt is text-only (no multimodal embeddings injected) and longer than the chunk budget. Each chunk processes through all layers before advancing to the next, keeping the SWA window properly filled.
+
+### Prefill Caching
+
+Three levels of cross-layer caching are maintained during prefill to avoid redundant recomputation:
+
+- **SWA mask cache**: `_cachedSWAMaskWidths` stores the per-head sliding-window mask widths for the current query length and start position. Regenerated only when `seqLen` or `startPos` changes.
+- **NeoX RoPE cos/sin lookup table cache**: `_neoXRopeCos` / `_neoXRopeSin` tables are built once per forward pass for global layers and reused across all global attention layers, eliminating millions of `MathF.Cos`/`MathF.Sin` calls.
+- **RoPE position tensor cache**: `_cachedRoPEPosQ` / `_cachedRoPEPosK` tensors for local-layer RoPE positions are cached across layers within a forward pass and reused when `seqLen` and `startPos` match.
+
 ### Optimization Opportunities
 
-- MoE layers disable the fused decode path. A fused MoE GPU kernel would recover the speedup.
+- MoE layers disable the fused decode and fused prefill paths. A fused MoE GPU kernel would recover the speedup.
 - Expert FFN runs sequentially per-token per-expert. Batching across experts would improve throughput.
 
 ---
@@ -433,6 +460,25 @@ Additional vision encoder improvements:
 
 - **Parallelized block-order reorder**: `ReorderToBlockOrder()` parallelizes across block rows using `Parallel.For`, so spatial-merge reordering scales with CPU core count.
 - **GPU-aware QKV split**: on GPU backends the QKV split uses `Narrow` + `NewContiguous` to keep data on-device; on CPU it uses a fused parallel `Buffer.MemoryCopy` pass to split Q/K/V in one sweep, eliminating three separate allocation + copy passes.
+
+### Fused Prefill Attention
+
+For multi-token prefill (`seqLen > 1`) on a GGML backend, `FusedPrefillAttention` combines the entire attention score computation into a single GGML graph dispatch:
+
+1. Q * K^T (scaled) — with GQA head broadcasting
+2. Causal mask application (lower-triangular, with `maskStartPos` offset for continuation prefill)
+3. Softmax
+4. Scores * V → attention output
+
+This replaces ~5 separate C#-to-GGML round-trips (matmul, mask, softmax, matmul, transpose) with one fused dispatch per attention layer. Handles both initial prefill (empty KV cache) and continuation prefill (existing KV cache entries from prior turns). The `inputFormat` parameter supports both `[seqLen, numHeads, headDim]` and `[numHeads, seqLen, headDim]` tensor layouts.
+
+### In-place QK RMSNorm
+
+The per-head QK normalization in `ApplyPerHeadRMSNorm()` is now performed in-place: the input tensor is reshaped via `View(seqLen * numHeads, headDim)` and normalized directly without allocating a separate output tensor. Since row-independent RMSNorm produces the same result regardless of row order, the reshaped view is valid for both Q and K. This avoids one tensor allocation and one `Ops.CopyTo` per Q/K per layer.
+
+### RoPE Position Tensor Caching
+
+`_cachedRoPEPosQ` and `_cachedRoPEPosK` are cached across attention layers within a single forward pass. The position tensors are regenerated only when `seqLen` or `startPos` changes, avoiding repeated tensor allocation and population for the same positional data across all 12+ attention layers.
 
 ### Parallelized Q/Gate Deinterleave
 
@@ -823,6 +869,8 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Tool calling | No | Yes | Yes | Yes | No | Yes | No |
 | Fused QKV | No | Yes | Yes | No (split Q/K/V or recurrent QKV) | No | Yes | Yes |
 | Fused GPU decode | No | Yes (Metal) | No | No | No | No | No |
+| Fused GPU prefill | No | Yes (dense layers) | No | No | No | No | No |
+| Fused prefill attention | No | No | No | Yes | No | No | No |
 | Native model decode | No | No | Yes | No | No | No | No |
 | Batched GPU MoE | No | No | No | Yes (qwen35moe / qwen3next, fused with shared expert + residual) | No | Yes | No |
 | Fused outproj+FFN | No | No | No | Yes (dense layers) | No | No | No |

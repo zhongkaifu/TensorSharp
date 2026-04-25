@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -33,7 +33,8 @@ namespace TensorSharp.Cli
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-            ConsoleBanner.Print();
+            bool showSarah = Array.Exists(args, a => a == "--xzf");
+            ConsoleBanner.Print(showSarah);
 
             var loggingOptions = CliLoggingSetup.ParseFromArgs(args);
             using var loggerFactory = CliLoggingSetup.Build(loggingOptions);
@@ -205,6 +206,12 @@ namespace TensorSharp.Cli
                 "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} elapsedMs={ElapsedMs:F1}",
                 Path.GetFileName(modelPath), model.Config.Architecture ?? "(unknown)",
                 model.MaxContextLength, modelLoadSw.Elapsed.TotalMilliseconds);
+
+            var warmupSw = Stopwatch.StartNew();
+            model.WarmUpKernels();
+            warmupSw.Stop();
+            _log.LogInformation(LogEventIds.HostConfiguration,
+                "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
 
             if (mmProjPath != null)
             {

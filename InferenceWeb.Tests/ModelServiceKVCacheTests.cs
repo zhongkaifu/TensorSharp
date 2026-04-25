@@ -25,11 +25,11 @@ public class ModelServiceKVCacheTests
     }
 
     [Fact]
-    public void ResolvePrefillChunkSize_NonCudaLongPrompt_DoesNotChunk()
+    public void ResolvePrefillChunkSize_NonCudaLongPrompt_ChunksAt2048()
     {
-        Assert.Equal(11573, ModelService.ResolvePrefillChunkSize(BackendType.GgmlCpu, 11573));
-        Assert.Equal(11573, ModelService.ResolvePrefillChunkSize(BackendType.GgmlMetal, 11573));
-        Assert.Equal(11573, ModelService.ResolvePrefillChunkSize(BackendType.Cpu, 11573));
+        Assert.Equal(2048, ModelService.ResolvePrefillChunkSize(BackendType.GgmlCpu, 11573));
+        Assert.Equal(2048, ModelService.ResolvePrefillChunkSize(BackendType.GgmlMetal, 11573));
+        Assert.Equal(2048, ModelService.ResolvePrefillChunkSize(BackendType.Cpu, 11573));
     }
 
     [Fact]

@@ -1807,3 +1807,302 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         return 0;
     }
 }
+
+// ============================================================================
+// Fused single-layer prefill: entire transformer layer as one GGML graph.
+// Eliminates all per-op C#→GGML round trips and keeps intermediates on device.
+// Handles: attn_norm → QKV → QK-norm → V-norm → RoPE → KV-cache-write →
+//          attention(mul_mat+softmax+mul_mat) → O-proj → post-attn-norm →
+//          residual → FFN-norm → gate_up → GELU*up → down → post-FFN-norm →
+//          residual → layer-scale.
+// Dense (non-MoE), non-shared layers only.
+// ============================================================================
+
+TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
+    float* hidden_data,     // [seqLen * hiddenSize] in/out
+    int hiddenSize, int seqLen,
+    // Attention weights
+    void* attnNormW,        // F32 [hiddenSize]
+    void* qkvW, int qkvType, std::int64_t qkvNe0, std::int64_t qkvNe1, std::int64_t qkvBytes,
+    void* qNormW,           // F32 [headDim]
+    void* kNormW,           // F32 [headDim]
+    void* oW, int oType, std::int64_t oNe0, std::int64_t oNe1, std::int64_t oBytes,
+    void* postAttnNormW,    // F32 [hiddenSize]
+    // FFN weights
+    void* ffnNormW,         // F32 [hiddenSize]
+    void* guW, int guType, std::int64_t guNe0, std::int64_t guNe1, std::int64_t guBytes,
+    void* downW, int downType, std::int64_t downNe0, std::int64_t downNe1, std::int64_t downBytes,
+    void* postFfnNormW,     // F32 [hiddenSize]
+    // KV cache
+    float* kCacheData, float* vCacheData,
+    // Layer params
+    int numHeads, int kvHeads, int headDim,
+    int cacheSize, int startPos,
+    int isLocal, int slidingWindow,
+    float ropeBase, int ropeDims,
+    float* ropeFreqFactors, int freqFactorsLen,
+    float layerScalar, float eps)
+{
+    try
+    {
+        if (!ensure_backend()) return 0;
+
+        const int qDim = numHeads * headDim;
+        const int kDim = kvHeads * headDim;
+        const int totalSeqLen = startPos + seqLen;
+        const std::int64_t intermediateSize = guNe1 / 2;
+
+        const std::size_t ctx_size = 16 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create context for Gemma4 layer prefill.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        // Create GGML tensors
+        ggml_tensor* hidden_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hiddenSize, seqLen);
+        ggml_tensor* hidden_out_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hiddenSize, seqLen);
+
+        ggml_tensor* attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hiddenSize);
+        ggml_tensor* qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkvType), qkvNe0, qkvNe1);
+        ggml_tensor* q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, headDim);
+        ggml_tensor* k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, headDim);
+        ggml_tensor* o_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(oType), oNe0, oNe1);
+        ggml_tensor* post_attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hiddenSize);
+        ggml_tensor* ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hiddenSize);
+        ggml_tensor* gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(guType), guNe0, guNe1);
+        ggml_tensor* down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(downType), downNe0, downNe1);
+        ggml_tensor* post_ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hiddenSize);
+
+        ggml_tensor* k_cache_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, cacheSize, kvHeads);
+        ggml_tensor* v_cache_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, cacheSize, kvHeads);
+
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqLen);
+        std::vector<int32_t> pos_data(seqLen);
+        for (int i = 0; i < seqLen; i++) pos_data[i] = startPos + i;
+
+        ggml_tensor* freq_factors_t = nullptr;
+        if (ropeFreqFactors != nullptr && freqFactorsLen > 0)
+            freq_factors_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, freqFactorsLen);
+
+        // === Build graph ===
+
+        // 1. Attn norm
+        ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden_t, eps), attn_norm_w);
+
+        // 2. QKV projection: [seqLen, hiddenSize] @ [hiddenSize, qkvDim] → [seqLen, qkvDim]
+        ggml_tensor* qkv_out = ggml_mul_mat(ctx, qkv_w, normed);
+
+        // 3. Split Q/K/V
+        ggml_tensor* q_raw = ggml_view_2d(ctx, qkv_out, qDim, seqLen,
+            qkv_out->nb[1], 0);
+        ggml_tensor* k_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
+            qkv_out->nb[1], static_cast<std::size_t>(qDim) * sizeof(float));
+        ggml_tensor* v_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
+            qkv_out->nb[1], static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+
+        // 4. Per-head Q/K norm: reshape to [headDim, numHeads*seqLen] for RMSNorm
+        ggml_tensor* q_heads = ggml_reshape_2d(ctx, q_raw, headDim, numHeads * seqLen);
+        ggml_tensor* k_heads = ggml_reshape_2d(ctx, k_raw, headDim, kvHeads * seqLen);
+        ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_heads, eps), q_norm_w);
+        ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_heads, eps), k_norm_w);
+
+        // V norm (unweighted)
+        ggml_tensor* v_heads = ggml_reshape_2d(ctx, v_raw, headDim, kvHeads * seqLen);
+        ggml_tensor* v_normed = ggml_rms_norm(ctx, v_heads, eps);
+
+        // 5. RoPE
+        ggml_tensor* rope_ff = (isLocal != 0) ? nullptr : freq_factors_t;
+        ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, headDim, numHeads, seqLen, 1);
+        ggml_tensor* k_4d = ggml_reshape_4d(ctx, k_normed, headDim, kvHeads, seqLen, 1);
+        ggml_tensor* q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, rope_ff,
+            ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
+        ggml_tensor* k_roped = ggml_rope_ext(ctx, k_4d, pos_tensor, rope_ff,
+            ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
+
+        // 6. Reshape for attention: [headDim, seqLen, numHeads]
+        ggml_tensor* q_attn = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
+        ggml_tensor* k_3d = ggml_reshape_3d(ctx,
+            ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)),
+            headDim, seqLen, kvHeads);
+        ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_normed, headDim, kvHeads * seqLen, 1);
+        v_3d = ggml_reshape_3d(ctx, v_normed, headDim, seqLen, kvHeads);
+
+        // 7. KV cache write
+        ggml_tensor* k_cpy = nullptr;
+        ggml_tensor* v_cpy = nullptr;
+        {
+            int writePos = (isLocal != 0) ? (startPos % cacheSize) : startPos;
+            int writeLen = seqLen;
+            if (isLocal != 0 && writePos + seqLen > cacheSize)
+                writeLen = cacheSize - writePos; // truncate to avoid wrap for simplicity
+
+            std::size_t kv_offset = static_cast<std::size_t>(writePos) * headDim * sizeof(float);
+            ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_t,
+                headDim, writeLen, kvHeads,
+                k_cache_t->nb[1], k_cache_t->nb[2], kv_offset);
+            ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_t,
+                headDim, writeLen, kvHeads,
+                v_cache_t->nb[1], v_cache_t->nb[2], kv_offset);
+
+            ggml_tensor* k_src = (writeLen == seqLen) ? k_3d
+                : ggml_view_3d(ctx, k_3d, headDim, writeLen, kvHeads, k_3d->nb[1], k_3d->nb[2], 0);
+            ggml_tensor* v_src = (writeLen == seqLen) ? v_3d
+                : ggml_view_3d(ctx, v_3d, headDim, writeLen, kvHeads, v_3d->nb[1], v_3d->nb[2], 0);
+
+            k_cpy = ggml_cpy(ctx, k_src, k_dst);
+            v_cpy = ggml_cpy(ctx, v_src, v_dst);
+        }
+
+        // 8. Attention: Q*K^T → softmax(mask) → *V
+        // Build causal mask [kvLen, seqLen] in FP16
+        int kvLen = seqLen; // using freshly computed K/V for this chunk
+        int maskStart = 0;  // kvLen == seqLen, so mask startPos = 0
+        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
+        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * seqLen);
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            int win = (isLocal != 0) ? slidingWindow : 0;
+            for (int qi = 0; qi < seqLen; qi++)
+            {
+                int threshold = maskStart + qi;
+                int winStart = (win > 0) ? std::max(0, threshold - win + 1) : 0;
+                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(qi) * kvLen];
+                for (int ki = 0; ki < kvLen; ki++)
+                    row[ki] = (ki > threshold || ki < winStart) ? neg_inf : zero_val;
+            }
+        }
+
+        // Q: [headDim, seqLen, numHeads], K: [headDim, seqLen, kvHeads]
+        ggml_tensor* scores = ggml_mul_mat(ctx, k_3d, ggml_cont(ctx, q_attn));
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, 1.0f, 0.0f);
+        ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_3d, 1, 0, 2, 3));
+        ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
+
+        // Permute to flat: [headDim, seqLen, numHeads] → [headDim, numHeads, seqLen] → cont → [qDim, seqLen]
+        ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
+
+        // 9. O projection
+        ggml_tensor* o_out = ggml_mul_mat(ctx, o_w, attn_flat);
+
+        // 10. Post-attn norm + residual
+        ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), post_attn_norm_w);
+        ggml_tensor* residual1 = ggml_add(ctx, hidden_t, post_attn);
+
+        // 11. FFN: norm → gate_up → GELU*up → down → post_norm → residual
+        ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), ffn_norm_w);
+        ggml_tensor* gu_out = ggml_mul_mat(ctx, gu_w, ffn_normed);
+        ggml_tensor* gate_v = ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
+            gu_out->nb[1], 0);
+        ggml_tensor* up_v = ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
+            gu_out->nb[1], static_cast<std::size_t>(intermediateSize) * sizeof(float));
+        ggml_tensor* ffn_act = ggml_mul(ctx, ggml_gelu(ctx, gate_v), up_v);
+        ggml_tensor* down_out = ggml_mul_mat(ctx, down_w, ffn_act);
+
+        // 12. Post-FFN norm + residual
+        ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down_out, eps), post_ffn_norm_w);
+        ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn);
+
+        // 13. Layer scalar
+        if (std::fabs(layerScalar - 1.0f) > 1e-6f)
+            residual2 = ggml_scale(ctx, residual2, layerScalar);
+
+        // Output
+        ggml_tensor* output = ggml_cpy(ctx, residual2, hidden_out_t);
+        ggml_set_output(output);
+
+        // Build graph
+        const std::size_t graph_size = 512;
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_build_forward_expand(graph, k_cpy);
+        ggml_build_forward_expand(graph, v_cpy);
+        ggml_build_forward_expand(graph, output);
+
+        // Bind weights
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* t; void* d; std::size_t b; };
+        std::vector<HostBinding> uploads;
+        std::vector<BufferHandle> ephem;
+
+        auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cache) {
+            if (t == nullptr || data == nullptr) return;
+            if (cache && bytes >= 4096) {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+                    if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
+                        if (needs) uploads.push_back({t, data, bytes});
+                        return;
+                    }
+                    invalidate_cached_buffer(data);
+                }
+            }
+            if (bytes >= 4096) {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cache, buf)) {
+                    if (!cache) ephem.emplace_back(buf);
+                    if (ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS) return;
+                }
+            }
+            uploads.push_back({t, data, bytes});
+        };
+
+        bind(qkv_w, qkvW, static_cast<std::size_t>(qkvBytes), true);
+        bind(o_w, oW, static_cast<std::size_t>(oBytes), true);
+        bind(gu_w, guW, static_cast<std::size_t>(guBytes), true);
+        bind(down_w, downW, static_cast<std::size_t>(downBytes), true);
+        bind(attn_norm_w, attnNormW, hiddenSize * sizeof(float), true);
+        bind(post_attn_norm_w, postAttnNormW, hiddenSize * sizeof(float), true);
+        bind(ffn_norm_w, ffnNormW, hiddenSize * sizeof(float), true);
+        bind(post_ffn_norm_w, postFfnNormW, hiddenSize * sizeof(float), true);
+        bind(q_norm_w, qNormW, headDim * sizeof(float), true);
+        bind(k_norm_w, kNormW, headDim * sizeof(float), true);
+        bind(k_cache_t, kCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true);
+        bind(v_cache_t, vCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true);
+
+        // Allocate graph buffer
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr) {
+            set_last_error("Failed to allocate buffer for Gemma4 layer prefill.");
+            return 0;
+        }
+
+        // Upload data
+        for (auto& u : uploads)
+            ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+
+        ggml_backend_tensor_set(hidden_t, hidden_data, 0,
+            static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
+        ggml_backend_tensor_set(pos_tensor, pos_data.data(), 0, seqLen * sizeof(int32_t));
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        if (freq_factors_t != nullptr)
+            ggml_backend_tensor_set(freq_factors_t, ropeFreqFactors, 0, freqFactorsLen * sizeof(float));
+
+        // Execute
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            set_last_error("Graph compute failed for Gemma4 layer prefill.");
+            return 0;
+        }
+        ggml_backend_synchronize(g_backend);
+
+        // Download result
+        ggml_backend_tensor_get(hidden_out_t, hidden_data, 0,
+            static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
+
+        // Also sync KV cache back to host
+        ggml_backend_tensor_get(k_cache_t, kCacheData, 0, kv_cache_bytes(kvHeads, cacheSize, headDim));
+        ggml_backend_tensor_get(v_cache_t, vCacheData, 0, kv_cache_bytes(kvHeads, cacheSize, headDim));
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in Gemma4 layer prefill."); return 0; }
+}

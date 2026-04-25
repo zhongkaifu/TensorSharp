@@ -814,6 +814,70 @@ namespace TensorSharp.GGML
                 maxSeqLen, position, scale);
         }
 
+        public static void Gemma4LayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr postAttnNormW,
+            IntPtr ffnNormW,
+            IntPtr guW, int guType, long guNe0, long guNe1, long guBytes,
+            IntPtr downW, int downType, long downNe0, long downNe1, long downBytes,
+            IntPtr postFfnNormW,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isLocal, int slidingWindow,
+            float ropeBase, int ropeDims,
+            IntPtr ropeFreqFactors, int freqFactorsLen,
+            float layerScalar, float eps)
+        {
+            GgmlNative.Gemma4LayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qNormW, kNormW,
+                oW, oType, oNe0, oNe1, oBytes,
+                postAttnNormW,
+                ffnNormW,
+                guW, guType, guNe0, guNe1, guBytes,
+                downW, downType, downNe0, downNe1, downBytes,
+                postFfnNormW,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                isLocal, slidingWindow,
+                ropeBase, ropeDims,
+                ropeFreqFactors, freqFactorsLen,
+                layerScalar, eps);
+        }
+
+        /// <summary>
+        /// Fused multi-token prefill attention. Runs Q*K^T → causal mask → softmax → *V as
+        /// a single GGML graph on the device (Metal/CUDA/CPU), eliminating ~5 separate C# → GGML
+        /// round trips. Supports GQA and optional sliding window.
+        ///
+        /// Q: [numHeads, seqLen, headDim], K/V: [numKVHeads, kvLen, headDim], all F32 contiguous.
+        /// </summary>
+        /// <param name="inputFormat">0 = head-first [numHeads, seqLen, headDim], 1 = flat [seqLen, numHeads*headDim]</param>
+        public static void FusedPrefillAttention(Tensor q, Tensor k, Tensor v, Tensor output,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen,
+            int maskStartPos, int slidingWindow, float scale, int inputFormat = 0)
+        {
+            IntPtr qPtr = GetBufferStart(q);
+            IntPtr kPtr = GetBufferStart(k);
+            IntPtr vPtr = GetBufferStart(v);
+            IntPtr outPtr = GetBufferStart(output);
+
+            GgmlNative.FusedPrefillAttention(
+                qPtr, kPtr, vPtr, outPtr,
+                numHeads, numKvHeads, headDim,
+                seqLen, kvLen,
+                maskStartPos, slidingWindow, scale, inputFormat);
+        }
+
         /// <summary>
         /// Single-token Qwen3.5 full-attention decode kernel. Performs the entire FullAttention
         /// block (RMSNorm, fused QKV, deinterleave Q/gate, per-head QK norm, RoPE, KV cache append,

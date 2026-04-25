@@ -61,6 +61,28 @@ namespace TensorSharp.Models
 
         private Tensor _onesForVNorm;
 
+        // Per-forward-pass SWA mask cache: all SWA layers share the same
+        // mask parameters (queryLen, startPos, windowSize), so we precompute
+        // per-row fill widths once and reuse across layers. This eliminates
+        // redundant mask rebuilds that were a ~28% regression in ollama.
+        private int[] _cachedSWAMaskWidths;
+        private int _cachedSWAMaskQueryLen;
+        private int _cachedSWAMaskStartPos = -1;
+
+        // NeoX RoPE cos/sin lookup table cached across global layers.
+        // The table depends only on (seqLen, startPos, freqs) which are
+        // identical for all global layers in a forward pass, eliminating
+        // ~35M MathF.Cos/Sin calls per chunk (~700ms → ~5ms).
+        private float[] _neoXRopeCos, _neoXRopeSin;
+        private int _neoXRopeCacheSeqLen, _neoXRopeCacheStartPos = -1;
+        private float[] _neoXRopeCacheFreqs;
+
+        // Cached RoPE position tensors for local layers.
+        // All local layers in a forward pass share the same (seqLen, startPos),
+        // so we precompute once and reuse.
+        private Tensor _cachedRoPEPosQ, _cachedRoPEPosK;
+        private int _cachedRoPEPosSeqLen, _cachedRoPEPosStartPos = -1;
+
         private int _numExperts;
         private int _numExpertsUsed;
 
@@ -458,8 +480,21 @@ namespace TensorSharp.Models
                         perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
 
                     bool isShared = _kvDonorMap.ContainsKey(l);
-                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
 
+                    // Fused GPU layer: entire transformer block as one GGML graph.
+                    // Only for dense, non-shared, non-MoE layers without PLE/multimodal.
+                    if (IsGgmlBackend && seqLen > 1 && !isShared && !HasMoE(l) &&
+                        perLayerInput == null && exceptPositions == null &&
+                        _canUseFusedDecode)
+                    {
+                        if (TryFusedLayerPrefill(hidden, l, seqLen, startPos))
+                        {
+                            perLayerInput?.Dispose();
+                            continue;
+                        }
+                    }
+
+                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
                     perLayerInput?.Dispose();
                 }
 
@@ -476,21 +511,20 @@ namespace TensorSharp.Models
 
             perLayerInputs?.Dispose();
 
-            Tensor normed = RMSNormOp(hidden, "output_norm.weight");
-            hidden.Dispose();
-
             Tensor lastHidden;
             if (seqLen > 1)
             {
-                // Prefill only needs next-token logits, so keep the LM head on the final token.
-                using var lastRow = normed.Narrow(0, seqLen - 1, 1);
+                using var lastRow = hidden.Narrow(0, seqLen - 1, 1);
                 lastHidden = Ops.NewContiguous(lastRow);
+                hidden.Dispose();
+                Ops.RMSNorm(lastHidden, lastHidden, _weights["output_norm.weight"], null, Config.Eps);
             }
             else
             {
-                lastHidden = normed.CopyRef();
+                Tensor normed = RMSNormOp(hidden, "output_norm.weight");
+                hidden.Dispose();
+                lastHidden = normed;
             }
-            normed.Dispose();
 
             t0 = Stopwatch.GetTimestamp();
             string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
@@ -525,12 +559,34 @@ namespace TensorSharp.Models
             if (tokens == null || tokens.Length <= 1 || !_canUseFusedDecode)
                 return Forward(tokens);
 
-            int prefixLen = tokens.Length - 1;
-            var prefixTokens = new int[prefixLen];
-            Array.Copy(tokens, prefixTokens, prefixLen);
+            int lastIdx = tokens.Length - 1;
 
+            // Chunked prefill: process the prefix in bounded chunks to avoid
+            // O(n²) attention score tensors for SWA layers on large prompts.
+            // Skip chunking when multimodal embeddings are queued because
+            // their insertion positions are relative to the full sequence.
+            // Use 2× sliding window to keep SWA attention matrices small while
+            // preserving enough context at chunk boundaries.
+            int prefillChunkSize = Math.Max(512, Math.Min(2048, _slidingWindow * 2));
+            bool hasMultimodal = _pendingVisionEmbeddingsList.Count > 0
+                              || _pendingAudioEmbeddingsList.Count > 0;
+
+            if (!hasMultimodal && lastIdx > prefillChunkSize)
+            {
+                for (int pos = 0; pos < lastIdx; pos += prefillChunkSize)
+                {
+                    int chunkLen = Math.Min(prefillChunkSize, lastIdx - pos);
+                    var chunk = new int[chunkLen];
+                    Array.Copy(tokens, pos, chunk, 0, chunkLen);
+                    PrefillWithoutLogits(chunk);
+                }
+                return Forward(new[] { tokens[lastIdx] });
+            }
+
+            var prefixTokens = new int[lastIdx];
+            Array.Copy(tokens, prefixTokens, lastIdx);
             PrefillWithoutLogits(prefixTokens);
-            return Forward(new[] { tokens[prefixLen] });
+            return Forward(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -605,8 +661,19 @@ namespace TensorSharp.Models
                         perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
 
                     bool isShared = _kvDonorMap.ContainsKey(l);
-                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
 
+                    if (IsGgmlBackend && seqLen > 1 && !isShared && !HasMoE(l) &&
+                        perLayerInput == null && exceptPositions == null &&
+                        _canUseFusedDecode)
+                    {
+                        if (TryFusedLayerPrefill(hidden, l, seqLen, startPos))
+                        {
+                            perLayerInput?.Dispose();
+                            continue;
+                        }
+                    }
+
+                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
                     perLayerInput?.Dispose();
                 }
 
@@ -905,6 +972,60 @@ namespace TensorSharp.Models
                 a.PlePostNorm);
         }
 
+        private unsafe bool TryFusedLayerPrefill(Tensor hidden, int layer, int seqLen, int startPos)
+        {
+            if (_decodeArrays == null) return false;
+            var a = _decodeArrays;
+
+            string prefix = $"blk.{layer}";
+            string postAttnKey = $"{prefix}.post_attention_norm.weight";
+            string postFfnKey = _weights.ContainsKey($"{prefix}.post_ffw_norm.weight")
+                ? $"{prefix}.post_ffw_norm.weight" : $"{prefix}.ffn_post_norm.weight";
+
+            if (!_weights.ContainsKey(postAttnKey) || !_weights.ContainsKey(postFfnKey))
+                return false;
+
+            bool isLocal = IsLocalLayer(layer);
+            var (ropeBase, ropeDims) = RopeForLayer(layer);
+
+            IntPtr freqFactorsPtr = IntPtr.Zero;
+            int freqFactorsLen = 0;
+            if (!isLocal && _weights.TryGetValue("rope_freqs.weight", out var freqTensor))
+            {
+                freqFactorsPtr = (IntPtr)GetFloatPtr(freqTensor);
+                freqFactorsLen = (int)freqTensor.ElementCount();
+            }
+
+            try
+            {
+                GgmlBasicOps.Gemma4LayerPrefill(
+                    (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, seqLen,
+                    (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_norm.weight"]),
+                    a.Qkv[layer], a.QkvType[layer], a.QkvNe0[layer], a.QkvNe1[layer], a.QkvBytes[layer],
+                    a.QNorm[layer],
+                    isLocal ? a.KNorm[layer] : a.KNorm[layer],
+                    a.O[layer], a.OType[layer], a.ONe0[layer], a.ONe1[layer], a.OBytes[layer],
+                    (IntPtr)GetFloatPtr(_weights[postAttnKey]),
+                    (IntPtr)GetFloatPtr(_weights[$"{prefix}.ffn_norm.weight"]),
+                    a.Gu[layer], a.GuType[layer], a.GuNe0[layer], a.GuNe1[layer], a.GuBytes[layer],
+                    a.Down[layer], a.DownType[layer], a.DownNe0[layer], a.DownNe1[layer], a.DownBytes[layer],
+                    (IntPtr)GetFloatPtr(_weights[postFfnKey]),
+                    a.KCache[layer], a.VCache[layer],
+                    Config.NumHeads, a.KvHeads[layer], a.HeadDim[layer],
+                    a.CacheSize[layer], startPos,
+                    a.IsLocal[layer], _slidingWindow,
+                    ropeBase, ropeDims,
+                    freqFactorsPtr, freqFactorsLen,
+                    a.LayerScalar[layer], Config.Eps);
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void EnsureKvCacheHostSynchronized()
         {
             if (!_kvCacheHostDirty || !IsGgmlBackend || _kvCacheK == null)
@@ -1061,61 +1182,62 @@ namespace TensorSharp.Models
 
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
 
-            using var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared, exceptPositions);
+            var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared, exceptPositions);
 
-            using var postAttnNormed = RMSNormOp(attnOut, $"{prefix}.post_attention_norm.weight");
+            // In-place post-attention norm: attnOut is only consumed here,
+            // saving one tensor allocation (~14 MB) per layer.
+            Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, Config.Eps);
 
-            Ops.Add(postAttnNormed, postAttnNormed, hidden);
+            Ops.Add(attnOut, attnOut, hidden);
             hidden.Dispose();
 
             Tensor result;
 
             if (HasMoE(layer))
             {
-                // MoE: run dense MLP and MoE in parallel, then combine
-                using var mlpNormed = RMSNormOp(postAttnNormed, $"{prefix}.ffn_norm.weight");
-                using var mlpOut = FFNGelu(mlpNormed, $"{prefix}.ffn_gate_up.weight",
+                using var mlpNormed = RMSNormOp(attnOut, $"{prefix}.ffn_norm.weight");
+                var mlpOut = FFNGelu(mlpNormed, $"{prefix}.ffn_gate_up.weight",
                     $"{prefix}.ffn_down.weight", seqLen);
 
                 string postMlpNorm1Key = $"{prefix}.post_ffw_norm_1.weight";
                 if (!_weights.ContainsKey(postMlpNorm1Key))
                     postMlpNorm1Key = $"{prefix}.ffn_post_norm_1.weight";
-                using var postMlpNormed1 = RMSNormOp(mlpOut, postMlpNorm1Key);
+                Ops.RMSNorm(mlpOut, mlpOut, _weights[postMlpNorm1Key], null, Config.Eps);
 
-                using var moeOut = MoEForward(postAttnNormed, layer, prefix, seqLen);
+                using var moeOut = MoEForward(attnOut, layer, prefix, seqLen);
 
                 string postMoeNormKey = $"{prefix}.post_ffw_norm_2.weight";
                 if (!_weights.ContainsKey(postMoeNormKey))
                     postMoeNormKey = $"{prefix}.ffn_post_norm_2.weight";
                 using var postMoeNormed = RMSNormOp(moeOut, postMoeNormKey);
 
-                // Combine MLP + MoE
-                var combined = new Tensor(_allocator, DType.Float32, postMlpNormed1.Sizes);
-                Ops.Add(combined, postMlpNormed1, postMoeNormed);
+                Ops.Add(mlpOut, mlpOut, postMoeNormed);
 
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
                     postFfnNormKey = $"{prefix}.ffn_post_norm.weight";
-                using var postFfnNormed = RMSNormOp(combined, postFfnNormKey);
-                combined.Dispose();
+                Ops.RMSNorm(mlpOut, mlpOut, _weights[postFfnNormKey], null, Config.Eps);
 
-                result = new Tensor(_allocator, DType.Float32, postAttnNormed.Sizes);
-                Ops.Add(result, postAttnNormed, postFfnNormed);
+                Ops.Add(attnOut, attnOut, mlpOut);
+                mlpOut.Dispose();
+                result = attnOut;
             }
             else
             {
-                // Dense layers: MLP only
-                using var ffnNormed = RMSNormOp(postAttnNormed, $"{prefix}.ffn_norm.weight");
-                using var ffnOut = FFNGelu(ffnNormed, $"{prefix}.ffn_gate_up.weight",
+                using var ffnNormed = RMSNormOp(attnOut, $"{prefix}.ffn_norm.weight");
+                var ffnOut = FFNGelu(ffnNormed, $"{prefix}.ffn_gate_up.weight",
                     $"{prefix}.ffn_down.weight", seqLen);
 
+                // In-place post-FFN norm: ffnOut is only consumed here
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
                     postFfnNormKey = $"{prefix}.ffn_post_norm.weight";
-                using var postFfnNormed = RMSNormOp(ffnOut, postFfnNormKey);
+                Ops.RMSNorm(ffnOut, ffnOut, _weights[postFfnNormKey], null, Config.Eps);
 
-                result = new Tensor(_allocator, DType.Float32, postAttnNormed.Sizes);
-                Ops.Add(result, postAttnNormed, postFfnNormed);
+                // In-place residual add: reuse attnOut as result, no new allocation
+                Ops.Add(attnOut, attnOut, ffnOut);
+                ffnOut.Dispose();
+                result = attnOut;
             }
 
             // PLE injection
@@ -1147,16 +1269,13 @@ namespace TensorSharp.Models
 
         private unsafe Tensor MoEForward(Tensor hiddenState, int layer, string prefix, int seqLen)
         {
-            // Router receives UN-normed hiddenState (Router does its own unweighted RMSNorm)
             var (routingWeights, selectedExperts) = MoERoute(hiddenState, prefix, seqLen);
 
-            // Pre-norm for expert input (separate from router norm)
             string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
             if (!_weights.ContainsKey(moeNormKey))
                 moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
             using var moeInput = RMSNormOp(hiddenState, moeNormKey);
 
-            // Expert computation: for each token, run selected experts
             int hiddenDim = (int)moeInput.Sizes[1];
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
             Ops.Fill(output, 0f);
@@ -1164,63 +1283,89 @@ namespace TensorSharp.Models
             float* inputPtr = GetFloatPtr(moeInput);
             float* outputPtr = GetFloatPtr(output);
 
-            var tokenInput = new Tensor(_allocator, DType.Float32, 1, hiddenDim);
-            float* tokenPtr = GetFloatPtr(tokenInput);
+            // Group tokens by expert for batched processing.
+            // Instead of seqLen*numExpertsUsed individual single-row matmuls,
+            // we run at most numExperts batched matmuls with much better GEMM efficiency.
+            var expertBatches = new List<(int tokenIdx, float weight)>[_numExperts];
+            for (int i = 0; i < _numExperts; i++)
+                expertBatches[i] = new List<(int, float)>();
 
             for (int s = 0; s < seqLen; s++)
-            {
                 for (int e = 0; e < _numExpertsUsed; e++)
                 {
                     int expertIdx = selectedExperts[s * _numExpertsUsed + e];
                     float weight = routingWeights[s * _numExpertsUsed + e];
+                    expertBatches[expertIdx].Add((s, weight));
+                }
 
-                    Buffer.MemoryCopy(inputPtr + (long)s * hiddenDim, tokenPtr,
-                        hiddenDim * sizeof(float), hiddenDim * sizeof(float));
+            // Look up scale key once per layer
+            string scaleKey = $"{prefix}.ffn_down_exps.scale";
+            if (!_weights.ContainsKey(scaleKey))
+                scaleKey = $"{prefix}.ffn_gate_inp.per_expert_scale";
+            _weights.TryGetValue(scaleKey, out var perExpertScale);
 
-                    // Run expert FFN: GELU(gate) * up, then down
+            for (int expertIdx = 0; expertIdx < _numExperts; expertIdx++)
+            {
+                var batch = expertBatches[expertIdx];
+                if (batch.Count == 0) continue;
+
+                int batchSize = batch.Count;
+
+                // Gather input rows assigned to this expert
+                var batchInput = new Tensor(_allocator, DType.Float32, batchSize, hiddenDim);
+                float* batchPtr = GetFloatPtr(batchInput);
+                int rowBytes = hiddenDim * sizeof(float);
+                for (int b = 0; b < batchSize; b++)
+                    Buffer.MemoryCopy(inputPtr + (long)batch[b].tokenIdx * hiddenDim,
+                        batchPtr + (long)b * hiddenDim, rowBytes, rowBytes);
+
+                // Run batched expert FFN
+                string fusedKey = $"{prefix}.ffn_gate_up_exps.{expertIdx}.weight";
+                string downKey = $"{prefix}.ffn_down_exps.{expertIdx}.weight";
+                Tensor expertOut;
+
+                if (_weights.ContainsKey(fusedKey) || _quantWeights.ContainsKey(fusedKey))
+                {
+                    expertOut = FFNGelu(batchInput, fusedKey, downKey, batchSize);
+                }
+                else
+                {
                     string gateKey = $"{prefix}.ffn_gate_exps.{expertIdx}.weight";
                     string upKey = $"{prefix}.ffn_up_exps.{expertIdx}.weight";
-                    string downKey = $"{prefix}.ffn_down_exps.{expertIdx}.weight";
-
-                    // Try fused gate_up first
-                    string fusedKey = $"{prefix}.ffn_gate_up_exps.{expertIdx}.weight";
-                    Tensor expertOut;
-                    if (_weights.ContainsKey(fusedKey) || _quantWeights.ContainsKey(fusedKey))
+                    if (!(_weights.ContainsKey(gateKey) || _quantWeights.ContainsKey(gateKey)) ||
+                        !(_weights.ContainsKey(downKey) || _quantWeights.ContainsKey(downKey)))
                     {
-                        expertOut = FFNGelu(tokenInput, fusedKey, downKey, 1);
-                    }
-                    else if ((_weights.ContainsKey(gateKey) || _quantWeights.ContainsKey(gateKey)) &&
-                             (_weights.ContainsKey(downKey) || _quantWeights.ContainsKey(downKey)))
-                    {
-                        using var gateOut = LinearForward(tokenInput, gateKey);
-                        using var upOut = LinearForward(tokenInput, upKey);
-                        Ops.GELUMul(gateOut, gateOut, upOut);
-                        expertOut = LinearForward(gateOut, downKey);
-                    }
-                    else
-                    {
+                        batchInput.Dispose();
                         continue;
                     }
-
-                    // Apply per-expert down scale if present
-                    string scaleKey = $"{prefix}.ffn_down_exps.scale";
-                    if (!_weights.ContainsKey(scaleKey))
-                        scaleKey = $"{prefix}.ffn_gate_inp.per_expert_scale";
-                    if (_weights.TryGetValue(scaleKey, out var scaleTensor))
-                    {
-                        float expertScale = scaleTensor.GetElementAsFloat(expertIdx);
-                        Ops.Mul(expertOut, expertOut, expertScale);
-                    }
-
-                    // Accumulate weighted expert output
-                    float* expertPtr = GetFloatPtr(expertOut);
-                    for (int d = 0; d < hiddenDim; d++)
-                        outputPtr[s * hiddenDim + d] += weight * expertPtr[d];
-                    expertOut.Dispose();
+                    using var gateOut = LinearForward(batchInput, gateKey);
+                    using var upOut = LinearForward(batchInput, upKey);
+                    Ops.GELUMul(gateOut, gateOut, upOut);
+                    expertOut = LinearForward(gateOut, downKey);
                 }
+                batchInput.Dispose();
+
+                // Apply per-expert scale
+                if (perExpertScale != null)
+                {
+                    float s = perExpertScale.GetElementAsFloat(expertIdx);
+                    if (s != 1f) Ops.Mul(expertOut, expertOut, s);
+                }
+
+                // Scatter-accumulate back with routing weights
+                float* expPtr = GetFloatPtr(expertOut);
+                for (int b = 0; b < batchSize; b++)
+                {
+                    int tokenIdx = batch[b].tokenIdx;
+                    float w = batch[b].weight;
+                    float* src = expPtr + (long)b * hiddenDim;
+                    float* dst = outputPtr + (long)tokenIdx * hiddenDim;
+                    for (int d = 0; d < hiddenDim; d++)
+                        dst[d] += w * src[d];
+                }
+                expertOut.Dispose();
             }
 
-            tokenInput.Dispose();
             return output;
         }
 
@@ -1229,27 +1374,18 @@ namespace TensorSharp.Models
         {
             int hiddenDim = (int)input.Sizes[1];
 
-            // Unweighted RMSNorm
-            using var normed = new Tensor(_allocator, DType.Float32, input.Sizes);
-            Ops.Copy(normed, input);
+            // Unweighted RMSNorm on a copy (input is used elsewhere)
+            using var normed = Ops.NewContiguous(input);
             ApplyUnweightedRMSNorm(normed, 1, hiddenDim, seqLen);
 
             // Scale by 1/sqrt(hidden_size)
             float invSqrtHidden = 1f / MathF.Sqrt(hiddenDim);
             Ops.Mul(normed, normed, invSqrtHidden);
 
-            // Multiply by learned scale parameter
+            // Multiply by learned scale parameter (broadcast per-dim scale across tokens)
             string scaleKey = $"{prefix}.ffn_gate_inp.scale";
             if (_weights.TryGetValue(scaleKey, out var scaleTensor))
-            {
-                // Element-wise multiply per hidden dim
-                float* nPtr = GetFloatPtr(normed);
-                float* sPtr = GetFloatPtr(scaleTensor);
-                int scaleDim = (int)scaleTensor.ElementCount();
-                for (int s = 0; s < seqLen; s++)
-                    for (int d = 0; d < Math.Min(hiddenDim, scaleDim); d++)
-                        nPtr[s * hiddenDim + d] *= sPtr[d];
-            }
+                Ops.Mul(normed, normed, scaleTensor);
 
             // Project to expert logits
             using var expertScores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");
@@ -1430,15 +1566,17 @@ namespace TensorSharp.Models
             }
             else
             {
+                // gate needs a contiguous copy for the downstream LinearForward.
+                // up is only read by GELUMul, so a non-contiguous narrow view
+                // suffices (GELUMul's Apply3 path handles strides).
                 using (var gView = gateUp.Narrow(1, 0, halfDim))
                     gate = Ops.NewContiguous(gView);
-                using (var uView = gateUp.Narrow(1, halfDim, halfDim))
-                    up = Ops.NewContiguous(uView);
+                up = gateUp.Narrow(1, halfDim, halfDim);
             }
-            gateUp.Dispose();
 
             Ops.GELUMul(gate, gate, up);
             up.Dispose();
+            gateUp.Dispose();
 
             Tensor down = LinearForward(gate, downWeightName);
             gate.Dispose();
@@ -1461,7 +1599,37 @@ namespace TensorSharp.Models
             string qkvName = $"{prefix}.attn_qkv.weight";
             bool useFusedQKV = !isShared && (_quantWeights.ContainsKey(qkvName) || _weights.ContainsKey(qkvName));
 
-            if (useFusedQKV)
+            // For global (non-SWA) prefill layers with fused QKV, use a fast path
+            // that copies directly from QKV to head-first layout, skipping the
+            // intermediate flat copies and the separate ReshapeToHeads step.
+            bool _useGlobalFastPath = useFusedQKV && seqLen > 1 && !isLocal && !isShared;
+            Tensor _globalQHeads = null, _globalKHeads = null, _globalVHeads = null;
+
+            if (_useGlobalFastPath)
+            {
+                Tensor qkv = LinearForward(input, qkvName);
+                int vDim = (int)qkv.Sizes[1] - qDim - kDim;
+
+                _globalQHeads = SplitQKVToHeadFirst(qkv, 0, Config.NumHeads, seqLen, hd);
+                _globalKHeads = SplitQKVToHeadFirst(qkv, qDim, kvHeads, seqLen, hd);
+                _globalVHeads = SplitQKVToHeadFirst(qkv, qDim + kDim, kvHeads, seqLen, hd);
+                qkv.Dispose();
+
+                // RMSNorm on head-first layout (row-independent, order doesn't matter)
+                using (var qR = _globalQHeads.View(Config.NumHeads * seqLen, hd))
+                    Ops.RMSNorm(qR, qR, _weights[$"{prefix}.attn_q_norm.weight"], null, Config.Eps);
+                using (var kR = _globalKHeads.View(kvHeads * seqLen, hd))
+                    Ops.RMSNorm(kR, kR, _weights[$"{prefix}.attn_k_norm.weight"], null, Config.Eps);
+                ApplyUnweightedRMSNorm(_globalVHeads, kvHeads, hd, seqLen);
+
+                // NeoX RoPE on head-first layout
+                float[] globalFreqs = _ropeFreqsGlobal;
+                ApplyNeoXRoPEHeadFirst(_globalQHeads, Config.NumHeads, hd, seqLen, startPos, globalFreqs);
+                ApplyNeoXRoPEHeadFirst(_globalKHeads, kvHeads, hd, seqLen, startPos, globalFreqs);
+
+                q = null; k = null; v = null;
+            }
+            else if (useFusedQKV)
             {
                 Tensor qkv = LinearForward(input, qkvName);
                 int vDim = (int)qkv.Sizes[1] - qDim - kDim;
@@ -1523,25 +1691,28 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Apply NeoX-style RoPE
-            float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
-            if (seqLen == 1)
+            // Apply NeoX-style RoPE (skipped for global fast path - already applied)
+            if (!_useGlobalFastPath)
             {
-                ApplyNeoXRoPEDecode(q, Config.NumHeads, hd, startPos, freqs);
-                if (k != null)
-                    ApplyNeoXRoPEDecode(k, kvHeads, hd, startPos, freqs);
-            }
-            else if (isLocal)
-            {
-                q = ApplyRoPEPrefill(q, Config.NumHeads, hd, seqLen, startPos, _ropeLocalBase);
-                if (k != null)
-                    k = ApplyRoPEPrefill(k, kvHeads, hd, seqLen, startPos, _ropeLocalBase);
-            }
-            else
-            {
-                q = ApplyNeoXRoPEPrefill(q, Config.NumHeads, hd, seqLen, startPos, freqs);
-                if (k != null)
-                    k = ApplyNeoXRoPEPrefill(k, kvHeads, hd, seqLen, startPos, freqs);
+                float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
+                if (seqLen == 1)
+                {
+                    ApplyNeoXRoPEDecode(q, Config.NumHeads, hd, startPos, freqs);
+                    if (k != null)
+                        ApplyNeoXRoPEDecode(k, kvHeads, hd, startPos, freqs);
+                }
+                else if (isLocal)
+                {
+                    q = ApplyRoPEPrefill(q, Config.NumHeads, hd, seqLen, startPos, _ropeLocalBase);
+                    if (k != null)
+                        k = ApplyRoPEPrefill(k, kvHeads, hd, seqLen, startPos, _ropeLocalBase);
+                }
+                else
+                {
+                    q = ApplyNeoXRoPEPrefill(q, Config.NumHeads, hd, seqLen, startPos, freqs);
+                    if (k != null)
+                        k = ApplyNeoXRoPEPrefill(k, kvHeads, hd, seqLen, startPos, freqs);
+                }
             }
 
             int totalSeqLen = startPos + seqLen;
@@ -1578,7 +1749,15 @@ namespace TensorSharp.Models
             else
             {
                 Tensor kHeadsForAttn = null, vHeadsForAttn = null;
-                if (!isShared)
+                if (_useGlobalFastPath)
+                {
+                    // Global fast path: Q/K/V already in head-first format
+                    kHeadsForAttn = _globalKHeads;
+                    vHeadsForAttn = _globalVHeads;
+                    CopyToCache(_kvCacheK[layer], kHeadsForAttn, startPos, seqLen);
+                    CopyToCache(_kvCacheV[layer], vHeadsForAttn, startPos, seqLen);
+                }
+                else if (!isShared)
                 {
                     Tensor kHeads = ReshapeToHeads(k, kvHeads, seqLen, hd);
                     Tensor vHeads = ReshapeToHeads(v, kvHeads, seqLen, hd);
@@ -1596,35 +1775,95 @@ namespace TensorSharp.Models
                     vHeadsForAttn = vHeads;
                 }
 
-                Tensor qHeads = ReshapeToHeads(q, Config.NumHeads, seqLen, hd);
+                Tensor qHeads = _useGlobalFastPath
+                    ? _globalQHeads
+                    : ReshapeToHeads(q, Config.NumHeads, seqLen, hd);
 
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor2) ? donor2 : layer;
                 int groupSize = Config.NumHeads / kvHeads;
 
+                // Identify K/V source for attention (un-expanded heads)
+                Tensor kvSrcK, kvSrcV;
                 int kvLen;
-                Tensor kExpanded, vExpanded;
+                bool kvIsSeqHeads = false;
                 if (kHeadsForAttn != null && (startPos == 0 || isLocal))
                 {
-                    // Non-shared SWA layers bypass the circular cache for attention;
-                    // use freshly computed K/V in correct sequential order.
+                    kvSrcK = kHeadsForAttn;
+                    kvSrcV = vHeadsForAttn;
                     kvLen = seqLen;
-                    kExpanded = ExpandKVHeads(kHeadsForAttn, groupSize, seqLen);
-                    vExpanded = ExpandKVHeads(vHeadsForAttn, groupSize, seqLen);
+                    kvIsSeqHeads = true;
                 }
                 else if (isLocal && startPos > 0 && _prefillSWAKV != null
                          && _prefillSWAKV.TryGetValue(kvCacheLayer, out var donorKV))
                 {
-                    // Shared SWA layer: reuse donor's saved K/V in sequential order
+                    kvSrcK = donorKV.k;
+                    kvSrcV = donorKV.v;
                     kvLen = seqLen;
-                    kExpanded = ExpandKVHeads(donorKV.k, groupSize, seqLen);
-                    vExpanded = ExpandKVHeads(donorKV.v, groupSize, seqLen);
+                    kvIsSeqHeads = true;
                 }
                 else
                 {
                     int cacheLen = _kvCacheSize[kvCacheLayer];
                     kvLen = Math.Min(totalSeqLen, cacheLen);
-                    kExpanded = ExpandKVHeads(_kvCacheK[kvCacheLayer], groupSize, kvLen);
-                    vExpanded = ExpandKVHeads(_kvCacheV[kvCacheLayer], groupSize, kvLen);
+                    kvSrcK = _kvCacheK[kvCacheLayer];
+                    kvSrcV = _kvCacheV[kvCacheLayer];
+                }
+
+                // Block-wise windowed attention for SWA layers with very large
+                // sequences (e.g., when chunking is disabled for multimodal).
+                // Avoids O(n²) score tensor that can exhaust memory.
+                bool useWindowedAttn = isLocal && kvIsSeqHeads && seqLen > _slidingWindow * 4;
+
+                // Fused prefill attention: run Q*K^T → mask → softmax → *V as a
+                // single GGML graph on the device, eliminating ~5 separate dispatches.
+                // Only for GGML backends and when there are no special mask exceptions
+                // (multimodal bidirectional tokens).
+                bool useFusedPrefillAttn = IsGgmlBackend && !useWindowedAttn
+                    && kvIsSeqHeads && exceptPositions == null;
+
+                if (useFusedPrefillAttn)
+                {
+                    int windowSize = isLocal ? _slidingWindow : 0;
+                    int maskStart = kvLen - seqLen;
+                    // Native kernel outputs directly in flat [seqLen, numHeads*hd]
+                    // via on-device permute+cont, skipping ReshapeFromHeadsEx copy.
+                    result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                    GgmlBasicOps.FusedPrefillAttention(
+                        qHeads, kvSrcK, kvSrcV, result,
+                        Config.NumHeads, kvHeads, hd,
+                        seqLen, kvLen,
+                        maskStart, windowSize, 1.0f);
+                    qHeads.Dispose();
+                }
+                else if (useWindowedAttn)
+                {
+                    result = WindowedPrefillAttention(qHeads, kvSrcK, kvSrcV,
+                        Config.NumHeads, kvHeads, seqLen, hd);
+                    qHeads.Dispose();
+                }
+                else
+                {
+                    Tensor kExpanded = ExpandKVHeads(kvSrcK, groupSize, kvLen);
+                    Tensor vExpanded = ExpandKVHeads(kvSrcV, groupSize, kvLen);
+
+                    using var kT = kExpanded.Transpose(1, 2);
+                    var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, kvLen);
+                    Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
+                    qHeads.Dispose();
+                    kExpanded.Dispose();
+
+                    int windowSize = isLocal ? _slidingWindow : 0;
+                    HashSet<int> maskExcept = isLocal ? null : exceptPositions;
+                    ApplyCausalMask(scores, seqLen, kvLen, windowSize, maskExcept);
+                    Ops.Softmax(scores, scores);
+
+                    var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
+                    Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+                    scores.Dispose();
+                    vExpanded.Dispose();
+
+                    result = ReshapeFromHeadsEx(attnOut, Config.NumHeads, seqLen, hd);
+                    attnOut.Dispose();
                 }
 
                 // Save non-shared SWA K/V for shared layers that use this as donor
@@ -1638,28 +1877,9 @@ namespace TensorSharp.Models
                     kHeadsForAttn?.Dispose();
                     vHeadsForAttn?.Dispose();
                 }
-
-                using var kT = kExpanded.Transpose(1, 2);
-                var scores = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, kvLen);
-                Ops.AddmmBatch(scores, 0, scores, 1f, qHeads, kT);
-                qHeads.Dispose();
-                kExpanded.Dispose();
-
-                int windowSize = isLocal ? _slidingWindow : 0;
-                HashSet<int> maskExcept = isLocal ? null : exceptPositions;
-                ApplyCausalMask(scores, seqLen, kvLen, windowSize, maskExcept);
-                Ops.Softmax(scores, scores);
-
-                var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
-                Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-                scores.Dispose();
-                vExpanded.Dispose();
-
-                result = ReshapeFromHeadsEx(attnOut, Config.NumHeads, seqLen, hd);
-                attnOut.Dispose();
             }
 
-            q.Dispose();
+            q?.Dispose();
             k?.Dispose();
             v?.Dispose();
 
@@ -1671,15 +1891,197 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Block-wise windowed attention for SWA prefill. Instead of computing
+        /// the full [numHeads, seqLen, seqLen] score matrix (O(n²)), splits queries
+        /// into blocks of slidingWindow size and computes attention only against
+        /// keys within the window, reducing peak memory for very large sequences.
+        /// </summary>
+        private Tensor WindowedPrefillAttention(
+            Tensor qHeads, Tensor kHeads, Tensor vHeads,
+            int numQHeads, int numKVHeads, int seqLen, int headDim)
+        {
+            int W = _slidingWindow;
+            int groupSize = numQHeads / numKVHeads;
+            var output = new Tensor(_allocator, DType.Float32, numQHeads, seqLen, headDim);
+
+            for (int bStart = 0; bStart < seqLen; bStart += W)
+            {
+                int bLen = Math.Min(W, seqLen - bStart);
+                int kStart = Math.Max(0, bStart - W + 1);
+                int kEnd = bStart + bLen;
+                int kLen = kEnd - kStart;
+
+                Tensor qBlock;
+                using (var qNarrow = qHeads.Narrow(1, bStart, bLen))
+                    qBlock = Ops.NewContiguous(qNarrow);
+
+                Tensor kBlock;
+                using (var kNarrow = kHeads.Narrow(1, kStart, kLen))
+                {
+                    var kContig = Ops.NewContiguous(kNarrow);
+                    if (groupSize <= 1) { kBlock = kContig; }
+                    else { kBlock = Ops.RepeatInterleave(null, kContig, groupSize, 0); kContig.Dispose(); }
+                }
+
+                Tensor vBlock;
+                using (var vNarrow = vHeads.Narrow(1, kStart, kLen))
+                {
+                    var vContig = Ops.NewContiguous(vNarrow);
+                    if (groupSize <= 1) { vBlock = vContig; }
+                    else { vBlock = Ops.RepeatInterleave(null, vContig, groupSize, 0); vContig.Dispose(); }
+                }
+
+                using var kT = kBlock.Transpose(1, 2);
+                var scores = new Tensor(_allocator, DType.Float32, numQHeads, bLen, kLen);
+                Ops.AddmmBatch(scores, 0, scores, 1f, qBlock, kT);
+                qBlock.Dispose();
+                kBlock.Dispose();
+
+                ApplyCausalMask(scores, bLen, kLen, _slidingWindow, null);
+                Ops.Softmax(scores, scores);
+
+                var attnBlock = new Tensor(_allocator, DType.Float32, numQHeads, bLen, headDim);
+                Ops.AddmmBatch(attnBlock, 0, attnBlock, 1f, scores, vBlock);
+                scores.Dispose();
+                vBlock.Dispose();
+
+                using (var outSlice = output.Narrow(1, bStart, bLen))
+                    Ops.Copy(outSlice, attnBlock);
+                attnBlock.Dispose();
+            }
+
+            Tensor flatResult = ReshapeFromHeadsEx(output, numQHeads, seqLen, headDim);
+            output.Dispose();
+            return flatResult;
+        }
+
+        /// <summary>
+        /// Fused QKV split + transpose to head-first layout in a single strided
+        /// copy. Combines the Narrow→NewContiguous and View→Transpose→NewContiguous
+        /// steps, eliminating one full tensor copy per projection.
+        /// </summary>
+        private unsafe Tensor SplitQKVToHeadFirst(Tensor qkv, int colOffset, int numHeads, int seqLen, int headDim)
+        {
+            var result = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
+            float* src = GetFloatPtr(qkv);
+            float* dst = GetFloatPtr(result);
+            int qkvStride = (int)qkv.Sizes[1];
+            int headBytes = headDim * sizeof(float);
+
+            if (numHeads * seqLen >= 64)
+            {
+                int totalWork = numHeads * seqLen;
+                System.Threading.Tasks.Parallel.For(0, totalWork, idx =>
+                {
+                    int h = idx / seqLen;
+                    int s = idx % seqLen;
+                    float* srcRow = src + (long)s * qkvStride + colOffset + h * headDim;
+                    float* dstRow = dst + ((long)h * seqLen + s) * headDim;
+                    Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
+                });
+            }
+            else
+            {
+                for (int h = 0; h < numHeads; h++)
+                {
+                    float* dstHead = dst + (long)h * seqLen * headDim;
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        float* srcRow = src + (long)s * qkvStride + colOffset + h * headDim;
+                        Buffer.MemoryCopy(srcRow, dstHead + (long)s * headDim, headBytes, headBytes);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// NeoX RoPE for head-first layout [numHeads, seqLen, headDim].
+        /// Uses the same cached cos/sin table as the flat-layout version.
+        /// </summary>
+        private unsafe void ApplyNeoXRoPEHeadFirst(Tensor data, int numHeads, int headDim,
+            int seqLen, int startPos, float[] freqs)
+        {
+            float* ptr = GetFloatPtr(data);
+            int ropeHalf = freqs.Length;
+
+            if (_neoXRopeCos == null || _neoXRopeCacheSeqLen != seqLen ||
+                _neoXRopeCacheStartPos != startPos || _neoXRopeCacheFreqs != freqs)
+            {
+                int tableSize = seqLen * ropeHalf;
+                if (_neoXRopeCos == null || _neoXRopeCos.Length != tableSize)
+                {
+                    _neoXRopeCos = new float[tableSize];
+                    _neoXRopeSin = new float[tableSize];
+                }
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int pos = startPos + s;
+                    int off = s * ropeHalf;
+                    for (int j = 0; j < ropeHalf; j++)
+                    {
+                        float angle = pos * freqs[j];
+                        _neoXRopeCos[off + j] = MathF.Cos(angle);
+                        _neoXRopeSin[off + j] = MathF.Sin(angle);
+                    }
+                }
+                _neoXRopeCacheSeqLen = seqLen;
+                _neoXRopeCacheStartPos = startPos;
+                _neoXRopeCacheFreqs = freqs;
+            }
+
+            if (numHeads * seqLen >= 64)
+            {
+                int totalWork = numHeads * seqLen;
+                var cosTab = _neoXRopeCos;
+                var sinTab = _neoXRopeSin;
+                System.Threading.Tasks.Parallel.For(0, totalWork, idx =>
+                {
+                    int h = idx / seqLen;
+                    int s = idx % seqLen;
+                    int tableOff = s * ropeHalf;
+                    float* head = ptr + ((long)h * seqLen + s) * headDim;
+                    for (int j = 0; j < ropeHalf; j++)
+                    {
+                        float cos = cosTab[tableOff + j];
+                        float sin = sinTab[tableOff + j];
+                        float x0 = head[j];
+                        float x1 = head[j + ropeHalf];
+                        head[j] = x0 * cos - x1 * sin;
+                        head[j + ropeHalf] = x0 * sin + x1 * cos;
+                    }
+                });
+            }
+            else
+            {
+                for (int h = 0; h < numHeads; h++)
+                {
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        int tableOff = s * ropeHalf;
+                        float* head = ptr + ((long)h * seqLen + s) * headDim;
+                        for (int j = 0; j < ropeHalf; j++)
+                        {
+                            float cos = _neoXRopeCos[tableOff + j];
+                            float sin = _neoXRopeSin[tableOff + j];
+                            float x0 = head[j];
+                            float x1 = head[j + ropeHalf];
+                            head[j] = x0 * cos - x1 * sin;
+                            head[j + ropeHalf] = x0 * sin + x1 * cos;
+                        }
+                    }
+                }
+            }
+        }
+
         private Tensor ApplyBatchRMSNorm(Tensor data, string weightName, int numHeads, int seqLen, int headDim)
         {
             var alpha = _weights[weightName];
             using var reshaped = data.View(seqLen * numHeads, headDim);
-            Tensor normed = Ops.RMSNorm(null, reshaped, alpha, null, Config.Eps);
-            data.Dispose();
-            Tensor flat = normed.View(seqLen, numHeads * headDim);
-            normed.Dispose();
-            return flat;
+            Ops.RMSNorm(reshaped, reshaped, alpha, null, Config.Eps);
+            return data;
         }
 
         private void ApplyUnweightedRMSNorm(Tensor data, int numVectors, int dim, int seqLen)
@@ -1698,23 +2100,44 @@ namespace TensorSharp.Models
         private Tensor ApplyRoPEPrefill(Tensor data, int numHeads, int headDim,
             int seqLen, int startPos, float ropeBase)
         {
-            int totalRows = seqLen * numHeads;
-            int[] positions = new int[totalRows];
-            for (int s = 0; s < seqLen; s++)
-                for (int h = 0; h < numHeads; h++)
-                    positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
+            // Cache the position tensor: all local layers in a forward pass
+            // share the same (seqLen, startPos), only numHeads differs (Q vs K).
+            Tensor posTensor;
+            bool isQ = (numHeads == Config.NumHeads);
+
+            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            {
+                posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
+                if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
+                    posTensor = null;
+            }
+            else
+            {
+                _cachedRoPEPosQ?.Dispose();
+                _cachedRoPEPosK?.Dispose();
+                _cachedRoPEPosQ = null;
+                _cachedRoPEPosK = null;
+                _cachedRoPEPosSeqLen = seqLen;
+                _cachedRoPEPosStartPos = startPos;
+                posTensor = null;
+            }
+
+            if (posTensor == null)
+            {
+                int totalRows = seqLen * numHeads;
+                int[] positions = new int[totalRows];
+                for (int s = 0; s < seqLen; s++)
+                    for (int h = 0; h < numHeads; h++)
+                        positions[s * numHeads + h] = startPos + s;
+                posTensor = CreateIntTensor(positions, totalRows);
+                if (isQ) _cachedRoPEPosQ = posTensor;
+                else _cachedRoPEPosK = posTensor;
+            }
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
-            Tensor result = Ops.RoPEEx(
-                null, reshaped, posTensor, headDim, 2, 0,
-                ropeBase, 1.0f,
-                0.0f, 1.0f, 0.0f, 0.0f);
-
-            data.Dispose();
-            Tensor flat = result.View(seqLen, numHeads * headDim);
-            result.Dispose();
-            return flat;
+            Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
+                ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            return data;
         }
 
         private unsafe void ApplyNeoXRoPEDecode(Tensor data, int numHeads, int headDim, int position, float[] freqs)
@@ -1744,21 +2167,73 @@ namespace TensorSharp.Models
             float* ptr = GetFloatPtr(data);
             int ropeHalf = freqs.Length;
 
-            for (int s = 0; s < seqLen; s++)
+            // Precompute cos/sin table once, reused across all global layers
+            // in the same forward pass (same seqLen, startPos, freqs).
+            if (_neoXRopeCos == null || _neoXRopeCacheSeqLen != seqLen ||
+                _neoXRopeCacheStartPos != startPos || _neoXRopeCacheFreqs != freqs)
             {
-                int position = startPos + s;
-                for (int h = 0; h < numHeads; h++)
+                int tableSize = seqLen * ropeHalf;
+                if (_neoXRopeCos == null || _neoXRopeCos.Length != tableSize)
                 {
-                    float* head = ptr + ((long)s * numHeads + h) * headDim;
+                    _neoXRopeCos = new float[tableSize];
+                    _neoXRopeSin = new float[tableSize];
+                }
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int pos = startPos + s;
+                    int off = s * ropeHalf;
                     for (int j = 0; j < ropeHalf; j++)
                     {
-                        float angle = position * freqs[j];
-                        float cos = MathF.Cos(angle);
-                        float sin = MathF.Sin(angle);
-                        float x0 = head[j];
-                        float x1 = head[j + ropeHalf];
-                        head[j] = x0 * cos - x1 * sin;
-                        head[j + ropeHalf] = x0 * sin + x1 * cos;
+                        float angle = pos * freqs[j];
+                        _neoXRopeCos[off + j] = MathF.Cos(angle);
+                        _neoXRopeSin[off + j] = MathF.Sin(angle);
+                    }
+                }
+                _neoXRopeCacheSeqLen = seqLen;
+                _neoXRopeCacheStartPos = startPos;
+                _neoXRopeCacheFreqs = freqs;
+            }
+
+            // Parallel over sequence positions: each position's heads are independent
+            if (seqLen >= 64)
+            {
+                var cosTab = _neoXRopeCos;
+                var sinTab = _neoXRopeSin;
+                System.Threading.Tasks.Parallel.For(0, seqLen, s =>
+                {
+                    int tableOff = s * ropeHalf;
+                    for (int h = 0; h < numHeads; h++)
+                    {
+                        float* head = ptr + ((long)s * numHeads + h) * headDim;
+                        for (int j = 0; j < ropeHalf; j++)
+                        {
+                            float cos = cosTab[tableOff + j];
+                            float sin = sinTab[tableOff + j];
+                            float x0 = head[j];
+                            float x1 = head[j + ropeHalf];
+                            head[j] = x0 * cos - x1 * sin;
+                            head[j + ropeHalf] = x0 * sin + x1 * cos;
+                        }
+                    }
+                });
+            }
+            else
+            {
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int tableOff = s * ropeHalf;
+                    for (int h = 0; h < numHeads; h++)
+                    {
+                        float* head = ptr + ((long)s * numHeads + h) * headDim;
+                        for (int j = 0; j < ropeHalf; j++)
+                        {
+                            float cos = _neoXRopeCos[tableOff + j];
+                            float sin = _neoXRopeSin[tableOff + j];
+                            float x0 = head[j];
+                            float x1 = head[j + ropeHalf];
+                            head[j] = x0 * cos - x1 * sin;
+                            head[j + ropeHalf] = x0 * sin + x1 * cos;
+                        }
                     }
                 }
             }
@@ -1885,14 +2360,30 @@ namespace TensorSharp.Models
             int headDim = (int)cache.Sizes[2];
             int headBytes = headDim * sizeof(float);
 
-            for (int s = 0; s < seqLen; s++)
+            int totalWork = seqLen * numHeads;
+            if (totalWork >= 64)
             {
-                int cacheIdx = (startPos + s) % cacheSize;
-                for (int h = 0; h < numHeads; h++)
+                System.Threading.Tasks.Parallel.For(0, totalWork, idx =>
                 {
+                    int s = idx / numHeads;
+                    int h = idx % numHeads;
+                    int cacheIdx = (startPos + s) % cacheSize;
                     float* srcRow = srcPtr + (long)h * seqLen * headDim + (long)s * headDim;
                     float* dstRow = cachePtr + (long)h * cacheSize * headDim + (long)cacheIdx * headDim;
                     Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
+                });
+            }
+            else
+            {
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int cacheIdx = (startPos + s) % cacheSize;
+                    for (int h = 0; h < numHeads; h++)
+                    {
+                        float* srcRow = srcPtr + (long)h * seqLen * headDim + (long)s * headDim;
+                        float* dstRow = cachePtr + (long)h * cacheSize * headDim + (long)cacheIdx * headDim;
+                        Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
+                    }
                 }
             }
 
@@ -1934,6 +2425,20 @@ namespace TensorSharp.Models
 
             if (windowSize > 0)
             {
+                // Cache per-row fill widths: all SWA layers in a forward pass share
+                // the same (queryLen, startPos, windowSize), so the widths are
+                // identical across layers. Recompute only when parameters change.
+                if (_cachedSWAMaskWidths == null ||
+                    _cachedSWAMaskQueryLen != queryLen ||
+                    _cachedSWAMaskStartPos != startPos)
+                {
+                    _cachedSWAMaskWidths = new int[queryLen];
+                    _cachedSWAMaskQueryLen = queryLen;
+                    _cachedSWAMaskStartPos = startPos;
+                    for (int q = 0; q < queryLen; q++)
+                        _cachedSWAMaskWidths[q] = Math.Max(0, startPos + q - windowSize + 1);
+                }
+
                 float* sPtr = GetFloatPtr(scores);
                 int numHeads = (int)scores.Sizes[0];
                 int rowStride = queryLen * totalKVLen;
@@ -1943,14 +2448,9 @@ namespace TensorSharp.Models
                     float* headScores = sPtr + h * rowStride;
                     for (int q = 0; q < queryLen; q++)
                     {
-                        int queryPos = startPos + q;
-                        int windowStart = queryPos - windowSize + 1;
-                        if (windowStart > 0)
-                        {
-                            float* row = headScores + q * totalKVLen;
-                            for (int kv = 0; kv < windowStart; kv++)
-                                row[kv] = float.NegativeInfinity;
-                        }
+                        int width = _cachedSWAMaskWidths[q];
+                        if (width > 0)
+                            new Span<float>(headScores + q * totalKVLen, width).Fill(float.NegativeInfinity);
                     }
                 }
                 InvalidateTensorDeviceCache(scores);

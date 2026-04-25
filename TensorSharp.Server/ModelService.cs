@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -793,11 +793,11 @@ namespace TensorSharp.Server
             if (tokenCount <= 0)
                 return 0;
 
-            // CUDA can OOM on a single huge prefill graph, so we cap the chunk size.
-            // CPU / Metal handle a single big graph fine.
+            // Chunked prefill keeps attention score tensors bounded and avoids
+            // O(n²) blowup for sliding-window layers on large prompts.
             return backend == BackendType.GgmlCuda
                 ? Math.Min(tokenCount, 5120)
-                : tokenCount;
+                : Math.Min(tokenCount, 2048);
         }
 
         private List<int> TruncatePromptToContext(ChatSession session, List<int> inputTokens, int maxTokens)

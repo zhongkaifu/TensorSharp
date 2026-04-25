@@ -184,6 +184,10 @@ namespace TensorSharp.Models
         // Pre-computed RoPE frequency table
         private float[] _ropeFreqs;
 
+        // Cached RoPE position tensors (reused across attention layers in one forward pass)
+        private Tensor _cachedRoPEPosQ, _cachedRoPEPosK;
+        private int _cachedRoPEPosSeqLen, _cachedRoPEPosStartPos = -1;
+
         // (GDN scratch buffers, chunked-prefill staging, and timing counters live in
         // Qwen35Model.GatedDeltaNet.cs.)
 
@@ -1138,7 +1142,7 @@ namespace TensorSharp.Models
 
             // Attention computation
             float attentionScale = 1.0f / MathF.Sqrt(headDim);
-            Tensor attnOutput;
+            Tensor attnOutput = null;
 
             if (seqLen == 1)
             {
@@ -1176,41 +1180,91 @@ namespace TensorSharp.Models
             }
             else
             {
-                Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
-                qTensor.Dispose();
-                Tensor kHeads = ReshapeToHeads(kTensor, numKVHeads, seqLen, headDim);
-                kTensor.Dispose();
-                Tensor vHeads = ReshapeToHeads(vTensor, numKVHeads, seqLen, headDim);
-                vTensor.Dispose();
                 if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnReshapeTicks += now - stageStart; stageStart = now; }
 
+                // Write to KV cache using head-first layout
+                Tensor kHeads = ReshapeToHeads(kTensor, numKVHeads, seqLen, headDim);
+                Tensor vHeads = ReshapeToHeads(vTensor, numKVHeads, seqLen, headDim);
                 CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
                 CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
-                kHeads.Dispose();
-                vHeads.Dispose();
                 if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnCacheCopyTicks += now - stageStart; stageStart = now; }
 
-                int groupSize = numHeads / numKVHeads;
-                Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
-                Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
-                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnExpandKvTicks += now - stageStart; stageStart = now; }
+                if (profilePrefill) { long now2 = Stopwatch.GetTimestamp(); _prefillAttnExpandKvTicks += now2 - stageStart; stageStart = now2; }
 
-                using var kT = kExpanded.Transpose(1, 2);
-                var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
-                Ops.AddmmBatch(scores, 0, scores, attentionScale, qHeads, kT);
-                qHeads.Dispose();
-                kExpanded.Dispose();
+                // Fused GPU attention: Q*K^T → causal mask → softmax → *V in one
+                // GGML graph dispatch, eliminating ExpandKVHeads + 5 separate ops.
+                bool usedFusedAttn = false;
+                if (IsGgmlBackend)
+                {
+                    try
+                    {
+                        attnOutput = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
 
-                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-                Ops.Softmax(scores, scores);
+                        if (startPos == 0)
+                        {
+                            // Initial prefill: pass flat Q/K/V directly (inputFormat=1).
+                            // The GPU kernel does reshape+permute as free graph ops,
+                            // eliminating the ReshapeToHeads copies for Q.
+                            GgmlBasicOps.FusedPrefillAttention(
+                                qTensor, kTensor, vTensor, attnOutput,
+                                numHeads, numKVHeads, headDim,
+                                seqLen, seqLen,
+                                0, 0, attentionScale, inputFormat: 1);
+                        }
+                        else
+                        {
+                            // Continuation: KV cache is head-first format (inputFormat=0),
+                            // but Q is flat (inputFormat=1). Use head-first path with cache.
+                            Tensor qHeadsForAttn = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
+                            GgmlBasicOps.FusedPrefillAttention(
+                                qHeadsForAttn, _kvCacheK[layer], _kvCacheV[layer], attnOutput,
+                                numHeads, numKVHeads, headDim,
+                                seqLen, totalSeqLen,
+                                startPos, 0, attentionScale, inputFormat: 0);
+                            qHeadsForAttn.Dispose();
+                        }
+                        usedFusedAttn = true;
+                        qTensor.Dispose();
+                        kTensor.Dispose();
+                        vTensor.Dispose();
+                    }
+                    catch
+                    {
+                        attnOutput?.Dispose();
+                        attnOutput = null;
+                    }
+                }
+                kHeads.Dispose();
+                vHeads.Dispose();
 
-                var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
-                Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-                scores.Dispose();
-                vExpanded.Dispose();
+                if (!usedFusedAttn)
+                {
+                    Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
+                    qTensor.Dispose();
+                    kTensor.Dispose();
+                    vTensor.Dispose();
 
-                attnOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, headDim);
-                attnOut.Dispose();
+                    int groupSize = numHeads / numKVHeads;
+                    Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
+                    Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
+
+                    using var kT = kExpanded.Transpose(1, 2);
+                    var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
+                    Ops.AddmmBatch(scores, 0, scores, attentionScale, qHeads, kT);
+                    qHeads?.Dispose();
+                    kExpanded.Dispose();
+
+                    Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
+                    Ops.Softmax(scores, scores);
+
+                    var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
+                    Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+                    scores.Dispose();
+                    vExpanded.Dispose();
+
+                    attnOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, headDim);
+                    attnOut.Dispose();
+                }
                 if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnComputeTicks += now - stageStart; stageStart = now; }
             }
 
@@ -1731,13 +1785,11 @@ namespace TensorSharp.Models
                 return data;
             }
 
+            // In-place RMSNorm: row-independent normalization works regardless
+            // of row order, avoiding one tensor allocation+copy per Q/K per layer.
             using var reshaped = data.View(seqLen * numHeads, headDim);
-            Tensor normed = Ops.RMSNorm(null, reshaped, alpha, null, Config.Eps);
-            data.Dispose();
-
-            Tensor result = normed.View(seqLen, numHeads * headDim);
-            normed.Dispose();
-            return result;
+            Ops.RMSNorm(reshaped, reshaped, alpha, null, Config.Eps);
+            return data;
         }
 
         /// <summary>
@@ -1807,23 +1859,47 @@ namespace TensorSharp.Models
         {
             int headDim = Config.HeadDim;
             int ropeDim = _ropeDimCount > 0 ? _ropeDimCount : headDim;
-            int totalRows = seqLen * numHeads;
-            int[] positions = new int[totalRows];
-            for (int s = 0; s < seqLen; s++)
-                for (int h = 0; h < numHeads; h++)
-                    positions[s * numHeads + h] = startPos + s;
-            using var posTensor = CreateIntTensor(positions, totalRows);
 
+            // Cache position tensors across attention layers in the same forward pass.
+            // All attention layers share (seqLen, startPos); only numHeads differs (Q vs K).
+            Tensor posTensor;
+            bool isQ = (numHeads == Config.NumHeads);
+
+            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            {
+                posTensor = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
+                if (posTensor == null || (int)posTensor.Sizes[0] != seqLen * numHeads)
+                    posTensor = null;
+            }
+            else
+            {
+                _cachedRoPEPosQ?.Dispose();
+                _cachedRoPEPosK?.Dispose();
+                _cachedRoPEPosQ = null;
+                _cachedRoPEPosK = null;
+                _cachedRoPEPosSeqLen = seqLen;
+                _cachedRoPEPosStartPos = startPos;
+                posTensor = null;
+            }
+
+            if (posTensor == null)
+            {
+                int totalRows = seqLen * numHeads;
+                int[] positions = new int[totalRows];
+                for (int s = 0; s < seqLen; s++)
+                    for (int h = 0; h < numHeads; h++)
+                        positions[s * numHeads + h] = startPos + s;
+                posTensor = CreateIntTensor(positions, totalRows);
+                if (isQ) _cachedRoPEPosQ = posTensor;
+                else _cachedRoPEPosK = posTensor;
+            }
+
+            // In-place RoPE: avoids allocating a new tensor per call
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
-            Tensor result = Ops.RoPEEx(
-                null, reshaped, posTensor, ropeDim, 2, 0,
+            Ops.RoPEEx(reshaped, reshaped, posTensor, ropeDim, 2, 0,
                 Config.RopeBase, 1.0f / Config.RopeScale,
                 0.0f, 1.0f, 0.0f, 0.0f);
-
-            data.Dispose();
-            Tensor flat = result.View(seqLen, numHeads * headDim);
-            result.Dispose();
-            return flat;
+            return data;
         }
 
         #endregion
@@ -2154,6 +2230,99 @@ namespace TensorSharp.Models
                 prefillRowBuf = _moeTokenInput;
             }
 
+            // Prefill batched-by-expert path: group tokens by expert assignment
+            // and run batched matmuls instead of per-token dispatches.
+            // Converts seqLen*numExpertsUsed individual matmuls → numExperts batched matmuls.
+            if (seqLen > 1 && _expertGateQW != null && _expertGateQW[layer] != null)
+            {
+                // 1. Route all tokens and group by expert
+                var expertBatches = new List<(int tokenIdx, float weight)>[_numExperts];
+                for (int i = 0; i < _numExperts; i++)
+                    expertBatches[i] = new List<(int, float)>();
+
+                for (int s = 0; s < seqLen; s++)
+                {
+                    float* probsRow = probsPtr + (long)s * _numExperts;
+                    int[] tokTop = new int[_numExpertsUsed];
+                    SelectTopKInPlace(probsRow, _numExperts, _numExpertsUsed, tokTop);
+
+                    float wSum = 0f;
+                    float[] tokW = new float[_numExpertsUsed];
+                    for (int k = 0; k < _numExpertsUsed; k++)
+                    {
+                        tokW[k] = probsRow[tokTop[k]];
+                        wSum += tokW[k];
+                    }
+                    if (_normTopKProb && wSum > 0f)
+                    {
+                        float inv = 1.0f / wSum;
+                        for (int k = 0; k < _numExpertsUsed; k++)
+                            tokW[k] *= inv;
+                    }
+                    for (int k = 0; k < _numExpertsUsed; k++)
+                        expertBatches[tokTop[k]].Add((s, tokW[k]));
+                }
+
+                // 2. Process each expert with batched tokens
+                int rowBytes = hiddenSize * sizeof(float);
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    var batch = expertBatches[e];
+                    if (batch.Count == 0) continue;
+                    int batchSize = batch.Count;
+
+                    // Gather input rows
+                    var batchInput = new Tensor(_allocator, DType.Float32, batchSize, hiddenSize);
+                    float* batchPtr = GetFloatPtr(batchInput);
+                    for (int b = 0; b < batchSize; b++)
+                        Buffer.MemoryCopy(inputPtr + (long)batch[b].tokenIdx * hiddenSize,
+                            batchPtr + (long)b * hiddenSize, rowBytes, rowBytes);
+
+                    // Batched expert FFN: gate → up → SiLU*up → down
+                    Tensor gate = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 0);
+                    Tensor up = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 1);
+                    batchInput.Dispose();
+                    if (gate == null || up == null) { gate?.Dispose(); up?.Dispose(); continue; }
+
+                    Ops.SiLUMul(gate, gate, up);
+                    up.Dispose();
+
+                    Tensor down = ExpertLinearForwardAlloc(gate, layer, e, kind: 2);
+                    gate.Dispose();
+                    if (down == null) continue;
+
+                    // Scatter-accumulate with routing weights
+                    float* downPtr = GetFloatPtr(down);
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        float w = batch[b].weight;
+                        float* src = downPtr + (long)b * hiddenSize;
+                        float* dst = outputPtr + (long)batch[b].tokenIdx * hiddenSize;
+                        VecScaleAdd(dst, src, w, hiddenSize);
+                    }
+                    down.Dispose();
+                }
+
+                // 3. Add shared expert contribution (already computed in batch)
+                if (sharedDownAll != null)
+                {
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        float gateScalar = 1.0f;
+                        if (sharedGateInpPtr != null)
+                        {
+                            float* tokenRow = inputPtr + (long)s * hiddenSize;
+                            int n = Math.Min(sharedGateInpDim, hiddenSize);
+                            gateScalar = SigmoidScalar(VecDot(tokenRow, sharedGateInpPtr, n));
+                        }
+                        float* sharedPtr = GetFloatPtr(sharedDownAll) + (long)s * hiddenSize;
+                        VecScaleAdd(outputPtr + (long)s * hiddenSize, sharedPtr, gateScalar, hiddenSize);
+                    }
+                }
+            }
+            else
+            {
+            // Original token-by-token path (decode and fallback)
             for (int s = 0; s < seqLen; s++)
             {
                 float* probsRow = probsPtr + (long)s * _numExperts;
@@ -2223,6 +2392,7 @@ namespace TensorSharp.Models
                 if (disposeTokenInput)
                     tokenInput.Dispose();
             }
+            } // end of token-by-token else
 
             sharedDownAll?.Dispose();
             routerProbs.Dispose();
