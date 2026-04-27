@@ -548,7 +548,15 @@ internal enum GgmlIndexReductionOp
             int isLocal, int slidingWindow,
             float ropeBase, int ropeDims,
             IntPtr ropeFreqFactors, int freqFactorsLen,
-            float layerScalar, float eps);
+            float layerScalar, float eps,
+            IntPtr swaPrevK, IntPtr swaPrevV, int prevWindowLen,
+            IntPtr pleInputData, int pleDim,
+            IntPtr pleGateW, int pleGateType, long pleGateNe0, long pleGateNe1, long pleGateBytes,
+            IntPtr pleProjW, int pleProjType, long pleProjNe0, long pleProjNe1, long pleProjBytes,
+            IntPtr plePostNormW,
+            IntPtr freshKOut, IntPtr freshVOut,
+            int isShared,
+            IntPtr donorK, IntPtr donorV, int donorKvLen);
 
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
@@ -567,7 +575,15 @@ internal enum GgmlIndexReductionOp
             int isLocal, int slidingWindow,
             float ropeBase, int ropeDims,
             IntPtr ropeFreqFactors, int freqFactorsLen,
-            float layerScalar, float eps)
+            float layerScalar, float eps,
+            IntPtr swaPrevK, IntPtr swaPrevV, int prevWindowLen,
+            IntPtr pleInputData, int pleDim,
+            IntPtr pleGateW, int pleGateType, long pleGateNe0, long pleGateNe1, long pleGateBytes,
+            IntPtr pleProjW, int pleProjType, long pleProjNe0, long pleProjNe1, long pleProjBytes,
+            IntPtr plePostNormW,
+            IntPtr freshKOut, IntPtr freshVOut,
+            int isShared,
+            IntPtr donorK, IntPtr donorV, int donorKvLen)
         {
             CheckResult(TSGgml_Gemma4LayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -586,7 +602,15 @@ internal enum GgmlIndexReductionOp
                 isLocal, slidingWindow,
                 ropeBase, ropeDims,
                 ropeFreqFactors, freqFactorsLen,
-                layerScalar, eps), "gemma4_layer_prefill");
+                layerScalar, eps,
+                swaPrevK, swaPrevV, prevWindowLen,
+                pleInputData, pleDim,
+                pleGateW, pleGateType, pleGateNe0, pleGateNe1, pleGateBytes,
+                pleProjW, pleProjType, pleProjNe0, pleProjNe1, pleProjBytes,
+                plePostNormW,
+                freshKOut, freshVOut,
+                isShared,
+                donorK, donorV, donorKvLen), "gemma4_layer_prefill");
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]

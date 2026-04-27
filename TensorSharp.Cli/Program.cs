@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -79,6 +79,10 @@ namespace TensorSharp.Cli
             int benchmarkPrefill = 32;
             int benchmarkDecode = 64;
             int benchmarkRuns = 1;
+            bool benchmarkChunked = false;
+            bool runChunkedPrefillCorrectness = false;
+            int correctnessPrefill = 1500;
+            int correctnessDecode = 8;
             bool runKvCacheBenchmark = false;
             int kvCacheBenchTurns = 4;
             bool runInteractive = false;
@@ -110,6 +114,10 @@ namespace TensorSharp.Cli
                     case "--bench-prefill": benchmarkPrefill = int.Parse(args[++i]); break;
                     case "--bench-decode": benchmarkDecode = int.Parse(args[++i]); break;
                     case "--bench-runs": benchmarkRuns = int.Parse(args[++i]); break;
+                    case "--bench-chunked": benchmarkChunked = true; break;
+                    case "--test-chunked-prefill": runChunkedPrefillCorrectness = true; break;
+                    case "--correct-prefill": correctnessPrefill = int.Parse(args[++i]); break;
+                    case "--correct-decode": correctnessDecode = int.Parse(args[++i]); break;
                     case "--bench-kvcache": runKvCacheBenchmark = true; break;
                     case "--bench-kv-turns": kvCacheBenchTurns = int.Parse(args[++i]); break;
                     case "-i":
@@ -272,7 +280,13 @@ namespace TensorSharp.Cli
 
             if (runBenchmark)
             {
-                RunBenchmark(model, benchmarkPrefill, benchmarkDecode, benchmarkRuns);
+                RunBenchmark(model, benchmarkPrefill, benchmarkDecode, benchmarkRuns, benchmarkChunked);
+                return;
+            }
+
+            if (runChunkedPrefillCorrectness)
+            {
+                RunChunkedPrefillCorrectness(model, correctnessPrefill, correctnessDecode);
                 return;
             }
 
@@ -1498,11 +1512,11 @@ namespace TensorSharp.Cli
         /// benchmark can be run twice (e.g. with and without GDN_DISABLE_CHUNKED_PREFILL=1)
         /// and the outputs compared.
         /// </summary>
-        static void RunBenchmark(ModelBase model, int prefillTokens, int decodeTokens, int runs)
+        static void RunBenchmark(ModelBase model, int prefillTokens, int decodeTokens, int runs, bool chunked = false)
         {
             _log.LogInformation(LogEventIds.CliBenchmark,
-                "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs}",
-                prefillTokens, decodeTokens, runs);
+                "inference benchmark starting: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens} runs={Runs} chunked={Chunked}",
+                prefillTokens, decodeTokens, runs, chunked);
 
             // Build a synthetic prompt of `prefillTokens` tokens by repeating a stable token.
             // We pick a token id that's safely inside the vocab (not BOS/EOS/special).
@@ -1526,9 +1540,14 @@ namespace TensorSharp.Cli
             {
                 model.ResetKVCache();
 
-                // Prefill timing
+                // Prefill timing - choose path based on chunked flag.
+                // Forward(): single non-chunked pass, used by --benchmark default.
+                // ForwardRefill(): the path the server uses for long prompts; engages
+                // the model's internal chunked prefill (with rolling SWA cache, etc.).
                 var prefillSw = Stopwatch.StartNew();
-                float[] logits = model.Forward(prefillIds);
+                float[] logits = chunked
+                    ? model.ForwardRefill(prefillIds)
+                    : model.Forward(prefillIds);
                 prefillSw.Stop();
                 double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
                 double prefillTps = prefillTokens / (prefillMs / 1000.0);
@@ -1601,6 +1620,70 @@ namespace TensorSharp.Cli
                 }
             }
             return idx;
+        }
+
+        /// <summary>
+        /// Correctness check for chunked prefill: prefill the same prompt twice -
+        /// once via Forward() (single-pass), once via ForwardRefill() (chunked) -
+        /// and compare the next decoded tokens. They must match exactly: any
+        /// divergence indicates that chunked prefill (rolling SWA cache, position
+        /// handling, sparse window) is not bit-equivalent to non-chunked.
+        ///
+        /// Useful when iterating on the chunked attention path - quickly catches
+        /// regressions like missing previous-window tokens for SWA layers.
+        /// </summary>
+        static void RunChunkedPrefillCorrectness(ModelBase model, int prefillTokens, int decodeTokens)
+        {
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "chunked prefill correctness test: prefillTokens={PrefillTokens} decodeTokens={DecodeTokens}",
+                prefillTokens, decodeTokens);
+
+            int vocab = model.Config.VocabSize;
+            int basisToken = Math.Min(100, vocab - 1);
+            int[] prefillIds = new int[prefillTokens];
+            for (int i = 0; i < prefillTokens; i++)
+                prefillIds[i] = basisToken + (i % 17);
+
+            int[] DecodeWith(System.Func<int[], float[]> prefill)
+            {
+                model.ResetKVCache();
+                var sw = Stopwatch.StartNew();
+                float[] logits = prefill(prefillIds);
+                sw.Stop();
+                int firstSampled = SampleGreedyFromLogits(logits, vocab);
+                var decoded = new int[decodeTokens];
+                int next = firstSampled;
+                var decodeSw = Stopwatch.StartNew();
+                for (int i = 0; i < decodeTokens; i++)
+                {
+                    decoded[i] = next;
+                    logits = model.Forward(new[] { next });
+                    next = SampleGreedyFromLogits(logits, vocab);
+                }
+                decodeSw.Stop();
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "  prefillMs={PrefillMs:F0} decodeMs={DecodeMs:F0} firstSampled={First} decoded=[{Decoded}]",
+                    sw.Elapsed.TotalMilliseconds, decodeSw.Elapsed.TotalMilliseconds, firstSampled,
+                    string.Join(", ", decoded));
+                return decoded;
+            }
+
+            _log.LogInformation(LogEventIds.CliBenchmark, "Pass 1: Forward (non-chunked)");
+            int[] tokensForward = DecodeWith(t => model.Forward(t));
+
+            _log.LogInformation(LogEventIds.CliBenchmark, "Pass 2: ForwardRefill (chunked)");
+            int[] tokensRefill = DecodeWith(t => model.ForwardRefill(t));
+
+            int matches = 0;
+            for (int i = 0; i < decodeTokens; i++)
+                if (tokensForward[i] == tokensRefill[i]) matches++;
+                else break;
+
+            bool pass = matches == decodeTokens;
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "chunked prefill correctness: matched={Matched}/{Total} {Status} forward=[{F}] refill=[{R}]",
+                matches, decodeTokens, pass ? "PASS" : "FAIL",
+                string.Join(",", tokensForward), string.Join(",", tokensRefill));
         }
 
         /// <summary>

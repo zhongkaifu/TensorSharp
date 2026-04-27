@@ -831,7 +831,15 @@ namespace TensorSharp.GGML
             int isLocal, int slidingWindow,
             float ropeBase, int ropeDims,
             IntPtr ropeFreqFactors, int freqFactorsLen,
-            float layerScalar, float eps)
+            float layerScalar, float eps,
+            IntPtr swaPrevK = default, IntPtr swaPrevV = default, int prevWindowLen = 0,
+            IntPtr pleInputData = default, int pleDim = 0,
+            IntPtr pleGateW = default, int pleGateType = 0, long pleGateNe0 = 0, long pleGateNe1 = 0, long pleGateBytes = 0,
+            IntPtr pleProjW = default, int pleProjType = 0, long pleProjNe0 = 0, long pleProjNe1 = 0, long pleProjBytes = 0,
+            IntPtr plePostNormW = default,
+            IntPtr freshKOut = default, IntPtr freshVOut = default,
+            int isShared = 0,
+            IntPtr donorK = default, IntPtr donorV = default, int donorKvLen = 0)
         {
             GgmlNative.Gemma4LayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -850,7 +858,15 @@ namespace TensorSharp.GGML
                 isLocal, slidingWindow,
                 ropeBase, ropeDims,
                 ropeFreqFactors, freqFactorsLen,
-                layerScalar, eps);
+                layerScalar, eps,
+                swaPrevK, swaPrevV, prevWindowLen,
+                pleInputData, pleDim,
+                pleGateW, pleGateType, pleGateNe0, pleGateNe1, pleGateBytes,
+                pleProjW, pleProjType, pleProjNe0, pleProjNe1, pleProjBytes,
+                plePostNormW,
+                freshKOut, freshVOut,
+                isShared,
+                donorK, donorV, donorKvLen);
         }
 
         /// <summary>
