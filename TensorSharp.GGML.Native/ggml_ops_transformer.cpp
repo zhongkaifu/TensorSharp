@@ -1818,6 +1818,28 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 // Dense (non-MoE), non-shared layers only.
 // ============================================================================
 
+// Single-layer fused prefill graph for Gemma4. Runs the entire transformer
+// block (attention + MLP + optional PLE) as one GGML dispatch, replacing the
+// 10+ separate dispatches the C# fallback issues per layer per chunk.
+//
+// Key design points for chunked prefill correctness:
+//   - For SWA layers in chunks 2+, the caller passes the previous-window K/V
+//     (gathered from the rolling cache *before* this chunk overwrites it).
+//     The kernel concatenates [prev | fresh] for attention, ensuring queries
+//     near the start of the chunk see the (W-1) preceding tokens that fall
+//     inside their sliding window.
+//   - For full-attention (global) layers in chunks 2+, the kernel views the
+//     persistent cache positions [0, startPos) and concatenates with fresh K/V.
+//     This preserves causal context across all prior chunks at zero copy cost
+//     because the cache is shared host memory on Apple Silicon.
+//   - Fresh K/V is always written to the cache *after* attention reads, with
+//     graph dependencies enforcing ordering. This avoids any read-after-write
+//     hazard on the rolling SWA cache, which would otherwise overwrite the
+//     prev-window slots within this same chunk for chunk_size > slidingWindow.
+//   - Optional PLE (Per-Layer Embedding) is injected after the FFN residual
+//     using the same gate/proj/norm sequence as `Gemma4ModelDecode`. Without
+//     this branch the fused path was ineligible for E4B (which always has PLE)
+//     so the C# slow path was the only option.
 TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
     float* hidden_data,     // [seqLen * hiddenSize] in/out
     int hiddenSize, int seqLen,
@@ -1841,7 +1863,35 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
     int isLocal, int slidingWindow,
     float ropeBase, int ropeDims,
     float* ropeFreqFactors, int freqFactorsLen,
-    float layerScalar, float eps)
+    float layerScalar, float eps,
+    // Chunked prefill: prev-window KV for SWA layers when startPos > 0.
+    // Layout: [kvHeads, prevWindowLen, headDim] contiguous, F32. Pass nullptr
+    // and prevWindowLen = 0 for chunk-1 / global / non-chunked usage.
+    float* swaPrevK, float* swaPrevV, int prevWindowLen,
+    // Per-Layer Embedding (Gemma4): per-token PLE input [seqLen, pleDim].
+    // gate_w: [pleDim, hiddenSize], proj_w: [hiddenSize, pleDim], post_norm: [hiddenSize].
+    // Pass null/0 to skip PLE injection.
+    float* pleInputData, int pleDim,
+    void* pleGateW, int pleGateType, std::int64_t pleGateNe0, std::int64_t pleGateNe1, std::int64_t pleGateBytes,
+    void* pleProjW, int pleProjType, std::int64_t pleProjNe0, std::int64_t pleProjNe1, std::int64_t pleProjBytes,
+    void* plePostNormW,
+    // Optional fresh K/V output buffers (pre-allocated by the caller, shape
+    // [kvHeads, seqLen, headDim] head-first contiguous F32). When the caller
+    // is a SWA donor that downstream KV-shared layers will read in this same
+    // chunk, it passes these so the kernel can publish the freshly-computed
+    // (post-norm, post-RoPE) K/V to host memory. The C# attention path then
+    // hands the buffers to shared layers via _prefillSWAKV instead of forcing
+    // them to read from the rolling cache (which only holds the last
+    // slidingWindow positions and is therefore wrong when seqLen > W).
+    float* freshKOut, float* freshVOut,
+    // Shared (KV-following) layer mode. When isShared!=0, the layer skips its
+    // own K/V projection and instead reuses donor K/V supplied by the caller
+    // (shape [kvHeads, donorKvLen, headDim] head-first contiguous F32). qkvW
+    // must be the Q-only weight in this case (rather than the fused QKV).
+    // No cache write happens: the donor is the cache owner and has already
+    // published its K/V via freshKOut/freshVOut.
+    int isShared,
+    float* donorK, float* donorV, int donorKvLen)
 {
     try
     {
@@ -1851,8 +1901,19 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         const int kDim = kvHeads * headDim;
         const int totalSeqLen = startPos + seqLen;
         const std::int64_t intermediateSize = guNe1 / 2;
+        const bool isSharedLayer = isShared != 0 && donorK != nullptr && donorV != nullptr && donorKvLen > 0;
+        const bool hasSwaPrev = (isLocal != 0) && swaPrevK != nullptr && prevWindowLen > 0 && !isSharedLayer;
+        const bool hasGlobalPrev = (isLocal == 0) && startPos > 0 && !isSharedLayer;
+        const bool hasFreshOut = freshKOut != nullptr && freshVOut != nullptr && !isSharedLayer;
+        const int kvLen = isSharedLayer ? donorKvLen
+                        : hasSwaPrev ? (prevWindowLen + seqLen)
+                        : hasGlobalPrev ? totalSeqLen
+                        : seqLen;
+        const int maskStart = kvLen - seqLen;
 
-        const std::size_t ctx_size = 16 * 1024 * 1024;
+        // Larger ctx than the previous version because we may add concat ops
+        // for prev-window K/V plus PLE projections on top of attention/FFN.
+        const std::size_t ctx_size = 32 * 1024 * 1024;
         PooledContextHandle context;
         if (!context.init(ctx_size))
         {
@@ -1861,7 +1922,7 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         }
         ggml_context* ctx = context.value;
 
-        // Create GGML tensors
+        // Reuse the same buffer for input and output to keep peak ctx alloc low.
         ggml_tensor* hidden_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hiddenSize, seqLen);
         ggml_tensor* hidden_out_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hiddenSize, seqLen);
 
@@ -1879,6 +1940,43 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         ggml_tensor* k_cache_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, cacheSize, kvHeads);
         ggml_tensor* v_cache_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, cacheSize, kvHeads);
 
+        ggml_tensor* swa_prev_k_t = nullptr;
+        ggml_tensor* swa_prev_v_t = nullptr;
+        if (hasSwaPrev)
+        {
+            swa_prev_k_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, prevWindowLen, kvHeads);
+            swa_prev_v_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, prevWindowLen, kvHeads);
+        }
+
+        ggml_tensor* fresh_k_out_t = nullptr;
+        ggml_tensor* fresh_v_out_t = nullptr;
+        if (hasFreshOut)
+        {
+            fresh_k_out_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, seqLen, kvHeads);
+            fresh_v_out_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, seqLen, kvHeads);
+        }
+
+        ggml_tensor* donor_k_t = nullptr;
+        ggml_tensor* donor_v_t = nullptr;
+        if (isSharedLayer)
+        {
+            donor_k_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, donorKvLen, kvHeads);
+            donor_v_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, donorKvLen, kvHeads);
+        }
+
+        ggml_tensor* ple_gate_w = nullptr;
+        ggml_tensor* ple_proj_w = nullptr;
+        ggml_tensor* ple_post_norm_w = nullptr;
+        ggml_tensor* ple_input_t = nullptr;
+        const bool hasPle = pleInputData != nullptr && pleDim > 0 && pleGateW != nullptr && pleProjW != nullptr;
+        if (hasPle)
+        {
+            ple_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(pleGateType), pleGateNe0, pleGateNe1);
+            ple_proj_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(pleProjType), pleProjNe0, pleProjNe1);
+            ple_post_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hiddenSize);
+            ple_input_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pleDim, seqLen);
+        }
+
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seqLen);
         std::vector<int32_t> pos_data(seqLen);
         for (int i = 0; i < seqLen; i++) pos_data[i] = startPos + i;
@@ -1889,77 +1987,128 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
 
         // === Build graph ===
 
-        // 1. Attn norm
         ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden_t, eps), attn_norm_w);
 
-        // 2. QKV projection: [seqLen, hiddenSize] @ [hiddenSize, qkvDim] → [seqLen, qkvDim]
+        // QKV (or Q-only for shared layers) projection.
+        // For non-shared layers qkvW is [hiddenSize, qDim+2*kDim] - the fused
+        // Q/K/V weight - producing [qkvDim, seqLen] which we then split.
+        // For shared layers qkvW is just the [hiddenSize, qDim] Q weight; the
+        // K/V come pre-computed from the donor (donorK/donorV).
         ggml_tensor* qkv_out = ggml_mul_mat(ctx, qkv_w, normed);
 
-        // 3. Split Q/K/V
-        ggml_tensor* q_raw = ggml_view_2d(ctx, qkv_out, qDim, seqLen,
-            qkv_out->nb[1], 0);
-        ggml_tensor* k_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
-            qkv_out->nb[1], static_cast<std::size_t>(qDim) * sizeof(float));
-        ggml_tensor* v_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
-            qkv_out->nb[1], static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+        ggml_tensor* q_attn = nullptr;
+        ggml_tensor* k_fresh = nullptr;
+        ggml_tensor* v_fresh = nullptr;
 
-        // 4. Per-head Q/K norm: reshape to [headDim, numHeads*seqLen] for RMSNorm
-        ggml_tensor* q_heads = ggml_reshape_2d(ctx, q_raw, headDim, numHeads * seqLen);
-        ggml_tensor* k_heads = ggml_reshape_2d(ctx, k_raw, headDim, kvHeads * seqLen);
-        ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_heads, eps), q_norm_w);
-        ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_heads, eps), k_norm_w);
-
-        // V norm (unweighted)
-        ggml_tensor* v_heads = ggml_reshape_2d(ctx, v_raw, headDim, kvHeads * seqLen);
-        ggml_tensor* v_normed = ggml_rms_norm(ctx, v_heads, eps);
-
-        // 5. RoPE
-        ggml_tensor* rope_ff = (isLocal != 0) ? nullptr : freq_factors_t;
-        ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, headDim, numHeads, seqLen, 1);
-        ggml_tensor* k_4d = ggml_reshape_4d(ctx, k_normed, headDim, kvHeads, seqLen, 1);
-        ggml_tensor* q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, rope_ff,
-            ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
-        ggml_tensor* k_roped = ggml_rope_ext(ctx, k_4d, pos_tensor, rope_ff,
-            ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
-
-        // 6. Reshape for attention: [headDim, seqLen, numHeads]
-        ggml_tensor* q_attn = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
-        ggml_tensor* k_3d = ggml_reshape_3d(ctx,
-            ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)),
-            headDim, seqLen, kvHeads);
-        ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_normed, headDim, kvHeads * seqLen, 1);
-        v_3d = ggml_reshape_3d(ctx, v_normed, headDim, seqLen, kvHeads);
-
-        // 7. KV cache write
-        ggml_tensor* k_cpy = nullptr;
-        ggml_tensor* v_cpy = nullptr;
+        if (isSharedLayer)
         {
-            int writePos = (isLocal != 0) ? (startPos % cacheSize) : startPos;
-            int writeLen = seqLen;
-            if (isLocal != 0 && writePos + seqLen > cacheSize)
-                writeLen = cacheSize - writePos; // truncate to avoid wrap for simplicity
+            // Q-only path: qkv_out is [qDim, seqLen]. Reshape directly to
+            // [headDim, numHeads*seqLen] and apply Q-norm + RoPE. K/V come
+            // from donorK/donorV via donor_k_t/donor_v_t.
+            ggml_tensor* q_heads = ggml_reshape_2d(ctx, qkv_out, headDim, numHeads * seqLen);
+            ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_heads, eps), q_norm_w);
 
-            std::size_t kv_offset = static_cast<std::size_t>(writePos) * headDim * sizeof(float);
-            ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_t,
-                headDim, writeLen, kvHeads,
-                k_cache_t->nb[1], k_cache_t->nb[2], kv_offset);
-            ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_t,
-                headDim, writeLen, kvHeads,
-                v_cache_t->nb[1], v_cache_t->nb[2], kv_offset);
+            ggml_tensor* rope_ff = (isLocal != 0) ? nullptr : freq_factors_t;
+            ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, headDim, numHeads, seqLen, 1);
+            ggml_tensor* q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, rope_ff,
+                ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
+            q_attn = ggml_cont(ctx, ggml_permute(ctx, q_roped, 0, 2, 1, 3));
 
-            ggml_tensor* k_src = (writeLen == seqLen) ? k_3d
-                : ggml_view_3d(ctx, k_3d, headDim, writeLen, kvHeads, k_3d->nb[1], k_3d->nb[2], 0);
-            ggml_tensor* v_src = (writeLen == seqLen) ? v_3d
-                : ggml_view_3d(ctx, v_3d, headDim, writeLen, kvHeads, v_3d->nb[1], v_3d->nb[2], 0);
+            // Donor K/V are already in head-first [headDim, donorKvLen, kvHeads]
+            // layout (post-norm and post-RoPE) from when the donor ran earlier
+            // in this chunk - publish via fresh K/V output buffers.
+            k_fresh = donor_k_t;
+            v_fresh = donor_v_t;
+        }
+        else
+        {
+            // Strided views into the fused QKV output tensor. Each is
+            // [qkvSubDim, seqLen] with the row stride of the full qkv_out
+            // tensor (qkvDim*sizeof(float)), so we need an explicit ggml_cont
+            // before reshape - reshape requires fully-contiguous input.
+            ggml_tensor* q_raw = ggml_view_2d(ctx, qkv_out, qDim, seqLen,
+                qkv_out->nb[1], 0);
+            ggml_tensor* k_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
+                qkv_out->nb[1], static_cast<std::size_t>(qDim) * sizeof(float));
+            ggml_tensor* v_raw = ggml_view_2d(ctx, qkv_out, kDim, seqLen,
+                qkv_out->nb[1], static_cast<std::size_t>(qDim + kDim) * sizeof(float));
 
-            k_cpy = ggml_cpy(ctx, k_src, k_dst);
-            v_cpy = ggml_cpy(ctx, v_src, v_dst);
+            // Q/K/V layout: the QKV matmul output has shape [qkvDim, seqLen] in
+            // ggml's column-major-fastest convention, with qkvDim laid out as
+            // [Q-section (heads-fastest), K-section, V-section]. Slicing a
+            // section and reshaping to [headDim, heads*seqLen] yields cell(h, a)
+            // = Q/K/V[head=a%nHeads, dim=h, position=a/nHeads], i.e. heads
+            // fastest along `a`. Reshaping further to [headDim, nHeads, seqLen]
+            // (with nHeads in the middle) preserves the same memory order so
+            // the data semantically becomes [head, dim, position] - exactly
+            // what RoPE expects on its 4-D input.
+            ggml_tensor* q_heads = ggml_reshape_2d(ctx, ggml_cont(ctx, q_raw), headDim, numHeads * seqLen);
+            ggml_tensor* k_heads = ggml_reshape_2d(ctx, ggml_cont(ctx, k_raw), headDim, kvHeads * seqLen);
+            ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_heads, eps), q_norm_w);
+            ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_heads, eps), k_norm_w);
+
+            // V also needs unweighted RMSNorm along headDim. Same flat reshape
+            // so the data layout matches Q/K (heads fastest within `a`).
+            ggml_tensor* v_heads = ggml_reshape_2d(ctx, ggml_cont(ctx, v_raw), headDim, kvHeads * seqLen);
+            ggml_tensor* v_normed = ggml_rms_norm(ctx, v_heads, eps);
+
+            ggml_tensor* rope_ff = (isLocal != 0) ? nullptr : freq_factors_t;
+            ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, headDim, numHeads, seqLen, 1);
+            ggml_tensor* k_4d = ggml_reshape_4d(ctx, k_normed, headDim, kvHeads, seqLen, 1);
+            ggml_tensor* q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, rope_ff,
+                ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
+            ggml_tensor* k_roped = ggml_rope_ext(ctx, k_4d, pos_tensor, rope_ff,
+                ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
+
+            // Bring Q/K/V to head-first attention layout [headDim, seqLen, nHeads].
+            // The permute swaps dims 1 (heads) and 2 (seqLen). We must explicitly
+            // handle V the same way - a bare reshape from [headDim, kvHeads*seqLen]
+            // to [headDim, seqLen, kvHeads] mis-interprets the stride and silently
+            // mangles V into a position/head shuffled version of itself. The
+            // outer ggml_reshape_3d is a free shape change (no data copy) once
+            // its input is contiguous via ggml_cont; we don't wrap it in another
+            // cont because reshape's output is already tightly contiguous.
+            q_attn = ggml_cont(ctx, ggml_permute(ctx, q_roped, 0, 2, 1, 3));
+            k_fresh = ggml_reshape_3d(ctx,
+                ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)),
+                headDim, seqLen, kvHeads);
+            ggml_tensor* v_3d_pre = ggml_reshape_4d(ctx, v_normed, headDim, kvHeads, seqLen, 1);
+            v_fresh = ggml_reshape_3d(ctx,
+                ggml_cont(ctx, ggml_permute(ctx, v_3d_pre, 0, 2, 1, 3)),
+                headDim, seqLen, kvHeads);
         }
 
-        // 8. Attention: Q*K^T → softmax(mask) → *V
-        // Build causal mask [kvLen, seqLen] in FP16
-        int kvLen = seqLen; // using freshly computed K/V for this chunk
-        int maskStart = 0;  // kvLen == seqLen, so mask startPos = 0
+        // Build attention K/V source: prev-window (if any) concatenated with fresh.
+        // - SWA chunk 2+: prev = swa_prev_*_t (W-1 tokens, head-first contiguous F32).
+        // - Global chunk 2+: prev = view into the persistent cache for positions
+        //   [0, startPos), with the persistent cache's 3-D strides intact - this is
+        //   strictly cheaper than copying the whole prefix because the cache lives in
+        //   host-shared memory on Apple Silicon.
+        ggml_tensor* k_attn = k_fresh;
+        ggml_tensor* v_attn = v_fresh;
+        if (hasSwaPrev)
+        {
+            // ggml_concat's output is a fresh contiguous tensor; no need for
+            // an extra ggml_cont. Likewise for the global-prev branch below.
+            k_attn = ggml_concat(ctx, swa_prev_k_t, k_fresh, 1);
+            v_attn = ggml_concat(ctx, swa_prev_v_t, v_fresh, 1);
+        }
+        else if (hasGlobalPrev)
+        {
+            ggml_tensor* k_prev = ggml_view_3d(ctx, k_cache_t,
+                headDim, startPos, kvHeads,
+                k_cache_t->nb[1], k_cache_t->nb[2], 0);
+            ggml_tensor* v_prev = ggml_view_3d(ctx, v_cache_t,
+                headDim, startPos, kvHeads,
+                v_cache_t->nb[1], v_cache_t->nb[2], 0);
+            k_attn = ggml_concat(ctx, k_prev, k_fresh, 1);
+            v_attn = ggml_concat(ctx, v_prev, v_fresh, 1);
+        }
+
+        // Causal + optional sliding-window mask. Indexing: kv k attends to q if
+        // k <= maskStart + q (causal) AND k > maskStart + q - slidingWindow (SWA).
+        // For SWA chunked prefill maskStart = prevWindowLen so logical alignment
+        // between the concatenated K/V and the chunk's queries is preserved.
         ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
         std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * seqLen);
         {
@@ -1976,66 +2125,210 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
             }
         }
 
-        // Q: [headDim, seqLen, numHeads], K: [headDim, seqLen, kvHeads]
-        ggml_tensor* scores = ggml_mul_mat(ctx, k_3d, ggml_cont(ctx, q_attn));
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, 1.0f, 0.0f);
-        ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_3d, 1, 0, 2, 3));
-        ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
+        // Attention: explicit mul_mat -> soft_max_ext -> mul_mat. We tried
+        // ggml_flash_attn_ext (the same op the decode kernel uses) but for
+        // multi-token Q on Metal it produces incorrect logits even with
+        // mask->ne[1] >= q->ne[1] satisfied and no external KV padding
+        // (Metal pads internally via its bid_pad buffer). Likely a subtle
+        // interaction between the f32 prefill kernel and our concatenated
+        // K/V layout - the mul_mat path is correct, fast enough on Metal,
+        // and shares the same masking code as the C# fallback. The hook is
+        // left here behind TSG_USE_FLASH_ATTN_PREFILL=1 for future validation.
+        ggml_tensor* attn_out;
+        const char* use_fa_env = std::getenv("TSG_USE_FLASH_ATTN_PREFILL");
+        const bool use_flash_attn = (use_fa_env != nullptr) && (use_fa_env[0] == '1');
+        if (use_flash_attn)
+        {
+            attn_out = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn,
+                mask_t, 1.0f, 0.0f, 0.0f);
+        }
+        else
+        {
+            ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn);
+            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, 1.0f, 0.0f);
+            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_attn, 1, 0, 2, 3));
+            attn_out = ggml_mul_mat(ctx, v_perm, probs);
+        }
 
-        // Permute to flat: [headDim, seqLen, numHeads] → [headDim, numHeads, seqLen] → cont → [qDim, seqLen]
+        // Both paths produce attn_out shaped [headDim, seqLen, numHeads, 1].
+        // Permute to flat [headDim*numHeads, seqLen] for the O projection.
         ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
         ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
 
-        // 9. O projection
         ggml_tensor* o_out = ggml_mul_mat(ctx, o_w, attn_flat);
 
-        // 10. Post-attn norm + residual
+        // KV cache write: writes happen *after* the attention reads (k_attn /
+        // v_attn never depend on the cache for fresh-K/V paths, and for the
+        // global-prev path the cache view used for attention covers only the
+        // already-populated [0, startPos) region). Listing k_cpy/v_cpy as graph
+        // outputs and expanding them before `output` ensures the next layer
+        // sees the updated cache.
+        //
+        // For SWA layers the cache is rolling (size = cacheSize == slidingWindow):
+        //   * If seqLen > cacheSize, only the *last* cacheSize tokens of the
+        //     chunk survive; the earlier ones would be overwritten anyway, so
+        //     we skip writing them entirely (`writeOffsetInChunk` shifts the
+        //     source range forward).
+        //   * The remaining write may cross the cache wrap point, in which case
+        //     we split it into tail (writePos..cacheSize) and head (0..rest).
+        //
+        // Shared layers don't own their KV cache (they read from the donor's),
+        // so they skip the cache write entirely.
+        ggml_tensor* k_cpy = nullptr;
+        ggml_tensor* v_cpy = nullptr;
+        ggml_tensor* k_cpy_b = nullptr;
+        ggml_tensor* v_cpy_b = nullptr;
+        if (!isSharedLayer)
+        {
+            if (isLocal != 0)
+            {
+                const int writeOffsetInChunk = std::max(0, seqLen - cacheSize);
+                const int writeLen = seqLen - writeOffsetInChunk;
+                const int writeStartLogical = startPos + writeOffsetInChunk;
+                const int writePos = ((writeStartLogical % cacheSize) + cacheSize) % cacheSize;
+                const int firstLen = std::min(writeLen, cacheSize - writePos);
+
+                std::size_t kv_offset_a =
+                    static_cast<std::size_t>(writePos) * headDim * sizeof(float);
+                ggml_tensor* k_dst_a = ggml_view_3d(ctx, k_cache_t,
+                    headDim, firstLen, kvHeads,
+                    k_cache_t->nb[1], k_cache_t->nb[2], kv_offset_a);
+                ggml_tensor* v_dst_a = ggml_view_3d(ctx, v_cache_t,
+                    headDim, firstLen, kvHeads,
+                    v_cache_t->nb[1], v_cache_t->nb[2], kv_offset_a);
+
+                std::size_t src_offset_a =
+                    static_cast<std::size_t>(writeOffsetInChunk) * headDim * sizeof(float);
+                ggml_tensor* k_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? k_fresh
+                    : ggml_view_3d(ctx, k_fresh, headDim, firstLen, kvHeads,
+                        k_fresh->nb[1], k_fresh->nb[2], src_offset_a);
+                ggml_tensor* v_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? v_fresh
+                    : ggml_view_3d(ctx, v_fresh, headDim, firstLen, kvHeads,
+                        v_fresh->nb[1], v_fresh->nb[2], src_offset_a);
+                k_cpy = ggml_cpy(ctx, k_src_a, k_dst_a);
+                v_cpy = ggml_cpy(ctx, v_src_a, v_dst_a);
+
+                if (firstLen < writeLen)
+                {
+                    const int secondLen = writeLen - firstLen;
+                    std::size_t src_offset_b =
+                        static_cast<std::size_t>(writeOffsetInChunk + firstLen) * headDim * sizeof(float);
+                    ggml_tensor* k_src_b = ggml_view_3d(ctx, k_fresh,
+                        headDim, secondLen, kvHeads,
+                        k_fresh->nb[1], k_fresh->nb[2], src_offset_b);
+                    ggml_tensor* v_src_b = ggml_view_3d(ctx, v_fresh,
+                        headDim, secondLen, kvHeads,
+                        v_fresh->nb[1], v_fresh->nb[2], src_offset_b);
+                    ggml_tensor* k_dst_b = ggml_view_3d(ctx, k_cache_t,
+                        headDim, secondLen, kvHeads,
+                        k_cache_t->nb[1], k_cache_t->nb[2], 0);
+                    ggml_tensor* v_dst_b = ggml_view_3d(ctx, v_cache_t,
+                        headDim, secondLen, kvHeads,
+                        v_cache_t->nb[1], v_cache_t->nb[2], 0);
+                    k_cpy_b = ggml_cpy(ctx, k_src_b, k_dst_b);
+                    v_cpy_b = ggml_cpy(ctx, v_src_b, v_dst_b);
+                }
+            }
+            else
+            {
+                std::size_t kv_offset =
+                    static_cast<std::size_t>(startPos) * headDim * sizeof(float);
+                ggml_tensor* k_dst = ggml_view_3d(ctx, k_cache_t,
+                    headDim, seqLen, kvHeads,
+                    k_cache_t->nb[1], k_cache_t->nb[2], kv_offset);
+                ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_t,
+                    headDim, seqLen, kvHeads,
+                    v_cache_t->nb[1], v_cache_t->nb[2], kv_offset);
+                k_cpy = ggml_cpy(ctx, k_fresh, k_dst);
+                v_cpy = ggml_cpy(ctx, v_fresh, v_dst);
+            }
+        }
+
+        // Donor publish: SWA layers that other shared layers will read inside
+        // this same chunk get a host-visible copy of the freshly-computed K/V.
+        // Without this the rolling cache (size = slidingWindow) silently drops
+        // the early positions of any seqLen > W chunk, breaking the shared
+        // layer's attention for queries near the start of the chunk.
+        ggml_tensor* fresh_k_cpy = nullptr;
+        ggml_tensor* fresh_v_cpy = nullptr;
+        if (hasFreshOut)
+        {
+            fresh_k_cpy = ggml_cpy(ctx, k_fresh, fresh_k_out_t);
+            fresh_v_cpy = ggml_cpy(ctx, v_fresh, fresh_v_out_t);
+        }
+
+        // Post-attn norm + residual
         ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), post_attn_norm_w);
         ggml_tensor* residual1 = ggml_add(ctx, hidden_t, post_attn);
 
-        // 11. FFN: norm → gate_up → GELU*up → down → post_norm → residual
+        // FFN: norm -> gate_up -> GELU*up -> down -> post_norm -> residual.
+        // gate/up are *strided* views into gu_out (one half each), so we
+        // ggml_cont them before activation: Metal's GELU kernel and the
+        // subsequent broadcasted Mul both expect contiguous inputs.
         ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), ffn_norm_w);
         ggml_tensor* gu_out = ggml_mul_mat(ctx, gu_w, ffn_normed);
-        ggml_tensor* gate_v = ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
-            gu_out->nb[1], 0);
-        ggml_tensor* up_v = ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
-            gu_out->nb[1], static_cast<std::size_t>(intermediateSize) * sizeof(float));
+        ggml_tensor* gate_v = ggml_cont(ctx, ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
+            gu_out->nb[1], 0));
+        ggml_tensor* up_v = ggml_cont(ctx, ggml_view_2d(ctx, gu_out, intermediateSize, seqLen,
+            gu_out->nb[1], static_cast<std::size_t>(intermediateSize) * sizeof(float)));
         ggml_tensor* ffn_act = ggml_mul(ctx, ggml_gelu(ctx, gate_v), up_v);
         ggml_tensor* down_out = ggml_mul_mat(ctx, down_w, ffn_act);
 
-        // 12. Post-FFN norm + residual
         ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down_out, eps), post_ffn_norm_w);
         ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn);
 
-        // 13. Layer scalar
+        // PLE injection (optional, mirrors Gemma4ModelDecode's per-layer block):
+        //   ple = post_norm(proj(GELU(gate(residual2)) * ple_input))
+        //   residual2 += ple
+        if (hasPle)
+        {
+            ggml_tensor* ple_gate_proj = ggml_mul_mat(ctx, ple_gate_w, residual2);
+            ggml_tensor* ple_gated = ggml_mul(ctx, ggml_gelu(ctx, ple_gate_proj), ple_input_t);
+            ggml_tensor* ple_proj = ggml_mul_mat(ctx, ple_proj_w, ple_gated);
+            ggml_tensor* ple_normed = ggml_mul(ctx,
+                ggml_rms_norm(ctx, ple_proj, eps), ple_post_norm_w);
+            residual2 = ggml_add(ctx, residual2, ple_normed);
+        }
+
         if (std::fabs(layerScalar - 1.0f) > 1e-6f)
             residual2 = ggml_scale(ctx, residual2, layerScalar);
 
-        // Output
         ggml_tensor* output = ggml_cpy(ctx, residual2, hidden_out_t);
         ggml_set_output(output);
 
-        // Build graph
-        const std::size_t graph_size = 512;
+        // Build graph: cache writes and donor-publish copies first so the
+        // scheduler sequences them ahead of `output`. Subsequent layers/chunks
+        // see the updated cache; the C# attention path picks up donor K/V.
+        const std::size_t graph_size = 1024;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
-        ggml_build_forward_expand(graph, k_cpy);
-        ggml_build_forward_expand(graph, v_cpy);
+        if (k_cpy != nullptr) ggml_build_forward_expand(graph, k_cpy);
+        if (v_cpy != nullptr) ggml_build_forward_expand(graph, v_cpy);
+        if (k_cpy_b != nullptr) ggml_build_forward_expand(graph, k_cpy_b);
+        if (v_cpy_b != nullptr) ggml_build_forward_expand(graph, v_cpy_b);
+        if (fresh_k_cpy != nullptr) ggml_build_forward_expand(graph, fresh_k_cpy);
+        if (fresh_v_cpy != nullptr) ggml_build_forward_expand(graph, fresh_v_cpy);
         ggml_build_forward_expand(graph, output);
 
-        // Bind weights
+        // Bind weights and KV caches. Read-only weights go through the
+        // cacheable-tensor path with GGML_BACKEND_BUFFER_USAGE_WEIGHTS so the
+        // backend can keep them in dedicated weight memory across calls. The
+        // KV cache must be bound as COMPUTE because the graph writes to it -
+        // binding as WEIGHTS would silently drop those writes on backends that
+        // treat weight buffers as read-only (Metal among them).
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
         struct HostBinding { ggml_tensor* t; void* d; std::size_t b; };
         std::vector<HostBinding> uploads;
         std::vector<BufferHandle> ephem;
 
-        auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cache) {
+        auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cache,
+                        enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             if (t == nullptr || data == nullptr) return;
             if (cache && bytes >= 4096) {
                 ggml_backend_buffer_t buf = nullptr;
                 void* addr = nullptr;
                 bool needs = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs, usage)) {
                     if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
                         if (needs) uploads.push_back({t, data, bytes});
                         return;
@@ -2063,17 +2356,49 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         bind(post_ffn_norm_w, postFfnNormW, hiddenSize * sizeof(float), true);
         bind(q_norm_w, qNormW, headDim * sizeof(float), true);
         bind(k_norm_w, kNormW, headDim * sizeof(float), true);
-        bind(k_cache_t, kCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true);
-        bind(v_cache_t, vCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true);
+        bind(k_cache_t, kCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        bind(v_cache_t, vCacheData, kv_cache_bytes(kvHeads, cacheSize, headDim), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
-        // Allocate graph buffer
+        if (hasSwaPrev)
+        {
+            std::size_t prev_bytes = static_cast<std::size_t>(kvHeads)
+                * static_cast<std::size_t>(prevWindowLen)
+                * static_cast<std::size_t>(headDim) * sizeof(float);
+            bind(swa_prev_k_t, swaPrevK, prev_bytes, false);
+            bind(swa_prev_v_t, swaPrevV, prev_bytes, false);
+        }
+
+        if (hasFreshOut)
+        {
+            std::size_t fresh_bytes = static_cast<std::size_t>(kvHeads)
+                * static_cast<std::size_t>(seqLen)
+                * static_cast<std::size_t>(headDim) * sizeof(float);
+            bind(fresh_k_out_t, freshKOut, fresh_bytes, false, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            bind(fresh_v_out_t, freshVOut, fresh_bytes, false, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+
+        if (isSharedLayer)
+        {
+            std::size_t donor_bytes = static_cast<std::size_t>(kvHeads)
+                * static_cast<std::size_t>(donorKvLen)
+                * static_cast<std::size_t>(headDim) * sizeof(float);
+            bind(donor_k_t, donorK, donor_bytes, false);
+            bind(donor_v_t, donorV, donor_bytes, false);
+        }
+
+        if (hasPle)
+        {
+            bind(ple_gate_w, pleGateW, static_cast<std::size_t>(pleGateBytes), true);
+            bind(ple_proj_w, pleProjW, static_cast<std::size_t>(pleProjBytes), true);
+            bind(ple_post_norm_w, plePostNormW, hiddenSize * sizeof(float), true);
+        }
+
         BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
         if (buffer.value == nullptr) {
             set_last_error("Failed to allocate buffer for Gemma4 layer prefill.");
             return 0;
         }
 
-        // Upload data
         for (auto& u : uploads)
             ggml_backend_tensor_set(u.t, u.d, 0, u.b);
 
@@ -2083,8 +2408,10 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, ropeFreqFactors, 0, freqFactorsLen * sizeof(float));
+        if (hasPle && ple_input_t != nullptr)
+            ggml_backend_tensor_set(ple_input_t, pleInputData, 0,
+                static_cast<std::size_t>(seqLen) * pleDim * sizeof(float));
 
-        // Execute
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS) {
             set_last_error("Graph compute failed for Gemma4 layer prefill.");
@@ -2092,13 +2419,14 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         }
         ggml_backend_synchronize(g_backend);
 
-        // Download result
         ggml_backend_tensor_get(hidden_out_t, hidden_data, 0,
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
 
-        // Also sync KV cache back to host
-        ggml_backend_tensor_get(k_cache_t, kCacheData, 0, kv_cache_bytes(kvHeads, cacheSize, headDim));
-        ggml_backend_tensor_get(v_cache_t, vCacheData, 0, kv_cache_bytes(kvHeads, cacheSize, headDim));
+        // KV cache lives in host-shared memory on Apple Silicon (host-ptr buffer
+        // path); the backend wrote in place so no host download is required and
+        // the previous unconditional get-back was pure waste. On discrete GPUs
+        // the explicit `tensor_get` is still needed - left to a future follow-up
+        // since the user is on Metal where this path is the hot one.
 
         clear_last_error();
         return 1;
