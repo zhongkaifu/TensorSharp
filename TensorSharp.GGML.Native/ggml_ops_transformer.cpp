@@ -2061,14 +2061,30 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
                 ropeDims, 2, 0, ropeBase, 1.0f, 0, 1, 0, 0);
 
             // Bring Q/K/V to head-first attention layout [headDim, seqLen, nHeads].
+            //
+            // For Q and (when no concat is needed) K/V, leave as strided permute
+            // views - this matches llama.cpp's build_attn_mha exactly. Their
+            // KV cache is laid out as [head_dim, kv_heads, n_kv, n_streams]
+            // and they call ggml_permute(0,2,1,3) right before flash_attn_ext
+            // without any ggml_cont, producing a "positions/heads interleaved"
+            // strided view. flash_attn_ext on Metal walks K/V via the strides,
+            // and the f32 matrix kernel only correctly handles inputs in this
+            // strided layout - tight contiguous K/V reorderings (that nb[1] <
+            // nb[2] case) silently produce wrong logits, even with set_prec
+            // F32. We discovered this by comparing failing prefill paths
+            // against the working decode path which also uses strided cache
+            // views. K/V always go through reshape_4d+permute(0,2,1,3) to get
+            // the same nb[1] > nb[2] stride relationship.
+            // Bring Q/K/V to head-first attention layout [headDim, seqLen, nHeads].
             // The permute swaps dims 1 (heads) and 2 (seqLen). We must explicitly
             // handle V the same way - a bare reshape from [headDim, kvHeads*seqLen]
             // to [headDim, seqLen, kvHeads] mis-interprets the stride and silently
-            // mangles V into a position/head shuffled version of itself. The
-            // outer ggml_reshape_3d is a free shape change (no data copy) once
-            // its input is contiguous via ggml_cont; we don't wrap it in another
-            // cont because reshape's output is already tightly contiguous.
-            q_attn = ggml_cont(ctx, ggml_permute(ctx, q_roped, 0, 2, 1, 3));
+            // mangles V into a position/head shuffled version of itself. Q stays
+            // as a strided permute view (matches the working decode path); K/V
+            // need to be tight contiguous so we can ggml_concat them with the
+            // previous-window K/V (same tight layout as the persistent cache and
+            // the C# fresh-publish buffers).
+            q_attn = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
             k_fresh = ggml_reshape_3d(ctx,
                 ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)),
                 headDim, seqLen, kvHeads);
@@ -2084,12 +2100,25 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         //   [0, startPos), with the persistent cache's 3-D strides intact - this is
         //   strictly cheaper than copying the whole prefix because the cache lives in
         //   host-shared memory on Apple Silicon.
+        // Build k_full/v_full in the LLAMA.CPP TIGHT LAYOUT
+        //   [headDim, kvHeads, kvLen] (positions are the slowest dim).
+        // This is the layout the f32 flash_attn_ext metal kernel expects after
+        // the standard permute(0,2,1,3) is applied to it (yielding strided
+        // [headDim, kvLen, kvHeads] with nb[1] > nb[2]).
+        //
+        // - swa_prev_*_t and the global-prev cache view both currently live in
+        //   our own "head-first" tight layout [headDim, prevLen, kvHeads], so
+        //   we permute(0,2,1,3) + cont them to reach llama.cpp's tight layout.
+        //   (The cont is a single per-layer copy of prevLen tokens, ~MB sized.)
+        // - k_fresh / v_fresh after the QKV step above are *already* in the
+        //   llama.cpp tight layout [headDim, kvHeads, seqLen], so no extra
+        //   work is needed for them.
+        // - The concat is along ne[2] (positions, i.e. the slowest dim) and
+        //   produces a tight contiguous [headDim, kvHeads, kvLen].
         ggml_tensor* k_attn = k_fresh;
         ggml_tensor* v_attn = v_fresh;
         if (hasSwaPrev)
         {
-            // ggml_concat's output is a fresh contiguous tensor; no need for
-            // an extra ggml_cont. Likewise for the global-prev branch below.
             k_attn = ggml_concat(ctx, swa_prev_k_t, k_fresh, 1);
             v_attn = ggml_concat(ctx, swa_prev_v_t, v_fresh, 1);
         }
@@ -2105,13 +2134,18 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
             v_attn = ggml_concat(ctx, v_prev, v_fresh, 1);
         }
 
+        // k_fresh_my aliases k_fresh in this layout (no conversion needed
+        // because both share the same OLD tight layout used by the cache
+        // and the C# fresh-publish buffers).
+        ggml_tensor* k_fresh_my = k_fresh;
+        ggml_tensor* v_fresh_my = v_fresh;
+
         // Causal + optional sliding-window mask. Indexing: kv k attends to q if
         // k <= maskStart + q (causal) AND k > maskStart + q - slidingWindow (SWA).
         // For SWA chunked prefill maskStart = prevWindowLen so logical alignment
         // between the concatenated K/V and the chunk's queries is preserved.
-        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
-        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * seqLen);
-        {
+        auto fill_prefill_mask = [&](std::vector<ggml_fp16_t>& data, int maskKvLen) {
+            data.resize(static_cast<std::size_t>(maskKvLen) * seqLen);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
             int win = (isLocal != 0) ? slidingWindow : 0;
@@ -2119,42 +2153,102 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
             {
                 int threshold = maskStart + qi;
                 int winStart = (win > 0) ? std::max(0, threshold - win + 1) : 0;
-                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(qi) * kvLen];
-                for (int ki = 0; ki < kvLen; ki++)
-                    row[ki] = (ki > threshold || ki < winStart) ? neg_inf : zero_val;
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * maskKvLen];
+                for (int ki = 0; ki < maskKvLen; ki++)
+                    row[ki] = (ki >= kvLen || ki > threshold || ki < winStart) ? neg_inf : zero_val;
+            }
+        };
+
+        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
+        std::vector<ggml_fp16_t> mask_data;
+        fill_prefill_mask(mask_data, kvLen);
+
+        // Attention: ggml_flash_attn_ext when enabled (default), with the
+        // explicit mul_mat -> soft_max_ext -> mul_mat chain as fallback.
+        //
+        // The critical detail that took two prior attempts to find: without
+        // ggml_flash_attn_ext_set_prec(GGML_PREC_F32) the kernel uses F16
+        // accumulators internally for the K*Q scores and softmax, which
+        // underflows/overflows for Gemma4's head_dim=256 (SWA) and 512
+        // (global) on multi-token Q and silently produces wrong logits
+        // (decoded as eos spam on real prompts). Both ollama and llama.cpp
+        // call set_prec(F32) immediately after every flash_attn_ext for
+        // exactly this reason.
+        //
+        // The fallback path remains accessible via TSG_USE_FLASH_ATTN_PREFILL=0
+        // for A/B comparison or in case a future ggml-metal regression breaks
+        // the fast path.
+        ggml_tensor* attn_flat;
+        const char* use_fa_env = std::getenv("TSG_USE_FLASH_ATTN_PREFILL");
+        const bool use_flash_attn = (use_fa_env == nullptr) || (use_fa_env[0] != '0');
+        ggml_tensor* flash_attn_out = nullptr;
+        ggml_tensor* flash_mask_t = mask_t;
+        std::vector<ggml_fp16_t> flash_mask_data;
+
+        if (use_flash_attn)
+        {
+            // ggml_flash_attn_ext returns the result in [n_embd_v, n_head,
+            // n_batch, ne3] layout - i.e. *already permuted* relative to the
+            // mul_mat path which leaves attn in [n_embd_v, n_batch, n_head].
+            // The flash layout is exactly what the O projection wants for
+            // its [qDim, seqLen] input (one column per position with all
+            // heads contiguous within the column), so we reshape directly
+            // and skip the manual permute+cont. Earlier attempts that did
+            // the permute anyway scrambled the heads across positions and
+            // produced eos/garbage logits - that's the multi-token prefill
+            // bug we'd been chasing.
+            //
+            // ggml_flash_attn_ext_set_prec(GGML_PREC_F32) keeps the QK
+            // accumulator and softmax in F32 even when the kernel template
+            // would default to F16 internals; both ollama and llama.cpp do
+            // this for every flash_attn_ext call.
+            flash_attn_out = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn,
+                mask_t, 1.0f, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(flash_attn_out, GGML_PREC_F32);
+
+            // CUDA's 512/576-dim flash-attn kernels require the grouped-query
+            // path, which in turn requires a 256-aligned KV length. Decode
+            // already satisfies this by viewing a padded cache window; prefill
+            // builds fresh/concatenated K/V tensors, so pad them explicitly and
+            // mask the added slots when the backend rejects the unpadded op.
+            if (!backend_supports_op(flash_attn_out) &&
+                flash_attn_requires_masked_padding(headDim) &&
+                (kvLen % kFlashAttnKvStride) != 0)
+            {
+                const int paddedKvLen =
+                    ((kvLen + kFlashAttnKvStride - 1) / kFlashAttnKvStride) * kFlashAttnKvStride;
+                const int padKvLen = paddedKvLen - kvLen;
+
+                ggml_tensor* k_attn_padded = ggml_pad(ctx, k_attn, 0, padKvLen, 0, 0);
+                ggml_tensor* v_attn_padded = ggml_pad(ctx, v_attn, 0, padKvLen, 0, 0);
+                flash_mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, paddedKvLen, seqLen, 1, 1);
+                fill_prefill_mask(flash_mask_data, paddedKvLen);
+
+                flash_attn_out = ggml_flash_attn_ext(ctx, q_attn, k_attn_padded, v_attn_padded,
+                    flash_mask_t, 1.0f, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(flash_attn_out, GGML_PREC_F32);
             }
         }
 
-        // Attention: explicit mul_mat -> soft_max_ext -> mul_mat. We tried
-        // ggml_flash_attn_ext (the same op the decode kernel uses) but for
-        // multi-token Q on Metal it produces incorrect logits even with
-        // mask->ne[1] >= q->ne[1] satisfied and no external KV padding
-        // (Metal pads internally via its bid_pad buffer). Likely a subtle
-        // interaction between the f32 prefill kernel and our concatenated
-        // K/V layout - the mul_mat path is correct, fast enough on Metal,
-        // and shares the same masking code as the C# fallback. The hook is
-        // left here behind TSG_USE_FLASH_ATTN_PREFILL=1 for future validation.
-        ggml_tensor* attn_out;
-        const char* use_fa_env = std::getenv("TSG_USE_FLASH_ATTN_PREFILL");
-        const bool use_flash_attn = (use_fa_env != nullptr) && (use_fa_env[0] == '1');
-        if (use_flash_attn)
+        if (use_flash_attn && backend_supports_op(flash_attn_out))
         {
-            attn_out = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn,
-                mask_t, 1.0f, 0.0f, 0.0f);
+            attn_flat = ggml_reshape_2d(ctx, flash_attn_out, qDim, seqLen);
         }
         else
         {
-            ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn);
+            ggml_tensor* q_attn_cont = ggml_cont(ctx, q_attn);
+            ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn_cont);
             ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
             ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, 1.0f, 0.0f);
             ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_attn, 1, 0, 2, 3));
-            attn_out = ggml_mul_mat(ctx, v_perm, probs);
+            ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
+            // mul_mat output is [headDim, seqLen, numHeads]; permute to
+            // [headDim, numHeads, seqLen] then reshape so the per-position
+            // qDim block contains all heads contiguously, matching what the
+            // O projection (and the flash path above) consume.
+            ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
+            attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
         }
-
-        // Both paths produce attn_out shaped [headDim, seqLen, numHeads, 1].
-        // Permute to flat [headDim*numHeads, seqLen] for the O projection.
-        ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
 
         ggml_tensor* o_out = ggml_mul_mat(ctx, o_w, attn_flat);
 
@@ -2200,12 +2294,12 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
 
                 std::size_t src_offset_a =
                     static_cast<std::size_t>(writeOffsetInChunk) * headDim * sizeof(float);
-                ggml_tensor* k_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? k_fresh
-                    : ggml_view_3d(ctx, k_fresh, headDim, firstLen, kvHeads,
-                        k_fresh->nb[1], k_fresh->nb[2], src_offset_a);
-                ggml_tensor* v_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? v_fresh
-                    : ggml_view_3d(ctx, v_fresh, headDim, firstLen, kvHeads,
-                        v_fresh->nb[1], v_fresh->nb[2], src_offset_a);
+                ggml_tensor* k_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? k_fresh_my
+                    : ggml_view_3d(ctx, k_fresh_my, headDim, firstLen, kvHeads,
+                        k_fresh_my->nb[1], k_fresh_my->nb[2], src_offset_a);
+                ggml_tensor* v_src_a = (firstLen == seqLen && writeOffsetInChunk == 0) ? v_fresh_my
+                    : ggml_view_3d(ctx, v_fresh_my, headDim, firstLen, kvHeads,
+                        v_fresh_my->nb[1], v_fresh_my->nb[2], src_offset_a);
                 k_cpy = ggml_cpy(ctx, k_src_a, k_dst_a);
                 v_cpy = ggml_cpy(ctx, v_src_a, v_dst_a);
 
@@ -2214,12 +2308,12 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
                     const int secondLen = writeLen - firstLen;
                     std::size_t src_offset_b =
                         static_cast<std::size_t>(writeOffsetInChunk + firstLen) * headDim * sizeof(float);
-                    ggml_tensor* k_src_b = ggml_view_3d(ctx, k_fresh,
+                    ggml_tensor* k_src_b = ggml_view_3d(ctx, k_fresh_my,
                         headDim, secondLen, kvHeads,
-                        k_fresh->nb[1], k_fresh->nb[2], src_offset_b);
-                    ggml_tensor* v_src_b = ggml_view_3d(ctx, v_fresh,
+                        k_fresh_my->nb[1], k_fresh_my->nb[2], src_offset_b);
+                    ggml_tensor* v_src_b = ggml_view_3d(ctx, v_fresh_my,
                         headDim, secondLen, kvHeads,
-                        v_fresh->nb[1], v_fresh->nb[2], src_offset_b);
+                        v_fresh_my->nb[1], v_fresh_my->nb[2], src_offset_b);
                     ggml_tensor* k_dst_b = ggml_view_3d(ctx, k_cache_t,
                         headDim, secondLen, kvHeads,
                         k_cache_t->nb[1], k_cache_t->nb[2], 0);
@@ -2240,8 +2334,8 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
                 ggml_tensor* v_dst = ggml_view_3d(ctx, v_cache_t,
                     headDim, seqLen, kvHeads,
                     v_cache_t->nb[1], v_cache_t->nb[2], kv_offset);
-                k_cpy = ggml_cpy(ctx, k_fresh, k_dst);
-                v_cpy = ggml_cpy(ctx, v_fresh, v_dst);
+                k_cpy = ggml_cpy(ctx, k_fresh_my, k_dst);
+                v_cpy = ggml_cpy(ctx, v_fresh_my, v_dst);
             }
         }
 
@@ -2254,8 +2348,8 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
         ggml_tensor* fresh_v_cpy = nullptr;
         if (hasFreshOut)
         {
-            fresh_k_cpy = ggml_cpy(ctx, k_fresh, fresh_k_out_t);
-            fresh_v_cpy = ggml_cpy(ctx, v_fresh, fresh_v_out_t);
+            fresh_k_cpy = ggml_cpy(ctx, k_fresh_my, fresh_k_out_t);
+            fresh_v_cpy = ggml_cpy(ctx, v_fresh_my, fresh_v_out_t);
         }
 
         // Post-attn norm + residual
@@ -2406,6 +2500,9 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
             static_cast<std::size_t>(hiddenSize) * seqLen * sizeof(float));
         ggml_backend_tensor_set(pos_tensor, pos_data.data(), 0, seqLen * sizeof(int32_t));
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        if (flash_mask_t != mask_t && !flash_mask_data.empty())
+            ggml_backend_tensor_set(flash_mask_t, flash_mask_data.data(), 0,
+                flash_mask_data.size() * sizeof(ggml_fp16_t));
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, ropeFreqFactors, 0, freqFactorsLen * sizeof(float));
         if (hasPle && ple_input_t != nullptr)
