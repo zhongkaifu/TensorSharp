@@ -15,7 +15,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
-- **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Linux/NVIDIA, with fused whole-model GPU dispatch for Gemma 4 decode and prefill on Metal (~2.6x speedup over per-op dispatch)
+- **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Windows/Linux with NVIDIA GPUs, with fused whole-model GPU dispatch for Gemma 4 decode and prefill on Metal (~2.6x speedup over per-op dispatch)
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
@@ -70,7 +70,7 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 | Backend | Flag | Description |
 |---|---|---|
 | GGML Metal | `--backend ggml_metal` | GPU-accelerated via Apple Metal (macOS). Recommended for Apple Silicon. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
-| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Linux with an NVIDIA GPU. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
+| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Windows or Linux with an NVIDIA GPU. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
 | GGML CPU | `--backend ggml_cpu` | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
 | Pure C# CPU | `--backend cpu` | Portable CPU inference with no native dependencies. |
 
@@ -129,6 +129,7 @@ This split keeps engine users off the web stack, keeps API-layer changes from le
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library
+- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
 
@@ -176,7 +177,19 @@ Linux (GGML_CUDA enabled):
 bash build-linux.sh --cuda
 ```
 
-On Linux, `build-linux.sh` now auto-detects the visible NVIDIA GPU compute capability and passes a narrow `CMAKE_CUDA_ARCHITECTURES` value to ggml-cuda (for example `86-real` on an RTX 3080), which cuts CUDA build time substantially. The native build also runs in parallel by default with a conservative job cap so `nvcc` does not overwhelm typical developer machines.
+Windows (CPU-only):
+
+```powershell
+.\build-windows.ps1 --no-cuda
+```
+
+Windows (GGML_CUDA enabled):
+
+```powershell
+.\build-windows.ps1 --cuda
+```
+
+On Windows and Linux, the native build script auto-detects the visible NVIDIA GPU compute capability and passes a narrow `CMAKE_CUDA_ARCHITECTURES` value to ggml-cuda (for example `86-real` on an RTX 3080), which cuts CUDA build time substantially. The native build also runs in parallel by default with a conservative job cap so `nvcc` does not overwhelm typical developer machines.
 
 If you want to override the auto-detected architecture list or the default build parallelism, use either environment variables or explicit build flags:
 
@@ -186,13 +199,23 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'
 TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2 bash build-linux.sh --cuda
 ```
 
+```powershell
+$env:TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real'; .\build-windows.ps1 --cuda
+.\build-windows.ps1 --cuda --cuda-arch='86-real;89-real'
+$env:TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2; .\build-windows.ps1 --cuda
+```
+
 You can also request a CUDA-enabled native build from `dotnet build`:
 
 ```bash
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 ```
 
-On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Linux, `build-linux.sh` preserves an existing CUDA-enabled build and auto-enables GGML_CUDA when a CUDA toolchain is detected; `build-linux.sh --cuda` and `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` force CUDA explicitly. The build output is automatically copied to the application's output directory.
+```powershell
+$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
+```
+
+On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Windows and Linux, the native scripts preserve an existing CUDA-enabled build and auto-enable GGML_CUDA when a CUDA toolchain is detected; `build-windows.ps1 --cuda`, `build-linux.sh --cuda`, and `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` force CUDA explicitly. The build output is automatically copied to the application's output directory.
 
 ## Usage
 
@@ -205,7 +228,7 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
 
-# Text inference on Linux + NVIDIA GPU
+# Text inference on Windows/Linux + NVIDIA GPU
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
@@ -644,7 +667,7 @@ TensorSharp is structured as a layered system:
 
 3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
-4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
+4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
 
 5. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, and the FIFO inference queue.
 

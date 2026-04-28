@@ -7,6 +7,6 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\..\TensorSharp.GGML\TensorSharp.GGML.csproj" />
+    <ProjectReference Include="..\..\..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
   </ItemGroup>
 </Project>

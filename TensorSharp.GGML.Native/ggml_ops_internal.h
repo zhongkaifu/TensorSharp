@@ -23,6 +23,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #if defined(TSG_GGML_USE_METAL)

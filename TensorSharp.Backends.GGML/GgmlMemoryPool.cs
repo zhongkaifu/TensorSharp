@@ -227,10 +227,10 @@ namespace TensorSharp.GGML
         private const uint WindowsMemRelease = 0x8000;
         private const uint WindowsPageReadWrite = 0x04;
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "VirtualAlloc", ExactSpelling = true, SetLastError = true)]
         private static extern IntPtr WindowsVirtualAlloc(IntPtr lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", EntryPoint = "VirtualFree", ExactSpelling = true, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool WindowsVirtualFree(IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
 

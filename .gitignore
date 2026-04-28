@@ -22,6 +22,8 @@ bld/
 project.lock.json
 project.fragment.lock.json
 artifacts/
+TensorSharp.GGML.Native/build/
+TensorSharp.GGML.Native/build-windows/
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt

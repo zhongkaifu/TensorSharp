@@ -13,6 +13,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace TensorSharp.GGML
 {
@@ -202,6 +203,7 @@ internal enum GgmlIndexReductionOp
     {
         private const string DllName = "GgmlOps";
         private const CallingConvention CallingConventionType = CallingConvention.Cdecl;
+        private static int s_windowsDependencySearchPathsInitialized;
 
         static GgmlNative()
         {
@@ -837,9 +839,9 @@ internal enum GgmlIndexReductionOp
                 throw new PlatformNotSupportedException("The GGML Metal backend is available on macOS only.");
             }
 
-            if (backendType == GgmlBackendType.Cuda && !OperatingSystem.IsLinux())
+            if (backendType == GgmlBackendType.Cuda && !IsCudaPlatformSupported())
             {
-                throw new PlatformNotSupportedException("The GGML CUDA backend is currently supported on Linux only.");
+                throw new PlatformNotSupportedException("The GGML CUDA backend is supported on Windows and Linux only.");
             }
 
             try
@@ -872,7 +874,7 @@ internal enum GgmlIndexReductionOp
                 return false;
             }
 
-            if (backendType == GgmlBackendType.Cuda && !OperatingSystem.IsLinux())
+            if (backendType == GgmlBackendType.Cuda && !IsCudaPlatformSupported())
             {
                 return false;
             }
@@ -1553,6 +1555,8 @@ internal enum GgmlIndexReductionOp
                 return IntPtr.Zero;
             }
 
+            EnsureWindowsNativeDependencySearchPaths();
+
             foreach (string candidate in GetCandidatePaths(assembly))
             {
                 if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
@@ -1581,6 +1585,8 @@ internal enum GgmlIndexReductionOp
                 {
                     yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", fileName);
                     yield return Path.Combine(root, "TensorSharp.GGML.Native", "build", "Release", fileName);
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build-windows", fileName);
+                    yield return Path.Combine(root, "TensorSharp.GGML.Native", "build-windows", "Release", fileName);
                 }
             }
         }
@@ -1604,6 +1610,55 @@ internal enum GgmlIndexReductionOp
             yield return OperatingSystem.IsWindows() ? "GgmlOps.dll" :
                 OperatingSystem.IsMacOS() ? "libGgmlOps.dylib" :
                 "libGgmlOps.so";
+        }
+
+        private static bool IsCudaPlatformSupported()
+        {
+            return OperatingSystem.IsWindows() || OperatingSystem.IsLinux();
+        }
+
+        private static void EnsureWindowsNativeDependencySearchPaths()
+        {
+            if (!OperatingSystem.IsWindows())
+                return;
+
+            if (Interlocked.Exchange(ref s_windowsDependencySearchPathsInitialized, 1) != 0)
+                return;
+
+            string currentPath = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            var existingEntries = new HashSet<string>(
+                currentPath.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+
+            var additions = EnumerateWindowsNativeDependencyDirectories()
+                .Where(path => Directory.Exists(path) && !existingEntries.Contains(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (additions.Length == 0)
+                return;
+
+            Environment.SetEnvironmentVariable(
+                "PATH",
+                string.Join(Path.PathSeparator, additions.Concat(new[] { currentPath })));
+        }
+
+        private static IEnumerable<string> EnumerateWindowsNativeDependencyDirectories()
+        {
+            foreach (string variableName in new[] { "CUDA_PATH", "CUDA_HOME" })
+            {
+                string root = Environment.GetEnvironmentVariable(variableName);
+                if (!string.IsNullOrWhiteSpace(root))
+                    yield return Path.Combine(root, "bin");
+            }
+
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string cudaRoot = Path.Combine(programFiles, "NVIDIA GPU Computing Toolkit", "CUDA");
+            if (!Directory.Exists(cudaRoot))
+                yield break;
+
+            foreach (string versionDir in Directory.EnumerateDirectories(cudaRoot, "v*").OrderByDescending(path => path))
+                yield return Path.Combine(versionDir, "bin");
         }
 
         private static bool IsRepoRoot(string path)
@@ -1631,9 +1686,11 @@ internal enum GgmlIndexReductionOp
             string defaultMessage = "Build the native GGML bridge and ensure the requested GGML backend is available.";
             string backendMessage = GetLastErrorMessage(defaultMessage);
 
-            if (backendType == GgmlBackendType.Cuda && OperatingSystem.IsLinux())
+            if (backendType == GgmlBackendType.Cuda && IsCudaPlatformSupported())
             {
-                const string rebuildHint = "Rebuild the native GGML bridge with CUDA enabled, for example: `bash TensorSharp.GGML.Native/build-linux.sh --cuda` or `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build`.";
+                string rebuildHint = OperatingSystem.IsWindows()
+                    ? "Rebuild the native GGML bridge with CUDA enabled, for example: `powershell -ExecutionPolicy Bypass -File TensorSharp.GGML.Native/build-windows.ps1 --cuda` or `set TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` before `dotnet build`."
+                    : "Rebuild the native GGML bridge with CUDA enabled, for example: `bash TensorSharp.GGML.Native/build-linux.sh --cuda` or `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build`.";
 
                 if (string.IsNullOrWhiteSpace(backendMessage))
                     return rebuildHint;

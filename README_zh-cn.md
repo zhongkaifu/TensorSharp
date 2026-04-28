@@ -15,7 +15,7 @@
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
-- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Linux/NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode 与 prefill（相对逐算子调度约提升 2.6 倍）
+- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode 与 prefill（相对逐算子调度约提升 2.6 倍）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -70,7 +70,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | 后端 | 参数 | 说明 |
 |---|---|---|
 | GGML Metal | `--backend ggml_metal` | 通过 Apple Metal（macOS）进行 GPU 加速。推荐用于 Apple Silicon。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
-| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
+| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
 | GGML CPU | `--backend ggml_cpu` | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
 | 纯 C# CPU | `--backend cpu` | 无原生依赖的可移植 CPU 推理。 |
 
@@ -129,6 +129,7 @@ TensorSharp/
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具
+- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda`，还需要 NVIDIA 驱动和 CUDA Toolkit 12.x 或其他兼容版本
 - **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda`，还需要 NVIDIA 驱动和 CUDA Toolkit 12.x 或其他兼容版本
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
 
@@ -176,7 +177,19 @@ Linux（启用 GGML_CUDA）：
 bash build-linux.sh --cuda
 ```
 
-在 Linux 上，`build-linux.sh` 现在会自动检测可见 NVIDIA GPU 的 compute capability，并把一个精简的 `CMAKE_CUDA_ARCHITECTURES` 列表传给 ggml-cuda（例如在 RTX 3080 上为 `86-real`），从而显著降低 CUDA 构建时间。原生构建默认还会以受控的并行任务数运行，避免 `nvcc` 拖慢普通开发机器。
+Windows（仅 CPU）：
+
+```powershell
+.\build-windows.ps1 --no-cuda
+```
+
+Windows（启用 GGML_CUDA）：
+
+```powershell
+.\build-windows.ps1 --cuda
+```
+
+在 Windows 和 Linux 上，原生构建脚本会自动检测可见 NVIDIA GPU 的 compute capability，并把一个精简的 `CMAKE_CUDA_ARCHITECTURES` 列表传给 ggml-cuda（例如在 RTX 3080 上为 `86-real`），从而显著降低 CUDA 构建时间。原生构建默认还会以受控的并行任务数运行，避免 `nvcc` 拖慢普通开发机器。
 
 如需覆盖自动检测到的架构列表或默认的并行度，可使用以下任一方式：
 
@@ -186,13 +199,23 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'
 TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2 bash build-linux.sh --cuda
 ```
 
+```powershell
+$env:TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real'; .\build-windows.ps1 --cuda
+.\build-windows.ps1 --cuda --cuda-arch='86-real;89-real'
+$env:TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=2; .\build-windows.ps1 --cuda
+```
+
 也可以在 `dotnet build` 时通过环境变量请求 CUDA 版本的原生库：
 
 ```bash
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 ```
 
-在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Linux 上，`build-linux.sh` 会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
+```powershell
+$env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
+```
+
+在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Windows 和 Linux 上，原生脚本会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-windows.ps1 --cuda`、`build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
 
 ## 使用方法
 
@@ -205,7 +228,7 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_metal
 
-# Linux + NVIDIA GPU 文本推理
+# Windows/Linux + NVIDIA GPU 文本推理
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
@@ -638,7 +661,7 @@ TensorSharp 采用分层系统结构：
 
 3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
-4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
+4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
 
 5. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理和 FIFO 推理队列。
 
