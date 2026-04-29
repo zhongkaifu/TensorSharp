@@ -20,6 +20,7 @@
 using System;
 using System.Buffers;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Xml;
 using System.Threading.Tasks;
@@ -80,6 +81,106 @@ namespace TensorSharp
         private static bool ShouldParallelize(int outerWork, int innerWork)
         {
             return outerWork > 1 && (long)outerWork * innerWork >= ParallelWorkThreshold;
+        }
+
+        unsafe private static void SiLUContiguous(float* resultPtr, float* srcPtr, int length)
+        {
+            ReadOnlySpan<float> input = new ReadOnlySpan<float>(srcPtr, length);
+            Span<float> output = new Span<float>(resultPtr, length);
+
+            if (resultPtr != srcPtr)
+            {
+                TensorPrimitives.Sigmoid(input, output);
+                TensorPrimitives.Multiply(input, output, output);
+                return;
+            }
+
+            float[] rented = ArrayPool<float>.Shared.Rent(length);
+            try
+            {
+                Span<float> sigmoid = rented.AsSpan(0, length);
+                TensorPrimitives.Sigmoid(input, sigmoid);
+                TensorPrimitives.Multiply(input, sigmoid, output);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+
+        unsafe private static void SiLUMulContiguous(float* resultPtr, float* gatePtr, float* upPtr, int length)
+        {
+            ReadOnlySpan<float> gate = new ReadOnlySpan<float>(gatePtr, length);
+            ReadOnlySpan<float> up = new ReadOnlySpan<float>(upPtr, length);
+            Span<float> output = new Span<float>(resultPtr, length);
+
+            if (resultPtr != gatePtr && resultPtr != upPtr)
+            {
+                TensorPrimitives.Sigmoid(gate, output);
+                MultiplySiLUGateUp(gate, up, output, output);
+                return;
+            }
+
+            float[] rented = ArrayPool<float>.Shared.Rent(length);
+            try
+            {
+                Span<float> tmp = rented.AsSpan(0, length);
+                TensorPrimitives.Sigmoid(gate, tmp);
+                MultiplySiLUGateUp(gate, up, tmp, output);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+
+        private static void MultiplySiLUGateUp(
+            ReadOnlySpan<float> gate,
+            ReadOnlySpan<float> up,
+            ReadOnlySpan<float> sigmoid,
+            Span<float> output)
+        {
+            int vectorSize = Vector<float>.Count;
+            int i = 0;
+            for (; i <= output.Length - vectorSize; i += vectorSize)
+            {
+                Vector<float> value =
+                    new Vector<float>(gate.Slice(i)) *
+                    new Vector<float>(sigmoid.Slice(i)) *
+                    new Vector<float>(up.Slice(i));
+                value.CopyTo(output.Slice(i));
+            }
+
+            for (; i < output.Length; i++)
+            {
+                output[i] = gate[i] * sigmoid[i] * up[i];
+            }
+        }
+
+        unsafe private static void SigmoidMulContiguous(float* resultPtr, float* xPtr, float* gatePtr, int length)
+        {
+            ReadOnlySpan<float> x = new ReadOnlySpan<float>(xPtr, length);
+            ReadOnlySpan<float> gate = new ReadOnlySpan<float>(gatePtr, length);
+            Span<float> output = new Span<float>(resultPtr, length);
+
+            if (resultPtr != xPtr && resultPtr != gatePtr)
+            {
+                TensorPrimitives.Sigmoid(gate, output);
+                TensorPrimitives.Multiply(x, output, output);
+                return;
+            }
+
+            float[] rented = ArrayPool<float>.Shared.Rent(length);
+            try
+            {
+                Span<float> tmp = rented.AsSpan(0, length);
+                TensorPrimitives.Sigmoid(gate, tmp);
+                TensorPrimitives.Multiply(x, tmp, output);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -990,11 +1091,7 @@ namespace TensorSharp
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
             {
-                for (int i = 0; i < length; i++)
-                {
-                    resultPtr[i] = sigmoid(srcPtr[i]);
-                }
-
+                TensorPrimitives.Sigmoid(new ReadOnlySpan<float>(srcPtr, length), new Span<float>(resultPtr, length));
                 return;
             }
 
@@ -1082,11 +1179,7 @@ namespace TensorSharp
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
             {
-                for (int i = 0; i < length; i++)
-                {
-                    resultPtr[i] = MathF.Exp(srcPtr[i]);
-                }
-
+                TensorPrimitives.Exp(new ReadOnlySpan<float>(srcPtr, length), new Span<float>(resultPtr, length));
                 return;
             }
 
@@ -1157,12 +1250,7 @@ namespace TensorSharp
                 TryGetContiguousFloat(src, out float* srcPtr, out int srcLength) &&
                 length == srcLength)
             {
-                for (int i = 0; i < length; i++)
-                {
-                    float value = srcPtr[i];
-                    resultPtr[i] = value / (1.0f + MathF.Exp(-value));
-                }
-
+                SiLUContiguous(resultPtr, srcPtr, length);
                 return;
             }
 
@@ -1224,12 +1312,7 @@ namespace TensorSharp
                 TryGetContiguousFloat(up, out float* upPtr, out int upLength) &&
                 length == gateLength && length == upLength)
             {
-                for (int i = 0; i < length; i++)
-                {
-                    float gateValue = gatePtr[i];
-                    resultPtr[i] = (gateValue / (1.0f + MathF.Exp(-gateValue))) * upPtr[i];
-                }
-
+                SiLUMulContiguous(resultPtr, gatePtr, upPtr, length);
                 return;
             }
 
@@ -1247,11 +1330,7 @@ namespace TensorSharp
                 TryGetContiguousFloat(gate, out float* gatePtr, out int gateLength) &&
                 length == xLength && length == gateLength)
             {
-                for (int i = 0; i < length; i++)
-                {
-                    resultPtr[i] = xPtr[i] * (1.0f / (1.0f + MathF.Exp(-gatePtr[i])));
-                }
-
+                SigmoidMulContiguous(resultPtr, xPtr, gatePtr, length);
                 return;
             }
 
@@ -2168,7 +2247,8 @@ namespace TensorSharp
 
 				Span<float> spanSO = new Span<float>(so, cols);
 				Span<float> spanAlpha = new Span<float>(alpha, cols);
-				Span<float> spanBeta = (beta != null) ? new Span<float>(beta, cols) : null;
+				bool hasBeta = beta != null;
+				Span<float> spanBeta = hasBeta ? new Span<float>(beta, cols) : Span<float>.Empty;
 				Vector<float> vecSigma = new Vector<float>(sigma);
 
 				for (i = 0; i < cols - vectorSize; i += vectorSize)
@@ -2178,7 +2258,7 @@ namespace TensorSharp
 
 					Vector<float> vecT = vecAlpha * ((vecSp - vecMean) / vecSigma);
 
-					if (spanBeta != null)
+					if (hasBeta)
 					{
 						Vector<float> vecBeta = new Vector<float>(spanBeta.Slice(i));
 						vecT += vecBeta;

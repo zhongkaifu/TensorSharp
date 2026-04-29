@@ -20,6 +20,7 @@
 using AdvUtils;
 using System;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -184,22 +185,9 @@ namespace TensorSharp.Cpu
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe float DotContiguous(float* lhs, float* rhs, int length)
         {
-            int vectorSize = Vector<float>.Count;
-            Vector<float> acc = Vector<float>.Zero;
-            int i = 0;
-
-            for (; i <= length - vectorSize; i += vectorSize)
-            {
-                acc += LoadVec(lhs + i) * LoadVec(rhs + i);
-            }
-
-            float sum = Vector.Sum(acc);
-            for (; i < length; i++)
-            {
-                sum += lhs[i] * rhs[i];
-            }
-
-            return sum;
+            return TensorPrimitives.Dot(
+                new ReadOnlySpan<float>(lhs, length),
+                new ReadOnlySpan<float>(rhs, length));
         }
 
         private static unsafe void ApplyBeta(float* row, int length, float beta)
@@ -261,6 +249,234 @@ namespace TensorSharp.Cpu
             }
         }
 
+        private static unsafe void ManagedGemmRowRowFour(
+            float alpha,
+            float* aRow0, float* aRow1, float* aRow2, float* aRow3,
+            float* bBase, int bRowStride,
+            float beta,
+            float* cRow0, float* cRow1, float* cRow2, float* cRow3,
+            int n, int k)
+        {
+            ApplyBeta(cRow0, n, beta);
+            ApplyBeta(cRow1, n, beta);
+            ApplyBeta(cRow2, n, beta);
+            ApplyBeta(cRow3, n, beta);
+
+            if (alpha == 0.0f)
+            {
+                return;
+            }
+
+            int vectorSize = Vector<float>.Count;
+            for (int kk = 0; kk < k; kk++)
+            {
+                float scaledA0 = alpha * aRow0[kk];
+                float scaledA1 = alpha * aRow1[kk];
+                float scaledA2 = alpha * aRow2[kk];
+                float scaledA3 = alpha * aRow3[kk];
+
+                bool update0 = scaledA0 != 0.0f;
+                bool update1 = scaledA1 != 0.0f;
+                bool update2 = scaledA2 != 0.0f;
+                bool update3 = scaledA3 != 0.0f;
+                if (!update0 && !update1 && !update2 && !update3)
+                {
+                    continue;
+                }
+
+                float* bRow = bBase + kk * bRowStride;
+                int j = 0;
+                if (update0 && update1 && update2 && update3)
+                {
+                    Vector<float> vecA0 = new Vector<float>(scaledA0);
+                    Vector<float> vecA1 = new Vector<float>(scaledA1);
+                    Vector<float> vecA2 = new Vector<float>(scaledA2);
+                    Vector<float> vecA3 = new Vector<float>(scaledA3);
+                    for (; j <= n - vectorSize; j += vectorSize)
+                    {
+                        Vector<float> vecB = LoadVec(bRow + j);
+                        StoreVec(cRow0 + j, LoadVec(cRow0 + j) + vecB * vecA0);
+                        StoreVec(cRow1 + j, LoadVec(cRow1 + j) + vecB * vecA1);
+                        StoreVec(cRow2 + j, LoadVec(cRow2 + j) + vecB * vecA2);
+                        StoreVec(cRow3 + j, LoadVec(cRow3 + j) + vecB * vecA3);
+                    }
+
+                    for (; j < n; j++)
+                    {
+                        float b = bRow[j];
+                        cRow0[j] += scaledA0 * b;
+                        cRow1[j] += scaledA1 * b;
+                        cRow2[j] += scaledA2 * b;
+                        cRow3[j] += scaledA3 * b;
+                    }
+
+                    continue;
+                }
+
+                Vector<float> vecA0Optional = new Vector<float>(scaledA0);
+                Vector<float> vecA1Optional = new Vector<float>(scaledA1);
+                Vector<float> vecA2Optional = new Vector<float>(scaledA2);
+                Vector<float> vecA3Optional = new Vector<float>(scaledA3);
+                for (; j <= n - vectorSize; j += vectorSize)
+                {
+                    Vector<float> vecB = LoadVec(bRow + j);
+                    if (update0) StoreVec(cRow0 + j, LoadVec(cRow0 + j) + vecB * vecA0Optional);
+                    if (update1) StoreVec(cRow1 + j, LoadVec(cRow1 + j) + vecB * vecA1Optional);
+                    if (update2) StoreVec(cRow2 + j, LoadVec(cRow2 + j) + vecB * vecA2Optional);
+                    if (update3) StoreVec(cRow3 + j, LoadVec(cRow3 + j) + vecB * vecA3Optional);
+                }
+
+                for (; j < n; j++)
+                {
+                    float b = bRow[j];
+                    if (update0) cRow0[j] += scaledA0 * b;
+                    if (update1) cRow1[j] += scaledA1 * b;
+                    if (update2) cRow2[j] += scaledA2 * b;
+                    if (update3) cRow3[j] += scaledA3 * b;
+                }
+            }
+        }
+
+        private static unsafe void DotContiguousFour(
+            float* lhs0, float* lhs1, float* lhs2, float* lhs3,
+            float* rhs,
+            int length,
+            out float sum0, out float sum1, out float sum2, out float sum3)
+        {
+            int vectorSize = Vector<float>.Count;
+            Vector<float> acc0 = Vector<float>.Zero;
+            Vector<float> acc1 = Vector<float>.Zero;
+            Vector<float> acc2 = Vector<float>.Zero;
+            Vector<float> acc3 = Vector<float>.Zero;
+            int i = 0;
+
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                Vector<float> r = LoadVec(rhs + i);
+                acc0 += LoadVec(lhs0 + i) * r;
+                acc1 += LoadVec(lhs1 + i) * r;
+                acc2 += LoadVec(lhs2 + i) * r;
+                acc3 += LoadVec(lhs3 + i) * r;
+            }
+
+            sum0 = Vector.Sum(acc0);
+            sum1 = Vector.Sum(acc1);
+            sum2 = Vector.Sum(acc2);
+            sum3 = Vector.Sum(acc3);
+            for (; i < length; i++)
+            {
+                float r = rhs[i];
+                sum0 += lhs0[i] * r;
+                sum1 += lhs1[i] * r;
+                sum2 += lhs2[i] * r;
+                sum3 += lhs3[i] * r;
+            }
+        }
+
+        private static unsafe void DotContiguousFourByFour(
+            float* lhs0, float* lhs1, float* lhs2, float* lhs3,
+            float* rhs0, float* rhs1, float* rhs2, float* rhs3,
+            int length,
+            out float sum00, out float sum01, out float sum02, out float sum03,
+            out float sum10, out float sum11, out float sum12, out float sum13,
+            out float sum20, out float sum21, out float sum22, out float sum23,
+            out float sum30, out float sum31, out float sum32, out float sum33)
+        {
+            int vectorSize = Vector<float>.Count;
+            Vector<float> acc00 = Vector<float>.Zero;
+            Vector<float> acc01 = Vector<float>.Zero;
+            Vector<float> acc02 = Vector<float>.Zero;
+            Vector<float> acc03 = Vector<float>.Zero;
+            Vector<float> acc10 = Vector<float>.Zero;
+            Vector<float> acc11 = Vector<float>.Zero;
+            Vector<float> acc12 = Vector<float>.Zero;
+            Vector<float> acc13 = Vector<float>.Zero;
+            Vector<float> acc20 = Vector<float>.Zero;
+            Vector<float> acc21 = Vector<float>.Zero;
+            Vector<float> acc22 = Vector<float>.Zero;
+            Vector<float> acc23 = Vector<float>.Zero;
+            Vector<float> acc30 = Vector<float>.Zero;
+            Vector<float> acc31 = Vector<float>.Zero;
+            Vector<float> acc32 = Vector<float>.Zero;
+            Vector<float> acc33 = Vector<float>.Zero;
+            int i = 0;
+
+            for (; i <= length - vectorSize; i += vectorSize)
+            {
+                Vector<float> a0 = LoadVec(lhs0 + i);
+                Vector<float> a1 = LoadVec(lhs1 + i);
+                Vector<float> a2 = LoadVec(lhs2 + i);
+                Vector<float> a3 = LoadVec(lhs3 + i);
+                Vector<float> b0 = LoadVec(rhs0 + i);
+                Vector<float> b1 = LoadVec(rhs1 + i);
+                Vector<float> b2 = LoadVec(rhs2 + i);
+                Vector<float> b3 = LoadVec(rhs3 + i);
+
+                acc00 += a0 * b0;
+                acc01 += a0 * b1;
+                acc02 += a0 * b2;
+                acc03 += a0 * b3;
+                acc10 += a1 * b0;
+                acc11 += a1 * b1;
+                acc12 += a1 * b2;
+                acc13 += a1 * b3;
+                acc20 += a2 * b0;
+                acc21 += a2 * b1;
+                acc22 += a2 * b2;
+                acc23 += a2 * b3;
+                acc30 += a3 * b0;
+                acc31 += a3 * b1;
+                acc32 += a3 * b2;
+                acc33 += a3 * b3;
+            }
+
+            sum00 = Vector.Sum(acc00);
+            sum01 = Vector.Sum(acc01);
+            sum02 = Vector.Sum(acc02);
+            sum03 = Vector.Sum(acc03);
+            sum10 = Vector.Sum(acc10);
+            sum11 = Vector.Sum(acc11);
+            sum12 = Vector.Sum(acc12);
+            sum13 = Vector.Sum(acc13);
+            sum20 = Vector.Sum(acc20);
+            sum21 = Vector.Sum(acc21);
+            sum22 = Vector.Sum(acc22);
+            sum23 = Vector.Sum(acc23);
+            sum30 = Vector.Sum(acc30);
+            sum31 = Vector.Sum(acc31);
+            sum32 = Vector.Sum(acc32);
+            sum33 = Vector.Sum(acc33);
+
+            for (; i < length; i++)
+            {
+                float a0 = lhs0[i];
+                float a1 = lhs1[i];
+                float a2 = lhs2[i];
+                float a3 = lhs3[i];
+                float b0 = rhs0[i];
+                float b1 = rhs1[i];
+                float b2 = rhs2[i];
+                float b3 = rhs3[i];
+
+                sum00 += a0 * b0;
+                sum01 += a0 * b1;
+                sum02 += a0 * b2;
+                sum03 += a0 * b3;
+                sum10 += a1 * b0;
+                sum11 += a1 * b1;
+                sum12 += a1 * b2;
+                sum13 += a1 * b3;
+                sum20 += a2 * b0;
+                sum21 += a2 * b1;
+                sum22 += a2 * b2;
+                sum23 += a2 * b3;
+                sum30 += a3 * b0;
+                sum31 += a3 * b1;
+                sum32 += a3 * b2;
+                sum33 += a3 * b3;
+            }
+        }
+
         private static unsafe void ManagedGemmRowColOne(float alpha, float* aRow, float* bBase, int bColStride, float beta, float* cRow, int n, int k)
         {
             if (alpha == 0.0f)
@@ -273,6 +489,107 @@ namespace TensorSharp.Cpu
             {
                 float value = alpha * DotContiguous(aRow, bBase + j * bColStride, k);
                 cRow[j] = beta == 0.0f ? value : value + beta * cRow[j];
+            }
+        }
+
+        private static unsafe void ManagedGemmRowColFour(
+            float alpha,
+            float* aRow0, float* aRow1, float* aRow2, float* aRow3,
+            float* bBase, int bColStride,
+            float beta,
+            float* cRow0, float* cRow1, float* cRow2, float* cRow3,
+            int n, int k)
+        {
+            if (alpha == 0.0f)
+            {
+                ApplyBeta(cRow0, n, beta);
+                ApplyBeta(cRow1, n, beta);
+                ApplyBeta(cRow2, n, beta);
+                ApplyBeta(cRow3, n, beta);
+                return;
+            }
+
+            int j = 0;
+            for (; j + 3 < n; j += 4)
+            {
+                DotContiguousFourByFour(
+                    aRow0, aRow1, aRow2, aRow3,
+                    bBase + j * bColStride,
+                    bBase + (j + 1) * bColStride,
+                    bBase + (j + 2) * bColStride,
+                    bBase + (j + 3) * bColStride,
+                    k,
+                    out float dot00, out float dot01, out float dot02, out float dot03,
+                    out float dot10, out float dot11, out float dot12, out float dot13,
+                    out float dot20, out float dot21, out float dot22, out float dot23,
+                    out float dot30, out float dot31, out float dot32, out float dot33);
+
+                if (beta == 0.0f)
+                {
+                    cRow0[j] = alpha * dot00;
+                    cRow0[j + 1] = alpha * dot01;
+                    cRow0[j + 2] = alpha * dot02;
+                    cRow0[j + 3] = alpha * dot03;
+                    cRow1[j] = alpha * dot10;
+                    cRow1[j + 1] = alpha * dot11;
+                    cRow1[j + 2] = alpha * dot12;
+                    cRow1[j + 3] = alpha * dot13;
+                    cRow2[j] = alpha * dot20;
+                    cRow2[j + 1] = alpha * dot21;
+                    cRow2[j + 2] = alpha * dot22;
+                    cRow2[j + 3] = alpha * dot23;
+                    cRow3[j] = alpha * dot30;
+                    cRow3[j + 1] = alpha * dot31;
+                    cRow3[j + 2] = alpha * dot32;
+                    cRow3[j + 3] = alpha * dot33;
+                }
+                else
+                {
+                    cRow0[j] = alpha * dot00 + beta * cRow0[j];
+                    cRow0[j + 1] = alpha * dot01 + beta * cRow0[j + 1];
+                    cRow0[j + 2] = alpha * dot02 + beta * cRow0[j + 2];
+                    cRow0[j + 3] = alpha * dot03 + beta * cRow0[j + 3];
+                    cRow1[j] = alpha * dot10 + beta * cRow1[j];
+                    cRow1[j + 1] = alpha * dot11 + beta * cRow1[j + 1];
+                    cRow1[j + 2] = alpha * dot12 + beta * cRow1[j + 2];
+                    cRow1[j + 3] = alpha * dot13 + beta * cRow1[j + 3];
+                    cRow2[j] = alpha * dot20 + beta * cRow2[j];
+                    cRow2[j + 1] = alpha * dot21 + beta * cRow2[j + 1];
+                    cRow2[j + 2] = alpha * dot22 + beta * cRow2[j + 2];
+                    cRow2[j + 3] = alpha * dot23 + beta * cRow2[j + 3];
+                    cRow3[j] = alpha * dot30 + beta * cRow3[j];
+                    cRow3[j + 1] = alpha * dot31 + beta * cRow3[j + 1];
+                    cRow3[j + 2] = alpha * dot32 + beta * cRow3[j + 2];
+                    cRow3[j + 3] = alpha * dot33 + beta * cRow3[j + 3];
+                }
+            }
+
+            for (; j < n; j++)
+            {
+                DotContiguousFour(
+                    aRow0, aRow1, aRow2, aRow3,
+                    bBase + j * bColStride,
+                    k,
+                    out float dot0, out float dot1, out float dot2, out float dot3);
+
+                float value0 = alpha * dot0;
+                float value1 = alpha * dot1;
+                float value2 = alpha * dot2;
+                float value3 = alpha * dot3;
+                if (beta == 0.0f)
+                {
+                    cRow0[j] = value0;
+                    cRow1[j] = value1;
+                    cRow2[j] = value2;
+                    cRow3[j] = value3;
+                }
+                else
+                {
+                    cRow0[j] = value0 + beta * cRow0[j];
+                    cRow1[j] = value1 + beta * cRow1[j];
+                    cRow2[j] = value2 + beta * cRow2[j];
+                    cRow3[j] = value3 + beta * cRow3[j];
+                }
             }
         }
 
@@ -301,7 +618,45 @@ namespace TensorSharp.Cpu
                     ManagedGemmRowRowOne(alpha, aPtr + row * aRowStride, bPtr, bRowStride, beta, cPtr + row * cRowStride, n, k);
                 }
 
-                if (ShouldParallelize(m, n * k))
+                void ComputeRowRowBlock(int block)
+                {
+                    int row = block * 4;
+                    ManagedGemmRowRowFour(
+                        alpha,
+                        aPtr + row * aRowStride,
+                        aPtr + (row + 1) * aRowStride,
+                        aPtr + (row + 2) * aRowStride,
+                        aPtr + (row + 3) * aRowStride,
+                        bPtr, bRowStride, beta,
+                        cPtr + row * cRowStride,
+                        cPtr + (row + 1) * cRowStride,
+                        cPtr + (row + 2) * cRowStride,
+                        cPtr + (row + 3) * cRowStride,
+                        n, k);
+                }
+
+                int fullRows = m & ~3;
+                if (fullRows >= 4)
+                {
+                    int blockCount = fullRows / 4;
+                    if (ShouldParallelize(fullRows, n * k))
+                    {
+                        Parallel.For(0, blockCount, ComputeRowRowBlock);
+                    }
+                    else
+                    {
+                        for (int block = 0; block < blockCount; block++)
+                        {
+                            ComputeRowRowBlock(block);
+                        }
+                    }
+
+                    for (int row = fullRows; row < m; row++)
+                    {
+                        ComputeRowRow(row);
+                    }
+                }
+                else if (ShouldParallelize(m, n * k))
                 {
                     Parallel.For(0, m, ComputeRowRow);
                 }
@@ -341,7 +696,46 @@ namespace TensorSharp.Cpu
                 ManagedGemmRowColOne(alpha, aPtr + row * aRowStride, bPtr, bColStride, beta, cPtr + row * cRowStride, n, k);
             }
 
-            if (ShouldParallelize(m, n * k))
+            if (m >= 4)
+            {
+                int fullRows = m & ~3;
+
+                void ComputeRowColBlock(int block)
+                {
+                    int row = block * 4;
+                    ManagedGemmRowColFour(
+                        alpha,
+                        aPtr + row * aRowStride,
+                        aPtr + (row + 1) * aRowStride,
+                        aPtr + (row + 2) * aRowStride,
+                        aPtr + (row + 3) * aRowStride,
+                        bPtr, bColStride, beta,
+                        cPtr + row * cRowStride,
+                        cPtr + (row + 1) * cRowStride,
+                        cPtr + (row + 2) * cRowStride,
+                        cPtr + (row + 3) * cRowStride,
+                        n, k);
+                }
+
+                int blockCount = fullRows / 4;
+                if (ShouldParallelize(fullRows, n * k))
+                {
+                    Parallel.For(0, blockCount, ComputeRowColBlock);
+                }
+                else
+                {
+                    for (int block = 0; block < blockCount; block++)
+                    {
+                        ComputeRowColBlock(block);
+                    }
+                }
+
+                for (int row = fullRows; row < m; row++)
+                {
+                    ComputeRowCol(row);
+                }
+            }
+            else if (ShouldParallelize(m, n * k))
             {
                 Parallel.For(0, m, ComputeRowCol);
             }
@@ -385,7 +779,24 @@ namespace TensorSharp.Cpu
                     float* aBatch = aPtr + batchIndex * aBatchStride;
                     float* bBatch = bPtr + batchIndex * bBatchStrideRow;
                     float* cBatch = cPtr + batchIndex * cBatchStride;
-                    for (int row = 0; row < m; row++)
+                    int row = 0;
+                    for (; row + 3 < m; row += 4)
+                    {
+                        ManagedGemmRowRowFour(
+                            alpha,
+                            aBatch + row * aRowStride,
+                            aBatch + (row + 1) * aRowStride,
+                            aBatch + (row + 2) * aRowStride,
+                            aBatch + (row + 3) * aRowStride,
+                            bBatch, bRowStride, beta,
+                            cBatch + row * cRowStride,
+                            cBatch + (row + 1) * cRowStride,
+                            cBatch + (row + 2) * cRowStride,
+                            cBatch + (row + 3) * cRowStride,
+                            n, k);
+                    }
+
+                    for (; row < m; row++)
                     {
                         ManagedGemmRowRowOne(alpha, aBatch + row * aRowStride, bBatch, bRowStride, beta, cBatch + row * cRowStride, n, k);
                     }
@@ -419,7 +830,24 @@ namespace TensorSharp.Cpu
                 float* aBatch = aPtr + batchIndex * aBatchStride;
                 float* bBatch = bPtr + batchIndex * bBatchStrideCol;
                 float* cBatch = cPtr + batchIndex * cBatchStride;
-                for (int row = 0; row < m; row++)
+                int row = 0;
+                for (; row + 3 < m; row += 4)
+                {
+                    ManagedGemmRowColFour(
+                        alpha,
+                        aBatch + row * aRowStride,
+                        aBatch + (row + 1) * aRowStride,
+                        aBatch + (row + 2) * aRowStride,
+                        aBatch + (row + 3) * aRowStride,
+                        bBatch, bColStride, beta,
+                        cBatch + row * cRowStride,
+                        cBatch + (row + 1) * cRowStride,
+                        cBatch + (row + 2) * cRowStride,
+                        cBatch + (row + 3) * cRowStride,
+                        n, k);
+                }
+
+                for (; row < m; row++)
                 {
                     ManagedGemmRowColOne(alpha, aBatch + row * aRowStride, bBatch, bColStride, beta, cBatch + row * cRowStride, n, k);
                 }
