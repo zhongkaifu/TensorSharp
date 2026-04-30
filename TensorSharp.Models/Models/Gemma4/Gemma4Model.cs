@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -113,7 +114,13 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
-            _visionEncoder = new Gemma4VisionEncoder(mmProjPath, _allocator);
+            // The direct CUDA backend currently diverges numerically in the Gemma4
+            // vision stack; keep projector embeddings on the stable CPU path and
+            // copy the final embeddings into the CUDA language model.
+            IAllocator visionAllocator = _backend == BackendType.Cuda
+                ? new CpuAllocator(BlasEnum.DotNet)
+                : _allocator;
+            _visionEncoder = new Gemma4VisionEncoder(mmProjPath, visionAllocator);
         }
 
         public void LoadAudioEncoder(string mmProjPath)
@@ -764,7 +771,15 @@ namespace TensorSharp.Models
         {
             int numVisionTokens = (int)visionEmbeddings.Sizes[0];
             using var target = hidden.Narrow(0, insertPos, numVisionTokens);
-            Ops.Copy(target, visionEmbeddings);
+            if (ReferenceEquals(target.Allocator, visionEmbeddings.Allocator))
+            {
+                Ops.Copy(target, visionEmbeddings);
+            }
+            else
+            {
+                float[] hostEmbeddings = visionEmbeddings.GetElementsAsFloat((int)visionEmbeddings.ElementCount());
+                target.SetElementsAsFloat(hostEmbeddings);
+            }
             Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
         }
 

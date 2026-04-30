@@ -49,6 +49,7 @@ namespace TensorSharp.Cuda
                 return false;
 
             srcStorage.EnsureDeviceCurrent();
+            srcStorage.SynchronizeDeviceWork();
             resultStorage.AllocatorImpl.Context.MakeCurrent();
             TensorSharp.Cuda.Interop.CudaDriverApi.cuMemcpyDtoD(
                 resultPtr,

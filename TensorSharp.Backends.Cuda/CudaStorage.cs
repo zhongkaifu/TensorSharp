@@ -118,6 +118,7 @@ namespace TensorSharp.Cuda
                     return;
 
                 AllocatorImpl.Context.MakeCurrent();
+                AllocatorImpl.Stream.Synchronize();
                 CudaDriverApi.cuMemcpyDtoH(hostBuffer, deviceBuffer, new UIntPtr((ulong)ByteLength)).ThrowOnError();
                 deviceDirty = false;
                 hostDirty = false;
@@ -132,9 +133,17 @@ namespace TensorSharp.Cuda
                 throw new ArgumentException("CUDA device copy requires equal byte lengths.", nameof(src));
 
             src.EnsureDeviceCurrent();
+            src.SynchronizeDeviceWork();
             AllocatorImpl.Context.MakeCurrent();
             CudaDriverApi.cuMemcpyDtoD(deviceBuffer, src.deviceBuffer, new UIntPtr((ulong)ByteLength)).ThrowOnError();
             MarkDeviceModified();
+        }
+
+        internal void SynchronizeDeviceWork()
+        {
+            ThrowIfDisposed();
+            AllocatorImpl.Context.MakeCurrent();
+            AllocatorImpl.Stream.Synchronize();
         }
 
         public override int[] GetElementsAsInt(long index, int length)
