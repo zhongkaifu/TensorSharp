@@ -225,6 +225,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             string ext = Path.GetExtension(file.FileName).ToLowerInvariant();
             string safeFileName = $"{Guid.NewGuid():N}{ext}";
             string savePath = Path.Combine(_options.UploadDirectory, safeFileName);
+            string uploadUrl = BuildUploadUrl(safeFileName);
 
             using (var stream = File.Create(savePath))
                 await file.CopyToAsync(stream);
@@ -245,9 +246,11 @@ namespace TensorSharp.Server.ProtocolAdapters
                 {
                     ok = true,
                     path = savePath,
+                    url = uploadUrl,
                     mediaType,
                     fileName = file.FileName,
                     frames = frames.Select(f => Path.GetFileName(f)).ToList(),
+                    frameUrls = frames.Select(f => BuildUploadUrl(Path.GetFileName(f))).ToList(),
                     framePaths = frames,
                 });
             }
@@ -265,6 +268,7 @@ namespace TensorSharp.Server.ProtocolAdapters
                 {
                     ok = true,
                     path = savePath,
+                    url = uploadUrl,
                     mediaType,
                     fileName = file.FileName,
                     textContent = prepared.TextContent,
@@ -277,7 +281,12 @@ namespace TensorSharp.Server.ProtocolAdapters
                 });
             }
 
-            return Results.Json(new { ok = true, path = savePath, mediaType, fileName = file.FileName });
+            return Results.Json(new { ok = true, path = savePath, url = uploadUrl, mediaType, fileName = file.FileName });
+        }
+
+        private static string BuildUploadUrl(string fileName)
+        {
+            return "/uploads/" + Uri.EscapeDataString(fileName);
         }
 
         private static string ClassifyExtension(string ext) => ext switch

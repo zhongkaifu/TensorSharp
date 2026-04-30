@@ -1378,13 +1378,13 @@ function addUserBubble(text, attachments, historyIdx) {
   let mediaHtml = '';
   attachments.forEach(att => {
     if (att.mediaType === 'image') {
-      mediaHtml += `<div class="media-preview"><img src="/uploads/${att.path.split('/').pop()}" alt="uploaded"></div>`;
+      mediaHtml += `<div class="media-preview"><img src="${escapeHtml(uploadUrlForAttachment(att))}" alt="uploaded"></div>`;
     } else if (att.mediaType === 'video') {
-      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3AC; ${att.fileName}</div></div>`;
+      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3AC; ${escapeHtml(att.fileName || '')}</div></div>`;
     } else if (att.mediaType === 'audio') {
-      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3B5; ${att.fileName}</div></div>`;
+      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F3B5; ${escapeHtml(att.fileName || '')}</div></div>`;
     } else if (att.mediaType === 'text') {
-      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F4DD; ${att.fileName}</div></div>`;
+      mediaHtml += `<div class="media-preview"><div class="audio-label">&#x1F4DD; ${escapeHtml(att.fileName || '')}</div></div>`;
     }
   });
 
@@ -1427,6 +1427,15 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+function uploadUrlForAttachment(att) {
+  if (att && att.url) return att.url;
+  const raw = String((att && (att.path || att.fileName)) || '');
+  if (!raw) return '';
+  const normalized = raw.replace(/\\/g, '/');
+  const fileName = normalized.split('/').filter(Boolean).pop() || raw;
+  return '/uploads/' + encodeURIComponent(fileName);
 }
 
 fetchServerState();
