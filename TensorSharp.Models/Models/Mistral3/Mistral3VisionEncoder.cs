@@ -10,7 +10,6 @@
 using System;
 using System.Collections.Generic;
 using TensorSharp;
-using TensorSharp.Cpu;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -502,14 +501,8 @@ namespace TensorSharp.Models
             return transposed;
         }
 
-        private static unsafe float* GetFloatPtr(Tensor t)
-        {
-            if (t.Storage is GgmlStorage gs)
-                return (float*)gs.PtrAtElement(t.StorageOffset);
-            if (t.Storage is CpuStorage cs)
-                return (float*)cs.PtrAtElement(t.StorageOffset);
-            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
-        }
+        private static unsafe float* GetFloatPtr(Tensor t) =>
+            TensorComputePrimitives.GetFloatPointer(t);
 
         public void Dispose()
         {

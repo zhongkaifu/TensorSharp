@@ -2627,30 +2627,8 @@ namespace TensorSharp.Models
             return false;
         }
 
-        private static unsafe void SelectTopKInPlace(float* values, int n, int k, int[] indices)
-        {
-            Span<float> topVals = stackalloc float[k];
-            for (int i = 0; i < k; i++)
-            {
-                topVals[i] = float.NegativeInfinity;
-                indices[i] = -1;
-            }
-
-            for (int i = 0; i < n; i++)
-            {
-                int minIdx = 0;
-                for (int j = 1; j < k; j++)
-                {
-                    if (topVals[j] < topVals[minIdx])
-                        minIdx = j;
-                }
-                if (values[i] > topVals[minIdx])
-                {
-                    topVals[minIdx] = values[i];
-                    indices[minIdx] = i;
-                }
-            }
-        }
+        private static unsafe void SelectTopKInPlace(float* values, int n, int k, int[] indices) =>
+            TensorComputePrimitives.SelectTopKInPlace(values, n, k, indices);
 
         #endregion
 

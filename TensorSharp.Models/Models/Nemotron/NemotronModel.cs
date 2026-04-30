@@ -434,11 +434,11 @@ namespace TensorSharp.Models
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe Vector<float> LdV(float* p) =>
-            Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)p);
+            TensorComputePrimitives.LoadVector(p);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe void StV(float* p, Vector<float> v) =>
-            Unsafe.WriteUnaligned(ref *(byte*)p, v);
+            TensorComputePrimitives.StoreVector(p, v);
 
         private unsafe Tensor RMSNormCPU(Tensor input, string weightName)
         {
@@ -1035,50 +1035,11 @@ namespace TensorSharp.Models
             return output;
         }
 
-        private static void SelectTopKInPlace(float[] values, int n, int k, int[] indices)
-        {
-            Span<float> topVals = stackalloc float[k];
-            for (int i = 0; i < k; i++)
-            {
-                topVals[i] = float.NegativeInfinity;
-                indices[i] = -1;
-            }
+        private static void SelectTopKInPlace(float[] values, int n, int k, int[] indices) =>
+            TensorComputePrimitives.SelectTopKInPlace(values, n, k, indices);
 
-            for (int i = 0; i < n; i++)
-            {
-                int minIdx = 0;
-                for (int j = 1; j < k; j++)
-                {
-                    if (topVals[j] < topVals[minIdx])
-                        minIdx = j;
-                }
-                if (values[i] > topVals[minIdx])
-                {
-                    topVals[minIdx] = values[i];
-                    indices[minIdx] = i;
-                }
-            }
-        }
-
-        private unsafe void ReluSquaredInPlace(Tensor t)
-        {
-            float* ptr = GetFloatPtr(t);
-            long count = t.ElementCount();
-            int vLen = Vector<float>.Count;
-            var zero = Vector<float>.Zero;
-            long i = 0;
-            for (; i <= count - vLen; i += vLen)
-            {
-                var v = LdV(ptr + i);
-                var mask = Vector.GreaterThan(v, zero);
-                StV(ptr + i, Vector.ConditionalSelect(mask, v * v, zero));
-            }
-            for (; i < count; i++)
-            {
-                float v = ptr[i];
-                ptr[i] = v > 0f ? v * v : 0f;
-            }
-        }
+        private static unsafe void ReluSquaredInPlace(Tensor t) =>
+            TensorComputePrimitives.ReluSquaredInPlace(t);
 
         #endregion
 
@@ -1335,27 +1296,13 @@ namespace TensorSharp.Models
         #region Helper functions
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float SigmoidScalar(float x)
-        {
-            if (x >= 0)
-            {
-                float e = MathF.Exp(-x);
-                return 1.0f / (1.0f + e);
-            }
-            float en = MathF.Exp(x);
-            return en / (1.0f + en);
-        }
+        private static float SigmoidScalar(float x) => TensorComputePrimitives.Sigmoid(x);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float SiLUScalar(float x) => x * SigmoidScalar(x);
+        private static float SiLUScalar(float x) => TensorComputePrimitives.SiLU(x);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float SoftplusScalar(float x)
-        {
-            if (x > 20f) return x;
-            if (x < -20f) return MathF.Exp(x);
-            return MathF.Log(1.0f + MathF.Exp(x));
-        }
+        private static float SoftplusScalar(float x) => TensorComputePrimitives.Softplus(x);
 
         #endregion
 

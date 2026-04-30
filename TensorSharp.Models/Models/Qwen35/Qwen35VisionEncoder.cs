@@ -12,10 +12,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
 using System.Numerics.Tensors;
-using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
-using TensorSharp.Cpu;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -586,12 +584,12 @@ namespace TensorSharp.Models
                         int d = 0;
                         for (; d <= halfDim - vLen; d += vLen)
                         {
-                            var x0 = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(head + d));
-                            var x1 = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(head1 + d));
-                            var cv = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(cosRow + d));
-                            var sv = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(sinRow + d));
-                            Unsafe.WriteUnaligned(ref *(byte*)(head + d), x0 * cv - x1 * sv);
-                            Unsafe.WriteUnaligned(ref *(byte*)(head1 + d), x0 * sv + x1 * cv);
+                            var x0 = TensorComputePrimitives.LoadVector(head + d);
+                            var x1 = TensorComputePrimitives.LoadVector(head1 + d);
+                            var cv = TensorComputePrimitives.LoadVector(cosRow + d);
+                            var sv = TensorComputePrimitives.LoadVector(sinRow + d);
+                            TensorComputePrimitives.StoreVector(head + d, x0 * cv - x1 * sv);
+                            TensorComputePrimitives.StoreVector(head1 + d, x0 * sv + x1 * cv);
                         }
                         for (; d < halfDim; d++)
                         {
@@ -655,14 +653,8 @@ namespace TensorSharp.Models
             Console.WriteLine($"] norm0={MathF.Sqrt(norm0):F4} normLast={MathF.Sqrt(normLast):F4}");
         }
 
-        private static unsafe float* GetFloatPtr(Tensor t)
-        {
-            if (t.Storage is TensorSharp.GGML.GgmlStorage gs)
-                return (float*)gs.PtrAtElement(t.StorageOffset);
-            if (t.Storage is CpuStorage cs)
-                return (float*)cs.PtrAtElement(t.StorageOffset);
-            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
-        }
+        private static unsafe float* GetFloatPtr(Tensor t) =>
+            TensorComputePrimitives.GetFloatPointer(t);
 
         private Tensor GetOrCreateTransposedWeight(string weightName)
         {
@@ -737,12 +729,12 @@ namespace TensorSharp.Models
                     int d = 0;
                     for (; d <= hiddenSize - vLen; d += vLen)
                     {
-                        var a = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(p00 + d));
-                        var b = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(p01 + d));
-                        var c = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(p10 + d));
-                        var e = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(p11 + d));
+                        var a = TensorComputePrimitives.LoadVector(p00 + d);
+                        var b = TensorComputePrimitives.LoadVector(p01 + d);
+                        var c = TensorComputePrimitives.LoadVector(p10 + d);
+                        var e = TensorComputePrimitives.LoadVector(p11 + d);
                         var r = a * v00 + b * v01 + c * v10 + e * v11;
-                        Unsafe.WriteUnaligned(ref *(byte*)(dstRow + d), r);
+                        TensorComputePrimitives.StoreVector(dstRow + d, r);
                     }
                     for (; d < hiddenSize; d++)
                         dstRow[d] = wt00 * p00[d] + wt01 * p01[d] + wt10 * p10[d] + wt11 * p11[d];

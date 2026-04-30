@@ -1548,11 +1548,11 @@ namespace TensorSharp.Models
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe Vector<float> LdVecLocal(float* p) =>
-            Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)p);
+            TensorComputePrimitives.LoadVector(p);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe void StVecLocal(float* p, Vector<float> v) =>
-            Unsafe.WriteUnaligned(ref *(byte*)p, v);
+            TensorComputePrimitives.StoreVector(p, v);
 
         /// <summary>
         /// Apply SiLU(x) = x * sigmoid(x) in place using the hardware-accelerated
@@ -1589,11 +1589,8 @@ namespace TensorSharp.Models
         /// Conv1D + SiLU + packing memcpys into one pass over the tokens.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ApplySiLUInPlaceScratch(Span<float> data, Span<float> tmp)
-        {
-            TensorPrimitives.Sigmoid(data, tmp);
-            TensorPrimitives.Multiply(data, tmp, data);
-        }
+        private static void ApplySiLUInPlaceScratch(Span<float> data, Span<float> tmp) =>
+            TensorComputePrimitives.ApplySiLUInPlace(data, tmp);
 
         /// <summary>
         /// Pointer-based wrapper used inside the per-token loop where we already have a
@@ -1621,27 +1618,10 @@ namespace TensorSharp.Models
             }
         }
 
-        private static float SigmoidScalar(float x)
-        {
-            if (x >= 0)
-            {
-                float e = MathF.Exp(-x);
-                return 1.0f / (1.0f + e);
-            }
+        private static float SigmoidScalar(float x) => TensorComputePrimitives.Sigmoid(x);
 
-            float en = MathF.Exp(x);
-            return en / (1.0f + en);
-        }
+        private static float SiLUScalar(float x) => TensorComputePrimitives.SiLU(x);
 
-        private static float SiLUScalar(float x) => x * SigmoidScalar(x);
-
-        private static float SoftplusScalar(float x)
-        {
-            if (x > 20f)
-                return x;
-            if (x < -20f)
-                return MathF.Exp(x);
-            return MathF.Log(1.0f + MathF.Exp(x));
-        }
+        private static float SoftplusScalar(float x) => TensorComputePrimitives.Softplus(x);
     }
 }

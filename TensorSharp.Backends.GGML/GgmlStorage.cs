@@ -42,7 +42,7 @@ namespace TensorSharp.GGML
             return $"GGML:{DeviceId}";
         }
 
-        public IntPtr PtrAtElement(long index)
+        public override IntPtr PtrAtElement(long index)
         {
             return new IntPtr(buffer.ToInt64() + (index * ElementType.Size()));
         }

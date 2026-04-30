@@ -36,6 +36,8 @@ namespace TensorSharp
             return GetCurrentRefCount() == 1;
         }
 
+        public abstract IntPtr PtrAtElement(long index);
+
 
         public abstract int[] GetElementsAsInt(long index, int length);
         public abstract void SetElementsAsInt(long index, int[] value);

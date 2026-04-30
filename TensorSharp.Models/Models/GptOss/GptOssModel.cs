@@ -910,8 +910,8 @@ namespace TensorSharp.Models
             int i = 0;
             for (; i <= n - vLen; i += vLen)
             {
-                var gRaw = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(gate + i));
-                var uRaw = Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)(up + i));
+                var gRaw = TensorComputePrimitives.LoadVector(gate + i);
+                var uRaw = TensorComputePrimitives.LoadVector(up + i);
 
                 var x = Vector.Min(gRaw, vLimit);
                 var y = Vector.Max(Vector.Min(uRaw, vLimit), vNegLimit);
@@ -921,7 +921,7 @@ namespace TensorSharp.Models
                 var sigmoid = vOne / (vOne + expNegAx);
                 var result = x * sigmoid * (y + vOne);
 
-                Unsafe.WriteUnaligned(ref *(byte*)(gate + i), result);
+                TensorComputePrimitives.StoreVector(gate + i, result);
             }
 
             for (; i < n; i++)

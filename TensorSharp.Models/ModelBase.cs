@@ -1009,82 +1009,27 @@ namespace TensorSharp.Models
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe Vector<float> LdVec(float* p) =>
-            Unsafe.ReadUnaligned<Vector<float>>(ref *(byte*)p);
+            TensorComputePrimitives.LoadVector(p);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe void StVec(float* p, Vector<float> v) =>
-            Unsafe.WriteUnaligned(ref *(byte*)p, v);
+            TensorComputePrimitives.StoreVector(p, v);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe float VecDot(float* a, float* b, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var acc0 = Vector<float>.Zero;
-            var acc1 = Vector<float>.Zero;
-            int i = 0;
-            for (; i <= n - vLen * 2; i += vLen * 2)
-            {
-                acc0 += LdVec(a + i) * LdVec(b + i);
-                acc1 += LdVec(a + i + vLen) * LdVec(b + i + vLen);
-            }
-            var acc = acc0 + acc1;
-            for (; i <= n - vLen; i += vLen)
-                acc += LdVec(a + i) * LdVec(b + i);
-            float sum = Vector.Sum(acc);
-            for (; i < n; i++)
-                sum += a[i] * b[i];
-            return sum;
-        }
+        protected static unsafe float VecDot(float* a, float* b, int n) =>
+            TensorComputePrimitives.Dot(a, b, n);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe float VecSumSq(float* a, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var acc0 = Vector<float>.Zero;
-            var acc1 = Vector<float>.Zero;
-            int i = 0;
-            for (; i <= n - vLen * 2; i += vLen * 2)
-            {
-                var v0 = LdVec(a + i);
-                var v1 = LdVec(a + i + vLen);
-                acc0 += v0 * v0;
-                acc1 += v1 * v1;
-            }
-            var acc = acc0 + acc1;
-            for (; i <= n - vLen; i += vLen)
-            {
-                var v = LdVec(a + i);
-                acc += v * v;
-            }
-            float sum = Vector.Sum(acc);
-            for (; i < n; i++)
-                sum += a[i] * a[i];
-            return sum;
-        }
+        protected static unsafe float VecSumSq(float* a, int n) =>
+            TensorComputePrimitives.SumSquares(a, n);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe void VecScale(float* data, float scale, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var vs = new Vector<float>(scale);
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-                StVec(data + i, LdVec(data + i) * vs);
-            for (; i < n; i++)
-                data[i] *= scale;
-        }
+        protected static unsafe void VecScale(float* data, float scale, int n) =>
+            TensorComputePrimitives.Scale(data, scale, n);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe void VecScaleAdd(float* dst, float* src, float w, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var vw = new Vector<float>(w);
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-                StVec(dst + i, LdVec(dst + i) + LdVec(src + i) * vw);
-            for (; i < n; i++)
-                dst[i] += w * src[i];
-        }
+        protected static unsafe void VecScaleAdd(float* dst, float* src, float w, int n) =>
+            TensorComputePrimitives.ScaleAdd(dst, src, w, n);
 
         /// <summary>
         /// Batched dot product: simultaneously compute four independent dot products
@@ -1096,36 +1041,8 @@ namespace TensorSharp.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected static unsafe void VecDot4(float* a0, float* a1, float* a2, float* a3,
             float* b, int n,
-            out float r0, out float r1, out float r2, out float r3)
-        {
-            int vLen = Vector<float>.Count;
-            var acc0 = Vector<float>.Zero;
-            var acc1 = Vector<float>.Zero;
-            var acc2 = Vector<float>.Zero;
-            var acc3 = Vector<float>.Zero;
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-            {
-                var vb = LdVec(b + i);
-                acc0 += LdVec(a0 + i) * vb;
-                acc1 += LdVec(a1 + i) * vb;
-                acc2 += LdVec(a2 + i) * vb;
-                acc3 += LdVec(a3 + i) * vb;
-            }
-            float s0 = Vector.Sum(acc0);
-            float s1 = Vector.Sum(acc1);
-            float s2 = Vector.Sum(acc2);
-            float s3 = Vector.Sum(acc3);
-            for (; i < n; i++)
-            {
-                float bi = b[i];
-                s0 += a0[i] * bi;
-                s1 += a1[i] * bi;
-                s2 += a2[i] * bi;
-                s3 += a3[i] * bi;
-            }
-            r0 = s0; r1 = s1; r2 = s2; r3 = s3;
-        }
+            out float r0, out float r1, out float r2, out float r3) =>
+            TensorComputePrimitives.Dot4(a0, a1, a2, a3, b, n, out r0, out r1, out r2, out r3);
 
         /// <summary>
         /// Batched scale-add: simultaneously update four destination vectors with the
@@ -1135,54 +1052,16 @@ namespace TensorSharp.Models
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected static unsafe void VecScaleAdd4(float* d0, float* d1, float* d2, float* d3,
-            float* src, float w0, float w1, float w2, float w3, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var vw0 = new Vector<float>(w0);
-            var vw1 = new Vector<float>(w1);
-            var vw2 = new Vector<float>(w2);
-            var vw3 = new Vector<float>(w3);
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-            {
-                var vs = LdVec(src + i);
-                StVec(d0 + i, LdVec(d0 + i) + vs * vw0);
-                StVec(d1 + i, LdVec(d1 + i) + vs * vw1);
-                StVec(d2 + i, LdVec(d2 + i) + vs * vw2);
-                StVec(d3 + i, LdVec(d3 + i) + vs * vw3);
-            }
-            for (; i < n; i++)
-            {
-                float s = src[i];
-                d0[i] += w0 * s;
-                d1[i] += w1 * s;
-                d2[i] += w2 * s;
-                d3[i] += w3 * s;
-            }
-        }
+            float* src, float w0, float w1, float w2, float w3, int n) =>
+            TensorComputePrimitives.ScaleAdd4(d0, d1, d2, d3, src, w0, w1, w2, w3, n);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe void VecSubScale(float* dst, float* a, float* b, float scale, int n)
-        {
-            int vLen = Vector<float>.Count;
-            var vs = new Vector<float>(scale);
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-                StVec(dst + i, (LdVec(a + i) - LdVec(b + i)) * vs);
-            for (; i < n; i++)
-                dst[i] = (a[i] - b[i]) * scale;
-        }
+        protected static unsafe void VecSubScale(float* dst, float* a, float* b, float scale, int n) =>
+            TensorComputePrimitives.SubScale(dst, a, b, scale, n);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        protected static unsafe void VecZero(float* data, int n)
-        {
-            int vLen = Vector<float>.Count;
-            int i = 0;
-            for (; i <= n - vLen; i += vLen)
-                StVec(data + i, Vector<float>.Zero);
-            for (; i < n; i++)
-                data[i] = 0;
-        }
+        protected static unsafe void VecZero(float* data, int n) =>
+            TensorComputePrimitives.Zero(data, n);
 
         #endregion
 
@@ -1836,32 +1715,14 @@ namespace TensorSharp.Models
             }
         }
 
-        protected static unsafe float* GetFloatPtr(Tensor t)
-        {
-            if (t.Storage is GgmlStorage gs)
-                return (float*)gs.PtrAtElement(t.StorageOffset);
-            if (t.Storage is CpuStorage cs)
-                return (float*)cs.PtrAtElement(t.StorageOffset);
-            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
-        }
+        protected static unsafe float* GetFloatPtr(Tensor t) =>
+            TensorComputePrimitives.GetFloatPointer(t);
 
-        private static IntPtr GetStoragePtr(Tensor t)
-        {
-            if (t.Storage is GgmlStorage gs)
-                return gs.PtrAtElement(t.StorageOffset);
-            if (t.Storage is CpuStorage cs)
-                return cs.PtrAtElement(t.StorageOffset);
-            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
-        }
+        private static IntPtr GetStoragePtr(Tensor t) =>
+            TensorComputePrimitives.GetStoragePointer(t);
 
-        private static IntPtr GetStorageBasePtr(Tensor t)
-        {
-            if (t.Storage is GgmlStorage gs)
-                return gs.PtrAtElement(0);
-            if (t.Storage is CpuStorage cs)
-                return cs.PtrAtElement(0);
-            throw new NotSupportedException("Requires GgmlStorage or CpuStorage");
-        }
+        private static IntPtr GetStorageBasePtr(Tensor t) =>
+            TensorComputePrimitives.GetStorageBasePointer(t);
 
         protected void InvalidateTensorDeviceCache(Tensor tensor)
         {
