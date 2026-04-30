@@ -8,14 +8,37 @@
 
 一个用于在本地运行大型语言模型（LLM）的 C# 推理引擎，使用 GGUF 模型文件。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 
+## 文档导航
+
+| 从这里开始 | 适合你想要... |
+|---|---|
+| [快速构建与使用](#构建) | 构建解决方案、编译原生 GGML 桥接库、运行 CLI 或 Server |
+| [支持的模型架构](#支持的模型架构) | 查看已实现的 GGUF 架构标识、多模态、思维链与工具调用能力 |
+| [计算后端](#计算后端) | 在纯 C# CPU、Direct CUDA/cuBLAS、GGML CPU、GGML Metal、GGML CUDA 之间选择 |
+| [HTTP API](#http-api) | 使用 Ollama 兼容、OpenAI 兼容或 Web UI SSE 端点 |
+| [模型架构卡片](docs/model_cards_cn.md) | 修改模型内部、优化路径、缓存布局或新增架构 |
+| [服务端 API 示例](TensorSharp.Server/API_EXAMPLES_zh-cn.md) | 复制完整的 curl 与 Python 示例 |
+| [服务端集成测试](TensorSharp.Server/testdata/README_zh-cn.md) | 针对运行中的服务验证公开 API 契约 |
+
+## 当前状态
+
+| 范围 | 状态 |
+|---|---|
+| 模型家族 | Gemma 3/4、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H、Mistral 3 |
+| 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API |
+| 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、GGML CPU、GGML Metal、GGML CUDA |
+| 多模态 | Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3 支持图像输入 |
+| 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不再扫描目录 |
+| 可观测性 | 结构化每轮日志、队列状态，以及 Web UI / Ollama / OpenAI 响应中的 KV 缓存复用指标 |
+
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5、GPT OSS、Nemotron-H、Mistral 3
-- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5 / Mistral 3）
-- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）
+- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3
+- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3）
+- **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
-- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA）；Gemma 4 在 Metal 上支持整模型融合 GPU decode 与 prefill（相对逐算子调度约提升 2.6 倍）
+- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -24,9 +47,9 @@
 - **批处理** —— 控制台应用支持 JSONL 输入，并内置用于测量 prefill / decode 吞吐的推理基准
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout），并支持中断/停止正在生成的请求
 - **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层
-- **混合注意力-递归网络** —— Qwen 3.5 在同一模型中混合全注意力层与 GatedDeltaNet 递归层
-- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5 MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
-- **批量 GPU MoE** —— Qwen 3.5 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
+- **混合注意力-递归网络** —— Qwen 3.5/3.6-family 在同一模型中混合全注意力层与 GatedDeltaNet 递归层
+- **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5/3.6-family MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
+- **批量 GPU MoE** —— Qwen 3.5/3.6-family 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5-family 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **文本/图像/音频/视频上传** —— Web 界面支持最大 500 MB 的文件上传，对超大文本会按 token 预算自动截断
 - **每轮可观测性** —— 结构化日志会完整保留用户输入与模型原始输出（包括 `<think>` 思维链和最终结果），并记录 KV 缓存命中率。同样的命中率指标通过所有 API 透出：Ollama 的 `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio`、OpenAI 的 `usage.prompt_tokens_details.cached_tokens`，以及 Web UI SSE `done` 事件中的 `promptTokens` / `kvReusedTokens` / `kvReusePercent`
@@ -38,7 +61,7 @@
 | Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 |
 | Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 |
 | Qwen 3 | `qwen3` | Qwen3-4B | 仅文本 | 支持 | 支持 |
-| Qwen 3.5 | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B（MoE） | 图像 | 支持 | 支持 |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE） | 图像 | 支持 | 支持 |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE） | 仅文本 | 支持 | 支持 |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 |
@@ -57,8 +80,8 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | Gemma 4 | gemma-4-mmproj（多模态投影器） | 包含在上述 GGUF 仓库中 |
 | Gemma 3 | gemma-3-4b-it | [google/gemma-3-4b-it-qat-q4_0-gguf](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) |
 | Qwen 3 | Qwen3-4B | [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF) |
-| Qwen 3.5 | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
-| Qwen 3.5 | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
+| Qwen 3.5 / 3.6 family | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
+| Qwen 3.5 / 3.6 family | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
 | GPT OSS | gpt-oss-20b（MoE） | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) |
 | Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
@@ -67,12 +90,13 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 
 ## 计算后端
 
-| 后端 | 参数 | 说明 |
-|---|---|---|
-| GGML Metal | `--backend ggml_metal` | 通过 Apple Metal（macOS）进行 GPU 加速。推荐用于 Apple Silicon。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
-| GGML CUDA | `--backend ggml_cuda` | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
-| GGML CPU | `--backend ggml_cpu` | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
-| 纯 C# CPU | `--backend cpu` | 无原生依赖的可移植 CPU 推理。 |
+| 后端 | 参数 | 适合场景 | 说明 |
+|---|---|---|---|
+| Direct CUDA/cuBLAS | `--backend cuda` | NVIDIA 后端实验与开发 | 通过 CUDA Driver API、cuBLAS GEMM、常用 Float32 PTX 内核，以及受支持 GGUF 量化类型的原生量化 matmul/get-rows 加速推理；未实现的算子会回退到 CPU，同时保持张量语义。 |
+| GGML Metal | `--backend ggml_metal` | Apple Silicon | 通过 Apple Metal 进行 GPU 加速。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
+| GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
+| GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
+| 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。 |
 
 ## 项目结构
 
@@ -82,6 +106,7 @@ TensorSharp/
 ├── TensorSharp.Runtime/         # GGUF、分词器、模板、采样、协议解析
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
 ├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
+├── TensorSharp.Backends.Cuda/   # Direct CUDA 后端（CUDA Driver API、cuBLAS、PTX 内核）
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps，拆分为多个专注源文件）
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
 │   ├── Program.cs               # 精简启动：DI 注册、中间件、端点映射
@@ -120,6 +145,7 @@ TensorSharp/
 | `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF 解析、分词器、Prompt 渲染、采样与输出协议解析 |
 | `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`、各模型架构、多模态编码器与模型侧执行辅助 |
 | `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML 执行后端与原生互操作 |
+| `TensorSharp.Backends.Cuda` | `TensorSharp.Backends.Cuda` | `TensorSharp.Cuda` | Direct CUDA 分配器、存储、cuBLAS GEMM、PTX 内核和量化 CUDA 算子 |
 | `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core 服务、OpenAI/Ollama 适配层、队列与 Web UI |
 | `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | 控制台宿主、调试工具与 JSONL 批处理 |
 
@@ -129,8 +155,8 @@ TensorSharp/
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具
-- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda`，还需要 NVIDIA 驱动和 CUDA Toolkit 12.x 或其他兼容版本
-- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda`，还需要 NVIDIA 驱动和 CUDA Toolkit 12.x 或其他兼容版本
+- **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
+- **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
 
 ## 构建
@@ -217,6 +243,8 @@ $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/Tens
 
 在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Windows 和 Linux 上，原生脚本会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-windows.ps1 --cuda`、`build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
 
+Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet build` 时，`TensorSharp.Backends.Cuda` 会在检测到 `nvcc` 后把 `native/kernels/*.cu` 编译到 `native/ptx/*.ptx`；如果缺少 `nvcc`，构建会继续，PTX 覆盖的算子会使用 CPU 回退。cuBLAS GEMM 仍要求运行时能够找到 CUDA 运行库。
+
 ## 使用方法
 
 ### 控制台应用
@@ -237,7 +265,7 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --backend ggml_metal -i \
     --system "你是一名简洁的助手。" --temperature 0.7 --top-p 0.9 --think
 
-# 图像推理（Gemma 3/4，Qwen 3.5）
+# 图像推理（Gemma 3/4，Qwen 3.5-family）
 ./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
 # 视频推理（Gemma 4）
@@ -296,7 +324,7 @@ cd TensorSharp.Cli/bin
 | `--audio <path>` | 音频文件（WAV、MP3、OGG）用于音频推理 |
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
-| `--backend <type>` | 计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
+| `--backend <type>` | 计算后端：`cpu`、`cuda`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
@@ -361,7 +389,7 @@ cd TensorSharp.Cli/bin
 |---|---|
 | `/info`、`/status` | 显示当前加载的模型、后端、架构、上下文/词表大小、投影器、对话深度与待发送附件 |
 | `/model <路径>` | 在当前后端上加载另一个 `.gguf` 模型（会重置会话） |
-| `/backend <名称>` | 用其他后端重新加载当前模型：`cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` |
+| `/backend <名称>` | 用其他后端重新加载当前模型：`cpu`、`cuda`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` |
 | `/mmproj <路径>` | 为当前模型加载（或替换）多模态投影器。别名：`/projector` |
 
 采样（实时生效，跨多轮持久化）：
@@ -436,7 +464,7 @@ cd TensorSharp.Server/bin
 |---|---|
 | `--model <path>` | 需要托管的 GGUF 文件（推理时必填；如未指定，服务仍可启动，但 `/api/models/load` 会报告未加载模型） |
 | `--mmproj <path>` | 多模态投影器 GGUF（仅给文件名时按模型目录解析；传 `none` 可显式禁用）。需要先指定 `--model`。 |
-| `--backend <type>` | 默认计算后端：`cpu`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
+| `--backend <type>` | 默认计算后端：`cpu`、`cuda`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
 | `--max-tokens <N>` | 当请求未携带 max-tokens 时使用的默认上限（默认：`20000`） |
 | `--temperature <f>` | 当请求未提供时使用的默认采样温度（`0` = 贪心） |
 | `--top-k <N>` | 当请求未提供时使用的默认 Top-K 过滤（`0` = 关闭） |
@@ -457,7 +485,7 @@ cd TensorSharp.Server/bin
 
 | 变量 | 说明 |
 |---|---|
-| `BACKEND` | 未传 `--backend` 时使用的默认计算后端（默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
+| `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 当 `--max-tokens` 与请求级上限均未指定时使用的默认生成长度（默认：`20000`） |
 | `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
 | `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
@@ -608,9 +636,9 @@ curl http://localhost:5000/api/queue/status
 
 ## 思维链 / 推理模式
 
-支持思维链模式的模型（Qwen 3、Qwen 3.5、Gemma 4、GPT OSS、Nemotron-H）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
+支持思维链模式的模型（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
 
-- **Qwen 3 / Qwen 3.5 / Nemotron-H：** 使用 `<think>...</think>` 标签
+- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H：** 使用 `<think>...</think>` 标签
 - **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签
 - **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复
 
@@ -622,7 +650,7 @@ curl http://localhost:5000/api/queue/status
 
 各架构使用各自的工具调用格式：
 
-- **Qwen 3 / Qwen 3.5 / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4：** `<|tool_call>call:function_name{args}<tool_call|>`
 
 输出解析器（`OutputParser.cs`）会自动从模型原始输出中提取工具调用，与架构无关。
@@ -641,9 +669,9 @@ Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`ge
 
 Gemma 3 支持 PNG、JPEG 与 HEIC/HEIF 图像输入。将其多模态投影器（`mmproj-gemma3-4b-f16.gguf`）放在模型文件相同目录即可自动加载。
 
-### Qwen 3.5
+### Qwen 3.5 / 3.6 family
 
-所有 Qwen 3.5 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用同一个 `Qwen35Model` 实现。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；将投影器（`Qwen3.5-mmproj-F16.gguf`）放到模型 GGUF 同一目录下即可自动加载。MoE 变体（例如 Qwen3.5-35B-A3B）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
+所有 Qwen 3.5/3.6-family 变体（`qwen35`、`qwen35moe` 与 `qwen3next`）共用同一个 `Qwen35Model` 实现。图像输入通过支持动态分辨率的 `Qwen35VisionEncoder` 处理；将投影器（`Qwen3.5-mmproj-F16.gguf`）放到模型 GGUF 同一目录下即可自动加载。MoE 变体（例如 Qwen3.5-35B-A3B，以及使用同一架构标识的 Qwen3.6-35B-A3B GGUF）在 decode 时还会启用融合的 `MoEExpertsSwiGLUResidual` GGML 内核，将所有被选中的专家、可选的 shared expert 与残差加法合并到一次 GPU 计算图调度中执行。
 
 ### Mistral 3
 
@@ -663,9 +691,11 @@ TensorSharp 采用分层系统结构：
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。操作包括原生量化 matmul（Q4_K_M、Q8_0 等），无需反量化到 FP32。
 
-5. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理和 FIFO 推理队列。
+5. **TensorSharp.Backends.Cuda** 是 Direct CUDA 路径。它使用 CUDA Driver API 管理设备、上下文与存储，用 cuBLAS 执行 Float32 GEMM，用 PTX 内核覆盖热点标量与 Transformer 辅助算子，并对尚未实现的原生内核使用 CPU 回退。
 
-6. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查和 JSONL 批处理。
+6. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理和 FIFO 推理队列。
+
+7. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查和 JSONL 批处理。
 
 ### 性能优化
 
@@ -673,26 +703,27 @@ TensorSharp 采用分层系统结构：
 - **融合 GPU prefill**（Gemma 4）：对于密集（非 MoE、非 KV 共享、无 PLE/多模态）层，`Gemma4LayerPrefill` 将整个 Transformer 块（RMSNorm + QKV + QK-norm + RoPE + 注意力 + 输出投影 + post-attn norm + GeGLU FFN + post-FFN norm + 残差 + 层缩放因子）合并为 prefill 期间每层一次的 GGML 计算图调度，将融合方法从单 token decode 扩展到多 token prefill。
 - **分块 prefill**（Gemma 4）：长提示被拆分为有界的分块（2 倍滑动窗口，最大 2048 tokens），以避免 SWA 层上 O(n²) 的注意力分数张量。分块在纯文本（无多模态嵌入）时自动应用，确保每个分块在 SWA 窗口预算内。
 - **整模型原生 decode**（Qwen 3）：所有 Transformer 层在一次原生调用（`TransformerModelDecode`）中完成，每层权重指针在加载阶段预解析并缓存，从 decode 热点路径中移除托管循环开销。
-- **融合 Qwen 3.5 attention 层 decode**：单次 GGML 计算图为每个 FullAttention 层完成 RMSNorm + 融合 QKV + Q/gate 反交错 + 每头 QK norm + RoPE + KV 缓存追加 + flash attention + sigmoid 门控混合 + 输出投影 + 残差加法。替换了原本每层 ~2 次独立 GGML 调用与 ~6 个小型 CPU/GPU 同步点。当缓存序列长度超过 4096 token 时启用（可通过 `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖）。
-- **融合 prefill 注意力**（Qwen 3.5）：`FusedPrefillAttention` 将 Q*K^T、因果掩码、softmax 和 *V 合并为 prefill 期间每个注意力层一次的 GGML 计算图调度，消除了每个注意力层约 5 次独立的 C# 到 GGML 往返。同时支持初始 prefill 和带有已有 KV 缓存条目的续接。
-- **融合输出投影 + FFN**（Qwen 3.5）：对于 FullAttention 和 GatedDeltaNet 中的 dense FFN 层，`FusedOutProjFFN` 将输出投影、残差加法、post-attention RMSNorm 以及完整的 SwiGLU FFN（gate_up matmul + SiLU + down matmul + 残差加法）合并为单次 GGML 计算图调度，将每层 2 次 GPU 往返减少为 1 次。
-- **融合输出投影 + 归一化 + 路由器**（Qwen 3.5 MoE）：`FusedOutProjNormRouter` 将 GatedDeltaNet 输出投影、残差加法、post-attention RMSNorm 和 MoE 路由器投影合并为一次调度。预计算的路由器 logits 随后由批量 MoE 内核直接消费，消除了每个 MoE 层的独立路由器调度。
-- **融合视觉编码器**（Qwen 3.5）：`FusedVisionAttention` 将 LayerNorm + QKV + 偏置 + 2D RoPE + 缩放点积注意力 + 输出投影 + 偏置 + 残差合并为一次 GGML 计算图调度（~8 个算子 → 1）。`FusedVisionMLP` 将 LayerNorm + up + 偏置 + GELU + down + 偏置 + 残差合并为一次调度（7 个算子 → 1）。两者结合将每个编码器块的 GPU 往返从约 15 次减少到 2 次。
+- **融合 Qwen 3.5/3.6-family attention 层 decode**：单次 GGML 计算图为每个 FullAttention 层完成 RMSNorm + 融合 QKV + Q/gate 反交错 + 每头 QK norm + RoPE + KV 缓存追加 + flash attention + sigmoid 门控混合 + 输出投影 + 残差加法。替换了原本每层 ~2 次独立 GGML 调用与 ~6 个小型 CPU/GPU 同步点。当缓存序列长度超过 4096 token 时启用（可通过 `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖）。
+- **融合 prefill 注意力**（Qwen 3.5/3.6-family）：`FusedPrefillAttention` 将 Q*K^T、因果掩码、softmax 和 *V 合并为 prefill 期间每个注意力层一次的 GGML 计算图调度，消除了每个注意力层约 5 次独立的 C# 到 GGML 往返。同时支持初始 prefill 和带有已有 KV 缓存条目的续接。
+- **融合输出投影 + FFN**（Qwen 3.5/3.6-family）：对于 FullAttention 和 GatedDeltaNet 中的 dense FFN 层，`FusedOutProjFFN` 将输出投影、残差加法、post-attention RMSNorm 以及完整的 SwiGLU FFN（gate_up matmul + SiLU + down matmul + 残差加法）合并为单次 GGML 计算图调度，将每层 2 次 GPU 往返减少为 1 次。
+- **融合输出投影 + 归一化 + 路由器**（Qwen 3.5/3.6-family MoE）：`FusedOutProjNormRouter` 将 GatedDeltaNet 输出投影、残差加法、post-attention RMSNorm 和 MoE 路由器投影合并为一次调度。预计算的路由器 logits 随后由批量 MoE 内核直接消费，消除了每个 MoE 层的独立路由器调度。
+- **融合视觉编码器**（Qwen 3.5/3.6-family）：`FusedVisionAttention` 将 LayerNorm + QKV + 偏置 + 2D RoPE + 缩放点积注意力 + 输出投影 + 偏置 + 残差合并为一次 GGML 计算图调度（~8 个算子 → 1）。`FusedVisionMLP` 将 LayerNorm + up + 偏置 + GELU + down + 偏置 + 残差合并为一次调度（7 个算子 → 1）。两者结合将每个编码器块的 GPU 往返从约 15 次减少到 2 次。
 - **融合权重投影**：Q/K/V 投影融合为单次 QKV matmul；gate 与 up 投影融合为单次 gate_up matmul。
 - **原生量化计算**：量化权重（Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4 等）直接参与 matmul，无需展开为 FP32，节省内存与带宽。批量 `AddmmQuantBatch` 内核可在一次调度内完成对同一量化权重块的多个子矩阵 matmul。
-- **批量 GPU MoE**：`MoEExpertsSwiGLUResidual`（Qwen 3.5）和 `MoEExpertsForward`（Nemotron-H）将每个 MoE 层中所有被选中的专家——以及 Qwen 3.5 中可选的 shared expert 与残差加法——合并为一次 GGML 计算图调度。
-- **基于 GEMM 的视觉 patch embedding**（Qwen 3.5）：将 patch embedding 重构为并行 im2col + 矩阵乘法，把单线程标量五重嵌套循环替换为可在 GPU 上加速的 matmul。
-- **并行化 Q/gate 反交错**（Qwen 3.5）：FullAttention prefill 中的 Q + sigmoid-gate 反交错按 token 并行化，长 prompt 时可随 CPU 核心数线性扩展。
+- **Direct CUDA 内核**：`cuda` 后端加速 fill/copy、unary ops、融合激活、RMSNorm、softmax、index select、因果掩码、RoPE/RoPEEx、cuBLAS GEMM，以及受支持的量化 matmul/get-rows；未覆盖算子会安全回退。
+- **批量 GPU MoE**：`MoEExpertsSwiGLUResidual`（Qwen 3.5/3.6-family）和 `MoEExpertsForward`（Nemotron-H）将每个 MoE 层中所有被选中的专家——以及 Qwen 3.5/3.6-family 中可选的 shared expert 与残差加法——合并为一次 GGML 计算图调度。
+- **基于 GEMM 的视觉 patch embedding**（Qwen 3.5/3.6-family）：将 patch embedding 重构为并行 im2col + 矩阵乘法，把单线程标量五重嵌套循环替换为可在 GPU 上加速的 matmul。
+- **并行化 Q/gate 反交错**（Qwen 3.5/3.6-family）：FullAttention prefill 中的 Q + sigmoid-gate 反交错按 token 并行化，长 prompt 时可随 CPU 核心数线性扩展。
 - **优化后的纯 C# CPU 路径**：托管 GEMM 快速路径和连续 Float32 内核加速了 decode、softmax、RMSNorm、RoPE、融合激活等热点路径，同时在 CPU 加载时保持量化 GGUF 权重压缩状态。
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
 - **KV 缓存前缀复用**：多轮对话会复用各轮之间最长的匹配 token 前缀。对 SWA 模型，截断会自动按滑动窗口大小回退，使后缀部分可以重建 SWA 上下文。
 - **内核预热**：CLI 和 Server 在启动时运行一次微型前向传播，以预编译 GPU 内核（Metal pipeline state、CUDA JIT）并预热内存池，避免首次推理请求的冷启动延迟。
-- **Prefill 缓存**（Gemma 4、Qwen 3.5）：逐 forward 传播的 SWA 掩码缓存（Gemma 4）、跨全局层的 NeoX RoPE cos/sin 查找表缓存（Gemma 4）、以及跨层的 RoPE 位置张量缓存（Gemma 4、Qwen 3.5），消除了 prefill 期间的冗余重复计算。
-- **原地 QK RMSNorm**（Qwen 3.5）：逐头 QK 归一化通过 `View` 原地执行，避免了每层每个 Q/K 的一次张量分配与拷贝。
+- **Prefill 缓存**（Gemma 4、Qwen 3.5/3.6-family）：逐 forward 传播的 SWA 掩码缓存（Gemma 4）、跨全局层的 NeoX RoPE cos/sin 查找表缓存（Gemma 4）、以及跨层的 RoPE 位置张量缓存（Gemma 4、Qwen 3.5/3.6-family），消除了 prefill 期间的冗余重复计算。
+- **原地 QK RMSNorm**（Qwen 3.5/3.6-family）：逐头 QK 归一化通过 `View` 原地执行，避免了每层每个 Q/K 的一次张量分配与拷贝。
 
 ### 内存优化
 
-- **零拷贝文件映射量化权重**（CUDA、Metal、GGML CPU）：GGUF 模型文件以内存映射方式打开，量化张量通过 host 指针缓冲区直接绑定到原生算子。这样省去了之前每张张量从磁盘复制到新分配原生堆缓冲区的过程——这一过程在 Apple Silicon 上会让大型量化模型的常驻内存几乎翻倍。例如，`Qwen3.5-35B-A3B-IQ2_XXS`（约 10 GB GGUF）在 Metal 后端的实际工作内存峰值从约 17 GB 降至约 7 GB。映射文件由操作系统的页缓存管理，必要时可换出，且在 Apple Silicon（统一内存）上不会带来推理性能损失。
+- **零拷贝文件映射量化权重**（Direct CUDA、GGML CUDA、GGML Metal、GGML CPU）：GGUF 模型文件以内存映射方式打开，量化张量通过 host 指针缓冲区直接绑定到原生算子。这样省去了之前每张张量从磁盘复制到新分配原生堆缓冲区的过程——这一过程在 Apple Silicon 上会让大型量化模型的常驻内存几乎翻倍。例如，`Qwen3.5-35B-A3B-IQ2_XXS`（约 10 GB GGUF）在 Metal 后端的实际工作内存峰值从约 17 GB 降至约 7 GB。映射文件由操作系统的页缓存管理，必要时可换出，且在 Apple Silicon（统一内存）上不会带来推理性能损失。
 - **最佳匹配内存池**：GGML 主机分配器使用 best-fit 而非 first-fit 在已池化块中检索可重用空间，避免把大块草稿内存交给小型中间张量请求，从而把工作集严格控制在合理范围内。
 - **有界池保留量**：集成 GPU / CPU 内存池现在将单个保留块上限设为 64 MB，整池上限设为 32 块。结合 mmap 后的权重，可在快速复用短生命中间张量的同时限制峰值常驻内存。
 - **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管分配。F32 权重与 norm 仍按需加载；量化权重在受支持的后端上通过 mmap 方式绑定。
@@ -721,7 +752,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史与 KV 缓存联动、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现等。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史与 KV 缓存联动、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现等。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

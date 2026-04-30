@@ -6,6 +6,28 @@ TensorSharp supports seven model architectures. This document is a developer ref
 
 All model classes live under `TensorSharp.Models/Models/<Name>/` and inherit from `ModelBase` (in `TensorSharp.Models/ModelBase.cs`). `ModelBase` provides shared primitives: GGUF loading, weight storage (`_weights` for F32, `_quantWeights` for quantized), KV cache helpers, embedding lookup, RMSNorm, linear forward, RoPE utilities, timing instrumentation, and the `Forward(int[] tokens) → float[]` interface.
 
+## Implementation Matrix
+
+| Architecture | Model class | GGUF keys | Modalities | Reasoning | Tools | Notable acceleration |
+|---|---|---|---|---|---|---|
+| Gemma 3 | `Gemma3Model` | `gemma3` | Text, image | No | No | SWA/global attention, quantized weight loading |
+| Gemma 4 | `Gemma4Model` | `gemma4` | Text, image, video, audio | Yes | Yes | Fused GGML decode/prefill for eligible dense layers, circular SWA KV cache |
+| Qwen 3 | `Qwen3Model` | `qwen3` | Text | Yes | Yes | Native whole-model decode path |
+| Qwen 3.5 / 3.6 family | `Qwen35Model` | `qwen35`, `qwen35moe`, `qwen3next` | Text, image | Yes | Yes | Hybrid attention/recurrent execution, fused attention, fused prefill attention, batched MoE |
+| GPT OSS | `GptOssModel` | `gptoss`, `gpt-oss` | Text | Yes | No | Harmony output parsing, MoE FFN support |
+| Nemotron-H | `NemotronModel` | `nemotron_h`, `nemotron_h_moe` | Text | Yes | Yes | Mamba2 + attention hybrid cache, batched MoE |
+| Mistral 3 | `Mistral3Model` | `mistral3` | Text, image | No | No | Pixtral vision encoder and YaRN attention helpers |
+
+## Backend Notes
+
+Model code is backend-agnostic where possible. `ModelBase` chooses tensor storage through `BackendType` and the execution plan, then delegates operations to the registered backend implementation:
+
+| Backend type | Package | Notes |
+|---|---|---|
+| `Cpu` | `TensorSharp.Core` | Pure managed tensors and SIMD/managed quantized fast paths |
+| `Cuda` | `TensorSharp.Backends.Cuda` | Direct CUDA allocator/storage, cuBLAS GEMM, PTX kernels, supported quantized CUDA matmul/get-rows, CPU fallback for incomplete ops |
+| `GgmlCpu` / `GgmlMetal` / `GgmlCuda` | `TensorSharp.Backends.GGML` + `TensorSharp.GGML.Native` | Native ggml bridge with quantized graph dispatch and platform backends |
+
 ---
 
 ## Gemma 3
@@ -312,14 +334,14 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 ---
 
-## Qwen 3.5
+## Qwen 3.5 / 3.6 Family
 
 | Property | Value |
 |---|---|
 | Source file | `TensorSharp.Models/Models/Qwen35/Qwen35Model.cs` |
 | Provider | Alibaba |
 | GGUF architecture key | `qwen35`, `qwen35moe`, `qwen3next` |
-| Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-32B, Qwen3.5-35B-A3B (MoE) |
+| Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-32B, Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family GGUFs) |
 | Modalities | Text, Image |
 | Thinking mode | Yes (`<think>`) |
 | Tool calling | Yes (`<tool_call>`) |
@@ -327,7 +349,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 ### Architecture Overview
 
-Qwen 3.5 is a hybrid model mixing full-attention and GatedDeltaNet recurrent layers, with optional Mixture-of-Experts FFN. All variants (`qwen35`, `qwen35moe`, `qwen3next`) load through the same `Qwen35Model` implementation; the MoE variants additionally enable a fused expert kernel.
+Qwen 3.5 / 3.6-family GGUFs are hybrid models mixing full-attention and GatedDeltaNet recurrent layers, with optional Mixture-of-Experts FFN. All variants (`qwen35`, `qwen35moe`, `qwen3next`) load through the same `Qwen35Model` implementation; the MoE variants additionally enable a fused expert kernel.
 
 - **Layer type**: `_isRecurrent[layer]` is true when `(layer + 1) % _fullAttentionInterval != 0` (default interval 4). For 48 layers with interval 4: 36 recurrent + 12 attention.
 - **Full attention layers**: same as Qwen 3 but with **gated Q** — the Q projection outputs `2 * numHeads * headDim`. The output is deinterleaved: first half is Q, second half is a sigmoid gate. Attention output is multiplied by `sigmoid(gate)` via `Ops.SigmoidMul`.
@@ -449,7 +471,7 @@ For GatedDeltaNet layers followed by MoE FFN during decode, `FusedOutProjNormRou
 
 ### Fused Vision Encoder Blocks
 
-The Qwen 3.5 vision encoder (`Qwen35VisionEncoder`) now uses two fused GPU kernels per encoder block when running on a GGML backend:
+The Qwen 3.5/3.6-family vision encoder (`Qwen35VisionEncoder`) now uses two fused GPU kernels per encoder block when running on a GGML backend:
 
 - **`FusedVisionAttention`**: merges LayerNorm + QKV projection + bias + 2D RoPE + scaled dot-product attention + output projection + bias + residual into one GGML graph dispatch (~8 separate operations → 1).
 - **`FusedVisionMLP`**: merges LayerNorm + up projection + bias + GELU activation + down projection + bias + residual into one GGML graph dispatch (7 separate operations → 1).
@@ -486,7 +508,7 @@ The Q + sigmoid-gate deinterleave in `FullAttention` prefill is now parallelized
 
 ### File-Mapped Quantized Weights
 
-When the backend supports it (Apple Silicon Metal, GGML CPU, integrated GPUs) the loader avoids copying quantized tensors into a fresh native heap buffer and instead binds the GGUF file directly via `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`. Combined with GGML's host-pointer buffer mapping this lets Metal command buffers read the weights straight from the OS page cache. The peak resident set for `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) drops from ~17 GB to ~7 GB on M-series Macs without any per-token copy.
+When the backend supports it (direct CUDA, GGML CUDA, Apple Silicon Metal, GGML CPU, integrated GPUs) the loader avoids copying quantized tensors into a fresh native heap buffer and instead binds the GGUF file directly via `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`. Combined with GGML's host-pointer buffer mapping this lets Metal command buffers read the weights straight from the OS page cache. The peak resident set for `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) drops from ~17 GB to ~7 GB on M-series Macs without any per-token copy.
 
 ### Optimization Opportunities
 
@@ -844,7 +866,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 
 ## Architecture Comparison
 
-| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 | GPT OSS | Nemotron-H | Mistral 3 |
+| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5/3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
 |---|---|---|---|---|---|---|---|
 | Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
 | Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Gated | Full + Sinks | Full GQA (no RoPE) | Full GQA |
@@ -868,7 +890,7 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 | Thinking | No | Yes | Yes | Yes | Yes (always) | Yes | No |
 | Tool calling | No | Yes | Yes | Yes | No | Yes | No |
 | Fused QKV | No | Yes | Yes | No (split Q/K/V or recurrent QKV) | No | Yes | Yes |
-| Fused GPU decode | No | Yes (Metal) | No | No | No | No | No |
+| Fused GPU decode | No | Yes (GGML Metal) | No | No | No | No | No |
 | Fused GPU prefill | No | Yes (dense layers) | No | No | No | No | No |
 | Fused prefill attention | No | No | No | Yes | No | No | No |
 | Native model decode | No | No | Yes | No | No | No | No |
@@ -889,4 +911,5 @@ hidden → RMSNorm(output_norm) → narrow to last token → LM head → logits
 5. Register in `ModelBase.Create()` switch expression (in `ModelBase.cs`).
 6. Add an `IOutputParser` implementation in `OutputParser.cs` if the model uses a non-standard output format. Register in `OutputParserFactory.Create()`. Set `AlwaysRequired = true` if the model always wraps output in structural tags.
 7. Add chat template support in `ChatTemplate.cs` / `Jinja2Template.cs` if the model uses a novel template format.
+8. Update the root README, this model-card file, API examples, and integration-test capability gates when the new model changes public support for modalities, thinking, tools, or backend behavior.
 

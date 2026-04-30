@@ -3,6 +3,7 @@
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
 TensorSharp.Server provides three API styles plus a few utility endpoints:
+
 - **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/models`)
 - **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`)
@@ -10,11 +11,28 @@ TensorSharp.Server provides three API styles plus a few utility endpoints:
 
 Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The Web UI and compatibility endpoints expose only that hosted model; `/api/models/load` can reload it, but it does not switch to arbitrary files at runtime.
 
+## Current Contract
+
+| Area | Contract |
+|---|---|
+| Hosted models | One GGUF file, selected with `--model`; requests must name that hosted file or its basename |
+| Projectors | Optional single projector, selected with `--mmproj`; used for multimodal-capable models |
+| Backends | `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`; `/api/models` reports which are available on the host |
+| Concurrency | FIFO queue with queue-position events/chunks while a request waits |
+| Sessions | Web UI uses per-tab sessions; Ollama/OpenAI compatibility endpoints share the default session |
+| Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `json_schema` cannot be combined with `think` or `tools` |
+
 ## Starting the Server
 
 ```bash
 # Text-only model
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal
+
+# Windows/Linux + NVIDIA, direct CUDA/cuBLAS backend
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend cuda
+
+# Windows/Linux + NVIDIA, GGML CUDA backend
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_cuda
 
 # Multimodal model (explicit projector)
 ./TensorSharp.Server --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
@@ -25,6 +43,16 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 ```
 
 The server starts on `http://localhost:5000` (override with the standard ASP.NET Core `PORT` / `ASPNETCORE_URLS` environment variables).
+
+Backend quick reference:
+
+| Value | Meaning |
+|---|---|
+| `cpu` | Pure C# CPU backend |
+| `cuda` | Direct CUDA backend using CUDA Driver API, cuBLAS, PTX kernels, and CPU fallbacks |
+| `ggml_cpu` | Native GGML CPU backend |
+| `ggml_metal` | GGML Metal backend for macOS |
+| `ggml_cuda` | GGML CUDA backend for NVIDIA GPUs |
 
 ---
 
@@ -224,7 +252,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### Chat with Thinking / Reasoning Mode
 
-Thinking-capable architectures (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H) accept `"think": true` and split chain-of-thought from the visible response:
+Thinking-capable architectures (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H) accept `"think": true` and split chain-of-thought from the visible response:
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -558,7 +586,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs.
 
 ---
 

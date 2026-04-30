@@ -8,14 +8,37 @@
 
 A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
+## Documentation Map
+
+| Start here | Use this when you want to... |
+|---|---|
+| [Quick build and usage](#building) | Build the solution, compile the native GGML bridge, and run the CLI or server |
+| [Supported model architectures](#supported-model-architectures) | Check which GGUF architecture keys, modalities, thinking mode, and tool calling paths are implemented |
+| [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, GGML CPU, GGML Metal, and GGML CUDA |
+| [HTTP APIs](#http-apis) | Use the Ollama-compatible, OpenAI-compatible, or Web UI SSE endpoints |
+| [Model architecture cards](docs/model_cards.md) | Work on model internals, optimizer paths, cache layout, or a new architecture |
+| [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Copy complete curl and Python examples for the server surface |
+| [Server integration tests](TensorSharp.Server/testdata/README.md) | Exercise the public API contract against a running server |
+
+## Current Status
+
+| Area | Status |
+|---|---|
+| Model families | Gemma 3/4, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H, and Mistral 3 |
+| Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API |
+| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), GGML CPU, GGML Metal, GGML CUDA |
+| Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, and Mistral 3 image input |
+| Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning |
+| Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes |
+
 ## Features
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5, GPT OSS, Nemotron-H, Mistral 3
-- **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5 / Mistral 3
-- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H)
+- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3
+- **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3
+- **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
-- **GPU-accelerated** -- GGML Metal on macOS and GGML CUDA on Windows/Linux with NVIDIA GPUs, with fused whole-model GPU dispatch for Gemma 4 decode and prefill on Metal (~2.6x speedup over per-op dispatch)
+- **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, and a direct CUDA/cuBLAS backend with PTX kernels plus CPU fallbacks for unsupported ops
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
@@ -24,9 +47,9 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Batch processing** -- JSONL input support in the console application, plus a built-in inference benchmark for prefill/decode throughput
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
 - **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model
-- **Hybrid Attention-Recurrent** -- Qwen 3.5 mixes full-attention layers with GatedDeltaNet recurrent layers
-- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5 MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
-- **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5 and Nemotron-H decode, eliminating per-expert round-trips
+- **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers
+- **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5/3.6-family MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
+- **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5/3.6-family and Nemotron-H decode, eliminating per-expert round-trips
 - **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
 - **Text/Image/Audio/Video uploads** -- the web UI accepts file uploads up to 500 MB, with automatic token-budget-aware truncation for large text files
 - **Per-turn observability** -- structured logs capture the full user input and the full raw assistant output (both `<think>` reasoning and the final result) plus the KV cache hit ratio. The same cache-hit stats are surfaced through every API: `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio` (Ollama), `usage.prompt_tokens_details.cached_tokens` (OpenAI), and `promptTokens` / `kvReusedTokens` / `kvReusePercent` in the Web UI SSE `done` event
@@ -38,7 +61,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
 | Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No |
 | Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes |
-| Qwen 3.5 | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B (MoE) | Image | Yes | Yes |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes | No |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE) | Text only | Yes | Yes |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No |
@@ -57,8 +80,8 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 | Gemma 4 | gemma-4-mmproj (multimodal projector) | Included in the GGUF repos above |
 | Gemma 3 | gemma-3-4b-it | [google/gemma-3-4b-it-qat-q4_0-gguf](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) |
 | Qwen 3 | Qwen3-4B | [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF) |
-| Qwen 3.5 | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
-| Qwen 3.5 | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
+| Qwen 3.5 / 3.6 family | Qwen3.5-9B | [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) |
+| Qwen 3.5 / 3.6 family | Qwen3.5-35B-A3B | [ggml-org/Qwen3.5-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF) |
 | GPT OSS | gpt-oss-20b (MoE) | [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) |
 | Nemotron-H | Nemotron-H-8B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) |
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
@@ -67,12 +90,13 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 
 ## Compute Backends
 
-| Backend | Flag | Description |
-|---|---|---|
-| GGML Metal | `--backend ggml_metal` | GPU-accelerated via Apple Metal (macOS). Recommended for Apple Silicon. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
-| GGML CUDA | `--backend ggml_cuda` | GPU-accelerated via GGML CUDA on Windows or Linux with an NVIDIA GPU. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
-| GGML CPU | `--backend ggml_cpu` | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
-| Pure C# CPU | `--backend cpu` | Portable CPU inference with no native dependencies. |
+| Backend | Flag | Best fit | Description |
+|---|---|---|---|
+| Direct CUDA/cuBLAS | `--backend cuda` | NVIDIA experimentation and backend development | Uses the CUDA Driver API, cuBLAS GEMM, PTX kernels for common float32 ops, and native quantized matmul/get-rows for supported GGUF quant types. Unsupported ops route through CPU fallbacks while preserving tensor semantics. |
+| GGML Metal | `--backend ggml_metal` | Apple Silicon | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
+| GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
+| GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
+| Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. |
 
 ## Project Structure
 
@@ -82,6 +106,7 @@ TensorSharp/
 ├── TensorSharp.Runtime/         # GGUF, tokenizers, templates, sampling, protocol parsing
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/CPU via native library)
+├── TensorSharp.Backends.Cuda/   # Direct CUDA backend using CUDA Driver API, cuBLAS, and PTX kernels
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps, split into focused source files)
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
 │   ├── Program.cs               # Slim bootstrap: DI wiring, middleware, endpoint mapping
@@ -120,6 +145,7 @@ The repository is now split along package boundaries so consumers can depend on 
 | `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF parsing, tokenizers, prompt rendering, sampling, and output protocol parsing |
 | `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`, architecture implementations, multimodal encoders, and model-side execution helpers |
 | `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML-backed execution and native interop |
+| `TensorSharp.Backends.Cuda` | `TensorSharp.Backends.Cuda` | `TensorSharp.Cuda` | Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, and quantized CUDA ops |
 | `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core server, OpenAI/Ollama adapters, queueing, and web UI |
 | `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | Console host and debugging / batch tooling |
 
@@ -129,8 +155,8 @@ This split keeps engine users off the web stack, keeps API-layer changes from le
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library
-- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit
-- **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit
+- **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
+- **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
 
 ## Building
@@ -217,6 +243,8 @@ $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/Tens
 
 On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Windows and Linux, the native scripts preserve an existing CUDA-enabled build and auto-enable GGML_CUDA when a CUDA toolchain is detected; `build-windows.ps1 --cuda`, `build-linux.sh --cuda`, and `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` force CUDA explicitly. The build output is automatically copied to the application's output directory.
 
+The direct `cuda` backend is built as managed C# plus PTX kernels. During `dotnet build`, `TensorSharp.Backends.Cuda` compiles `native/kernels/*.cu` to `native/ptx/*.ptx` when `nvcc` is available; if `nvcc` is missing, the build continues and PTX-backed ops use CPU fallbacks. cuBLAS-backed GEMM still requires the CUDA runtime libraries to be discoverable at run time.
+
 ## Usage
 
 ### Console Application
@@ -237,7 +265,7 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <model.gguf> --backend ggml_metal -i \
     --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think
 
-# Image inference (Gemma 3/4, Qwen 3.5)
+# Image inference (Gemma 3/4, Qwen 3.5-family)
 ./TensorSharp.Cli --model <model.gguf> --image photo.png --backend ggml_metal
 
 # Video inference (Gemma 4)
@@ -296,7 +324,7 @@ cd TensorSharp.Cli/bin
 | `--audio <path>` | Audio file (WAV, MP3, OGG) for audio inference |
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--backend <type>` | Compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Compute backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
@@ -361,7 +389,7 @@ Model and runtime:
 |---|---|
 | `/info`, `/status` | Show the loaded model, backend, architecture, context/vocab size, projector, conversation depth, and pending attachments |
 | `/model <path>` | Load a different `.gguf` model on the current backend (resets the session) |
-| `/backend <name>` | Reload the current model on a different backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector` |
 
 Sampling (live, persists across turns):
@@ -437,7 +465,7 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 |---|---|
 | `--model <path>` | GGUF file to host (required for inference; if omitted, the server starts but `/api/models/load` will report no hosted model) |
 | `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
-| `--backend <type>` | Default compute backend: `cpu`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
 | `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
 | `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
@@ -458,7 +486,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 
 | Variable | Description |
 |---|---|
-| `BACKEND` | Default compute backend, used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `BACKEND` | Default compute backend (`cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
@@ -614,9 +642,9 @@ curl http://localhost:5000/api/queue/status
 
 ## Thinking / Reasoning Mode
 
-Models that support thinking mode (Qwen 3, Qwen 3.5, Gemma 4, GPT OSS, Nemotron-H) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
+Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H) can produce structured chain-of-thought reasoning before generating the final answer. The thinking content is separated from the main response and can be displayed or hidden by the client.
 
-- **Qwen 3 / Qwen 3.5 / Nemotron-H:** uses `<think>...</think>` tags
+- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** uses `<think>...</think>` tags
 - **Gemma 4:** uses `<|channel>thought\n...<channel|>` tags
 - **GPT OSS:** uses Harmony format with `<|channel|>analysis` for thinking and `<|channel|>final` for the response
 
@@ -628,7 +656,7 @@ Models can invoke user-defined tools and participate in multi-turn tool-call con
 
 Each architecture uses its own wire format for tool calls:
 
-- **Qwen 3 / Qwen 3.5 / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+- **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
 
 The output parser (`OutputParser.cs`) automatically extracts tool calls from the model's raw output regardless of architecture.
@@ -647,9 +675,9 @@ Gemma 4 models support image, video, and audio inputs. Place the multimodal proj
 
 Gemma 3 supports PNG, JPEG, and HEIC/HEIF image inputs. Place its multimodal projector (`mmproj-gemma3-4b-f16.gguf`) next to the model file for automatic loading.
 
-### Qwen 3.5
+### Qwen 3.5 / 3.6 family
 
-All Qwen 3.5 variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the same `Qwen35Model` implementation. Image inputs are supported via the dynamic-resolution `Qwen35VisionEncoder`; place the projector (`Qwen3.5-mmproj-F16.gguf`) next to the model GGUF for automatic loading. The MoE variants (e.g. Qwen3.5-35B-A3B) additionally enable a fused `MoEExpertsSwiGLUResidual` GGML kernel during decode that runs all selected experts, the optional shared expert, and the residual add in a single GPU graph dispatch.
+All Qwen 3.5/3.6-family variants (`qwen35`, `qwen35moe`, and `qwen3next`) load through the same `Qwen35Model` implementation. Image inputs are supported via the dynamic-resolution `Qwen35VisionEncoder`; place the projector (`Qwen3.5-mmproj-F16.gguf`) next to the model GGUF for automatic loading. The MoE variants (e.g. Qwen3.5-35B-A3B and Qwen3.6-35B-A3B GGUFs that report the same architecture keys) additionally enable a fused `MoEExpertsSwiGLUResidual` GGML kernel during decode that runs all selected experts, the optional shared expert, and the residual add in a single GPU graph dispatch.
 
 ### Mistral 3
 
@@ -669,9 +697,11 @@ TensorSharp is structured as a layered system:
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
 
-5. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, and the FIFO inference queue.
+5. **TensorSharp.Backends.Cuda** is the direct CUDA path. It uses the CUDA Driver API for device/context/storage management, cuBLAS for float32 GEMM, PTX kernels for hot scalar and transformer helper ops, and CPU fallbacks where native kernels are not implemented yet.
 
-6. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, and JSONL batch workflows.
+6. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, and the FIFO inference queue.
+
+7. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, and JSONL batch workflows.
 
 ### Performance Optimizations
 
@@ -679,26 +709,27 @@ TensorSharp is structured as a layered system:
 - **Fused GPU prefill** (Gemma 4): for dense (non-MoE, non-shared, non-PLE/multimodal) layers, `Gemma4LayerPrefill` runs the entire transformer block (RMSNorm + QKV + QK-norm + RoPE + attention + output projection + post-attn norm + GeGLU FFN + post-FFN norm + residual + layer scalar) as a single GGML graph dispatch per layer during prefill, extending the fused approach from decode to multi-token prefill.
 - **Chunked prefill** (Gemma 4): long prompts are split into bounded chunks (2x sliding window, max 2048 tokens) to avoid O(n^2) attention score tensors for SWA layers. Chunking is applied automatically when text-only (no multimodal embeddings) and keeps each chunk within the SWA window budget.
 - **Native whole-model decode** (Qwen 3): all transformer layers run in one native call (`TransformerModelDecode`) with pre-resolved per-layer weight pointers cached at load time, removing managed-loop overhead from the decode hot path.
-- **Fused Qwen 3.5 attention layer decode**: a single GGML graph performs RMSNorm + fused QKV + Q/gate deinterleave + per-head QK norm + RoPE + KV cache append + flash attention + sigmoid-gated mix + output projection + residual add for each FullAttention layer. Replaces ~2 standalone GGML calls and ~6 small CPU/GPU sync points per attention layer. Engages once the cached sequence length exceeds 4096 tokens (override with `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N`).
-- **Fused prefill attention** (Qwen 3.5): `FusedPrefillAttention` combines Q*K^T, causal mask, softmax, and *V into a single GGML graph dispatch during multi-token prefill, eliminating ~5 separate C#-to-GGML round-trips per attention layer. Handles both initial prefill and continuation with existing KV cache entries.
-- **Fused output-projection + FFN** (Qwen 3.5): for both FullAttention and GatedDeltaNet layers with dense FFN, `FusedOutProjFFN` merges the output projection, residual add, post-attention RMSNorm, and the full SwiGLU FFN (gate_up matmul + SiLU + down matmul + residual) into a single GGML graph dispatch, reducing two GPU round-trips to one per layer.
-- **Fused output-projection + norm + router** (Qwen 3.5 MoE): `FusedOutProjNormRouter` merges the GatedDeltaNet output projection, residual add, post-attention RMSNorm, and MoE router projection into one dispatch. The pre-computed router logits are then consumed directly by the batched MoE kernel, eliminating a separate router dispatch per MoE layer.
-- **Fused vision encoder** (Qwen 3.5): `FusedVisionAttention` merges LayerNorm + QKV + bias + 2D RoPE + scaled dot-product attention + output projection + bias + residual into one GGML graph dispatch (~8 ops → 1). `FusedVisionMLP` merges LayerNorm + up + bias + GELU + down + bias + residual into one dispatch (7 ops → 1). Combined, these cut the per-block GPU round-trips from ~15 to 2.
+- **Fused Qwen 3.5/3.6-family attention layer decode**: a single GGML graph performs RMSNorm + fused QKV + Q/gate deinterleave + per-head QK norm + RoPE + KV cache append + flash attention + sigmoid-gated mix + output projection + residual add for each FullAttention layer. Replaces ~2 standalone GGML calls and ~6 small CPU/GPU sync points per attention layer. Engages once the cached sequence length exceeds 4096 tokens (override with `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N`).
+- **Fused prefill attention** (Qwen 3.5/3.6-family): `FusedPrefillAttention` combines Q*K^T, causal mask, softmax, and *V into a single GGML graph dispatch during multi-token prefill, eliminating ~5 separate C#-to-GGML round-trips per attention layer. Handles both initial prefill and continuation with existing KV cache entries.
+- **Fused output-projection + FFN** (Qwen 3.5/3.6-family): for both FullAttention and GatedDeltaNet layers with dense FFN, `FusedOutProjFFN` merges the output projection, residual add, post-attention RMSNorm, and the full SwiGLU FFN (gate_up matmul + SiLU + down matmul + residual) into a single GGML graph dispatch, reducing two GPU round-trips to one per layer.
+- **Fused output-projection + norm + router** (Qwen 3.5/3.6-family MoE): `FusedOutProjNormRouter` merges the GatedDeltaNet output projection, residual add, post-attention RMSNorm, and MoE router projection into one dispatch. The pre-computed router logits are then consumed directly by the batched MoE kernel, eliminating a separate router dispatch per MoE layer.
+- **Fused vision encoder** (Qwen 3.5/3.6-family): `FusedVisionAttention` merges LayerNorm + QKV + bias + 2D RoPE + scaled dot-product attention + output projection + bias + residual into one GGML graph dispatch (~8 ops → 1). `FusedVisionMLP` merges LayerNorm + up + bias + GELU + down + bias + residual into one dispatch (7 ops → 1). Combined, these cut the per-block GPU round-trips from ~15 to 2.
 - **Fused weight projections**: Q/K/V projections are fused into a single QKV matmul; gate and up projections are fused into a single gate_up matmul.
 - **Native quantized compute**: quantized weights (Q4_K_M, Q6_K, Q8_0, IQ2_XXS, MXFP4, etc.) are used directly in matmul without expanding to FP32, saving memory and bandwidth. A batched `AddmmQuantBatch` kernel handles multiple sub-weight matmuls against a single quantized blob in one dispatch.
-- **Batched GPU MoE**: `MoEExpertsSwiGLUResidual` (Qwen 3.5) and `MoEExpertsForward` (Nemotron-H) collapse all selected experts -- and, for Qwen 3.5, the optional shared expert and the residual add -- into a single GGML graph dispatch per MoE layer.
-- **GEMM-based vision patch embedding** (Qwen 3.5): the patch embedding step is reformulated as parallel im2col + matrix multiplication, replacing a single-threaded scalar quintuple-nested loop with a GPU-accelerated matmul.
-- **Parallelized Q/gate deinterleave** (Qwen 3.5): the Q + sigmoid-gate deinterleave in FullAttention prefill is parallelized across tokens, scaling linearly with CPU core count for long prompts.
+- **Direct CUDA kernels**: the `cuda` backend accelerates fill/copy, unary ops, activation fusions, RMSNorm, softmax, index select, causal masking, RoPE/RoPEEx, cuBLAS GEMM, and supported quantized matmul/get-rows while safely falling back for incomplete op coverage.
+- **Batched GPU MoE**: `MoEExpertsSwiGLUResidual` (Qwen 3.5/3.6-family) and `MoEExpertsForward` (Nemotron-H) collapse all selected experts -- and, for Qwen 3.5/3.6-family, the optional shared expert and the residual add -- into a single GGML graph dispatch per MoE layer.
+- **GEMM-based vision patch embedding** (Qwen 3.5/3.6-family): the patch embedding step is reformulated as parallel im2col + matrix multiplication, replacing a single-threaded scalar quintuple-nested loop with a GPU-accelerated matmul.
+- **Parallelized Q/gate deinterleave** (Qwen 3.5/3.6-family): the Q + sigmoid-gate deinterleave in FullAttention prefill is parallelized across tokens, scaling linearly with CPU core count for long prompts.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **KV-cache prefix reuse**: multi-turn conversations reuse the longest matching token prefix across turns. Truncation is automatically backed off by the sliding-window size for SWA models so the suffix can rebuild the SWA context.
 - **Kernel warmup**: both CLI and Server run a tiny forward pass at startup to pre-compile GPU kernels (Metal pipeline states, CUDA JIT) and warm the memory pool, avoiding cold-start latency on the first real inference request.
-- **Prefill caching** (Gemma 4, Qwen 3.5): per-forward-pass SWA mask cache (Gemma 4), NeoX RoPE cos/sin lookup table cache across global layers (Gemma 4), and RoPE position tensor cache across layers (Gemma 4, Qwen 3.5) eliminate redundant recomputation during prefill.
-- **In-place QK RMSNorm** (Qwen 3.5): per-head QK normalization is performed in-place using a `View`, avoiding one tensor allocation and copy per Q/K per layer.
+- **Prefill caching** (Gemma 4, Qwen 3.5/3.6-family): per-forward-pass SWA mask cache (Gemma 4), NeoX RoPE cos/sin lookup table cache across global layers (Gemma 4), and RoPE position tensor cache across layers (Gemma 4, Qwen 3.5/3.6-family) eliminate redundant recomputation during prefill.
+- **In-place QK RMSNorm** (Qwen 3.5/3.6-family): per-head QK normalization is performed in-place using a `View`, avoiding one tensor allocation and copy per Q/K per layer.
 
 ### Memory Optimizations
 
-- **Zero-copy file-mapped quantized weights** (CUDA, Metal, GGML CPU): the GGUF model file is memory-mapped and quantized tensors are bound directly into native ops via host-pointer buffers. This removes the per-tensor copy from disk into a freshly-allocated native heap buffer that previously roughly doubled the resident set on Apple Silicon for large quantized models. For example, `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) now runs with ~7 GB peak working memory under Metal instead of ~17 GB. The OS keeps the mapped file in its page cache and pages it out under memory pressure without any inference penalty on Apple Silicon (unified memory).
+- **Zero-copy file-mapped quantized weights** (direct CUDA, GGML CUDA, GGML Metal, GGML CPU): the GGUF model file is memory-mapped and quantized tensors are bound directly into native ops via host-pointer buffers. This removes the per-tensor copy from disk into a freshly-allocated native heap buffer that previously roughly doubled the resident set on Apple Silicon for large quantized models. For example, `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) now runs with ~7 GB peak working memory under Metal instead of ~17 GB. The OS keeps the mapped file in its page cache and pages it out under memory pressure without any inference penalty on Apple Silicon (unified memory).
 - **Best-fit memory pool**: the GGML host allocator uses a best-fit search across pooled blocks instead of first-fit, which avoids handing out a large scratch block to satisfy a tiny intermediate-tensor request and keeps the working-set tightly bounded across long-running inference.
 - **Bounded pool retention**: the integrated-GPU / CPU memory pool now caps individual retained blocks at 64 MB and the total pool at 32 blocks. Combined with mmap-backed weights, this keeps short-lived intermediate tensors recycled fast while bounding the peak resident set.
 - **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations. F32 weights and norms still load on demand; quantized weights are mmap-backed when supported by the backend.
@@ -727,7 +758,7 @@ The memory reduction comes primarily from no longer copying the GGUF file into a
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, and backend catalog resolution.
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, and backend catalog resolution.
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

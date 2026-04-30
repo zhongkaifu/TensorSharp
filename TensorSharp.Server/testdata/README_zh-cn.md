@@ -10,6 +10,15 @@
 
 测试脚本会自动检测当前加载模型的架构，并在该模型不支持思维链或工具调用时自动跳过相关用例。
 
+## 当前套件状态
+
+| 接口 | 覆盖内容 |
+|---|---|
+| Web UI SSE | 会话级流式输出、队列进度、done 事件指标、中断处理 |
+| Ollama 兼容 | 聊天流式/非流式、多轮历史、思维链、工具调用请求链路 |
+| OpenAI 兼容 | Chat Completions 流式/非流式、工具调用、结构化输出、校验错误 |
+| 运维行为 | FIFO 队列、并发请求、混合 API 切换、按架构自动跳过 |
+
 ## 快速开始
 
 1. 启动 TensorSharp.Server：
@@ -17,6 +26,8 @@
 ```bash
 ./TensorSharp.Server --model ~/models/model.gguf --backend ggml_metal
 ```
+
+Windows/Linux + NVIDIA 可使用 `--backend cuda` 或 `--backend ggml_cuda`，macOS 可使用 `--backend ggml_metal`，CPU 测试可使用 `--backend ggml_cpu` 或 `--backend cpu`。
 
 2. 运行任一套件：
 

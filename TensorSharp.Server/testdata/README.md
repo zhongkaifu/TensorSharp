@@ -10,6 +10,15 @@ Two test suites exercise TensorSharp.Server's current public compatibility surfa
 
 The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities.
 
+## Current Suite Status
+
+| Surface | Coverage |
+|---|---|
+| Web UI SSE | Session-scoped streaming, queue progress, done event metrics, abort handling |
+| Ollama compatibility | Chat streaming/non-streaming, multi-turn history, thinking, tool-call request plumbing |
+| OpenAI compatibility | Chat Completions streaming/non-streaming, tool calls, structured outputs, validation errors |
+| Operational behavior | FIFO queue, concurrent requests, mixed API handoff, architecture-aware skips |
+
 ## Quick Start
 
 1. Start TensorSharp.Server:
@@ -17,6 +26,8 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 ```bash
 ./TensorSharp.Server --model ~/models/model.gguf --backend ggml_metal
 ```
+
+Use `--backend cuda` or `--backend ggml_cuda` on Windows/Linux NVIDIA machines, `--backend ggml_metal` on macOS, or `--backend ggml_cpu` / `--backend cpu` for CPU runs.
 
 2. Run either suite:
 
