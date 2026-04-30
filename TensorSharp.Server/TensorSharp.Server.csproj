@@ -20,6 +20,7 @@
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
     <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />

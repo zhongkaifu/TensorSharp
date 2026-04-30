@@ -7,15 +7,22 @@ public class BackendCatalogTests
     [Fact]
     public void GetSupportedBackends_OnlyReturnsAvailableBackendsInUiOrder()
     {
-        var backends = BackendCatalog.GetSupportedBackends(backendType => backendType switch
-        {
-            GgmlBackendType.Metal => false,
-            GgmlBackendType.Cuda => true,
-            GgmlBackendType.Cpu => true,
-            _ => false,
-        });
+        var backends = BackendCatalog.GetSupportedBackends(
+            backendType => backendType switch
+            {
+                GgmlBackendType.Metal => false,
+                GgmlBackendType.Cuda => true,
+                GgmlBackendType.Cpu => true,
+                _ => false,
+            },
+            () => true);
 
         Assert.Collection(backends,
+            backend =>
+            {
+                Assert.Equal("cuda", backend.Value);
+                Assert.Equal("CUDA (cuBLAS GPU)", backend.Label);
+            },
             backend =>
             {
                 Assert.Equal("ggml_cuda", backend.Value);
@@ -36,7 +43,7 @@ public class BackendCatalogTests
     [Fact]
     public void GetSupportedBackends_AlwaysIncludesBothCpuBackends()
     {
-        var backends = BackendCatalog.GetSupportedBackends(_ => false);
+        var backends = BackendCatalog.GetSupportedBackends(_ => false, () => false);
 
         Assert.Collection(backends,
             backend =>
@@ -56,13 +63,13 @@ public class BackendCatalogTests
     {
         var supportedBackends = new[]
         {
-            new BackendOption("ggml_cuda", "GGML CUDA (GPU)"),
+            new BackendOption("cuda", "CUDA (cuBLAS GPU)"),
             new BackendOption("ggml_cpu", "GGML CPU"),
         };
 
         string backend = BackendCatalog.ResolveDefaultBackend("cuda", supportedBackends);
 
-        Assert.Equal("ggml_cuda", backend);
+        Assert.Equal("cuda", backend);
     }
 
     [Fact]
@@ -80,6 +87,7 @@ public class BackendCatalogTests
     }
 
     [Theory]
+    [InlineData(BackendType.Cuda, "cuda")]
     [InlineData(BackendType.GgmlMetal, "ggml_metal")]
     [InlineData(BackendType.GgmlCuda, "ggml_cuda")]
     [InlineData(BackendType.GgmlCpu, "ggml_cpu")]
@@ -115,6 +123,21 @@ public class BackendCatalogTests
         };
 
         bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.GgmlCpu, info);
+
+        Assert.True(shouldStoreQuantized);
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_DirectCudaKeepsSupportedWeightsCompressed()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.attn_q.weight",
+            Type = GgmlTensorType.Q8_0,
+            Shape = new ulong[] { 128, 256 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Cuda, info);
 
         Assert.True(shouldStoreQuantized);
     }

@@ -413,7 +413,7 @@ namespace TensorSharp.Cli
             Console.WriteLine("  /info, /status         Show the loaded model, backend, and projector.");
             Console.WriteLine("  /model <path>          Load a different .gguf model (resets the session).");
             Console.WriteLine("  /backend <name>        Reload the current model on a different backend");
-            Console.WriteLine("                         (cpu | ggml_cpu | ggml_metal | ggml_cuda).");
+            Console.WriteLine("                         (cpu | cuda | ggml_cpu | ggml_metal | ggml_cuda).");
             Console.WriteLine("  /mmproj <path>         Load a multimodal projector for the current model");
             Console.WriteLine("                         (pass an empty value to clear).");
             Console.WriteLine();
@@ -726,12 +726,12 @@ namespace TensorSharp.Cli
             string requested = (arg ?? "").Trim().ToLowerInvariant();
             if (string.IsNullOrEmpty(requested))
             {
-                Console.WriteLine($"Current backend: {_backend}. Usage: /backend cpu|ggml_cpu|ggml_metal|ggml_cuda");
+                Console.WriteLine($"Current backend: {_backend}. Usage: /backend cpu|cuda|ggml_cpu|ggml_metal|ggml_cuda");
                 return;
             }
             if (!TryParseBackend(requested, out BackendType target))
             {
-                Console.WriteLine($"Unknown backend '{requested}'. Use: cpu, ggml_cpu, ggml_metal, ggml_cuda");
+                Console.WriteLine($"Unknown backend '{requested}'. Use: cpu, cuda, ggml_cpu, ggml_metal, ggml_cuda");
                 return;
             }
             if (target == _backend)
@@ -856,6 +856,11 @@ namespace TensorSharp.Cli
                 case "cpu":
                     backend = BackendType.Cpu;
                     return true;
+                case "cuda":
+                case "direct_cuda":
+                case "direct-cuda":
+                    backend = BackendType.Cuda;
+                    return true;
                 case "ggml_cpu":
                 case "ggml-cpu":
                     backend = BackendType.GgmlCpu;
@@ -865,7 +870,6 @@ namespace TensorSharp.Cli
                 case "ggml-metal":
                     backend = BackendType.GgmlMetal;
                     return true;
-                case "cuda":
                 case "ggml_cuda":
                 case "ggml-cuda":
                     backend = BackendType.GgmlCuda;

@@ -183,10 +183,10 @@ namespace TensorSharp.Cli
             if (modelPath == null || !File.Exists(modelPath))
             {
                 _log.LogError(LogEventIds.CliFailed,
-                    "Model file not found: {ModelPath}", modelPath ?? "(none)");
+                "Model file not found: {ModelPath}", modelPath ?? "(none)");
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
-                    "[--max-tokens N] [--test] [--backend cpu|ggml_cpu|ggml_metal|ggml_cuda] " +
+                    "[--max-tokens N] [--test] [--backend cpu|cuda|ggml_cpu|ggml_metal|ggml_cuda] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
                     "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
@@ -198,10 +198,11 @@ namespace TensorSharp.Cli
             BackendType backend = backendStr switch
             {
                 "cpu" => BackendType.Cpu,
+                "cuda" or "direct_cuda" or "direct-cuda" => BackendType.Cuda,
                 "ggml_cpu" => BackendType.GgmlCpu,
                 "ggml_metal" => BackendType.GgmlMetal,
-                "cuda" or "ggml_cuda" => BackendType.GgmlCuda,
-                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, ggml_cpu, ggml_metal, ggml_cuda"),
+                "ggml_cuda" or "ggml-cuda" => BackendType.GgmlCuda,
+                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, ggml_cpu, ggml_metal, ggml_cuda"),
             };
 
             _log.LogInformation(LogEventIds.ModelLoadStarted,

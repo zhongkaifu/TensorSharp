@@ -12,6 +12,7 @@ namespace TensorSharp.Runtime
     public enum BackendType
     {
         Cpu,
+        Cuda,
         GgmlCpu,
         GgmlMetal,
         GgmlCuda,

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Server
@@ -13,18 +14,25 @@ namespace TensorSharp.Server
         // `ggml_cpu` is the native GGML CPU backend, while `cpu` is the pure C# backend.
         private static readonly BackendDescriptor[] BackendDescriptors =
         {
+            new("cuda", "CUDA (cuBLAS GPU)", null, AlwaysAvailable: false),
             new("ggml_metal", "GGML Metal (GPU)", GgmlBackendType.Metal, AlwaysAvailable: false),
             new("ggml_cuda", "GGML CUDA (GPU)", GgmlBackendType.Cuda, AlwaysAvailable: false),
             new("ggml_cpu", "GGML CPU", GgmlBackendType.Cpu, AlwaysAvailable: true),
             new("cpu", "CPU (Pure C#)", GgmlBackendType.Cpu, AlwaysAvailable: true),
         };
 
-        internal static IReadOnlyList<BackendOption> GetSupportedBackends(Func<GgmlBackendType, bool> isGgmlBackendAvailable = null)
+        internal static IReadOnlyList<BackendOption> GetSupportedBackends(
+            Func<GgmlBackendType, bool> isGgmlBackendAvailable = null,
+            Func<bool> isCudaBackendAvailable = null)
         {
             isGgmlBackendAvailable ??= IsGgmlBackendAvailable;
+            isCudaBackendAvailable ??= CudaBackend.IsAvailable;
 
             return BackendDescriptors
-                .Where(descriptor => descriptor.AlwaysAvailable || isGgmlBackendAvailable(descriptor.GgmlBackendType))
+                .Where(descriptor => descriptor.AlwaysAvailable ||
+                    (descriptor.GgmlBackendType.HasValue
+                        ? isGgmlBackendAvailable(descriptor.GgmlBackendType.Value)
+                        : isCudaBackendAvailable()))
                 .Select(descriptor => new BackendOption(descriptor.Value, descriptor.Label))
                 .ToArray();
         }
@@ -48,7 +56,8 @@ namespace TensorSharp.Server
 
             return backend.Trim().ToLowerInvariant() switch
             {
-                "cuda" or "ggml_cuda" => "ggml_cuda",
+                "cuda" or "direct_cuda" or "direct-cuda" => "cuda",
+                "ggml_cuda" or "ggml-cuda" => "ggml_cuda",
                 "ggml_metal" => "ggml_metal",
                 "ggml_cpu" => "ggml_cpu",
                 "cpu" => "cpu",
@@ -60,6 +69,7 @@ namespace TensorSharp.Server
         {
             return backendType switch
             {
+                BackendType.Cuda => "cuda",
                 BackendType.GgmlMetal => "ggml_metal",
                 BackendType.GgmlCuda => "ggml_cuda",
                 BackendType.GgmlCpu => "ggml_cpu",
@@ -82,7 +92,7 @@ namespace TensorSharp.Server
             }
         }
 
-        private sealed record BackendDescriptor(string Value, string Label, GgmlBackendType GgmlBackendType, bool AlwaysAvailable);
+        private sealed record BackendDescriptor(string Value, string Label, GgmlBackendType? GgmlBackendType, bool AlwaysAvailable);
     }
 }
 

@@ -17,6 +17,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -251,6 +252,9 @@ namespace TensorSharp.Models
                 case BackendType.GgmlCuda:
                     _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Cuda);
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
+                    break;
+                case BackendType.Cuda:
+                    _allocator = new CudaAllocator(0);
                     break;
                 case BackendType.Cpu:
                     _allocator = new CpuAllocator(BlasEnum.DotNet);
@@ -501,6 +505,9 @@ namespace TensorSharp.Models
             if (info.Type == GgmlTensorType.F32)
                 return false;
 
+            if (backend == BackendType.Cuda && !CudaQuantizedOps.SupportsQuantizedType((int)info.Type))
+                return false;
+
             if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
                 return false;
 
@@ -526,6 +533,7 @@ namespace TensorSharp.Models
         /// </summary>
         protected bool CanUseFileMappedQuantizedWeights
             => _backend == BackendType.GgmlCuda
+            || _backend == BackendType.Cuda
             || _backend == BackendType.GgmlMetal
             || _backend == BackendType.GgmlCpu;
 
@@ -659,6 +667,12 @@ namespace TensorSharp.Models
 
         protected void PrepareCudaQuantizedWeightsForInference()
         {
+            if (_backend == BackendType.Cuda)
+            {
+                PrepareDirectCudaQuantizedWeightsForInference();
+                return;
+            }
+
             if (_backend != BackendType.GgmlCuda || _cudaQuantWeightsPrepared || _quantWeights.Count == 0)
                 return;
 
@@ -703,6 +717,39 @@ namespace TensorSharp.Models
 
             if (preloadedCount > 0)
                 Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+        }
+
+        private void PrepareDirectCudaQuantizedWeightsForInference()
+        {
+            if (_cudaQuantWeightsPrepared || _quantWeights.Count == 0)
+                return;
+
+            if (_allocator is not CudaAllocator cudaAllocator)
+                return;
+
+            long preloadedBytes = 0;
+            int preloadedCount = 0;
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                    continue;
+
+                IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                CudaQuantizedOps.PreloadQuantizedWeight(
+                    cudaAllocator,
+                    cacheKey,
+                    qw.Data,
+                    qw.GgmlType,
+                    qw.Ne0,
+                    qw.Ne1,
+                    qw.RawBytes);
+                preloadedBytes += qw.RawBytes;
+                preloadedCount++;
+            }
+
+            _cudaQuantWeightsPrepared = true;
+            if (preloadedCount > 0)
+                Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
         }
 
         private static bool ShouldRetainCudaHostQuantWeight(string weightName)
@@ -907,6 +954,26 @@ namespace TensorSharp.Models
         private unsafe Tensor EmbeddingManagedQuantized(int[] tokens, QuantizedWeight weight)
         {
             int dim = (int)weight.Ne0;
+            if (_backend == BackendType.Cuda)
+            {
+                var resultCuda = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                using var indicesCuda = CreateIntTensor(tokens, tokens.Length);
+                if (CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    resultCuda,
+                    weight.EnsureDeviceCacheKey(),
+                    weight.Data,
+                    weight.GgmlType,
+                    weight.Ne0,
+                    weight.Ne1,
+                    weight.RawBytes,
+                    indicesCuda))
+                {
+                    return resultCuda;
+                }
+
+                resultCuda.Dispose();
+            }
+
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
             float* dst = GetFloatPtr(result);
@@ -931,6 +998,20 @@ namespace TensorSharp.Models
             int outDim = (int)weight.Ne1;
             if ((int)input.Sizes[1] != inDim)
                 throw new ArgumentException($"Input dim {input.Sizes[1]} does not match quantized weight width {inDim}.");
+
+            if (_backend == BackendType.Cuda &&
+                CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    result,
+                    input,
+                    weight.EnsureDeviceCacheKey(),
+                    weight.Data,
+                    weight.GgmlType,
+                    weight.Ne0,
+                    weight.Ne1,
+                    weight.RawBytes))
+            {
+                return;
+            }
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             float* inputPtr = GetFloatPtr(input);
@@ -1857,11 +1938,20 @@ namespace TensorSharp.Models
             if (IsGgmlBackend)
                 GgmlBasicOps.ClearHostBufferCache();
 
+            if (_backend == BackendType.Cuda && _allocator is CudaAllocator cudaAllocator)
+            {
+                foreach (var qw in _quantWeights.Values)
+                    CudaQuantizedOps.ReleaseQuantizedWeight(cudaAllocator, qw.CacheKey);
+            }
+
             foreach (var qw in _quantWeights.Values)
                 qw.Dispose();
             _quantWeights.Clear();
 
             _gguf?.Dispose();
+
+            if (_allocator is IDisposable allocatorDisposable)
+                allocatorDisposable.Dispose();
         }
 
         public static ModelBase Create(string ggufPath, BackendType backend)
