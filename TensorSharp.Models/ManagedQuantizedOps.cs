@@ -8,9 +8,14 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Buffers;
 using System.Numerics;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+using System.Threading.Tasks;
 
 namespace TensorSharp.Models
 {
@@ -26,6 +31,16 @@ namespace TensorSharp.Models
         private const int QK_MXFP4 = 32;
         private const int QK_K = 256;
         private const int K_SCALE_SIZE = 12;
+        private const int Q4_0BlockBytes = 2 + QK4_0 / 2;
+        private const int Q4_1BlockBytes = 4 + QK4_1 / 2;
+        private const int Q5_0BlockBytes = 2 + 4 + QK5_0 / 2;
+        private const int Q5_1BlockBytes = 4 + 4 + QK5_1 / 2;
+        private const int Q8_0BlockBytes = 2 + QK8_0;
+        private const int Q8_1BlockBytes = 4 + QK8_1;
+        private const int Q4_KBlockBytes = 4 + K_SCALE_SIZE + QK_K / 2;
+        private const int Q5_KBlockBytes = 4 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2;
+        private const int Q6_KBlockBytes = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+        private const int Q8_KBlockBytes = 4 + QK_K + 2 * (QK_K / 16);
 
         private static readonly sbyte[] Iq4NlValues =
         {
@@ -197,6 +212,215 @@ namespace TensorSharp.Models
                 chunkPtr += GetDotChunkBytes(type, chunkElements);
                 elementOffset += chunkElements;
             }
+        }
+
+        public static unsafe bool TryAddmmQuantizedToFloat32(
+            int ggmlType,
+            IntPtr weights,
+            long ne0,
+            long ne1,
+            float* input,
+            int inputRowStride,
+            int rowCount,
+            float* output,
+            int outputRowStride)
+        {
+            var type = (GgmlTensorType)ggmlType;
+            if (ne0 > int.MaxValue || ne1 > int.MaxValue)
+                return false;
+
+            if (!TryGetDirectMatMulPlan(type, (int)ne0, out ActivationQuantKind activationKind, out int activationRowBytes))
+                return false;
+
+            if (weights == IntPtr.Zero)
+                throw new ArgumentException("Quantized weights pointer cannot be null.", nameof(weights));
+            if (inputRowStride < ne0)
+                throw new ArgumentOutOfRangeException(nameof(inputRowStride));
+            if (outputRowStride < ne1)
+                throw new ArgumentOutOfRangeException(nameof(outputRowStride));
+
+            long totalActivationBytes = (long)rowCount * activationRowBytes;
+            if (totalActivationBytes > int.MaxValue)
+                return false;
+
+            byte[] rented = ArrayPool<byte>.Shared.Rent((int)totalActivationBytes);
+            try
+            {
+                fixed (byte* activationBase = rented)
+                {
+                    for (int row = 0; row < rowCount; row++)
+                    {
+                        byte* dst = activationBase + (long)row * activationRowBytes;
+                        float* src = input + (long)row * inputRowStride;
+                        QuantizeActivation(src, dst, (int)ne0, activationKind);
+                    }
+
+                    byte* weightBase = (byte*)weights.ToPointer();
+                    int weightRowBytes = (int)RowSize(ggmlType, ne0);
+                    int outDim = (int)ne1;
+                    int inDim = (int)ne0;
+                    nint activationAddress = (nint)activationBase;
+                    nint weightAddress = (nint)weightBase;
+                    nint outputAddress = (nint)output;
+
+                    void ComputeColumnRange(int startCol, int endCol)
+                    {
+                        byte* activationPtr = (byte*)activationAddress;
+                        byte* weightPtr = (byte*)weightAddress;
+                        float* outputPtr = (float*)outputAddress;
+
+                        for (int col = startCol; col < endCol; col++)
+                        {
+                            byte* weightRow = weightPtr + (long)col * weightRowBytes;
+                            for (int row = 0; row < rowCount; row++)
+                            {
+                                byte* activationRow = activationPtr + (long)row * activationRowBytes;
+                                outputPtr[(long)row * outputRowStride + col] =
+                                    DotQuantized(type, weightRow, activationRow, inDim);
+                            }
+                        }
+                    }
+
+                    bool useParallel = outDim >= 128 && (long)rowCount * outDim >= 512 && Environment.ProcessorCount > 1;
+                    if (useParallel)
+                    {
+                        Parallel.For(0, outDim, col => ComputeColumnRange(col, col + 1));
+                    }
+                    else
+                    {
+                        ComputeColumnRange(0, outDim);
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+
+            return true;
+        }
+
+        public static unsafe bool TryAddmmQuantizedToFloat32(
+            int ggmlType,
+            byte[] weights,
+            int weightsOffset,
+            long ne0,
+            long ne1,
+            float[] input,
+            int inputOffset,
+            int inputRowStride,
+            int rowCount,
+            float[] output,
+            int outputOffset,
+            int outputRowStride)
+        {
+            if (weights == null)
+                throw new ArgumentNullException(nameof(weights));
+            if (input == null)
+                throw new ArgumentNullException(nameof(input));
+            if (output == null)
+                throw new ArgumentNullException(nameof(output));
+
+            fixed (byte* weightPtr = weights)
+            fixed (float* inputPtr = input)
+            fixed (float* outputPtr = output)
+            {
+                return TryAddmmQuantizedToFloat32(
+                    ggmlType,
+                    (IntPtr)(weightPtr + weightsOffset),
+                    ne0,
+                    ne1,
+                    inputPtr + inputOffset,
+                    inputRowStride,
+                    rowCount,
+                    outputPtr + outputOffset,
+                    outputRowStride);
+            }
+        }
+
+        private enum ActivationQuantKind
+        {
+            Q8_0,
+            Q8_1,
+            Q8_K,
+        }
+
+        private static bool TryGetDirectMatMulPlan(
+            GgmlTensorType type,
+            int elementCount,
+            out ActivationQuantKind activationKind,
+            out int activationRowBytes)
+        {
+            activationKind = default;
+            activationRowBytes = 0;
+
+            switch (type)
+            {
+                case GgmlTensorType.Q4_0:
+                case GgmlTensorType.Q5_0:
+                case GgmlTensorType.Q8_0:
+                case GgmlTensorType.Q8_1:
+                    if (elementCount % QK8_0 != 0)
+                        return false;
+                    activationKind = ActivationQuantKind.Q8_0;
+                    activationRowBytes = elementCount / QK8_0 * Q8_0BlockBytes;
+                    return true;
+
+                case GgmlTensorType.Q4_1:
+                case GgmlTensorType.Q5_1:
+                    if (elementCount % QK8_1 != 0)
+                        return false;
+                    activationKind = ActivationQuantKind.Q8_1;
+                    activationRowBytes = elementCount / QK8_1 * Q8_1BlockBytes;
+                    return true;
+
+                case GgmlTensorType.Q4_K:
+                case GgmlTensorType.Q5_K:
+                case GgmlTensorType.Q6_K:
+                    if (elementCount % QK_K != 0)
+                        return false;
+                    activationKind = ActivationQuantKind.Q8_K;
+                    activationRowBytes = elementCount / QK_K * Q8_KBlockBytes;
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static unsafe void QuantizeActivation(float* src, byte* dst, int elementCount, ActivationQuantKind kind)
+        {
+            switch (kind)
+            {
+                case ActivationQuantKind.Q8_0:
+                    QuantizeF32ToQ8_0(src, dst, elementCount);
+                    return;
+                case ActivationQuantKind.Q8_1:
+                    QuantizeF32ToQ8_1(src, dst, elementCount);
+                    return;
+                case ActivationQuantKind.Q8_K:
+                    QuantizeF32ToQ8_K(src, dst, elementCount);
+                    return;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(kind), kind, null);
+            }
+        }
+
+        private static unsafe float DotQuantized(GgmlTensorType type, byte* weightRow, byte* activationRow, int elementCount)
+        {
+            return type switch
+            {
+                GgmlTensorType.Q4_0 => VecDotQ4_0Q8_0(weightRow, activationRow, elementCount / QK4_0),
+                GgmlTensorType.Q4_1 => VecDotQ4_1Q8_1(weightRow, activationRow, elementCount / QK4_1),
+                GgmlTensorType.Q5_0 => VecDotQ5_0Q8_0(weightRow, activationRow, elementCount / QK5_0),
+                GgmlTensorType.Q5_1 => VecDotQ5_1Q8_1(weightRow, activationRow, elementCount / QK5_1),
+                GgmlTensorType.Q8_0 => VecDotQ8_0Q8_0(weightRow, activationRow, elementCount / QK8_0),
+                GgmlTensorType.Q8_1 => VecDotQ8_1Q8_0(weightRow, activationRow, elementCount / QK8_1),
+                GgmlTensorType.Q4_K => VecDotQ4_KQ8_K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.Q5_K => VecDotQ5_KQ8_K(weightRow, activationRow, elementCount / QK_K),
+                GgmlTensorType.Q6_K => VecDotQ6_KQ8_K(weightRow, activationRow, elementCount / QK_K),
+                _ => throw new NotSupportedException($"Direct managed quantized matmul does not support {type}."),
+            };
         }
 
         private static unsafe void DequantizeToFloat32(GgmlTensorType type, byte* src, float* dst, long numElements)
@@ -597,6 +821,492 @@ namespace TensorSharp.Models
             }
         }
 
+        private static unsafe void QuantizeF32ToQ8_0(float* src, byte* dst, int elementCount)
+        {
+            int blockCount = elementCount / QK8_0;
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockSrc = src + block * QK8_0;
+                byte* blockDst = dst + block * Q8_0BlockBytes;
+                float maxAbs = MaxAbs(blockSrc, QK8_0);
+                float scale = maxAbs / 127.0f;
+                WriteHalf(blockDst, scale);
+
+                sbyte* qs = (sbyte*)(blockDst + 2);
+                if (scale == 0.0f)
+                {
+                    Unsafe.InitBlockUnaligned(qs, 0, QK8_0);
+                    continue;
+                }
+
+                float invScale = 1.0f / scale;
+                for (int i = 0; i < QK8_0; i++)
+                    qs[i] = ClampToInt8(MathF.Round(blockSrc[i] * invScale));
+            }
+        }
+
+        private static unsafe void QuantizeF32ToQ8_1(float* src, byte* dst, int elementCount)
+        {
+            int blockCount = elementCount / QK8_1;
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockSrc = src + block * QK8_1;
+                byte* blockDst = dst + block * Q8_1BlockBytes;
+                float maxAbs = MaxAbs(blockSrc, QK8_1);
+                float scale = maxAbs / 127.0f;
+                WriteHalf(blockDst, scale);
+
+                sbyte* qs = (sbyte*)(blockDst + 4);
+                int sum = 0;
+                if (scale != 0.0f)
+                {
+                    float invScale = 1.0f / scale;
+                    for (int i = 0; i < QK8_1; i++)
+                    {
+                        sbyte q = ClampToInt8(MathF.Round(blockSrc[i] * invScale));
+                        qs[i] = q;
+                        sum += q;
+                    }
+                }
+                else
+                {
+                    Unsafe.InitBlockUnaligned(qs, 0, QK8_1);
+                }
+
+                WriteHalf(blockDst + 2, scale * sum);
+            }
+        }
+
+        private static unsafe void QuantizeF32ToQ8_K(float* src, byte* dst, int elementCount)
+        {
+            int blockCount = elementCount / QK_K;
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockSrc = src + block * QK_K;
+                byte* blockDst = dst + block * Q8_KBlockBytes;
+                float maxAbs = MaxAbs(blockSrc, QK_K);
+                float scale = maxAbs / 127.0f;
+                Unsafe.WriteUnaligned(blockDst, scale);
+
+                sbyte* qs = (sbyte*)(blockDst + 4);
+                short* bsums = (short*)(blockDst + 4 + QK_K);
+                if (scale == 0.0f)
+                {
+                    Unsafe.InitBlockUnaligned(qs, 0, QK_K);
+                    Unsafe.InitBlockUnaligned(bsums, 0, QK_K / 16 * sizeof(short));
+                    continue;
+                }
+
+                float invScale = 1.0f / scale;
+                for (int group = 0; group < QK_K / 16; group++)
+                {
+                    int sum = 0;
+                    int offset = group * 16;
+                    for (int i = 0; i < 16; i++)
+                    {
+                        sbyte q = ClampToInt8(MathF.Round(blockSrc[offset + i] * invScale));
+                        qs[offset + i] = q;
+                        sum += q;
+                    }
+
+                    bsums[group] = (short)sum;
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void WriteHalf(byte* dst, float value)
+        {
+            Unsafe.WriteUnaligned(dst, BitConverter.HalfToUInt16Bits((System.Half)value));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static sbyte ClampToInt8(float value)
+        {
+            int rounded = (int)value;
+            if (rounded > 127) return 127;
+            if (rounded < -127) return -127;
+            return (sbyte)rounded;
+        }
+
+        private static unsafe float MaxAbs(float* src, int length)
+        {
+            if (Avx512F.IsSupported && length >= 16)
+            {
+                Vector512<float> max = Vector512<float>.Zero;
+                int i = 0;
+                for (; i <= length - 16; i += 16)
+                    max = Avx512F.Max(max, Vector512.Abs(Avx512F.LoadVector512(src + i)));
+
+                float result = HorizontalMax(max);
+                for (; i < length; i++)
+                {
+                    float abs = MathF.Abs(src[i]);
+                    if (abs > result) result = abs;
+                }
+
+                return result;
+            }
+
+            int vectorSize = Vector<float>.Count;
+            Vector<float> maxVec = Vector<float>.Zero;
+            int j = 0;
+            for (; j <= length - vectorSize; j += vectorSize)
+                maxVec = Vector.Max(maxVec, Vector.Abs(LoadVec(src + j)));
+
+            float maxAbs = 0.0f;
+            for (int lane = 0; lane < Vector<float>.Count; lane++)
+                if (maxVec[lane] > maxAbs) maxAbs = maxVec[lane];
+
+            for (; j < length; j++)
+            {
+                float abs = MathF.Abs(src[j]);
+                if (abs > maxAbs) maxAbs = abs;
+            }
+
+            return maxAbs;
+        }
+
+        private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
+        {
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* q4Block = q4 + block * Q4_0BlockBytes;
+                byte* q8Block = q8 + block * Q8_0BlockBytes;
+                float d4 = HalfToSingle(ReadUInt16(q4Block));
+                float d8 = HalfToSingle(ReadUInt16(q8Block));
+                byte* qs = q4Block + 2;
+                sbyte* qx = (sbyte*)(q8Block + 2);
+
+                int isum = 0;
+                for (int i = 0; i < QK4_0 / 2; i++)
+                {
+                    int low = (qs[i] & 0x0F) - 8;
+                    int high = (qs[i] >> 4) - 8;
+                    isum += low * qx[i] + high * qx[i + QK4_0 / 2];
+                }
+
+                sum += d4 * d8 * isum;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ4_1Q8_1(byte* q4, byte* q8, int blockCount)
+        {
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* q4Block = q4 + block * Q4_1BlockBytes;
+                byte* q8Block = q8 + block * Q8_1BlockBytes;
+                float d4 = HalfToSingle(ReadUInt16(q4Block));
+                float m4 = HalfToSingle(ReadUInt16(q4Block + 2));
+                float d8 = HalfToSingle(ReadUInt16(q8Block));
+                float s8 = HalfToSingle(ReadUInt16(q8Block + 2));
+                byte* qs = q4Block + 4;
+                sbyte* qx = (sbyte*)(q8Block + 4);
+
+                int isum = 0;
+                for (int i = 0; i < QK4_1 / 2; i++)
+                    isum += (qs[i] & 0x0F) * qx[i] + (qs[i] >> 4) * qx[i + QK4_1 / 2];
+
+                sum += d4 * d8 * isum + m4 * s8;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ5_0Q8_0(byte* q5, byte* q8, int blockCount)
+        {
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* q5Block = q5 + block * Q5_0BlockBytes;
+                byte* q8Block = q8 + block * Q8_0BlockBytes;
+                float d5 = HalfToSingle(ReadUInt16(q5Block));
+                float d8 = HalfToSingle(ReadUInt16(q8Block));
+                uint qh = ReadUInt32(q5Block + 2);
+                byte* qs = q5Block + 6;
+                sbyte* qx = (sbyte*)(q8Block + 2);
+
+                int isum = 0;
+                for (int i = 0; i < QK5_0 / 2; i++)
+                {
+                    int xh0 = (int)(((qh >> i) << 4) & 0x10);
+                    int xh1 = (int)((qh >> (i + 12)) & 0x10);
+                    int x0 = ((qs[i] & 0x0F) | xh0) - 16;
+                    int x1 = ((qs[i] >> 4) | xh1) - 16;
+                    isum += x0 * qx[i] + x1 * qx[i + QK5_0 / 2];
+                }
+
+                sum += d5 * d8 * isum;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ5_1Q8_1(byte* q5, byte* q8, int blockCount)
+        {
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* q5Block = q5 + block * Q5_1BlockBytes;
+                byte* q8Block = q8 + block * Q8_1BlockBytes;
+                float d5 = HalfToSingle(ReadUInt16(q5Block));
+                float m5 = HalfToSingle(ReadUInt16(q5Block + 2));
+                uint qh = ReadUInt32(q5Block + 4);
+                byte* qs = q5Block + 8;
+                float d8 = HalfToSingle(ReadUInt16(q8Block));
+                float s8 = HalfToSingle(ReadUInt16(q8Block + 2));
+                sbyte* qx = (sbyte*)(q8Block + 4);
+
+                int isum = 0;
+                for (int i = 0; i < QK5_1 / 2; i++)
+                {
+                    int xh0 = (int)(((qh >> i) << 4) & 0x10);
+                    int xh1 = (int)((qh >> (i + 12)) & 0x10);
+                    int x0 = (qs[i] & 0x0F) | xh0;
+                    int x1 = (qs[i] >> 4) | xh1;
+                    isum += x0 * qx[i] + x1 * qx[i + QK5_1 / 2];
+                }
+
+                sum += d5 * d8 * isum + m5 * s8;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ8_0Q8_0(byte* q8w, byte* q8x, int blockCount)
+        {
+            if (Avx512F.IsSupported && Avx512BW.IsSupported)
+                return VecDotQ8_0Q8_0Avx512(q8w, q8x, blockCount);
+            if (Avx2.IsSupported)
+                return VecDotQ8_0Q8_0Avx2(q8w, q8x, blockCount);
+
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q8w + block * Q8_0BlockBytes;
+                byte* xb = q8x + block * Q8_0BlockBytes;
+                float dw = HalfToSingle(ReadUInt16(wb));
+                float dx = HalfToSingle(ReadUInt16(xb));
+                sbyte* qw = (sbyte*)(wb + 2);
+                sbyte* qx = (sbyte*)(xb + 2);
+
+                int isum = 0;
+                for (int i = 0; i < QK8_0; i++)
+                    isum += qw[i] * qx[i];
+                sum += dw * dx * isum;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ8_1Q8_0(byte* q8w, byte* q8x, int blockCount)
+        {
+            float sum = 0.0f;
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q8w + block * Q8_1BlockBytes;
+                byte* xb = q8x + block * Q8_0BlockBytes;
+                float dw = HalfToSingle(ReadUInt16(wb));
+                float dx = HalfToSingle(ReadUInt16(xb));
+                sbyte* qw = (sbyte*)(wb + 4);
+                sbyte* qx = (sbyte*)(xb + 2);
+
+                int isum = 0;
+                for (int i = 0; i < QK8_1; i++)
+                    isum += qw[i] * qx[i];
+                sum += dw * dx * isum;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ8_0Q8_0Avx512(byte* q8w, byte* q8x, int blockCount)
+        {
+            Vector512<float> acc = Vector512<float>.Zero;
+            Vector512<short> ones = Vector512.Create((short)1);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q8w + block * Q8_0BlockBytes;
+                byte* xb = q8x + block * Q8_0BlockBytes;
+                float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+
+                Vector256<sbyte> qwBytes = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb + 2);
+                Vector256<sbyte> qxBytes = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 2);
+                Vector512<short> qw = Avx512BW.ConvertToVector512Int16(qwBytes);
+                Vector512<short> qx = Avx512BW.ConvertToVector512Int16(qxBytes);
+                Vector512<short> products = Avx512BW.MultiplyLow(qw, qx);
+                Vector512<int> pairSums = Avx512BW.MultiplyAddAdjacent(products, ones);
+                Vector512<float> dotParts = Avx512F.ConvertToVector512Single(pairSums);
+
+                acc = Avx512F.FusedMultiplyAdd(Vector512.Create(scale), dotParts, acc);
+            }
+
+            return HorizontalSum(acc);
+        }
+
+        private static unsafe float VecDotQ8_0Q8_0Avx2(byte* q8w, byte* q8x, int blockCount)
+        {
+            Vector256<float> acc = Vector256<float>.Zero;
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q8w + block * Q8_0BlockBytes;
+                byte* xb = q8x + block * Q8_0BlockBytes;
+                float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+
+                Vector256<sbyte> qw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb + 2);
+                Vector256<sbyte> qx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 2);
+                Vector256<sbyte> absW = Avx2.Sign(qw, qw);
+                Vector256<sbyte> signedX = Avx2.Sign(qx, qw);
+                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absW.AsByte(), signedX);
+                Vector256<int> pairSums = Avx2.MultiplyAddAdjacent(prod, ones);
+                Vector256<float> dotParts = Avx.ConvertToVector256Single(pairSums);
+                acc = Fma.IsSupported
+                    ? Fma.MultiplyAdd(Vector256.Create(scale), dotParts, acc)
+                    : Avx.Add(acc, Avx.Multiply(Vector256.Create(scale), dotParts));
+            }
+
+            return HorizontalSum(acc);
+        }
+
+        private static unsafe float VecDotQ4_KQ8_K(byte* q4k, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            byte* scBuf = stackalloc byte[8];
+            byte* mnBuf = stackalloc byte[8];
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                float d4 = HalfToSingle(ReadUInt16(q4k));
+                float dmin = HalfToSingle(ReadUInt16(q4k + 2));
+                UnpackQ4Q5Scales(q4k + 4, scBuf, mnBuf);
+                byte* qs = q4k + 16;
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int pairIndex = j / 2;
+                    bool highNibble = (j & 1) != 0;
+                    sbyte* q8Vals = q8Values + j * 32;
+                    int prodSum = 0;
+                    for (int i = 0; i < 32; i++)
+                    {
+                        int raw = qs[pairIndex * 32 + i];
+                        int q = highNibble ? raw >> 4 : raw & 0x0F;
+                        prodSum += q * q8Vals[i];
+                    }
+
+                    int q8Sum = bsums[j * 2] + bsums[j * 2 + 1];
+                    sum += d8 * (d4 * scBuf[j] * prodSum - dmin * mnBuf[j] * q8Sum);
+                }
+
+                q4k += Q4_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ5_KQ8_K(byte* q5k, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            byte* scBuf = stackalloc byte[8];
+            byte* mnBuf = stackalloc byte[8];
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                float d5 = HalfToSingle(ReadUInt16(q5k));
+                float dmin = HalfToSingle(ReadUInt16(q5k + 2));
+                UnpackQ4Q5Scales(q5k + 4, scBuf, mnBuf);
+                byte* qh = q5k + 16;
+                byte* qs = q5k + 48;
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int pairIndex = j / 2;
+                    bool highNibble = (j & 1) != 0;
+                    sbyte* q8Vals = q8Values + j * 32;
+                    int prodSum = 0;
+                    for (int i = 0; i < 32; i++)
+                    {
+                        int raw = qs[pairIndex * 32 + i];
+                        int lo4 = highNibble ? raw >> 4 : raw & 0x0F;
+                        int bit5 = (qh[i] >> j) & 1;
+                        prodSum += (lo4 | (bit5 << 4)) * q8Vals[i];
+                    }
+
+                    int q8Sum = bsums[j * 2] + bsums[j * 2 + 1];
+                    sum += d8 * (d5 * scBuf[j] * prodSum - dmin * mnBuf[j] * q8Sum);
+                }
+
+                q5k += Q5_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ6_KQ8_K(byte* q6k, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                byte* ql = q6k;
+                byte* qh = q6k + QK_K / 2;
+                sbyte* scales = (sbyte*)(q6k + QK_K / 2 + QK_K / 4);
+                float d6 = HalfToSingle(ReadUInt16((byte*)(scales + QK_K / 16)));
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                float scaleBase = d6 * d8;
+
+                for (int sub = 0; sub < 16; sub++)
+                {
+                    float scale = scaleBase * scales[sub];
+                    sbyte* q8Vals = q8Values + sub * 16;
+                    int half = sub / 8;
+                    int sh = sub % 8;
+                    int qlOffset = half * 64 + (sh % 4) * 16;
+                    bool isUpper = sh >= 4;
+                    int qhOffset = half * 32 + (sh % 2) * 16;
+                    int qhShift = (sh / 2) * 2;
+
+                    int isum = 0;
+                    for (int i = 0; i < 16; i++)
+                    {
+                        int lo4 = isUpper ? (ql[qlOffset + i] >> 4) & 0x0F : ql[qlOffset + i] & 0x0F;
+                        int hi2 = (qh[qhOffset + i] >> qhShift) & 0x03;
+                        int q6 = (lo4 | (hi2 << 4)) - 32;
+                        isum += q6 * q8Vals[i];
+                    }
+
+                    sum += scale * isum;
+                }
+
+                q6k += Q6_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return sum;
+        }
+
+        private static unsafe void UnpackQ4Q5Scales(byte* packed, byte* scales, byte* mins)
+        {
+            for (int i = 0; i < 8; i++)
+                GetScaleMinK4(i, packed, out scales[i], out mins[i]);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static int GetDotChunkSize(GgmlTensorType type, long remaining)
         {
@@ -630,30 +1340,9 @@ namespace TensorSharp.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe float DotFloat(float* lhs, float* rhs, int length)
         {
-            int vectorSize = Vector<float>.Count;
-            Vector<float> acc0 = Vector<float>.Zero;
-            Vector<float> acc1 = Vector<float>.Zero;
-            int i = 0;
-
-            for (; i <= length - 2 * vectorSize; i += 2 * vectorSize)
-            {
-                acc0 += LoadVec(lhs + i) * LoadVec(rhs + i);
-                acc1 += LoadVec(lhs + i + vectorSize) * LoadVec(rhs + i + vectorSize);
-            }
-
-            Vector<float> acc = acc0 + acc1;
-            for (; i <= length - vectorSize; i += vectorSize)
-            {
-                acc += LoadVec(lhs + i) * LoadVec(rhs + i);
-            }
-
-            float sum = Vector.Sum(acc);
-            for (; i < length; i++)
-            {
-                sum += lhs[i] * rhs[i];
-            }
-
-            return sum;
+            return TensorPrimitives.Dot(
+                new ReadOnlySpan<float>(lhs, length),
+                new ReadOnlySpan<float>(rhs, length));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -672,7 +1361,40 @@ namespace TensorSharp.Models
         private static unsafe double ReadDouble(byte* p) => Unsafe.ReadUnaligned<double>(ref *p);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float ReadSingle(byte* p) => Unsafe.ReadUnaligned<float>(ref *p);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float HalfToSingle(ushort value) => (float)BitConverter.UInt16BitsToHalf(value);
+
+        private static unsafe float HorizontalSum(Vector256<float> v)
+        {
+            float* tmp = stackalloc float[8];
+            Avx.Store(tmp, v);
+            float sum = 0.0f;
+            for (int i = 0; i < 8; i++)
+                sum += tmp[i];
+            return sum;
+        }
+
+        private static unsafe float HorizontalSum(Vector512<float> v)
+        {
+            float* tmp = stackalloc float[16];
+            Avx512F.Store(tmp, v);
+            float sum = 0.0f;
+            for (int i = 0; i < 16; i++)
+                sum += tmp[i];
+            return sum;
+        }
+
+        private static unsafe float HorizontalMax(Vector512<float> v)
+        {
+            float* tmp = stackalloc float[16];
+            Avx512F.Store(tmp, v);
+            float max = tmp[0];
+            for (int i = 1; i < 16; i++)
+                if (tmp[i] > max) max = tmp[i];
+            return max;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float E8M0ToFp32Half(byte value)

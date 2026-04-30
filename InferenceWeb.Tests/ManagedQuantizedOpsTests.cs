@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 
 namespace InferenceWeb.Tests;
 
@@ -193,6 +195,173 @@ public class ManagedQuantizedOpsTests
         Assert.Equal(Dot(dequantized, inputs, 512, 256), actual[2], 5);
     }
 
+    [Fact]
+    public void TryAddmmQuantizedToFloat32_UsesDirectQ80Path()
+    {
+        const int inDim = 64;
+        const int outDim = 5;
+        const int rows = 3;
+
+        float[] weightsF32 = Enumerable.Range(0, outDim * inDim)
+            .Select(i => MathF.Sin(i * 0.07f) * 0.35f)
+            .ToArray();
+        byte[] weightsQ80 = QuantizeRowsQ80(weightsF32, outDim, inDim);
+
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => MathF.Cos(i * 0.11f) * 0.2f)
+            .ToArray();
+        float[] actual = new float[rows * outDim];
+
+        Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            (int)GgmlTensorType.Q8_0,
+            weightsQ80,
+            0,
+            inDim,
+            outDim,
+            input,
+            0,
+            inDim,
+            rows,
+            actual,
+            0,
+            outDim));
+
+        float[] expected = DequantizedMatmul(weightsQ80, GgmlTensorType.Q8_0, outDim, inDim, input, rows);
+        AssertClose(expected, actual, 0.03f);
+    }
+
+    [Fact]
+    public void TryAddmmQuantizedToFloat32_UsesDirectQ4KPath()
+    {
+        const int inDim = 256;
+        const int outDim = 2;
+        const int rows = 2;
+
+        byte[] row = new byte[144];
+        WriteHalf(row, 0, 0.5f);
+        WriteHalf(row, 2, 0.25f);
+        row[4] = 2;
+        row[8] = 1;
+        row[5] = 3;
+        row[9] = 4;
+        row[16] = 0x21;
+        row[48] = 0x34;
+        row[80] = 0x87;
+        row[112] = 0x65;
+
+        byte[] weights = new byte[row.Length * outDim];
+        Buffer.BlockCopy(row, 0, weights, 0, row.Length);
+        Buffer.BlockCopy(row, 0, weights, row.Length, row.Length);
+
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => 0.03f * ((i % 23) - 11))
+            .ToArray();
+        float[] actual = new float[rows * outDim];
+
+        Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            (int)GgmlTensorType.Q4_K,
+            weights,
+            0,
+            inDim,
+            outDim,
+            input,
+            0,
+            inDim,
+            rows,
+            actual,
+            0,
+            outDim));
+
+        float[] expected = DequantizedMatmul(weights, GgmlTensorType.Q4_K, outDim, inDim, input, rows);
+        AssertClose(expected, actual, 0.2f);
+    }
+
+    [Fact]
+    public void Benchmark_Q80DirectMatmul_VsDequantizedBlockDot()
+    {
+        const int inDim = 1024;
+        const int outDim = 256;
+        const int rows = 4;
+        const int warmup = 2;
+        const int iterations = 8;
+
+        float[] weightsF32 = Enumerable.Range(0, outDim * inDim)
+            .Select(i => MathF.Sin(i * 0.013f) * 0.08f)
+            .ToArray();
+        byte[] weightsQ80 = QuantizeRowsQ80(weightsF32, outDim, inDim);
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => MathF.Cos(i * 0.017f) * 0.08f)
+            .ToArray();
+
+        float[] oldPath = new float[rows * outDim];
+        float[] direct = new float[rows * outDim];
+        float[] sums = new float[rows];
+
+        void RunOld()
+        {
+            long rowBytes = NativeDequant.RowSize((int)GgmlTensorType.Q8_0, inDim);
+            for (int col = 0; col < outDim; col++)
+            {
+                ManagedQuantizedOps.DotRowBatchToFloat32(
+                    (int)GgmlTensorType.Q8_0,
+                    weightsQ80,
+                    (int)(col * rowBytes),
+                    input,
+                    0,
+                    inDim,
+                    rows,
+                    inDim,
+                    sums,
+                    0);
+
+                for (int row = 0; row < rows; row++)
+                    oldPath[row * outDim + col] = sums[row];
+            }
+        }
+
+        void RunDirect()
+        {
+            Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+                (int)GgmlTensorType.Q8_0,
+                weightsQ80,
+                0,
+                inDim,
+                outDim,
+                input,
+                0,
+                inDim,
+                rows,
+                direct,
+                0,
+                outDim));
+        }
+
+        for (int i = 0; i < warmup; i++)
+        {
+            RunOld();
+            RunDirect();
+        }
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iterations; i++)
+            RunOld();
+        double oldMs = sw.Elapsed.TotalMilliseconds;
+
+        sw.Restart();
+        for (int i = 0; i < iterations; i++)
+            RunDirect();
+        double directMs = sw.Elapsed.TotalMilliseconds;
+
+        float maxDiff = MaxAbsDiff(oldPath, direct);
+        Console.WriteLine(
+            $"[ManagedQuantizedOps Q8_0] dequant-block: {oldMs / iterations:F3} ms/iter, " +
+            $"direct-int8: {directMs / iterations:F3} ms/iter, " +
+            $"speedup: {oldMs / directMs:F2}x, max diff: {maxDiff:E3}, " +
+            $"AVX512F={Avx512F.IsSupported}, AVX512BW={Avx512BW.IsSupported}");
+
+        Assert.True(maxDiff < 0.08f, $"Direct quantized path drifted too far from dequantized reference: {maxDiff}");
+    }
+
     private static void WriteHalf(byte[] buffer, int offset, float value)
     {
         BinaryPrimitives.WriteUInt16LittleEndian(
@@ -209,5 +378,76 @@ public class ManagedQuantizedOpsTests
         }
 
         return sum;
+    }
+
+    private static byte[] QuantizeRowsQ80(float[] values, int rows, int cols)
+    {
+        const int blockSize = 32;
+        const int blockBytes = 34;
+        Assert.Equal(0, cols % blockSize);
+
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int row = 0; row < rows; row++)
+        {
+            for (int block = 0; block < blocksPerRow; block++)
+            {
+                int srcOffset = row * cols + block * blockSize;
+                int dstOffset = row * blocksPerRow * blockBytes + block * blockBytes;
+                float maxAbs = 0.0f;
+                for (int i = 0; i < blockSize; i++)
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(values[srcOffset + i]));
+
+                float scale = maxAbs / 127.0f;
+                WriteHalf(raw, dstOffset, scale);
+                if (scale == 0.0f)
+                    continue;
+
+                float invScale = 1.0f / scale;
+                for (int i = 0; i < blockSize; i++)
+                {
+                    int q = (int)MathF.Round(values[srcOffset + i] * invScale);
+                    q = Math.Clamp(q, -127, 127);
+                    raw[dstOffset + 2 + i] = unchecked((byte)(sbyte)q);
+                }
+            }
+        }
+
+        return raw;
+    }
+
+    private static float[] DequantizedMatmul(byte[] weights, GgmlTensorType type, int outDim, int inDim, float[] input, int rows)
+    {
+        long rowBytes = NativeDequant.RowSize((int)type, inDim);
+        float[] expected = new float[rows * outDim];
+        float[] weightRow = new float[inDim];
+        for (int col = 0; col < outDim; col++)
+        {
+            NativeDequant.DequantizeToFloat32((int)type, weights, (int)(col * rowBytes), weightRow, 0, inDim);
+            for (int row = 0; row < rows; row++)
+                expected[row * outDim + col] = Dot(weightRow, input, row * inDim, inDim);
+        }
+
+        return expected;
+    }
+
+    private static void AssertClose(float[] expected, float[] actual, float tolerance)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.True(
+                MathF.Abs(expected[i] - actual[i]) <= tolerance,
+                $"index {i}: expected {expected[i]}, observed {actual[i]}, tolerance {tolerance}");
+        }
+    }
+
+    private static float MaxAbsDiff(float[] expected, float[] actual)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        float max = 0.0f;
+        for (int i = 0; i < expected.Length; i++)
+            max = MathF.Max(max, MathF.Abs(expected[i] - actual[i]));
+        return max;
     }
 }

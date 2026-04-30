@@ -937,6 +937,21 @@ namespace TensorSharp.Models
             float* resultPtr = GetFloatPtr(result);
             byte* weightBase = (byte*)weight.Data.ToPointer();
 
+            if (ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+                weight.GgmlType,
+                weight.Data,
+                weight.Ne0,
+                weight.Ne1,
+                inputPtr,
+                inDim,
+                seqLen,
+                resultPtr,
+                outDim))
+            {
+                InvalidateTensorDeviceCache(result);
+                return;
+            }
+
             void RunRange(int start, int end, float* sums)
             {
                 for (int col = start; col < end; col++)
