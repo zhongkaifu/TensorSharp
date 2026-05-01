@@ -85,7 +85,6 @@ namespace TensorSharp.Cuda
                 cPtr,
                 ldc).ThrowOnCublasError();
 
-            allocator.Stream.Synchronize();
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -153,30 +152,30 @@ namespace TensorSharp.Cuda
 
             int ldb = shared;
             int ldc = cols;
-            for (int b = 0; b < batch; b++)
-            {
-                IntPtr aPtr = m2Storage.DevicePtrAtElement(m2.StorageOffset + b * m2.Strides[0]);
-                IntPtr bPtr = m1Storage.DevicePtrAtElement(m1.StorageOffset + b * m1.Strides[0]);
-                IntPtr cPtr = resultStorage.DevicePtrAtElement(result.StorageOffset + b * result.Strides[0]);
+            IntPtr aPtr = m2Storage.DevicePtrAtElement(m2.StorageOffset);
+            IntPtr bPtr = m1Storage.DevicePtrAtElement(m1.StorageOffset);
+            IntPtr cPtr = resultStorage.DevicePtrAtElement(result.StorageOffset);
 
-                CublasApi.cublasSgemm(
-                    allocator.Blas.Handle,
-                    transa,
-                    CublasApi.CUBLAS_OP_N,
-                    cols,
-                    rows,
-                    shared,
-                    ref alpha,
-                    aPtr,
-                    lda,
-                    bPtr,
-                    ldb,
-                    ref beta,
-                    cPtr,
-                    ldc).ThrowOnCublasError();
-            }
+            CublasApi.cublasSgemmStridedBatched(
+                allocator.Blas.Handle,
+                transa,
+                CublasApi.CUBLAS_OP_N,
+                cols,
+                rows,
+                shared,
+                ref alpha,
+                aPtr,
+                lda,
+                checked(m2.Strides[0]),
+                bPtr,
+                ldb,
+                checked(m1.Strides[0]),
+                ref beta,
+                cPtr,
+                ldc,
+                checked(result.Strides[0]),
+                batch).ThrowOnCublasError();
 
-            allocator.Stream.Synchronize();
             resultStorage.MarkDeviceModified();
             return true;
         }

@@ -346,6 +346,42 @@ public class CudaBackendTests
         }
     }
 
+    [Fact]
+    public void CudaQuantizedMatmul_Q4_0WithMultipleOutputColumns_MatchesDequantizedReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 64;
+        const int outDim = 7;
+        const int rows = 3;
+        byte[] weights = CreateQ4_0Rows(outDim, inDim, (r, c) => (sbyte)(((r * 5 + c * 3) % 16) - 8), r => 0.125f + r * 0.03125f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.037f) * 0.75f;
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, inputTensor, host, host, 2, inDim, outDim, weights.Length));
+
+            float[] expected = DequantizedMatmulQ40(weights, outDim, inDim, input, rows);
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), 1e-3f);
+
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
     private static float[] SoftmaxRow(params float[] values)
     {
         float max = values.Max();
@@ -390,6 +426,30 @@ public class CudaBackendTests
         return data;
     }
 
+    private static byte[] CreateQ4_0Rows(int rows, int cols, Func<int, int, sbyte> value, Func<int, float> scale)
+    {
+        int blocks = cols / 32;
+        byte[] data = new byte[rows * blocks * 18];
+        for (int row = 0; row < rows; row++)
+        {
+            for (int block = 0; block < blocks; block++)
+            {
+                int offset = (row * blocks + block) * 18;
+                ushort scaleBits = BitConverter.HalfToUInt16Bits((System.Half)scale(row));
+                data[offset] = (byte)(scaleBits & 0xFF);
+                data[offset + 1] = (byte)(scaleBits >> 8);
+                for (int i = 0; i < 16; i++)
+                {
+                    int low = value(row, block * 32 + i) + 8;
+                    int high = value(row, block * 32 + i + 16) + 8;
+                    data[offset + 2 + i] = (byte)(low | (high << 4));
+                }
+            }
+        }
+
+        return data;
+    }
+
     private static float[] DequantizedMatmulQ80(byte[] weights, int outDim, int inDim, float[,] input, int rows)
     {
         int blocks = inDim / 32;
@@ -407,6 +467,34 @@ public class CudaBackendTests
                     {
                         sbyte q = unchecked((sbyte)weights[offset + 2 + i]);
                         sum += scale * q * input[r, block * 32 + i];
+                    }
+                }
+                expected[r * outDim + o] = sum;
+            }
+        }
+        return expected;
+    }
+
+    private static float[] DequantizedMatmulQ40(byte[] weights, int outDim, int inDim, float[,] input, int rows)
+    {
+        int blocks = inDim / 32;
+        float[] expected = new float[rows * outDim];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int o = 0; o < outDim; o++)
+            {
+                float sum = 0;
+                for (int block = 0; block < blocks; block++)
+                {
+                    int offset = (o * blocks + block) * 18;
+                    float scale = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset] | (weights[offset + 1] << 8)));
+                    for (int i = 0; i < 16; i++)
+                    {
+                        byte packed = weights[offset + 2 + i];
+                        int low = (packed & 0x0F) - 8;
+                        int high = (packed >> 4) - 8;
+                        sum += scale * low * input[r, block * 32 + i];
+                        sum += scale * high * input[r, block * 32 + i + 16];
                     }
                 }
                 expected[r * outDim + o] = sum;

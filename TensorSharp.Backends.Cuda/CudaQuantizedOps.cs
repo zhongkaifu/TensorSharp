@@ -129,15 +129,33 @@ namespace TensorSharp.Cuda
             DeviceWeight weight = EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             inputStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchQuantMatmulF32(
-                weight.DevicePtr,
-                inputPtr,
-                resultPtr,
-                ggmlType,
-                checked((int)ne0),
-                checked((int)ne1),
-                checked((int)input.Sizes[0]),
-                allocator.Stream.Handle);
+            int inDim = checked((int)ne0);
+            int outDim = checked((int)ne1);
+            int rows = checked((int)input.Sizes[0]);
+            if (ggmlType == 8)
+            {
+                kernels.LaunchQuantMatmulQ80F32(
+                    weight.DevicePtr,
+                    inputPtr,
+                    resultPtr,
+                    inDim,
+                    outDim,
+                    rows,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchQuantMatmulF32(
+                    weight.DevicePtr,
+                    inputPtr,
+                    resultPtr,
+                    ggmlType,
+                    inDim,
+                    outDim,
+                    rows,
+                    allocator.Stream.Handle);
+            }
+
             resultStorage.MarkDeviceModified();
             return true;
         }

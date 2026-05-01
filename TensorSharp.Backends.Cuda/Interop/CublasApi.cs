@@ -36,6 +36,27 @@ namespace TensorSharp.Cuda.Interop
             IntPtr c,
             int ldc);
 
+        [DllImport(LibName)]
+        public static extern int cublasSgemmStridedBatched(
+            IntPtr handle,
+            int transa,
+            int transb,
+            int m,
+            int n,
+            int k,
+            ref float alpha,
+            IntPtr a,
+            int lda,
+            long strideA,
+            IntPtr b,
+            int ldb,
+            long strideB,
+            ref float beta,
+            IntPtr c,
+            int ldc,
+            long strideC,
+            int batchCount);
+
         public const int CUBLAS_OP_N = 0;
         public const int CUBLAS_OP_T = 1;
         public const int CUBLAS_TENSOR_OP_MATH = 1;
