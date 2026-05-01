@@ -21,6 +21,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr softmaxF32;
         private readonly IntPtr scaledDotProductAttentionF32;
+        private readonly IntPtr gqaPrefillAttentionF32;
         private readonly IntPtr indexSelectF32;
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
@@ -45,6 +46,7 @@ namespace TensorSharp.Cuda
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
+            gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
@@ -227,6 +229,41 @@ namespace TensorSharp.Cuda
                 &seqKArg, &headsArg, &keyDimArg, &valueDimArg, &scaleArg, &hasMaskArg
             };
             Launch(scaledDotProductAttentionF32, (uint)(batch * heads), (uint)seqQ, 1, BlockSize, 1, 1, (uint)(seqK * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaPrefillAttentionF32(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg
+            };
+            Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
 
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)

@@ -10,6 +10,7 @@ namespace TensorSharp.Cuda
         private readonly object sync = new object();
         private IntPtr hostBuffer;
         private IntPtr deviceBuffer;
+        private long deviceAllocationBytes;
         private bool hostDirty;
         private bool deviceDirty;
 
@@ -20,15 +21,8 @@ namespace TensorSharp.Cuda
             if (ByteLength < 0)
                 throw new ArgumentOutOfRangeException(nameof(elementCount));
 
-            long allocationSize = Math.Max(ByteLength, 1);
-            hostBuffer = (IntPtr)NativeMemory.AlignedAlloc((nuint)allocationSize, 64);
-            if (hostBuffer == IntPtr.Zero)
-                throw new OutOfMemoryException($"Failed to allocate {allocationSize} bytes of CUDA host mirror memory.");
-
             AllocatorImpl.Context.MakeCurrent();
-            CudaDriverApi.cuMemAlloc(out deviceBuffer, new UIntPtr((ulong)allocationSize)).ThrowOnError();
-            CudaDriverApi.cuMemsetD8(deviceBuffer, 0, new UIntPtr((ulong)allocationSize)).ThrowOnError();
-            deviceDirty = true;
+            deviceBuffer = AllocatorImpl.RentDeviceMemory(ByteLength, out deviceAllocationBytes);
         }
 
         internal CudaAllocator AllocatorImpl { get; }
@@ -44,8 +38,9 @@ namespace TensorSharp.Cuda
                 if (deviceBuffer != IntPtr.Zero)
                 {
                     AllocatorImpl.Context.MakeCurrent();
-                    CudaDriverApi.cuMemFree(deviceBuffer);
+                    AllocatorImpl.ReturnDeviceMemory(deviceBuffer, deviceAllocationBytes);
                     deviceBuffer = IntPtr.Zero;
+                    deviceAllocationBytes = 0;
                 }
 
                 if (hostBuffer != IntPtr.Zero)

@@ -514,6 +514,57 @@ public class CudaBackendTests
         AssertClose(expected, actual, 1e-5f);
     }
 
+    [Fact]
+    public void CudaGqaPrefillAttention_WithWindowMatchesReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int seqLen = 3;
+        const int kvLen = 5;
+        const int headDim = 5;
+        const int maskStart = kvLen - seqLen;
+        const int windowSize = 3;
+
+        float[,,] q = new float[numQHeads, seqLen, headDim];
+        float[,,] k = new float[numKVHeads, kvLen, headDim];
+        float[,,] v = new float[numKVHeads, kvLen, headDim];
+
+        for (int h = 0; h < numQHeads; h++)
+            for (int t = 0; t < seqLen; t++)
+                for (int d = 0; d < headDim; d++)
+                    q[h, t, d] = MathF.Sin((h + 1) * (t + 2) * (d + 3) * 0.037f);
+
+        for (int h = 0; h < numKVHeads; h++)
+        {
+            for (int t = 0; t < kvLen; t++)
+            {
+                for (int d = 0; d < headDim; d++)
+                {
+                    k[h, t, d] = MathF.Cos((h + 2) * (t + 1) * (d + 1) * 0.041f);
+                    v[h, t, d] = MathF.Sin((h + 3) * (t + 2) * (d + 1) * 0.029f) * 0.5f;
+                }
+            }
+        }
+
+        using var allocator = new CudaAllocator();
+        using var qTensor = Tensor.FromArray(allocator, q);
+        using var kTensor = Tensor.FromArray(allocator, k);
+        using var vTensor = Tensor.FromArray(allocator, v);
+        using var actualTensor = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+
+        Assert.True(CudaFusedOps.TryGqaPrefillAttention(
+            actualTensor, qTensor, kTensor, vTensor,
+            numQHeads, numKVHeads, headDim,
+            seqLen, kvLen,
+            maskStart, windowSize, 1.0f));
+
+        float[] expected = GqaPrefillAttentionReference(q, k, v, numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize);
+        AssertClose(expected, actualTensor.GetElementsAsFloat(seqLen * numQHeads * headDim), 1e-5f);
+    }
+
     private static float[] SoftmaxRow(params float[] values)
     {
         float max = values.Max();
@@ -676,6 +727,65 @@ public class CudaBackendTests
                             acc += scores[tk] / sum * v[b, tk, h, d];
                         result[((b * seqQ + tq) * heads + h) * valueDim + d] = acc;
                     }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static float[] GqaPrefillAttentionReference(
+        float[,,] q,
+        float[,,] k,
+        float[,,] v,
+        int numQHeads,
+        int numKVHeads,
+        int seqLen,
+        int kvLen,
+        int headDim,
+        int maskStart,
+        int windowSize)
+    {
+        int groupSize = numQHeads / numKVHeads;
+        float[] result = new float[seqLen * numQHeads * headDim];
+
+        for (int h = 0; h < numQHeads; h++)
+        {
+            int kvHead = h / groupSize;
+            for (int tq = 0; tq < seqLen; tq++)
+            {
+                int visible = maskStart + tq;
+                int minVisible = windowSize > 0 ? Math.Max(0, visible - windowSize + 1) : 0;
+                float[] scores = new float[kvLen];
+                float max = float.NegativeInfinity;
+                for (int tk = 0; tk < kvLen; tk++)
+                {
+                    if (tk > visible || tk < minVisible)
+                    {
+                        scores[tk] = 0;
+                        continue;
+                    }
+
+                    float dot = 0;
+                    for (int d = 0; d < headDim; d++)
+                        dot += q[h, tq, d] * k[kvHead, tk, d];
+                    scores[tk] = dot;
+                    max = MathF.Max(max, dot);
+                }
+
+                float sum = 0;
+                for (int tk = minVisible; tk <= visible; tk++)
+                {
+                    scores[tk] = MathF.Exp(scores[tk] - max);
+                    sum += scores[tk];
+                }
+
+                for (int d = 0; d < headDim; d++)
+                {
+                    float acc = 0;
+                    for (int tk = minVisible; tk <= visible; tk++)
+                        acc += scores[tk] / sum * v[kvHead, tk, d];
+                    result[(tq * numQHeads + h) * headDim + d] = acc;
                 }
             }
         }

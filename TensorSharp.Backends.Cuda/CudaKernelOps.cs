@@ -412,6 +412,78 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryGqaPrefillAttention(
+            Tensor result,
+            Tensor query,
+            Tensor key,
+            Tensor value,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            int maskStart,
+            int windowSize,
+            float scale)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out _) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out _) ||
+                !TryGetContiguousFloat(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
+                !TryGetContiguousFloat(value, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                query.DimensionCount != 3 ||
+                key.DimensionCount != 3 ||
+                value.DimensionCount != 3 ||
+                result.DimensionCount != 2 ||
+                numQHeads <= 0 ||
+                numKVHeads <= 0 ||
+                headDim <= 0 ||
+                seqLen <= 0 ||
+                kvLen <= 0 ||
+                kvLen > 8192 ||
+                numQHeads % numKVHeads != 0 ||
+                query.Sizes[0] != numQHeads ||
+                query.Sizes[1] != seqLen ||
+                query.Sizes[2] != headDim ||
+                key.Sizes[0] != numKVHeads ||
+                key.Sizes[1] != kvLen ||
+                key.Sizes[2] != headDim ||
+                value.Sizes[0] != numKVHeads ||
+                value.Sizes[1] != kvLen ||
+                value.Sizes[2] != headDim ||
+                result.Sizes[0] != seqLen ||
+                result.Sizes[1] != numQHeads * headDim ||
+                maskStart < 0 ||
+                maskStart >= kvLen)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchGqaPrefillAttentionF32(
+                queryPtr,
+                keyPtr,
+                valuePtr,
+                resultPtr,
+                numQHeads,
+                numKVHeads,
+                seqLen,
+                kvLen,
+                headDim,
+                maskStart,
+                windowSize,
+                scale,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryIndexSelect(Tensor result, Tensor src, Tensor indices, bool isAdd)
         {
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||

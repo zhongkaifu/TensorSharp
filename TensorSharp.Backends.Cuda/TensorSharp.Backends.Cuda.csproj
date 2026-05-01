@@ -16,7 +16,13 @@
   <PropertyGroup>
     <CudaKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'kernels'))</CudaKernelDir>
     <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'ptx'))</PtxOutputDir>
-    <CudaArch>compute_61</CudaArch>
+    <CudaPtxStampDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ptx'))</CudaPtxStampDir>
+    <CudaArch Condition="'$(CudaArch)' == '' And '$(TENSORSHARP_CUDA_ARCH)' != ''">$(TENSORSHARP_CUDA_ARCH)</CudaArch>
+    <CudaArch Condition="'$(CudaArch)' == ''">auto</CudaArch>
+    <CudaArchFallback Condition="'$(CudaArchFallback)' == ''">compute_61</CudaArchFallback>
+    <CudaNvccOptimizationFlags Condition="'$(CudaNvccOptimizationFlags)' == ''">-O3 --extra-device-vectorization</CudaNvccOptimizationFlags>
+    <CudaEnableFastMath Condition="'$(CudaEnableFastMath)' == ''">false</CudaEnableFastMath>
+    <CudaFastMathFlag Condition="'$(CudaEnableFastMath)' == 'true' Or '$(CudaEnableFastMath)' == 'True'">--use_fast_math</CudaFastMathFlag>
   </PropertyGroup>
 
   <ItemGroup>
@@ -28,13 +34,29 @@
     </Content>
   </ItemGroup>
 
-  <Target Name="CompileCudaPtx"
-          BeforeTargets="BeforeBuild"
-          Inputs="@(CudaKernel)"
-          Outputs="@(CudaKernel->'$(PtxOutputDir)\%(Filename).ptx')">
+  <Target Name="ResolveCudaPtxBuildSettings">
     <Exec Command="nvcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_NvccExitCode" />
     </Exec>
+    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native')"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\native\resolve-cuda-arch.ps1&quot; -FallbackArch &quot;$(CudaArchFallback)&quot;"
+          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
+    </Exec>
+    <PropertyGroup Condition="'$(_NvccExitCode)' == '0'">
+      <_ResolvedCudaArch Condition="'$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native'">$(CudaArch)</_ResolvedCudaArch>
+      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == '' And '$(_DetectedCudaArch)' != ''">$(_DetectedCudaArch.Trim())</_ResolvedCudaArch>
+      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == ''">$(CudaArchFallback)</_ResolvedCudaArch>
+      <_CudaBuildSettingsKey>$(_ResolvedCudaArch.Replace('compute_', 'compute_').Replace('sm_', 'sm_'))_$(CudaNvccOptimizationFlags.Replace(' ', '_').Replace('-', ''))$(CudaFastMathFlag.Replace(' ', '_').Replace('-', ''))</_CudaBuildSettingsKey>
+    </PropertyGroup>
+    <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
+  </Target>
+
+  <Target Name="CompileCudaPtx"
+          BeforeTargets="BeforeBuild"
+          DependsOnTargets="ResolveCudaPtxBuildSettings"
+          Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(MSBuildProjectDirectory)\native\resolve-cuda-arch.ps1"
+          Outputs="@(CudaKernel->'$(PtxOutputDir)\%(Filename).ptx');$(CudaPtxStampDir)\tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="WARNING: TensorSharp CUDA kernels were not compiled because nvcc was not found. The CUDA backend will keep CPU fallbacks for PTX-backed ops." />
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
@@ -42,18 +64,22 @@
     </PropertyGroup>
     <Exec Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(_CompilerBinDir)' == ''"
           Command="for /f &quot;delims=&quot; %%i in ('&quot;%25ProgramFiles(x86)%25\Microsoft Visual Studio\Installer\vswhere.exe&quot; -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe') do @echo %%~dpi"
-          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardErrorImportance="low">
+          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_ClExeDir" />
     </Exec>
     <PropertyGroup Condition="'$(_CompilerBinDir)' == '' And '$(_ClExeDir)' != ''">
       <_ClExeDirClean>$(_ClExeDir.Trim().TrimEnd('\'))</_ClExeDirClean>
       <_CompilerBinDir>--compiler-bindir=&quot;$(_ClExeDirClean)&quot;</_CompilerBinDir>
     </PropertyGroup>
-    <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
-    <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
+    <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir);$(CudaPtxStampDir)" />
+    <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX for $(_ResolvedCudaArch)" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)\%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)\%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
+    <WriteLinesToFile Condition="'$(_NvccExitCode)' == '0'"
+                      File="$(CudaPtxStampDir)\tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp"
+                      Lines="arch=$(_ResolvedCudaArch);flags=$(CudaNvccOptimizationFlags) $(CudaFastMathFlag)"
+                      Overwrite="true" />
   </Target>
 
   <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx">

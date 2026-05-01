@@ -2095,13 +2095,12 @@ namespace TensorSharp.Models
                 bool useWindowedAttn = isLocal && kvIsSeqHeads && seqLen > _slidingWindow * 4;
 
                 // Fused prefill attention: run Q*K^T → mask → softmax → *V as a
-                // single GGML graph on the device, eliminating ~5 separate dispatches.
-                // Only for GGML backends and when there are no special mask exceptions
-                // (multimodal bidirectional tokens).
-                bool useFusedPrefillAttn = IsGgmlBackend && !useWindowedAttn
-                    && kvIsSeqHeads && exceptPositions == null;
+                // a fused backend kernel where available, eliminating several dispatches
+                // when there are no special mask exceptions (multimodal tokens).
+                bool canUseFusedPrefillAttn = !useWindowedAttn && kvIsSeqHeads && exceptPositions == null;
+                result = null;
 
-                if (useFusedPrefillAttn)
+                if (IsGgmlBackend && canUseFusedPrefillAttn)
                 {
                     int windowSize = isLocal ? _slidingWindow : 0;
                     int maskStart = kvLen - seqLen;
@@ -2115,13 +2114,33 @@ namespace TensorSharp.Models
                         maskStart, windowSize, 1.0f);
                     qHeads.Dispose();
                 }
-                else if (useWindowedAttn)
+                else if (_backend == BackendType.Cuda && canUseFusedPrefillAttn)
+                {
+                    int windowSize = isLocal ? _slidingWindow : 0;
+                    int maskStart = kvLen - seqLen;
+                    var fusedResult = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                    if (CudaFusedOps.TryGqaPrefillAttention(
+                        fusedResult, qHeads, kvSrcK, kvSrcV,
+                        Config.NumHeads, kvHeads, hd,
+                        seqLen, kvLen,
+                        maskStart, windowSize, 1.0f))
+                    {
+                        result = fusedResult;
+                        qHeads.Dispose();
+                    }
+                    else
+                    {
+                        fusedResult.Dispose();
+                    }
+                }
+
+                if (result == null && useWindowedAttn)
                 {
                     result = WindowedPrefillAttention(qHeads, kvSrcK, kvSrcV,
                         Config.NumHeads, kvHeads, seqLen, hd);
                     qHeads.Dispose();
                 }
-                else
+                else if (result == null)
                 {
                     Tensor kExpanded = ExpandKVHeads(kvSrcK, groupSize, kvLen);
                     Tensor vExpanded = ExpandKVHeads(kvSrcV, groupSize, kvLen);
