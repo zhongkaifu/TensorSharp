@@ -37,6 +37,15 @@ namespace TensorSharp.Cuda.Interop
         [DllImport(LibName)]
         public static extern int cuCtxSetCurrent(IntPtr ctx);
 
+        [DllImport(LibName)]
+        public static extern int cuCtxGetCurrent(out IntPtr ctx);
+
+        [DllImport(LibName)]
+        public static extern int cuDevicePrimaryCtxRetain(out IntPtr ctx, int device);
+
+        [DllImport(LibName)]
+        public static extern int cuDevicePrimaryCtxRelease(int device);
+
         [DllImport(LibName, EntryPoint = "cuMemAlloc_v2")]
         public static extern int cuMemAlloc(out IntPtr devicePtr, UIntPtr byteSize);
 

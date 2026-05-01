@@ -18,8 +18,16 @@ namespace TensorSharp.Cuda
         public static CudaCublasHandle Create()
         {
             CublasApi.cublasCreate(out IntPtr handle).ThrowOnCublasError();
-            CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH).ThrowOnCublasError();
-            return new CudaCublasHandle(handle);
+            try
+            {
+                CublasApi.cublasSetMathMode(handle, CublasApi.CUBLAS_TENSOR_OP_MATH).ThrowOnCublasError();
+                return new CudaCublasHandle(handle);
+            }
+            catch
+            {
+                CublasApi.cublasDestroy(handle);
+                throw;
+            }
         }
 
         public void SetStream(IntPtr stream)

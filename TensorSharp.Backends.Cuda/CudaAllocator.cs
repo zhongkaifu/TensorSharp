@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
@@ -6,15 +7,39 @@ namespace TensorSharp.Cuda
     [Serializable]
     public sealed class CudaAllocator : IAllocator, IDisposable
     {
+        private int disposed;
+
         public CudaAllocator(int deviceId = 0)
         {
             CudaBackend.Register();
-            Context = CudaContext.Create(deviceId);
-            Context.MakeCurrent();
-            Stream = CudaStream.Create();
-            Blas = CudaCublasHandle.Create();
-            Blas.SetStream(Stream.Handle);
-            Kernels = CudaKernels.TryCreate();
+
+            CudaContext context = null;
+            CudaStream stream = null;
+            CudaCublasHandle blas = null;
+            CudaKernels kernels = null;
+
+            try
+            {
+                context = CudaContext.Create(deviceId);
+                context.MakeCurrent();
+                stream = CudaStream.Create();
+                blas = CudaCublasHandle.Create();
+                blas.SetStream(stream.Handle);
+                kernels = CudaKernels.TryCreate();
+            }
+            catch
+            {
+                kernels?.Dispose();
+                blas?.Dispose();
+                stream?.Dispose();
+                context?.Dispose();
+                throw;
+            }
+
+            Context = context;
+            Stream = stream;
+            Blas = blas;
+            Kernels = kernels;
             DeviceId = deviceId;
         }
 
@@ -55,6 +80,10 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+
+            Context.MakeCurrent();
             Kernels?.Dispose();
             Blas.Dispose();
             Stream.Dispose();

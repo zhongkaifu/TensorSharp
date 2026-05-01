@@ -52,10 +52,12 @@ namespace TensorSharp.Cuda.Interop
                 yield break;
             }
 
-            yield return "libcublas.so";
-            yield return "libcublas.so.13";
+            // Prefer versioned runtime libraries; unversioned symlinks can point
+            // at stubs or a different toolkit than the native GGML bridge uses.
             yield return "libcublas.so.12";
+            yield return "libcublas.so.13";
             yield return "libcublas.so.11";
+            yield return "libcublas.so";
         }
 
         private static void EnsureWindowsCudaPath()
