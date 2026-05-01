@@ -26,6 +26,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
         private readonly IntPtr quantMatmulF32;
+        private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ80F32;
         private readonly IntPtr quantGetRowsF32;
 
@@ -49,6 +50,7 @@ namespace TensorSharp.Cuda
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
+            quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
         }
@@ -324,6 +326,19 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
             Launch(quantMatmulF32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQuantMatmulQ40F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + 3) / 4);
+            Launch(quantMatmulQ40F32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantMatmulQ80F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)

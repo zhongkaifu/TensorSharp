@@ -28,7 +28,7 @@ namespace TensorSharp.Cuda
             AllocatorImpl.Context.MakeCurrent();
             CudaDriverApi.cuMemAlloc(out deviceBuffer, new UIntPtr((ulong)allocationSize)).ThrowOnError();
             CudaDriverApi.cuMemsetD8(deviceBuffer, 0, new UIntPtr((ulong)allocationSize)).ThrowOnError();
-            NativeMemory.Clear(hostBuffer.ToPointer(), (nuint)allocationSize);
+            deviceDirty = true;
         }
 
         internal CudaAllocator AllocatorImpl { get; }
@@ -93,7 +93,11 @@ namespace TensorSharp.Cuda
                     return;
 
                 AllocatorImpl.Context.MakeCurrent();
-                CudaDriverApi.cuMemcpyHtoD(deviceBuffer, hostBuffer, new UIntPtr((ulong)ByteLength)).ThrowOnError();
+                CudaDriverApi.cuMemcpyHtoDAsync(
+                    deviceBuffer,
+                    hostBuffer,
+                    new UIntPtr((ulong)ByteLength),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
                 hostDirty = false;
                 deviceDirty = false;
             }
@@ -117,9 +121,14 @@ namespace TensorSharp.Cuda
                 if (!deviceDirty)
                     return;
 
+                EnsureHostBuffer();
                 AllocatorImpl.Context.MakeCurrent();
+                CudaDriverApi.cuMemcpyDtoHAsync(
+                    hostBuffer,
+                    deviceBuffer,
+                    new UIntPtr((ulong)ByteLength),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
                 AllocatorImpl.Stream.Synchronize();
-                CudaDriverApi.cuMemcpyDtoH(hostBuffer, deviceBuffer, new UIntPtr((ulong)ByteLength)).ThrowOnError();
                 deviceDirty = false;
                 hostDirty = false;
             }
@@ -132,10 +141,41 @@ namespace TensorSharp.Cuda
             if (src.ByteLength != ByteLength)
                 throw new ArgumentException("CUDA device copy requires equal byte lengths.", nameof(src));
 
+            CopyDeviceFrom(src, 0, 0, ByteLength);
+        }
+
+        internal void CopyDeviceFrom(CudaStorage src, long destinationByteOffset, long sourceByteOffset, long byteCount)
+        {
+            if (src == null)
+                throw new ArgumentNullException(nameof(src));
+            if (destinationByteOffset < 0 || sourceByteOffset < 0 || byteCount < 0 ||
+                destinationByteOffset + byteCount > ByteLength ||
+                sourceByteOffset + byteCount > src.ByteLength)
+            {
+                throw new ArgumentOutOfRangeException(nameof(byteCount));
+            }
+
+            if (byteCount == 0)
+                return;
+
             src.EnsureDeviceCurrent();
-            src.SynchronizeDeviceWork();
             AllocatorImpl.Context.MakeCurrent();
-            CudaDriverApi.cuMemcpyDtoD(deviceBuffer, src.deviceBuffer, new UIntPtr((ulong)ByteLength)).ThrowOnError();
+            IntPtr dst = AddBytes(deviceBuffer, destinationByteOffset);
+            IntPtr source = AddBytes(src.deviceBuffer, sourceByteOffset);
+            if (ReferenceEquals(AllocatorImpl, src.AllocatorImpl))
+            {
+                CudaDriverApi.cuMemcpyDtoDAsync(
+                    dst,
+                    source,
+                    new UIntPtr((ulong)byteCount),
+                    AllocatorImpl.Stream.Handle).ThrowOnError();
+            }
+            else
+            {
+                src.SynchronizeDeviceWork();
+                CudaDriverApi.cuMemcpyDtoD(dst, source, new UIntPtr((ulong)byteCount)).ThrowOnError();
+            }
+
             MarkDeviceModified();
         }
 
@@ -169,6 +209,7 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException("Element type " + ElementType + " not supported");
 
             ValidateElementRange(index, value.Length);
+            EnsureHostBuffer();
             int* target = (int*)HostPtrAtElementUnchecked(index).ToPointer();
             for (int i = 0; i < value.Length; i++)
                 target[i] = value[i];
@@ -210,6 +251,7 @@ namespace TensorSharp.Cuda
         public override void SetElementAsFloat(long index, float value)
         {
             ValidateElementRange(index, 1);
+            EnsureHostBuffer();
             switch (ElementType)
             {
                 case DType.Float32:
@@ -240,6 +282,7 @@ namespace TensorSharp.Cuda
                 throw new NotSupportedException("Element type " + ElementType + " not supported");
 
             ValidateElementRange(index, value.Length);
+            EnsureHostBuffer();
             float* target = (float*)HostPtrAtElementUnchecked(index).ToPointer();
             for (int i = 0; i < value.Length; i++)
                 target[i] = value[i];
@@ -259,6 +302,7 @@ namespace TensorSharp.Cuda
                 throw new ArgumentNullException(nameof(src));
 
             ValidateByteRange(storageIndex, byteCount);
+            EnsureHostBuffer();
             Buffer.MemoryCopy(src.ToPointer(), HostPtrAtElementUnchecked(storageIndex).ToPointer(), byteCount, byteCount);
             hostDirty = true;
             deviceDirty = false;
@@ -276,7 +320,19 @@ namespace TensorSharp.Cuda
 
         private IntPtr HostPtrAtElementUnchecked(long index)
         {
+            EnsureHostBuffer();
             return AddBytes(hostBuffer, checked(index * ElementType.Size()));
+        }
+
+        private void EnsureHostBuffer()
+        {
+            if (hostBuffer != IntPtr.Zero)
+                return;
+
+            long allocationSize = Math.Max(ByteLength, 1);
+            hostBuffer = (IntPtr)NativeMemory.AlignedAlloc((nuint)allocationSize, 64);
+            if (hostBuffer == IntPtr.Zero)
+                throw new OutOfMemoryException($"Failed to allocate {allocationSize} bytes of CUDA host mirror memory.");
         }
 
         private static IntPtr AddBytes(IntPtr pointer, long byteOffset)
@@ -299,7 +355,7 @@ namespace TensorSharp.Cuda
 
         private void ThrowIfDisposed()
         {
-            if (hostBuffer == IntPtr.Zero || deviceBuffer == IntPtr.Zero)
+            if (deviceBuffer == IntPtr.Zero)
                 throw new ObjectDisposedException(nameof(CudaStorage));
         }
     }

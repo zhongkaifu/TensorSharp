@@ -729,6 +729,13 @@ namespace TensorSharp.Models
 
             long preloadedBytes = 0;
             int preloadedCount = 0;
+            int mappedHostViews = 0;
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                if (qw.HasExternalHostView)
+                    mappedHostViews++;
+            }
+
             foreach (QuantizedWeight qw in _quantWeights.Values)
             {
                 if (!qw.HasHostData || !CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
@@ -745,11 +752,19 @@ namespace TensorSharp.Models
                     qw.RawBytes);
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
+
+                bool wasMappedView = qw.HasExternalHostView;
+                qw.ReleaseHostData();
+                if (wasMappedView)
+                    mappedHostViews--;
             }
 
             _cudaQuantWeightsPrepared = true;
+            if (mappedHostViews == 0)
+                _gguf?.Dispose();
+
             if (preloadedCount > 0)
-                Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+                Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors (host copies released)");
         }
 
         private static bool ShouldRetainCudaHostQuantWeight(string weightName)

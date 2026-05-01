@@ -55,11 +55,20 @@ namespace TensorSharp.Cuda.Interop
         [DllImport(LibName, EntryPoint = "cuMemcpyHtoD_v2")]
         public static extern int cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, UIntPtr byteCount);
 
+        [DllImport(LibName, EntryPoint = "cuMemcpyHtoDAsync_v2")]
+        public static extern int cuMemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, UIntPtr byteCount, IntPtr stream);
+
         [DllImport(LibName, EntryPoint = "cuMemcpyDtoH_v2")]
         public static extern int cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, UIntPtr byteCount);
 
+        [DllImport(LibName, EntryPoint = "cuMemcpyDtoHAsync_v2")]
+        public static extern int cuMemcpyDtoHAsync(IntPtr dstHost, IntPtr srcDevice, UIntPtr byteCount, IntPtr stream);
+
         [DllImport(LibName, EntryPoint = "cuMemcpyDtoD_v2")]
         public static extern int cuMemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, UIntPtr byteCount);
+
+        [DllImport(LibName, EntryPoint = "cuMemcpyDtoDAsync_v2")]
+        public static extern int cuMemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, UIntPtr byteCount, IntPtr stream);
 
         [DllImport(LibName, EntryPoint = "cuMemsetD8_v2")]
         public static extern int cuMemsetD8(IntPtr dstDevice, byte value, UIntPtr count);

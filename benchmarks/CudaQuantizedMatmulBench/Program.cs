@@ -4,6 +4,7 @@ using TensorSharp;
 using TensorSharp.Cuda;
 
 const int GgmlTypeQ8_0 = 8;
+const int GgmlTypeQ4_0 = 2;
 
 if (!CudaBackend.IsAvailable())
 {
@@ -27,6 +28,8 @@ foreach (BenchCase bench in cases)
     RunCase(allocator, bench, warmup, iterations);
 }
 
+RunQ4Case(allocator, new BenchCase("decode-q4_0-4096x4096-r1", 1, 4096, 4096), warmup, iterations);
+RunQ4Case(allocator, new BenchCase("smallbatch-q4_0-4096x4096-r8", 8, 4096, 4096), warmup, iterations);
 RunBatchedAddmmCase(allocator, warmup, iterations);
 RunScaledDotProductAttentionCase(allocator, warmup, iterations);
 RunElementwiseCase(allocator, warmup, iterations);
@@ -107,6 +110,79 @@ static void RunCase(CudaAllocator allocator, BenchCase bench, int warmup, int it
     }
 }
 
+static void RunQ4Case(CudaAllocator allocator, BenchCase bench, int warmup, int iterations)
+{
+    byte[] weights = CreateQ4_0Rows(bench.OutDim, bench.InDim);
+    float[,] inputValues = CreateInput(bench.Rows, bench.InDim);
+    IntPtr hostWeights = Marshal.AllocHGlobal(weights.Length);
+
+    try
+    {
+        Marshal.Copy(weights, 0, hostWeights, weights.Length);
+        using var input = Tensor.FromArray(allocator, inputValues);
+        using var output = new Tensor(allocator, DType.Float32, bench.Rows, bench.OutDim);
+
+        bool ok = CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+            output,
+            input,
+            hostWeights,
+            hostWeights,
+            GgmlTypeQ4_0,
+            bench.InDim,
+            bench.OutDim,
+            weights.Length);
+        if (!ok)
+            throw new InvalidOperationException("CUDA Q4_0 quantized matmul dispatch failed.");
+
+        allocator.Synchronize();
+        float[] expected = DequantizedMatmulQ40(weights, bench.OutDim, bench.InDim, inputValues, bench.Rows);
+        float[] actual = output.GetElementsAsFloat(bench.Rows * bench.OutDim);
+        float maxAbsDiff = MaxAbsDiff(expected, actual);
+
+        for (int i = 0; i < warmup; i++)
+        {
+            CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                output,
+                input,
+                hostWeights,
+                hostWeights,
+                GgmlTypeQ4_0,
+                bench.InDim,
+                bench.OutDim,
+                weights.Length);
+        }
+        allocator.Synchronize();
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iterations; i++)
+        {
+            CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                output,
+                input,
+                hostWeights,
+                hostWeights,
+                GgmlTypeQ4_0,
+                bench.InDim,
+                bench.OutDim,
+                weights.Length);
+        }
+        allocator.Synchronize();
+        sw.Stop();
+
+        actual = output.GetElementsAsFloat(bench.Rows * bench.OutDim);
+        float postBenchmarkDiff = MaxAbsDiff(expected, actual);
+        double ms = sw.Elapsed.TotalMilliseconds / iterations;
+        double gflops = (2.0 * bench.Rows * bench.InDim * bench.OutDim) / (ms * 1.0e6);
+
+        Console.WriteLine($"{bench.Name}: {ms:F3} ms/op, {gflops:F1} GFLOP/s, max_abs_diff={maxAbsDiff:G6}, post_diff={postBenchmarkDiff:G6}");
+    }
+    finally
+    {
+        CudaQuantizedOps.ReleaseQuantizedWeight(allocator, hostWeights);
+        Marshal.FreeHGlobal(hostWeights);
+    }
+}
+
 static int GetArg(string name, int defaultValue)
 {
     string[] args = Environment.GetCommandLineArgs();
@@ -147,6 +223,32 @@ static byte[] CreateQ8_0Rows(int rows, int cols)
     return data;
 }
 
+static byte[] CreateQ4_0Rows(int rows, int cols)
+{
+    int blocks = cols / 32;
+    byte[] data = new byte[rows * blocks * 18];
+    for (int row = 0; row < rows; row++)
+    {
+        for (int block = 0; block < blocks; block++)
+        {
+            int offset = (row * blocks + block) * 18;
+            float scale = 0.0625f + ((row + block) % 11) * 0.00390625f;
+            ushort scaleBits = BitConverter.HalfToUInt16Bits((System.Half)scale);
+            data[offset] = (byte)(scaleBits & 0xFF);
+            data[offset + 1] = (byte)(scaleBits >> 8);
+
+            for (int i = 0; i < 16; i++)
+            {
+                int low = ((row * 13 + block * 7 + i * 5) & 15);
+                int high = ((row * 17 + block * 11 + i * 3 + 16) & 15);
+                data[offset + 2 + i] = (byte)(low | (high << 4));
+            }
+        }
+    }
+
+    return data;
+}
+
 static float[,] CreateInput(int rows, int cols)
 {
     var input = new float[rows, cols];
@@ -179,6 +281,36 @@ static float[] DequantizedMatmulQ80(byte[] weights, int outDim, int inDim, float
                 {
                     sbyte q = unchecked((sbyte)weights[offset + 2 + i]);
                     sum += scale * q * input[r, block * 32 + i];
+                }
+            }
+
+            expected[r * outDim + o] = sum;
+        }
+    }
+
+    return expected;
+}
+
+static float[] DequantizedMatmulQ40(byte[] weights, int outDim, int inDim, float[,] input, int rows)
+{
+    int blocks = inDim / 32;
+    float[] expected = new float[rows * outDim];
+    for (int r = 0; r < rows; r++)
+    {
+        for (int o = 0; o < outDim; o++)
+        {
+            float sum = 0;
+            for (int block = 0; block < blocks; block++)
+            {
+                int offset = (o * blocks + block) * 18;
+                float scale = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset] | (weights[offset + 1] << 8)));
+                for (int i = 0; i < 16; i++)
+                {
+                    byte packed = weights[offset + 2 + i];
+                    int low = (packed & 0x0F) - 8;
+                    int high = (packed >> 4) - 8;
+                    sum += scale * low * input[r, block * 32 + i];
+                    sum += scale * high * input[r, block * 32 + i + 16];
                 }
             }
 

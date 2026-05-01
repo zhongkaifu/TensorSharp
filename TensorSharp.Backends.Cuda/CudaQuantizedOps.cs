@@ -132,7 +132,18 @@ namespace TensorSharp.Cuda
             int inDim = checked((int)ne0);
             int outDim = checked((int)ne1);
             int rows = checked((int)input.Sizes[0]);
-            if (ggmlType == 8)
+            if (ggmlType == 2)
+            {
+                kernels.LaunchQuantMatmulQ40F32(
+                    weight.DevicePtr,
+                    inputPtr,
+                    resultPtr,
+                    inDim,
+                    outDim,
+                    rows,
+                    allocator.Stream.Handle);
+            }
+            else if (ggmlType == 8)
             {
                 kernels.LaunchQuantMatmulQ80F32(
                     weight.DevicePtr,

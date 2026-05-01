@@ -63,8 +63,8 @@ namespace TensorSharp.Cuda
 
         public static bool TryCopy(Tensor result, Tensor src)
         {
-            if (!TryGetContiguous(result, out CudaStorage resultStorage, out IntPtr resultPtr, out long resultCount) ||
-                !TryGetContiguous(src, out CudaStorage srcStorage, out IntPtr srcPtr, out long srcCount))
+            if (!TryGetContiguous(result, out CudaStorage resultStorage, out _, out long resultCount) ||
+                !TryGetContiguous(src, out CudaStorage srcStorage, out _, out long srcCount))
             {
                 return false;
             }
@@ -73,13 +73,10 @@ namespace TensorSharp.Cuda
                 return false;
 
             srcStorage.EnsureDeviceCurrent();
-            srcStorage.SynchronizeDeviceWork();
-            resultStorage.AllocatorImpl.Context.MakeCurrent();
-            TensorSharp.Cuda.Interop.CudaDriverApi.cuMemcpyDtoD(
-                resultPtr,
-                srcPtr,
-                new UIntPtr((ulong)(resultCount * result.ElementType.Size()))).ThrowOnError();
-            resultStorage.MarkDeviceModified();
+            long byteCount = checked(resultCount * result.ElementType.Size());
+            long resultByteOffset = checked(result.StorageOffset * result.ElementType.Size());
+            long srcByteOffset = checked(src.StorageOffset * src.ElementType.Size());
+            resultStorage.CopyDeviceFrom(srcStorage, resultByteOffset, srcByteOffset, byteCount);
             return true;
         }
 

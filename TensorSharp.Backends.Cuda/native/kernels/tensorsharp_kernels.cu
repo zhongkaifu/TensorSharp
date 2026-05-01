@@ -773,6 +773,89 @@ extern "C" __global__ void ts_quant_matmul_f32(
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
 }
 
+extern "C" __global__ void ts_quant_matmul_q4_0_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    const int cols_per_block = 4;
+    int out_col0 = blockIdx.x * cols_per_block;
+    int row = blockIdx.y;
+    if (out_col0 >= out_dim || row >= rows)
+        return;
+
+    int row_bytes = (in_dim / 32) * 18;
+    const float* x_row = input + (size_t)row * in_dim;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (int k = threadIdx.x; k < in_dim; k += blockDim.x)
+    {
+        int block_offset = (k / 32) * 18;
+        int lane = k & 31;
+        int packed_index = lane & 15;
+        int high = lane >> 4;
+        float x = x_row[k];
+
+        const uint8_t* w0 = weights + (size_t)(out_col0 + 0) * row_bytes + block_offset;
+        float d0 = __half2float(*reinterpret_cast<const half*>(w0));
+        uint8_t p0 = w0[2 + packed_index];
+        int q0 = (high ? (p0 >> 4) : (p0 & 0x0F)) - 8;
+        acc0 += d0 * (float)q0 * x;
+
+        if (out_col0 + 1 < out_dim)
+        {
+            const uint8_t* w1 = weights + (size_t)(out_col0 + 1) * row_bytes + block_offset;
+            float d1 = __half2float(*reinterpret_cast<const half*>(w1));
+            uint8_t p1 = w1[2 + packed_index];
+            int q1 = (high ? (p1 >> 4) : (p1 & 0x0F)) - 8;
+            acc1 += d1 * (float)q1 * x;
+        }
+
+        if (out_col0 + 2 < out_dim)
+        {
+            const uint8_t* w2 = weights + (size_t)(out_col0 + 2) * row_bytes + block_offset;
+            float d2 = __half2float(*reinterpret_cast<const half*>(w2));
+            uint8_t p2 = w2[2 + packed_index];
+            int q2 = (high ? (p2 >> 4) : (p2 & 0x0F)) - 8;
+            acc2 += d2 * (float)q2 * x;
+        }
+
+        if (out_col0 + 3 < out_dim)
+        {
+            const uint8_t* w3 = weights + (size_t)(out_col0 + 3) * row_bytes + block_offset;
+            float d3 = __half2float(*reinterpret_cast<const half*>(w3));
+            uint8_t p3 = w3[2 + packed_index];
+            int q3 = (high ? (p3 >> 4) : (p3 & 0x0F)) - 8;
+            acc3 += d3 * (float)q3 * x;
+        }
+    }
+
+    acc0 = block_reduce_sum(acc0);
+    if (threadIdx.x == 0)
+        output[(size_t)row * out_dim + out_col0] = acc0;
+    __syncthreads();
+
+    acc1 = block_reduce_sum(acc1);
+    if (threadIdx.x == 0 && out_col0 + 1 < out_dim)
+        output[(size_t)row * out_dim + out_col0 + 1] = acc1;
+    __syncthreads();
+
+    acc2 = block_reduce_sum(acc2);
+    if (threadIdx.x == 0 && out_col0 + 2 < out_dim)
+        output[(size_t)row * out_dim + out_col0 + 2] = acc2;
+    __syncthreads();
+
+    acc3 = block_reduce_sum(acc3);
+    if (threadIdx.x == 0 && out_col0 + 3 < out_dim)
+        output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+}
+
 extern "C" __global__ void ts_quant_matmul_q8_0_f32(
     const uint8_t* weights,
     const float* input,

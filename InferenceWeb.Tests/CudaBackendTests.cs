@@ -1,5 +1,6 @@
 using TensorSharp;
 using TensorSharp.Cuda;
+using TensorSharp.Models;
 using System.Runtime.InteropServices;
 
 namespace InferenceWeb.Tests;
@@ -348,6 +349,42 @@ public class CudaBackendTests
         {
             Marshal.FreeHGlobal(host);
         }
+    }
+
+    [Fact]
+    public void CudaQuantizedWeight_CanRunAfterHostCopyReleased()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        byte[] weights = CreateQ8_0Rows(new[]
+        {
+            Enumerable.Range(1, 32).Select(i => (sbyte)i).ToArray(),
+            Enumerable.Range(1, 32).Select(i => (sbyte)(-i)).ToArray(),
+        });
+
+        using var qw = new QuantizedWeight(weights, 8, 32, 2);
+        using var allocator = new CudaAllocator();
+        IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+        CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+        qw.ReleaseHostData();
+        Assert.False(qw.HasHostData);
+
+        using var input = Tensor.FromArray(allocator, CreateQuantInput());
+        using var output = new Tensor(allocator, DType.Float32, 2, 2);
+        Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, input, cacheKey, IntPtr.Zero, 8, 32, 2, weights.Length));
+        AssertClose(new[] { 528f, -528f, 11440f, -11440f }, output.GetElementsAsFloat(4), 1e-3f);
+
+        using var indices = Tensor.FromArray(allocator, new int[] { 1, 0 });
+        using var rows = new Tensor(allocator, DType.Float32, 2, 32);
+        Assert.True(CudaQuantizedOps.TryGetRowsQuantizedToFloat32(rows, cacheKey, IntPtr.Zero, 8, 32, 2, weights.Length, indices));
+        float[] actualRows = rows.GetElementsAsFloat(64);
+        Assert.Equal(-1f, actualRows[0]);
+        Assert.Equal(-32f, actualRows[31]);
+        Assert.Equal(1f, actualRows[32]);
+        Assert.Equal(32f, actualRows[63]);
+
+        CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
     }
 
     [Fact]

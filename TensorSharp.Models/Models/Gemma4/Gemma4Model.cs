@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -1293,14 +1294,33 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    float* pleDst = GetFloatPtr(pleTokenEmb);
-                    byte* pleBase = (byte*)pleQw.Data.ToPointer();
-                    long rowBytes = NativeDequant.RowSize(pleQw.GgmlType, pleQw.Ne0);
-                    for (int i = 0; i < seqLen; i++)
+                    if (_backend == BackendType.Cuda &&
+                        CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                            pleTokenEmb,
+                            pleQw.EnsureDeviceCacheKey(),
+                            pleQw.Data,
+                            pleQw.GgmlType,
+                            pleQw.Ne0,
+                            pleQw.Ne1,
+                            pleQw.RawBytes,
+                            pleIdx))
                     {
-                        int token = tokens[i];
-                        byte* rowPtr = pleBase + (long)token * rowBytes;
-                        ManagedQuantizedOps.DequantizeRowToFloat32(pleQw.GgmlType, (IntPtr)rowPtr, pleDst + (long)i * totalPleDim, totalPleDim);
+                        // PLE rows are now resident on the CUDA device; no host dequant needed.
+                    }
+                    else
+                    {
+                        if (!pleQw.HasHostData)
+                            throw new InvalidOperationException("Direct CUDA PLE quantized row lookup failed and host quantized data has been released.");
+
+                        float* pleDst = GetFloatPtr(pleTokenEmb);
+                        byte* pleBase = (byte*)pleQw.Data.ToPointer();
+                        long rowBytes = NativeDequant.RowSize(pleQw.GgmlType, pleQw.Ne0);
+                        for (int i = 0; i < seqLen; i++)
+                        {
+                            int token = tokens[i];
+                            byte* rowPtr = pleBase + (long)token * rowBytes;
+                            ManagedQuantizedOps.DequantizeRowToFloat32(pleQw.GgmlType, (IntPtr)rowPtr, pleDst + (long)i * totalPleDim, totalPleDim);
+                        }
                     }
                 }
 
