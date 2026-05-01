@@ -28,6 +28,9 @@ foreach (BenchCase bench in cases)
 }
 
 RunBatchedAddmmCase(allocator, warmup, iterations);
+RunScaledDotProductAttentionCase(allocator, warmup, iterations);
+RunElementwiseCase(allocator, warmup, iterations);
+RunFusedElementwiseCase(allocator, warmup, iterations);
 
 return 0;
 
@@ -265,6 +268,141 @@ static void RunBatchedAddmmCase(CudaAllocator allocator, int warmup, int iterati
     }
 }
 
+static void RunScaledDotProductAttentionCase(CudaAllocator allocator, int warmup, int iterations)
+{
+    const int batch = 1;
+    const int seqQ = 256;
+    const int seqK = 256;
+    const int heads = 8;
+    const int keyDim = 64;
+    const int valueDim = 64;
+    float scale = 1.0f / MathF.Sqrt(keyDim);
+
+    float[,,,] q = new float[batch, seqQ, heads, keyDim];
+    float[,,,] k = new float[batch, seqK, heads, keyDim];
+    float[,,,] v = new float[batch, seqK, heads, valueDim];
+    for (int b = 0; b < batch; b++)
+    {
+        for (int t = 0; t < seqQ; t++)
+            for (int h = 0; h < heads; h++)
+                for (int d = 0; d < keyDim; d++)
+                    q[b, t, h, d] = MathF.Sin((t + 1) * (h + 2) * (d + 3) * 0.0017f);
+
+        for (int t = 0; t < seqK; t++)
+        {
+            for (int h = 0; h < heads; h++)
+            {
+                for (int d = 0; d < keyDim; d++)
+                    k[b, t, h, d] = MathF.Cos((t + 3) * (h + 1) * (d + 5) * 0.0013f);
+                for (int d = 0; d < valueDim; d++)
+                    v[b, t, h, d] = MathF.Sin((t + 5) * (h + 3) * (d + 1) * 0.0011f) * 0.25f;
+            }
+        }
+    }
+
+    using var qTensor = Tensor.FromArray(allocator, q);
+    using var kTensor = Tensor.FromArray(allocator, k);
+    using var vTensor = Tensor.FromArray(allocator, v);
+    using var output = Ops.ScaledDotProductAttention(null, qTensor, kTensor, vTensor, null, scale);
+    allocator.Synchronize();
+
+    float[] actualPrefix = output.GetElementsAsFloat(Math.Min(256, (int)output.ElementCount()));
+    float[] expectedPrefix = ScaledDotProductAttentionPrefix(q, k, v, scale, actualPrefix.Length);
+    float maxAbsDiff = MaxAbsDiff(expectedPrefix, actualPrefix);
+
+    for (int i = 0; i < warmup; i++)
+    {
+        Ops.ScaledDotProductAttention(output, qTensor, kTensor, vTensor, null, scale);
+    }
+    allocator.Synchronize();
+
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < iterations; i++)
+    {
+        Ops.ScaledDotProductAttention(output, qTensor, kTensor, vTensor, null, scale);
+    }
+    allocator.Synchronize();
+    sw.Stop();
+
+    double ms = sw.Elapsed.TotalMilliseconds / iterations;
+    double gflops = (2.0 * batch * heads * seqQ * seqK * (keyDim + valueDim)) / (ms * 1.0e6);
+    Console.WriteLine($"sdpa-f32-b{batch}-s{seqQ}x{seqK}-h{heads}-d{keyDim}: {ms:F3} ms/op, approx {gflops:F1} GFLOP/s, prefix_max_abs_diff={maxAbsDiff:G6}");
+}
+
+static void RunElementwiseCase(CudaAllocator allocator, int warmup, int iterations)
+{
+    const int count = 8 * 1024 * 1024;
+    using var lhs = new Tensor(allocator, DType.Float32, count);
+    using var rhs = new Tensor(allocator, DType.Float32, count);
+    FillTensor(lhs, 0.000013f, 0.1f);
+    FillTensor(rhs, -0.000017f, -0.2f);
+    using var output = new Tensor(allocator, DType.Float32, count);
+
+    Ops.Add(output, lhs, rhs);
+    allocator.Synchronize();
+    float[] prefix = output.GetElementsAsFloat(8);
+    float[] lhsPrefix = lhs.GetElementsAsFloat(8);
+    float[] rhsPrefix = rhs.GetElementsAsFloat(8);
+    float[] expected = new float[8];
+    for (int i = 0; i < expected.Length; i++)
+        expected[i] = lhsPrefix[i] + rhsPrefix[i];
+    float maxAbsDiff = MaxAbsDiff(expected, prefix);
+
+    for (int i = 0; i < warmup; i++)
+        Ops.Add(output, lhs, rhs);
+    allocator.Synchronize();
+
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < iterations; i++)
+        Ops.Add(output, lhs, rhs);
+    allocator.Synchronize();
+    sw.Stop();
+
+    double ms = sw.Elapsed.TotalMilliseconds / iterations;
+    double gibPerSecond = (3.0 * count * sizeof(float)) / (ms / 1000.0) / (1024.0 * 1024.0 * 1024.0);
+    Console.WriteLine($"elementwise-add-f32-{count}: {ms:F3} ms/op, {gibPerSecond:F1} GiB/s, prefix_max_abs_diff={maxAbsDiff:G6}");
+}
+
+static void RunFusedElementwiseCase(CudaAllocator allocator, int warmup, int iterations)
+{
+    const int count = 8 * 1024 * 1024;
+    using var x = new Tensor(allocator, DType.Float32, count);
+    using var y = new Tensor(allocator, DType.Float32, count);
+    using var z = new Tensor(allocator, DType.Float32, count);
+    using var w = new Tensor(allocator, DType.Float32, count);
+    FillTensor(x, 0.000013f, 0.1f);
+    FillTensor(y, -0.000017f, -0.2f);
+    FillTensor(z, 0.000019f, 0.3f);
+    FillTensor(w, -0.000023f, 0.05f);
+    using var output = new Tensor(allocator, DType.Float32, count);
+
+    Ops.MulMulAdd(output, x, y, z, w);
+    allocator.Synchronize();
+    float[] prefix = output.GetElementsAsFloat(8);
+    float[] xPrefix = x.GetElementsAsFloat(8);
+    float[] yPrefix = y.GetElementsAsFloat(8);
+    float[] zPrefix = z.GetElementsAsFloat(8);
+    float[] wPrefix = w.GetElementsAsFloat(8);
+    float[] expected = new float[8];
+    for (int i = 0; i < expected.Length; i++)
+        expected[i] = xPrefix[i] * yPrefix[i] + zPrefix[i] * wPrefix[i];
+    float maxAbsDiff = MaxAbsDiff(expected, prefix);
+
+    for (int i = 0; i < warmup; i++)
+        Ops.MulMulAdd(output, x, y, z, w);
+    allocator.Synchronize();
+
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < iterations; i++)
+        Ops.MulMulAdd(output, x, y, z, w);
+    allocator.Synchronize();
+    sw.Stop();
+
+    double ms = sw.Elapsed.TotalMilliseconds / iterations;
+    double gibPerSecond = (5.0 * count * sizeof(float)) / (ms / 1000.0) / (1024.0 * 1024.0 * 1024.0);
+    Console.WriteLine($"fused-mulmuladd-f32-{count}: {ms:F3} ms/op, {gibPerSecond:F1} GiB/s, prefix_max_abs_diff={maxAbsDiff:G6}");
+}
+
 static void RunLoopedAddmm(Tensor[] lhsSlices, Tensor[] rhsSlices, Tensor[] outputSlices, CudaAllocator allocator)
 {
     for (int b = 0; b < lhsSlices.Length; b++)
@@ -278,6 +416,58 @@ static void FillTensor(Tensor tensor, float scale, float offset)
     for (int i = 0; i < values.Length; i++)
         values[i] = MathF.Sin((i + 1) * scale) * 0.5f + MathF.Cos((i + 3) * scale * 0.37f) * 0.25f + offset;
     tensor.SetElementsAsFloat(values);
+}
+
+static float[] ScaledDotProductAttentionPrefix(float[,,,] q, float[,,,] k, float[,,,] v, float scale, int prefixLength)
+{
+    int batch = q.GetLength(0);
+    int seqQ = q.GetLength(1);
+    int heads = q.GetLength(2);
+    int keyDim = q.GetLength(3);
+    int seqK = k.GetLength(1);
+    int valueDim = v.GetLength(3);
+    float[] result = new float[prefixLength];
+
+    for (int b = 0; b < batch; b++)
+    {
+        for (int tq = 0; tq < seqQ; tq++)
+        {
+            for (int h = 0; h < heads; h++)
+            {
+                float[] scores = new float[seqK];
+                float max = float.NegativeInfinity;
+                for (int tk = 0; tk < seqK; tk++)
+                {
+                    float dot = 0;
+                    for (int d = 0; d < keyDim; d++)
+                        dot += q[b, tq, h, d] * k[b, tk, h, d];
+                    scores[tk] = dot * scale;
+                    max = MathF.Max(max, scores[tk]);
+                }
+
+                float sum = 0;
+                for (int tk = 0; tk < seqK; tk++)
+                {
+                    scores[tk] = MathF.Exp(scores[tk] - max);
+                    sum += scores[tk];
+                }
+
+                for (int d = 0; d < valueDim; d++)
+                {
+                    int flat = ((b * seqQ + tq) * heads + h) * valueDim + d;
+                    if (flat >= prefixLength)
+                        return result;
+
+                    float acc = 0;
+                    for (int tk = 0; tk < seqK; tk++)
+                        acc += scores[tk] / sum * v[b, tk, h, d];
+                    result[flat] = acc;
+                }
+            }
+        }
+    }
+
+    return result;
 }
 
 internal readonly record struct BenchCase(string Name, int Rows, int InDim, int OutDim);

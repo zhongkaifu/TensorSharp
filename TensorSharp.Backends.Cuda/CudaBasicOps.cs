@@ -144,69 +144,85 @@ namespace TensorSharp.Cuda
         public static Tensor GELU(Tensor result, Tensor src) => Unary("GELU", result, src, CudaUnaryOp.GELU);
 
         [RegisterOpStorageType("addv", typeof(CudaStorage))]
-        public static Tensor AddValue(Tensor result, Tensor lhs, float rhs) => Scalar("addv", result, lhs, rhs);
+        public static Tensor AddValue(Tensor result, Tensor lhs, float rhs) => Scalar("addv", result, lhs, rhs, CudaScalarOp.Add);
 
         [RegisterOpStorageType("subv", typeof(CudaStorage))]
-        public static Tensor SubValue(Tensor result, Tensor lhs, float rhs) => Scalar("subv", result, lhs, rhs);
+        public static Tensor SubValue(Tensor result, Tensor lhs, float rhs) => Scalar("subv", result, lhs, rhs, CudaScalarOp.Sub);
 
         [RegisterOpStorageType("rsubv", typeof(CudaStorage))]
         public static Tensor RSubValue(Tensor result, float lhs, Tensor rhs)
         {
-            return CudaCpuFallback.InvokeTensor("rsubv", result, result, lhs, rhs);
+            return Scalar("rsubv", result, rhs, lhs, CudaScalarOp.ReverseSub);
         }
 
         [RegisterOpStorageType("mulv", typeof(CudaStorage))]
-        public static Tensor MulValue(Tensor result, Tensor lhs, float rhs) => Scalar("mulv", result, lhs, rhs);
+        public static Tensor MulValue(Tensor result, Tensor lhs, float rhs) => Scalar("mulv", result, lhs, rhs, CudaScalarOp.Mul);
 
         [RegisterOpStorageType("divv", typeof(CudaStorage))]
-        public static Tensor DivValue(Tensor result, Tensor lhs, float rhs) => Scalar("divv", result, lhs, rhs);
+        public static Tensor DivValue(Tensor result, Tensor lhs, float rhs) => Scalar("divv", result, lhs, rhs, CudaScalarOp.Div);
 
         [RegisterOpStorageType("rdivv", typeof(CudaStorage))]
         public static Tensor RDivValue(Tensor result, float lhs, Tensor rhs)
         {
-            return CudaCpuFallback.InvokeTensor("rdivv", result, result, lhs, rhs);
+            return Scalar("rdivv", result, rhs, lhs, CudaScalarOp.ReverseDiv);
         }
 
         [RegisterOpStorageType("modv", typeof(CudaStorage))]
-        public static Tensor ModValue(Tensor result, Tensor lhs, float rhs) => Scalar("modv", result, lhs, rhs);
+        public static Tensor ModValue(Tensor result, Tensor lhs, float rhs) => ScalarFallback("modv", result, lhs, rhs);
 
         [RegisterOpStorageType("addt", typeof(CudaStorage))]
-        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("addt", result, lhs, rhs);
+        public static Tensor AddTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("addt", result, lhs, rhs, CudaBinaryOp.Add);
 
         [RegisterOpStorageType("subt", typeof(CudaStorage))]
-        public static Tensor SubTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("subt", result, lhs, rhs);
+        public static Tensor SubTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("subt", result, lhs, rhs, CudaBinaryOp.Sub);
 
         [RegisterOpStorageType("mult", typeof(CudaStorage))]
-        public static Tensor MulTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("mult", result, lhs, rhs);
+        public static Tensor MulTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("mult", result, lhs, rhs, CudaBinaryOp.Mul);
 
         [RegisterOpStorageType("divt", typeof(CudaStorage))]
-        public static Tensor DivTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("divt", result, lhs, rhs);
+        public static Tensor DivTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("divt", result, lhs, rhs, CudaBinaryOp.Div);
 
         [RegisterOpStorageType("modt", typeof(CudaStorage))]
-        public static Tensor ModTensor(Tensor result, Tensor lhs, Tensor rhs) => Binary("modt", result, lhs, rhs);
+        public static Tensor ModTensor(Tensor result, Tensor lhs, Tensor rhs) => BinaryFallback("modt", result, lhs, rhs);
 
         [RegisterOpStorageType("addmul", typeof(CudaStorage))]
         public static Tensor AddMul(Tensor result, Tensor x, Tensor y, Tensor z)
         {
-            return CudaCpuFallback.InvokeTensor("addmul", result, result, x, y, z);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
+            if (CudaKernelOps.TryTernary(writeTarget, x, y, z, CudaTernaryOp.AddMul))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("addmul", writeTarget, writeTarget, x, y, z);
         }
 
         [RegisterOpStorageType("adddiv", typeof(CudaStorage))]
         public static Tensor AddDiv(Tensor result, Tensor x, Tensor y, Tensor z)
         {
-            return CudaCpuFallback.InvokeTensor("adddiv", result, result, x, y, z);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
+            if (CudaKernelOps.TryTernary(writeTarget, x, y, z, CudaTernaryOp.AddDiv))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("adddiv", writeTarget, writeTarget, x, y, z);
         }
 
         [RegisterOpStorageType("addmulv", typeof(CudaStorage))]
         public static Tensor AddMulV(Tensor result, Tensor x, Tensor y, float z)
         {
-            return CudaCpuFallback.InvokeTensor("addmulv", result, result, x, y, z);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
+            if (CudaKernelOps.TryAddMulScalar(writeTarget, x, y, z))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("addmulv", writeTarget, writeTarget, x, y, z);
         }
 
         [RegisterOpStorageType("mulmuladd", typeof(CudaStorage))]
         public static Tensor MulMulAdd(Tensor result, Tensor x, Tensor y, Tensor z, Tensor w)
         {
-            return CudaCpuFallback.InvokeTensor("mulmuladd", result, result, x, y, z, w);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
+            if (CudaKernelOps.TryMulMulAdd(writeTarget, x, y, z, w))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("mulmuladd", writeTarget, writeTarget, x, y, z, w);
         }
 
         [RegisterOpStorageType("SiLUMul", typeof(CudaStorage))]
@@ -291,6 +307,17 @@ namespace TensorSharp.Cuda
         public static Tensor SoftmaxGrad(Tensor grad, Tensor adj, Tensor val, bool addGrad)
         {
             return CudaCpuFallback.InvokeTensor("softmaxgrad", grad, grad, adj, val, addGrad);
+        }
+
+        [RegisterOpStorageType("scaled_dot_product_attention", typeof(CudaStorage))]
+        public static Tensor ScaledDotProductAttention(Tensor result, Tensor query, Tensor key, Tensor value, Tensor mask, float scale)
+        {
+            long[] outputSizes = new long[] { query.Sizes[0], query.Sizes[1], query.Sizes[2], value.Sizes[3] };
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, query.Allocator, query.ElementType, false, outputSizes);
+            if (CudaKernelOps.TryScaledDotProductAttention(writeTarget, query, key, value, mask, scale))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor("scaled_dot_product_attention", writeTarget, writeTarget, query, key, value, mask, scale);
         }
 
         [RegisterOpStorageType("indexselect", typeof(CudaStorage))]
@@ -479,12 +506,30 @@ namespace TensorSharp.Cuda
             return CudaCpuFallback.InvokeTensor(opName, writeTarget, writeTarget, src);
         }
 
-        private static Tensor Binary(string opName, Tensor result, Tensor lhs, Tensor rhs)
+        private static Tensor Binary(string opName, Tensor result, Tensor lhs, Tensor rhs, CudaBinaryOp cudaOp)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
+            if (CudaKernelOps.TryBinary(writeTarget, lhs, rhs, cudaOp))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor(opName, writeTarget, writeTarget, lhs, rhs);
+        }
+
+        private static Tensor Scalar(string opName, Tensor result, Tensor lhs, float rhs, CudaScalarOp cudaOp)
+        {
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, lhs, false, lhs.Sizes);
+            if (CudaKernelOps.TryScalar(writeTarget, lhs, rhs, cudaOp))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor(opName, writeTarget, writeTarget, lhs, rhs);
+        }
+
+        private static Tensor BinaryFallback(string opName, Tensor result, Tensor lhs, Tensor rhs)
         {
             return CudaCpuFallback.InvokeTensor(opName, result, result, lhs, rhs);
         }
 
-        private static Tensor Scalar(string opName, Tensor result, Tensor lhs, float rhs)
+        private static Tensor ScalarFallback(string opName, Tensor result, Tensor lhs, float rhs)
         {
             return CudaCpuFallback.InvokeTensor(opName, result, result, lhs, rhs);
         }

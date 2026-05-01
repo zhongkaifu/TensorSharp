@@ -11,10 +11,16 @@ namespace TensorSharp.Cuda
         private readonly CudaModule module;
         private readonly IntPtr fillF32;
         private readonly IntPtr unaryF32;
+        private readonly IntPtr binaryF32;
+        private readonly IntPtr scalarF32;
+        private readonly IntPtr ternaryF32;
+        private readonly IntPtr addMulScalarF32;
+        private readonly IntPtr mulMulAddF32;
         private readonly IntPtr binaryActivationF32;
         private readonly IntPtr siluMulSplitF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr softmaxF32;
+        private readonly IntPtr scaledDotProductAttentionF32;
         private readonly IntPtr indexSelectF32;
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
@@ -28,10 +34,16 @@ namespace TensorSharp.Cuda
             this.module = module;
             fillF32 = module.GetFunction("ts_fill_f32");
             unaryF32 = module.GetFunction("ts_unary_f32");
+            binaryF32 = module.GetFunction("ts_binary_f32");
+            scalarF32 = module.GetFunction("ts_scalar_f32");
+            ternaryF32 = module.GetFunction("ts_ternary_f32");
+            addMulScalarF32 = module.GetFunction("ts_addmul_scalar_f32");
+            mulMulAddF32 = module.GetFunction("ts_mulmuladd_f32");
             binaryActivationF32 = module.GetFunction("ts_binary_activation_f32");
             siluMulSplitF32 = module.GetFunction("ts_silu_mul_split_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
+            scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
@@ -74,6 +86,63 @@ namespace TensorSharp.Cuda
             int opArg = op;
             void** args = stackalloc void*[] { &inputArg, &outputArg, &countArg, &opArg };
             Launch(unaryF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchBinaryF32(IntPtr lhs, IntPtr rhs, IntPtr output, int count, int op, IntPtr stream)
+        {
+            IntPtr lhsArg = lhs;
+            IntPtr rhsArg = rhs;
+            IntPtr outputArg = output;
+            int countArg = count;
+            int opArg = op;
+            void** args = stackalloc void*[] { &lhsArg, &rhsArg, &outputArg, &countArg, &opArg };
+            Launch(binaryF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchScalarF32(IntPtr input, IntPtr output, int count, float value, int op, IntPtr stream)
+        {
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int countArg = count;
+            float valueArg = value;
+            int opArg = op;
+            void** args = stackalloc void*[] { &inputArg, &outputArg, &countArg, &valueArg, &opArg };
+            Launch(scalarF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchTernaryF32(IntPtr x, IntPtr y, IntPtr z, IntPtr output, int count, int op, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr yArg = y;
+            IntPtr zArg = z;
+            IntPtr outputArg = output;
+            int countArg = count;
+            int opArg = op;
+            void** args = stackalloc void*[] { &xArg, &yArg, &zArg, &outputArg, &countArg, &opArg };
+            Launch(ternaryF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchAddMulScalarF32(IntPtr x, IntPtr y, IntPtr output, int count, float value, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr yArg = y;
+            IntPtr outputArg = output;
+            int countArg = count;
+            float valueArg = value;
+            void** args = stackalloc void*[] { &xArg, &yArg, &outputArg, &countArg, &valueArg };
+            Launch(addMulScalarF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMulMulAddF32(IntPtr x, IntPtr y, IntPtr z, IntPtr w, IntPtr output, int count, IntPtr stream)
+        {
+            IntPtr xArg = x;
+            IntPtr yArg = y;
+            IntPtr zArg = z;
+            IntPtr wArg = w;
+            IntPtr outputArg = output;
+            int countArg = count;
+            void** args = stackalloc void*[] { &xArg, &yArg, &zArg, &wArg, &outputArg, &countArg };
+            Launch(mulMulAddF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchBinaryActivationF32(IntPtr a, IntPtr b, IntPtr output, int count, int op, IntPtr stream)
@@ -119,6 +188,43 @@ namespace TensorSharp.Cuda
             int colsArg = cols;
             void** args = stackalloc void*[] { &inputArg, &outputArg, &rowsArg, &colsArg };
             Launch(softmaxF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchScaledDotProductAttentionF32(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr mask,
+            IntPtr output,
+            int batch,
+            int seqQ,
+            int seqK,
+            int heads,
+            int keyDim,
+            int valueDim,
+            float scale,
+            int hasMask,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr maskArg = mask;
+            IntPtr outputArg = output;
+            int batchArg = batch;
+            int seqQArg = seqQ;
+            int seqKArg = seqK;
+            int headsArg = heads;
+            int keyDimArg = keyDim;
+            int valueDimArg = valueDim;
+            float scaleArg = scale;
+            int hasMaskArg = hasMask;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &maskArg, &outputArg, &batchArg, &seqQArg,
+                &seqKArg, &headsArg, &keyDimArg, &valueDimArg, &scaleArg, &hasMaskArg
+            };
+            Launch(scaledDotProductAttentionF32, (uint)(batch * heads), (uint)seqQ, 1, BlockSize, 1, 1, (uint)(seqK * sizeof(float)), stream, args);
         }
 
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)

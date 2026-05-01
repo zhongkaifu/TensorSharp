@@ -210,6 +210,46 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaElementwiseAndScalarOps_MatchExpected()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var x = Tensor.FromArray(allocator, new float[,] { { 1, -2, 3 }, { -4, 5, -6 } });
+        using var y = Tensor.FromArray(allocator, new float[,] { { 0.5f, 2, -1 }, { 4, -0.25f, 3 } });
+        using var z = Tensor.FromArray(allocator, new float[,] { { 2, -3, 0.5f }, { 1.5f, -2, 4 } });
+        using var w = Tensor.FromArray(allocator, new float[,] { { -1, 0.25f, 2 }, { -0.5f, 3, -2 } });
+
+        using var add = Ops.Add(null, x, y);
+        AssertClose(new[] { 1.5f, 0f, 2f, 0f, 4.75f, -3f }, add.GetElementsAsFloat(6));
+
+        using var mul = Ops.Mul(null, x, y);
+        AssertClose(new[] { 0.5f, -4f, -3f, -16f, -1.25f, -18f }, mul.GetElementsAsFloat(6));
+
+        using var scaled = Ops.Mul(null, x, 0.25f);
+        AssertClose(new[] { 0.25f, -0.5f, 0.75f, -1f, 1.25f, -1.5f }, scaled.GetElementsAsFloat(6));
+
+        using var reverseSub = Ops.Sub(null, 10f, x);
+        AssertClose(new[] { 9f, 12f, 7f, 14f, 5f, 16f }, reverseSub.GetElementsAsFloat(6));
+
+        using var reverseDiv = Ops.Div(null, 12f, x);
+        AssertClose(new[] { 12f, -6f, 4f, -3f, 2.4f, -2f }, reverseDiv.GetElementsAsFloat(6), 1e-5f);
+
+        using var addMul = Ops.AddMul(null, x, y, z);
+        AssertClose(new[] { 2f, -8f, 2.5f, 2f, 5.5f, 6f }, addMul.GetElementsAsFloat(6), 1e-5f);
+
+        using var addDiv = Ops.AddDiv(null, x, y, z);
+        AssertClose(new[] { 1.25f, -2.6666667f, 1f, -1.3333333f, 5.125f, -5.25f }, addDiv.GetElementsAsFloat(6), 1e-5f);
+
+        using var addMulV = Ops.AddMulV(null, x, y, 0.5f);
+        AssertClose(new[] { 1.25f, -1f, 2.5f, -2f, 4.875f, -4.5f }, addMulV.GetElementsAsFloat(6), 1e-5f);
+
+        using var mulMulAdd = Ops.MulMulAdd(null, x, y, z, w);
+        AssertClose(new[] { -1.5f, -4.75f, -2f, -16.75f, -7.25f, -26f }, mulMulAdd.GetElementsAsFloat(6), 1e-5f);
+    }
+
+    [Fact]
     public void CudaRmsNormSoftmaxAndIndexSelect_MatchExpected()
     {
         if (!CudaBackend.IsAvailable())
@@ -382,6 +422,61 @@ public class CudaBackendTests
         }
     }
 
+    [Fact]
+    public void CudaScaledDotProductAttention_WithMaskMatchesReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int batch = 2;
+        const int seqQ = 3;
+        const int seqK = 4;
+        const int heads = 2;
+        const int keyDim = 5;
+        const int valueDim = 6;
+        const float scale = 0.37f;
+
+        float[,,,] q = new float[batch, seqQ, heads, keyDim];
+        float[,,,] k = new float[batch, seqK, heads, keyDim];
+        float[,,,] v = new float[batch, seqK, heads, valueDim];
+        float[,,,] mask = new float[batch, heads, seqQ, seqK];
+
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqQ; t++)
+                for (int h = 0; h < heads; h++)
+                    for (int d = 0; d < keyDim; d++)
+                        q[b, t, h, d] = MathF.Sin((b + 1) * (t + 2) * (h + 3) * (d + 1) * 0.031f);
+
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqK; t++)
+                for (int h = 0; h < heads; h++)
+                    for (int d = 0; d < keyDim; d++)
+                        k[b, t, h, d] = MathF.Cos((b + 2) * (t + 1) * (h + 1) * (d + 2) * 0.027f);
+
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqK; t++)
+                for (int h = 0; h < heads; h++)
+                    for (int d = 0; d < valueDim; d++)
+                        v[b, t, h, d] = MathF.Sin((b + 3) * (t + 2) * (h + 2) * (d + 1) * 0.019f) * 0.5f;
+
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < heads; h++)
+                for (int tq = 0; tq < seqQ; tq++)
+                    for (int tk = 0; tk < seqK; tk++)
+                        mask[b, h, tq, tk] = tk > tq + 1 ? float.NegativeInfinity : 0.01f * (b - h);
+
+        using var allocator = new CudaAllocator();
+        using var qTensor = Tensor.FromArray(allocator, q);
+        using var kTensor = Tensor.FromArray(allocator, k);
+        using var vTensor = Tensor.FromArray(allocator, v);
+        using var maskTensor = Tensor.FromArray(allocator, mask);
+        using var actualTensor = Ops.ScaledDotProductAttention(null, qTensor, kTensor, vTensor, maskTensor, scale);
+
+        float[] actual = actualTensor.GetElementsAsFloat((int)actualTensor.ElementCount());
+        float[] expected = ScaledDotProductAttentionReference(q, k, v, mask, scale);
+        AssertClose(expected, actual, 1e-5f);
+    }
+
     private static float[] SoftmaxRow(params float[] values)
     {
         float max = values.Max();
@@ -501,6 +596,54 @@ public class CudaBackendTests
             }
         }
         return expected;
+    }
+
+    private static float[] ScaledDotProductAttentionReference(float[,,,] q, float[,,,] k, float[,,,] v, float[,,,] mask, float scale)
+    {
+        int batch = q.GetLength(0);
+        int seqQ = q.GetLength(1);
+        int heads = q.GetLength(2);
+        int keyDim = q.GetLength(3);
+        int seqK = k.GetLength(1);
+        int valueDim = v.GetLength(3);
+        float[] result = new float[batch * seqQ * heads * valueDim];
+
+        for (int b = 0; b < batch; b++)
+        {
+            for (int tq = 0; tq < seqQ; tq++)
+            {
+                for (int h = 0; h < heads; h++)
+                {
+                    float[] scores = new float[seqK];
+                    float max = float.NegativeInfinity;
+                    for (int tk = 0; tk < seqK; tk++)
+                    {
+                        float dot = 0;
+                        for (int d = 0; d < keyDim; d++)
+                            dot += q[b, tq, h, d] * k[b, tk, h, d];
+                        scores[tk] = dot * scale + mask[b, h, tq, tk];
+                        max = MathF.Max(max, scores[tk]);
+                    }
+
+                    float sum = 0;
+                    for (int tk = 0; tk < seqK; tk++)
+                    {
+                        scores[tk] = MathF.Exp(scores[tk] - max);
+                        sum += scores[tk];
+                    }
+
+                    for (int d = 0; d < valueDim; d++)
+                    {
+                        float acc = 0;
+                        for (int tk = 0; tk < seqK; tk++)
+                            acc += scores[tk] / sum * v[b, tk, h, d];
+                        result[((b * seqQ + tq) * heads + h) * valueDim + d] = acc;
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     private static float[,] CreateQuantInput()

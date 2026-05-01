@@ -20,6 +20,30 @@ namespace TensorSharp.Cuda
         SigmoidMul = 2,
     }
 
+    internal enum CudaBinaryOp
+    {
+        Add = 0,
+        Sub = 1,
+        Mul = 2,
+        Div = 3,
+    }
+
+    internal enum CudaScalarOp
+    {
+        Add = 0,
+        Sub = 1,
+        Mul = 2,
+        Div = 3,
+        ReverseSub = 4,
+        ReverseDiv = 5,
+    }
+
+    internal enum CudaTernaryOp
+    {
+        AddMul = 0,
+        AddDiv = 1,
+    }
+
     internal static class CudaKernelOps
     {
         public static bool TryFill(Tensor result, float value)
@@ -101,6 +125,139 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryBinary(Tensor result, Tensor lhs, Tensor rhs, CudaBinaryOp op)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(lhs, out CudaStorage lhsStorage, out IntPtr lhsPtr, out int lhsCount) ||
+                !TryGetContiguousFloat(rhs, out CudaStorage rhsStorage, out IntPtr rhsPtr, out int rhsCount) ||
+                count != lhsCount ||
+                count != rhsCount ||
+                !SameShape(result, lhs) ||
+                !SameShape(result, rhs))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            lhsStorage.EnsureDeviceCurrent();
+            rhsStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchBinaryF32(lhsPtr, rhsPtr, resultPtr, count, (int)op, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryScalar(Tensor result, Tensor lhs, float rhs, CudaScalarOp op)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(lhs, out CudaStorage lhsStorage, out IntPtr lhsPtr, out int lhsCount) ||
+                count != lhsCount ||
+                !SameShape(result, lhs))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            lhsStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchScalarF32(lhsPtr, resultPtr, count, rhs, (int)op, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryTernary(Tensor result, Tensor x, Tensor y, Tensor z, CudaTernaryOp op)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(x, out CudaStorage xStorage, out IntPtr xPtr, out int xCount) ||
+                !TryGetContiguousFloat(y, out CudaStorage yStorage, out IntPtr yPtr, out int yCount) ||
+                !TryGetContiguousFloat(z, out CudaStorage zStorage, out IntPtr zPtr, out int zCount) ||
+                count != xCount ||
+                count != yCount ||
+                count != zCount ||
+                !SameShape(result, x) ||
+                !SameShape(result, y) ||
+                !SameShape(result, z))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            xStorage.EnsureDeviceCurrent();
+            yStorage.EnsureDeviceCurrent();
+            zStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchTernaryF32(xPtr, yPtr, zPtr, resultPtr, count, (int)op, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryAddMulScalar(Tensor result, Tensor x, Tensor y, float z)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(x, out CudaStorage xStorage, out IntPtr xPtr, out int xCount) ||
+                !TryGetContiguousFloat(y, out CudaStorage yStorage, out IntPtr yPtr, out int yCount) ||
+                count != xCount ||
+                count != yCount ||
+                !SameShape(result, x) ||
+                !SameShape(result, y))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            xStorage.EnsureDeviceCurrent();
+            yStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchAddMulScalarF32(xPtr, yPtr, resultPtr, count, z, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryMulMulAdd(Tensor result, Tensor x, Tensor y, Tensor z, Tensor w)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(x, out CudaStorage xStorage, out IntPtr xPtr, out int xCount) ||
+                !TryGetContiguousFloat(y, out CudaStorage yStorage, out IntPtr yPtr, out int yCount) ||
+                !TryGetContiguousFloat(z, out CudaStorage zStorage, out IntPtr zPtr, out int zCount) ||
+                !TryGetContiguousFloat(w, out CudaStorage wStorage, out IntPtr wPtr, out int wCount) ||
+                count != xCount ||
+                count != yCount ||
+                count != zCount ||
+                count != wCount ||
+                !SameShape(result, x) ||
+                !SameShape(result, y) ||
+                !SameShape(result, z) ||
+                !SameShape(result, w))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            xStorage.EnsureDeviceCurrent();
+            yStorage.EnsureDeviceCurrent();
+            zStorage.EnsureDeviceCurrent();
+            wStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchMulMulAddF32(xPtr, yPtr, zPtr, wPtr, resultPtr, count, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TrySiLUMulSplit(Tensor result, Tensor gateUp, int halfDim)
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
@@ -176,6 +333,84 @@ namespace TensorSharp.Cuda
             srcStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             kernels.LaunchSoftmaxF32(srcPtr, resultPtr, rows, cols, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryScaledDotProductAttention(Tensor result, Tensor query, Tensor key, Tensor value, Tensor mask, float scale)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out _) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out _) ||
+                !TryGetContiguousFloat(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
+                !TryGetContiguousFloat(value, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                query.DimensionCount != 4 ||
+                key.DimensionCount != 4 ||
+                value.DimensionCount != 4 ||
+                result.DimensionCount != 4 ||
+                query.Sizes[0] != key.Sizes[0] ||
+                query.Sizes[0] != value.Sizes[0] ||
+                query.Sizes[2] != key.Sizes[2] ||
+                query.Sizes[2] != value.Sizes[2] ||
+                query.Sizes[3] != key.Sizes[3] ||
+                result.Sizes[0] != query.Sizes[0] ||
+                result.Sizes[1] != query.Sizes[1] ||
+                result.Sizes[2] != query.Sizes[2] ||
+                result.Sizes[3] != value.Sizes[3])
+            {
+                return false;
+            }
+
+            int batch = checked((int)query.Sizes[0]);
+            int seqQ = checked((int)query.Sizes[1]);
+            int heads = checked((int)query.Sizes[2]);
+            int keyDim = checked((int)query.Sizes[3]);
+            int seqK = checked((int)key.Sizes[1]);
+            int valueDim = checked((int)value.Sizes[3]);
+            if (seqK <= 0 || seqK > 8192)
+                return false;
+
+            IntPtr maskPtr = IntPtr.Zero;
+            CudaStorage maskStorage = null;
+            int hasMask = 0;
+            if (mask != null)
+            {
+                if (!TryGetContiguousFloat(mask, out maskStorage, out maskPtr, out _) ||
+                    mask.DimensionCount != 4 ||
+                    mask.Sizes[0] != batch ||
+                    mask.Sizes[1] != heads ||
+                    mask.Sizes[2] != seqQ ||
+                    mask.Sizes[3] != seqK)
+                {
+                    return false;
+                }
+
+                hasMask = 1;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            maskStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchScaledDotProductAttentionF32(
+                queryPtr,
+                keyPtr,
+                valuePtr,
+                maskPtr,
+                resultPtr,
+                batch,
+                seqQ,
+                seqK,
+                heads,
+                keyDim,
+                valueDim,
+                scale,
+                hasMask,
+                allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -371,6 +606,20 @@ namespace TensorSharp.Cuda
         {
             kernels = allocator.Kernels;
             return kernels != null;
+        }
+
+        private static bool SameShape(Tensor a, Tensor b)
+        {
+            if (a.DimensionCount != b.DimensionCount)
+                return false;
+
+            for (int i = 0; i < a.DimensionCount; i++)
+            {
+                if (a.Sizes[i] != b.Sizes[i])
+                    return false;
+            }
+
+            return true;
         }
     }
 }

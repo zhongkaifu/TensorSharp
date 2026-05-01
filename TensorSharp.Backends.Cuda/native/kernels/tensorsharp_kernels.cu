@@ -270,6 +270,74 @@ extern "C" __global__ void ts_unary_f32(const float* input, float* output, int c
     output[i] = y;
 }
 
+extern "C" __global__ void ts_binary_f32(const float* lhs, const float* rhs, float* output, int count, int op)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    float x = lhs[i];
+    float y = rhs[i];
+    if (op == 0)
+        output[i] = x + y;
+    else if (op == 1)
+        output[i] = x - y;
+    else if (op == 2)
+        output[i] = x * y;
+    else
+        output[i] = x / y;
+}
+
+extern "C" __global__ void ts_scalar_f32(const float* input, float* output, int count, float value, int op)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    float x = input[i];
+    if (op == 0)
+        output[i] = x + value;
+    else if (op == 1)
+        output[i] = x - value;
+    else if (op == 2)
+        output[i] = x * value;
+    else if (op == 3)
+        output[i] = x / value;
+    else if (op == 4)
+        output[i] = value - x;
+    else
+        output[i] = value / x;
+}
+
+extern "C" __global__ void ts_ternary_f32(const float* x, const float* y, const float* z, float* output, int count, int op)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    float a = x[i];
+    float b = y[i];
+    float c = z[i];
+    if (op == 0)
+        output[i] = a + b * c;
+    else
+        output[i] = a + b / c;
+}
+
+extern "C" __global__ void ts_addmul_scalar_f32(const float* x, const float* y, float* output, int count, float value)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        output[i] = x[i] + y[i] * value;
+}
+
+extern "C" __global__ void ts_mulmuladd_f32(const float* x, const float* y, const float* z, const float* w, float* output, int count)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        output[i] = x[i] * y[i] + z[i] * w[i];
+}
+
 extern "C" __global__ void ts_binary_activation_f32(const float* a, const float* b, float* output, int count, int op)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -374,6 +442,79 @@ extern "C" __global__ void ts_softmax_f32(const float* input, float* output, int
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         y[i] *= inv_sum;
+}
+
+extern "C" __global__ void ts_scaled_dot_product_attention_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* mask,
+    float* output,
+    int batch,
+    int seq_q,
+    int seq_k,
+    int heads,
+    int key_dim,
+    int value_dim,
+    float scale,
+    int has_mask)
+{
+    int batch_head = blockIdx.x;
+    int q_pos = blockIdx.y;
+    if (batch_head >= batch * heads || q_pos >= seq_q)
+        return;
+
+    int b = batch_head / heads;
+    int h = batch_head - b * heads;
+    const float* q = query + (((size_t)b * seq_q + q_pos) * heads + h) * key_dim;
+    extern __shared__ float scores[];
+
+    float max_v = -FLT_MAX;
+    for (int k_pos = threadIdx.x; k_pos < seq_k; k_pos += blockDim.x)
+    {
+        const float* k = key + (((size_t)b * seq_k + k_pos) * heads + h) * key_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < key_dim; d++)
+            dot += q[d] * k[d];
+
+        float score = dot * scale;
+        if (has_mask)
+            score += mask[(((size_t)b * heads + h) * seq_q + q_pos) * seq_k + k_pos];
+        scores[k_pos] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int k_pos = threadIdx.x; k_pos < seq_k; k_pos += blockDim.x)
+    {
+        float p = expf(scores[k_pos] - shared_max);
+        scores[k_pos] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (((size_t)b * seq_q + q_pos) * heads + h) * value_dim;
+    for (int d = threadIdx.x; d < value_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k_pos = 0; k_pos < seq_k; k_pos++)
+        {
+            const float* v = value + (((size_t)b * seq_k + k_pos) * heads + h) * value_dim;
+            acc += scores[k_pos] * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
 }
 
 extern "C" __global__ void ts_index_select_f32(
