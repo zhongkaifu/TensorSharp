@@ -91,6 +91,9 @@ namespace TensorSharp.Models
         private float[] _neoXRopeCos, _neoXRopeSin;
         private int _neoXRopeCacheSeqLen, _neoXRopeCacheStartPos = -1;
         private float[] _neoXRopeCacheFreqs;
+        private Tensor _neoXRopeCosTensor, _neoXRopeSinTensor;
+        private int _neoXRopeDeviceCacheSeqLen, _neoXRopeDeviceCacheStartPos = -1;
+        private float[] _neoXRopeDeviceCacheFreqs;
 
         // Cached RoPE position tensors for local layers.
         // All local layers in a forward pass share the same (seqLen, startPos),
@@ -779,7 +782,9 @@ namespace TensorSharp.Models
             else
             {
                 float[] hostEmbeddings = visionEmbeddings.GetElementsAsFloat((int)visionEmbeddings.ElementCount());
-                target.SetElementsAsFloat(hostEmbeddings);
+                using var deviceEmbeddings = new Tensor(hidden.Allocator, visionEmbeddings.ElementType, (long[])visionEmbeddings.Sizes.Clone());
+                deviceEmbeddings.SetElementsAsFloat(hostEmbeddings);
+                Ops.Copy(target, deviceEmbeddings);
             }
             Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
         }
@@ -1389,12 +1394,11 @@ namespace TensorSharp.Models
         private Tensor ExtractPerLayerSlice(Tensor perLayerInputs, int layer, int seqLen)
         {
             int offset = layer * _pleDim;
+            if (seqLen > 1)
+                return SliceColumnsContiguous(perLayerInputs, offset, _pleDim);
+
             var slice = perLayerInputs.Narrow(1, offset, _pleDim);
-            if (seqLen == 1)
-                return slice;
-            var contiguous = Ops.NewContiguous(slice);
-            slice.Dispose();
-            return contiguous;
+            return slice;
         }
 
         #endregion
@@ -1795,6 +1799,19 @@ namespace TensorSharp.Models
             Tensor gateUp = LinearForward(input, gateUpWeightName);
             int halfDim = (int)(gateUp.Sizes[1] / 2);
 
+            if (_backend == BackendType.Cuda && seqLen > 1)
+            {
+                var activated = new Tensor(_allocator, DType.Float32, gateUp.Sizes[0], halfDim);
+                if (CudaFusedOps.TryGELUMulSplit(activated, gateUp, halfDim))
+                {
+                    gateUp.Dispose();
+                    Tensor downFast = LinearForward(activated, downWeightName);
+                    activated.Dispose();
+                    return downFast;
+                }
+                activated.Dispose();
+            }
+
             Tensor gate, up;
             if (seqLen == 1)
             {
@@ -1878,9 +1895,9 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    using (var qView = qkv.Narrow(1, 0, qDim)) q = Ops.NewContiguous(qView);
-                    using (var kView = qkv.Narrow(1, qDim, kDim)) k = Ops.NewContiguous(kView);
-                    using (var vView = qkv.Narrow(1, qDim + kDim, vDim)) v = Ops.NewContiguous(vView);
+                    q = SliceColumnsContiguous(qkv, 0, qDim);
+                    k = SliceColumnsContiguous(qkv, qDim, kDim);
+                    v = SliceColumnsContiguous(qkv, qDim + kDim, vDim);
                 }
                 qkv.Dispose();
 
@@ -1971,16 +1988,25 @@ namespace TensorSharp.Models
                 {
                     int attendLen = Math.Min(totalSeqLen, _slidingWindow);
                     result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
-                    AttentionDecodeCircular(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
-                        Config.NumHeads, kvHeads, hd, hd,
-                        startPos, attendLen, cacheLen, 1f);
+                    int attendStart = Math.Max(0, startPos + 1 - attendLen);
+                    if (!CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            Config.NumHeads, kvHeads, hd, attendStart, startPos + 1 - attendStart, cacheLen, true, 1f))
+                    {
+                        AttentionDecodeCircular(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
+                            Config.NumHeads, kvHeads, hd, hd,
+                            startPos, attendLen, cacheLen, 1f);
+                    }
                 }
                 else
                 {
                     result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
-                    AttentionDecodeWithWindow(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
-                        Config.NumHeads, kvHeads, hd, hd,
-                        0, totalSeqLen, 1f);
+                    if (!CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            Config.NumHeads, kvHeads, hd, 0, totalSeqLen, cacheLen, false, 1f))
+                    {
+                        AttentionDecodeWithWindow(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
+                            Config.NumHeads, kvHeads, hd, hd,
+                            0, totalSeqLen, 1f);
+                    }
                 }
             }
             else
@@ -2271,9 +2297,23 @@ namespace TensorSharp.Models
         /// copy. Combines the Narrow→NewContiguous and View→Transpose→NewContiguous
         /// steps, eliminating one full tensor copy per projection.
         /// </summary>
+        private Tensor SliceColumnsContiguous(Tensor src, int colOffset, int width)
+        {
+            var result = new Tensor(_allocator, DType.Float32, src.Sizes[0], width);
+            if (CudaFusedOps.TrySliceColumns(result, src, colOffset, width))
+                return result;
+            result.Dispose();
+
+            using var view = src.Narrow(1, colOffset, width);
+            return Ops.NewContiguous(view);
+        }
+
         private unsafe Tensor SplitQKVToHeadFirst(Tensor qkv, int colOffset, int numHeads, int seqLen, int headDim)
         {
             var result = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
+            if (CudaFusedOps.TrySplitQkvToHeadFirst(result, qkv, colOffset, numHeads, seqLen, headDim))
+                return result;
+
             float* src = GetFloatPtr(qkv);
             float* dst = GetFloatPtr(result);
             int qkvStride = (int)qkv.Sizes[1];
@@ -2314,8 +2354,8 @@ namespace TensorSharp.Models
         private unsafe void ApplyNeoXRoPEHeadFirst(Tensor data, int numHeads, int headDim,
             int seqLen, int startPos, float[] freqs)
         {
-            float* ptr = GetFloatPtr(data);
             int ropeHalf = freqs.Length;
+            bool rebuiltTables = false;
 
             if (_neoXRopeCos == null || _neoXRopeCacheSeqLen != seqLen ||
                 _neoXRopeCacheStartPos != startPos || _neoXRopeCacheFreqs != freqs)
@@ -2340,8 +2380,17 @@ namespace TensorSharp.Models
                 _neoXRopeCacheSeqLen = seqLen;
                 _neoXRopeCacheStartPos = startPos;
                 _neoXRopeCacheFreqs = freqs;
+                rebuiltTables = true;
             }
 
+            if (EnsureNeoXRopeDeviceTables(seqLen, startPos, freqs, rebuiltTables) &&
+                CudaFusedOps.TryNeoXRoPEHeadFirst(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    numHeads, seqLen, headDim, ropeHalf))
+            {
+                return;
+            }
+
+            float* ptr = GetFloatPtr(data);
             if (numHeads * seqLen >= 64)
             {
                 int totalWork = numHeads * seqLen;
@@ -2384,6 +2433,38 @@ namespace TensorSharp.Models
                     }
                 }
             }
+        }
+
+        private bool EnsureNeoXRopeDeviceTables(int seqLen, int startPos, float[] freqs, bool rebuiltTables)
+        {
+            if (_backend != BackendType.Cuda || _neoXRopeCos == null || _neoXRopeSin == null)
+                return false;
+
+            int tableSize = seqLen * freqs.Length;
+            bool needsUpload = rebuiltTables ||
+                _neoXRopeCosTensor == null ||
+                (int)_neoXRopeCosTensor.Sizes[0] != tableSize ||
+                _neoXRopeDeviceCacheSeqLen != seqLen ||
+                _neoXRopeDeviceCacheStartPos != startPos ||
+                _neoXRopeDeviceCacheFreqs != freqs;
+
+            if (!needsUpload)
+                return true;
+
+            if (_neoXRopeCosTensor == null || (int)_neoXRopeCosTensor.Sizes[0] != tableSize)
+            {
+                _neoXRopeCosTensor?.Dispose();
+                _neoXRopeSinTensor?.Dispose();
+                _neoXRopeCosTensor = new Tensor(_allocator, DType.Float32, tableSize);
+                _neoXRopeSinTensor = new Tensor(_allocator, DType.Float32, tableSize);
+            }
+
+            _neoXRopeCosTensor.SetElementsAsFloat(_neoXRopeCos);
+            _neoXRopeSinTensor.SetElementsAsFloat(_neoXRopeSin);
+            _neoXRopeDeviceCacheSeqLen = seqLen;
+            _neoXRopeDeviceCacheStartPos = startPos;
+            _neoXRopeDeviceCacheFreqs = freqs;
+            return true;
         }
 
         private Tensor ApplyBatchRMSNorm(Tensor data, string weightName, int numHeads, int seqLen, int headDim)
@@ -2684,9 +2765,12 @@ namespace TensorSharp.Models
         {
             if (prevWindowLen <= 0) return null;
             var result = new Tensor(_allocator, DType.Float32, kvHeads, prevWindowLen, headDim);
+            int prevStart = startPos - prevWindowLen;
+            if (CudaFusedOps.TryGatherCircularHeadFirst(result, cache, prevStart, prevWindowLen, cacheSize))
+                return result;
+
             float* cachePtr = GetFloatPtr(cache);
             float* dstPtr = GetFloatPtr(result);
-            int prevStart = startPos - prevWindowLen;
             int firstSlot = ((prevStart % cacheSize) + cacheSize) % cacheSize;
             long headBytes = (long)headDim * sizeof(float);
 
@@ -2731,6 +2815,8 @@ namespace TensorSharp.Models
             int hd = (int)a.Sizes[2];
             int totalLen = lenA + lenB;
             var result = new Tensor(_allocator, DType.Float32, kvHeads, totalLen, hd);
+            if (CudaFusedOps.TryConcatHeadFirst(result, a, b))
+                return result;
 
             float* aPtr = GetFloatPtr(a);
             float* bPtr = GetFloatPtr(b);
@@ -2801,6 +2887,9 @@ namespace TensorSharp.Models
 
         private unsafe void CopyToCacheCircular(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize)
         {
+            if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, cacheSize, true))
+                return;
+
             float* srcPtr = GetFloatPtr(src);
             float* cachePtr = GetFloatPtr(cache);
             int numHeads = (int)cache.Sizes[0];
@@ -2909,6 +2998,8 @@ namespace TensorSharp.Models
         public override void Dispose()
         {
             _onesForVNorm?.Dispose();
+            _neoXRopeCosTensor?.Dispose();
+            _neoXRopeSinTensor?.Dispose();
             _visionEncoder?.Dispose();
             _audioEncoder?.Dispose();
             foreach (var (emb, _) in _pendingVisionEmbeddingsList)

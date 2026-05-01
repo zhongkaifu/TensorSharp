@@ -1312,6 +1312,11 @@ namespace TensorSharp.Models
             if (seqLen == 1)
                 return data.View(numHeads, 1, headDim);
 
+            var result = new Tensor(_allocator, data.ElementType, numHeads, seqLen, headDim);
+            if (CudaFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
+                return result;
+            result.Dispose();
+
             using var reshaped = data.View(seqLen, numHeads, headDim);
             using var transposed = reshaped.Transpose(0, 1);
             return Ops.NewContiguous(transposed);
@@ -1329,6 +1334,9 @@ namespace TensorSharp.Models
 
         protected void CopyToCache(Tensor cache, Tensor src, int startPos, int seqLen)
         {
+            if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, (int)cache.Sizes[1], false))
+                return;
+
             using var cacheSlice = cache.Narrow(1, startPos, seqLen);
             Ops.Copy(cacheSlice, src);
             InvalidateTensorDeviceCache(cache);
@@ -1345,6 +1353,17 @@ namespace TensorSharp.Models
         protected unsafe void CopyToCacheDecode(Tensor kCache, Tensor kTensor,
             Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
         {
+            using (var kHeads = kTensor.View(numKVHeads, 1, headDim))
+            using (var vHeads = vTensor.View(numKVHeads, 1, headDim))
+            {
+                int cacheSize = (int)kCache.Sizes[1];
+                if (CudaFusedOps.TryCopyHeadFirstToCache(kCache, kHeads, startPos, 1, cacheSize, false) &&
+                    CudaFusedOps.TryCopyHeadFirstToCache(vCache, vHeads, startPos, 1, cacheSize, false))
+                {
+                    return;
+                }
+            }
+
             float* kSrc = GetFloatPtr(kTensor);
             float* vSrc = GetFloatPtr(vTensor);
             float* kCachePtr = GetFloatPtr(kCache);

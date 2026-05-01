@@ -280,6 +280,31 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryGELUMulSplit(Tensor result, Tensor gateUp, int halfDim)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(gateUp, out CudaStorage gateUpStorage, out IntPtr gateUpPtr, out _) ||
+                result.DimensionCount != 2 ||
+                gateUp.DimensionCount != 2 ||
+                result.Sizes[0] != gateUp.Sizes[0] ||
+                result.Sizes[1] != halfDim ||
+                gateUp.Sizes[1] < halfDim * 2 ||
+                count != result.Sizes[0] * halfDim)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            gateUpStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchGELUMulSplitF32(gateUpPtr, resultPtr, checked((int)result.Sizes[0]), halfDim, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryRMSNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
         {
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
@@ -481,6 +506,340 @@ namespace TensorSharp.Cuda
                 scale,
                 allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryGqaDecodeAttention(
+            Tensor result,
+            Tensor query,
+            Tensor keyCache,
+            Tensor valueCache,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            bool circular,
+            float scale)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out int queryCount) ||
+                !TryGetContiguousFloat(keyCache, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
+                !TryGetContiguousFloat(valueCache, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                query.DimensionCount != 2 ||
+                result.DimensionCount != 2 ||
+                keyCache.DimensionCount != 3 ||
+                valueCache.DimensionCount != 3 ||
+                numQHeads <= 0 ||
+                numKVHeads <= 0 ||
+                headDim <= 0 ||
+                attendStart < 0 ||
+                attendLen <= 0 ||
+                attendLen > 8192 ||
+                cacheSize <= 0 ||
+                numQHeads % numKVHeads != 0 ||
+                query.Sizes[0] != 1 ||
+                query.Sizes[1] != numQHeads * headDim ||
+                result.Sizes[0] != 1 ||
+                result.Sizes[1] != numQHeads * headDim ||
+                keyCache.Sizes[0] != numKVHeads ||
+                keyCache.Sizes[1] != cacheSize ||
+                keyCache.Sizes[2] != headDim ||
+                valueCache.Sizes[0] != numKVHeads ||
+                valueCache.Sizes[1] != cacheSize ||
+                valueCache.Sizes[2] != headDim ||
+                queryCount != numQHeads * headDim ||
+                resultCount != queryCount ||
+                (!circular && attendStart + attendLen > cacheSize))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchGqaDecodeAttentionF32(
+                queryPtr,
+                keyPtr,
+                valuePtr,
+                resultPtr,
+                numQHeads,
+                numKVHeads,
+                headDim,
+                attendStart,
+                attendLen,
+                cacheSize,
+                circular ? 1 : 0,
+                scale,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TrySliceColumns(Tensor result, Tensor src, int colOffset, int width)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(src, out CudaStorage srcStorage, out IntPtr srcPtr, out _) ||
+                result.DimensionCount != 2 ||
+                src.DimensionCount != 2 ||
+                width <= 0 ||
+                colOffset < 0 ||
+                result.Sizes[0] != src.Sizes[0] ||
+                result.Sizes[1] != width ||
+                colOffset + width > src.Sizes[1] ||
+                resultCount != result.Sizes[0] * width)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            srcStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchSliceColumnsF32(
+                srcPtr,
+                resultPtr,
+                checked((int)result.Sizes[0]),
+                checked((int)src.Sizes[1]),
+                colOffset,
+                width,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryFlatToHeadFirst(Tensor result, Tensor src, int numHeads, int seqLen, int headDim)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcCount) ||
+                result.DimensionCount != 3 ||
+                src.DimensionCount != 2 ||
+                numHeads <= 0 ||
+                seqLen <= 0 ||
+                headDim <= 0 ||
+                src.Sizes[0] != seqLen ||
+                src.Sizes[1] != numHeads * headDim ||
+                result.Sizes[0] != numHeads ||
+                result.Sizes[1] != seqLen ||
+                result.Sizes[2] != headDim ||
+                srcCount != seqLen * numHeads * headDim ||
+                resultCount != srcCount)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            srcStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchFlatToHeadFirstF32(srcPtr, resultPtr, seqLen, numHeads, headDim, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TrySplitQkvToHeadFirst(Tensor result, Tensor qkv, int colOffset, int numHeads, int seqLen, int headDim)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(qkv, out CudaStorage qkvStorage, out IntPtr qkvPtr, out _) ||
+                result.DimensionCount != 3 ||
+                qkv.DimensionCount != 2 ||
+                numHeads <= 0 ||
+                seqLen <= 0 ||
+                headDim <= 0 ||
+                colOffset < 0 ||
+                qkv.Sizes[0] != seqLen ||
+                colOffset + numHeads * headDim > qkv.Sizes[1] ||
+                result.Sizes[0] != numHeads ||
+                result.Sizes[1] != seqLen ||
+                result.Sizes[2] != headDim ||
+                resultCount != seqLen * numHeads * headDim)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            qkvStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchSplitQkvHeadFirstF32(
+                qkvPtr,
+                resultPtr,
+                seqLen,
+                checked((int)qkv.Sizes[1]),
+                colOffset,
+                numHeads,
+                headDim,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryCopyHeadFirstToCache(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize, bool circular)
+        {
+            if (!TryGetContiguousFloat(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _) ||
+                !TryGetContiguousFloat(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcCount) ||
+                cache.DimensionCount != 3 ||
+                src.DimensionCount != 3 ||
+                seqLen <= 0 ||
+                cacheSize <= 0 ||
+                startPos < 0 ||
+                src.Sizes[0] != cache.Sizes[0] ||
+                src.Sizes[1] != seqLen ||
+                src.Sizes[2] != cache.Sizes[2] ||
+                cache.Sizes[1] != cacheSize ||
+                srcCount != src.Sizes[0] * seqLen * src.Sizes[2] ||
+                (!circular && startPos + seqLen > cacheSize))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = cacheStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            srcStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchCopyHeadFirstToCacheF32(
+                srcPtr,
+                cachePtr,
+                checked((int)src.Sizes[0]),
+                seqLen,
+                checked((int)src.Sizes[2]),
+                startPos,
+                cacheSize,
+                circular ? 1 : 0,
+                allocator.Stream.Handle);
+            cacheStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryGatherCircularHeadFirst(Tensor result, Tensor cache, int startPos, int seqLen, int cacheSize)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _) ||
+                result.DimensionCount != 3 ||
+                cache.DimensionCount != 3 ||
+                seqLen <= 0 ||
+                cacheSize <= 0 ||
+                result.Sizes[0] != cache.Sizes[0] ||
+                result.Sizes[1] != seqLen ||
+                result.Sizes[2] != cache.Sizes[2] ||
+                cache.Sizes[1] != cacheSize ||
+                resultCount != result.Sizes[0] * seqLen * result.Sizes[2])
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            cacheStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchGatherCircularHeadFirstF32(
+                cachePtr,
+                resultPtr,
+                checked((int)result.Sizes[0]),
+                seqLen,
+                checked((int)result.Sizes[2]),
+                startPos,
+                cacheSize,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryConcatHeadFirst(Tensor result, Tensor a, Tensor b)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(a, out CudaStorage aStorage, out IntPtr aPtr, out _) ||
+                !TryGetContiguousFloat(b, out CudaStorage bStorage, out IntPtr bPtr, out _) ||
+                result.DimensionCount != 3 ||
+                a.DimensionCount != 3 ||
+                b.DimensionCount != 3 ||
+                a.Sizes[0] != b.Sizes[0] ||
+                a.Sizes[2] != b.Sizes[2] ||
+                result.Sizes[0] != a.Sizes[0] ||
+                result.Sizes[1] != a.Sizes[1] + b.Sizes[1] ||
+                result.Sizes[2] != a.Sizes[2] ||
+                resultCount != result.Sizes[0] * result.Sizes[1] * result.Sizes[2])
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            aStorage.EnsureDeviceCurrent();
+            bStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchConcatHeadFirstF32(
+                aPtr,
+                bPtr,
+                resultPtr,
+                checked((int)result.Sizes[0]),
+                checked((int)a.Sizes[1]),
+                checked((int)b.Sizes[1]),
+                checked((int)result.Sizes[2]),
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryNeoXRoPEHeadFirst(Tensor data, Tensor cosTable, Tensor sinTable, int numHeads, int seqLen, int headDim, int ropeHalf)
+        {
+            if (!TryGetContiguousFloat(data, out CudaStorage dataStorage, out IntPtr dataPtr, out int dataCount) ||
+                !TryGetContiguousFloat(cosTable, out CudaStorage cosStorage, out IntPtr cosPtr, out int cosCount) ||
+                !TryGetContiguousFloat(sinTable, out CudaStorage sinStorage, out IntPtr sinPtr, out int sinCount) ||
+                data.DimensionCount != 3 ||
+                cosTable.DimensionCount != 1 ||
+                sinTable.DimensionCount != 1 ||
+                numHeads <= 0 ||
+                seqLen <= 0 ||
+                headDim <= 0 ||
+                ropeHalf <= 0 ||
+                ropeHalf * 2 > headDim ||
+                data.Sizes[0] != numHeads ||
+                data.Sizes[1] != seqLen ||
+                data.Sizes[2] != headDim ||
+                dataCount != numHeads * seqLen * headDim ||
+                cosCount != seqLen * ropeHalf ||
+                sinCount != cosCount)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = dataStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            dataStorage.EnsureDeviceCurrent();
+            cosStorage.EnsureDeviceCurrent();
+            sinStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchNeoXRoPEHeadFirstF32(
+                dataPtr,
+                cosPtr,
+                sinPtr,
+                numHeads,
+                seqLen,
+                headDim,
+                ropeHalf,
+                allocator.Stream.Handle);
+            dataStorage.MarkDeviceModified();
             return true;
         }
 

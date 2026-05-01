@@ -369,6 +369,21 @@ extern "C" __global__ void ts_silu_mul_split_f32(const float* gate_up, float* ou
     output[idx] = silu(gate) * up;
 }
 
+extern "C" __global__ void ts_gelu_mul_split_f32(const float* gate_up, float* output, int rows, int half_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * half_dim;
+    if (idx >= total)
+        return;
+
+    int row = idx / half_dim;
+    int col = idx - row * half_dim;
+    const float* row_ptr = gate_up + (size_t)row * half_dim * 2;
+    float gate = row_ptr[col];
+    float up = row_ptr[col + half_dim];
+    output[idx] = gelu(gate) * up;
+}
+
 extern "C" __global__ void ts_rmsnorm_f32(
     const float* input,
     const float* alpha,
@@ -599,6 +614,243 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
         }
         out[d] = acc;
     }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_f32(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    const float* q = query + (size_t)q_head * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = -FLT_MAX;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        int logical_pos = attend_start + t;
+        int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+        if (cache_pos < 0)
+            cache_pos += cache_size;
+
+        const float* k = key_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * k[d];
+
+        float score = dot * scale;
+        scores[t] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        float p = expf(scores[t] - shared_max);
+        scores[t] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (size_t)q_head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int t = 0; t < attend_len; t++)
+        {
+            int logical_pos = attend_start + t;
+            int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+            if (cache_pos < 0)
+                cache_pos += cache_size;
+
+            const float* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+            acc += scores[t] * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_slice_columns_f32(
+    const float* source,
+    float* output,
+    int rows,
+    int source_cols,
+    int col_offset,
+    int width)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * width;
+    if (idx >= total)
+        return;
+
+    int row = idx / width;
+    int col = idx - row * width;
+    output[idx] = source[(size_t)row * source_cols + col_offset + col];
+}
+
+extern "C" __global__ void ts_flat_to_head_first_f32(
+    const float* source,
+    float* output,
+    int seq_len,
+    int num_heads,
+    int head_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_heads * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    output[idx] = source[((size_t)seq * num_heads + head) * head_dim + d];
+}
+
+extern "C" __global__ void ts_split_qkv_head_first_f32(
+    const float* source,
+    float* output,
+    int seq_len,
+    int source_cols,
+    int col_offset,
+    int num_heads,
+    int head_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_heads * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    output[idx] = source[(size_t)seq * source_cols + col_offset + head * head_dim + d];
+}
+
+extern "C" __global__ void ts_copy_head_first_to_cache_f32(
+    const float* source,
+    float* cache,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int start_pos,
+    int cache_size,
+    int circular)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    int cache_pos = circular ? ((start_pos + seq) % cache_size) : (start_pos + seq);
+    cache[((size_t)head * cache_size + cache_pos) * head_dim + d] = source[idx];
+}
+
+extern "C" __global__ void ts_gather_circular_head_first_f32(
+    const float* cache,
+    float* output,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int start_pos,
+    int cache_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    int cache_pos = (start_pos + seq) % cache_size;
+    if (cache_pos < 0)
+        cache_pos += cache_size;
+    output[idx] = cache[((size_t)head * cache_size + cache_pos) * head_dim + d];
+}
+
+extern "C" __global__ void ts_concat_head_first_f32(
+    const float* a,
+    const float* b,
+    float* output,
+    int num_heads,
+    int len_a,
+    int len_b,
+    int head_dim)
+{
+    int total_len = len_a + len_b;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * total_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % total_len;
+    int head = tmp / total_len;
+    if (seq < len_a)
+        output[idx] = a[((size_t)head * len_a + seq) * head_dim + d];
+    else
+        output[idx] = b[((size_t)head * len_b + (seq - len_a)) * head_dim + d];
+}
+
+extern "C" __global__ void ts_neox_rope_head_first_f32(
+    float* data,
+    const float* cos_table,
+    const float* sin_table,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int rope_half)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * rope_half;
+    if (idx >= total)
+        return;
+
+    int j = idx % rope_half;
+    int tmp = idx / rope_half;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    size_t base = ((size_t)head * seq_len + seq) * head_dim;
+    size_t table = (size_t)seq * rope_half + j;
+    float cos_v = cos_table[table];
+    float sin_v = sin_table[table];
+    float x0 = data[base + j];
+    float x1 = data[base + j + rope_half];
+    data[base + j] = x0 * cos_v - x1 * sin_v;
+    data[base + j + rope_half] = x0 * sin_v + x1 * cos_v;
 }
 
 extern "C" __global__ void ts_index_select_f32(
@@ -940,7 +1192,7 @@ extern "C" __global__ void ts_quant_matmul_q4_0_f32(
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
 }
 
-extern "C" __global__ void ts_quant_matmul_q8_0_f32(
+extern "C" __global__ void ts_quant_matmul_q8_0_single_f32(
     const uint8_t* weights,
     const float* input,
     float* output,
@@ -1015,6 +1267,165 @@ extern "C" __global__ void ts_quant_matmul_q8_0_f32(
     acc3 = block_reduce_sum(acc3);
     if (threadIdx.x == 0 && out_col0 + 3 < out_dim)
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+}
+
+extern "C" __global__ void ts_quant_matmul_q8_0_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    const int cols_per_block = 4;
+    int out_col0 = blockIdx.x * cols_per_block;
+
+    int row0 = blockIdx.y * 4;
+    if (out_col0 >= out_dim || row0 >= rows)
+        return;
+
+    int row_bytes = (in_dim / 32) * 34;
+    bool has_r1 = row0 + 1 < rows;
+    bool has_r2 = row0 + 2 < rows;
+    bool has_r3 = row0 + 3 < rows;
+
+    float acc00 = 0.0f, acc01 = 0.0f, acc02 = 0.0f, acc03 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f, acc12 = 0.0f, acc13 = 0.0f;
+    float acc20 = 0.0f, acc21 = 0.0f, acc22 = 0.0f, acc23 = 0.0f;
+    float acc30 = 0.0f, acc31 = 0.0f, acc32 = 0.0f, acc33 = 0.0f;
+    for (int k = threadIdx.x; k < in_dim; k += blockDim.x)
+    {
+        int block_offset = (k / 32) * 34;
+        int lane = k & 31;
+        float x0 = input[(size_t)(row0 + 0) * in_dim + k];
+        float x1 = has_r1 ? input[(size_t)(row0 + 1) * in_dim + k] : 0.0f;
+        float x2 = has_r2 ? input[(size_t)(row0 + 2) * in_dim + k] : 0.0f;
+        float x3 = has_r3 ? input[(size_t)(row0 + 3) * in_dim + k] : 0.0f;
+
+        const uint8_t* w0 = weights + (size_t)(out_col0 + 0) * row_bytes + block_offset;
+        float d0 = __half2float(*reinterpret_cast<const half*>(w0));
+        int8_t q0 = reinterpret_cast<const int8_t*>(w0 + 2)[lane];
+        float wv0 = d0 * (float)q0;
+        acc00 += wv0 * x0;
+        acc10 += wv0 * x1;
+        acc20 += wv0 * x2;
+        acc30 += wv0 * x3;
+
+        if (out_col0 + 1 < out_dim)
+        {
+            const uint8_t* w1 = weights + (size_t)(out_col0 + 1) * row_bytes + block_offset;
+            float d1 = __half2float(*reinterpret_cast<const half*>(w1));
+            int8_t q1 = reinterpret_cast<const int8_t*>(w1 + 2)[lane];
+            float wv1 = d1 * (float)q1;
+            acc01 += wv1 * x0;
+            acc11 += wv1 * x1;
+            acc21 += wv1 * x2;
+            acc31 += wv1 * x3;
+        }
+
+        if (out_col0 + 2 < out_dim)
+        {
+            const uint8_t* w2 = weights + (size_t)(out_col0 + 2) * row_bytes + block_offset;
+            float d2 = __half2float(*reinterpret_cast<const half*>(w2));
+            int8_t q2 = reinterpret_cast<const int8_t*>(w2 + 2)[lane];
+            float wv2 = d2 * (float)q2;
+            acc02 += wv2 * x0;
+            acc12 += wv2 * x1;
+            acc22 += wv2 * x2;
+            acc32 += wv2 * x3;
+        }
+
+        if (out_col0 + 3 < out_dim)
+        {
+            const uint8_t* w3 = weights + (size_t)(out_col0 + 3) * row_bytes + block_offset;
+            float d3 = __half2float(*reinterpret_cast<const half*>(w3));
+            int8_t q3 = reinterpret_cast<const int8_t*>(w3 + 2)[lane];
+            float wv3 = d3 * (float)q3;
+            acc03 += wv3 * x0;
+            acc13 += wv3 * x1;
+            acc23 += wv3 * x2;
+            acc33 += wv3 * x3;
+        }
+    }
+
+    acc00 = block_reduce_sum(acc00);
+    if (threadIdx.x == 0)
+        output[(size_t)(row0 + 0) * out_dim + out_col0] = acc00;
+    __syncthreads();
+
+    acc01 = block_reduce_sum(acc01);
+    if (threadIdx.x == 0 && out_col0 + 1 < out_dim)
+        output[(size_t)(row0 + 0) * out_dim + out_col0 + 1] = acc01;
+    __syncthreads();
+
+    acc02 = block_reduce_sum(acc02);
+    if (threadIdx.x == 0 && out_col0 + 2 < out_dim)
+        output[(size_t)(row0 + 0) * out_dim + out_col0 + 2] = acc02;
+    __syncthreads();
+
+    acc03 = block_reduce_sum(acc03);
+    if (threadIdx.x == 0 && out_col0 + 3 < out_dim)
+        output[(size_t)(row0 + 0) * out_dim + out_col0 + 3] = acc03;
+    __syncthreads();
+
+    acc10 = block_reduce_sum(acc10);
+    if (threadIdx.x == 0 && has_r1)
+        output[(size_t)(row0 + 1) * out_dim + out_col0] = acc10;
+    __syncthreads();
+
+    acc11 = block_reduce_sum(acc11);
+    if (threadIdx.x == 0 && has_r1 && out_col0 + 1 < out_dim)
+        output[(size_t)(row0 + 1) * out_dim + out_col0 + 1] = acc11;
+    __syncthreads();
+
+    acc12 = block_reduce_sum(acc12);
+    if (threadIdx.x == 0 && has_r1 && out_col0 + 2 < out_dim)
+        output[(size_t)(row0 + 1) * out_dim + out_col0 + 2] = acc12;
+    __syncthreads();
+
+    acc13 = block_reduce_sum(acc13);
+    if (threadIdx.x == 0 && has_r1 && out_col0 + 3 < out_dim)
+        output[(size_t)(row0 + 1) * out_dim + out_col0 + 3] = acc13;
+    __syncthreads();
+
+    acc20 = block_reduce_sum(acc20);
+    if (threadIdx.x == 0 && has_r2)
+        output[(size_t)(row0 + 2) * out_dim + out_col0] = acc20;
+    __syncthreads();
+
+    acc21 = block_reduce_sum(acc21);
+    if (threadIdx.x == 0 && has_r2 && out_col0 + 1 < out_dim)
+        output[(size_t)(row0 + 2) * out_dim + out_col0 + 1] = acc21;
+    __syncthreads();
+
+    acc22 = block_reduce_sum(acc22);
+    if (threadIdx.x == 0 && has_r2 && out_col0 + 2 < out_dim)
+        output[(size_t)(row0 + 2) * out_dim + out_col0 + 2] = acc22;
+    __syncthreads();
+
+    acc23 = block_reduce_sum(acc23);
+    if (threadIdx.x == 0 && has_r2 && out_col0 + 3 < out_dim)
+        output[(size_t)(row0 + 2) * out_dim + out_col0 + 3] = acc23;
+    __syncthreads();
+
+    acc30 = block_reduce_sum(acc30);
+    if (threadIdx.x == 0 && has_r3)
+        output[(size_t)(row0 + 3) * out_dim + out_col0] = acc30;
+    __syncthreads();
+
+    acc31 = block_reduce_sum(acc31);
+    if (threadIdx.x == 0 && has_r3 && out_col0 + 1 < out_dim)
+        output[(size_t)(row0 + 3) * out_dim + out_col0 + 1] = acc31;
+    __syncthreads();
+
+    acc32 = block_reduce_sum(acc32);
+    if (threadIdx.x == 0 && has_r3 && out_col0 + 2 < out_dim)
+        output[(size_t)(row0 + 3) * out_dim + out_col0 + 2] = acc32;
+    __syncthreads();
+
+    acc33 = block_reduce_sum(acc33);
+    if (threadIdx.x == 0 && has_r3 && out_col0 + 3 < out_dim)
+        output[(size_t)(row0 + 3) * out_dim + out_col0 + 3] = acc33;
 }
 
 extern "C" __global__ void ts_quant_get_rows_f32(

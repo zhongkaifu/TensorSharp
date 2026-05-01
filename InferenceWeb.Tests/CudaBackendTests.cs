@@ -24,6 +24,31 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaStagedHostEmbeddingCopy_PreservesDeviceResidentTensorData()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var tensor = new Tensor(allocator, DType.Float32, 4, 4);
+        FillSequential(tensor, scale: 1f, offset: 0f);
+        Ops.Mul(tensor, tensor, 2f);
+
+        using var staged = new Tensor(allocator, DType.Float32, 1, 4);
+        staged.SetElementsAsFloat(new[] { 100f, 101f, 102f, 103f });
+        using (var row = tensor.Narrow(0, 1, 1))
+            Ops.Copy(row, staged);
+
+        AssertClose(new[]
+        {
+            0f, 2f, 4f, 6f,
+            100f, 101f, 102f, 103f,
+            16f, 18f, 20f, 22f,
+            24f, 26f, 28f, 30f,
+        }, tensor.GetElementsAsFloat(16));
+    }
+
+    [Fact]
     public void CudaAddmm_MatchesCpuForTransposedWeightView()
     {
         if (!CudaBackend.IsAvailable())
@@ -565,12 +590,155 @@ public class CudaBackendTests
         AssertClose(expected, actualTensor.GetElementsAsFloat(seqLen * numQHeads * headDim), 1e-5f);
     }
 
+    [Fact]
+    public void CudaFusedLayoutOps_MatchReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var qkv = new Tensor(allocator, DType.Float32, 3, 10);
+        FillSequential(qkv, scale: 1f, offset: 0f);
+
+        using var slice = new Tensor(allocator, DType.Float32, 3, 4);
+        Assert.True(CudaFusedOps.TrySliceColumns(slice, qkv, 2, 4));
+        AssertClose(new[] { 2f, 3f, 4f, 5f, 12f, 13f, 14f, 15f, 22f, 23f, 24f, 25f },
+            slice.GetElementsAsFloat(12));
+
+        using var split = new Tensor(allocator, DType.Float32, 2, 3, 2);
+        Assert.True(CudaFusedOps.TrySplitQkvToHeadFirst(split, qkv, 1, 2, 3, 2));
+        AssertClose(new[] { 1f, 2f, 11f, 12f, 21f, 22f, 3f, 4f, 13f, 14f, 23f, 24f },
+            split.GetElementsAsFloat(12));
+
+        using var flat = new Tensor(allocator, DType.Float32, 3, 6);
+        FillSequential(flat, scale: 1f, offset: 100f);
+        using var heads = new Tensor(allocator, DType.Float32, 2, 3, 3);
+        Assert.True(CudaFusedOps.TryFlatToHeadFirst(heads, flat, 2, 3, 3));
+        AssertClose(new[] { 100f, 101f, 102f, 106f, 107f, 108f, 112f, 113f, 114f, 103f, 104f, 105f, 109f, 110f, 111f, 115f, 116f, 117f },
+            heads.GetElementsAsFloat(18));
+    }
+
+    [Fact]
+    public void CudaGqaDecodeAttention_CircularMatchesReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int headDim = 3;
+        const int cacheSize = 5;
+        const int attendStart = 3;
+        const int attendLen = 4;
+
+        using var allocator = new CudaAllocator();
+        using var q = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        using var k = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        using var v = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        FillSinusoidal(q, 0.07f);
+        FillSinusoidal(k, 0.11f);
+        FillSinusoidal(v, -0.13f);
+
+        using var actual = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaDecodeAttention(
+            actual, q, k, v, numQHeads, numKVHeads, headDim,
+            attendStart, attendLen, cacheSize, circular: true, scale: 1.0f));
+
+        float[] expected = GqaDecodeAttentionReference(
+            q.GetElementsAsFloat(numQHeads * headDim),
+            k.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            v.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            numQHeads, numKVHeads, headDim, attendStart, attendLen, cacheSize, circular: true);
+        AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 1e-5f);
+    }
+
+    [Fact]
+    public void CudaFusedCacheOps_MatchReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var src = new Tensor(allocator, DType.Float32, 2, 4, 3);
+        FillSequential(src, scale: 1f, offset: 1f);
+        using var cache = new Tensor(allocator, DType.Float32, 2, 5, 3);
+        Ops.Fill(cache, -1f);
+
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(cache, src, 3, 4, 5, circular: true));
+        using var gathered = new Tensor(allocator, DType.Float32, 2, 4, 3);
+        Assert.True(CudaFusedOps.TryGatherCircularHeadFirst(gathered, cache, 3, 4, 5));
+        AssertClose(src.GetElementsAsFloat(24), gathered.GetElementsAsFloat(24));
+
+        using var a = new Tensor(allocator, DType.Float32, 2, 2, 3);
+        using var b = new Tensor(allocator, DType.Float32, 2, 3, 3);
+        FillSequential(a, scale: 1f, offset: 10f);
+        FillSequential(b, scale: 1f, offset: 100f);
+        using var concat = new Tensor(allocator, DType.Float32, 2, 5, 3);
+        Assert.True(CudaFusedOps.TryConcatHeadFirst(concat, a, b));
+        AssertClose(new[]
+        {
+            10f, 11f, 12f, 13f, 14f, 15f, 100f, 101f, 102f, 103f, 104f, 105f, 106f, 107f, 108f,
+            16f, 17f, 18f, 19f, 20f, 21f, 109f, 110f, 111f, 112f, 113f, 114f, 115f, 116f, 117f,
+        }, concat.GetElementsAsFloat(30));
+    }
+
+    [Fact]
+    public void CudaFusedGeluAndNeoXRope_MatchReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var gateUp = new Tensor(allocator, DType.Float32, 2, 6);
+        gateUp.SetElementsAsFloat(new[] { -1f, 0.5f, 2f, 3f, -4f, 0.25f, 1.25f, -0.75f, 0.1f, 2f, 3f, -5f });
+        using var activated = new Tensor(allocator, DType.Float32, 2, 3);
+        Assert.True(CudaFusedOps.TryGELUMulSplit(activated, gateUp, 3));
+
+        float[] gateUpHost = gateUp.GetElementsAsFloat(12);
+        float[] expectedActivated = new float[6];
+        for (int row = 0; row < 2; row++)
+            for (int col = 0; col < 3; col++)
+                expectedActivated[row * 3 + col] = Gelu(gateUpHost[row * 6 + col]) * gateUpHost[row * 6 + 3 + col];
+        AssertClose(expectedActivated, activated.GetElementsAsFloat(6), 1e-5f);
+
+        using var data = new Tensor(allocator, DType.Float32, 2, 2, 4);
+        data.SetElementsAsFloat(Enumerable.Range(0, 16).Select(i => 0.25f * (i + 1)).ToArray());
+        using var cos = Tensor.FromArray(allocator, new[] { 1f, 0.5f, 0.25f, -0.75f });
+        using var sin = Tensor.FromArray(allocator, new[] { 0f, 0.8660254f, 0.9682458f, 0.6614378f });
+        float[] before = data.GetElementsAsFloat(16);
+        Assert.True(CudaFusedOps.TryNeoXRoPEHeadFirst(data, cos, sin, 2, 2, 4, 2));
+
+        float[] expectedRope = (float[])before.Clone();
+        for (int h = 0; h < 2; h++)
+        {
+            for (int s = 0; s < 2; s++)
+            {
+                int baseIdx = (h * 2 + s) * 4;
+                for (int j = 0; j < 2; j++)
+                {
+                    float c = cos.GetElementAsFloat(s * 2 + j);
+                    float sn = sin.GetElementAsFloat(s * 2 + j);
+                    float x0 = before[baseIdx + j];
+                    float x1 = before[baseIdx + j + 2];
+                    expectedRope[baseIdx + j] = x0 * c - x1 * sn;
+                    expectedRope[baseIdx + j + 2] = x0 * sn + x1 * c;
+                }
+            }
+        }
+        AssertClose(expectedRope, data.GetElementsAsFloat(16), 1e-5f);
+    }
+
     private static float[] SoftmaxRow(params float[] values)
     {
         float max = values.Max();
         float[] exps = values.Select(v => MathF.Exp(v - max)).ToArray();
         float sum = exps.Sum();
         return exps.Select(v => v / sum).ToArray();
+    }
+
+    private static float Gelu(float x)
+    {
+        return 0.5f * x * (1.0f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
     }
 
     private static byte[] CreateQ8_0Rows(sbyte[][] rows)
@@ -787,6 +955,60 @@ public class CudaBackendTests
                         acc += scores[tk] / sum * v[kvHead, tk, d];
                     result[(tq * numQHeads + h) * headDim + d] = acc;
                 }
+            }
+        }
+
+        return result;
+    }
+
+    private static float[] GqaDecodeAttentionReference(
+        float[] q,
+        float[] k,
+        float[] v,
+        int numQHeads,
+        int numKVHeads,
+        int headDim,
+        int attendStart,
+        int attendLen,
+        int cacheSize,
+        bool circular)
+    {
+        int groupSize = numQHeads / numKVHeads;
+        float[] result = new float[numQHeads * headDim];
+
+        for (int h = 0; h < numQHeads; h++)
+        {
+            int kvHead = h / groupSize;
+            float[] scores = new float[attendLen];
+            float max = float.NegativeInfinity;
+            for (int t = 0; t < attendLen; t++)
+            {
+                int logical = attendStart + t;
+                int cachePos = circular ? logical % cacheSize : logical;
+                float dot = 0;
+                for (int d = 0; d < headDim; d++)
+                    dot += q[h * headDim + d] * k[(kvHead * cacheSize + cachePos) * headDim + d];
+                scores[t] = dot;
+                max = MathF.Max(max, dot);
+            }
+
+            float sum = 0;
+            for (int t = 0; t < attendLen; t++)
+            {
+                scores[t] = MathF.Exp(scores[t] - max);
+                sum += scores[t];
+            }
+
+            for (int d = 0; d < headDim; d++)
+            {
+                float acc = 0;
+                for (int t = 0; t < attendLen; t++)
+                {
+                    int logical = attendStart + t;
+                    int cachePos = circular ? logical % cacheSize : logical;
+                    acc += scores[t] / sum * v[(kvHead * cacheSize + cachePos) * headDim + d];
+                }
+                result[h * headDim + d] = acc;
             }
         }
 

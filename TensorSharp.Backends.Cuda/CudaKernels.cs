@@ -18,16 +18,26 @@ namespace TensorSharp.Cuda
         private readonly IntPtr mulMulAddF32;
         private readonly IntPtr binaryActivationF32;
         private readonly IntPtr siluMulSplitF32;
+        private readonly IntPtr geluMulSplitF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr softmaxF32;
         private readonly IntPtr scaledDotProductAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF32;
+        private readonly IntPtr gqaDecodeAttentionF32;
+        private readonly IntPtr sliceColumnsF32;
+        private readonly IntPtr flatToHeadFirstF32;
+        private readonly IntPtr splitQkvHeadFirstF32;
+        private readonly IntPtr copyHeadFirstToCacheF32;
+        private readonly IntPtr gatherCircularHeadFirstF32;
+        private readonly IntPtr concatHeadFirstF32;
+        private readonly IntPtr neoxRopeHeadFirstF32;
         private readonly IntPtr indexSelectF32;
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
         private readonly IntPtr quantMatmulF32;
         private readonly IntPtr quantMatmulQ40F32;
+        private readonly IntPtr quantMatmulQ80SingleF32;
         private readonly IntPtr quantMatmulQ80F32;
         private readonly IntPtr quantGetRowsF32;
 
@@ -43,16 +53,26 @@ namespace TensorSharp.Cuda
             mulMulAddF32 = module.GetFunction("ts_mulmuladd_f32");
             binaryActivationF32 = module.GetFunction("ts_binary_activation_f32");
             siluMulSplitF32 = module.GetFunction("ts_silu_mul_split_f32");
+            geluMulSplitF32 = module.GetFunction("ts_gelu_mul_split_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
+            gqaDecodeAttentionF32 = module.GetFunction("ts_gqa_decode_attention_f32");
+            sliceColumnsF32 = module.GetFunction("ts_slice_columns_f32");
+            flatToHeadFirstF32 = module.GetFunction("ts_flat_to_head_first_f32");
+            splitQkvHeadFirstF32 = module.GetFunction("ts_split_qkv_head_first_f32");
+            copyHeadFirstToCacheF32 = module.GetFunction("ts_copy_head_first_to_cache_f32");
+            gatherCircularHeadFirstF32 = module.GetFunction("ts_gather_circular_head_first_f32");
+            concatHeadFirstF32 = module.GetFunction("ts_concat_head_first_f32");
+            neoxRopeHeadFirstF32 = module.GetFunction("ts_neox_rope_head_first_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
+            quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
         }
@@ -171,6 +191,17 @@ namespace TensorSharp.Cuda
             Launch(siluMulSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchGELUMulSplitF32(IntPtr gateUp, IntPtr output, int rows, int halfDim, IntPtr stream)
+        {
+            IntPtr gateUpArg = gateUp;
+            IntPtr outputArg = output;
+            int rowsArg = rows;
+            int halfDimArg = halfDim;
+            int count = checked(rows * halfDim);
+            void** args = stackalloc void*[] { &gateUpArg, &outputArg, &rowsArg, &halfDimArg };
+            Launch(geluMulSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)
         {
             IntPtr inputArg = input;
@@ -264,6 +295,203 @@ namespace TensorSharp.Cuda
                 &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg
             };
             Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionF32(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &headDimArg, &attendStartArg, &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg
+            };
+            Launch(gqaDecodeAttentionF32, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchSliceColumnsF32(
+            IntPtr source,
+            IntPtr output,
+            int rows,
+            int sourceCols,
+            int colOffset,
+            int width,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr outputArg = output;
+            int rowsArg = rows;
+            int sourceColsArg = sourceCols;
+            int colOffsetArg = colOffset;
+            int widthArg = width;
+            int count = checked(rows * width);
+            void** args = stackalloc void*[] { &sourceArg, &outputArg, &rowsArg, &sourceColsArg, &colOffsetArg, &widthArg };
+            Launch(sliceColumnsF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchFlatToHeadFirstF32(
+            IntPtr source,
+            IntPtr output,
+            int seqLen,
+            int numHeads,
+            int headDim,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr outputArg = output;
+            int seqLenArg = seqLen;
+            int numHeadsArg = numHeads;
+            int headDimArg = headDim;
+            int count = checked(seqLen * numHeads * headDim);
+            void** args = stackalloc void*[] { &sourceArg, &outputArg, &seqLenArg, &numHeadsArg, &headDimArg };
+            Launch(flatToHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchSplitQkvHeadFirstF32(
+            IntPtr source,
+            IntPtr output,
+            int seqLen,
+            int sourceCols,
+            int colOffset,
+            int numHeads,
+            int headDim,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr outputArg = output;
+            int seqLenArg = seqLen;
+            int sourceColsArg = sourceCols;
+            int colOffsetArg = colOffset;
+            int numHeadsArg = numHeads;
+            int headDimArg = headDim;
+            int count = checked(seqLen * numHeads * headDim);
+            void** args = stackalloc void*[]
+            {
+                &sourceArg, &outputArg, &seqLenArg, &sourceColsArg, &colOffsetArg, &numHeadsArg, &headDimArg
+            };
+            Launch(splitQkvHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchCopyHeadFirstToCacheF32(
+            IntPtr source,
+            IntPtr cache,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int startPos,
+            int cacheSize,
+            int circular,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr cacheArg = cache;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int startPosArg = startPos;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            int count = checked(numHeads * seqLen * headDim);
+            void** args = stackalloc void*[]
+            {
+                &sourceArg, &cacheArg, &numHeadsArg, &seqLenArg, &headDimArg, &startPosArg, &cacheSizeArg, &circularArg
+            };
+            Launch(copyHeadFirstToCacheF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchGatherCircularHeadFirstF32(
+            IntPtr cache,
+            IntPtr output,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int startPos,
+            int cacheSize,
+            IntPtr stream)
+        {
+            IntPtr cacheArg = cache;
+            IntPtr outputArg = output;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int startPosArg = startPos;
+            int cacheSizeArg = cacheSize;
+            int count = checked(numHeads * seqLen * headDim);
+            void** args = stackalloc void*[]
+            {
+                &cacheArg, &outputArg, &numHeadsArg, &seqLenArg, &headDimArg, &startPosArg, &cacheSizeArg
+            };
+            Launch(gatherCircularHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchConcatHeadFirstF32(
+            IntPtr a,
+            IntPtr b,
+            IntPtr output,
+            int numHeads,
+            int lenA,
+            int lenB,
+            int headDim,
+            IntPtr stream)
+        {
+            IntPtr aArg = a;
+            IntPtr bArg = b;
+            IntPtr outputArg = output;
+            int numHeadsArg = numHeads;
+            int lenAArg = lenA;
+            int lenBArg = lenB;
+            int headDimArg = headDim;
+            int count = checked(numHeads * (lenA + lenB) * headDim);
+            void** args = stackalloc void*[] { &aArg, &bArg, &outputArg, &numHeadsArg, &lenAArg, &lenBArg, &headDimArg };
+            Launch(concatHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchNeoXRoPEHeadFirstF32(
+            IntPtr data,
+            IntPtr cosTable,
+            IntPtr sinTable,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int ropeHalf,
+            IntPtr stream)
+        {
+            IntPtr dataArg = data;
+            IntPtr cosTableArg = cosTable;
+            IntPtr sinTableArg = sinTable;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int ropeHalfArg = ropeHalf;
+            int count = checked(numHeads * seqLen * ropeHalf);
+            void** args = stackalloc void*[]
+            {
+                &dataArg, &cosTableArg, &sinTableArg, &numHeadsArg, &seqLenArg, &headDimArg, &ropeHalfArg
+            };
+            Launch(neoxRopeHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)
@@ -388,7 +616,10 @@ namespace TensorSharp.Cuda
             int rowsArg = rows;
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
-            Launch(quantMatmulQ80F32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+            if (rows < 4)
+                Launch(quantMatmulQ80SingleF32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+            else
+                Launch(quantMatmulQ80F32, gridX, (uint)((rows + 3) / 4), 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantGetRowsF32(IntPtr weights, IntPtr indices, IntPtr output, int type, int cols, int rows, int indicesAreInt32, IntPtr stream)
