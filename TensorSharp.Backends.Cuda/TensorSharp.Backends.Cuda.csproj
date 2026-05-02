@@ -5,9 +5,9 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>Direct CUDA backend for TensorSharp using the CUDA Driver API and cuBLAS.</Description>
-    <PackageTags>tensor;backend;cuda;cublas;gpu</PackageTags>
+    <IsPackable>true</IsPackable>
+    <Description>Direct CUDA backend for TensorSharp using the CUDA Driver API, cuBLAS, PTX kernels, and quantized CUDA ops.</Description>
+    <PackageTags>$(TensorSharpPackageTags);backend;cuda;cublas;gpu;ptx</PackageTags>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
@@ -17,6 +17,8 @@
     <CudaKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'kernels'))</CudaKernelDir>
     <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'ptx'))</PtxOutputDir>
     <CudaPtxStampDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'obj', 'cuda_ptx'))</CudaPtxStampDir>
+    <CudaArchResolverPs1>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'resolve-cuda-arch.ps1'))</CudaArchResolverPs1>
+    <CudaArchResolverSh>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', 'native', 'resolve-cuda-arch.sh'))</CudaArchResolverSh>
     <CudaArch Condition="'$(CudaArch)' == '' And '$(TENSORSHARP_CUDA_ARCH)' != ''">$(TENSORSHARP_CUDA_ARCH)</CudaArch>
     <CudaArch Condition="'$(CudaArch)' == ''">auto</CudaArch>
     <CudaArchFallback Condition="'$(CudaArchFallback)' == ''">compute_61</CudaArchFallback>
@@ -26,10 +28,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <CudaKernel Include="$(CudaKernelDir)\*.cu">
+    <CudaKernel Include="$(CudaKernelDir)/*.cu">
       <FastMathFlag></FastMathFlag>
     </CudaKernel>
-    <Content Include="$(PtxOutputDir)\*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(PtxOutputDir)')">
+    <Content Include="$(PtxOutputDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(PtxOutputDir)')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
@@ -38,25 +40,35 @@
     <Exec Command="nvcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_NvccExitCode" />
     </Exec>
-    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native')"
-          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\native\resolve-cuda-arch.ps1&quot; -FallbackArch &quot;$(CudaArchFallback)&quot;"
+    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(CudaArchResolverPs1)&quot; -FallbackArch &quot;$(CudaArchFallback)&quot;"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
+      <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
+    </Exec>
+    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
+          Command="sh &quot;$(CudaArchResolverSh)&quot; &quot;$(CudaArchFallback)&quot;"
+          ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
+      <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
     </Exec>
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0'">
       <_ResolvedCudaArch Condition="'$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native'">$(CudaArch)</_ResolvedCudaArch>
-      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == '' And '$(_DetectedCudaArch)' != ''">$(_DetectedCudaArch.Trim())</_ResolvedCudaArch>
+      <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == '' And '$(_DetectCudaArchExitCode)' == '0' And '$(_DetectedCudaArch)' != ''">$(_DetectedCudaArch.Trim())</_ResolvedCudaArch>
       <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == ''">$(CudaArchFallback)</_ResolvedCudaArch>
       <_CudaBuildSettingsKey>$(_ResolvedCudaArch.Replace('compute_', 'compute_').Replace('sm_', 'sm_'))_$(CudaNvccOptimizationFlags.Replace(' ', '_').Replace('-', ''))$(CudaFastMathFlag.Replace(' ', '_').Replace('-', ''))</_CudaBuildSettingsKey>
     </PropertyGroup>
+    <Message Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$(_DetectCudaArchExitCode)' != '' And '$(_DetectCudaArchExitCode)' != '0'"
+             Importance="high"
+             Text="WARNING: TensorSharp CUDA architecture detection failed; using $(CudaArchFallback)." />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
   </Target>
 
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
           DependsOnTargets="ResolveCudaPtxBuildSettings"
-          Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(MSBuildProjectDirectory)\native\resolve-cuda-arch.ps1"
-          Outputs="@(CudaKernel->'$(PtxOutputDir)\%(Filename).ptx');$(CudaPtxStampDir)\tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
+          Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
+          Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="WARNING: TensorSharp CUDA kernels were not compiled because nvcc was not found. The CUDA backend will keep CPU fallbacks for PTX-backed ops." />
     <PropertyGroup Condition="'$(_NvccExitCode)' == '0' And '$([MSBuild]::IsOSPlatform(Windows))' == 'true' And '$(VCToolsInstallDir)' != ''">
@@ -74,19 +86,19 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir);$(CudaPtxStampDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX for $(_ResolvedCudaArch)" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)\%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(_ResolvedCudaArch) $(CudaNvccOptimizationFlags) $(CudaFastMathFlag) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
     <WriteLinesToFile Condition="'$(_NvccExitCode)' == '0'"
-                      File="$(CudaPtxStampDir)\tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp"
+                      File="$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp"
                       Lines="arch=$(_ResolvedCudaArch);flags=$(CudaNvccOptimizationFlags) $(CudaFastMathFlag)"
                       Overwrite="true" />
   </Target>
 
   <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx">
-    <MakeDir Directories="$(OutDir)\cuda_kernels" Condition="Exists('$(PtxOutputDir)\tensorsharp_kernels.ptx')" />
-    <Copy SourceFiles="$(PtxOutputDir)\tensorsharp_kernels.ptx"
-          DestinationFolder="$(OutDir)\cuda_kernels"
+    <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="Exists('$(PtxOutputDir)/tensorsharp_kernels.ptx')" />
+    <Copy SourceFiles="$(PtxOutputDir)/tensorsharp_kernels.ptx"
+          DestinationFolder="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(PtxOutputDir)\tensorsharp_kernels.ptx')" />
+          Condition="Exists('$(PtxOutputDir)/tensorsharp_kernels.ptx')" />
   </Target>
 </Project>

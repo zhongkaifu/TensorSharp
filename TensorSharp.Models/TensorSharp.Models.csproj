@@ -1,11 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <Description>TensorSharp model architecture implementations and multimodal model utilities.</Description>
-    <PackageTags>tensor;models;llm;multimodal</PackageTags>
+    <IsPackable>true</IsPackable>
+    <Description>Model architecture implementations, multimodal encoders, and model execution helpers for TensorSharp.</Description>
+    <PackageTags>$(TensorSharpPackageTags);models;multimodal;architecture</PackageTags>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
@@ -27,15 +27,5 @@
     <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260330" />
     <PackageReference Include="StbImageSharp" Version="2.30.15" />
     <PackageReference Include="System.Numerics.Tensors" Version="10.0.7" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\LICENSE">
-      <Pack>True</Pack>
-      <PackagePath></PackagePath>
-    </None>
-    <None Include="..\README.md">
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
   </ItemGroup>
 </Project>

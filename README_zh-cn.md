@@ -156,6 +156,14 @@ TensorSharp/
 
 这样的拆分让引擎使用者不必带上 Web 依赖，也能把 API 层改动和核心运行时隔离开，并让后续 benchmark / eval harness 更容易独立发布。
 
+发布前可验证包元数据与 README 依赖边界：
+
+```powershell
+pwsh ./eng/verify-packages.ps1
+```
+
+该验证会对上表 7 个公开包运行 `dotnet pack`，并在 `AdvUtils` 等内部依赖泄漏到 `.nuspec`，或 TensorSharp 包依赖了上表之外的分层时失败。
+
 ## 前置要求
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)

@@ -2,10 +2,11 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <Description>Command-line host for TensorSharp model inference and diagnostics.</Description>
+    <IsPackable>true</IsPackable>
+    <Description>Command-line host for TensorSharp local inference, diagnostics, prompt inspection, and JSONL batch processing.</Description>
+    <PackageTags>$(TensorSharpPackageTags);cli;console;batch;diagnostics</PackageTags>
   </PropertyGroup>
   <PropertyGroup>
     <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>

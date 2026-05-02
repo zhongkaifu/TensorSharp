@@ -1,0 +1,33 @@
+<Project>
+  <PropertyGroup>
+    <TensorSharpVersion>2.8.6</TensorSharpVersion>
+    <TensorSharpPackageTags>tensorsharp;tensor;llm;gguf;inference</TensorSharpPackageTags>
+
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <Authors>Zhongkai Fu</Authors>
+    <PackageId Condition="'$(PackageId)' == ''">$(MSBuildProjectName)</PackageId>
+    <Version Condition="'$(Version)' == ''">$(TensorSharpVersion)</Version>
+    <PackageVersion Condition="'$(PackageVersion)' == ''">$(Version)</PackageVersion>
+    <RepositoryUrl>https://github.com/zhongkaifu/TensorSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/zhongkaifu/TensorSharp</PackageProjectUrl>
+    <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags Condition="'$(PackageTags)' == ''">$(TensorSharpPackageTags)</PackageTags>
+    <Description Condition="'$(Description)' == ''">TensorSharp project component.</Description>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <IsPackable Condition="'$(IsPackable)' == ''">false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)README.md"
+          Link="README.md"
+          Pack="true"
+          PackagePath=""
+          Condition="Exists('$(MSBuildThisFileDirectory)README.md')" />
+  </ItemGroup>
+</Project>

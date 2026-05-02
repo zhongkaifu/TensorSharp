@@ -156,6 +156,14 @@ The repository is now split along package boundaries so consumers can depend on 
 
 This split keeps engine users off the web stack, keeps API-layer changes from leaking into core/runtime packages, and makes future benchmark or eval-harness projects easier to publish independently.
 
+Validate package metadata and README dependency boundaries before publishing:
+
+```powershell
+pwsh ./eng/verify-packages.ps1
+```
+
+The verifier runs `dotnet pack` for the seven public packages above and fails if an internal dependency such as `AdvUtils` leaks into the `.nuspec`, or if a TensorSharp package depends on a layer outside this table.
+
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)

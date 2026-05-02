@@ -1,10 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <Description>HTTP and web server host for TensorSharp runtime and model services.</Description>
+    <IsPackable>true</IsPackable>
+    <Description>ASP.NET Core server package for TensorSharp with web UI plus Ollama and OpenAI-compatible APIs.</Description>
+    <PackageTags>$(TensorSharpPackageTags);server;aspnetcore;openai;ollama;web</PackageTags>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />

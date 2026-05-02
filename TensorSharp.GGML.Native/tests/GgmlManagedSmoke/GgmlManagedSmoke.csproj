@@ -4,7 +4,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <RollForward>Major</RollForward>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <Description>Smoke test for the managed TensorSharp GGML backend bridge.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />

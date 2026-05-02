@@ -4,7 +4,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <RollForward>Major</RollForward>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <Description>Smoke test for TensorSharp runtime and model inference wiring.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />

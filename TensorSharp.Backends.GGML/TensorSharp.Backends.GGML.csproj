@@ -5,14 +5,9 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
-    <Description>GGML backend integration for TensorSharp model execution.</Description>
-    <PackageTags>tensor;backend;ggml;native</PackageTags>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-  </PropertyGroup>
-  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>true</IsPackable>
+    <Description>GGML backend integration for TensorSharp, including native interop for CPU, Metal, and GGML CUDA execution.</Description>
+    <PackageTags>$(TensorSharpPackageTags);backend;ggml;metal;native;cuda</PackageTags>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'ReleaseCpuOnly|AnyCPU'">
     <OutputPath>bin\ReleaseCpuOnly\</OutputPath>
@@ -37,7 +32,6 @@
     <PackageReference Include="System.Data.DataSetExtensions" Version="4.5.0" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
   </ItemGroup>
   <Target Name="BuildGgmlNativeWindows" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''">
