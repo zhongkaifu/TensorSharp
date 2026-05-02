@@ -110,7 +110,12 @@ TensorSharp/
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps，拆分为多个专注源文件）
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
 │   ├── Program.cs               # 精简启动：DI 注册、中间件、端点映射
-│   ├── ModelService.cs          # 模型生命周期、KV 缓存复用、聊天/生成流式输出与每轮指标
+│   ├── ModelService.cs          # 保持服务端推理公共 API 稳定的门面
+│   ├── ModelLifecycleService.cs # 模型加载/释放与后端选择
+│   ├── SessionKvCacheManager.cs # 活跃会话切换、KV 复用/截断/重置、prefill 分块
+│   ├── ChatGenerationPipeline.cs # Prompt 渲染、prefill、decode 循环与 stop 处理
+│   ├── InferenceTelemetry.cs    # Prompt/eval 计时、TTFT、tokens/sec、完整输入/输出日志
+│   ├── ChatHistoryPreparer.cs   # 历史归一化、raw token 拼接、多模态顺序辅助
 │   ├── ChatSession.cs           # 单会话 KV 缓存与历史跟踪
 │   ├── SessionManager.cs        # 线程安全的会话注册（默认会话 + 每个 UI Tab 的会话）
 │   ├── InferenceQueue.cs        # 带排队位置跟踪的 FIFO 请求队列

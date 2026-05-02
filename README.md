@@ -110,7 +110,12 @@ TensorSharp/
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps, split into focused source files)
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
 │   ├── Program.cs               # Slim bootstrap: DI wiring, middleware, endpoint mapping
-│   ├── ModelService.cs          # Model lifecycle, KV cache reuse, chat/generate streams + per-turn metrics
+│   ├── ModelService.cs          # Facade that keeps the public server inference API stable
+│   ├── ModelLifecycleService.cs # Model load/dispose and backend selection
+│   ├── SessionKvCacheManager.cs # Active session switching, KV reuse/truncate/reset, prefill chunking
+│   ├── ChatGenerationPipeline.cs # Prompt rendering, prefill, decode loop, stop handling
+│   ├── InferenceTelemetry.cs    # Prompt/eval timing, TTFT, tokens/sec, full input/output logs
+│   ├── ChatHistoryPreparer.cs   # History normalization, raw-token splice helpers, multimodal order helpers
 │   ├── ChatSession.cs           # Per-conversation KV cache + tracked history
 │   ├── SessionManager.cs        # Thread-safe session registry (default + per-tab sessions)
 │   ├── InferenceQueue.cs        # FIFO request queue with position tracking
