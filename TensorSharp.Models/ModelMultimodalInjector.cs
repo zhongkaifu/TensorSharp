@@ -610,7 +610,7 @@ namespace TensorSharp.Models
 
         private static Tensor CloneTensor(Tensor source)
         {
-            var clone = new Tensor(source.Allocator, source.ElementType, (long[])source.Sizes.Clone());
+            var clone = new Tensor(source.Allocator, source.ElementType, source.Sizes);
             Ops.Copy(clone, source);
             return clone;
         }

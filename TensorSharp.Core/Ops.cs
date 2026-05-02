@@ -31,7 +31,7 @@ namespace TensorSharp
 
         public static Tensor NewContiguous(Tensor src)
         {
-            Tensor result = new Tensor(src.Allocator, src.ElementType, (long[])src.Sizes.Clone());
+            Tensor result = new Tensor(src.Allocator, src.ElementType, src.Sizes);
             Copy(result, src);
             return result;
         }

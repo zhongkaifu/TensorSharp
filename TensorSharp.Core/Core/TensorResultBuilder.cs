@@ -7,7 +7,7 @@
 //
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
-﻿using System;
+using System;
 
 namespace TensorSharp.Core
 {
@@ -16,20 +16,30 @@ namespace TensorSharp.Core
         // If a maybeResult is null, a new tensor will be constructed using the device id and element type of newTemplate
         public static Tensor GetWriteTarget(Tensor maybeResult, Tensor newTemplate, bool requireContiguous, params long[] requiredSizes)
         {
+            return GetWriteTarget(maybeResult, newTemplate.Allocator, newTemplate.ElementType, requireContiguous, (ReadOnlySpan<long>)requiredSizes);
+        }
+
+        public static Tensor GetWriteTarget(Tensor maybeResult, Tensor newTemplate, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
+        {
             return GetWriteTarget(maybeResult, newTemplate.Allocator, newTemplate.ElementType, requireContiguous, requiredSizes);
         }
 
         public static Tensor GetWriteTarget(Tensor maybeResult, IAllocator allocatorForNew, DType elementTypeForNew, bool requireContiguous, params long[] requiredSizes)
+        {
+            return GetWriteTarget(maybeResult, allocatorForNew, elementTypeForNew, requireContiguous, (ReadOnlySpan<long>)requiredSizes);
+        }
+
+        public static Tensor GetWriteTarget(Tensor maybeResult, IAllocator allocatorForNew, DType elementTypeForNew, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
         {
             if (maybeResult != null)
             {
                 if (!MatchesRequirements(maybeResult, requireContiguous, requiredSizes))
                 {
                     string message = string.Format("output tensor does not match requirements. Tensor must have sizes {0}{1}",
-                        string.Join(", ", requiredSizes),
+                        TensorDimensionHelpers.FormatDimensions(requiredSizes, ", "),
                         requireContiguous ? "; and must be contiguous. " : ". ");
 
-                    message += $"Tensor's actual shape is '{string.Join(", ", maybeResult.Sizes)}' and contiguous = '{maybeResult.IsContiguous()}'";
+                    message += $"Tensor's actual shape is '{TensorDimensionHelpers.FormatDimensions(maybeResult.Sizes, ", ")}' and contiguous = '{maybeResult.IsContiguous()}'";
 
                     throw new InvalidOperationException(message);
                 }
@@ -41,7 +51,7 @@ namespace TensorSharp.Core
             }
         }
 
-        private static bool MatchesRequirements(Tensor tensor, bool requireContiguous, params long[] requiredSizes)
+        private static bool MatchesRequirements(Tensor tensor, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
         {
             if (requireContiguous && !tensor.IsContiguous())
             {
@@ -51,7 +61,8 @@ namespace TensorSharp.Core
             return ArrayEqual(tensor.Sizes, requiredSizes);
         }
 
-        public static bool ArrayEqual<T>(T[] a, T[] b)
+        public static bool ArrayEqual<T>(ReadOnlySpan<T> a, ReadOnlySpan<T> b)
+            where T : IEquatable<T>
         {
             if (a.Length != b.Length)
             {
@@ -69,7 +80,8 @@ namespace TensorSharp.Core
             return true;
         }
 
-        public static bool ArrayEqualExcept<T>(T[] a, T[] b, int ignoreIndex)
+        public static bool ArrayEqualExcept<T>(ReadOnlySpan<T> a, ReadOnlySpan<T> b, int ignoreIndex)
+            where T : IEquatable<T>
         {
             if (a.Length != b.Length)
             {

@@ -22,7 +22,7 @@ namespace TensorSharp.GGML
             ValidateGgmlTensor(result, nameof(result), "fill");
 
             float* buffer = (float*)GetBufferStart(result);
-            TensorIterState iter = new TensorIterState(buffer, result.DimensionCount, result.Sizes, result.Strides);
+            TensorIterState iter = new TensorIterState(buffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
 
             do
             {
@@ -174,9 +174,9 @@ namespace TensorSharp.GGML
             ValidateGatherArguments(result, src, dim, indices);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, indices.Allocator, src.ElementType, false, indices.Sizes);
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides, dim);
-            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.Sizes, src.Strides, dim);
-            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.Sizes, indices.Strides, dim);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory, dim);
+            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
+            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
 
             do
             {
@@ -200,9 +200,9 @@ namespace TensorSharp.GGML
         {
             ValidateScatterArguments(result, src, dim, indices, "scatter");
 
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.Sizes, result.Strides, dim);
-            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.Sizes, src.Strides, dim);
-            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.Sizes, indices.Strides, dim);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
+            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
+            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
 
             do
             {
@@ -226,9 +226,9 @@ namespace TensorSharp.GGML
         {
             ValidateScatterArguments(result, src, dim, indices, "scatter_add");
 
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.Sizes, result.Strides, dim);
-            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.Sizes, src.Strides, dim);
-            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.Sizes, indices.Strides, dim);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
+            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
+            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
 
             do
             {
@@ -252,8 +252,8 @@ namespace TensorSharp.GGML
         {
             ValidateScatterFillArguments(result, dim, indices);
 
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.Sizes, result.Strides, dim);
-            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.Sizes, indices.Strides, dim);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
+            TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
 
             do
             {
@@ -1211,8 +1211,8 @@ namespace TensorSharp.GGML
                 return;
             }
 
-            TensorIterState resultIter = new TensorIterState(resultBuffer, result.DimensionCount, result.Sizes, result.Strides);
-            TensorIterState srcIter = new TensorIterState(srcBuffer, src.DimensionCount, src.Sizes, src.Strides);
+            TensorIterState resultIter = new TensorIterState(resultBuffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
+            TensorIterState srcIter = new TensorIterState(srcBuffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
 
             do
             {
@@ -1321,7 +1321,7 @@ namespace TensorSharp.GGML
             ValidateGgmlTensor(src, nameof(src), "iscorrupted");
 
             float* buffer = (float*)GetBufferStart(src);
-            TensorIterState iter = new TensorIterState(buffer, src.DimensionCount, src.Sizes, src.Strides);
+            TensorIterState iter = new TensorIterState(buffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
             do
             {
                 for (; !iter.ReachedBlockEnd(); iter.BlockStep())
@@ -1422,10 +1422,10 @@ namespace TensorSharp.GGML
             ValidateElementwiseArguments(result, "addmul", x, y, z);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides);
-            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.Sizes, x.Strides);
-            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.Sizes, y.Strides);
-            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.Sizes, z.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory);
+            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.SizesMemory, x.StridesMemory);
+            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.SizesMemory, y.StridesMemory);
+            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.SizesMemory, z.StridesMemory);
 
             do
             {
@@ -1445,10 +1445,10 @@ namespace TensorSharp.GGML
             ValidateElementwiseArguments(result, "adddiv", x, y, z);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides);
-            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.Sizes, x.Strides);
-            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.Sizes, y.Strides);
-            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.Sizes, z.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory);
+            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.SizesMemory, x.StridesMemory);
+            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.SizesMemory, y.StridesMemory);
+            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.SizesMemory, z.StridesMemory);
 
             do
             {
@@ -1468,9 +1468,9 @@ namespace TensorSharp.GGML
             ValidateElementwiseArguments(result, "addmulv", x, y);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides);
-            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.Sizes, x.Strides);
-            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.Sizes, y.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory);
+            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.SizesMemory, x.StridesMemory);
+            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.SizesMemory, y.StridesMemory);
 
             do
             {
@@ -1490,11 +1490,11 @@ namespace TensorSharp.GGML
             ValidateElementwiseArguments(result, "mulmuladd", x, y, z, w);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, x, false, x.Sizes);
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides);
-            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.Sizes, x.Strides);
-            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.Sizes, y.Strides);
-            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.Sizes, z.Strides);
-            TensorIterState wIter = new TensorIterState((float*)GetBufferStart(w), w.DimensionCount, w.Sizes, w.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory);
+            TensorIterState xIter = new TensorIterState((float*)GetBufferStart(x), x.DimensionCount, x.SizesMemory, x.StridesMemory);
+            TensorIterState yIter = new TensorIterState((float*)GetBufferStart(y), y.DimensionCount, y.SizesMemory, y.StridesMemory);
+            TensorIterState zIter = new TensorIterState((float*)GetBufferStart(z), z.DimensionCount, z.SizesMemory, z.StridesMemory);
+            TensorIterState wIter = new TensorIterState((float*)GetBufferStart(w), w.DimensionCount, w.SizesMemory, w.StridesMemory);
 
             do
             {
@@ -1589,7 +1589,7 @@ namespace TensorSharp.GGML
             if (repeats < 1)
                 throw new ArgumentOutOfRangeException(nameof(repeats));
 
-            long[] resultSizes = (long[])src.Sizes.Clone();
+            long[] resultSizes = src.Sizes.ToArray();
             resultSizes[dim] *= repeats;
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, resultSizes);
@@ -1867,9 +1867,9 @@ namespace TensorSharp.GGML
 
         private static unsafe Tensor ExecuteBinaryTensorHost(Tensor result, Tensor lhs, Tensor rhs, GgmlBinaryTensorOp op, string opName)
         {
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(result), result.DimensionCount, result.Sizes, result.Strides);
-            TensorIterState lhsIter = new TensorIterState((float*)GetBufferStart(lhs), lhs.DimensionCount, lhs.Sizes, lhs.Strides);
-            TensorIterState rhsIter = new TensorIterState((float*)GetBufferStart(rhs), rhs.DimensionCount, rhs.Sizes, rhs.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory);
+            TensorIterState lhsIter = new TensorIterState((float*)GetBufferStart(lhs), lhs.DimensionCount, lhs.SizesMemory, lhs.StridesMemory);
+            TensorIterState rhsIter = new TensorIterState((float*)GetBufferStart(rhs), rhs.DimensionCount, rhs.SizesMemory, rhs.StridesMemory);
 
             do
             {
@@ -1894,8 +1894,8 @@ namespace TensorSharp.GGML
 
         private static unsafe Tensor ExecuteAtomicAddHost(Tensor result, Tensor rhs)
         {
-            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(result), result.DimensionCount, result.Sizes, result.Strides);
-            TensorIterState rhsIter = new TensorIterState((float*)GetBufferStart(rhs), rhs.DimensionCount, rhs.Sizes, rhs.Strides);
+            TensorIterState resultIter = new TensorIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory);
+            TensorIterState rhsIter = new TensorIterState((float*)GetBufferStart(rhs), rhs.DimensionCount, rhs.SizesMemory, rhs.StridesMemory);
 
             do
             {
@@ -2227,8 +2227,8 @@ namespace TensorSharp.GGML
                 return false;
             }
 
-            long[] compactSizes = (long[])tensor.Sizes.Clone();
-            long[] compactStrides = (long[])tensor.Strides.Clone();
+            long[] compactSizes = tensor.Sizes.ToArray();
+            long[] compactStrides = tensor.Strides.ToArray();
             bool changed = false;
 
             for (int i = 0; i < compactSizes.Length; ++i)
@@ -2658,7 +2658,7 @@ namespace TensorSharp.GGML
         {
             ValidateReductionArguments(result, src, dimension, opName);
 
-            long[] desiredSize = (long[])src.Sizes.Clone();
+            long[] desiredSize = src.Sizes.ToArray();
             desiredSize[dimension] = 1;
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, desiredSize);
@@ -2667,8 +2667,8 @@ namespace TensorSharp.GGML
                 return writeTarget;
             }
 
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides, dimension);
-            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.Sizes, src.Strides, dimension);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory, dimension);
+            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dimension);
 
             do
             {
@@ -2688,7 +2688,7 @@ namespace TensorSharp.GGML
         {
             ValidateReductionArguments(result, src, dimension, opName);
 
-            long[] desiredSize = (long[])src.Sizes.Clone();
+            long[] desiredSize = src.Sizes.ToArray();
             desiredSize[dimension] = 1;
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, desiredSize);
@@ -2697,8 +2697,8 @@ namespace TensorSharp.GGML
                 return writeTarget;
             }
 
-            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.Sizes, writeTarget.Strides, dimension);
-            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.Sizes, src.Strides, dimension);
+            TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory, dimension);
+            TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dimension);
 
             do
             {

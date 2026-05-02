@@ -78,7 +78,7 @@ namespace TensorSharp.Cuda
 
         private static Tensor ToCpuTensor(Tensor source)
         {
-            Tensor cpu = new Tensor(CpuAllocator, source.ElementType, (long[])source.Sizes.Clone());
+            Tensor cpu = new Tensor(CpuAllocator, source.ElementType, source.Sizes);
             CopyLogical(cpu, source);
             return cpu;
         }
@@ -96,7 +96,7 @@ namespace TensorSharp.Cuda
             }
 
             allocator ??= new CudaAllocator();
-            return new Tensor(allocator, source.ElementType, (long[])source.Sizes.Clone());
+            return new Tensor(allocator, source.ElementType, source.Sizes);
         }
 
         internal static void CopyLogical(Tensor destination, Tensor source)

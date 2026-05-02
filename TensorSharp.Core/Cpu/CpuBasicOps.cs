@@ -1136,7 +1136,7 @@ namespace TensorSharp.Cpu
             if (repeats < 1)
                 throw new ArgumentOutOfRangeException(nameof(repeats));
 
-            long[] resultSizes = (long[])src.Sizes.Clone();
+            long[] resultSizes = src.Sizes.ToArray();
             resultSizes[dim] *= repeats;
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, resultSizes);

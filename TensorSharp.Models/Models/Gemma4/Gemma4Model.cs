@@ -782,7 +782,7 @@ namespace TensorSharp.Models
             else
             {
                 float[] hostEmbeddings = visionEmbeddings.GetElementsAsFloat((int)visionEmbeddings.ElementCount());
-                using var deviceEmbeddings = new Tensor(hidden.Allocator, visionEmbeddings.ElementType, (long[])visionEmbeddings.Sizes.Clone());
+                using var deviceEmbeddings = new Tensor(hidden.Allocator, visionEmbeddings.ElementType, visionEmbeddings.Sizes);
                 deviceEmbeddings.SetElementsAsFloat(hostEmbeddings);
                 Ops.Copy(target, deviceEmbeddings);
             }

@@ -50,7 +50,7 @@ namespace TensorSharp.Cpu
                 throw new ArgumentOutOfRangeException(nameof(dimension));
             }
 
-            long[] desiredSize = (long[])src.Sizes.Clone();
+            long[] desiredSize = src.Sizes.ToArray();
             desiredSize[dimension] = 1;
             Tensor resultTensor = TensorResultBuilder.GetWriteTarget(result, src, false, desiredSize);
 
@@ -73,7 +73,7 @@ namespace TensorSharp.Cpu
                 throw new ArgumentOutOfRangeException(nameof(dimension));
             }
 
-            long[] desiredSize = (long[])src.Sizes.Clone();
+            long[] desiredSize = src.Sizes.ToArray();
             desiredSize[dimension] = 1;
             Tensor resultTensor = TensorResultBuilder.GetWriteTarget(result, src, false, desiredSize);
 
@@ -188,10 +188,11 @@ namespace TensorSharp.Cpu
             return tensorRef;
         }
 
-        private static IntPtr AllocArray(long[] data)
+        private static IntPtr AllocArray(ReadOnlySpan<long> data)
         {
             IntPtr result = Marshal.AllocHGlobal(sizeof(long) * data.Length);
-            Marshal.Copy(data, 0, result, data.Length);
+            long[] copy = data.ToArray();
+            Marshal.Copy(copy, 0, result, copy.Length);
             return result;
         }
 

@@ -7,153 +7,148 @@
 //
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System;
 
 namespace TensorSharp
 {
-	public class TensorIterState
-	{
+    public class TensorIterState
+    {
+        private readonly ReadOnlyMemory<long> sizes;
+        private readonly ReadOnlyMemory<long> strides;
 
-		long[] sizes;
-		long[] strides;
+        private long stride, size;
+        private int dim;
+        private readonly long[] counter;
+        private readonly int step;
 
+        private long index;
+        unsafe public float* data;
 
-		long elementCount, stride, size;
-		int dim;
-		long[] counter;
-		int step;
+        unsafe public TensorIterState(float* buffer, int dimCount, long[] sizes, long[] strides, int step = 1)
+            : this(buffer, dimCount, (ReadOnlyMemory<long>)sizes, (ReadOnlyMemory<long>)strides, step)
+        {
+        }
 
-		long index;
-		unsafe public float* data;
+        unsafe public TensorIterState(float* buffer, int dimCount, ReadOnlyMemory<long> sizes, ReadOnlyMemory<long> strides, int step = 1)
+        {
+            if (sizes.Length < dimCount || strides.Length < dimCount)
+            {
+                throw new ArgumentException("sizes and strides must contain dimCount elements");
+            }
 
+            this.sizes = sizes;
+            this.strides = strides;
+            this.step = step;
 
-		long ElementCount(int dimCount, long[] sizes)
-		{
-			if (dimCount == 0)
-				return 0;
+            ReadOnlySpan<long> sizesSpan = sizes.Span;
+            ReadOnlySpan<long> stridesSpan = strides.Span;
 
-			long total = 1L;
-			for (int i = 0; i < dimCount; ++i)
-				total *= sizes[i];
-			return total;
-		}
+            index = 0;
+            data = buffer;
 
+            for (dim = dimCount - 1; dim >= 0; dim--)
+            {
+                if (sizesSpan[dim] != 1)
+                {
+                    break;
+                }
+            }
 
-		unsafe public TensorIterState(float* buffer, int dimCount, long[] sizes, long[] strides, int step = 1)
-		{
-			this.sizes = sizes;
-			this.strides = strides;
-			this.step = step;
+            // Get stride for dimension
+            stride = (dim == -1 ? 0 : stridesSpan[dim]);
 
-			index = 0;
-			data = buffer;
+            // Find largest contiguous section.
+            // Note: this updates dim and size.
+            size = 1;
+            for (dim = dimCount - 1; dim >= 0; dim--)
+            {
+                if (stridesSpan[dim] == size)
+                {
+                    size *= sizesSpan[dim];
+                }
+                else
+                {
+                    break;
+                }
+            }
 
-			for (dim = dimCount - 1; dim >= 0; dim--)
-			{
-				if (sizes[dim] != 1)
-					break;
-			}
+            if (size % step != 0)
+            {
+                throw new ArgumentException($"Size '{size}' mod step '{step}' must be zero.");
+            }
 
-			// Get stride for dimension
-			stride = (dim == -1 ? 0 : strides[dim]);
+            // Counter keeps track of dimensions outside the contiguous block.
+            counter = new long[dim + 1];
+            for (int i = 0; i < dim + 1; ++i)
+            {
+                counter[i] = 0;
+            }
+        }
 
+        public bool ReachedBlockEnd()
+        {
+            return !(index < size);
+        }
 
-			// Find largest contiguous section
-			// Note: this updates dim and size
-			size = 1;
-			for (dim = dimCount - 1; dim >= 0; dim--)
-			{
-				if (strides[dim] == size)
-				{
-					size *= sizes[dim];
-				}
-				else
-				{
-					break;
-				}
-			}
+        public void BlockStep()
+        {
+            unsafe
+            {
+                index += step;
+                data += (stride * step);
+            }
+        }
 
-			if (size % step != 0)
-			{
-				throw new ArgumentException($"Size '{size}' mod step '{step}' must be zero.");
-			}
+        // Returns true if there is another block to iterate over,
+        // returns false if we are at end of iteration
+        public bool NextBlock()
+        {
+            unsafe
+            {
+                // If not at end of current block yet, do nothing
+                if (index == size)
+                {
+                    // If contiguous block encompassed all dimensions, we are done
+                    if (dim == -1)
+                    {
+                        return false;
+                    }
 
+                    ReadOnlySpan<long> sizesSpan = sizes.Span;
+                    ReadOnlySpan<long> stridesSpan = strides.Span;
 
-			// Counter keeps track of how many iterations have been performed on each dimension
-			// that is *not* part of the above contiguous block
-			// Iterations are performed from highest dimension index to lowest.
-			// When a complete iteration of dimension i is finished, the counter for dim i-1 gets incremented by 1
-			counter = new long[dim + 1];
-			for (int i = 0; i < dim + 1; ++i)
-				counter[i] = 0;
+                    // Reset data offset
+                    data -= size * stride;
 
-			elementCount = ElementCount(dimCount, sizes);
-		}
+                    // Update counter and data for next contiguous block
+                    for (long j = dim; j >= 0; --j)
+                    {
+                        counter[j]++;
+                        data += stridesSpan[(int)j];
 
+                        if (counter[j] == sizesSpan[(int)j])
+                        {
+                            if (j == 0)
+                            {
+                                return false;
+                            }
+                            else
+                            {
+                                data -= counter[j] * stridesSpan[(int)j];
+                                counter[j] = 0;
+                            }
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
 
-		public bool ReachedBlockEnd()
-		{
-			return !(index < size);
-		}
+                    index = 0;
+                }
 
-		public void BlockStep()
-		{
-			unsafe
-			{
-				index += step;
-				data += (stride * step);
-			}
-		}
-
-		// Returns true if there is another block to iterate over,
-		// returns false if we are at end of iteration
-		public bool NextBlock()
-		{
-			unsafe
-			{
-				// If not at end of current block yet, do nothing
-				if (index == size)
-				{
-					// If contiguous block encompassed all dimensions, we are done
-					if (dim == -1)
-						return false;
-
-					// Reset data offset
-					data -= size * stride;
-
-					// Update counter and data for next contiguous block
-					for (long j = dim; j >= 0; --j)
-					{
-						counter[j]++;
-						data += strides[j];
-
-						if (counter[j] == sizes[j])
-						{
-							if (j == 0)
-							{
-								return false;
-							}
-							else
-							{
-								data -= counter[j] * strides[j];
-								counter[j] = 0;
-							}
-						}
-						else
-						{
-							break;
-						}
-					}
-
-					index = 0;
-				}
-
-				return true;
-			}
-		}
-	}
+                return true;
+            }
+        }
+    }
 }

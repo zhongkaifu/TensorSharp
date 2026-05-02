@@ -220,7 +220,7 @@ namespace TensorSharp
 		{
 			float* buffer1 = (float*)CpuNativeHelpers.GetBufferStart(tensor1);
 
-			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides);
+			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory);
 
 			do
 			{
@@ -238,8 +238,8 @@ namespace TensorSharp
 			float* buffer1 = (float*)CpuNativeHelpers.GetBufferStart(tensor1);
 			float* buffer2 = (float*)CpuNativeHelpers.GetBufferStart(tensor2);
 
-			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides, step);
-			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides, step);
+			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory, step);
+			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory, step);
 
 			do
 			{
@@ -258,9 +258,9 @@ namespace TensorSharp
 			float* buffer2 = (float*)CpuNativeHelpers.GetBufferStart(tensor2);
 			float* buffer3 = (float*)CpuNativeHelpers.GetBufferStart(tensor3);
 
-			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides, step);
-			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides, step);
-			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.Sizes, tensor3.Strides, step);
+			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory, step);
+			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory, step);
+			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.SizesMemory, tensor3.StridesMemory, step);
 
 			do
 			{
@@ -281,10 +281,10 @@ namespace TensorSharp
 			float* buffer3 = (float*)CpuNativeHelpers.GetBufferStart(tensor3);
 			float* buffer4 = (float*)CpuNativeHelpers.GetBufferStart(tensor4);
 
-			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides);
-			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides);
-			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.Sizes, tensor3.Strides);
-			TensorIterState tensor4Iter = new TensorIterState(buffer4, tensor4.DimensionCount, tensor4.Sizes, tensor4.Strides);
+			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory);
+			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory);
+			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.SizesMemory, tensor3.StridesMemory);
+			TensorIterState tensor4Iter = new TensorIterState(buffer4, tensor4.DimensionCount, tensor4.SizesMemory, tensor4.StridesMemory);
 
 			do
 			{
@@ -307,11 +307,11 @@ namespace TensorSharp
 			float* buffer5 = (float*)CpuNativeHelpers.GetBufferStart(tensor5);
 
 
-			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides, step);
-			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides, step);
-			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.Sizes, tensor3.Strides, step);
-			TensorIterState tensor4Iter = new TensorIterState(buffer4, tensor4.DimensionCount, tensor4.Sizes, tensor4.Strides, step);
-			TensorIterState tensor5Iter = new TensorIterState(buffer5, tensor5.DimensionCount, tensor5.Sizes, tensor5.Strides, step);
+			TensorIterState tensor1Iter = new TensorIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory, step);
+			TensorIterState tensor2Iter = new TensorIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory, step);
+			TensorIterState tensor3Iter = new TensorIterState(buffer3, tensor3.DimensionCount, tensor3.SizesMemory, tensor3.StridesMemory, step);
+			TensorIterState tensor4Iter = new TensorIterState(buffer4, tensor4.DimensionCount, tensor4.SizesMemory, tensor4.StridesMemory, step);
+			TensorIterState tensor5Iter = new TensorIterState(buffer5, tensor5.DimensionCount, tensor5.SizesMemory, tensor5.StridesMemory, step);
 
 			do
 			{
@@ -330,8 +330,8 @@ namespace TensorSharp
 			float* buffer1 = (float*)CpuNativeHelpers.GetBufferStart(tensor1);
 			float* buffer2 = (float*)CpuNativeHelpers.GetBufferStart(tensor2);
 
-			TensorDimIterState tensor1Iter = new TensorDimIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides, iterationDim);
-			TensorDimIterState tensor2Iter = new TensorDimIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides, iterationDim);
+			TensorDimIterState tensor1Iter = new TensorDimIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory, iterationDim);
+			TensorDimIterState tensor2Iter = new TensorDimIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory, iterationDim);
 
 			do
 			{
@@ -350,9 +350,9 @@ namespace TensorSharp
 			float* buffer2 = (float*)CpuNativeHelpers.GetBufferStart(tensor2);
 			float* buffer3 = (float*)CpuNativeHelpers.GetBufferStart(tensor3);
 
-			TensorDimIterState tensor1Iter = new TensorDimIterState(buffer1, tensor1.DimensionCount, tensor1.Sizes, tensor1.Strides, iterationDim);
-			TensorDimIterState tensor2Iter = new TensorDimIterState(buffer2, tensor2.DimensionCount, tensor2.Sizes, tensor2.Strides, iterationDim);
-			TensorDimIterState tensor3Iter = new TensorDimIterState(buffer3, tensor3.DimensionCount, tensor3.Sizes, tensor3.Strides, iterationDim);
+			TensorDimIterState tensor1Iter = new TensorDimIterState(buffer1, tensor1.DimensionCount, tensor1.SizesMemory, tensor1.StridesMemory, iterationDim);
+			TensorDimIterState tensor2Iter = new TensorDimIterState(buffer2, tensor2.DimensionCount, tensor2.SizesMemory, tensor2.StridesMemory, iterationDim);
+			TensorDimIterState tensor3Iter = new TensorDimIterState(buffer3, tensor3.DimensionCount, tensor3.SizesMemory, tensor3.StridesMemory, iterationDim);
 
 			do
 			{
