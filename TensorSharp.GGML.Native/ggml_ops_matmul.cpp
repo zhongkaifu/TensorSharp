@@ -282,9 +282,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -507,9 +505,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -659,9 +655,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -947,9 +941,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1112,9 +1104,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1271,9 +1261,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;

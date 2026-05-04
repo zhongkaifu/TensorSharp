@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
 
@@ -56,6 +57,29 @@ namespace TensorSharp.Models
         private int[] _moeTokenMap;
         private float[] _moeWeightMap;
 
+        // Per-layer stacked-along-experts views into the original `ffn_gate_exps.weight`,
+        // `ffn_up_exps.weight`, `ffn_down_exps.weight` 3D blocks (loaded into
+        // `ModelBase._stackedExpertWeights`). Used by the fused MoE prefill kernel
+        // (TryMoEPrefillFused) to dispatch one ggml_cgraph per layer (with
+        // ggml_mul_mat_id + ggml_add_id + swiglu_oai) instead of looping over
+        // active experts per token. FuseExpertGateUpWeights leaves these
+        // per-expert SLICED `_quantWeights` entries gone but the underlying
+        // 3D stacked storage is untouched (FuseExpertGateUpWeights only
+        // disposes the per-expert *views*, not the bulk buffer).
+        private StackedExpertWeights[] _layerStackedGate;
+        private StackedExpertWeights[] _layerStackedUp;
+        private StackedExpertWeights[] _layerStackedDown;
+
+        // Per-layer stacked biases for the fused MoE prefill kernel. Layout is
+        // contiguous [bias_dim, num_experts] f32 so that the kernel can hand
+        // them directly to ggml_add_id (which expects ne0=bias_dim, ne1=num_experts).
+        // Built once at init time from `ffn_gate_up_exps.{e}.bias` (already
+        // gate || up concatenated by FuseExpertGateUpWeights, size 2*n_ff) and
+        // `ffn_down_exps.{e}.bias` (hidden_dim).
+        private float[][] _layerGateUpBiasStacked;  // shape [2*n_ff * num_experts] per layer
+        private float[][] _layerDownBiasStacked;    // shape [hidden_dim * num_experts] per layer
+        private int _layerStackedReady;             // 1 once InitMoeStackedWeights has run
+
         public GptOssModel(string ggufPath, BackendType backend)
             : base(ggufPath, backend)
         {
@@ -83,11 +107,119 @@ namespace TensorSharp.Models
 
             LoadWeights();
             SplitExpertBiases();
+            // Snapshot the gate/up biases per expert BEFORE FuseExpertGateUpWeights
+            // disposes them — we need them in their original split shape to build
+            // the stacked-by-expert bias tables for the fused MoE prefill kernel.
+            float[][] preFuseGateBias = SnapshotPerExpertBiases("ffn_gate_exps", _expertFfnLength);
+            float[][] preFuseUpBias = SnapshotPerExpertBiases("ffn_up_exps", _expertFfnLength);
             FuseExpertGateUpWeights();
             FuseQKVWeights();
             PrepareCudaQuantizedWeightsForInference();
             InitKVCache(ResolveConfiguredContextLength());
             PrecomputeConstants();
+            InitMoeStackedWeights(preFuseGateBias, preFuseUpBias);
+        }
+
+        // Build a per-(layer,expert) snapshot of bias arrays before FuseExpertGateUpWeights
+        // collapses them. Returns float[layer][expert*biasDim + d]. Caller is
+        // responsible for dimension consistency. Returns null if no biases found
+        // for the first layer (some MoE models don't ship gate/up biases).
+        private float[][] SnapshotPerExpertBiases(string kind, int biasDim)
+        {
+            int numLayers = Config.NumLayers;
+            float[][] result = new float[numLayers][];
+            bool any = false;
+            for (int l = 0; l < numLayers; l++)
+            {
+                float[] perLayer = new float[biasDim * _numExperts];
+                bool layerHasAny = false;
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    string biasName = $"blk.{l}.{kind}.{e}.bias";
+                    if (_weights.TryGetValue(biasName, out var biasTensor) && biasTensor != null)
+                    {
+                        float[] biasData = TensorToFloatArray(biasTensor);
+                        int copyLen = Math.Min(biasData.Length, biasDim);
+                        Array.Copy(biasData, 0, perLayer, e * biasDim, copyLen);
+                        layerHasAny = true;
+                    }
+                }
+                result[l] = layerHasAny ? perLayer : null;
+                any |= layerHasAny;
+            }
+            return any ? result : null;
+        }
+
+        // Build per-layer stacked weight + bias views for the fused MoE prefill
+        // kernel (TryMoEPrefillFused). Stacked weights are zero-cost views into
+        // the original 3D `_exps.weight` blocks loaded by ModelBase. Stacked
+        // biases are small contiguous f32 arrays built once from the per-expert
+        // biases captured prior to FuseExpertGateUpWeights.
+        private unsafe void InitMoeStackedWeights(float[][] preFuseGateBias, float[][] preFuseUpBias)
+        {
+            int numLayers = Config.NumLayers;
+            int hidden = Config.HiddenSize;
+            int nFf = _expertFfnLength;
+
+            _layerStackedGate = new StackedExpertWeights[numLayers];
+            _layerStackedUp = new StackedExpertWeights[numLayers];
+            _layerStackedDown = new StackedExpertWeights[numLayers];
+            _layerGateUpBiasStacked = new float[numLayers][];
+            _layerDownBiasStacked = new float[numLayers][];
+
+            int gotWeights = 0;
+            int gotBiases = 0;
+            for (int l = 0; l < numLayers; l++)
+            {
+                string p = $"blk.{l}.";
+                _stackedExpertWeights.TryGetValue(p + "ffn_gate_exps.weight", out _layerStackedGate[l]);
+                _stackedExpertWeights.TryGetValue(p + "ffn_up_exps.weight", out _layerStackedUp[l]);
+                _stackedExpertWeights.TryGetValue(p + "ffn_down_exps.weight", out _layerStackedDown[l]);
+                if (_layerStackedGate[l] != null && _layerStackedUp[l] != null && _layerStackedDown[l] != null)
+                    gotWeights++;
+
+                if (preFuseGateBias != null && preFuseUpBias != null
+                    && preFuseGateBias[l] != null && preFuseUpBias[l] != null)
+                {
+                    // Stack gate || up bias per expert into a contiguous
+                    // [2*n_ff, num_experts] f32 array (gate first n_ff, then up).
+                    // ggml_add_id reads bias[d, ids[u, t]] so layout must match
+                    // expert e occupying offset e * (2*n_ff).
+                    float[] fused = new float[2 * nFf * _numExperts];
+                    for (int e = 0; e < _numExperts; e++)
+                    {
+                        int dst = e * 2 * nFf;
+                        Array.Copy(preFuseGateBias[l], e * nFf, fused, dst, nFf);
+                        Array.Copy(preFuseUpBias[l], e * nFf, fused, dst + nFf, nFf);
+                    }
+                    _layerGateUpBiasStacked[l] = fused;
+                    gotBiases++;
+                }
+
+                // Down biases live in `_weights[blk.{l}.ffn_down_exps.{e}.bias]`
+                // as f32 [1, hidden_dim]. Stack them across experts for the kernel.
+                bool hasDownBias = false;
+                float[] downStack = new float[hidden * _numExperts];
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    string downBiasName = $"blk.{l}.ffn_down_exps.{e}.bias";
+                    if (_weights.TryGetValue(downBiasName, out var bt) && bt != null)
+                    {
+                        float[] bd = TensorToFloatArray(bt);
+                        Array.Copy(bd, 0, downStack, e * hidden, Math.Min(bd.Length, hidden));
+                        hasDownBias = true;
+                    }
+                }
+                if (hasDownBias)
+                    _layerDownBiasStacked[l] = downStack;
+            }
+
+            _layerStackedReady = (gotWeights == numLayers) ? 1 : 0;
+            if (gotWeights > 0)
+            {
+                Console.WriteLine($"  Fused MoE prefill: stacked weights ready for {gotWeights}/{numLayers} layers, " +
+                    $"stacked gate/up biases for {gotBiases}/{numLayers} layers");
+            }
         }
 
         #region Weight Fusion and Pre-computation
@@ -332,12 +464,25 @@ namespace TensorSharp.Models
             _maxContextLength = maxSeqLen;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
+            // Pick model-aligned default. For F16-quantised GPT-OSS this gives
+            // an F16 KV cache (halves cache memory + bandwidth, byte-identical
+            // outputs at 1e-3). The fused prefill kernel and the F16-aware
+            // decode loop (AttentionDecodeWithSinksF16 below) handle it
+            // natively. The legacy per-op prefill path (used only when
+            // seqLen > FusedAttnMaxSeqLen, i.e. ubatches > 256) doesn't yet
+            // read F16 cache directly via AddmmBatch, so for that path we'd
+            // either need to convert on the fly or keep the cache F32. The
+            // CLI always uses ubatches that hit the fused path on every
+            // shipping GGUF, so the F16 default is safe for benchmark and
+            // chat workloads.
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
@@ -420,11 +565,42 @@ namespace TensorSharp.Models
         {
             string[] wn = _layerNames[layer];
 
-            Tensor normed = RMSNormOp(hidden, wn[0]);
-            Tensor attnOut = Attention(normed, layer, wn, seqLen, startPos);
-            normed.Dispose();
-            Ops.Add(hidden, hidden, attnOut);
-            attnOut.Dispose();
+            // Prefill fused-layer fast path: collapses RMSNorm + fused QKV (+bias)
+            // + RoPE + KV-cache append + masked-softmax-with-sinks + attention
+            // + output projection (+bias) + residual add into ONE ggml_cgraph
+            // dispatch. Replaces the ~10 separate per-op submissions in the
+            // legacy Attention() path (each its own Metal command buffer).
+            // Mirrors the reference llama.cpp graph in src/models/openai-moe-iswa.cpp
+            // and the existing TSGgml_Gemma4LayerPrefill template.
+            //
+            // Decode (seqLen == 1) and the non-Metal backends still flow through
+            // the original per-op path below.
+            // Cap the fused path at seqLen <= 256 for now: above that the
+            // per-call backend buffer + Metal residency overhead from N
+            // attention layers + N MoE FFN layers in flight exceeds the
+            // recommendedMaxWorkingSetSize on Apple Silicon and triggers
+            // kIOGPUCommandBufferCallbackErrorOutOfMemory in subsequent kernels.
+            // The legacy per-op path is still competitive at long seqLen
+            // (each per-op kernel reuses small per-op intermediate buffers
+            // via ggml-pool) and remains the default for those. A future
+            // wave will rework per-call buffer reuse (e.g. via ggml_gallocr)
+            // to lift this cap.
+            const int FusedAttnMaxSeqLen = 256;
+            bool fusedAttnApplied = false;
+            if (seqLen > 1 && seqLen <= FusedAttnMaxSeqLen && IsGgmlBackend
+                && TryFusedAttnLayerPrefill(hidden, layer, wn, seqLen, startPos))
+            {
+                fusedAttnApplied = true;
+            }
+
+            if (!fusedAttnApplied)
+            {
+                Tensor normed = RMSNormOp(hidden, wn[0]);
+                Tensor attnOut = Attention(normed, layer, wn, seqLen, startPos);
+                normed.Dispose();
+                Ops.Add(hidden, hidden, attnOut);
+                attnOut.Dispose();
+            }
 
             int moeSeqLen = seqLen;
             Tensor moeInput = hidden;
@@ -462,6 +638,125 @@ namespace TensorSharp.Models
         }
 
         #region Attention
+
+        /// <summary>
+        /// Fused per-layer prefill kernel (TSGgml_GptOssAttentionLayerPrefill).
+        ///
+        /// Runs the full attention block (input RMSNorm + fused QKV (+bias) +
+        /// RoPE + KV-cache append + causal/SWA mask + softmax-with-sinks +
+        /// attention + output projection (+bias) + residual add) as ONE
+        /// ggml_cgraph dispatch per layer, writing the residual back into the
+        /// caller's `hidden` buffer in place. Returns true on success.
+        ///
+        /// Returns false (and does NOT touch `hidden`) when:
+        ///  - any of the required weights / norm tensors aren't loaded for
+        ///    this layer, or
+        ///  - the QKV weight isn't a quantized weight (the kernel currently
+        ///    requires the quantized-weight CacheKey for zero-copy binding;
+        ///    falling back to the F32 weight path is supported by the C# code
+        ///    below so we just refuse the fused path here).
+        ///
+        /// Caller is expected to fall back to the legacy per-op path.
+        /// </summary>
+        private unsafe bool TryFusedAttnLayerPrefill(
+            Tensor hidden, int layer, string[] wn, int seqLen, int startPos)
+        {
+            // The kernel binds quantized weights via QuantizedWeight.CacheKey
+            // (which becomes a stable pointer that the cacheable-buffer path can
+            // recognise across calls). For F32 weights we'd need to extend the
+            // kernel; for now we only enable the fast path when the QKV / O
+            // weights are quantized, which covers every Q*_0 / Q*_K / IQ* GGUF
+            // we ship benchmarks for.
+            if (!_quantWeights.TryGetValue(wn[1], out var qkvQw)) return false;
+            if (!_quantWeights.TryGetValue(wn[3], out var oQw)) return false;
+            if (!_weights.TryGetValue(wn[0], out var attnNormW)) return false;
+
+            // attn_qkv.bias / attn_output.bias are optional in the GGUF schema
+            // but present on every shipping GPT-OSS model (the bias arrays
+            // were already split per-projection earlier in the loader).
+            _weights.TryGetValue(wn[2], out var qkvBias);
+            _weights.TryGetValue(wn[4], out var oBias);
+
+            // Sliding-window for even layers; full causal for odd layers.
+            // Mirrors the legacy Attention() path's `bool isSWA = (layer % 2 == 0)`.
+            bool isSwa = (layer % 2 == 0);
+            float[] sinks = _layerSinks?[layer];
+
+            // For the separate-Q/K/V path we'd need the K/V quantized weights too.
+            // The kernel signature already accepts them; we wire up here.
+            QuantizedWeight kQw = null, vQw = null;
+            Tensor kBias = null, vBias = null;
+            if (!_isQkvFused)
+            {
+                if (!_quantWeights.TryGetValue(wn[8], out kQw)) return false;
+                if (!_quantWeights.TryGetValue(wn[10], out vQw)) return false;
+                _weights.TryGetValue(wn[9], out kBias);
+                _weights.TryGetValue(wn[11], out vBias);
+            }
+
+            // KV cache size and cache-dtype enum.
+            int cacheSize = (int)_kvCacheK[layer].Sizes[1];
+            int kvCacheTypeId = _kvCacheDtype.GgmlType();
+
+            // The kernel writes to the F32 KV cache via ggml_cpy(F32->F32) and
+            // to F16 via ggml_cpy(F32->F16). Quantized cache types aren't yet
+            // supported here, so fall back when we'd otherwise wedge.
+            if (kvCacheTypeId != 0 /* F32 */ && kvCacheTypeId != 1 /* F16 */)
+                return false;
+
+            try
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                GgmlBasicOps.GptOssAttentionLayerPrefill(
+                    (IntPtr)GetFloatPtr(hidden),
+                    Config.HiddenSize, seqLen,
+                    (IntPtr)GetFloatPtr(attnNormW),
+                    qkvQw.CacheKey, qkvQw.GgmlType, qkvQw.Ne0, qkvQw.Ne1, qkvQw.RawBytes,
+                    qkvBias != null ? (IntPtr)GetFloatPtr(qkvBias) : IntPtr.Zero,
+                    _isQkvFused ? 1 : 0,
+                    kQw != null ? kQw.CacheKey : IntPtr.Zero,
+                    kQw?.GgmlType ?? 0, kQw?.Ne0 ?? 0, kQw?.Ne1 ?? 0, kQw?.RawBytes ?? 0,
+                    kBias != null ? (IntPtr)GetFloatPtr(kBias) : IntPtr.Zero,
+                    vQw != null ? vQw.CacheKey : IntPtr.Zero,
+                    vQw?.GgmlType ?? 0, vQw?.Ne0 ?? 0, vQw?.Ne1 ?? 0, vQw?.RawBytes ?? 0,
+                    vBias != null ? (IntPtr)GetFloatPtr(vBias) : IntPtr.Zero,
+                    oQw.CacheKey, oQw.GgmlType, oQw.Ne0, oQw.Ne1, oQw.RawBytes,
+                    oBias != null ? (IntPtr)GetFloatPtr(oBias) : IntPtr.Zero,
+                    TensorComputePrimitives.GetStoragePointer(_kvCacheK[layer]),
+                    TensorComputePrimitives.GetStoragePointer(_kvCacheV[layer]),
+                    Config.NumHeads, Config.NumKVHeads, Config.HeadDim,
+                    cacheSize, startPos,
+                    isSwa ? 1 : 0, _slidingWindow,
+                    sinks != null ? (IntPtr)GetFloatArrayPtr(sinks, layer) : IntPtr.Zero,
+                    Config.RopeBase, 1.0f / Config.RopeScale, Config.HeadDim,
+                    Config.OriginalContextLength,
+                    kvCacheTypeId, Config.Eps);
+                _attnTicks += Stopwatch.GetTimestamp() - t0;
+                InvalidateTensorDeviceCache(hidden);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Per-layer cached pinned-handle for sinks arrays so we can hand the
+        // kernel a stable IntPtr that the cacheable-host-ptr path recognises
+        // across calls (and pin only once per layer).
+        private System.Runtime.InteropServices.GCHandle[] _sinksHandles;
+
+        private unsafe float* GetFloatArrayPtr(float[] arr, int layer)
+        {
+            if (arr == null) return null;
+            if (_sinksHandles == null)
+                _sinksHandles = new System.Runtime.InteropServices.GCHandle[Config.NumLayers];
+            if (!_sinksHandles[layer].IsAllocated)
+            {
+                _sinksHandles[layer] = System.Runtime.InteropServices.GCHandle.Alloc(arr, System.Runtime.InteropServices.GCHandleType.Pinned);
+            }
+            return (float*)_sinksHandles[layer].AddrOfPinnedObject();
+        }
 
         private Tensor Attention(Tensor input, int layer, string[] wn, int seqLen, int startPos)
         {
@@ -552,10 +847,33 @@ namespace TensorSharp.Models
             qHeads.Dispose();
             kExpanded.Dispose();
 
-            Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-            if (isSWA)
-                ApplySWAMask(scores, numHeads, seqLen, totalSeqLen, startPos);
-            ApplySoftmaxWithSinks(scores, numHeads, seqLen, totalSeqLen, sinks);
+            // Fused causal+SWA mask + softmax + attention sinks on GPU. Replaces the
+            // GPU AddCausalMask + the two CPU loops (ApplySWAMask /
+            // ApplySoftmaxWithSinks) which together dominated GptOss prefill —
+            // ~76% of total time on pp2048, mostly from the ~6-billion-element
+            // single-threaded MathF.Exp loop in ApplySoftmaxWithSinks.
+            //
+            // Scores are already pre-scaled by 1/sqrt(headDim) in AddmmBatch above,
+            // so we pass scale=1.0 here.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(
+                    scores,
+                    sinks,
+                    numHeads: numHeads,
+                    seqLen: seqLen,
+                    kvLen: totalSeqLen,
+                    maskStartPos: startPos,
+                    slidingWindow: isSWA ? _slidingWindow : 0,
+                    scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
+                if (isSWA)
+                    ApplySWAMask(scores, numHeads, seqLen, totalSeqLen, startPos);
+                ApplySoftmaxWithSinks(scores, numHeads, seqLen, totalSeqLen, sinks);
+            }
 
             var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
             Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
@@ -625,6 +943,21 @@ namespace TensorSharp.Models
         private unsafe void AttentionDecodeWithSinks(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA)
         {
+            // Dispatch on KV cache dtype. The fast paths (F32 below, F16 just
+            // beneath) are CPU implementations of single-token GQA attention
+            // with attention sinks (per-head learned bias added as a virtual
+            // token in the softmax max/exp-sum) and optional sliding-window
+            // attention (SWA: keys older than `slidingWindow` positions are
+            // masked out). Used as a fallback when the GGML decode kernel is
+            // unavailable for this layer (e.g. F16 cache + sinks not yet
+            // covered by TSGgml_FlashAttnDecodeF32 sink-adapted variant).
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                AttentionDecodeWithSinksF16(q, kCache, vCache, result,
+                    numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA);
+                return;
+            }
+
             float* qPtr = GetFloatPtr(q);
             float* kPtr = GetFloatPtr(kCache);
             float* vPtr = GetFloatPtr(vCache);
@@ -668,6 +1001,78 @@ namespace TensorSharp.Models
                 for (int i = 0; i < numScores; i++)
                     VecScaleAdd(rHead, vHead + (startT + i) * headDim, scores[i], headDim);
             }
+        }
+
+        /// <summary>
+        /// F16-cache variant of <see cref="AttentionDecodeWithSinks"/>. Reads
+        /// K/V values as ushort, converts to F32 inside the dot/scale-add hot
+        /// loops via <see cref="TensorComputePrimitives"/>. Identical math to
+        /// the F32 path; only the cache load is widened. Parallelised over
+        /// query heads to amortise the per-head F16-&gt;F32 widening.
+        /// </summary>
+        private unsafe void AttentionDecodeWithSinksF16(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale, float[] sinks, bool isSWA)
+        {
+            long qPtrL = (long)GetFloatPtr(q);
+            long kPtrL = (long)TensorComputePrimitives.GetHalfPointer(kCache);
+            long vPtrL = (long)TensorComputePrimitives.GetHalfPointer(vCache);
+            long rPtrL = (long)GetFloatPtr(result);
+            int maxSeqLen = (int)kCache.Sizes[1];
+            int groupSize = numHeads / numKVHeads;
+
+            int startT = isSWA ? Math.Max(0, totalSeqLen - _slidingWindow) : 0;
+            int numScores = totalSeqLen - startT;
+            int headDimLocal = headDim;
+            int maxSeqLenLocal = maxSeqLen;
+            int groupSizeLocal = groupSize;
+            int startTLocal = startT;
+            int numScoresLocal = numScores;
+            float scaleLocal = scale;
+            float[] sinksLocal = sinks;
+
+            Parallel.For(0, numHeads, h =>
+            {
+                float* qPtr = (float*)qPtrL;
+                ushort* kPtr = (ushort*)kPtrL;
+                ushort* vPtr = (ushort*)vPtrL;
+                float* rPtr = (float*)rPtrL;
+
+                float* qHead = qPtr + h * headDimLocal;
+                int kvHead = h / groupSizeLocal;
+                ushort* kHead = kPtr + kvHead * maxSeqLenLocal * headDimLocal;
+                ushort* vHead = vPtr + kvHead * maxSeqLenLocal * headDimLocal;
+
+                float* scores = stackalloc float[numScoresLocal];
+                float* vF32 = stackalloc float[headDimLocal];
+
+                float maxScore = (sinksLocal != null) ? sinksLocal[h] : float.NegativeInfinity;
+                for (int i = 0; i < numScoresLocal; i++)
+                {
+                    int t = startTLocal + i;
+                    float s = TensorComputePrimitives.DotF32F16(qHead, kHead + t * headDimLocal, headDimLocal) * scaleLocal;
+                    scores[i] = s;
+                    if (s > maxScore) maxScore = s;
+                }
+
+                float sumExp = (sinksLocal != null) ? MathF.Exp(sinksLocal[h] - maxScore) : 0f;
+                for (int i = 0; i < numScoresLocal; i++)
+                {
+                    float e = MathF.Exp(scores[i] - maxScore);
+                    scores[i] = e;
+                    sumExp += e;
+                }
+                float invSum = 1.0f / sumExp;
+                for (int i = 0; i < numScoresLocal; i++)
+                    scores[i] *= invSum;
+
+                float* rHead = rPtr + h * headDimLocal;
+                VecZero(rHead, headDimLocal);
+                for (int i = 0; i < numScoresLocal; i++)
+                {
+                    TensorComputePrimitives.F16ToF32(vF32, vHead + (startTLocal + i) * headDimLocal, headDimLocal);
+                    VecScaleAdd(rHead, vF32, scores[i], headDimLocal);
+                }
+            });
         }
 
         private Tensor ApplyRoPEInPlace(Tensor data, int numHeads, int headDim, int seqLen, int startPos)
@@ -718,7 +1123,25 @@ namespace TensorSharp.Models
         private unsafe void MoEForwardSingleToken(Tensor hiddenState, Tensor output,
             float[] routingWeights, int[] selectedExperts, int layer, int hiddenDim)
         {
-            float* inputPtr = GetFloatPtr(hiddenState);
+            // Decode fast path: route the single-token MoE FFN through the
+            // ggml_mul_mat_id-based fused kernel (TSGgml_MoEFFNPrefillSwiGLU)
+            // when the stacked weights are loaded. This collapses the
+            // per-active-expert loop (4 expert × 3 ops = ~12 graph dispatches
+            // per layer per token) into ONE dispatch using
+            // ggml_mul_mat_id with a [1, n_used] ids tensor, mirroring
+            // llama.cpp's `build_moe_ffn` and matching the prefill path.
+            // Falls back to the per-expert CPU loop only when the stacked
+            // weights aren't available for this layer.
+            if (_layerStackedReady != 0
+                && IsGgmlBackend
+                && _layerStackedGate != null && _layerStackedGate[layer] != null
+                && _layerStackedUp != null && _layerStackedUp[layer] != null
+                && _layerStackedDown != null && _layerStackedDown[layer] != null)
+            {
+                if (TryMoEPrefillFused(hiddenState, output, routingWeights, selectedExperts, layer, /*seqLen=*/1, hiddenDim))
+                    return;
+            }
+
             float* outputPtr = GetFloatPtr(output);
 
             for (int e = 0; e < _numExpertsUsed; e++)
@@ -737,6 +1160,32 @@ namespace TensorSharp.Models
         private unsafe void MoEForwardBatched(Tensor hiddenState, Tensor output,
             float[] routingWeights, int[] selectedExperts, int layer, int seqLen, int hiddenDim)
         {
+            // Fast path: collapse the entire MoE FFN body into a single ggml_cgraph
+            // built from ggml_mul_mat_id + ggml_add_id + swiglu_oai. Replaces the
+            // per-expert loop below (one ExpertFFN call per active expert) with
+            // a single dispatch per layer. Mirrors llama.cpp's `build_moe_ffn`
+            // and is required to close the prefill gap on MoE models like GPT-OSS.
+            //
+            // Skip for very long prefills: with only 32 experts the legacy
+            // batched-by-expert path keeps each per-expert matmul fat (count >> 1)
+            // so the per-call ggml graph build / Metal command-buffer overhead
+            // of the fused path is no longer a win, and on GPT-OSS specifically
+            // it perturbs the Metal scheduler enough to slow down the
+            // immediately-following SWA / full attention layers. The crossover
+            // is around seq_len ≈ 1024 on M-series Metal; below that the
+            // fused path is consistently faster.
+            const int FusedMoEMaxSeqLen = 1024;
+            if (seqLen <= FusedMoEMaxSeqLen
+                && _layerStackedReady != 0
+                && IsGgmlBackend
+                && _layerStackedGate != null && _layerStackedGate[layer] != null
+                && _layerStackedUp != null && _layerStackedUp[layer] != null
+                && _layerStackedDown != null && _layerStackedDown[layer] != null)
+            {
+                if (TryMoEPrefillFused(hiddenState, output, routingWeights, selectedExperts, layer, seqLen, hiddenDim))
+                    return;
+            }
+
             float* inputPtr = GetFloatPtr(hiddenState);
             float* outputPtr = GetFloatPtr(output);
 
@@ -808,6 +1257,74 @@ namespace TensorSharp.Models
                         expertOutPtr + (long)i * hiddenDim, weight, hiddenDim);
                 }
                 expertOut.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Fused MoE prefill via the GgmlBasicOps.MoEFFNPrefillSwiGLU kernel.
+        /// Replaces the per-active-expert ExpertFFN loop (~num_experts × ~3
+        /// graph dispatches per layer) with a single graph dispatch that
+        /// performs gate + up + add_id(bias) + swiglu_oai + down + add_id(bias)
+        /// + expert weighting + aggregation using ggml_mul_mat_id +
+        /// ggml_add_id, mirroring llama.cpp's build_moe_ffn for clamped-SiLU.
+        ///
+        /// Returns true on success (output has been written; routingWeights
+        /// scaling is applied by the kernel). Returns false when the kernel
+        /// can't handle the layout and the caller should fall back to the
+        /// legacy batched-by-expert path.
+        /// </summary>
+        private unsafe bool TryMoEPrefillFused(
+            Tensor hiddenState,
+            Tensor output,
+            float[] routingWeights,
+            int[] selectedExperts,
+            int layer,
+            int seqLen,
+            int hiddenDim)
+        {
+            var gateW = _layerStackedGate[layer];
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+
+            float[] gateBias = null;
+            float[] upBias = null;
+            if (_layerGateUpBiasStacked != null && _layerGateUpBiasStacked[layer] != null)
+            {
+                // The gate-up bias was stacked as [(2*nFf), num_experts]
+                // gate-then-up. Split into separate gate and up arrays so the
+                // kernel can use the SEPARATE gate/up weight path (which lets
+                // us reuse the original 3D `_exps.weight` blocks zero-copy).
+                int nFf = _expertFfnLength;
+                float[] fused = _layerGateUpBiasStacked[layer];
+                gateBias = new float[nFf * _numExperts];
+                upBias = new float[nFf * _numExperts];
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    Array.Copy(fused, e * 2 * nFf, gateBias, e * nFf, nFf);
+                    Array.Copy(fused, e * 2 * nFf + nFf, upBias, e * nFf, nFf);
+                }
+            }
+            float[] downBias = (_layerDownBiasStacked != null) ? _layerDownBiasStacked[layer] : null;
+
+            try
+            {
+                GgmlBasicOps.MoEFFNPrefillSwiGLU(
+                    hiddenState, output,
+                    seqLen, hiddenDim, _expertFfnLength, _numExperts, _numExpertsUsed,
+                    selectedExperts, routingWeights,
+                    gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, gateW.TotalRawBytes,
+                    upW.Data,   upW.GgmlType,   upW.PerExpertNe0,   upW.PerExpertNe1,   upW.TotalRawBytes,
+                    downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
+                    gateBias, upBias, downBias,
+                    useSwiGLUOAI: true,
+                    oaiAlpha: SiluAlpha,
+                    oaiLimit: SiluLimit);
+                InvalidateTensorDeviceCache(output);
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
             }
         }
 

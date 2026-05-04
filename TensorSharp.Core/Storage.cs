@@ -29,7 +29,10 @@ namespace TensorSharp
         public DType ElementType { get; private set; }
         public long ElementCount { get; private set; }
 
-        public long ByteLength => ElementCount * ElementType.Size();
+        // Block-quantized types (Q8_0) round their byte length up to the block
+        // boundary (32-element blocks of 34 bytes each). Linear types stay at
+        // ElementCount * ElementType.Size() as before.
+        public long ByteLength => ElementType.ByteLengthFor(ElementCount);
 
         public bool IsOwnerExclusive()
         {
@@ -54,6 +57,21 @@ namespace TensorSharp
 
         public abstract void CopyToStorage(long storageIndex, IntPtr src, long byteCount);
         public abstract void CopyFromStorage(IntPtr dst, long storageIndex, long byteCount);
+
+        /// <summary>
+        /// Hook that backends with deferred GPU compute (currently the GGML/Metal
+        /// backend in async mode) override to drain any in-flight work before host
+        /// code reads or writes this storage's bytes directly. Default: no-op.
+        ///
+        /// Called from <see cref="TensorComputePrimitives.GetFloatPointer"/> /
+        /// <see cref="TensorComputePrimitives.GetHalfPointer"/>, which are the
+        /// gateways for raw-pointer host access on tensor data. Native op code
+        /// goes through <see cref="PtrAtElement"/> directly and intentionally
+        /// skips this hook so that op chaining stays asynchronous.
+        /// </summary>
+        public virtual void EnsureHostReadable()
+        {
+        }
 
     }
 }

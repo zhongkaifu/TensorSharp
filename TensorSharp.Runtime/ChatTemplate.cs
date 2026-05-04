@@ -104,6 +104,186 @@ namespace TensorSharp.Runtime
         }
 
         /// <summary>
+        /// Render the NVIDIA Nemotron 3 Nano Omni chat template.
+        /// Matches the GGUF jinja template that ships with the model:
+        ///   - <|im_start|>{role}\n{content}<|im_end|>\n turn framing
+        ///   - For user/system: prepend "<image>\n" per image, "<video>\n" per video,
+        ///     "<so_embedding>\n" per audio when those modalities are present.
+        ///   - When tools is empty and there's no system message, no preamble.
+        ///   - Generation prompt: "&lt;|im_start|&gt;assistant\n&lt;think&gt;\n" when thinking is on,
+        ///     otherwise "&lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;".
+        /// </summary>
+        public static string RenderNemotron(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            List<ToolFunction> tools = null, bool enableThinking = false)
+        {
+            var sb = new StringBuilder();
+
+            bool hasSystem = messages != null && messages.Count > 0 && messages[0].Role == "system";
+            bool hasTools = tools != null && tools.Count > 0;
+            int startIdx = 0;
+
+            if (hasSystem)
+            {
+                sb.Append("<|im_start|>system\n");
+                sb.Append(SanitizeNemotronContent(messages[0].Content ?? ""));
+                startIdx = 1;
+            }
+            else if (hasTools)
+            {
+                sb.Append("<|im_start|>system\n");
+            }
+
+            if (hasTools)
+            {
+                if (hasSystem) sb.Append("\n\n");
+                sb.Append(BuildNemotronToolsPreamble(tools));
+            }
+
+            if (hasSystem || hasTools)
+                sb.Append("<|im_end|>\n");
+
+            if (messages != null)
+            {
+                for (int mi = startIdx; mi < messages.Count; mi++)
+                {
+                    var msg = messages[mi];
+                    if (msg.Role == "tool")
+                    {
+                        // Wrap consecutive tool messages in a single user block as the template does.
+                        bool prevIsTool = mi > startIdx && messages[mi - 1].Role == "tool";
+                        if (!prevIsTool)
+                            sb.Append("<|im_start|>user\n");
+                        sb.Append("<tool_response>\n").Append(msg.Content).Append("\n</tool_response>\n");
+
+                        bool nextIsTool = mi + 1 < messages.Count && messages[mi + 1].Role == "tool";
+                        if (!nextIsTool)
+                            sb.Append("<|im_end|>\n");
+                    }
+                    else if (msg.Role == "assistant")
+                    {
+                        sb.Append("<|im_start|>assistant\n");
+                        string content = msg.Content ?? string.Empty;
+                        if (!content.Contains("<think>") && !content.Contains("</think>"))
+                            content = "<think></think>" + content;
+                        sb.Append(content.Trim());
+                        if (msg.ToolCalls != null && msg.ToolCalls.Count > 0)
+                        {
+                            foreach (var tc in msg.ToolCalls)
+                                AppendNemotronToolCall(sb, tc);
+                        }
+                        sb.Append("<|im_end|>\n");
+                    }
+                    else // "user" or "system" appearing later
+                    {
+                        sb.Append("<|im_start|>").Append(msg.Role).Append('\n');
+                        AppendNemotronUserContent(sb, msg);
+                        sb.Append("<|im_end|>\n");
+                    }
+                }
+            }
+
+            if (addGenerationPrompt)
+            {
+                if (enableThinking)
+                    sb.Append("<|im_start|>assistant\n<think>\n");
+                else
+                    sb.Append("<|im_start|>assistant\n<think></think>");
+            }
+
+            return sb.ToString();
+        }
+
+        private static void AppendNemotronUserContent(StringBuilder sb, ChatMessage msg)
+        {
+            int imgCount = msg.ImagePaths?.Count ?? 0;
+            int audioCount = msg.AudioPaths?.Count ?? 0;
+
+            string textContent = msg.Content ?? string.Empty;
+            if (textContent.Contains("<image>")) imgCount = 0;
+            if (textContent.Contains("<so_embedding>")) audioCount = 0;
+
+            // Both single images and video frames map onto the per-image format. Video
+            // frames are passed in as imgCount frame paths from the caller.
+            if (imgCount == 1)
+            {
+                sb.Append("<image>\n");
+            }
+            else if (imgCount > 1)
+            {
+                for (int i = 0; i < imgCount; i++)
+                    sb.Append("<image ").Append(i + 1).Append("><image>");
+                sb.Append('\n');
+            }
+
+            for (int i = 0; i < audioCount; i++) sb.Append("<so_embedding>\n");
+
+            sb.Append(SanitizeNemotronContent(textContent.TrimStart('\n')));
+        }
+
+        private static string SanitizeNemotronContent(string content)
+        {
+            // Mirror the jinja sanitization: strip /think and /no_think directives but
+            // keep proper <think>/</think> XML tags intact.
+            return content
+                .Replace("</think>", "<_end_think>")
+                .Replace("/think", "")
+                .Replace("/no_think", "")
+                .Replace("<_end_think>", "</think>")
+                .Trim();
+        }
+
+        private static string BuildNemotronToolsPreamble(List<ToolFunction> tools)
+        {
+            var sb = new StringBuilder();
+            sb.Append("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            foreach (var tool in tools)
+            {
+                sb.Append("\n<function>\n<name>").Append(tool.Name).Append("</name>");
+                if (!string.IsNullOrEmpty(tool.Description))
+                    sb.Append("\n<description>").Append(tool.Description.Trim()).Append("</description>");
+                sb.Append("\n<parameters>");
+                if (tool.Parameters != null)
+                {
+                    foreach (var kv in tool.Parameters)
+                    {
+                        sb.Append("\n<parameter>");
+                        sb.Append("\n<name>").Append(kv.Key).Append("</name>");
+                        if (!string.IsNullOrEmpty(kv.Value.Type))
+                            sb.Append("\n<type>").Append(kv.Value.Type).Append("</type>");
+                        if (!string.IsNullOrEmpty(kv.Value.Description))
+                            sb.Append("\n<description>").Append(kv.Value.Description.Trim()).Append("</description>");
+                        if (kv.Value.Enum != null && kv.Value.Enum.Count > 0)
+                            sb.Append("\n<enum>").Append(JsonSerializer.Serialize(kv.Value.Enum)).Append("</enum>");
+                        sb.Append("\n</parameter>");
+                    }
+                }
+                if (tool.Required != null && tool.Required.Count > 0)
+                    sb.Append("\n<required>").Append(JsonSerializer.Serialize(tool.Required)).Append("</required>");
+                sb.Append("\n</parameters>\n</function>");
+            }
+            sb.Append("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n");
+            sb.Append("<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n");
+            sb.Append("<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n");
+            sb.Append("<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+            return sb.ToString();
+        }
+
+        private static void AppendNemotronToolCall(StringBuilder sb, ToolCall tc)
+        {
+            sb.Append("<tool_call>\n<function=").Append(tc.Name).Append(">\n");
+            if (tc.Arguments != null)
+            {
+                foreach (var kv in tc.Arguments)
+                {
+                    sb.Append("<parameter=").Append(kv.Key).Append(">\n");
+                    string val = kv.Value is string s ? s : JsonSerializer.Serialize(kv.Value);
+                    sb.Append(val).Append("\n</parameter>\n");
+                }
+            }
+            sb.Append("</function>\n</tool_call>\n");
+        }
+
+        /// <summary>
         /// Render Qwen3.5 template with optional image support.
         /// Matches the GGUF built-in chat template: for each image in a message,
         /// inserts <|vision_start|><|image_pad|><|vision_end|> markers.
@@ -344,6 +524,9 @@ namespace TensorSharp.Runtime
             if (architecture == "mistral3")
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
 
+            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
@@ -391,8 +574,8 @@ namespace TensorSharp.Runtime
                 return RenderQwen35(messages, addGenerationPrompt, enableThinking, tools);
             }
 
-            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe")
-                return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
+            if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
+                return RenderNemotron(messages, addGenerationPrompt, tools, enableThinking);
 
             if (architecture == "mistral3")
                 return RenderMistral3(messages, addGenerationPrompt);

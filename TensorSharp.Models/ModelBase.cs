@@ -202,6 +202,65 @@ namespace TensorSharp.Models
         }
     }
 
+    /// <summary>
+    /// A view of a per-layer 3D MoE expert weight tensor as stored on disk
+    /// (<c>[ne0, ne1, num_experts]</c> contiguous). Built when the per-expert
+    /// quantized weights are split out of the original 3D GGUF tensor in
+    /// <see cref="ModelBase.LoadWeights"/>, so it costs nothing on top of the
+    /// per-expert weights for mmap'd models — the base pointer is the start
+    /// of the original 3D block and the bytes are the same bytes the per-expert
+    /// views point into.
+    ///
+    /// The <see cref="MoEFFNPrefillSwiGLU"/> kernel consumes this directly to
+    /// run an entire MoE layer's gate/up/down via three <c>ggml_mul_mat_id</c>
+    /// dispatches (mirroring llama.cpp's <c>build_moe_ffn</c>) instead of the
+    /// previous per-active-expert loop that issued thousands of dispatches per
+    /// pp2048 forward.
+    /// </summary>
+    public sealed class StackedExpertWeights
+    {
+        public IntPtr Data { get; }
+        public int GgmlType { get; }
+        public long PerExpertNe0 { get; }
+        public long PerExpertNe1 { get; }
+        public int NumExperts { get; }
+        public long TotalRawBytes { get; }
+        public long PerExpertRawBytes => TotalRawBytes / NumExperts;
+        public bool IsExternalView { get; }
+
+        // Strong reference held to keep the underlying memory alive when this
+        // is an external view (e.g. into a GgufFile mmap or a sibling owning
+        // QuantizedWeight buffer). For owned buffers this is null.
+        private readonly object _ownerToken;
+
+        // For the non-mmap fallback path we own a pinned native buffer and
+        // free it on disposal of the parent ModelBase. Tracked so the buffer
+        // doesn't leak when ModelBase exits.
+        public IntPtr OwnedBuffer { get; }
+
+        public StackedExpertWeights(
+            IntPtr data,
+            int ggmlType,
+            long perExpertNe0,
+            long perExpertNe1,
+            int numExperts,
+            long totalRawBytes,
+            bool isExternalView,
+            object ownerToken,
+            IntPtr ownedBuffer)
+        {
+            Data = data;
+            GgmlType = ggmlType;
+            PerExpertNe0 = perExpertNe0;
+            PerExpertNe1 = perExpertNe1;
+            NumExperts = numExperts;
+            TotalRawBytes = totalRawBytes;
+            IsExternalView = isExternalView;
+            _ownerToken = ownerToken;
+            OwnedBuffer = ownedBuffer;
+        }
+    }
+
     public abstract class ModelBase : IModelArchitecture
     {
         public ModelConfig Config { get; protected set; }
@@ -216,12 +275,69 @@ namespace TensorSharp.Models
 
         protected readonly Dictionary<string, Tensor> _weights = new();
         protected readonly Dictionary<string, QuantizedWeight> _quantWeights = new();
+
+        /// <summary>
+        /// Stacked-along-experts views of MoE expert weight tensors keyed by
+        /// the original GGUF tensor name (e.g. <c>"blk.0.ffn_gate_exps.weight"</c>).
+        /// Populated in <see cref="LoadWeights"/> for any 3D <c>_exps.</c>
+        /// tensor. Used by <see cref="GgmlBasicOps.MoEFFNPrefillSwiGLU"/> to
+        /// dispatch the entire MoE FFN as a few <c>ggml_mul_mat_id</c> calls
+        /// per layer instead of per-active-expert. May be null/empty when the
+        /// model doesn't expose stacked views (e.g. some non-mmap paths).
+        /// </summary>
+        protected readonly Dictionary<string, StackedExpertWeights> _stackedExpertWeights = new();
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
 
         protected int _cacheSeqLen;
         protected int _maxContextLength;
         protected float[] _logitsBuffer;
+
+        /// <summary>
+        /// Storage dtype for the per-layer K/V cache tensors. Captured at model
+        /// construction time from <see cref="KvCacheDtypeConfig.Current"/> so the
+        /// rest of the per-model code (cache allocation, write-on-decode,
+        /// attention reads, native-layer-decode bindings) can specialize without
+        /// repeatedly polling the global config.
+        /// </summary>
+        protected KvCacheDtype _kvCacheDtype = KvCacheDtypeConfig.Current;
+
+        /// <summary>
+        /// Pick a model-aligned default KV-cache dtype based on the dominant
+        /// weight quantization tier seen in <paramref name="quantWeights"/>.
+        /// Mirrors <see cref="KvCacheDtypeConfig.ApplyModelDtypeDefault"/> but
+        /// is callable from inside a model constructor (after LoadWeights, before
+        /// InitKVCache) so each model picks its own default without forcing the
+        /// CLI front-end to inspect every GGUF file. Honors any explicit user
+        /// choice (env var or <c>--kv-cache-dtype</c> flag) - we only step in
+        /// when the user has left the dtype unset.
+        /// </summary>
+        protected void ApplyModelAlignedKvCacheDefault(IDictionary<string, QuantizedWeight> quantWeights)
+        {
+            if (KvCacheDtypeConfig.IsExplicitlySet) return;
+
+            int dominant = 0; // GGML_TYPE_F32
+            if (quantWeights != null && quantWeights.Count > 0)
+            {
+                Dictionary<int, long> typeBytes = new Dictionary<int, long>();
+                foreach (var qw in quantWeights.Values)
+                {
+                    if (qw == null) continue;
+                    if (!typeBytes.TryGetValue(qw.GgmlType, out long bytes)) bytes = 0;
+                    typeBytes[qw.GgmlType] = bytes + qw.RawBytes;
+                }
+                long bestBytes = 0;
+                foreach (var kv in typeBytes)
+                {
+                    if (kv.Value > bestBytes) { bestBytes = kv.Value; dominant = kv.Key; }
+                }
+            }
+
+            KvCacheDtypeConfig.ApplyModelDtypeDefault(dominant);
+            _kvCacheDtype = KvCacheDtypeConfig.Current;
+        }
+
+        public KvCacheDtype KvCacheDtype => _kvCacheDtype;
 
         public int MaxContextLength => _maxContextLength;
         public int CacheSeqLen => _cacheSeqLen;
@@ -561,7 +677,9 @@ namespace TensorSharp.Models
 
                     if (info.Shape.Length == 3 && info.Name.Contains("_exps."))
                     {
-                        // 3D MoE expert tensor: split into per-expert 2D quantized weights
+                        // 3D MoE expert tensor: split into per-expert 2D quantized weights.
+                        // Also build a single stacked-along-experts view that the fused
+                        // MoE prefill kernel can hand to ggml_mul_mat_id directly.
                         int numExperts = (int)info.Shape[2];
                         long perExpertBytes = byteCount / numExperts;
                         string baseName = info.Name;
@@ -576,27 +694,37 @@ namespace TensorSharp.Models
                                 _quantWeights[$"{baseName}.{e}.weight"] = QuantizedWeight.CreateExternalView(
                                     expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, _gguf);
                             }
+                            // Free zero-cost stacked view: same bytes the per-expert
+                            // views point into, owner is the GgufFile mmap.
+                            _stackedExpertWeights[info.Name] = new StackedExpertWeights(
+                                mappedTensorPtr, (int)info.Type, ne0, ne1, numExperts,
+                                byteCount, isExternalView: true, ownerToken: _gguf,
+                                ownedBuffer: IntPtr.Zero);
                             mappedQuantBytes += byteCount;
                         }
                         else
                         {
+                            // Non-mmap path: keep the bulk buffer alive as the
+                            // owning storage, and make per-expert views into it
+                            // instead of memcpy'ing into per-expert buffers. This
+                            // lets us expose a stacked-experts view for free at
+                            // the cost of an extra strong reference held by the
+                            // stacked weight (no memory duplication).
                             IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
                             _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
 
+                            var stacked = new StackedExpertWeights(
+                                bulkPtr, (int)info.Type, ne0, ne1, numExperts,
+                                byteCount, isExternalView: false, ownerToken: null,
+                                ownedBuffer: bulkPtr);
+                            _stackedExpertWeights[info.Name] = stacked;
+
                             for (int e = 0; e < numExperts; e++)
                             {
-                                IntPtr expertPtr = QuantizedWeight.AllocateBuffer(perExpertBytes);
-                                unsafe
-                                {
-                                    Buffer.MemoryCopy(
-                                        ((byte*)bulkPtr.ToPointer()) + e * perExpertBytes,
-                                        expertPtr.ToPointer(),
-                                        perExpertBytes, perExpertBytes);
-                                }
-                                _quantWeights[$"{baseName}.{e}.weight"] = new QuantizedWeight(expertPtr, perExpertBytes, (int)info.Type, ne0, ne1);
+                                IntPtr expertPtr = new IntPtr(bulkPtr.ToInt64() + e * perExpertBytes);
+                                _quantWeights[$"{baseName}.{e}.weight"] = QuantizedWeight.CreateExternalView(
+                                    expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, stacked);
                             }
-
-                            QuantizedWeight.FreeBuffer(bulkPtr);
                         }
                         countQuant += numExperts;
                         totalQuantBytes += byteCount;
@@ -1334,6 +1462,12 @@ namespace TensorSharp.Models
 
         protected void CopyToCache(Tensor cache, Tensor src, int startPos, int seqLen)
         {
+            if (cache.ElementType == DType.Float16)
+            {
+                CopyToCacheF16(cache, src, startPos, seqLen);
+                return;
+            }
+
             if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, (int)cache.Sizes[1], false))
                 return;
 
@@ -1342,17 +1476,82 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(cache);
         }
 
-        protected Tensor ExpandKVHeads(Tensor cache, int groupSize, int totalSeqLen)
+        /// <summary>
+        /// Append <paramref name="seqLen"/> rows of an F32 (numKVHeads, seqLen, headDim) tensor
+        /// to a Float16 cache of layout (numKVHeads, maxSeqLen, headDim) starting at
+        /// <paramref name="startPos"/>. Performs a per-element F32-&gt;F16 conversion.
+        /// </summary>
+        private unsafe void CopyToCacheF16(Tensor cache, Tensor src, int startPos, int seqLen)
         {
+            int numKVHeads = (int)cache.Sizes[0];
+            int maxSeqLen = (int)cache.Sizes[1];
+            int headDim = (int)cache.Sizes[2];
+
+            ushort* dstBase = TensorComputePrimitives.GetHalfPointer(cache);
+            float* srcBase = GetFloatPtr(src);
+
+            // Source layout (head-first contiguous after ReshapeToHeads): (numKVHeads, seqLen, headDim).
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                ushort* dstHead = dstBase + (long)h * maxSeqLen * headDim + (long)startPos * headDim;
+                float* srcHead = srcBase + (long)h * seqLen * headDim;
+                TensorComputePrimitives.F32ToF16(dstHead, srcHead, seqLen * headDim);
+            }
+
+            InvalidateTensorDeviceCache(cache);
+        }
+
+        /// <summary>
+        /// Return a contiguous F32 view of the active (0..totalSeqLen) region of the K
+        /// or V cache, broadcasting along the head axis when GQA group_size &gt; 1.
+        /// For Float16 caches the active region is dequantized into a freshly-allocated
+        /// F32 tensor before broadcasting; for Float32 caches the existing fast path is used.
+        /// </summary>
+        protected unsafe Tensor ExpandKVHeads(Tensor cache, int groupSize, int totalSeqLen)
+        {
+            if (cache.ElementType == DType.Float16)
+                return ExpandKVHeadsF16(cache, groupSize, totalSeqLen);
+
             using var active = cache.Narrow(1, 0, totalSeqLen);
             if (groupSize == 1)
                 return Ops.NewContiguous(active);
             return Ops.RepeatInterleave(null, active, groupSize, 0);
         }
 
+        private unsafe Tensor ExpandKVHeadsF16(Tensor cache, int groupSize, int totalSeqLen)
+        {
+            int numKVHeads = (int)cache.Sizes[0];
+            int maxSeqLen = (int)cache.Sizes[1];
+            int headDim = (int)cache.Sizes[2];
+            int outHeads = numKVHeads * groupSize;
+
+            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            float* dstBase = GetFloatPtr(f32);
+            ushort* srcBase = TensorComputePrimitives.GetHalfPointer(cache);
+
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                ushort* srcHead = srcBase + (long)h * maxSeqLen * headDim;
+                for (int g = 0; g < groupSize; g++)
+                {
+                    float* dstHead = dstBase + (long)(h * groupSize + g) * totalSeqLen * headDim;
+                    TensorComputePrimitives.F16ToF32(dstHead, srcHead, totalSeqLen * headDim);
+                }
+            }
+
+            InvalidateTensorDeviceCache(f32);
+            return f32;
+        }
+
         protected unsafe void CopyToCacheDecode(Tensor kCache, Tensor kTensor,
             Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
         {
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                CopyToCacheDecodeF16(kCache, kTensor, vCache, vTensor, numKVHeads, headDim, startPos);
+                return;
+            }
+
             using (var kHeads = kTensor.View(numKVHeads, 1, headDim))
             using (var vHeads = vTensor.View(numKVHeads, 1, headDim))
             {
@@ -1383,9 +1582,37 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(vCache);
         }
 
+        private unsafe void CopyToCacheDecodeF16(Tensor kCache, Tensor kTensor,
+            Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
+        {
+            float* kSrc = GetFloatPtr(kTensor);
+            float* vSrc = GetFloatPtr(vTensor);
+            ushort* kDst = TensorComputePrimitives.GetHalfPointer(kCache);
+            ushort* vDst = TensorComputePrimitives.GetHalfPointer(vCache);
+            int maxSeqLen = (int)kCache.Sizes[1];
+
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                long cacheOffset = (long)h * maxSeqLen * headDim + (long)startPos * headDim;
+                int srcOffset = h * headDim;
+                TensorComputePrimitives.F32ToF16(kDst + cacheOffset, kSrc + srcOffset, headDim);
+                TensorComputePrimitives.F32ToF16(vDst + cacheOffset, vSrc + srcOffset, headDim);
+            }
+
+            InvalidateTensorDeviceCache(kCache);
+            InvalidateTensorDeviceCache(vCache);
+        }
+
         protected unsafe void AttentionDecodePureCS(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale)
         {
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                AttentionDecodePureCSF16(q, kCache, vCache, result,
+                    numHeads, numKVHeads, headDim, totalSeqLen, scale);
+                return;
+            }
+
             float* qPtr = GetFloatPtr(q);
             float* kPtr = GetFloatPtr(kCache);
             float* vPtr = GetFloatPtr(vCache);
@@ -1830,6 +2057,199 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Single-token GQA decode attention specialized for an F16 KV cache.
+        /// Reads K/V values as ushort, converts to F32 inside the dot/scale-add
+        /// hot loops via <see cref="TensorComputePrimitives"/>. The cache layout
+        /// is identical to the F32 variant - <c>(num_kv_heads, max_seq_len, head_dim)</c> -
+        /// so callers don't need to special-case anything but the storage dtype.
+        ///
+        /// This is the C# fallback path when the native fused decode kernel is
+        /// unavailable. On Apple Silicon Metal / CUDA the native path
+        /// (<c>TransformerLayerDecode</c> / <c>TransformerModelDecode</c>) handles
+        /// F16 K/V directly via <c>ggml_flash_attn_ext</c>, which is much faster.
+        /// </summary>
+        protected unsafe void AttentionDecodePureCSF16(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int headDim, int totalSeqLen, float scale)
+        {
+            float* qPtr = GetFloatPtr(q);
+            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
+            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
+            float* rPtr = GetFloatPtr(result);
+            int maxSeqLen = (int)kCache.Sizes[1];
+            int groupSize = numHeads / numKVHeads;
+
+            int procCount = Environment.ProcessorCount;
+            bool useParallel = numKVHeads > 1 && (long)numHeads * totalSeqLen >= 4096;
+
+            if (useParallel)
+            {
+                long qPtrL = (long)qPtr;
+                long kPtrL = (long)kPtr;
+                long vPtrL = (long)vPtr;
+                long rPtrL = (long)rPtr;
+                int totalSeqLenLocal = totalSeqLen;
+                int headDimLocal = headDim;
+                int maxSeqLenLocal = maxSeqLen;
+                int groupSizeLocal = groupSize;
+                int numKVHeadsLocal = numKVHeads;
+                float scaleLocal = scale;
+
+                Parallel.For(0, numKVHeadsLocal, kvHead =>
+                {
+                    float* qP = (float*)qPtrL;
+                    ushort* kP = (ushort*)kPtrL;
+                    ushort* vP = (ushort*)vPtrL;
+                    float* rP = (float*)rPtrL;
+                    float* scoresBuf = stackalloc float[groupSizeLocal * totalSeqLenLocal];
+                    AttentionDecodeKVHeadGroupedF16(kvHead, qP, kP, vP, rP, scoresBuf,
+                        headDimLocal, maxSeqLenLocal, groupSizeLocal,
+                        totalSeqLenLocal, scaleLocal);
+                });
+            }
+            else
+            {
+                float* scores = stackalloc float[groupSize * totalSeqLen];
+                for (int kvHead = 0; kvHead < numKVHeads; kvHead++)
+                {
+                    AttentionDecodeKVHeadGroupedF16(kvHead, qPtr, kPtr, vPtr, rPtr, scores,
+                        headDim, maxSeqLen, groupSize, totalSeqLen, scale);
+                }
+            }
+        }
+
+        private static unsafe void AttentionDecodeKVHeadGroupedF16(int kvHead,
+            float* qPtr, ushort* kPtr, ushort* vPtr, float* rPtr, float* scores,
+            int headDim, int maxSeqLen, int groupSize, int totalSeqLen, float scale)
+        {
+            int hStart = kvHead * groupSize;
+            ushort* kHead = kPtr + (long)kvHead * maxSeqLen * headDim;
+            ushort* vHead = vPtr + (long)kvHead * maxSeqLen * headDim;
+
+            float maxG0 = float.NegativeInfinity;
+            float maxG1 = float.NegativeInfinity;
+            float maxG2 = float.NegativeInfinity;
+            float maxG3 = float.NegativeInfinity;
+
+            if (groupSize == 4)
+            {
+                float* qH0 = qPtr + (long)(hStart + 0) * headDim;
+                float* qH1 = qPtr + (long)(hStart + 1) * headDim;
+                float* qH2 = qPtr + (long)(hStart + 2) * headDim;
+                float* qH3 = qPtr + (long)(hStart + 3) * headDim;
+                float* row0 = scores + 0L * totalSeqLen;
+                float* row1 = scores + 1L * totalSeqLen;
+                float* row2 = scores + 2L * totalSeqLen;
+                float* row3 = scores + 3L * totalSeqLen;
+
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    ushort* kT = kHead + (long)t * headDim;
+                    float s0, s1, s2, s3;
+                    TensorComputePrimitives.Dot4F32F16(qH0, qH1, qH2, qH3, kT, headDim,
+                        out s0, out s1, out s2, out s3);
+                    s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                    row0[t] = s0; row1[t] = s1; row2[t] = s2; row3[t] = s3;
+                    if (s0 > maxG0) maxG0 = s0;
+                    if (s1 > maxG1) maxG1 = s1;
+                    if (s2 > maxG2) maxG2 = s2;
+                    if (s3 > maxG3) maxG3 = s3;
+                }
+            }
+            else
+            {
+                Span<float> maxScoresSpan = stackalloc float[groupSize];
+                for (int g = 0; g < groupSize; g++) maxScoresSpan[g] = float.NegativeInfinity;
+
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    ushort* kT = kHead + (long)t * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float* qH = qPtr + (long)(hStart + g) * headDim;
+                        float s = TensorComputePrimitives.DotF32F16(qH, kT, headDim) * scale;
+                        scores[g * totalSeqLen + t] = s;
+                        if (s > maxScoresSpan[g]) maxScoresSpan[g] = s;
+                    }
+                }
+
+                if (groupSize >= 1) maxG0 = maxScoresSpan[0];
+                if (groupSize >= 2) maxG1 = maxScoresSpan[1];
+                if (groupSize >= 3) maxG2 = maxScoresSpan[2];
+                if (groupSize >= 4) maxG3 = maxScoresSpan[3];
+            }
+
+            // Softmax (per-group)
+            Span<float> invSums = stackalloc float[groupSize];
+            for (int g = 0; g < groupSize; g++)
+            {
+                float maxS;
+                if (g == 0) maxS = maxG0;
+                else if (g == 1) maxS = maxG1;
+                else if (g == 2) maxS = maxG2;
+                else if (g == 3) maxS = maxG3;
+                else
+                {
+                    maxS = float.NegativeInfinity;
+                    float* rowG0 = scores + (long)g * totalSeqLen;
+                    for (int t = 0; t < totalSeqLen; t++)
+                        if (rowG0[t] > maxS) maxS = rowG0[t];
+                }
+
+                float sum = 0;
+                float* rowG = scores + (long)g * totalSeqLen;
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    float e = MathF.Exp(rowG[t] - maxS);
+                    rowG[t] = e;
+                    sum += e;
+                }
+                invSums[g] = 1.0f / sum;
+            }
+            for (int g = 0; g < groupSize; g++)
+            {
+                float invSum = invSums[g];
+                float* rowG = scores + (long)g * totalSeqLen;
+                VecScale(rowG, invSum, totalSeqLen);
+            }
+
+            // Aggregate V (F16): read V[t] once per t, scatter into all groupSize result heads.
+            for (int g = 0; g < groupSize; g++)
+                VecZero(rPtr + (long)(hStart + g) * headDim, headDim);
+
+            if (groupSize == 4)
+            {
+                float* r0 = rPtr + (long)(hStart + 0) * headDim;
+                float* r1 = rPtr + (long)(hStart + 1) * headDim;
+                float* r2 = rPtr + (long)(hStart + 2) * headDim;
+                float* r3 = rPtr + (long)(hStart + 3) * headDim;
+                float* row0 = scores + 0L * totalSeqLen;
+                float* row1 = scores + 1L * totalSeqLen;
+                float* row2 = scores + 2L * totalSeqLen;
+                float* row3 = scores + 3L * totalSeqLen;
+
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    ushort* vT = vHead + (long)t * headDim;
+                    TensorComputePrimitives.ScaleAdd4F16(r0, r1, r2, r3, vT,
+                        row0[t], row1[t], row2[t], row3[t], headDim);
+                }
+            }
+            else
+            {
+                for (int t = 0; t < totalSeqLen; t++)
+                {
+                    ushort* vT = vHead + (long)t * headDim;
+                    for (int g = 0; g < groupSize; g++)
+                    {
+                        float w = scores[g * totalSeqLen + t];
+                        float* rH = rPtr + (long)(hStart + g) * headDim;
+                        TensorComputePrimitives.ScaleAddF16(rH, vT, w, headDim);
+                    }
+                }
+            }
+        }
+
         protected static unsafe float* GetFloatPtr(Tensor t) =>
             TensorComputePrimitives.GetFloatPointer(t);
 
@@ -1870,6 +2290,18 @@ namespace TensorSharp.Models
             int safeToken = Math.Min(1, Config.VocabSize - 1);
             Forward(new[] { safeToken });
             ResetKVCache();
+            ResetForwardTiming();
+        }
+
+        /// <summary>
+        /// Reset the cumulative forward-pass timing counters used by
+        /// <see cref="PrintTimingStats"/>. Useful when a benchmark driver wants
+        /// to discard the cost of one or more warm-up inference passes (Metal
+        /// pipeline JIT for new batch sizes, allocator pool growth, etc.) so
+        /// only the timed run contributes to reported numbers.
+        /// </summary>
+        public void ResetForwardTiming()
+        {
             _linearTicks = 0;
             _attnTicks = 0;
             _normTicks = 0;
@@ -1981,6 +2413,17 @@ namespace TensorSharp.Models
             foreach (var qw in _quantWeights.Values)
                 qw.Dispose();
             _quantWeights.Clear();
+
+            // Free any owned bulk buffers backing stacked-experts views (only
+            // populated by the non-mmap path in LoadWeights). External-view
+            // entries that point into the GgufFile mmap have OwnedBuffer == 0
+            // and are released when the GgufFile itself is disposed below.
+            foreach (var stacked in _stackedExpertWeights.Values)
+            {
+                if (stacked.OwnedBuffer != IntPtr.Zero)
+                    QuantizedWeight.FreeBuffer(stacked.OwnedBuffer);
+            }
+            _stackedExpertWeights.Clear();
 
             _gguf?.Dispose();
 

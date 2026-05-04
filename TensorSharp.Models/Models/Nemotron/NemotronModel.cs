@@ -9,11 +9,13 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
+using TensorSharp.Cpu;
 using TensorSharp.GGML;
 
 namespace TensorSharp.Models
@@ -111,6 +113,37 @@ namespace TensorSharp.Models
         // Pre-allocated tensor for latent_out input (avoids per-token allocation)
         private Tensor _latentAccumTensor;
         private Tensor _latentOutResult;
+
+        // Multimodal: pending injections to apply at the next Forward() call.
+        private NemotronVisionEncoder _visionEncoder;
+        private readonly List<(Tensor embeddings, int position)> _pendingVisionEmbeddings = new();
+        private readonly List<(Tensor embeddings, int position)> _pendingAudioEmbeddings = new();
+
+        public NemotronVisionEncoder VisionEncoder => _visionEncoder;
+
+        public void LoadVisionEncoder(string mmProjPath)
+        {
+            // The mmproj uses the GGML allocator path so we get fast Metal/CUDA matmul
+            // for the vision encoder's BF16 weights. Falls back to CPU when the LM is on CPU.
+            IAllocator visionAllocator = _backend == BackendType.Cuda
+                ? new CpuAllocator(BlasEnum.DotNet)
+                : _allocator;
+            _visionEncoder = new NemotronVisionEncoder(mmProjPath, visionAllocator);
+        }
+
+        public NemotronImageProcessor ImageProcessor =>
+            _visionEncoder?.ImageProcessor
+                ?? throw new InvalidOperationException("Vision encoder must be loaded before accessing the image processor.");
+
+        public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
+        {
+            _pendingVisionEmbeddings.Add((embeddings, insertPosition));
+        }
+
+        public void SetAudioEmbeddings(Tensor embeddings, int insertPosition)
+        {
+            _pendingAudioEmbeddings.Add((embeddings, insertPosition));
+        }
 
         public NemotronModel(string ggufPath, BackendType backend)
             : base(ggufPath, backend)
@@ -282,11 +315,13 @@ namespace TensorSharp.Models
             _kvCacheV = new Tensor[numLayers];
             _convState = new float[numLayers][];
             _ssmState = new float[numLayers][];
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
 
             int convDim = Math.Max(0, _ssmDConv - 1);
             int convChannels = _ssmDInner + 2 * _ssmNGroup * _ssmDState;
             int ssmStateSize = _ssmDState * _ssmHeadDim * _ssmNHead;
 
+            DType kvDtype = _kvCacheDtype.ToDType();
             for (int l = 0; l < numLayers; l++)
             {
                 switch (_layerTypes[l])
@@ -294,8 +329,8 @@ namespace TensorSharp.Models
                     case LayerType.Attention:
                         int numKVH = _layerNumKVHeads[l];
                         int headDim = Config.HeadDim;
-                        _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVH, maxSeqLen, headDim);
-                        _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVH, maxSeqLen, headDim);
+                        _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVH, maxSeqLen, headDim);
+                        _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVH, maxSeqLen, headDim);
                         InitializeCacheTensor(_kvCacheK[l]);
                         InitializeCacheTensor(_kvCacheV[l]);
                         break;
@@ -563,6 +598,22 @@ namespace TensorSharp.Models
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
+            if (_pendingVisionEmbeddings.Count > 0 || _pendingAudioEmbeddings.Count > 0)
+            {
+                foreach (var (emb, pos) in _pendingVisionEmbeddings)
+                {
+                    InjectMultimodalEmbeddings(hidden, emb, pos);
+                    emb.Dispose();
+                }
+                _pendingVisionEmbeddings.Clear();
+                foreach (var (emb, pos) in _pendingAudioEmbeddings)
+                {
+                    InjectMultimodalEmbeddings(hidden, emb, pos);
+                    emb.Dispose();
+                }
+                _pendingAudioEmbeddings.Clear();
+            }
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 switch (_layerTypes[layer])
@@ -717,8 +768,20 @@ namespace TensorSharp.Models
             qHeads.Dispose();
             kExpanded.Dispose();
 
-            Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-            Ops.Softmax(scores, scores);
+            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
+            // (two separate ops) with one Metal kernel.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(
+                    scores, sinks: null,
+                    numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
+                    maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
+                Ops.Softmax(scores, scores);
+            }
 
             var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
             Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
@@ -1306,6 +1369,30 @@ namespace TensorSharp.Models
 
         #endregion
 
+        /// <summary>
+        /// Copy <paramref name="multimodalEmbeddings"/> (shape [N, hiddenSize]) into the
+        /// rows <paramref name="insertPos"/>..<paramref name="insertPos"/>+N-1 of
+        /// <paramref name="hidden"/>. Handles cross-allocator copies for multimodal
+        /// encoders that live on a different backend than the LM (eg. CPU vision
+        /// encoder feeding a CUDA LM).
+        /// </summary>
+        private void InjectMultimodalEmbeddings(Tensor hidden, Tensor multimodalEmbeddings, int insertPos)
+        {
+            int numTokens = (int)multimodalEmbeddings.Sizes[0];
+            using var target = hidden.Narrow(0, insertPos, numTokens);
+            if (ReferenceEquals(target.Allocator, multimodalEmbeddings.Allocator))
+            {
+                Ops.Copy(target, multimodalEmbeddings);
+            }
+            else
+            {
+                float[] hostEmbeddings = multimodalEmbeddings.GetElementsAsFloat((int)multimodalEmbeddings.ElementCount());
+                using var deviceEmb = new Tensor(hidden.Allocator, multimodalEmbeddings.ElementType, multimodalEmbeddings.Sizes);
+                deviceEmb.SetElementsAsFloat(hostEmbeddings);
+                Ops.Copy(target, deviceEmb);
+            }
+        }
+
         public override void Dispose()
         {
             if (_kvCacheK != null)
@@ -1316,6 +1403,14 @@ namespace TensorSharp.Models
             _expertDownResult?.Dispose();
             _latentAccumTensor?.Dispose();
             _latentOutResult?.Dispose();
+
+            foreach (var (emb, _) in _pendingVisionEmbeddings) emb?.Dispose();
+            _pendingVisionEmbeddings.Clear();
+            foreach (var (emb, _) in _pendingAudioEmbeddings) emb?.Dispose();
+            _pendingAudioEmbeddings.Clear();
+
+            _visionEncoder?.Dispose();
+            _visionEncoder = null;
 
             base.Dispose();
         }

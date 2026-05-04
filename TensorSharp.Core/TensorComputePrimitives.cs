@@ -31,6 +31,16 @@ namespace TensorSharp
             return tensor.Storage.PtrAtElement(0);
         }
 
+        // GetFloatPointer / GetHalfPointer hand out raw host pointers that callers
+        // dereference on the CPU. Under async-compute on the GGML/Metal backend,
+        // the bytes behind those pointers may still be receiving writes from a
+        // GPU command buffer that hasn't completed yet, so we drain any pending
+        // work before returning the pointer. The drain is cheap when nothing's
+        // pending (single atomic check on the C++ side).
+        //
+        // Native op binding code uses tensor.Storage.PtrAtElement directly (see
+        // GgmlBasicOps.GetBufferStart) and intentionally bypasses this hook so
+        // that GPU-only chaining stays asynchronous.
         public static float* GetFloatPointer(Tensor tensor)
         {
             if (tensor == null)
@@ -38,7 +48,19 @@ namespace TensorSharp
             if (tensor.ElementType != DType.Float32)
                 throw new NotSupportedException($"Requires a Float32 tensor, but found {tensor.ElementType}");
 
+            tensor.Storage.EnsureHostReadable();
             return (float*)GetStoragePointer(tensor);
+        }
+
+        public static ushort* GetHalfPointer(Tensor tensor)
+        {
+            if (tensor == null)
+                throw new ArgumentNullException(nameof(tensor));
+            if (tensor.ElementType != DType.Float16)
+                throw new NotSupportedException($"Requires a Float16 tensor, but found {tensor.ElementType}");
+
+            tensor.Storage.EnsureHostReadable();
+            return (ushort*)GetStoragePointer(tensor);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -206,6 +228,96 @@ namespace TensorSharp
                 StoreVector(data + i, Vector<float>.Zero);
             for (; i < n; i++)
                 data[i] = 0;
+        }
+
+        // ====================================================================
+        // Float16 helpers for the quantized KV cache. F16 storage is read into
+        // F32 accumulators on the fly: on Apple Silicon and modern x86 the
+        // F16->F32 conversion is essentially free in registers, so the dot
+        // product runs at twice the effective memory bandwidth of an F32
+        // cache when the cache is big enough to miss the LLC.
+        // ====================================================================
+
+        /// <summary>
+        /// Convert a contiguous block of <paramref name="n"/> float values to
+        /// IEEE 754 binary16 (half) and write them into <paramref name="dst"/>.
+        /// Uses <see cref="System.Half"/> which the BCL implements with the
+        /// hardware FP16 instructions when available.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void F32ToF16(ushort* dst, float* src, int n)
+        {
+            for (int i = 0; i < n; i++)
+                dst[i] = BitConverter.HalfToUInt16Bits((System.Half)src[i]);
+        }
+
+        /// <summary>
+        /// Convert a contiguous block of <paramref name="n"/> half-precision
+        /// values to F32. Useful when a downstream kernel only consumes F32.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void F16ToF32(float* dst, ushort* src, int n)
+        {
+            for (int i = 0; i < n; i++)
+                dst[i] = (float)BitConverter.UInt16BitsToHalf(src[i]);
+        }
+
+        /// <summary>
+        /// Dot product between an F32 vector <paramref name="a"/> and an F16
+        /// vector <paramref name="b"/>. Each F16 element is converted to F32
+        /// inside the inner loop using <see cref="BitConverter.UInt16BitsToHalf"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float DotF32F16(float* a, ushort* b, int n)
+        {
+            float sum = 0;
+            for (int i = 0; i < n; i++)
+                sum += a[i] * (float)BitConverter.UInt16BitsToHalf(b[i]);
+            return sum;
+        }
+
+        /// <summary>Four-way dot product variant of <see cref="DotF32F16"/>.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void Dot4F32F16(float* a0, float* a1, float* a2, float* a3,
+            ushort* b, int n,
+            out float r0, out float r1, out float r2, out float r3)
+        {
+            float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            for (int i = 0; i < n; i++)
+            {
+                float bi = (float)BitConverter.UInt16BitsToHalf(b[i]);
+                s0 += a0[i] * bi;
+                s1 += a1[i] * bi;
+                s2 += a2[i] * bi;
+                s3 += a3[i] * bi;
+            }
+            r0 = s0; r1 = s1; r2 = s2; r3 = s3;
+        }
+
+        /// <summary>
+        /// Read F16 source values, scale by <paramref name="weight"/> (F32),
+        /// and accumulate into F32 destination buffer.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void ScaleAddF16(float* dst, ushort* src, float weight, int n)
+        {
+            for (int i = 0; i < n; i++)
+                dst[i] += weight * (float)BitConverter.UInt16BitsToHalf(src[i]);
+        }
+
+        /// <summary>Four-way scale-add variant of <see cref="ScaleAddF16"/>.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void ScaleAdd4F16(float* d0, float* d1, float* d2, float* d3,
+            ushort* src, float w0, float w1, float w2, float w3, int n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                float s = (float)BitConverter.UInt16BitsToHalf(src[i]);
+                d0[i] += w0 * s;
+                d1[i] += w1 * s;
+                d2[i] += w2 * s;
+                d3[i] += w3 * s;
+            }
         }
 
         public static void SelectTopKInPlace(ReadOnlySpan<float> values, int k, Span<int> indices)

@@ -229,12 +229,14 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxSeqLen;
             int numKVHeads = Config.NumKVHeads;
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, _attnKeyLen);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, _attnValLen);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, _attnKeyLen);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, _attnValLen);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
@@ -483,8 +485,20 @@ namespace TensorSharp.Models
             qHeads.Dispose();
             kExpanded.Dispose();
 
-            Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-            Ops.Softmax(scores, scores);
+            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
+            // (two separate ops) with one Metal kernel.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(
+                    scores, sinks: null,
+                    numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
+                    maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
+                Ops.Softmax(scores, scores);
+            }
 
             var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, _attnValLen);
             Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);

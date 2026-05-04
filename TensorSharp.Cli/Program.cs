@@ -59,6 +59,10 @@ namespace TensorSharp.Cli
 
         static void MainCore(string[] args)
         {
+            // Pick up the KV cache dtype from the KV_CACHE_DTYPE environment variable
+            // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
+            KvCacheDtypeConfig.ConfigureFromEnvironment();
+
             string modelPath = null;
             string inputFile = null;
             string outputFile = null;
@@ -87,6 +91,7 @@ namespace TensorSharp.Cli
             int kvCacheBenchTurns = 4;
             bool runInteractive = false;
             string systemPrompt = null;
+            int warmupInferenceRuns = 0;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -120,6 +125,15 @@ namespace TensorSharp.Cli
                     case "--correct-decode": correctnessDecode = int.Parse(args[++i]); break;
                     case "--bench-kvcache": runKvCacheBenchmark = true; break;
                     case "--bench-kv-turns": kvCacheBenchTurns = int.Parse(args[++i]); break;
+                    case "--warmup-runs": warmupInferenceRuns = int.Parse(args[++i]); break;
+                    case "--kv-cache-dtype":
+                        {
+                            string kvDtypeStr = args[++i];
+                            if (!KvCacheDtypeConfig.TryParse(kvDtypeStr, out KvCacheDtype kvDtype))
+                                throw new ArgumentException($"Unknown --kv-cache-dtype value '{kvDtypeStr}'. Valid: f32, f16, q8_0.");
+                            KvCacheDtypeConfig.Set(kvDtype);
+                            break;
+                        }
                     case "-i":
                     case "--interactive":
                     case "--chat":
@@ -190,7 +204,7 @@ namespace TensorSharp.Cli
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
                     "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
-                    "[--seed N] [--stop <text>] [--think] " +
+                    "[--seed N] [--stop <text>] [--think] [--warmup-runs N] " +
                     "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
                 return;
             }
@@ -205,16 +219,20 @@ namespace TensorSharp.Cli
                 _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, ggml_cpu, ggml_metal, ggml_cuda"),
             };
 
+            string requestedDtype = KvCacheDtypeConfig.IsExplicitlySet
+                ? KvCacheDtypeConfig.Current.ToShortString()
+                : "auto";
             _log.LogInformation(LogEventIds.ModelLoadStarted,
-                "Loading model {ModelFile} on backend {Backend} (path={ModelPath})",
-                Path.GetFileName(modelPath), backend, modelPath);
+                "Loading model {ModelFile} on backend {Backend} kvCacheDtype={KvCacheDtype} (path={ModelPath})",
+                Path.GetFileName(modelPath), backend, requestedDtype, modelPath);
             var modelLoadSw = Stopwatch.StartNew();
             using var model = ModelBase.Create(modelPath, backend);
             modelLoadSw.Stop();
             _log.LogInformation(LogEventIds.ModelLoadCompleted,
-                "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} elapsedMs={ElapsedMs:F1}",
+                "Loaded model {ModelFile} architecture={Architecture} contextLength={ContextLength} kvCacheDtype={KvCacheDtype} elapsedMs={ElapsedMs:F1}",
                 Path.GetFileName(modelPath), model.Config.Architecture ?? "(unknown)",
-                model.MaxContextLength, modelLoadSw.Elapsed.TotalMilliseconds);
+                model.MaxContextLength, model.KvCacheDtype.ToShortString(),
+                modelLoadSw.Elapsed.TotalMilliseconds);
 
             var warmupSw = Stopwatch.StartNew();
             model.WarmUpKernels();
@@ -269,6 +287,32 @@ namespace TensorSharp.Cli
                 {
                     _log.LogInformation(LogEventIds.HostConfiguration,
                         "Auto-loading vision encoder: {MmProj}", autoMmproj);
+                    model.MultimodalInjector.LoadProjectors(autoMmproj);
+                }
+            }
+            else if ((imagePath != null || audioPath != null || videoPath != null) &&
+                     (model.Config.Architecture == "nemotron_h_omni" ||
+                      model.Config.Architecture == "nemotron_h" ||
+                      model.Config.Architecture == "nemotron_h_moe"))
+            {
+                string modelDir = Path.GetDirectoryName(modelPath);
+                // Look for any mmproj-suffixed companion file in the same directory.
+                string autoMmproj = null;
+                if (modelDir != null && Directory.Exists(modelDir))
+                {
+                    foreach (string candidate in Directory.GetFiles(modelDir, "*mmproj*.gguf"))
+                    {
+                        if (candidate.IndexOf("Nemotron", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            autoMmproj = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (autoMmproj != null && File.Exists(autoMmproj))
+                {
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading Nemotron vision encoder: {MmProj}", autoMmproj);
                     model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
@@ -432,10 +476,30 @@ namespace TensorSharp.Cli
             string cliTurnUploads = FormatUploadsForCli(imagePaths, audioPaths, videoPath);
 
             _log.LogInformation(LogEventIds.ChatStarted,
-                "cli.inference.start tokensRequested={MaxTokens} thinking={Thinking} tools={ToolCount} input=\"{Input}\" images={ImageCount} audio={AudioCount} video={Video} uploads={Uploads}",
+                "cli.inference.start tokensRequested={MaxTokens} thinking={Thinking} tools={ToolCount} input=\"{Input}\" images={ImageCount} audio={AudioCount} video={Video} uploads={Uploads} warmupRuns={WarmupRuns}",
                 maxTokens, enableThinking, tools?.Count ?? 0,
                 LoggingExtensions.SanitizeForLog(rawText), imagePaths?.Count ?? 0,
-                audioPaths?.Count ?? 0, videoPath != null, cliTurnUploads);
+                audioPaths?.Count ?? 0, videoPath != null, cliTurnUploads, warmupInferenceRuns);
+
+            // --warmup-runs N : run the full inference path N times silently
+            // before the real timed pass.  This forces Metal pipeline JIT
+            // (kernel variants for the actual prefill batch size, KV-cache
+            // attention shapes, etc.) and allocator pool growth to happen
+            // once per shape, so the timed run reflects steady-state speed
+            // rather than first-touch compile cost.  Decode tokens are kept
+            // small during warmup so the wall cost is bounded.
+            for (int w = 0; w < warmupInferenceRuns; w++)
+            {
+                int warmupDecodeTokens = Math.Min(maxTokens, 4);
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "cli.inference.warmup run={Run}/{Total} decodeTokens={DecodeTokens}",
+                    w + 1, warmupInferenceRuns, warmupDecodeTokens);
+                _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
+                    isVideo: videoPath != null, samplingConfig: samplingConfig,
+                    enableThinking: enableThinking, tools: tools, silent: true);
+                model.ResetKVCache();
+                model.ResetForwardTiming();
+            }
 
             string result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: videoPath != null, samplingConfig: samplingConfig,
@@ -892,7 +956,7 @@ namespace TensorSharp.Cli
 
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
             List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null,
-            bool enableThinking = false, List<ToolFunction> tools = null)
+            bool enableThinking = false, List<ToolFunction> tools = null, bool silent = false)
         {
             var messages = new List<ChatMessage>
             {
@@ -1039,6 +1103,102 @@ namespace TensorSharp.Cli
                         }
                         _log.LogInformation(LogEventIds.HostConfiguration,
                             "Total tokens after Gemma4 image expansion: {TotalTokens}", inputTokens.Count);
+                    }
+                    else if (imagePaths.Count > 0)
+                    {
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
+                    }
+                }
+                else if (arch == "nemotron_h_omni" || arch == "nemotron_h" || arch == "nemotron_h_moe")
+                {
+                    int imageTokenId = model.Tokenizer.LookupToken("<image>");
+                    int imageStartId = model.Tokenizer.LookupToken("<img>");
+                    int imageEndId = model.Tokenizer.LookupToken("</img>");
+                    if (imageTokenId < 0) imageTokenId = 18;
+                    if (imageStartId < 0) imageStartId = 19;
+                    if (imageEndId < 0) imageEndId = 20;
+
+                    if (model is NemotronModel nem && nem.VisionEncoder != null)
+                    {
+                        var allEmbeddings = new List<TensorSharp.Tensor>();
+                        var perImageTileCounts = new List<int[]>();
+
+                        foreach (var imgP in imagePaths)
+                        {
+                            // VIDEO_MAX_FRAMES already handled upstream by extracting frames.
+                            var tiles = nem.ImageProcessor.ProcessImage(imgP);
+                            var tileTokens = new int[tiles.Count];
+                            var tileEmbeddings = new TensorSharp.Tensor[tiles.Count];
+
+                            for (int t = 0; t < tiles.Count; t++)
+                            {
+                                var tile = tiles[t];
+                                var emb = nem.VisionEncoder.Encode(tile.Pixels, tile.Width, tile.Height);
+                                tileEmbeddings[t] = emb;
+                                tileTokens[t] = (int)emb.Sizes[0];
+                                _log.LogInformation(LogEventIds.HostConfiguration,
+                                    "Nemotron vision tile {Index}: source={Width}x{Height} embeddings={EmbeddingShape}",
+                                    t, tile.Width, tile.Height, $"{emb.Sizes[0]}x{emb.Sizes[1]}");
+                            }
+
+                            perImageTileCounts.Add(tileTokens);
+                            allEmbeddings.AddRange(tileEmbeddings);
+                        }
+
+                        // Each <image> token in the prompt corresponds to ONE image (chat
+                        // template inserts a single <image> per visual). Replace each
+                        // <image> with: <img> + (sum of tile token counts) image tokens
+                        // + </img>, and queue the embeddings for in-place injection.
+                        int searchFrom = 0;
+                        int injectedImages = 0;
+                        for (int imgIdx = 0; imgIdx < imagePaths.Count; imgIdx++)
+                        {
+                            int imageTokenPos = -1;
+                            for (int i = searchFrom; i < inputTokens.Count; i++)
+                            {
+                                if (inputTokens[i] == imageTokenId)
+                                {
+                                    imageTokenPos = i;
+                                    break;
+                                }
+                            }
+                            if (imageTokenPos < 0)
+                            {
+                                _log.LogWarning(LogEventIds.HostConfiguration,
+                                    "Nemotron vision: no more <image> tokens for image {Index}", imgIdx);
+                                break;
+                            }
+
+                            int totalImageTokens = 0;
+                            foreach (int t in perImageTileCounts[imgIdx]) totalImageTokens += t;
+
+                            var expanded = new List<int>(inputTokens.Count + totalImageTokens + 2);
+                            for (int i = 0; i < imageTokenPos; i++) expanded.Add(inputTokens[i]);
+                            expanded.Add(imageStartId);
+                            int injectStart = expanded.Count;
+                            for (int i = 0; i < totalImageTokens; i++) expanded.Add(imageTokenId);
+                            expanded.Add(imageEndId);
+                            for (int i = imageTokenPos + 1; i < inputTokens.Count; i++) expanded.Add(inputTokens[i]);
+                            inputTokens = expanded;
+
+                            // Each tile's embeddings get injected at consecutive offsets.
+                            int tileOffset = injectStart;
+                            int tileBase = injectedImages;
+                            for (int t = 0; t < perImageTileCounts[imgIdx].Length; t++)
+                            {
+                                nem.SetVisionEmbeddings(allEmbeddings[tileBase + t], tileOffset);
+                                tileOffset += perImageTileCounts[imgIdx][t];
+                            }
+                            injectedImages += perImageTileCounts[imgIdx].Length;
+
+                            searchFrom = injectStart + totalImageTokens + 1;
+                            _log.LogInformation(LogEventIds.HostConfiguration,
+                                "Nemotron vision image {Index}: tiles={Tiles} totalTokens={Tokens} insertPos={Pos}",
+                                imgIdx, perImageTileCounts[imgIdx].Length, totalImageTokens, injectStart);
+                        }
+                        _log.LogInformation(LogEventIds.HostConfiguration,
+                            "Total tokens after Nemotron image expansion: {TotalTokens}", inputTokens.Count);
                     }
                     else if (imagePaths.Count > 0)
                     {
@@ -1193,6 +1353,42 @@ namespace TensorSharp.Cli
                 }
             }
 
+            // Audio processing for Nemotron Omni: requires an audio mmproj to be loaded.
+            // The current GGUF distribution we tested with does not embed the parakeet
+            // weights; in that case we still preprocess the audio to verify the pipeline
+            // and warn the user that no inference will run on the embeddings.
+            if (audioPaths != null && audioPaths.Count > 0 &&
+                (model.Config.Architecture == "nemotron_h_omni" ||
+                 model.Config.Architecture == "nemotron_h" ||
+                 model.Config.Architecture == "nemotron_h_moe"))
+            {
+                int audioTokenId = model.Tokenizer.LookupToken("<so_embedding>");
+                int audioStartId = model.Tokenizer.LookupToken("<so_start>");
+                int audioEndId = model.Tokenizer.LookupToken("<so_end>");
+                if (audioTokenId < 0) audioTokenId = 27;
+                if (audioStartId < 0) audioStartId = 28;
+                if (audioEndId < 0) audioEndId = 29;
+
+                try
+                {
+                    float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(audioPaths[0]);
+                    var (mel, frames, validFrames) = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Nemotron audio decoded: durationSec={DurationSec:F1} frames={Frames} validFrames={ValidFrames} melShape={Bins}x{Frames2}",
+                        (double)samples.Length / NemotronAudioPreprocessor.SampleRate, frames, validFrames,
+                        NemotronAudioPreprocessor.MelBins, frames);
+
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "Nemotron audio inference is NOT supported by this mmproj (no Parakeet weights present). " +
+                        "The audio file was preprocessed for verification only. Pass an audio mmproj to enable real inference.");
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "Nemotron audio preprocessing failed: {Error}", ex.Message);
+                }
+            }
+
             // Audio processing for Gemma4
             if (audioPaths != null && audioPaths.Count > 0 && model.Config.Architecture == "gemma4")
             {
@@ -1278,6 +1474,7 @@ namespace TensorSharp.Cli
 
             bool tokenByToken = Environment.GetEnvironmentVariable("TOKEN_BY_TOKEN") == "1";
             float[] logits;
+            var prefillSw = Stopwatch.StartNew();
             if (tokenByToken)
             {
                 _log.LogInformation(LogEventIds.HostConfiguration, "TOKEN_BY_TOKEN prefill mode enabled");
@@ -1288,6 +1485,17 @@ namespace TensorSharp.Cli
             else
             {
                 logits = model.Forward(inputTokens.ToArray());
+            }
+            prefillSw.Stop();
+            double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
+            double prefillTps = inputTokens.Count > 0 && prefillMs > 0
+                ? inputTokens.Count / (prefillMs / 1000.0)
+                : 0.0;
+            if (!silent)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference prefill complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                    inputTokens.Count, prefillMs, prefillTps);
             }
             var generatedTokens = new List<int>();
 
@@ -1316,6 +1524,7 @@ namespace TensorSharp.Cli
             }
 
             string finishReason = "max_tokens";
+            var decodeSw = Stopwatch.StartNew();
             for (int step = 0; step < maxTokens; step++)
             {
                 int nextToken = sampler.Sample(logits, generatedTokens);
@@ -1337,6 +1546,17 @@ namespace TensorSharp.Cli
                     var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
                     if (shouldStop)
                     {
+                        decodeSw.Stop();
+                        double sdMs = decodeSw.Elapsed.TotalMilliseconds;
+                        double sdTps = generatedTokens.Count > 0 && sdMs > 0
+                            ? generatedTokens.Count / (sdMs / 1000.0)
+                            : 0.0;
+                        if (!silent)
+                        {
+                            _log.LogInformation(LogEventIds.CliBenchmark,
+                                "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                                generatedTokens.Count, sdMs, sdTps);
+                        }
                         finishReason = "stop_sequence";
                         _log.LogInformation(LogEventIds.ChatCompleted,
                             "cli.inference finishReason={FinishReason} tokens={Tokens}",
@@ -1354,11 +1574,22 @@ namespace TensorSharp.Cli
                 if (step < 3)
                     LogTopLogits(logits, model, $"decode_{step}");
             }
+            decodeSw.Stop();
+            double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
+            double decodeTps = generatedTokens.Count > 0 && decodeMs > 0
+                ? generatedTokens.Count / (decodeMs / 1000.0)
+                : 0.0;
+            if (!silent)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                    generatedTokens.Count, decodeMs, decodeTps);
 
-            _log.LogInformation(LogEventIds.ChatCompleted,
-                "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                finishReason, generatedTokens.Count);
-            model.PrintTimingStats();
+                _log.LogInformation(LogEventIds.ChatCompleted,
+                    "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                    finishReason, generatedTokens.Count);
+                model.PrintTimingStats();
+            }
             string decoded = model.Tokenizer.Decode(generatedTokens);
 
             if (useParser)

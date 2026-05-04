@@ -19,7 +19,72 @@ namespace TensorSharp.GGML
         [RegisterOpStorageType("fill", typeof(GgmlStorage))]
         public static unsafe void Fill(Tensor result, float value)
         {
-            ValidateGgmlTensor(result, nameof(result), "fill");
+            if (result == null)
+                throw new ArgumentNullException(nameof(result));
+            if (!(result.Storage is GgmlStorage))
+                throw new ArgumentException("Fill requires a GGML tensor.", nameof(result));
+
+            // Float16 KV-cache initialization path. The F16 KV cache is always allocated
+            // contiguous (head, seqLen, headDim) by the model, so we fill it as a flat
+            // ushort[]. value=0 is the common reset case which becomes a plain memset.
+            if (result.ElementType == DType.Float16)
+            {
+                if (!IsContiguousNonNarrowed(result))
+                    throw new NotSupportedException("Fill on Float16 GGML tensors requires a contiguous, non-narrowed tensor (used for KV-cache reset).");
+                ushort halfBits = System.BitConverter.HalfToUInt16Bits((System.Half)value);
+                ushort* halfBuffer = (ushort*)GetBufferStart(result);
+                long elementCount = result.ElementCount();
+                if (halfBits == 0)
+                {
+                    // memset for the common cache-reset case.
+                    new Span<ushort>(halfBuffer, checked((int)Math.Min(elementCount, int.MaxValue))).Clear();
+                    long remaining = elementCount - int.MaxValue;
+                    if (remaining > 0)
+                    {
+                        long offset = int.MaxValue;
+                        while (remaining > 0)
+                        {
+                            int slice = (int)Math.Min(remaining, int.MaxValue);
+                            new Span<ushort>(halfBuffer + offset, slice).Clear();
+                            offset += slice;
+                            remaining -= slice;
+                        }
+                    }
+                }
+                else
+                {
+                    for (long i = 0; i < elementCount; i++)
+                        halfBuffer[i] = halfBits;
+                }
+                return;
+            }
+
+            // Q8_0 KV-cache initialization path. Q8_0 stores 32-element blocks of
+            // 34 bytes each (16-bit scale + 32 int8 values); the all-zero block
+            // (scale=0, quants=0) decodes to all zeros, so a plain memset of the
+            // entire buffer is the correct fill-with-0 implementation. Non-zero
+            // fills aren't currently used for Q8_0 caches (callers only zero them
+            // at session reset).
+            if (result.ElementType == DType.Q8_0)
+            {
+                if (!IsContiguousNonNarrowed(result))
+                    throw new NotSupportedException("Fill on Q8_0 GGML tensors requires a contiguous, non-narrowed tensor (used for KV-cache reset).");
+                if (value != 0f)
+                    throw new NotSupportedException("Fill on Q8_0 GGML tensors only supports value=0 (cache reset).");
+                long byteLength = DTypeExtensions.Q8_0Bytes(result.ElementCount());
+                byte* byteBuffer = (byte*)GetBufferStart(result);
+                long offset = 0;
+                while (offset < byteLength)
+                {
+                    int slice = (int)Math.Min(byteLength - offset, int.MaxValue);
+                    new Span<byte>(byteBuffer + offset, slice).Clear();
+                    offset += slice;
+                }
+                return;
+            }
+
+            if (result.ElementType != DType.Float32)
+                throw new InvalidOperationException($"Fill only supports Float32, Float16 and Q8_0 GGML tensors (got {result.ElementType}).");
 
             float* buffer = (float*)GetBufferStart(result);
             TensorIterState iter = new TensorIterState(buffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
@@ -31,6 +96,18 @@ namespace TensorSharp.GGML
                     *iter.data = value;
                 }
             } while (iter.NextBlock());
+        }
+
+        private static bool IsContiguousNonNarrowed(Tensor t)
+        {
+            if (t.StorageOffset != 0) return false;
+            long expected = 1;
+            for (int d = t.DimensionCount - 1; d >= 0; d--)
+            {
+                if (t.Strides[d] != expected) return false;
+                expected *= t.Sizes[d];
+            }
+            return expected == t.ElementCount();
         }
 
         [RegisterOpStorageType("buildtrimask", typeof(GgmlStorage))]
@@ -713,6 +790,9 @@ namespace TensorSharp.GGML
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
+        public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
+        public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();
+        public static void HostReadBarrier() => GgmlNative.HostReadBarrier();
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 
@@ -728,7 +808,8 @@ namespace TensorSharp.GGML
             int headDim, int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode)
+            int intermediateSize, int ropeMode,
+            int kvCacheType = 0)
         {
             GgmlNative.TransformerModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -742,7 +823,7 @@ namespace TensorSharp.GGML
                 headDim, numHeads, numKvHeads,
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode);
+                intermediateSize, ropeMode, kvCacheType);
         }
 
         /// <summary>
@@ -762,7 +843,8 @@ namespace TensorSharp.GGML
             int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode)
+            int intermediateSize, int ropeMode,
+            int kvCacheType = 0)
         {
             GgmlNative.TransformerLayerDecode(
                 hiddenData, hiddenSize,
@@ -777,7 +859,7 @@ namespace TensorSharp.GGML
                 numHeads, numKvHeads,
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode);
+                intermediateSize, ropeMode, kvCacheType);
         }
 
         /// <summary>
@@ -797,8 +879,12 @@ namespace TensorSharp.GGML
             if (q == null || k == null || v == null || kCache == null || vCache == null || output == null)
                 throw new ArgumentNullException("Flash attention decode requires non-null Q/K/V/cache/output tensors.");
             if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 || v.ElementType != DType.Float32 ||
-                kCache.ElementType != DType.Float32 || vCache.ElementType != DType.Float32 || output.ElementType != DType.Float32)
-                throw new ArgumentException("Flash attention decode requires F32 tensors.");
+                output.ElementType != DType.Float32)
+                throw new ArgumentException("Flash attention decode requires F32 Q/K/V/output tensors.");
+            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+                throw new ArgumentException("Flash attention decode requires F32 or F16 K cache tensor.");
+            if (vCache.ElementType != kCache.ElementType)
+                throw new ArgumentException("Flash attention decode requires K and V caches to share an element type.");
 
             IntPtr qPtr = GetBufferStart(q);
             IntPtr kPtr = GetBufferStart(k);
@@ -807,11 +893,13 @@ namespace TensorSharp.GGML
             IntPtr vcPtr = GetBufferStart(vCache);
             IntPtr outPtr = GetBufferStart(output);
 
+            int kvGgmlType = kCache.ElementType == DType.Float16 ? 1 : 0;
+
             GgmlNative.FlashAttnDecode(
                 qPtr, kPtr, vPtr,
                 kcPtr, vcPtr, outPtr,
                 numHeads, numKvHeads, headDim,
-                maxSeqLen, position, scale);
+                maxSeqLen, position, scale, kvGgmlType);
         }
 
         public static void Gemma4LayerPrefill(
@@ -839,7 +927,8 @@ namespace TensorSharp.GGML
             IntPtr plePostNormW = default,
             IntPtr freshKOut = default, IntPtr freshVOut = default,
             int isShared = 0,
-            IntPtr donorK = default, IntPtr donorV = default, int donorKvLen = 0)
+            IntPtr donorK = default, IntPtr donorV = default, int donorKvLen = 0,
+            int kvCacheType = 0)
         {
             GgmlNative.Gemma4LayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -866,7 +955,8 @@ namespace TensorSharp.GGML
                 plePostNormW,
                 freshKOut, freshVOut,
                 isShared,
-                donorK, donorV, donorKvLen);
+                donorK, donorV, donorKvLen,
+                kvCacheType);
         }
 
         /// <summary>
@@ -875,6 +965,13 @@ namespace TensorSharp.GGML
         /// round trips. Supports GQA and optional sliding window.
         ///
         /// Q: [numHeads, seqLen, headDim], K/V: [numKVHeads, kvLen, headDim], all F32 contiguous.
+        ///
+        /// All four tensors must be Float32: the native kernel hardcodes
+        /// <c>GGML_TYPE_F32</c> for the input tensors, so passing a Float16 KV cache (e.g.
+        /// the persistent <c>_kvCacheK[layer]</c> on quantized models) silently misreads
+        /// half the bytes and produces NaN/garbage output. Callers that may have an F16
+        /// cache must dequantize first (e.g. via <c>ExpandKVHeads</c>) or fall back to
+        /// the non-fused path.
         /// </summary>
         /// <param name="inputFormat">0 = head-first [numHeads, seqLen, headDim], 1 = flat [seqLen, numHeads*headDim]</param>
         public static void FusedPrefillAttention(Tensor q, Tensor k, Tensor v, Tensor output,
@@ -882,6 +979,19 @@ namespace TensorSharp.GGML
             int seqLen, int kvLen,
             int maskStartPos, int slidingWindow, float scale, int inputFormat = 0)
         {
+            if (q == null) throw new ArgumentNullException(nameof(q));
+            if (k == null) throw new ArgumentNullException(nameof(k));
+            if (v == null) throw new ArgumentNullException(nameof(v));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (q.ElementType != DType.Float32 || k.ElementType != DType.Float32 ||
+                v.ElementType != DType.Float32 || output.ElementType != DType.Float32)
+            {
+                throw new ArgumentException(
+                    $"FusedPrefillAttention requires Float32 tensors but received Q={q.ElementType}, " +
+                    $"K={k.ElementType}, V={v.ElementType}, output={output.ElementType}. " +
+                    "Dequantize the KV cache (e.g. via ExpandKVHeads) or fall back to the non-fused path.");
+            }
+
             IntPtr qPtr = GetBufferStart(q);
             IntPtr kPtr = GetBufferStart(k);
             IntPtr vPtr = GetBufferStart(v);
@@ -901,6 +1011,91 @@ namespace TensorSharp.GGML
         /// graph dispatch. Reduces ~2 standalone GGML calls + ~6 small CPU/GPU sync points per
         /// attention layer per decode token to one fused dispatch.
         /// </summary>
+        /// <summary>
+        /// Fused Qwen3.5 attention layer prefill: full attention block (input
+        /// RMSNorm + fused QKV (interleaved Q+gate) + per-head Q/K norm + RoPE
+        /// + KV-cache append + causal-masked softmax + attention + sigmoid-gated
+        /// mix + output projection + residual add) as a single GGML graph
+        /// dispatch per layer.
+        ///
+        /// Mirrors llama.cpp's src/models/qwen35moe.cpp build and the existing
+        /// Qwen35AttentionLayerDecode kernel structure but for multi-row prefill.
+        /// </summary>
+        public static void Qwen35AttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int ropeMode,
+            int kvCacheType, float eps)
+        {
+            GgmlNative.Qwen35AttentionLayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qNormW, kNormW,
+                oW, oType, oNe0, oNe1, oBytes,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                ropeBase, ropeFreqScale, ropeDims,
+                ropeMode, kvCacheType, eps);
+        }
+
+        /// <summary>
+        /// Fused GPT-OSS attention layer prefill: full attention block (input
+        /// RMSNorm + fused QKV (+bias) + RoPE + KV-cache append +
+        /// causal/SWA mask + softmax-with-sinks + attention + output projection
+        /// (+bias) + residual add) as a single GGML graph dispatch per layer.
+        ///
+        /// Replaces the ~10 separate per-op submissions on the legacy GPT-OSS
+        /// prefill path (each its own Metal command buffer). Mirrors the
+        /// llama.cpp graph in src/models/openai-moe-iswa.cpp and the existing
+        /// TSGgml_Gemma4LayerPrefill template.
+        /// </summary>
+        public static void GptOssAttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvB,
+            int isQkvFused,
+            IntPtr kW, int kType, long kNe0, long kNe1, long kBytes,
+            IntPtr kB,
+            IntPtr vW, int vType, long vNe0, long vNe1, long vBytes,
+            IntPtr vB,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr oB,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isSwa, int slidingWindow,
+            IntPtr sinksData,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int originalContextLength,
+            int kvCacheType, float eps)
+        {
+            GgmlNative.GptOssAttentionLayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes, qkvB, isQkvFused,
+                kW, kType, kNe0, kNe1, kBytes, kB,
+                vW, vType, vNe0, vNe1, vBytes, vB,
+                oW, oType, oNe0, oNe1, oBytes, oB,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                isSwa, slidingWindow,
+                sinksData,
+                ropeBase, ropeFreqScale, ropeDims,
+                originalContextLength,
+                kvCacheType, eps);
+        }
+
         public static void Qwen35AttentionLayerDecode(
             Tensor residual,
             Tensor attnNorm,
@@ -916,9 +1111,12 @@ namespace TensorSharp.GGML
                 kCache == null || vCache == null)
                 throw new ArgumentNullException("Qwen3.5 attention layer decode requires non-null tensors.");
             if (residual.ElementType != DType.Float32 || attnNorm.ElementType != DType.Float32 ||
-                qNorm.ElementType != DType.Float32 || kNorm.ElementType != DType.Float32 ||
-                kCache.ElementType != DType.Float32 || vCache.ElementType != DType.Float32)
-                throw new ArgumentException("Qwen3.5 attention layer decode requires F32 tensors.");
+                qNorm.ElementType != DType.Float32 || kNorm.ElementType != DType.Float32)
+                throw new ArgumentException("Qwen3.5 attention layer decode requires F32 hidden/norm tensors.");
+            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+                throw new ArgumentException("Qwen3.5 attention layer decode requires F32 or F16 K cache tensor.");
+            if (vCache.ElementType != kCache.ElementType)
+                throw new ArgumentException("Qwen3.5 attention layer decode requires K and V caches to share an element type.");
             if (qkvData == IntPtr.Zero || oData == IntPtr.Zero)
                 throw new ArgumentException("Qwen3.5 attention layer decode requires non-zero quantized weight pointers.");
 
@@ -929,6 +1127,7 @@ namespace TensorSharp.GGML
             IntPtr kCachePtr = GetBufferStart(kCache);
             IntPtr vCachePtr = GetBufferStart(vCache);
             int hiddenSize = (int)residual.Sizes[residual.Sizes.Length - 1];
+            int kvGgmlType = kCache.ElementType == DType.Float16 ? 1 : 0;
 
             GgmlNative.Qwen35AttentionLayerDecode(
                 residualPtr, hiddenSize,
@@ -939,7 +1138,7 @@ namespace TensorSharp.GGML
                 kCachePtr, vCachePtr,
                 numHeads, numKvHeads,
                 maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale, ropeMode);
+                eps, ropeBase, ropeFreqScale, ropeMode, kvGgmlType);
         }
 
         /// <summary>
@@ -1012,7 +1211,8 @@ namespace TensorSharp.GGML
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr)
+            IntPtr[] plePostNormArr,
+            int kvCacheType = 0)
         {
             GgmlNative.Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -1034,7 +1234,7 @@ namespace TensorSharp.GGML
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr);
+                plePostNormArr, kvCacheType);
         }
 
         [RegisterOpStorageType("addmmbatch", typeof(GgmlStorage))]
@@ -1121,6 +1321,376 @@ namespace TensorSharp.GGML
 
             GgmlNative.Softmax(resultView, srcView);
             return writeTarget;
+        }
+
+        /// <summary>
+        /// In-place fused causal+SWA mask + softmax + optional attention sinks for
+        /// the GptOss-style attention path. The <paramref name="scores"/> tensor is
+        /// modified in place; its layout must be [numHeads, seqLen, kvLen] (a
+        /// 3D Float32 tensor with row-contiguous strides). Pass a null
+        /// <paramref name="sinks"/> to disable sinks; pass <paramref name="slidingWindow"/>
+        /// &lt;= 0 to disable the sliding window mask.
+        ///
+        /// This collapses what used to be three operations:
+        /// AddCausalMask (GPU) + ApplySWAMask (CPU walk) + ApplySoftmaxWithSinks
+        /// (CPU walk) into a single Metal kernel. The CPU softmax-with-sinks loop
+        /// was the single largest contributor to GptOss prefill time.
+        /// </summary>
+        public static unsafe void AttentionSoftmaxWithSinks(
+            Tensor scores,
+            float[] sinks,
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStartPos,
+            int slidingWindow,
+            float scale)
+        {
+            if (scores == null) throw new ArgumentNullException(nameof(scores));
+            if (!(scores.Storage is GgmlStorage))
+                throw new ArgumentException("scores must be a GGML tensor", nameof(scores));
+            if (scores.DimensionCount != 3)
+                throw new ArgumentException("scores must be 3-D [numHeads, seqLen, kvLen].", nameof(scores));
+            if (scores.Sizes[0] != numHeads || scores.Sizes[1] != seqLen || scores.Sizes[2] != kvLen)
+                throw new ArgumentException(
+                    $"scores shape ({scores.Sizes[0]}, {scores.Sizes[1]}, {scores.Sizes[2]}) doesn't match (numHeads={numHeads}, seqLen={seqLen}, kvLen={kvLen}).",
+                    nameof(scores));
+
+            if (!TryCreateStandardView(scores, out GgmlTensorView3D scoresView))
+            {
+                throw new NotSupportedException(
+                    "AttentionSoftmaxWithSinks requires a row-contiguous Float32 scores tensor.");
+            }
+
+            if (sinks != null && sinks.Length != numHeads)
+                throw new ArgumentException(
+                    $"sinks length ({sinks.Length}) doesn't match numHeads ({numHeads}).",
+                    nameof(sinks));
+
+            if (sinks == null)
+            {
+                GgmlNative.AttentionSoftmaxWithSinks(
+                    scoresView, IntPtr.Zero, numHeads, seqLen, kvLen,
+                    maskStartPos, slidingWindow, scale);
+            }
+            else
+            {
+                fixed (float* sinksPtr = sinks)
+                {
+                    GgmlNative.AttentionSoftmaxWithSinks(
+                        scoresView, (IntPtr)sinksPtr, numHeads, seqLen, kvLen,
+                        maskStartPos, slidingWindow, scale);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Activation mode for <see cref="MoEFFNPrefill"/>. Mirrors
+        /// <c>MoEActivation</c> in <c>ggml_ops_moe.cpp</c> so C# callers can
+        /// select the GLU variant without poking ints through the ABI.
+        /// </summary>
+        public enum MoEActivation : int
+        {
+            /// <summary>silu(gate) * up (Qwen 3.5 / Mixtral / generic MoE).</summary>
+            SwiGLUSplit = 0,
+            /// <summary>GPT-OSS clamped SwiGLU variant (uses alpha/limit).</summary>
+            SwiGLUOAI = 1,
+            /// <summary>gelu(gate) * up tanh-approx GeGLU (Gemma 4 MoE).</summary>
+            GEGLUSplit = 2,
+        }
+
+        /// <summary>
+        /// Fused MoE FFN forward: gate + up projections, GLU activation
+        /// (SwiGLU split / SwiGLU OAI / GeGLU split), down projection,
+        /// per-token expert weighting, and cross-expert aggregation in a
+        /// single GGML graph dispatch (one <c>ggml_mul_mat_id</c> per matmul,
+        /// matching llama.cpp's <c>build_moe_ffn</c>).
+        ///
+        /// This collapses the previous per-active-expert loop (which issued
+        /// O(num_active_experts × num_layers) GGML graph submissions per ubatch)
+        /// to a constant 1 submission per layer regardless of how many experts
+        /// are active. For GPT-OSS (32 experts × 4 active × ~24 layers), Qwen
+        /// 3.5 MoE (128 × 8), and Gemma 4 26B-A4B MoE (16 × 4) this is the
+        /// dominant MoE decode/prefill cost.
+        ///
+        /// Weight tensors must be passed as the original GGUF stacked layout
+        /// <c>[ne0, ne1, num_experts]</c> via a base host pointer + total
+        /// bytes. For mmap'd models the C# layer can pass the base pointer of
+        /// expert 0 directly (it points to the contiguous block); for non-mmap
+        /// models the caller stacks experts into a single buffer once at model
+        /// load time.
+        ///
+        /// Set <paramref name="upData"/> to <see cref="IntPtr.Zero"/> when
+        /// <paramref name="gateData"/> already contains a pre-fused gate+up
+        /// weight (gate_ne1 = 2*nFf), mirroring llama.cpp's gate_up_exps path.
+        ///
+        /// <paramref name="hiddenIn"/> and <paramref name="hiddenOut"/> must
+        /// both be row-contiguous Float32 tensors of shape
+        /// <c>[seqLen, hiddenDim]</c>. The kernel writes only to
+        /// <paramref name="hiddenOut"/>; the caller is responsible for adding
+        /// it back to a residual.
+        ///
+        /// Per-expert post-down-projection scales (Gemma 4's
+        /// <c>ffn_down_exps.scale</c>) should be folded into
+        /// <paramref name="routingWeights"/> by the caller before the call.
+        /// </summary>
+        public static unsafe void MoEFFNPrefill(
+            Tensor hiddenIn,
+            Tensor hiddenOut,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            int[] selectedExperts,
+            float[] routingWeights,
+            IntPtr gateData, int gateGgmlType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upGgmlType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downTotalBytes,
+            float[] gateBias,         // null to skip; otherwise [biasDim, numExperts] (biasDim = nFf or 2*nFf for fused gate_up)
+            float[] upBias,           // null to skip; only valid when upData != IntPtr.Zero
+            float[] downBias,         // null to skip; otherwise [hiddenDim, numExperts]
+            MoEActivation activation,
+            float oaiAlpha = 1.702f,
+            float oaiLimit = 7.0f)
+        {
+            if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
+            if (hiddenOut == null) throw new ArgumentNullException(nameof(hiddenOut));
+            if (selectedExperts == null) throw new ArgumentNullException(nameof(selectedExperts));
+            if (routingWeights == null) throw new ArgumentNullException(nameof(routingWeights));
+
+            if (!(hiddenIn.Storage is GgmlStorage))
+                throw new ArgumentException("hiddenIn must be a GGML tensor.", nameof(hiddenIn));
+            if (!(hiddenOut.Storage is GgmlStorage))
+                throw new ArgumentException("hiddenOut must be a GGML tensor.", nameof(hiddenOut));
+
+            if (hiddenIn.ElementType != DType.Float32 || hiddenOut.ElementType != DType.Float32)
+                throw new ArgumentException("hidden tensors must be Float32.");
+            if (hiddenIn.DimensionCount != 2 || hiddenOut.DimensionCount != 2)
+                throw new ArgumentException("hidden tensors must be 2D [seqLen, hiddenDim].");
+            if (hiddenIn.Sizes[0] != seqLen || hiddenIn.Sizes[1] != hiddenDim ||
+                hiddenOut.Sizes[0] != seqLen || hiddenOut.Sizes[1] != hiddenDim)
+                throw new ArgumentException("hidden tensor shape doesn't match (seqLen, hiddenDim).");
+            if (!hiddenIn.IsContiguous() || !hiddenOut.IsContiguous())
+                throw new ArgumentException("hidden tensors must be contiguous.");
+
+            if (selectedExperts.Length != seqLen * nUsed)
+                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+            if (routingWeights.Length != seqLen * nUsed)
+                throw new ArgumentException($"routingWeights length {routingWeights.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+
+            if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
+                throw new ArgumentException("gate and down weight pointers must be non-null.");
+
+            bool fusedGateUp = upData == IntPtr.Zero;
+            int gateBiasDim = fusedGateUp ? 2 * nFf : nFf;
+            if (gateBias != null && gateBias.Length != gateBiasDim * numExperts)
+                throw new ArgumentException($"gateBias length {gateBias.Length} != gateBiasDim * numExperts = {gateBiasDim * numExperts}.");
+            if (upBias != null)
+            {
+                if (fusedGateUp) throw new ArgumentException("upBias must be null when upData is null (fused gate_up).");
+                if (upBias.Length != nFf * numExperts)
+                    throw new ArgumentException($"upBias length {upBias.Length} != nFf * numExperts = {nFf * numExperts}.");
+            }
+            if (downBias != null && downBias.Length != hiddenDim * numExperts)
+                throw new ArgumentException($"downBias length {downBias.Length} != hiddenDim * numExperts = {hiddenDim * numExperts}.");
+
+            // hiddenIn/Out are GGML host-mapped (zero-copy on Metal) so we can
+            // pass their raw storage pointers. EnsureHostReadable in case there
+            // are pending GPU writes from a previous async op upstream.
+            hiddenIn.Storage.EnsureHostReadable();
+            hiddenOut.Storage.EnsureHostReadable();
+
+            IntPtr hiddenInPtr = TensorComputePrimitives.GetStoragePointer(hiddenIn);
+            IntPtr hiddenOutPtr = TensorComputePrimitives.GetStoragePointer(hiddenOut);
+
+            int activationType = (int)activation;
+
+            fixed (int* idsPtr = selectedExperts)
+            fixed (float* weightsPtr = routingWeights)
+            fixed (float* gateBiasPtr = gateBias)
+            fixed (float* upBiasPtr = upBias)
+            fixed (float* downBiasPtr = downBias)
+            {
+                GgmlNative.MoEFFNPrefillSwiGLUQuant(
+                    hiddenInPtr, hiddenOutPtr, seqLen, hiddenDim, nFf,
+                    numExperts, nUsed,
+                    (IntPtr)idsPtr, (IntPtr)weightsPtr,
+                    gateData, gateGgmlType, gateNe0, gateNe1, gateTotalBytes,
+                    upData,   upGgmlType,   upNe0,   upNe1,   upTotalBytes,
+                    downData, downGgmlType, downNe0, downNe1, downTotalBytes,
+                    gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
+                    upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
+                    downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
+                    activationType, oaiAlpha, oaiLimit);
+            }
+        }
+
+        /// <summary>
+        /// Gemma 4 MoE GEGLU + post_ffw_norm_2 + residual-add fused kernel.
+        ///
+        /// Fuses the entire post-attention MoE FFN block of a Gemma 4 MoE
+        /// layer into a single GGML graph dispatch:
+        /// <code>
+        ///   moe_out      = MoE_FFN(hidden_in, gate, up, down, ids, weights)
+        ///   moe_normed   = rms_norm(moe_out, eps) * post_ffw_norm_2.weight
+        ///   residual    += moe_normed
+        /// </code>
+        /// versus the previous unfused sequence which issued three separate
+        /// dispatches (TryMoEFusedGEGLU + Ops.RMSNorm + Ops.Add). On Apple
+        /// Silicon Metal each per-op dispatch costs ~50 µs of submission
+        /// latency, so collapsing two of them per MoE layer saves on the
+        /// order of 100 µs × num_moe_layers per token. This is the Gemma 4
+        /// analogue of <see cref="MoEExpertsSwiGLUResidual"/> for Qwen 3.5.
+        ///
+        /// <paramref name="residual"/> must be a row-contiguous Float32
+        /// <c>[seqLen, hiddenDim]</c> tensor that already contains the value
+        /// to add the normed MoE output to (typically the dense FFN output
+        /// after Gemma 4's <c>post_ffw_norm_1</c>). The kernel writes the sum
+        /// back over the same backend buffer in place.
+        ///
+        /// Same weight-layout / activation-mode rules as
+        /// <see cref="MoEFFNPrefill"/>; the routed-expert per-down-projection
+        /// scales (Gemma 4's <c>ffn_down_exps.scale</c>) must be folded into
+        /// <paramref name="routingWeights"/> by the caller.
+        /// </summary>
+        public static unsafe void MoEFFNGEGLUResidualGemma4(
+            Tensor hiddenIn,
+            Tensor residual,
+            Tensor postNormW,
+            float postNormEps,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            int[] selectedExperts,
+            float[] routingWeights,
+            IntPtr gateData, int gateGgmlType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upGgmlType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downTotalBytes,
+            float[] gateBias,
+            float[] upBias,
+            float[] downBias,
+            MoEActivation activation = MoEActivation.GEGLUSplit,
+            float oaiAlpha = 1.702f,
+            float oaiLimit = 7.0f)
+        {
+            if (hiddenIn == null) throw new ArgumentNullException(nameof(hiddenIn));
+            if (residual == null) throw new ArgumentNullException(nameof(residual));
+            if (postNormW == null) throw new ArgumentNullException(nameof(postNormW));
+            if (selectedExperts == null) throw new ArgumentNullException(nameof(selectedExperts));
+            if (routingWeights == null) throw new ArgumentNullException(nameof(routingWeights));
+
+            if (!(hiddenIn.Storage is GgmlStorage))
+                throw new ArgumentException("hiddenIn must be a GGML tensor.", nameof(hiddenIn));
+            if (!(residual.Storage is GgmlStorage))
+                throw new ArgumentException("residual must be a GGML tensor.", nameof(residual));
+            if (!(postNormW.Storage is GgmlStorage))
+                throw new ArgumentException("postNormW must be a GGML tensor.", nameof(postNormW));
+
+            if (hiddenIn.ElementType != DType.Float32 || residual.ElementType != DType.Float32 ||
+                postNormW.ElementType != DType.Float32)
+                throw new ArgumentException("hiddenIn / residual / postNormW must be Float32.");
+            if (hiddenIn.DimensionCount != 2 || residual.DimensionCount != 2)
+                throw new ArgumentException("hiddenIn and residual must be 2D [seqLen, hiddenDim].");
+            if (hiddenIn.Sizes[0] != seqLen || hiddenIn.Sizes[1] != hiddenDim ||
+                residual.Sizes[0] != seqLen || residual.Sizes[1] != hiddenDim)
+                throw new ArgumentException("tensor shape doesn't match (seqLen, hiddenDim).");
+            if (postNormW.ElementCount() != hiddenDim)
+                throw new ArgumentException($"postNormW must have hiddenDim elements (got {postNormW.ElementCount()}).");
+            if (!hiddenIn.IsContiguous() || !residual.IsContiguous())
+                throw new ArgumentException("hiddenIn and residual must be contiguous.");
+
+            if (selectedExperts.Length != seqLen * nUsed)
+                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+            if (routingWeights.Length != seqLen * nUsed)
+                throw new ArgumentException($"routingWeights length {routingWeights.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+
+            if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
+                throw new ArgumentException("gate and down weight pointers must be non-null.");
+
+            bool fusedGateUp = upData == IntPtr.Zero;
+            int gateBiasDim = fusedGateUp ? 2 * nFf : nFf;
+            if (gateBias != null && gateBias.Length != gateBiasDim * numExperts)
+                throw new ArgumentException($"gateBias length {gateBias.Length} != gateBiasDim * numExperts = {gateBiasDim * numExperts}.");
+            if (upBias != null)
+            {
+                if (fusedGateUp) throw new ArgumentException("upBias must be null when upData is null (fused gate_up).");
+                if (upBias.Length != nFf * numExperts)
+                    throw new ArgumentException($"upBias length {upBias.Length} != nFf * numExperts = {nFf * numExperts}.");
+            }
+            if (downBias != null && downBias.Length != hiddenDim * numExperts)
+                throw new ArgumentException($"downBias length {downBias.Length} != hiddenDim * numExperts = {hiddenDim * numExperts}.");
+
+            // Drain pending GPU writes targeting the residual / hidden / norm
+            // weight buffers so the kernel sees an up-to-date view.
+            hiddenIn.Storage.EnsureHostReadable();
+            residual.Storage.EnsureHostReadable();
+            postNormW.Storage.EnsureHostReadable();
+
+            IntPtr hiddenInPtr = TensorComputePrimitives.GetStoragePointer(hiddenIn);
+            IntPtr residualPtr = TensorComputePrimitives.GetStoragePointer(residual);
+            IntPtr postNormPtr = TensorComputePrimitives.GetStoragePointer(postNormW);
+
+            int activationType = (int)activation;
+
+            fixed (int* idsPtr = selectedExperts)
+            fixed (float* weightsPtr = routingWeights)
+            fixed (float* gateBiasPtr = gateBias)
+            fixed (float* upBiasPtr = upBias)
+            fixed (float* downBiasPtr = downBias)
+            {
+                GgmlNative.Gemma4MoEGEGLUResidual(
+                    hiddenInPtr, residualPtr, postNormPtr, postNormEps,
+                    seqLen, hiddenDim, nFf,
+                    numExperts, nUsed,
+                    (IntPtr)idsPtr, (IntPtr)weightsPtr,
+                    gateData, gateGgmlType, gateNe0, gateNe1, gateTotalBytes,
+                    upData,   upGgmlType,   upNe0,   upNe1,   upTotalBytes,
+                    downData, downGgmlType, downNe0, downNe1, downTotalBytes,
+                    gateBias != null ? (IntPtr)gateBiasPtr : IntPtr.Zero,
+                    upBias   != null ? (IntPtr)upBiasPtr   : IntPtr.Zero,
+                    downBias != null ? (IntPtr)downBiasPtr : IntPtr.Zero,
+                    activationType, oaiAlpha, oaiLimit);
+            }
+        }
+
+        /// <summary>
+        /// Backwards-compatible wrapper for <see cref="MoEFFNPrefill"/> that
+        /// selects SwiGLU (or SwiGLU OAI) activation. Retained so existing
+        /// Qwen 3.5 / GPT-OSS call sites don't need to care about the broader
+        /// activation enum.
+        /// </summary>
+        public static unsafe void MoEFFNPrefillSwiGLU(
+            Tensor hiddenIn,
+            Tensor hiddenOut,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            int[] selectedExperts,
+            float[] routingWeights,
+            IntPtr gateData, int gateGgmlType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upGgmlType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downTotalBytes,
+            float[] gateBias,
+            float[] upBias,
+            float[] downBias,
+            bool useSwiGLUOAI,
+            float oaiAlpha = 1.702f,
+            float oaiLimit = 7.0f)
+        {
+            MoEFFNPrefill(
+                hiddenIn, hiddenOut, seqLen, hiddenDim, nFf, numExperts, nUsed,
+                selectedExperts, routingWeights,
+                gateData, gateGgmlType, gateNe0, gateNe1, gateTotalBytes,
+                upData,   upGgmlType,   upNe0,   upNe1,   upTotalBytes,
+                downData, downGgmlType, downNe0, downNe1, downTotalBytes,
+                gateBias, upBias, downBias,
+                useSwiGLUOAI ? MoEActivation.SwiGLUOAI : MoEActivation.SwiGLUSplit,
+                oaiAlpha, oaiLimit);
         }
 
         [RegisterOpStorageType("scaled_dot_product_attention", typeof(GgmlStorage))]

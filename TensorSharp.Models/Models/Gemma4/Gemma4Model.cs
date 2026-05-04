@@ -104,7 +104,33 @@ namespace TensorSharp.Models
         private int _numExperts;
         private int _numExpertsUsed;
 
+        // Per-layer caches for the fused expert-batched MoE FFN kernel
+        // (GgmlBasicOps.MoEFFNPrefill with GEGLU activation). These are
+        // zero-cost views into the original 3D <c>ffn_{gate,up,down}_exps.weight</c>
+        // blocks populated by <see cref="ModelBase.LoadWeights"/>. When a layer
+        // has them, MoEForward collapses O(num_active_experts * seqLen)
+        // per-expert / per-token matmuls into one ggml_mul_mat_id dispatch
+        // per projection, mirroring llama.cpp's build_moe_ffn. _layerPerExpertScale
+        // folds the per-expert post-down-projection scale (Gemma 4's
+        // ffn_down_exps.scale / ffn_gate_inp.per_expert_scale) into the
+        // routing weights so the native kernel stays activation-agnostic.
+        // Null entries mean the layer is either non-MoE or its expert weights
+        // aren't in a stacked layout (e.g. F32 fallback) and the legacy
+        // batched-by-expert C# path is used instead.
+        private StackedExpertWeights[] _layerStackedGate;
+        private StackedExpertWeights[] _layerStackedUp;
+        private StackedExpertWeights[] _layerStackedDown;
+        private float[][] _layerPerExpertScale;
+
         private bool _canUseFusedDecode;
+        // Gates the model-wide single-graph decode kernel (NativeGemma4ModelDecode).
+        // When any layer is MoE this stays false because the model-wide kernel has
+        // no MoE branch — but per-layer fused prefill/decode (gated by
+        // _canUseFusedDecode + HasMoE(l) at the call site) is still allowed for
+        // the dense layers, recovering the speedup on the dense majority of an
+        // MoE Gemma 4 model. Kept as a separate flag so a future MoE-aware
+        // model-wide kernel can flip this on independently.
+        private bool _canUseFusedFullModelDecode;
         private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
@@ -231,6 +257,7 @@ namespace TensorSharp.Models
             FuseQKVWeights();
             FuseGateUpWeights();
             FuseExpertGateUpWeights();
+            CacheMoEStackedWeights();
             PrepareCudaQuantizedWeightsForInference();
             PrecomputeRoPE();
             InitKVCache(ResolveConfiguredContextLength());
@@ -265,8 +292,13 @@ namespace TensorSharp.Models
                     if (IsLocalLayer(j) == isLocal)
                     {
                         _kvDonorMap[i] = j;
-                        if (isLocal)
-                            _swaKVDonorLayers.Add(j);
+                        // Track every donor (both SWA and global) so the
+                        // fused-prefill kernel can publish their post-norm /
+                        // post-RoPE K/V to downstream shared layers via
+                        // _prefillSWAKV. Without this, global shared layers
+                        // bail out to the C# managed path - which would crash
+                        // when the cache is block-quantized (Q8_0).
+                        _swaKVDonorLayers.Add(j);
                         break;
                     }
                 }
@@ -370,6 +402,13 @@ namespace TensorSharp.Models
             _kvCacheV = new Tensor[Config.NumLayers];
             _kvCacheSize = new int[Config.NumLayers];
 
+            // Pick a model-aligned default cache dtype (F16 for any non-F32
+            // weights) when the user hasn't explicitly chosen one. This gives
+            // quantized models the bandwidth/memory benefits of F16 cache by
+            // default while staying byte-identical to F32 outputs.
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            DType kvDtype = _kvCacheDtype.ToDType();
+
             long totalCacheBytes = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -379,11 +418,14 @@ namespace TensorSharp.Models
                 int hd = HeadDimForLayer(l);
                 int cacheLen = IsLocalLayer(l) ? _slidingWindow : maxSeqLen;
                 _kvCacheSize[l] = cacheLen;
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, kvHeads, cacheLen, hd);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
-                totalCacheBytes += (long)kvHeads * cacheLen * hd * 4 * 2;
+                // Q8_0 has fractional bytes/elem (1.0625) - go through ByteLengthFor
+                // so block-quantized layouts are accounted for correctly.
+                long perLayerElems = (long)kvHeads * cacheLen * hd;
+                totalCacheBytes += _kvCacheDtype.ByteLengthFor(perLayerElems) * 2;
             }
 
             foreach (var kv in _kvDonorMap)
@@ -394,7 +436,7 @@ namespace TensorSharp.Models
             }
 
             Console.WriteLine($"  KV cache: {totalCacheBytes / 1024 / 1024} MB " +
-                $"(global layers: {maxSeqLen} seq, SWA layers: {_slidingWindow} seq)");
+                $"(dtype: {_kvCacheDtype.ToShortString()}, global layers: {maxSeqLen} seq, SWA layers: {_slidingWindow} seq)");
         }
 
         public override void ResetKVCache()
@@ -442,7 +484,11 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
-            bool useFusedDecode = seqLen == 1 && _canUseFusedDecode;
+            // The model-wide single-graph decode kernel is only enabled when
+            // every layer is dense; an MoE layer in the model forces the
+            // per-layer dispatch loop below (which can still hit the fused
+            // per-layer kernel for the dense majority).
+            bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -459,7 +505,7 @@ namespace TensorSharp.Models
                 {
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
-                        exceptPositions.Add(pos + i);
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -473,7 +519,7 @@ namespace TensorSharp.Models
                 {
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
-                        exceptPositions.Add(pos + i);
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -655,7 +701,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
-            bool useFusedDecode = seqLen == 1 && _canUseFusedDecode;
+            bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -672,7 +718,7 @@ namespace TensorSharp.Models
                 {
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
-                        exceptPositions.Add(pos + i);
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -686,7 +732,7 @@ namespace TensorSharp.Models
                 {
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
-                        exceptPositions.Add(pos + i);
+                        exceptPositions.Add(startPos + pos + i);
                     InjectVisionEmbeddings(hidden, emb, pos);
                     emb.Dispose();
                 }
@@ -818,23 +864,77 @@ namespace TensorSharp.Models
             {
                 if (HasMoE(l)) { anyMoE = true; break; }
             }
+
             if (anyMoE)
             {
-                _canUseFusedDecode = false;
-                return;
+                // MoE Gemma 4 (e.g. gemma-4-26B-A4B) cannot use the model-wide
+                // single-graph decode kernel (NativeGemma4ModelDecode) because
+                // that kernel has no MoE branch — it would need to embed a
+                // ggml_mul_mat_id-based MoE FFN inside its giant graph. Until
+                // that lands, leave _canUseFusedFullModelDecode = false so the
+                // forward path falls back to the per-layer dispatch loop.
+                //
+                // We deliberately still build _decodeArrays and set
+                // _canUseFusedDecode = true (further down) so the per-layer
+                // fused prefill / decode kernel (TSGgml_Gemma4LayerPrefill) is
+                // available to the dense layers in the model. The per-layer
+                // call site is guarded by !HasMoE(l), so MoE layers fall
+                // through to the C# TransformerBlock — which now itself runs
+                // the post-MoE-norm + residual add through the fused
+                // Gemma4MoEGEGLUResidual kernel rather than two extra device
+                // dispatches. Net effect: the dense majority of layers gets
+                // the same fused-graph speedup as a non-MoE Gemma 4 model,
+                // and MoE layers shed two dispatches each.
+                _canUseFusedFullModelDecode = false;
+
+                // The C# MoE / managed-attention fallback path mixes CPU loads
+                // / stores with device kernels — for example the legacy
+                // per-expert FFNGelu loop in MoEForward builds `batchInput`
+                // via Buffer.MemoryCopy on the host pointer and then
+                // immediately dispatches FFNGelu on the device. The Metal
+                // lazy-sync optimisation that GgmlContext enables by default
+                // (see <see cref="GgmlBasicOps.SetAsyncCompute"/>) is only
+                // safe for pure CPU-after-GPU read patterns: GetFloatPtr /
+                // EnsureHostReadable drains pending work before returning the
+                // host pointer, but there is no host_write_barrier counterpart
+                // to make CPU writes visible to the next GPU op. Under async
+                // compute the next kernel can dispatch against a stale cached
+                // device buffer for the same host pointer, leaving a portion
+                // of the residual stream effectively zeroed on every layer.
+                // The user-visible symptom on Apple Silicon Metal is
+                // repetitive / off-topic output for any non-trivial prompt
+                // (the model still emits coherent token-by-token text but
+                // loses its conditional content). Disable async compute for
+                // the lifetime of this model so each per-op kernel blocks on
+                // `ggml_backend_synchronize` before returning.
+                if (GgmlBasicOps.GetAsyncCompute())
+                    GgmlBasicOps.SetAsyncCompute(false);
+            }
+            else
+            {
+                _canUseFusedFullModelDecode = true;
             }
 
             int n = Config.NumLayers;
 
-            // Verify all layers have the needed quantized weight
+            // Verify all *non-MoE* layers have the needed quantized QKV weight
+            // for the per-layer fused kernel. MoE layers are dispatched via
+            // the C# TransformerBlock so they don't need the precomputed
+            // arrays — the loop below leaves their Qkv slot at IntPtr.Zero
+            // and the per-layer call site bails on HasMoE(l) before touching
+            // it. If a single dense layer is missing its quantized weight
+            // (e.g. an unfortunate F32 fallback), disable per-layer fused
+            // dispatch entirely to keep the dispatch decision simple.
             for (int l = 0; l < n; l++)
             {
+                if (HasMoE(l)) continue;
                 string prefix = $"blk.{l}";
                 bool isShared = _kvDonorMap.ContainsKey(l);
                 string qkvKey = isShared ? $"{prefix}.attn_q.weight" : $"{prefix}.attn_qkv.weight";
                 if (!_quantWeights.ContainsKey(qkvKey))
                 {
                     _canUseFusedDecode = false;
+                    _canUseFusedFullModelDecode = false;
                     return;
                 }
             }
@@ -876,8 +976,8 @@ namespace TensorSharp.Models
 
                 a.AttnNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_norm.weight"]);
                 a.QNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_q_norm.weight"]);
-                a.KCache[l] = (IntPtr)GetFloatPtr(_kvCacheK[kvSource]);
-                a.VCache[l] = (IntPtr)GetFloatPtr(_kvCacheV[kvSource]);
+                a.KCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheK[kvSource]);
+                a.VCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheV[kvSource]);
 
                 if (!isShared)
                     a.KNorm[l] = (IntPtr)GetFloatPtr(_weights[$"{prefix}.attn_k_norm.weight"]);
@@ -1041,7 +1141,8 @@ namespace TensorSharp.Models
                 pleDataPtr, _pleDim,
                 a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
                 a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
-                a.PlePostNorm);
+                a.PlePostNorm,
+                _kvCacheDtype.GgmlType());
         }
 
         /// <summary>
@@ -1064,6 +1165,10 @@ namespace TensorSharp.Models
             Tensor perLayerInput)
         {
             if (_decodeArrays == null) return false;
+            // The fused prefill kernel binds the K/V cache as F32 or F16 based on
+            // _kvCacheDtype. Fresh K/V is always F32 inside the kernel; the cache
+            // write goes through ggml_cpy(F32->cacheType) and the global-prev path
+            // materializes the F16 cache view as F32 before concatenating with fresh.
             var a = _decodeArrays;
 
             string prefix = $"blk.{layer}";
@@ -1116,9 +1221,9 @@ namespace TensorSharp.Models
             {
                 if (_prefillSWAKV == null || !_prefillSWAKV.TryGetValue(donorLayer, out var donorKv))
                 {
-                    // Donor hasn't published K/V (e.g. donor is a global layer
-                    // that doesn't go through _prefillSWAKV, or kernel was
-                    // disabled for this run). Fall back to C# path.
+                    // Donor hasn't published K/V (e.g. kernel was disabled for
+                    // this run, or this layer's donor lookup happened before
+                    // the donor's TryFusedLayerPrefill ran). Fall back to C#.
                     return false;
                 }
 
@@ -1183,7 +1288,14 @@ namespace TensorSharp.Models
             IntPtr freshVOutPtr = IntPtr.Zero;
             int kvHeadsLayer = a.KvHeads[layer];
             int hdLayer = a.HeadDim[layer];
-            if (isLocal && !isShared && _swaKVDonorLayers != null && _swaKVDonorLayers.Contains(layer)
+            // Donor publish: layers that downstream KV-shared layers depend on
+            // get host buffers the kernel writes fresh post-norm/RoPE K/V into.
+            // Both SWA (local) and global donors must publish, otherwise their
+            // shared layers bail out to the C# managed path (which can't read
+            // a Q8_0 cache). The donor list `_swaKVDonorLayers` already tracks
+            // both kinds; the local-vs-global distinction matters only inside
+            // the kernel itself.
+            if (!isShared && _swaKVDonorLayers != null && _swaKVDonorLayers.Contains(layer)
                 && _prefillSWAKV != null)
             {
                 freshKBuffer = new Tensor(_allocator, DType.Float32, kvHeadsLayer, seqLen, hdLayer);
@@ -1220,7 +1332,8 @@ namespace TensorSharp.Models
                     plePostNormW,
                     freshKOutPtr, freshVOutPtr,
                     isShared ? 1 : 0,
-                    donorKPtr, donorVPtr, donorKvLen);
+                    donorKPtr, donorVPtr, donorKvLen,
+                    _kvCacheDtype.GgmlType());
 
                 if (freshKBuffer != null)
                 {
@@ -1419,6 +1532,19 @@ namespace TensorSharp.Models
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
             bool isShared, Tensor perLayerInput, HashSet<int> exceptPositions = null)
         {
+            // The C# managed prefill / decode path reads and writes the cache as a
+            // flat F32 (or F16) buffer. Block-quantized layouts (Q8_0) cannot be
+            // walked with raw pointer arithmetic, so we surface a clear error
+            // here rather than letting downstream pointer math silently corrupt
+            // the cache. Users should pick --kv-cache-dtype f16 for multimodal
+            // prompts or any setup that disables the native fused kernels.
+            if (_kvCacheDtype.IsBlockQuantized())
+                throw new InvalidOperationException(
+                    $"Q8_0 KV cache requires the fused native attention kernels. " +
+                    $"This call path (multimodal injection / fused-prefill bailout / non-fused decode) " +
+                    $"falls back to the C# managed attention helpers which only support F32/F16. " +
+                    $"Use --kv-cache-dtype f16 for this configuration.");
+
             string prefix = $"blk.{layer}";
 
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
@@ -1445,14 +1571,23 @@ namespace TensorSharp.Models
                     postMlpNorm1Key = $"{prefix}.ffn_post_norm_1.weight";
                 Ops.RMSNorm(mlpOut, mlpOut, _weights[postMlpNorm1Key], null, Config.Eps);
 
-                using var moeOut = MoEForward(attnOut, layer, prefix, seqLen);
-
                 string postMoeNormKey = $"{prefix}.post_ffw_norm_2.weight";
                 if (!_weights.ContainsKey(postMoeNormKey))
                     postMoeNormKey = $"{prefix}.ffn_post_norm_2.weight";
-                using var postMoeNormed = RMSNormOp(moeOut, postMoeNormKey);
 
-                Ops.Add(mlpOut, mlpOut, postMoeNormed);
+                // Try the residual-fused MoE GEGLU kernel: one dispatch performs
+                // moe_ffn(...) → rms_norm(post_norm_2) → add into mlpOut. This
+                // collapses three device dispatches (MoEForward + RMSNorm +
+                // Add) into one, mirroring Qwen 3.5's MoEExpertsSwiGLUResidual
+                // pattern. Falls back to the legacy split path when the
+                // stacked expert weights aren't built (e.g. F32-only model)
+                // or when the kernel rejects the layout.
+                if (!TryMoEForwardResidual(attnOut, mlpOut, layer, prefix, seqLen, postMoeNormKey))
+                {
+                    using var moeOut = MoEForward(attnOut, layer, prefix, seqLen);
+                    using var postMoeNormed = RMSNormOp(moeOut, postMoeNormKey);
+                    Ops.Add(mlpOut, mlpOut, postMoeNormed);
+                }
 
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
@@ -1519,6 +1654,31 @@ namespace TensorSharp.Models
 
             int hiddenDim = (int)moeInput.Sizes[1];
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+
+            // Expert-batched fused path: one ggml_mul_mat_id-backed dispatch
+            // replaces the per-expert batched matmul loop below. This is the
+            // dominant MoE decode bottleneck (sequential per-token / per-
+            // selected-expert FFNs). Gated by IsGgmlBackend + availability of
+            // stacked expert weights (built at load time for quantized MoE
+            // tensors; F32-only models fall through to the legacy path).
+            // _layerStackedUp is null when the GGUF ships a pre-fused
+            // ffn_gate_up_exps.weight; in that case the kernel handles the
+            // split internally.
+            if (IsGgmlBackend
+                && _layerStackedGate != null
+                && _layerStackedGate[layer] != null
+                && _layerStackedDown[layer] != null)
+            {
+                if (TryMoEFusedGEGLU(moeInput, output, selectedExperts, routingWeights,
+                                     layer, seqLen, hiddenDim))
+                {
+                    return output;
+                }
+            }
+
+            // Legacy batched-by-expert fallback (still better than per-token
+            // per-expert matmuls: at most numExperts batched matmuls per
+            // MoE layer).
             Ops.Fill(output, 0f);
 
             float* inputPtr = GetFloatPtr(moeInput);
@@ -1608,6 +1768,200 @@ namespace TensorSharp.Models
             }
 
             return output;
+        }
+
+        /// <summary>
+        /// Fused MoE FFN via <see cref="GgmlBasicOps.MoEFFNPrefill"/> with
+        /// GEGLU activation. Collapses the per-active-expert loop into a
+        /// single graph dispatch per MoE layer (3 <c>ggml_mul_mat_id</c> ops
+        /// plus the GEGLU fused-op + expert aggregation) regardless of token
+        /// count, which is especially valuable on the decode path where
+        /// <paramref name="seqLen"/> = 1 and the legacy batched path
+        /// degenerates into <see cref="_numExpertsUsed"/> single-row matmuls.
+        /// </summary>
+        /// <remarks>
+        /// Per-expert post-down-projection scales (Gemma 4's
+        /// <c>ffn_down_exps.scale</c> / <c>ffn_gate_inp.per_expert_scale</c>)
+        /// are folded into <paramref name="routingWeights"/> before the
+        /// dispatch so the kernel itself stays activation-agnostic.
+        /// </remarks>
+        private unsafe bool TryMoEFusedGEGLU(
+            Tensor moeInput,
+            Tensor output,
+            int[] selectedExperts,
+            float[] routingWeights,
+            int layer,
+            int seqLen,
+            int hiddenDim)
+        {
+            var gateW = _layerStackedGate[layer];
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+            // When upW is null, gateW is actually the pre-fused gate_up_exps
+            // weight with ne1 = 2*n_ff. The native kernel detects this via
+            // upData == IntPtr.Zero and splits internally.
+            bool fusedGateUp = upW == null;
+            int nFf = fusedGateUp ? (int)(gateW.PerExpertNe1 / 2) : (int)gateW.PerExpertNe1;
+            int nUsed = _numExpertsUsed;
+
+            // Fold the per-expert scalar into routingWeights so a single
+            // multiply inside the kernel covers both contributions. Source
+            // arrays belong to the caller so we copy before mutating.
+            float[] kernelWeights = routingWeights;
+            float[] perExpertScale = _layerPerExpertScale?[layer];
+            if (perExpertScale != null)
+            {
+                kernelWeights = new float[routingWeights.Length];
+                for (int s = 0; s < seqLen; s++)
+                {
+                    for (int k = 0; k < nUsed; k++)
+                    {
+                        int idx = s * nUsed + k;
+                        int expertIdx = selectedExperts[idx];
+                        kernelWeights[idx] = routingWeights[idx] * perExpertScale[expertIdx];
+                    }
+                }
+            }
+
+            // moeInput is the output of RMSNormOp(hiddenState, moeNormKey) and
+            // is guaranteed Float32 + contiguous. If a future refactor ever
+            // changes that invariant, the NotSupportedException catch below
+            // falls the call back to the legacy batched path.
+            // For the pre-fused gate_up layout pass IntPtr.Zero + zeros for the
+            // up weight metadata; the native kernel uses that as the signal
+            // to consume gateW as a 2*n_ff block and skip the second matmul.
+            IntPtr upData = fusedGateUp ? IntPtr.Zero : upW.Data;
+            int upType = fusedGateUp ? 0 : upW.GgmlType;
+            long upNe0 = fusedGateUp ? 0L : upW.PerExpertNe0;
+            long upNe1 = fusedGateUp ? 0L : upW.PerExpertNe1;
+            long upBytes = fusedGateUp ? 0L : upW.TotalRawBytes;
+
+            try
+            {
+                GgmlBasicOps.MoEFFNPrefill(
+                    moeInput, output,
+                    seqLen, hiddenDim, nFf, _numExperts, nUsed,
+                    selectedExperts, kernelWeights,
+                    gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, gateW.TotalRawBytes,
+                    upData,     upType,        upNe0,              upNe1,              upBytes,
+                    downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
+                    gateBias: null, upBias: null, downBias: null,
+                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                InvalidateTensorDeviceCache(output);
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Single-dispatch MoE GEGLU + post_ffw_norm_2 + add-to-residual for
+        /// Gemma 4 MoE layers. Folds three device dispatches (MoEForward +
+        /// RMSNorm + Add) into one ggml graph submission via the native
+        /// <see cref="GgmlBasicOps.MoEFFNGEGLUResidualGemma4"/> kernel.
+        ///
+        /// On success <paramref name="residual"/> already contains
+        /// <c>residual + rms_norm(moe_ffn(hiddenState), eps) * post_norm_w</c>
+        /// and the caller proceeds directly to the post-FFN norm. On failure
+        /// the caller falls back to the legacy 3-dispatch sequence.
+        /// </summary>
+        /// <param name="hiddenState">Attention residual (input to the MoE block).</param>
+        /// <param name="residual">Dense FFN output (post_ffw_norm_1) — written in place.</param>
+        /// <param name="layer">Layer index for weight lookup.</param>
+        /// <param name="prefix">"blk.{layer}" prefix for tensor lookup.</param>
+        /// <param name="seqLen">Number of tokens in the chunk (1 for decode).</param>
+        /// <param name="postMoeNormKey">Resolved key for post_ffw_norm_2.weight.</param>
+        private unsafe bool TryMoEForwardResidual(
+            Tensor hiddenState,
+            Tensor residual,
+            int layer,
+            string prefix,
+            int seqLen,
+            string postMoeNormKey)
+        {
+            // Same gating as TryMoEFusedGEGLU: requires the GGML backend and
+            // the stacked-experts cache populated by CacheMoEStackedWeights.
+            // Falls back to the legacy split path on any miss so quantization
+            // / weight-layout edge cases don't degrade correctness.
+            if (!IsGgmlBackend
+                || _layerStackedGate == null
+                || _layerStackedGate[layer] == null
+                || _layerStackedDown[layer] == null)
+                return false;
+
+            if (!_weights.TryGetValue(postMoeNormKey, out var postNormW))
+                return false;
+
+            // Routing must run before the kernel: the C# loop builds the
+            // selected_experts / routing_weights arrays from the router
+            // logits (CPU softmax + top-K + per-expert-scale fold). The
+            // kernel itself is purely the GEGLU FFN + post-norm + add.
+            var (routingWeights, selectedExperts) = MoERoute(hiddenState, prefix, seqLen);
+
+            string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
+            if (!_weights.ContainsKey(moeNormKey))
+                moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
+            using var moeInput = RMSNormOp(hiddenState, moeNormKey);
+
+            int hiddenDim = (int)moeInput.Sizes[1];
+            var gateW = _layerStackedGate[layer];
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+
+            bool fusedGateUp = upW == null;
+            int nFf = fusedGateUp ? (int)(gateW.PerExpertNe1 / 2) : (int)gateW.PerExpertNe1;
+            int nUsed = _numExpertsUsed;
+
+            // Fold per-expert post-down scale (Gemma 4's
+            // ffn_down_exps.scale / ffn_gate_inp.per_expert_scale) into the
+            // routing weights so the kernel sees a single scalar per (token,
+            // active-expert) slot. Must copy to a fresh array because the
+            // caller's routingWeights may be reused.
+            float[] kernelWeights = routingWeights;
+            float[] perExpertScale = _layerPerExpertScale?[layer];
+            if (perExpertScale != null)
+            {
+                kernelWeights = new float[routingWeights.Length];
+                for (int s = 0; s < seqLen; s++)
+                {
+                    for (int k = 0; k < nUsed; k++)
+                    {
+                        int idx = s * nUsed + k;
+                        int expertIdx = selectedExperts[idx];
+                        kernelWeights[idx] = routingWeights[idx] * perExpertScale[expertIdx];
+                    }
+                }
+            }
+
+            // Up-weight metadata is signalled to the kernel via IntPtr.Zero +
+            // zeros for the fused-gate_up layout (mirrors MoEFFNPrefill /
+            // TryMoEFusedGEGLU).
+            IntPtr upData = fusedGateUp ? IntPtr.Zero : upW.Data;
+            int upType = fusedGateUp ? 0 : upW.GgmlType;
+            long upNe0 = fusedGateUp ? 0L : upW.PerExpertNe0;
+            long upNe1 = fusedGateUp ? 0L : upW.PerExpertNe1;
+            long upBytes = fusedGateUp ? 0L : upW.TotalRawBytes;
+
+            try
+            {
+                GgmlBasicOps.MoEFFNGEGLUResidualGemma4(
+                    moeInput, residual, postNormW, Config.Eps,
+                    seqLen, hiddenDim, nFf, _numExperts, nUsed,
+                    selectedExperts, kernelWeights,
+                    gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, gateW.TotalRawBytes,
+                    upData,     upType,        upNe0,              upNe1,              upBytes,
+                    downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
+                    gateBias: null, upBias: null, downBias: null,
+                    activation: GgmlBasicOps.MoEActivation.GEGLUSplit);
+                InvalidateTensorDeviceCache(residual);
+                return true;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
         }
 
         private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(
@@ -1790,6 +2144,91 @@ namespace TensorSharp.Models
             }
             if (fused > 0)
                 Console.WriteLine($"  Fused expert projections: {fused} Gate+Up");
+        }
+
+        /// <summary>
+        /// Snapshot per-layer stacked MoE expert weights and per-expert scales
+        /// so <see cref="MoEForward"/> can dispatch the fused GEGLU kernel
+        /// without re-scanning dictionaries every call. Runs once at model
+        /// load time after <see cref="FuseExpertGateUpWeights"/>; the stacked
+        /// views survive that fusion because it only mutates the per-expert
+        /// entries in <c>_quantWeights</c> / <c>_weights</c>, never the
+        /// <c>_stackedExpertWeights</c> dictionary.
+        ///
+        /// Two GGUF layouts are handled transparently:
+        ///   * Pre-fused <c>ffn_gate_up_exps.weight</c> of shape
+        ///     <c>[hidden, 2*n_ff, num_experts]</c> (used by the first-party
+        ///     Gemma 4 26B-A4B GGUFs). In this case <c>_layerStackedUp</c>
+        ///     stays <c>null</c> and the native kernel receives the gate
+        ///     pointer with <c>upData = IntPtr.Zero</c>, mirroring
+        ///     llama.cpp's <c>gate_up_exps</c> path.
+        ///   * Separate <c>ffn_gate_exps.weight</c> + <c>ffn_up_exps.weight</c>
+        ///     (used by some third-party converts). Both pointers are
+        ///     populated and the kernel issues two <c>ggml_mul_mat_id</c>
+        ///     projections.
+        /// </summary>
+        private void CacheMoEStackedWeights()
+        {
+            if (_numExperts == 0) return;
+
+            int numLayers = Config.NumLayers;
+            _layerStackedGate = new StackedExpertWeights[numLayers];
+            _layerStackedUp = new StackedExpertWeights[numLayers];
+            _layerStackedDown = new StackedExpertWeights[numLayers];
+            _layerPerExpertScale = new float[numLayers][];
+
+            int fusedCapable = 0;
+            int fusedGateUpLayers = 0;
+            for (int l = 0; l < numLayers; l++)
+            {
+                string prefix = $"blk.{l}";
+
+                // Prefer the pre-fused gate_up layout when the GGUF provides it:
+                // skips a ggml_mul_mat_id and saves one quant dequant path inside
+                // the kernel. Up stays null to signal the fused layout.
+                if (_stackedExpertWeights.TryGetValue($"{prefix}.ffn_gate_up_exps.weight", out var gateUp))
+                {
+                    _layerStackedGate[l] = gateUp;
+                    _layerStackedUp[l] = null;
+                    fusedGateUpLayers++;
+                }
+                else
+                {
+                    _stackedExpertWeights.TryGetValue($"{prefix}.ffn_gate_exps.weight", out _layerStackedGate[l]);
+                    _stackedExpertWeights.TryGetValue($"{prefix}.ffn_up_exps.weight",   out _layerStackedUp[l]);
+                }
+                _stackedExpertWeights.TryGetValue($"{prefix}.ffn_down_exps.weight", out _layerStackedDown[l]);
+
+                string scaleKey = $"{prefix}.ffn_down_exps.scale";
+                if (!_weights.ContainsKey(scaleKey))
+                    scaleKey = $"{prefix}.ffn_gate_inp.per_expert_scale";
+                if (_weights.TryGetValue(scaleKey, out var scaleT))
+                {
+                    var scales = new float[_numExperts];
+                    for (int e = 0; e < _numExperts; e++)
+                        scales[e] = scaleT.GetElementAsFloat(e);
+                    _layerPerExpertScale[l] = scales;
+                }
+
+                bool hasGateUp = _layerStackedGate[l] != null && (_layerStackedUp[l] != null || fusedGateUpLayers > 0);
+                // Re-evaluate per layer: gate must exist; either up exists, or the
+                // gate is the pre-fused gate_up (ne1 = 2 * n_ff).
+                bool gateIsFused = _layerStackedGate[l] != null
+                    && _layerStackedUp[l] == null
+                    && _stackedExpertWeights.ContainsKey($"{prefix}.ffn_gate_up_exps.weight");
+                bool ok = _layerStackedGate[l] != null
+                          && _layerStackedDown[l] != null
+                          && (_layerStackedUp[l] != null || gateIsFused);
+                if (ok) fusedCapable++;
+            }
+
+            if (fusedCapable > 0)
+            {
+                string layout = fusedGateUpLayers == fusedCapable
+                    ? "fused gate_up"
+                    : (fusedGateUpLayers > 0 ? "mixed" : "separate gate/up");
+                Console.WriteLine($"  Expert-batched MoE FFN kernel available on {fusedCapable}/{numLayers} layers ({layout})");
+            }
         }
 
         #endregion
@@ -2645,6 +3084,13 @@ namespace TensorSharp.Models
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
             int attendStart, int totalSeqLen, float scale)
         {
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                AttentionDecodeWithWindowF16(q, kCache, vCache, result,
+                    numHeads, numKVHeads, keyDim, valDim, attendStart, totalSeqLen, scale);
+                return;
+            }
+
             float* qPtr = GetFloatPtr(q);
             float* kPtr = GetFloatPtr(kCache);
             float* vPtr = GetFloatPtr(vCache);
@@ -2688,10 +3134,64 @@ namespace TensorSharp.Models
             }
         }
 
+        private unsafe void AttentionDecodeWithWindowF16(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
+            int attendStart, int totalSeqLen, float scale)
+        {
+            float* qPtr = GetFloatPtr(q);
+            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
+            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
+            float* rPtr = GetFloatPtr(result);
+            int maxSeqLen = (int)kCache.Sizes[1];
+            int groupSize = numHeads / numKVHeads;
+            int attendLen = totalSeqLen - attendStart;
+
+            float* scores = stackalloc float[attendLen];
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* qHead = qPtr + h * keyDim;
+                int kvHead = h / groupSize;
+                ushort* kHead = kPtr + kvHead * maxSeqLen * keyDim;
+                ushort* vHead = vPtr + kvHead * maxSeqLen * valDim;
+
+                float maxScore = float.NegativeInfinity;
+                for (int t = 0; t < attendLen; t++)
+                {
+                    float s = TensorComputePrimitives.DotF32F16(qHead, kHead + (attendStart + t) * keyDim, keyDim) * scale;
+                    scores[t] = s;
+                    if (s > maxScore) maxScore = s;
+                }
+
+                float sumExp = 0;
+                for (int t = 0; t < attendLen; t++)
+                {
+                    float e = MathF.Exp(scores[t] - maxScore);
+                    scores[t] = e;
+                    sumExp += e;
+                }
+                float invSum = 1f / sumExp;
+                for (int t = 0; t < attendLen; t++)
+                    scores[t] *= invSum;
+
+                float* rHead = rPtr + h * valDim;
+                VecZero(rHead, valDim);
+                for (int t = 0; t < attendLen; t++)
+                    TensorComputePrimitives.ScaleAddF16(rHead, vHead + (attendStart + t) * valDim, scores[t], valDim);
+            }
+        }
+
         private unsafe void AttentionDecodeCircular(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
             int currentPos, int attendLen, int cacheSize, float scale)
         {
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                AttentionDecodeCircularF16(q, kCache, vCache, result,
+                    numHeads, numKVHeads, keyDim, valDim, currentPos, attendLen, cacheSize, scale);
+                return;
+            }
+
             float* qPtr = GetFloatPtr(q);
             float* kPtr = GetFloatPtr(kCache);
             float* vPtr = GetFloatPtr(vCache);
@@ -2743,6 +3243,61 @@ namespace TensorSharp.Models
             }
         }
 
+        private unsafe void AttentionDecodeCircularF16(Tensor q, Tensor kCache, Tensor vCache,
+            Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
+            int currentPos, int attendLen, int cacheSize, float scale)
+        {
+            float* qPtr = GetFloatPtr(q);
+            ushort* kPtr = TensorComputePrimitives.GetHalfPointer(kCache);
+            ushort* vPtr = TensorComputePrimitives.GetHalfPointer(vCache);
+            float* rPtr = GetFloatPtr(result);
+            int groupSize = numHeads / numKVHeads;
+
+            float* scores = stackalloc float[attendLen];
+
+            int startLogicalPos = currentPos + 1 - attendLen;
+            if (startLogicalPos < 0) startLogicalPos = 0;
+            int actualAttendLen = currentPos + 1 - startLogicalPos;
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* qHead = qPtr + h * keyDim;
+                int kvHead = h / groupSize;
+                ushort* kHead = kPtr + kvHead * cacheSize * keyDim;
+                ushort* vHead = vPtr + kvHead * cacheSize * valDim;
+
+                float maxScore = float.NegativeInfinity;
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    int logicalPos = startLogicalPos + t;
+                    int cacheIdx = logicalPos % cacheSize;
+                    float s = TensorComputePrimitives.DotF32F16(qHead, kHead + cacheIdx * keyDim, keyDim) * scale;
+                    scores[t] = s;
+                    if (s > maxScore) maxScore = s;
+                }
+
+                float sumExp = 0;
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    float e = MathF.Exp(scores[t] - maxScore);
+                    scores[t] = e;
+                    sumExp += e;
+                }
+                float invSum = 1f / sumExp;
+                for (int t = 0; t < actualAttendLen; t++)
+                    scores[t] *= invSum;
+
+                float* rHead = rPtr + h * valDim;
+                VecZero(rHead, valDim);
+                for (int t = 0; t < actualAttendLen; t++)
+                {
+                    int logicalPos = startLogicalPos + t;
+                    int cacheIdx = logicalPos % cacheSize;
+                    TensorComputePrimitives.ScaleAddF16(rHead, vHead + cacheIdx * valDim, scores[t], valDim);
+                }
+            }
+        }
+
         /// <summary>
         /// Gather the live "previous window" K (or V) of an SWA layer's rolling
         /// cache into a contiguous tensor of shape [kvHeads, prevWindowLen, hd].
@@ -2769,9 +3324,49 @@ namespace TensorSharp.Models
             if (CudaFusedOps.TryGatherCircularHeadFirst(result, cache, prevStart, prevWindowLen, cacheSize))
                 return result;
 
+            int firstSlot = ((prevStart % cacheSize) + cacheSize) % cacheSize;
+
+            if (cache.ElementType == DType.Float16)
+            {
+                ushort* cachePtrH = TensorComputePrimitives.GetHalfPointer(cache);
+                float* dstPtrH = GetFloatPtr(result);
+                int doParallelH = kvHeads >= 4 ? 1 : 0;
+                int firstSlotLocal = firstSlot;
+                int prevWindowLenLocal = prevWindowLen;
+                int cacheSizeLocal = cacheSize;
+                int headDimLocal = headDim;
+                long cachePtrHAddr = (long)cachePtrH;
+                long dstPtrHAddr = (long)dstPtrH;
+                void CopyOneHeadH(int h)
+                {
+                    ushort* cacheHead = (ushort*)cachePtrHAddr + (long)h * cacheSizeLocal * headDimLocal;
+                    float* dstHead = (float*)dstPtrHAddr + (long)h * prevWindowLenLocal * headDimLocal;
+                    if (firstSlotLocal + prevWindowLenLocal <= cacheSizeLocal)
+                    {
+                        TensorComputePrimitives.F16ToF32(dstHead,
+                            cacheHead + (long)firstSlotLocal * headDimLocal,
+                            prevWindowLenLocal * headDimLocal);
+                    }
+                    else
+                    {
+                        int tailLen = cacheSizeLocal - firstSlotLocal;
+                        TensorComputePrimitives.F16ToF32(dstHead,
+                            cacheHead + (long)firstSlotLocal * headDimLocal,
+                            tailLen * headDimLocal);
+                        int headLen = prevWindowLenLocal - tailLen;
+                        TensorComputePrimitives.F16ToF32(dstHead + (long)tailLen * headDimLocal,
+                            cacheHead, headLen * headDimLocal);
+                    }
+                }
+                if (doParallelH != 0)
+                    System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHeadH);
+                else
+                    for (int h = 0; h < kvHeads; h++) CopyOneHeadH(h);
+                return result;
+            }
+
             float* cachePtr = GetFloatPtr(cache);
             float* dstPtr = GetFloatPtr(result);
-            int firstSlot = ((prevStart % cacheSize) + cacheSize) % cacheSize;
             long headBytes = (long)headDim * sizeof(float);
 
             int doParallel = kvHeads >= 4 ? 1 : 0;
@@ -2890,10 +3485,52 @@ namespace TensorSharp.Models
             if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, cacheSize, true))
                 return;
 
-            float* srcPtr = GetFloatPtr(src);
-            float* cachePtr = GetFloatPtr(cache);
             int numHeads = (int)cache.Sizes[0];
             int headDim = (int)cache.Sizes[2];
+
+            if (cache.ElementType == DType.Float16)
+            {
+                float* srcPtrF16 = GetFloatPtr(src);
+                ushort* cachePtrF16 = TensorComputePrimitives.GetHalfPointer(cache);
+                int totalWorkF16 = seqLen * numHeads;
+                if (totalWorkF16 >= 64)
+                {
+                    long srcAddrF16 = (long)srcPtrF16;
+                    long dstAddrF16 = (long)cachePtrF16;
+                    int seqLenLocal = seqLen;
+                    int cacheSizeLocal = cacheSize;
+                    int headDimLocal = headDim;
+                    int startPosLocal = startPos;
+                    int numHeadsLocal = numHeads;
+                    System.Threading.Tasks.Parallel.For(0, totalWorkF16, idx =>
+                    {
+                        int s = idx / numHeadsLocal;
+                        int h = idx % numHeadsLocal;
+                        int cacheIdx = (startPosLocal + s) % cacheSizeLocal;
+                        float* srcRow = (float*)srcAddrF16 + (long)h * seqLenLocal * headDimLocal + (long)s * headDimLocal;
+                        ushort* dstRow = (ushort*)dstAddrF16 + (long)h * cacheSizeLocal * headDimLocal + (long)cacheIdx * headDimLocal;
+                        TensorComputePrimitives.F32ToF16(dstRow, srcRow, headDimLocal);
+                    });
+                }
+                else
+                {
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        int cacheIdx = (startPos + s) % cacheSize;
+                        for (int h = 0; h < numHeads; h++)
+                        {
+                            float* srcRow = srcPtrF16 + (long)h * seqLen * headDim + (long)s * headDim;
+                            ushort* dstRow = cachePtrF16 + (long)h * cacheSize * headDim + (long)cacheIdx * headDim;
+                            TensorComputePrimitives.F32ToF16(dstRow, srcRow, headDim);
+                        }
+                    }
+                }
+                InvalidateTensorDeviceCache(cache);
+                return;
+            }
+
+            float* srcPtr = GetFloatPtr(src);
+            float* cachePtr = GetFloatPtr(cache);
             int headBytes = headDim * sizeof(float);
 
             int totalWork = seqLen * numHeads;

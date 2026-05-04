@@ -134,12 +134,14 @@ namespace TensorSharp.Models
             _maxContextLength = maxSeqLen;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, numKVHeads, maxSeqLen, headDim);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
@@ -401,8 +403,20 @@ namespace TensorSharp.Models
             qHeads.Dispose();
             kExpanded.Dispose();
 
-            Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-            Ops.Softmax(scores, scores);
+            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
+            // (two separate ops) with one Metal kernel.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(
+                    scores, sinks: null,
+                    numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
+                    maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
+                Ops.Softmax(scores, scores);
+            }
 
             var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
             Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
@@ -517,11 +531,13 @@ namespace TensorSharp.Models
                 (IntPtr)GetFloatPtr(ffnNormW),
                 guW.CacheKey, guW.GgmlType, guW.Ne0, guW.Ne1, guW.RawBytes,
                 downW.CacheKey, downW.GgmlType, downW.Ne0, downW.Ne1, downW.RawBytes,
-                (IntPtr)GetFloatPtr(_kvCacheK[layer]), (IntPtr)GetFloatPtr(_kvCacheV[layer]),
+                TensorComputePrimitives.GetStoragePointer(_kvCacheK[layer]),
+                TensorComputePrimitives.GetStoragePointer(_kvCacheV[layer]),
                 Config.NumHeads, Config.NumKVHeads,
                 maxSeqLen, startPos,
                 Config.Eps, Config.RopeBase, 1.0f / Config.RopeScale,
-                Config.IntermediateSize, 2);
+                Config.IntermediateSize, 2,
+                _kvCacheDtype.GgmlType());
         }
 
         private class ModelDecodeArrays
@@ -574,8 +590,8 @@ namespace TensorSharp.Models
                 arr.FfnNorm[l] = (IntPtr)GetFloatPtr(_weights[wn[5]]);
                 arr.Gu[l] = _quantWeights[wn[6]].CacheKey;
                 arr.Down[l] = _quantWeights[wn[7]].CacheKey;
-                arr.KCache[l] = (IntPtr)GetFloatPtr(_kvCacheK[l]);
-                arr.VCache[l] = (IntPtr)GetFloatPtr(_kvCacheV[l]);
+                arr.KCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
+                arr.VCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]);
             }
 
             _modelDecodeArrays = arr;
@@ -636,7 +652,8 @@ namespace TensorSharp.Models
                 Config.HeadDim, Config.NumHeads, Config.NumKVHeads,
                 maxSeqLen, startPos,
                 Config.Eps, Config.RopeBase, 1.0f / Config.RopeScale,
-                Config.IntermediateSize, 2);
+                Config.IntermediateSize, 2,
+                _kvCacheDtype.GgmlType());
         }
 
         #endregion

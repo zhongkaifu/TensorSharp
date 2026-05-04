@@ -578,6 +578,10 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
         {
             std::lock_guard<std::mutex> entry_lk(entry->compute_mutex);
 
+            // Drain any pending async work so the CPU memcpys below don't race
+            // with in-flight GPU writes targeting q/k/v/z/etc. host buffers.
+            host_read_barrier();
+
             ggml_backend_tensor_set(entry->q_storage,    q_desc.data,     0, entry->q_bytes);
             ggml_backend_tensor_set(entry->k_storage,    k_desc.data,     0, entry->k_bytes);
             ggml_backend_tensor_set(entry->v_storage,    v_desc.data,     0, entry->v_bytes);

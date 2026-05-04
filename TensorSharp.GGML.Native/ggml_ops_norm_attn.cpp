@@ -210,9 +210,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -497,6 +495,11 @@ namespace {
                 return 0;
             }
 
+            // Multi-tensor download path (gradients). We drain any pending async work
+            // so the explicit downloads below run on a quiesced backend, and clear
+            // the pending flag because we're about to ggml_backend_tensor_get
+            // (which would force a sync anyway).
+            host_read_barrier();
             ggml_backend_synchronize(g_backend);
             if (!use_zero_copy)
             {
@@ -653,6 +656,9 @@ namespace {
             return 0;
         }
 
+        // Multi-tensor download path (gradients). Drain pending async work first
+        // so the explicit downloads below run on a quiesced backend.
+        host_read_barrier();
         ggml_backend_synchronize(g_backend);
         if (!use_zero_copy)
         {
@@ -839,8 +845,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute_with_download(result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1012,8 +1017,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute_with_download(result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1243,9 +1247,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1370,9 +1372,196 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
+
+        clear_last_error();
+        return 1;
+    }
+
+    // ----------------------------------------------------------------------
+    // attention_softmax_with_sinks_f32_impl
+    //
+    // Fused causal + sliding-window mask + softmax + attention sinks for
+    // GPT-OSS-style attention. Replaces three separate C# ops that used to
+    // shuttle the scores tensor between GPU and CPU:
+    //   - Ops.AddCausalMask(scores, ...)     (GPU)
+    //   - ApplySWAMask(scores, ...)          (CPU walk on device memory)
+    //   - ApplySoftmaxWithSinks(scores, ...) (CPU walk on device memory,
+    //     ~6 billion MathF.Exp calls per pp2048 forward pass)
+    //
+    // The CPU softmax-with-sinks is the dominant cost in GPT-OSS prefill
+    // (~76% of total time on pp2048), and forces a sync mid-attention because
+    // it reads device-resident scores via GetFloatPtr. Doing it on GPU lets the
+    // entire attention block stay async.
+    //
+    // Layout: scores is C# [numHeads, seqLen, kvLen] which maps to GGML
+    // [kvLen, seqLen, numHeads] (head_dim-fastest convention).
+    // sinks (optional) is a [numHeads] F32 array; null disables sinks.
+    // The causal mask blocks any kv index k > maskStartPos + q (autoregressive).
+    // The SWA mask additionally blocks any k < maskStartPos + q - slidingWindow + 1
+    // when slidingWindow > 0; pass slidingWindow <= 0 to disable.
+    int attention_softmax_with_sinks_f32_impl(
+        const TensorView3DDesc& scores_desc,   // [numHeads, seqLen, kvLen] - in-place
+        const float* sinks_data,                // [numHeads] or nullptr
+        int num_heads,
+        int seq_len,
+        int kv_len,
+        int mask_start_pos,
+        int sliding_window,
+        float scale)
+    {
+        if (!ensure_backend()) return 0;
+        if (!validate_desc(scores_desc, "scores")) return 0;
+
+        if (scores_desc.dim0 != num_heads ||
+            scores_desc.dim1 != seq_len ||
+            scores_desc.dim2 != kv_len)
+        {
+            set_last_error("scores tensor shape doesn't match (num_heads, seq_len, kv_len) in SoftmaxWithSinks.");
+            return 0;
+        }
+
+        if (num_heads <= 0 || seq_len <= 0 || kv_len <= 0)
+        {
+            set_last_error("Invalid (num_heads, seq_len, kv_len) for SoftmaxWithSinks.");
+            return 0;
+        }
+
+        if (!can_map_standard_view(scores_desc))
+        {
+            set_last_error("scores layout is not supported by the SoftmaxWithSinks Metal path.");
+            return 0;
+        }
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for SoftmaxWithSinks.");
+            return 0;
+        }
+        auto* ctx = context.value;
+
+        // Bind scores zero-copy (in-place).
+        bool use_zero_copy = true;
+        std::vector<BufferHandle> host_ptr_buffers;
+        TensorBinding scores_binding;
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            if (!create_binding_from_host_ptr_3d(ctx, g_backend, scores_desc, scores_binding, buf))
+                use_zero_copy = false;
+            else
+                host_ptr_buffers.emplace_back(buf);
+        }
         if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+            scores_binding = create_standard_binding(ctx, scores_desc);
+
+        if (scores_binding.tensor == nullptr || scores_binding.storage == nullptr)
+        {
+            set_last_error("Failed to allocate scores binding in SoftmaxWithSinks.");
+            return 0;
+        }
+
+        // Build the causal+SWA mask on host as F16 [kv_len, seq_len, 1, 1].
+        // ggml_soft_max_ext broadcasts the mask across the head dimension.
+        ggml_tensor* mask_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_len, seq_len, 1, 1);
+        if (mask_tensor == nullptr)
+        {
+            set_last_error("Failed to allocate mask tensor in SoftmaxWithSinks.");
+            return 0;
+        }
+
+        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kv_len) * seq_len);
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int q_idx = 0; q_idx < seq_len; q_idx++)
+            {
+                int q_pos = mask_start_pos + q_idx;
+                int win_start = (sliding_window > 0) ? std::max(0, q_pos - sliding_window + 1) : 0;
+                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(q_idx) * kv_len];
+                for (int kv_idx = 0; kv_idx < kv_len; kv_idx++)
+                    row[kv_idx] = (kv_idx > q_pos || kv_idx < win_start) ? neg_inf : zero_val;
+            }
+        }
+
+        // Optional sinks tensor [num_heads]. ggml_soft_max_add_sinks treats it as
+        // an extra column in the per-row softmax denominator.
+        ggml_tensor* sinks_tensor = nullptr;
+        if (sinks_data != nullptr)
+        {
+            sinks_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_heads);
+            if (sinks_tensor == nullptr)
+            {
+                set_last_error("Failed to allocate sinks tensor in SoftmaxWithSinks.");
+                return 0;
+            }
+        }
+
+        // Build the graph:
+        //   scores' = soft_max_ext(scores, mask, scale, max_bias=0)
+        //   if sinks: soft_max_add_sinks(scores', sinks)
+        //   cpy scores' back to caller's scores buffer.
+        //
+        // soft_max_ext requires a contiguous source tensor; we copy first because
+        // the host_ptr binding may be a view with non-trivial strides.
+        ggml_tensor* scores_input = ggml_cont(ctx, scores_binding.tensor);
+        ggml_tensor* sm = ggml_soft_max_ext(ctx, scores_input, mask_tensor, scale, 0.0f);
+        if (sm == nullptr)
+        {
+            set_last_error("Failed to create soft_max_ext node in SoftmaxWithSinks.");
+            return 0;
+        }
+        if (sinks_tensor != nullptr)
+            ggml_soft_max_add_sinks(sm, sinks_tensor);
+
+        ggml_tensor* output = ggml_cpy(ctx, sm, scores_binding.tensor);
+        if (output == nullptr)
+        {
+            set_last_error("Failed to create output cpy node in SoftmaxWithSinks.");
+            return 0;
+        }
+        ggml_set_output(output);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        if (graph == nullptr)
+        {
+            set_last_error("Failed to create graph in SoftmaxWithSinks.");
+            return 0;
+        }
+        ggml_build_forward_expand(graph, output);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer in SoftmaxWithSinks.");
+            return 0;
+        }
+
+        if (!use_zero_copy)
+            upload_binding(scores_binding, scores_desc.data, scores_binding.raw_bytes);
+
+        // Drain pending async work so the upcoming CPU memcpys are safe (mask is
+        // built fresh on the C++ stack so it doesn't race; sinks_data is a host
+        // array passed by the caller and might point to a tensor-allocated buffer
+        // that the previous async op wrote to).
+        host_read_barrier();
+
+        ggml_backend_tensor_set(mask_tensor, mask_data.data(), 0,
+            mask_data.size() * sizeof(ggml_fp16_t));
+        if (sinks_tensor != nullptr)
+            ggml_backend_tensor_set(sinks_tensor, sinks_data, 0,
+                static_cast<std::size_t>(num_heads) * sizeof(float));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("graph compute failed in SoftmaxWithSinks.");
+            return 0;
+        }
+
+        finalize_compute(use_zero_copy, scores_binding.storage, scores_desc.data,
+            scores_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1555,9 +1744,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1852,7 +2039,11 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
             return 0;
         }
 
-        // Upload input data
+        // Upload input data. q/k/v_data are C# tensor pointers that may have
+        // pending GPU writes from a previous async op (e.g. zero-copy QKV matmul);
+        // drain first so the CPU-side memcpy underneath ggml_backend_tensor_set
+        // doesn't race with in-flight writes.
+        host_read_barrier();
         ggml_backend_tensor_set(q_in, q_data, 0, qSize * sizeof(float));
         ggml_backend_tensor_set(k_in, k_data, 0, kvSize * sizeof(float));
         ggml_backend_tensor_set(v_in, v_data, 0, kvSize * sizeof(float));
@@ -1865,8 +2056,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        ggml_backend_tensor_get(attn_result, out_data, 0, qSize * sizeof(float));
+        finalize_compute_with_download(attn_result, out_data, qSize * sizeof(float));
 
         clear_last_error();
         return 1;
@@ -1924,6 +2114,38 @@ TSG_EXPORT int TSGgml_SoftmaxF32(
     catch (...)
     {
         set_last_error("Unknown ggml softmax failure.");
+        return 0;
+    }
+}
+
+// In-place softmax with causal+SWA mask and optional attention sinks.
+// See attention_softmax_with_sinks_f32_impl above for the full contract.
+// Replaces the GptOss CPU softmax-with-sinks loop, which was the dominant
+// prefill cost on that model.
+TSG_EXPORT int TSGgml_AttentionSoftmaxWithSinksF32(
+    TensorView3DDesc scores,
+    const float* sinks_data,
+    int num_heads,
+    int seq_len,
+    int kv_len,
+    int mask_start_pos,
+    int sliding_window,
+    float scale)
+{
+    try
+    {
+        return attention_softmax_with_sinks_f32_impl(
+            scores, sinks_data, num_heads, seq_len, kv_len,
+            mask_start_pos, sliding_window, scale);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml attention softmax with sinks failure.");
         return 0;
     }
 }

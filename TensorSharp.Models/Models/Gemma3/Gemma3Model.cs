@@ -112,13 +112,15 @@ namespace TensorSharp.Models
         private void InitKVCache(int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            ApplyModelAlignedKvCacheDefault(_quantWeights);
+            DType kvDtype = _kvCacheDtype.ToDType();
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
 
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, _attnKeyLen);
-                _kvCacheV[l] = new Tensor(_allocator, DType.Float32, Config.NumKVHeads, maxSeqLen, _attnValLen);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, maxSeqLen, _attnKeyLen);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, maxSeqLen, _attnValLen);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }

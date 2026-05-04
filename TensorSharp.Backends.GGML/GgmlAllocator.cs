@@ -31,9 +31,22 @@ namespace TensorSharp.GGML
 
         public Storage Allocate(DType elementType, long elementCount)
         {
-            if (elementType == DType.Float16)
+            // Float16 storage is permitted only for KV-cache use (the Tensor framework
+            // ops still operate on Float32; F16 K/V tensors are read/written via the
+            // hand-written conversion helpers in ModelBase + the native flash-attention
+            // kernels which understand F16 cache layouts directly).
+            //
+            // Q8_0 is even more restricted: only the native GGML kernels can read/write
+            // it (they understand the 32-element block layout). Direct element access
+            // from C# throws.
+            if (elementType != DType.Float32 &&
+                elementType != DType.Float16 &&
+                elementType != DType.Float64 &&
+                elementType != DType.Int32 &&
+                elementType != DType.UInt8 &&
+                elementType != DType.Q8_0)
             {
-                throw new NotSupportedException("GGML backends currently support Float32 tensors only. Disable AMP to use this backend.");
+                throw new NotSupportedException($"GGML backend does not support storage for {elementType}.");
             }
 
             return new GgmlStorage(this, context, elementType, elementCount);

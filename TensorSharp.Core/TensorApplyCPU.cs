@@ -453,6 +453,55 @@ namespace TensorSharp
                 return;
             }
 
+            // The generic Apply1 path treats every element as 4 bytes, so
+            // routing a Float16 (or block-quantized Q8_0) tensor through it
+            // walks past the storage buffer and surfaces as an
+            // AccessViolationException during KV-cache zero-init. Mirror the
+            // GGML backend's contiguous F16/Q8_0 fast paths so non-F32 caches
+            // can be filled safely on the managed CPU backend.
+            if (result.ElementType == DType.Float16 && IsContiguousNonNarrowed(result))
+            {
+                ushort halfBits = BitConverter.HalfToUInt16Bits((System.Half)value);
+                ushort* halfBuffer = (ushort*)CpuNativeHelpers.GetBufferStart(result);
+                long elementCount = result.ElementCount();
+                if (halfBits == 0)
+                {
+                    long offset = 0;
+                    while (offset < elementCount)
+                    {
+                        int slice = (int)Math.Min(elementCount - offset, int.MaxValue);
+                        new Span<ushort>(halfBuffer + offset, slice).Clear();
+                        offset += slice;
+                    }
+                }
+                else
+                {
+                    for (long i = 0; i < elementCount; i++)
+                        halfBuffer[i] = halfBits;
+                }
+                return;
+            }
+
+            if (result.ElementType == DType.Q8_0 && IsContiguousNonNarrowed(result))
+            {
+                if (value != 0f)
+                    throw new NotSupportedException("Fill on Q8_0 tensors only supports value=0 (cache reset).");
+                long byteLength = DTypeExtensions.Q8_0Bytes(result.ElementCount());
+                byte* byteBuffer = (byte*)CpuNativeHelpers.GetBufferStart(result);
+                long offset = 0;
+                while (offset < byteLength)
+                {
+                    int slice = (int)Math.Min(byteLength - offset, int.MaxValue);
+                    new Span<byte>(byteBuffer + offset, slice).Clear();
+                    offset += slice;
+                }
+                return;
+            }
+
+            if (result.ElementType != DType.Float32)
+                throw new NotSupportedException(
+                    $"Fill on {result.ElementType} tensors requires a contiguous, non-narrowed layout.");
+
 			unsafe void func(float* r)
 			{
 				*r = value;
@@ -460,6 +509,18 @@ namespace TensorSharp
 
 			Apply1(result, func);
 		}
+
+        private static bool IsContiguousNonNarrowed(Tensor t)
+        {
+            if (t.StorageOffset != 0) return false;
+            long expected = 1;
+            for (int d = t.DimensionCount - 1; d >= 0; d--)
+            {
+                if (t.Strides[d] != expected) return false;
+                expected *= t.Sizes[d];
+            }
+            return expected == t.ElementCount();
+        }
 
 
 		unsafe public static void Clamp(Tensor result, Tensor src, float min, float max)

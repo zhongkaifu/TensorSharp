@@ -466,6 +466,74 @@ internal enum GgmlIndexReductionOp
             GgmlTensorView4D result,
             GgmlTensorView4D src);
 
+        // In-place softmax with causal+SWA mask and optional attention sinks.
+        // Replaces the GptOss CPU softmax-with-sinks loop. See native side:
+        // attention_softmax_with_sinks_f32_impl in ggml_ops_norm_attn.cpp.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_AttentionSoftmaxWithSinksF32(
+            GgmlTensorView3D scores,
+            IntPtr sinksData,         // float* [num_heads], or IntPtr.Zero for no sinks
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStartPos,
+            int slidingWindow,
+            float scale);
+
+        // Fused MoE FFN prefill (mul_mat_id-based).
+        // Collapses an entire layer's MoE forward (gate + up + SwiGLU + down +
+        // expert weighting + aggregation) into one GGML graph dispatch.
+        // See native side: TSGgml_MoEFFNPrefillSwiGLUQuantF32 in ggml_ops_moe.cpp.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_MoEFFNPrefillSwiGLUQuantF32(
+            IntPtr hiddenIn,
+            IntPtr hiddenOut,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            IntPtr selectedExperts,    // int32* [seqLen, nUsed]
+            IntPtr routingWeights,     // float* [seqLen, nUsed]
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias,           // optional float* [biasDim, numExperts] (biasDim = nFf or 2*nFf for fused gate_up); IntPtr.Zero to skip
+            IntPtr upBias,             // optional, only valid when up_data != null
+            IntPtr downBias,           // optional float* [hiddenDim, numExperts]
+            int activationType,        // 0 = SwiGLU split, 1 = SwiGLU OAI (gpt-oss), 2 = GEGLU split (Gemma 4)
+            float oaiAlpha,
+            float oaiLimit);
+
+        // Gemma 4 MoE GEGLU + post_norm + residual add fused kernel.
+        // Computes residual_in_out += rms_norm(moe_ffn(hidden_in), eps) * post_norm_w
+        // in a single GGML graph dispatch. Mirrors the existing
+        // TSGgml_MoEFFNPrefillSwiGLUQuantF32 ABI but adds the residual buffer,
+        // the post_ffw_norm_2 weight, and an RMSNorm epsilon.
+        // See native side: TSGgml_Gemma4MoEGEGLUResidualF32 in ggml_ops_moe.cpp.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4MoEGEGLUResidualF32(
+            IntPtr hiddenIn,
+            IntPtr residualInOut,      // float* [seqLen, hiddenDim] - dense FFN result; kernel adds normed MoE output to it in place
+            IntPtr postNormW,          // float* [hiddenDim] - post_ffw_norm_2.weight
+            float postNormEps,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            IntPtr selectedExperts,
+            IntPtr routingWeights,
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias,
+            IntPtr upBias,
+            IntPtr downBias,
+            int activationType,
+            float oaiAlpha,
+            float oaiLimit);
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_ScaledDotProductAttentionF32(
             GgmlTensorView4D result,
@@ -530,7 +598,8 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode);
+            int intermediateSize, int ropeMode,
+            int kvCacheType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4LayerPrefill(
@@ -558,7 +627,8 @@ internal enum GgmlIndexReductionOp
             IntPtr plePostNormW,
             IntPtr freshKOut, IntPtr freshVOut,
             int isShared,
-            IntPtr donorK, IntPtr donorV, int donorKvLen);
+            IntPtr donorK, IntPtr donorV, int donorKvLen,
+            int kvCacheType);
 
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
@@ -585,7 +655,8 @@ internal enum GgmlIndexReductionOp
             IntPtr plePostNormW,
             IntPtr freshKOut, IntPtr freshVOut,
             int isShared,
-            IntPtr donorK, IntPtr donorV, int donorKvLen)
+            IntPtr donorK, IntPtr donorV, int donorKvLen,
+            int kvCacheType = 0)
         {
             CheckResult(TSGgml_Gemma4LayerPrefill(
                 hiddenData, hiddenSize, seqLen,
@@ -612,7 +683,8 @@ internal enum GgmlIndexReductionOp
                 plePostNormW,
                 freshKOut, freshVOut,
                 isShared,
-                donorK, donorV, donorKvLen), "gemma4_layer_prefill");
+                donorK, donorV, donorKvLen,
+                kvCacheType), "gemma4_layer_prefill");
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -630,7 +702,7 @@ internal enum GgmlIndexReductionOp
             IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
             int maxSeqLen, int position,
-            float scale);
+            float scale, int kvCacheType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Qwen35AttentionLayerDecode(
@@ -643,7 +715,117 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int ropeMode);
+            int ropeMode, int kvCacheType);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GptOssAttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvB,
+            int isQkvFused,
+            IntPtr kW, int kType, long kNe0, long kNe1, long kBytes,
+            IntPtr kB,
+            IntPtr vW, int vType, long vNe0, long vNe1, long vBytes,
+            IntPtr vB,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr oB,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isSwa, int slidingWindow,
+            IntPtr sinksData,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int originalContextLength,
+            int kvCacheType,
+            float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35AttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int ropeMode,
+            int kvCacheType,
+            float eps);
+
+        public static void Qwen35AttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int ropeMode,
+            int kvCacheType,
+            float eps)
+        {
+            CheckResult(TSGgml_Qwen35AttentionLayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qNormW, kNormW,
+                oW, oType, oNe0, oNe1, oBytes,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                ropeBase, ropeFreqScale, ropeDims,
+                ropeMode, kvCacheType, eps), "qwen35_attention_layer_prefill");
+        }
+
+        public static void GptOssAttentionLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int seqLen,
+            IntPtr attnNormW,
+            IntPtr qkvW, int qkvType, long qkvNe0, long qkvNe1, long qkvBytes,
+            IntPtr qkvB,
+            int isQkvFused,
+            IntPtr kW, int kType, long kNe0, long kNe1, long kBytes,
+            IntPtr kB,
+            IntPtr vW, int vType, long vNe0, long vNe1, long vBytes,
+            IntPtr vB,
+            IntPtr oW, int oType, long oNe0, long oNe1, long oBytes,
+            IntPtr oB,
+            IntPtr kCacheData, IntPtr vCacheData,
+            int numHeads, int kvHeads, int headDim,
+            int cacheSize, int startPos,
+            int isSwa, int slidingWindow,
+            IntPtr sinksData,
+            float ropeBase, float ropeFreqScale, int ropeDims,
+            int originalContextLength,
+            int kvCacheType,
+            float eps)
+        {
+            CheckResult(TSGgml_GptOssAttentionLayerPrefill(
+                hiddenData, hiddenSize, seqLen,
+                attnNormW,
+                qkvW, qkvType, qkvNe0, qkvNe1, qkvBytes,
+                qkvB,
+                isQkvFused,
+                kW, kType, kNe0, kNe1, kBytes,
+                kB,
+                vW, vType, vNe0, vNe1, vBytes,
+                vB,
+                oW, oType, oNe0, oNe1, oBytes,
+                oB,
+                kCacheData, vCacheData,
+                numHeads, kvHeads, headDim,
+                cacheSize, startPos,
+                isSwa, slidingWindow,
+                sinksData,
+                ropeBase, ropeFreqScale, ropeDims,
+                originalContextLength,
+                kvCacheType,
+                eps), "gpt_oss_attention_layer_prefill");
+        }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_TransformerModelDecode(
@@ -658,7 +840,8 @@ internal enum GgmlIndexReductionOp
             int headDim, int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode);
+            int intermediateSize, int ropeMode,
+            int kvCacheType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelDecode(
@@ -681,7 +864,8 @@ internal enum GgmlIndexReductionOp
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr);
+            IntPtr[] plePostNormArr,
+            int kvCacheType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
@@ -713,6 +897,20 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_SyncHostBuffer(IntPtr ptr, long byteCount);
+
+        // Async dispatch (deferred ggml_backend_synchronize). When enabled, per-op
+        // kernels return without waiting on the Metal command buffer; subsequent ops
+        // chain through the Metal command queue, and host-side reads must call
+        // TSGgml_HostReadBarrier first to drain pending GPU work. See
+        // GgmlStorage.EnsureHostReadable for the C# entry point that triggers this.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_SetAsyncCompute(int enabled);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GetAsyncCompute();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_HostReadBarrier();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes);
@@ -1100,6 +1298,98 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_SoftmaxF32(result, src), "softmax");
         }
 
+        /// <summary>
+        /// In-place softmax with causal+SWA mask and optional attention sinks.
+        /// scores layout is [numHeads, seqLen, kvLen]. sinksData may be IntPtr.Zero
+        /// when no sinks are needed; slidingWindow &lt;= 0 disables the SWA mask.
+        ///
+        /// Replaces three separate ops in the GptOss attention path: AddCausalMask
+        /// (GPU) + ApplySWAMask (CPU) + ApplySoftmaxWithSinks (CPU). The CPU
+        /// softmax-with-sinks loop dominated GptOss prefill (~76% of total time
+        /// on pp2048) because it walked ~6 billion elements through MathF.Exp on
+        /// a single thread; folding it into one Metal kernel collapses that.
+        /// </summary>
+        public static void AttentionSoftmaxWithSinks(
+            GgmlTensorView3D scores,
+            IntPtr sinksData,
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStartPos,
+            int slidingWindow,
+            float scale)
+        {
+            CheckResult(TSGgml_AttentionSoftmaxWithSinksF32(
+                scores, sinksData, numHeads, seqLen, kvLen,
+                maskStartPos, slidingWindow, scale),
+                "attention_softmax_with_sinks");
+        }
+
+        public static void MoEFFNPrefillSwiGLUQuant(
+            IntPtr hiddenIn,
+            IntPtr hiddenOut,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            IntPtr selectedExperts,
+            IntPtr routingWeights,
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias,
+            IntPtr upBias,
+            IntPtr downBias,
+            int activationType,
+            float oaiAlpha,
+            float oaiLimit)
+        {
+            CheckResult(TSGgml_MoEFFNPrefillSwiGLUQuantF32(
+                hiddenIn, hiddenOut, seqLen, hiddenDim, nFf,
+                numExperts, nUsed, selectedExperts, routingWeights,
+                gateData, gateType, gateNe0, gateNe1, gateTotalBytes,
+                upData,   upType,   upNe0,   upNe1,   upTotalBytes,
+                downData, downType, downNe0, downNe1, downTotalBytes,
+                gateBias, upBias, downBias,
+                activationType, oaiAlpha, oaiLimit),
+                "moe_ffn_prefill_swiglu_quant");
+        }
+
+        public static void Gemma4MoEGEGLUResidual(
+            IntPtr hiddenIn,
+            IntPtr residualInOut,
+            IntPtr postNormW,
+            float postNormEps,
+            int seqLen,
+            int hiddenDim,
+            int nFf,
+            int numExperts,
+            int nUsed,
+            IntPtr selectedExperts,
+            IntPtr routingWeights,
+            IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateTotalBytes,
+            IntPtr upData,   int upType,   long upNe0,   long upNe1,   long upTotalBytes,
+            IntPtr downData, int downType, long downNe0, long downNe1, long downTotalBytes,
+            IntPtr gateBias,
+            IntPtr upBias,
+            IntPtr downBias,
+            int activationType,
+            float oaiAlpha,
+            float oaiLimit)
+        {
+            CheckResult(TSGgml_Gemma4MoEGEGLUResidualF32(
+                hiddenIn, residualInOut, postNormW, postNormEps,
+                seqLen, hiddenDim, nFf,
+                numExperts, nUsed, selectedExperts, routingWeights,
+                gateData, gateType, gateNe0, gateNe1, gateTotalBytes,
+                upData,   upType,   upNe0,   upNe1,   upTotalBytes,
+                downData, downType, downNe0, downNe1, downTotalBytes,
+                gateBias, upBias, downBias,
+                activationType, oaiAlpha, oaiLimit),
+                "gemma4_moe_geglu_residual");
+        }
+
         public static void ScaledDotProductAttention(GgmlTensorView4D result, GgmlTensorView4D query, GgmlTensorView4D key, GgmlTensorView4D value, GgmlTensorView4D mask, bool hasMask, float scale)
         {
             CheckResult(TSGgml_ScaledDotProductAttentionF32(result, query, key, value, mask, hasMask ? 1 : 0, scale), "scaled_dot_product_attention");
@@ -1251,7 +1541,8 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode)
+            int intermediateSize, int ropeMode,
+            int kvCacheType = 0)
         {
             CheckResult(TSGgml_TransformerLayerDecode(
                 hiddenData, hiddenSize,
@@ -1266,7 +1557,7 @@ internal enum GgmlIndexReductionOp
                 numHeads, numKvHeads,
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode), "transformer_layer_decode");
+                intermediateSize, ropeMode, kvCacheType), "transformer_layer_decode");
         }
 
         /// <summary>
@@ -1295,14 +1586,14 @@ internal enum GgmlIndexReductionOp
             IntPtr outData,
             int numHeads, int numKvHeads, int headDim,
             int maxSeqLen, int position,
-            float scale)
+            float scale, int kvCacheType = 0)
         {
             CheckResult(TSGgml_FlashAttnDecodeF32(
                 qData, kData, vData,
                 kCacheData, vCacheData,
                 outData,
                 numHeads, numKvHeads, headDim,
-                maxSeqLen, position, scale), "flash_attn_decode");
+                maxSeqLen, position, scale, kvCacheType), "flash_attn_decode");
         }
 
         public static void Qwen35AttentionLayerDecode(
@@ -1315,7 +1606,7 @@ internal enum GgmlIndexReductionOp
             int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int ropeMode)
+            int ropeMode, int kvCacheType = 0)
         {
             CheckResult(TSGgml_Qwen35AttentionLayerDecode(
                 residualData, hiddenSize,
@@ -1326,7 +1617,7 @@ internal enum GgmlIndexReductionOp
                 kCacheData, vCacheData,
                 numHeads, numKvHeads,
                 maxSeqLen, position,
-                eps, ropeBase, ropeFreqScale, ropeMode), "qwen35_attention_layer_decode");
+                eps, ropeBase, ropeFreqScale, ropeMode, kvCacheType), "qwen35_attention_layer_decode");
         }
 
         public static void TransformerModelDecode(
@@ -1341,7 +1632,8 @@ internal enum GgmlIndexReductionOp
             int headDim, int numHeads, int numKvHeads,
             int maxSeqLen, int position,
             float eps, float ropeBase, float ropeFreqScale,
-            int intermediateSize, int ropeMode)
+            int intermediateSize, int ropeMode,
+            int kvCacheType = 0)
         {
             CheckResult(TSGgml_TransformerModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -1355,7 +1647,7 @@ internal enum GgmlIndexReductionOp
                 headDim, numHeads, numKvHeads,
                 maxSeqLen, position,
                 eps, ropeBase, ropeFreqScale,
-                intermediateSize, ropeMode), "transformer_model_decode");
+                intermediateSize, ropeMode, kvCacheType), "transformer_model_decode");
         }
 
         public static void Gemma4ModelDecode(
@@ -1378,7 +1670,8 @@ internal enum GgmlIndexReductionOp
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr)
+            IntPtr[] plePostNormArr,
+            int kvCacheType = 0)
         {
             CheckResult(TSGgml_Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -1400,7 +1693,7 @@ internal enum GgmlIndexReductionOp
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr), "gemma4_model_decode");
+                plePostNormArr, kvCacheType), "gemma4_model_decode");
         }
 
         public static void GatedDeltaNetChunked(
@@ -1457,6 +1750,41 @@ internal enum GgmlIndexReductionOp
                 return;
 
             CheckResult(TSGgml_SyncHostBuffer(ptr, byteCount), "sync_host_buffer");
+        }
+
+        /// <summary>
+        /// Enable lazy synchronization on the Metal backend. When on, per-op kernels
+        /// return immediately after committing their command buffer instead of
+        /// blocking on `[cmd_buf waitUntilCompleted]`. Subsequent ops chain through
+        /// the Metal command queue, and host-side reads (via
+        /// TensorComputePrimitives.GetFloatPointer / GetHalfPointer, which call
+        /// Storage.EnsureHostReadable) drain pending work on demand.
+        ///
+        /// This mirrors llama.cpp's Metal backend: ggml_metal_graph_compute commits
+        /// its command buffer and returns; only an explicit ggml_backend_synchronize
+        /// blocks. For TensorSharp's per-op driving model, lazy sync collapses the
+        /// per-op `[cmd_buf waitUntilCompleted]` round-trip overhead (~30-100 µs each
+        /// on M-series Macs) that dominates prefill on long prompts.
+        /// </summary>
+        public static void SetAsyncCompute(bool enabled)
+        {
+            TSGgml_SetAsyncCompute(enabled ? 1 : 0);
+        }
+
+        /// <summary>True if async compute is currently enabled on the GGML backend.</summary>
+        public static bool GetAsyncCompute()
+        {
+            return TSGgml_GetAsyncCompute() != 0;
+        }
+
+        /// <summary>
+        /// Drain any GPU work that was deferred under async compute. Cheap when no
+        /// work is pending (single atomic exchange on the C++ side); when work is
+        /// pending it does one ggml_backend_synchronize on the Metal command queue.
+        /// </summary>
+        public static void HostReadBarrier()
+        {
+            TSGgml_HostReadBarrier();
         }
 
         public static void PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)

@@ -1,0 +1,4 @@
+FROM /Users/ZhongkaiFu/work/model/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
+TEMPLATE {{ .Prompt }}
+PARAMETER temperature 0
+PARAMETER num_ctx 4096

@@ -1,0 +1,4 @@
+FROM /Users/ZhongkaiFu/work/model/gpt-oss-20b-F16.gguf
+TEMPLATE {{ .Prompt }}
+PARAMETER temperature 0
+PARAMETER num_ctx 4096

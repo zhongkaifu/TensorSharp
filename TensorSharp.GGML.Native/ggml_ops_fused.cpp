@@ -202,10 +202,7 @@ int fused_rms_norm_matmul_quant_f32_impl(
         set_last_error("Graph execution failed for fused rms_norm_matmul.");
         return 0;
     }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+    finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -364,10 +361,7 @@ int fused_matmul_quant_add_f32_impl(
         set_last_error("Graph execution failed for fused matmul_add.");
         return 0;
     }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(residual_binding.storage, residual_desc.data, 0, residual_binding.raw_bytes);
+    finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -646,10 +640,7 @@ int fused_ffn_swiglu_quant_f32_impl(
         set_last_error("fused_ffn_swiglu: graph execution failed.");
         return 0;
     }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(residual_binding.storage, residual_desc.data, 0, residual_binding.raw_bytes);
+    finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -827,10 +818,7 @@ int fused_vision_mlp_f32_impl(
         set_last_error("fused_vision_mlp: graph compute failed.");
         return 0;
     }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(hidden_binding.storage, hidden_desc.data, 0, hidden_binding.raw_bytes);
+    finalize_compute(use_zero_copy, hidden_binding.storage, hidden_desc.data, hidden_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -1033,10 +1021,7 @@ int fused_vision_attention_f32_impl(
 
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_vision_attn: compute failed."); return 0; }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(hidden_binding.storage, hidden_desc.data, 0, hidden_binding.raw_bytes);
+    finalize_compute(use_zero_copy, hidden_binding.storage, hidden_desc.data, hidden_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -1205,10 +1190,7 @@ int fused_outproj_ffn_quant_f32_impl(
 
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_outproj_ffn: compute failed."); return 0; }
-    ggml_backend_synchronize(g_backend);
-
-    if (!use_zero_copy)
-        ggml_backend_tensor_get(residual_binding.storage, residual_desc.data, 0, residual_binding.raw_bytes);
+    finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
 
     clear_last_error();
     return 1;
@@ -1358,6 +1340,8 @@ int fused_outproj_norm_router_quant_f32_impl(
 
     ggml_status status = ggml_backend_graph_compute(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_outproj_norm_router: compute failed."); return 0; }
+    // Multi-tensor download path. Drain any prior async work, then sync+download.
+    host_read_barrier();
     ggml_backend_synchronize(g_backend);
 
     if (!use_zero_copy) {
@@ -1733,9 +1717,7 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!zc)
-            ggml_backend_tensor_get(res_bind.storage, result.data, 0, res_bind.raw_bytes);
+        finalize_compute(zc, res_bind.storage, result.data, res_bind.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1920,9 +1902,7 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUForwardF32(
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!zc)
-            ggml_backend_tensor_get(res_bind.storage, result.data, 0, res_bind.raw_bytes);
+        finalize_compute(zc, res_bind.storage, result.data, res_bind.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -2164,9 +2144,7 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUResidualF32(
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!zc)
-            ggml_backend_tensor_get(res_bind.storage, residual.data, 0, res_bind.raw_bytes);
+        finalize_compute(zc, res_bind.storage, residual.data, res_bind.raw_bytes);
 
         clear_last_error();
         return 1;

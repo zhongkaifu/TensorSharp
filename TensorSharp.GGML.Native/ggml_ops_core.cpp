@@ -96,6 +96,11 @@ namespace tsg
     std::mutex g_preloaded_buffer_cache_mutex;
     std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
 
+    // Async dispatch state. The defaults keep the legacy (eager-sync) behaviour;
+    // C# enables async at backend init time via TSGgml_SetAsyncCompute(1).
+    std::atomic<bool> g_async_compute_enabled{false};
+    std::atomic<bool> g_pending_gpu_work{false};
+
     // --- Error helpers ---
 
     void set_last_error(const std::string& message)
@@ -834,6 +839,19 @@ namespace tsg
 
     void upload_binding(const TensorBinding& binding, const void* data, std::size_t size)
     {
+        // Async mode safety: ggml_backend_tensor_set on a shared (host-mapped)
+        // backend buffer is a CPU memcpy. If the source `data` is host memory that
+        // a previously-committed-but-not-yet-completed Metal command buffer is
+        // still writing to (e.g. the output of a prior zero-copy op), the memcpy
+        // races with the GPU write and reads partial data.
+        //
+        // Draining pending work here is conservative — it converts every upload
+        // into a sync point. Ops that bind their inputs zero-copy don't reach
+        // this path, so they still chain freely; only ops that actually copy
+        // host data into a backend buffer pay the sync. For prefill on Metal the
+        // common path (matmul / addmm_quant / elementwise ops) is zero-copy, so
+        // this is rarely hit in steady state.
+        host_read_barrier();
         ggml_backend_tensor_set(binding.storage, data, 0, size);
     }
 
@@ -1194,6 +1212,43 @@ TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
     }
     set_last_error("Failed to synchronize cached GGML device buffer back to host memory.");
     return 0;
+}
+
+// Toggle the lazy-sync code path on the per-op kernels. When enabled, ops that
+// wrote their result to host-mapped memory (zero-copy) on the Metal backend skip
+// the trailing ggml_backend_synchronize so the next op's command buffer can be
+// queued while the previous one is still running on the GPU.
+//
+// C# enables this once at backend init (see GgmlBasicOps.SetAsyncCompute) and
+// pairs it with a barrier in TensorComputePrimitives.GetFloatPointer so that
+// host-side reads always see fully-flushed data.
+TSG_EXPORT void TSGgml_SetAsyncCompute(int enabled)
+{
+    bool desired = enabled != 0;
+    bool previous = g_async_compute_enabled.exchange(desired, std::memory_order_acq_rel);
+
+    // When async is being turned off, drain any pending GPU work so subsequent
+    // host reads don't see stale data.
+    if (previous && !desired)
+    {
+        if (g_pending_gpu_work.exchange(false, std::memory_order_acq_rel) && g_backend != nullptr)
+        {
+            ggml_backend_synchronize(g_backend);
+        }
+    }
+}
+
+TSG_EXPORT int TSGgml_GetAsyncCompute()
+{
+    return g_async_compute_enabled.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+// Drain pending GPU work iff any was deferred. Returns 1 when it actually
+// blocked on the backend, 0 when there was nothing to do. Safe to call from
+// any thread; cheap when there's no pending work (single atomic exchange).
+TSG_EXPORT int TSGgml_HostReadBarrier()
+{
+    return host_read_barrier() ? 1 : 0;
 }
 
 TSG_EXPORT int TSGgml_PreloadQuantizedWeight(

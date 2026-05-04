@@ -85,6 +85,7 @@ add_library(GgmlOps SHARED
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
     ggml_ops_gated_delta_net.cpp
+    ggml_ops_moe.cpp
 )
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"

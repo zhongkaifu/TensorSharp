@@ -1,0 +1,386 @@
+# Gemma 4
+
+[← 返回模型索引](README_zh-cn.md) | [English](gemma4.md)
+
+| 属性 | 值 |
+|---|---|
+| 提供方 | Google |
+| GGUF 架构标识 | `gemma4` |
+| 模型类 | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs) |
+| 视觉编码器 | [`Gemma4VisionEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.cs)（SigLIP 风格 ViT） |
+| 音频编码器 | [`Gemma4AudioEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioEncoder.cs)（USM 风格 chunked transformer） |
+| 音频前端 | [`Gemma4AudioPreprocessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioPreprocessor.cs)（16 kHz 单声道 → 128 bin log-mel） |
+| 图像处理器 | [`Gemma4ImageProcessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4ImageProcessor.cs) |
+| 示例模型 | gemma-4-E4B（8B 等效）、gemma-4-31B、gemma-4-26B-A4B（MoE） |
+| 模态 | 文本、图像、视频（帧栈）、音频 |
+| 思维链模式 | 是（`<\|channel>thought ... <channel\|>`） |
+| 工具调用 | 是（`<\|tool_call>call:name{...}<tool_call\|>`） |
+| 输出解析器 | `Gemma4OutputParser` |
+
+## 1. 来源与目标
+
+Gemma 4 是 TensorSharp 当前支持的功能最丰富的架构。它把 Google Gemma 系扩展到：
+
+- **per-layer 异构性**：每一层可独立选择注意力模式（SWA / 全局）、head 维度、KV head 数，以及是否与某个早期「donor」层共享 KV。
+- **Per-Layer Embedding（PLE）**：从 `per_layer_token_embd.weight` 取出的小型 side embedding 在每个 block 内混入 residual stream。
+- **MoE 变体**（如 `gemma-4-26B-A4B`）：每个 block 同时跑一个密集 MLP 与一个稀疏 MoE 分支，分别经过各自的 post-norm 后求和。
+- **真正的多模态**：图像、视频帧栈与音频共用同一 residual stream。
+
+相对 Gemma 3，SWA mask 与 RoPE 表跨层缓存，SWA 缓存改为环形（内存与上下文长度无关），整套 transformer 在 decode 时可以一次 GGML 图调度完成。
+
+## 2. 模型架构
+
+```
+                              tokens (int[])
+                                   │
+                              token_embd.weight × sqrt(hidden)
+                                   │
+                       [可选]  InjectVisionEmbeddings (图像 / 视频帧)
+                       [可选]  InjectVisionEmbeddings (音频 embedding，同算子)
+                                   │
+                       [若 PLE] ComputePLE(tokens, hidden) ──► perLayerInputs
+                                   │
+              ┌────── × NumLayers ─────────────────────────────────────┐
+              │ HeadDim, KVHeads, SWA/全局模式 per layer              │
+              │  RMSNorm(attn_norm)                                    │
+              │  QKV (融合，或 KV 共享层只走 Q)                         │
+              │  per-head RMSNorm(Q,K) + 无权 RMSNorm(V)                │
+              │  RoPE (NeoX local 或 global+比例/部分)                  │
+              │  Attention（SWA 或全因果）                              │
+              │  attn_output ─► RMSNorm(post_attn_norm) + 残差          │
+              │                                                        │
+              │  if MoE 层:                                            │
+              │     RMSNorm(ffn_norm)  ─► GeGLU(密集 MLP) ─► PostNorm1  │
+              │     RMSNorm(pre_ffw_norm_2) ─► MoE(route+experts)       │
+              │                              ─► PostNorm2               │
+              │     残差 += PostNorm(PostNorm1 + PostNorm2)             │
+              │  else:                                                  │
+              │     RMSNorm(ffn_norm) ─► GeGLU ─► RMSNorm(post_ffw)     │
+              │     残差 += branch                                       │
+              │                                                         │
+              │  if PLE:                                                │
+              │     残差 += proj(GELU(inp_gate(hidden)) * pleInput)     │
+              │                                                         │
+              │  hidden *= layer_output_scale[layer]                    │
+              └─────────────────────────────────────────────────────────┘
+                                   │
+                              RMSNorm(output_norm)
+                                   │
+                              LM head (output.weight 或 tied)
+                                   │
+                              [可选] tanh-softcap
+                                   │
+                                   ▼
+                                logits
+```
+
+## 3. 前向计算图
+
+### 3.1 Per-layer（密集）
+
+```
+hidden ─► RMSNorm(attn_norm)
+       ─► QKV matmul（融合权重）─► 拆为 Q [seq, qDim], K [seq, kvDim], V [seq, kvDim]
+       ─► per-head RMSNorm(Q) * attn_q_norm.weight
+       ─► per-head RMSNorm(K) * attn_k_norm.weight
+       ─► 无权 RMSNorm(V)                              // V-norm: weight ≡ 1
+       ─► RoPE(Q, K, freqs[layer])
+            • local 层：标准 NeoX RoPE，全 headDim
+            • global 层：NeoX RoPE 仅旋转前 _partialRotaryDims 维，使用 rope_freqs.weight 中的比例频率因子
+       ─► Q ← Q * (1/sqrt(headDim))
+       ─► append (K, V) 到 per-layer cache（SWA 走环形）
+       ─► attention(Q, K_cache, V_cache,
+                    window = slidingWindow if SWA else totalSeq)
+       ─► attn_output matmul → o
+       ─► RMSNorm(post_attn_norm)
+       ─► residual = hidden + o
+       ─► h2 = RMSNorm(ffn_norm) on residual
+       ─► ffn_gate_up matmul → [gate ‖ up]
+       ─► g = GELU(gate)
+       ─► h3 = ffn_down × (g * up)
+       ─► RMSNorm(post_ffw_norm)
+       ─► residual += h3
+       ─► (PLE 分支 — 见 § 4.4)
+       ─► hidden = residual * layer_output_scale[layer]
+```
+
+### 3.2 Per-layer（MoE）
+
+```
+... 同上的 attention block ...
+
+# 密集 MLP 分支
+b1 = RMSNorm(ffn_norm) on residual
+b1 = GeGLU(b1) using ffn_gate_up.weight + ffn_down.weight
+b1 = RMSNorm(post_ffw_norm_1) on b1
+
+# MoE 分支
+b2 = RMSNorm(pre_ffw_norm_2) on residual
+logits = ffn_gate_inp.weight × b2
+logits = unweighted_RMSNorm(logits) * ffn_gate_inp.scale   # 学到的 scale
+weights, idx = topK(softmax(logits), _numExpertsUsed)
+b2 = weighted_sum_experts(SwiGLU on b2 using ffn_gate_up_exps[idx] +
+                          ffn_down_exps[idx])
+b2 = RMSNorm(post_ffw_norm_2) on b2
+
+# 合并
+combined = RMSNorm(post_ffw_norm)(b1 + b2)
+residual += combined
+```
+
+### 3.3 Decode vs prefill
+
+- **Decode**（`seqLen == 1`）在 GGML 后端、所有层均为密集且权重均量化时：单次原生调用（`Gemma4ModelDecode`）一次 GPU 图调度处理整套堆栈，包含 PLE、per-layer head 维、环形 SWA cache、per-layer scalar。
+- **Prefill**（`seqLen > 1`）：每个符合条件的密集层走融合 per-layer GGML 图（`Gemma4LayerPrefill`）。MoE / KV 共享 / 当前 chunk 中有 PLE 注入的层回退到逐算子托管路径。长 prompt 切成 `min(2 × slidingWindow, 2048)` 的块，控制 SWA 层 score 张量的大小。
+
+## 4. 组件细节
+
+### 4.1 per-layer 异构性
+
+- `_slidingWindowPattern[layer]` 来自 `gemma4.attention.sliding_window_pattern`。`IsLocalLayer(layer)` 返回该项。`true` ⇒ SWA，`false` ⇒ 全因果。
+- `_localHeadDim` 来自 `gemma4.attention.key_length_swa`（默认 256），`_globalHeadDim` 来自 `gemma4.attention.key_length`（默认 512）。`HeadDimForLayer(layer)` 选择具体值。
+- `_numGlobalKVHeads` 来自 `gemma4.attention.global_head_count_kv`。Local 层使用 `Config.NumKVHeads`。`KVHeadsForLayer(layer)` 解析 KV head 数。
+- `DetectHeadDimsFromWeights()` 在 GGUF 元数据与实际 attention 权重形状不一致时把 head dim 重新对齐。
+
+### 4.2 KV 共享
+
+最后 `_sharedKVLayers` 层（来自 `gemma4.attention.shared_kv_layers`）复用其他层的 KV cache。`BuildKVDonorMap()` 生成 `_kvDonorMap[layer] → donorLayer`；共享层只投影 Q，跳过 K/V matmul 与 cache 写入。共享 cache 实现：
+
+- `_kvCacheK[shared] = _kvCacheK[donor]`（别名）。
+- 分块 prefill 时，donor 当前 chunk 内刚算出的 K/V 会暂存到 `_prefillSWAKV`，让 KV 共享的 SWA 层 attend 到完整 chunk 的 K/V，而不是滚动 cache 中的不完整窗口。
+
+### 4.3 Per-Layer Embedding（PLE）
+
+当 `gemma4.embedding_length_per_layer_input > 0`：
+
+```
+perLayerEmbeddings = lookup(per_layer_token_embd.weight, tokens)
+perLayerEmbeddings = RMSNorm(per_layer_proj_norm.weight) on perLayerEmbeddings
+perLayerEmbeddings = perLayerEmbeddings × per_layer_model_proj.weight^T
+
+# 每层内：
+ple = GELU(inp_gate.weight × hidden) * extract_layer_slice(perLayerInputs, l)
+ple = proj.weight × ple
+ple = RMSNorm(post_norm.weight) on ple
+residual += ple
+```
+
+`ComputePLE()` 在每次 forward 中跑一次完整 PLE 流水线，输出 `[seqLen, NumLayers * pleDim]`，每层在内部 `Narrow` 自己那一片。
+
+### 4.4 RoPE 变体
+
+- **Local 层**：标准 NeoX RoPE，全 headDim，base `_ropeLocalBase`（来自 `gemma4.rope.freq_base_swa` 或 `gemma4.rope.local.freq_base`，默认 10000）。`ApplyNeoXRoPEDecode` / `ApplyNeoXRoPEPrefill` 实现，含向量化 cos/sin 表。
+- **Global 层**：partial NeoX RoPE 只作用在 headDim 的前 `_partialRotaryDims` 维（其余直通）。频率向量为标准 NeoX schedule × 来自 `rope_freqs.weight` 的 per-frequency 因子。完整 cos/sin 查表跨全局层缓存到 `_neoXRopeCos` / `_neoXRopeSin`，每个 chunk 节省 ~35M 次 `MathF.Cos`/`MathF.Sin`。
+
+### 4.5 V-norm
+
+V 投影后，`ApplyUnweightedRMSNorm()` 用全 1 权重张量（`_onesForVNorm`）对每个 value 向量做 RMSNorm。这是 TensorSharp 矩阵中 Gemma 4 独有的特性。
+
+### 4.6 MoE
+
+`HasMoE(layer)` 在 `blk.{L}.ffn_gate_inp.weight` 存在时为 true。MoE 分支：
+
+1. `RMSNorm(pre_ffw_norm_2)` on residual。
+2. router matmul → 无权 RMSNorm → 乘学到的 scale `ffn_gate_inp.scale`。
+3. softmax → TopK(`_numExpertsUsed`)。
+4. 每个被选中的专家：SwiGLU(`ffn_gate_up_exps.{e}.weight`, `ffn_down_exps.{e}.weight`) + 加权累加。
+5. `RMSNorm(post_ffw_norm_2)`。
+
+密集分支与 MoE 分支求和后再过 `post_ffw_norm`。
+
+### 4.7 per-layer 输出缩放
+
+`_layerScalars[layer]` 来自 `blk.{L}.layer_output_scale.weight`（标量 `[1]`）。每层在返回到下一层前把 hidden 输出乘以这个 scalar。
+
+### 4.8 Logit softcap
+
+与 Gemma 3 一致：当 `gemma4.final_logit_softcapping > 0` 时走 `tanh(logits / cap) * cap`。
+
+### 4.9 视觉管线（图像与视频帧）
+
+`Gemma4VisionEncoder` 是带 2D 位置 embedding、GELU-Tanh MLP 和最终线性投影的 SigLIP 风格 ViT。视频帧从 MP4 中提取（默认通过 OpenCV / SkiaSharp 抽取最多 8 帧、1 fps），每帧独立编码，最终的 embedding 串联起来按顺序注入到连续的 `<|image>` 占位上。
+
+### 4.10 音频管线
+
+`Gemma4AudioPreprocessor` 解码 WAV / MP3 / OGG，重采样到 16 kHz 单声道，输出 128-bin log-mel（10 ms hop），并 pad 到编码器的 chunk size（12 帧 × 12 chunks）。
+
+`Gemma4AudioEncoder` 是 chunked-attention USM 风格 transformer：
+
+- 时间维 conv 子采样。
+- per-chunk 因果 attention，past context 12 帧。
+- attention logits 上 `logit_cap = 50`（与 LM logit softcap 思想一致）。
+- residual 缩放因子 `0.5`。
+- 最终线性投影到 LM hidden。
+
+输出走与图像 embedding 相同的 `InjectVisionEmbeddings` 路径；从语言模型视角，audio 与 image token 是预计算 embedding 的可互换载体。
+
+## 5. 参数与配置（GGUF 元数据）
+
+| Key | 类型 | 含义 |
+|---|---|---|
+| `gemma4.attention.sliding_window_pattern` | bool[] | per-layer SWA 模式 |
+| `gemma4.attention.sliding_window` | uint32 | SWA 窗口大小（默认 512） |
+| `gemma4.attention.key_length` | uint32 | 全局 head dim（默认 512） |
+| `gemma4.attention.key_length_swa` | uint32 | local head dim（默认 256） |
+| `gemma4.attention.global_head_count_kv` | uint32 | 全局层 KV head 数 |
+| `gemma4.attention.head_count_kv` | int32[] | per-layer KV head 数 |
+| `gemma4.attention.shared_kv_layers` | uint32 | 末尾共享 KV 的层数 |
+| `gemma4.rope.dimension_count` | uint32 | partial rotary 维数 |
+| `gemma4.rope.partial_rotary_factor` | float32 | head dim 旋转比例 |
+| `gemma4.rope.freq_base_swa` | float32 | local RoPE base |
+| `gemma4.embedding_length_per_layer_input` | uint32 | PLE 维度（0 关闭） |
+| `gemma4.expert_count` | uint32 | MoE 专家数（0 ⇒ 密集） |
+| `gemma4.expert_used_count` | uint32 | TopK 路由专家数 |
+| `gemma4.final_logit_softcapping` | float32 | LM head softcap |
+
+## 6. 权重命名约定
+
+```
+token_embd.weight
+output_norm.weight
+output.weight                              # （可选，若 tied 到 token_embd）
+
+blk.{L}.attn_norm.weight
+blk.{L}.attn_qkv.weight                    # 融合 QKV（非共享层）
+blk.{L}.attn_q.weight                      # 仅 Q（KV 共享层）
+blk.{L}.attn_q_norm.weight
+blk.{L}.attn_k_norm.weight
+blk.{L}.attn_output.weight
+blk.{L}.post_attention_norm.weight         # 或 attn_post_norm.weight
+blk.{L}.ffn_norm.weight
+blk.{L}.ffn_gate_up.weight                 # 融合 gate+up
+blk.{L}.ffn_down.weight
+blk.{L}.post_ffw_norm.weight               # 或 ffn_post_norm.weight
+blk.{L}.layer_output_scale.weight          # 标量 [1]
+
+# 仅 MoE：
+blk.{L}.ffn_gate_inp.weight                # router
+blk.{L}.ffn_gate_inp.scale                 # 学到的 router scale
+blk.{L}.ffn_gate_up_exps.{E}.weight        # 融合的 expert gate+up
+blk.{L}.ffn_down_exps.{E}.weight           # expert down
+blk.{L}.pre_ffw_norm_2.weight              # MoE 输入 norm
+blk.{L}.post_ffw_norm_1.weight             # 密集 MLP post-norm
+blk.{L}.post_ffw_norm_2.weight             # MoE post-norm
+
+# 仅 PLE：
+per_layer_token_embd.weight
+per_layer_model_proj.weight
+per_layer_proj_norm.weight
+blk.{L}.inp_gate.weight                    # PLE gate
+blk.{L}.proj.weight                        # PLE 投影
+blk.{L}.post_norm.weight                   # PLE post-norm
+
+# 全局 RoPE：
+rope_freqs.weight                          # 比例频率因子
+```
+
+## 7. TensorSharp 实现走读
+
+构造函数（`Gemma4Model(string ggufPath, BackendType backend)`）：
+
+1. `ParseBaseConfig()`（通用字段）。
+2. 读取 SWA 模式与窗口、双 head dim、双 KV head 数、双 RoPE base、partial rotary 维、PLE 维、共享 KV 层数、MoE 计数。根据 SWA 模式设置 `Config.UsesCircularKvCache`。
+3. `BuildKVDonorMap()` —— 产生 `_kvDonorMap[layer] → donorLayer`。
+4. `ParseTokenizer()`、`LoadWeights()`。
+5. `_hasTiedOutput` 检测。
+6. `DetectHeadDimsFromWeights()` —— 元数据不一致时修复 head dim。
+7. `LoadLayerScalars()` —— 加载 `_layerScalars[NumLayers]`。
+8. `FuseQKVWeights()`、`FuseGateUpWeights()`、`FuseExpertGateUpWeights()`。
+9. `PrepareCudaQuantizedWeightsForInference()`。
+10. `PrecomputeRoPE()`。
+11. `InitKVCache(maxSeqLen)` —— SWA 层容量为 `slidingWindow`，全局层为 `maxSeqLen`；共享层 alias 到 donor。
+12. `BuildGemma4DecodeArrays()` —— 把 per-layer 指针、类型、维度，以及可选的 MoE / PLE 标志打包到 `_decodeArrays` 给融合 decode kernel 用。
+
+`Forward(int[] tokens)`：
+
+- embedding lookup + 缩放。
+- 可选的图像 / 音频注入（被注入的位置加入 `exceptPositions` 让层代码跳过这些位置上的 RoPE / cache 写入）。
+- 可选 PLE 计算。
+- 然后：
+  - **融合 decode**（一次原生调用，见 § 9），或
+  - 逐层 C# 循环，每个密集层尝试 `TryFusedLayerPrefill`。
+- 最终 RMSNorm、LM head、可选 softcap、复制到 `_logitsBuffer`。
+
+`ForwardRefill(int[] tokens)` 是 prefill-then-decode 入口：把前缀切成 `min(2 × slidingWindow, 2048)`-token 的块（`TS_PREFILL_CHUNK` 可覆盖），最后调 `Forward([lastToken])`。多模态 prompt 跳过分块（注入位置是绝对的）。
+
+## 8. Prefill 优化
+
+### 融合 per-layer prefill（`Gemma4LayerPrefill`）
+
+每个符合条件的层（密集、非共享 KV、当前 chunk 无 PLE 注入、所有权重均量化），`TryFusedLayerPrefill()` 调起单次 GGML 图：
+
+1. `RMSNorm(attn_norm)`
+2. 融合 QKV matmul → 拆 Q/K/V
+3. per-head QK RMSNorm、V 无权 RMSNorm
+4. RoPE（local NeoX 或 global proportional）
+5. 因果 attention（SWA 或全因果），含 KV cache append
+6. output 投影 + `RMSNorm(post_attn_norm)` + 残差
+7. `RMSNorm(ffn_norm)` → ffn_gate_up matmul → `GELU(gate)*up` → ffn_down matmul
+8. `RMSNorm(post_ffw_norm)` + 残差 + layer_output_scale
+
+带 MoE、KV 共享或当前 chunk 中有 PLE 注入的层回退到逐算子托管路径。`TS_FUSED_LAYER_PREFILL=0` 关闭融合路径（用于调试 / A/B 基准）。
+
+### 分块 prefill
+
+`prefillChunkSize = min(2048, max(2 × slidingWindow, 1024))`。每个块走完所有层后再前进，保持 SWA score 张量小。`TS_PREFILL_CHUNK=N` 可覆盖。
+
+### 跨层缓存
+
+forward 内跨层复用的三类缓存：
+
+- `_cachedSWAMaskWidths` —— 当前 `(queryLen, startPos)` 的 per-row SWA mask 宽度；`seqLen` 或 `startPos` 改变时重建。
+- `_neoXRopeCos` / `_neoXRopeSin` —— 全局层 NeoX RoPE cos/sin 表，每次 forward 构建一次，跨所有全局层复用。
+- `_cachedRoPEPosQ` / `_cachedRoPEPosK` —— local 层 RoPE 位置张量，跨层复用，`(seqLen, startPos)` 匹配时不重新分配。
+
+### SWA prev-window gather
+
+长 prompt 在 chunk 内会让 SWA cache 滚动覆盖。chunk-2 起始位置的 query 仍需要 chunk 刚刚覆盖掉的 (W − 1) 个位置。新 chunk 第一层运行前 `PrepareSwaPrevWindowsForChunk(startPos, seqLen)` 快照活跃的 SWA 窗口；SWA 层在跑 attention 前把快照拼到新计算出的 K/V 前面。
+
+### Donor SWA-K/V 发布
+
+存在 KV 共享 SWA 层时，donor 层把刚算出的 K/V 发布到 `_prefillSWAKV`，让共享层 attend 到完整 chunk 的 K/V，而不是滚动 cache 中的不完整窗口。
+
+## 9. Decode 优化
+
+### 融合整模型 decode（`Gemma4ModelDecode`）
+
+`_canUseFusedDecode`（全密集、全量化）且 `seqLen == 1` 时，decode 路径变成单次原生调用。`BuildGemma4DecodeArrays()` 在加载时按层打包：
+
+- 量化权重元数据（`type`、`ne0`、`ne1`、原始字节指针）。
+- per-layer head 维、KV head 数、RoPE base / kind。
+- KV cache 指针（GPU 上的可写 scratch）。
+- layer scalar 值。
+- PLE 标志 / projection 指针。
+
+`NativeGemma4ModelDecode()` 就跑整套 stack —— embedding lookup 在 C# 里，每一层（RMSNorm + QKV + QK-norm + V-norm + RoPE + 环形 cache append + attention + output projection + post-attn norm + GeGLU FFN + post-FFN norm + 残差 + layer scalar）在 Metal / CUDA 上一次 GGML 图调度完成。这把每 token 的几百次 CPU↔GPU 往返压成一次。
+
+`EnsureKvCacheHostSynchronized()` 桥接融合与非融合路径：当下一次 forward 不走融合（如对话中间的 prefill），先把 host KV cache 拷贝从设备同步过来。
+
+### SWA 层环形 KV cache
+
+SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，`AttentionDecodeCircular()` 走环形读。SWA 层因此无视上下文长度只分配 `slidingWindow` 个槽位 —— 常驻内存有界。
+
+## 10. 内存与 KV cache 策略
+
+- **SWA 层**：容量 `_slidingWindow`，环形读写。
+- **全局层**：容量 `maxSeqLen`，线性 append/读。
+- **共享层**：alias 到 donor 的 cache，无独立分配。
+- **量化权重绑定**：在 GGML CPU / Metal / CUDA 上零拷贝 mmap（GGUF 文件用 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`）。Direct CUDA 把量化数据上传到设备一次，释放 host 拷贝。
+
+## 11. 输出解析器与聊天模板
+
+`Gemma4OutputParser` 处理两种结构化包装：
+
+- **思维链** —— `<|channel>thought ... <channel|>` 的 chain-of-thought，再跟最终答案。
+- **工具调用** —— `<|tool_call>call:function_name{...args...}<tool_call|>` 块，由 `OutputParser` 解出结构化的 tool call。
+
+聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
+
+## 12. 优化机会
+
+- **Gemma 4 融合 MoE GPU kernel** —— MoE 层目前会让 `Gemma4ModelDecode` 与 `Gemma4LayerPrefill` 都不可用。仿照 Qwen 3.5 的 `MoEExpertsSwiGLUResidual` 实现一套批量 expert kernel 可以恢复融合 decode / prefill 图的加速。（下文的 expert-batched FFN 已经把未融合路径里的顺序 per-expert 派发去掉了。）
+- **GPU 上的音频 prefill** —— 音频编码器的 conv 子采样仍跑在 CPU。把 conv 栈搬到 Metal / CUDA 可以降低长音频提示的 TTFT。
+
+### 已完成
+
+- **Expert-batched FFN（GEGLU）** —— 过去 `MoEForward` 里即便按 expert 分批，decode 路径依然退化成 `num_experts_used` 次单行 matmul。现在整层都通过 `GgmlBasicOps.MoEFFNPrefill(..., MoEActivation.GEGLUSplit)` 一次派发完成：2~3 次 `ggml_mul_mat_id`（gate[+up] / down）加上融合的 `ggml_geglu_split` 激活与专家聚合，每个 MoE 层提交常数个 GGML 图 —— 与 `seq_len`、`num_experts_used` 无关。kernel 直接消费原始的 3D `ffn_gate_up_exps.weight` / `ffn_down_exps.weight`（Apple Silicon 上是 mmap 视图，Windows / Linux 上是共享 buffer，零拷贝）。`ffn_down_exps.scale` 这种 per-expert 因子在 C# 侧提前折进 routing weights，让原生 kernel 保持与激活函数解耦。层级 stacked view 不可用时（比如 F32-only 张量）会回退到原来的 batched-by-expert C# 路径。

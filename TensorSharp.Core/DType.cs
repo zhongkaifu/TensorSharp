@@ -19,6 +19,12 @@ namespace TensorSharp
         Float64 = 2,
         Int32 = 3,
         UInt8 = 4,
+        // Block-quantized 8-bit float (GGML Q8_0). 32 elements per block, 34 bytes
+        // per block (16-bit scale + 32 int8 values), giving ~1.0625 bytes/elem.
+        // Direct element-level access is unsupported - this type is intended for
+        // KV-cache storage where reads/writes go through the native GGML kernels
+        // (which understand the block layout natively).
+        Q8_0 = 5,
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -39,9 +45,33 @@ namespace TensorSharp
                 case DType.Float64: return 8;
                 case DType.Int32: return 4;
                 case DType.UInt8: return 1;
+                // Q8_0 has a fractional 1.0625 bytes/elem due to its block layout.
+                // We return 1 here for legacy callers that scale offsets - actual
+                // buffer allocation must use Q8_0Bytes() for block-aligned sizing.
+                case DType.Q8_0: return 1;
                 default:
                     throw new NotSupportedException("Element type " + value + " not supported.");
             }
+        }
+
+        /// <summary>
+        /// Total bytes for storing <paramref name="elementCount"/> Q8_0 elements,
+        /// rounded up to the 32-element block boundary (1 block = 34 bytes:
+        /// 2-byte F16 scale + 32 int8 quants).
+        /// </summary>
+        public static long Q8_0Bytes(long elementCount)
+        {
+            const int blockElems = 32;
+            const int blockBytes = 34;
+            long blocks = (elementCount + blockElems - 1) / blockElems;
+            return blocks * blockBytes;
+        }
+
+        public static long ByteLengthFor(this DType value, long elementCount)
+        {
+            if (value == DType.Q8_0)
+                return Q8_0Bytes(elementCount);
+            return elementCount * value.Size();
         }
 
         public static Type ToCLRType(this DType value)

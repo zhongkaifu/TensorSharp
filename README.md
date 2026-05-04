@@ -16,7 +16,8 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | [Supported model architectures](#supported-model-architectures) | Check which GGUF architecture keys, modalities, thinking mode, and tool calling paths are implemented |
 | [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, GGML CPU, GGML Metal, and GGML CUDA |
 | [HTTP APIs](#http-apis) | Use the Ollama-compatible, OpenAI-compatible, or Web UI SSE endpoints |
-| [Model architecture cards](docs/model_cards.md) | Work on model internals, optimizer paths, cache layout, or a new architecture |
+| [Per-model architecture cards](docs/models/README.md) | Read end-to-end documentation of one architecture (origin, forward graph, components, parameters, and how TensorSharp implements / optimizes prefill and decode) |
+| [Inference benchmark matrix](docs/inference_benchmark_matrix.md) | Compare TensorSharp against llama.cpp and Ollama across text / multimodal workloads, with KV-cache dtype sweeps |
 | [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Copy complete curl and Python examples for the server surface |
 | [Server integration tests](TensorSharp.Server/testdata/README.md) | Exercise the public API contract against a running server |
 
@@ -27,14 +28,14 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Model families | Gemma 3/4, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H, and Mistral 3 |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), GGML CPU, GGML Metal, GGML CUDA |
-| Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, and Mistral 3 image input |
+| Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes |
 
 ## Features
 
 - **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3
-- **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3
+- **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
@@ -56,17 +57,17 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 
 ## Supported Model Architectures
 
-| Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tool Calling |
-|---|---|---|---|---|---|
-| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes |
-| Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No |
-| Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes |
-| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes |
-| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes | No |
-| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE) | Text only | Yes | Yes |
-| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No |
+| Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tool Calling | Card |
+|---|---|---|---|---|---|---|
+| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | [gemma4.md](docs/models/gemma4.md) |
+| Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | [gemma3.md](docs/models/gemma3.md) |
+| Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | [qwen3.md](docs/models/qwen3.md) |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes | [qwen35.md](docs/models/qwen35.md) |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | No | [gptoss.md](docs/models/gptoss.md) |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | [nemotron.md](docs/models/nemotron.md) |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | [mistral3.md](docs/models/mistral3.md) |
 
-See [Model Architecture Cards](docs/model_cards.md) for detailed documentation of each architecture.
+See the [per-model architecture cards](docs/models/README.md) for end-to-end documentation of each architecture (origin, forward graph, components, parameters, weight naming, and how TensorSharp implements / optimizes prefill and decode).
 
 ## Model Downloads (GGUF)
 
@@ -136,7 +137,11 @@ TensorSharp/
 ├── TensorSharp.Cli/             # CLI application
 ├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, web/server helpers
 ├── AdvUtils/                    # Utility library
-├── docs/                        # Developer reference (model cards, EN + 中文)
+├── docs/                        # Developer reference
+│   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
+│   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
+├── benchmarks/                  # Reproducible benchmark harnesses
+│   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
 └── ExternalProjects/            # Third-party dependencies (ggml)
 ```
 
@@ -338,6 +343,7 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--kv-cache-dtype <type>` | KV cache precision: `f32` (default), `f16`, or `q8_0`. Quantized / half-precision KV caches reduce memory at the cost of small numerical drift; benchmarks live in [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
@@ -359,6 +365,11 @@ cd TensorSharp.Cli/bin
 | `--bench-runs <N>` | Number of benchmark runs; reports best and average (default: 1) |
 | `--bench-kvcache` | Run a multi-turn KV-cache reuse benchmark (with-cache vs forced-reset prefill) |
 | `--bench-kv-turns <N>` | Number of conversation turns for `--bench-kvcache` (default: 4, max: 8) |
+| `--bench-chunked` | Run a chunked-prefill micro-benchmark (Gemma 4) |
+| `--warmup-runs <N>` | Number of throw-away forward passes before timing real text / multimodal prompts (default: 0) |
+| `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
+| `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
+| `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
 | `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
 | `--log-level <lvl>` | Console + file logger level: `trace`, `debug`, `info`, `warning`, `error`, `critical`, `off` |
@@ -698,6 +709,13 @@ Mistral 3 supports image inputs via the Pixtral vision encoder. Place the multim
 
 - **Images:** PNG, JPEG, HEIC/HEIF
 
+### Nemotron-H (Omni distribution)
+
+The Nemotron Omni distribution adds a RADIO / v2_vl ViT image encoder. Pass the matching multimodal projector with `--mmproj` (e.g. `nvidia_Nemotron-H-Omni-mmproj.gguf`); the language-model GGUF stays the same. Image tokens are inserted at `<image>` placeholders and expanded into `<img>` + N tile tokens + `</img>` automatically by the multimodal injector.
+
+- **Images:** PNG, JPEG, HEIC/HEIF
+- **Audio:** the chat template emits `<so_embedding>` per uploaded audio file and the CLI runs the Parakeet-style log-mel preprocessor for verification, but actual audio inference requires a Parakeet audio mmproj that the public GGUFs do not currently ship.
+
 ## Architecture
 
 TensorSharp is structured as a layered system:
@@ -717,6 +735,11 @@ TensorSharp is structured as a layered system:
 7. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, and JSONL batch workflows.
 
 ### Performance Optimizations
+
+The list below is the cross-architecture summary; each per-model card under
+[`docs/models/`](docs/models/README.md) walks through the same kernels in
+context, with the exact GGML graph dispatched and the conditions under which
+the fused path engages.
 
 - **Fused GPU decode** (Gemma 4): all transformer layers are executed in a single GGML compute graph dispatch on Metal, reducing CPU-GPU round-trips from hundreds per token to one. This achieves ~2.6x speedup over per-operation dispatch.
 - **Fused GPU prefill** (Gemma 4): for dense (non-MoE, non-shared, non-PLE/multimodal) layers, `Gemma4LayerPrefill` runs the entire transformer block (RMSNorm + QKV + QK-norm + RoPE + attention + output projection + post-attn norm + GeGLU FFN + post-FFN norm + residual + layer scalar) as a single GGML graph dispatch per layer during prefill, extending the fused approach from decode to multi-token prefill.
@@ -749,6 +772,8 @@ TensorSharp is structured as a layered system:
 
 ## Benchmarks
 
+### Internal regression baseline
+
 Reference numbers measured on `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` (~10 GB on disk, 256 routed experts of which 8 are active per token, with 12 full attention + 30 GatedDeltaNet recurrent layers) on an Apple M4 Pro with 24 GB unified memory:
 
 | Metric | Before (`v1` baseline) | After (this branch) | Change |
@@ -766,6 +791,10 @@ Reproduce with:
 ```
 
 The memory reduction comes primarily from no longer copying the GGUF file into a separate native heap buffer (the file is now mmap-bound zero-copy into Metal command buffers). The decode throughput increase is largely a side effect of removing that ~10 GB duplicate working set, which was previously triggering OS-level memory pressure on machines with 24 GB or less of physical RAM.
+
+### Cross-engine inference matrix
+
+For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic prefill / image / audio / video tasks and KV-cache dtype sweeps for `f32`, `f16`, and `q8_0`), see [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). The driver scripts are in `benchmarks/inference_matrix/scripts/` and the per-cell raw JSON outputs live under `benchmarks/inference_matrix/results/`.
 
 ## Testing
 

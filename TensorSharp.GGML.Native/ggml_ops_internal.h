@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -216,6 +217,123 @@ namespace tsg
     constexpr int BACKEND_TYPE_METAL = 1;
     constexpr int BACKEND_TYPE_CPU = 2;
     constexpr int BACKEND_TYPE_CUDA = 3;
+
+    // --- Async dispatch state ---
+    //
+    // When async compute is enabled (TSGgml_SetAsyncCompute(1)) per-op kernels can
+    // skip the trailing ggml_backend_synchronize and ggml_backend_tensor_get *iff*
+    // they used a host-mapped (zero-copy) result binding on the Metal backend.
+    //
+    // Skipping the sync lets the next op submit its command buffer while the previous
+    // one is still running on the GPU. Metal serialises command buffers in queue
+    // order, so subsequent ops still observe correct data, and host code that needs
+    // to read the result must call ts_metal_host_read_barrier() (exposed to C# via
+    // TSGgml_HostReadBarrier and invoked automatically from
+    // TensorComputePrimitives.GetFloatPointer).
+    //
+    // This is the same pattern llama.cpp uses on Metal: ggml_metal_graph_compute
+    // returns immediately after committing its command buffer and only blocks on
+    // an explicit ggml_backend_synchronize call (see ggml-metal-context.m).
+
+    extern std::atomic<bool> g_async_compute_enabled;
+    extern std::atomic<bool> g_pending_gpu_work;
+
+    // True iff we're allowed to defer the sync after this op:
+    //   - async mode is on,
+    //   - the result was bound zero-copy (host memory directly mapped to a Metal
+    //     buffer, so the GPU writes are visible to the host once the command
+    //     buffer retires),
+    //   - the active backend is Metal (other backends are not exercised under
+    //     this lazy-sync model yet).
+    inline bool can_defer_sync(bool result_used_zero_copy)
+    {
+        if (!result_used_zero_copy) return false;
+        if (!g_async_compute_enabled.load(std::memory_order_acquire)) return false;
+        return g_backend_type == BACKEND_TYPE_METAL;
+    }
+
+    inline void mark_pending_gpu_work()
+    {
+        g_pending_gpu_work.store(true, std::memory_order_release);
+    }
+
+    // Standard end-of-op finalisation. Either records that the GPU still has work in
+    // flight (lazy-sync path) or syncs and copies the result back to the caller's
+    // buffer (eager path, used when the result is not host-mapped or when async
+    // mode is disabled).
+    inline void finalize_compute(
+        bool result_used_zero_copy,
+        ggml_tensor* result_storage,
+        void* result_data,
+        std::size_t result_bytes)
+    {
+        if (can_defer_sync(result_used_zero_copy))
+        {
+            mark_pending_gpu_work();
+            return;
+        }
+        ggml_backend_synchronize(g_backend);
+        if (!result_used_zero_copy &&
+            result_storage != nullptr &&
+            result_data != nullptr &&
+            result_bytes > 0)
+        {
+            ggml_backend_tensor_get(result_storage, result_data, 0, result_bytes);
+        }
+    }
+
+    // Same as finalize_compute() but for ops that already drained their own data
+    // back to the host inside the impl (e.g. a partial argmax download). They just
+    // need to remember to either sync or mark-pending depending on async mode.
+    inline void finalize_compute_no_download()
+    {
+        if (g_async_compute_enabled.load(std::memory_order_acquire) && g_backend_type == BACKEND_TYPE_METAL)
+        {
+            mark_pending_gpu_work();
+            return;
+        }
+        ggml_backend_synchronize(g_backend);
+    }
+
+    // Variant for ops whose result lives in a ggml-owned backend buffer (no
+    // zero-copy host binding) and therefore *must* be copied back to the caller's
+    // host buffer. In async mode we queue an async blit-download on the Metal
+    // command queue, which returns immediately; the next op (or an explicit host
+    // read barrier) will observe the data once the queued blit retires. In eager
+    // mode we sync and copy back synchronously.
+    inline void finalize_compute_with_download(
+        ggml_tensor* result_storage,
+        void* result_data,
+        std::size_t result_bytes)
+    {
+        if (g_async_compute_enabled.load(std::memory_order_acquire) && g_backend_type == BACKEND_TYPE_METAL)
+        {
+            if (result_storage != nullptr && result_data != nullptr && result_bytes > 0)
+            {
+                ggml_backend_tensor_get_async(g_backend, result_storage, result_data, 0, result_bytes);
+            }
+            mark_pending_gpu_work();
+            return;
+        }
+        ggml_backend_synchronize(g_backend);
+        if (result_storage != nullptr && result_data != nullptr && result_bytes > 0)
+        {
+            ggml_backend_tensor_get(result_storage, result_data, 0, result_bytes);
+        }
+    }
+
+    // Drains pending GPU work if any. Called from C# right before host code wants
+    // to read tensor data (via Storage.EnsureHostReadable). Returns true when a
+    // sync actually happened.
+    inline bool host_read_barrier()
+    {
+        if (g_pending_gpu_work.exchange(false, std::memory_order_acq_rel))
+        {
+            ggml_backend_synchronize(g_backend);
+            return true;
+        }
+        return false;
+    }
 
     // --- RAII handles ---
 

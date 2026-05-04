@@ -136,9 +136,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -259,6 +257,9 @@ namespace {
         }
 
         std::vector<std::int32_t> host_indices(static_cast<std::size_t>(rows));
+        // We're about to read indices on the host, so drain any prior async work
+        // before issuing the (still-blocking) tensor_get below.
+        host_read_barrier();
         ggml_backend_synchronize(g_backend);
         ggml_backend_tensor_get(arg_tensor, host_indices.data(), 0, host_indices.size() * sizeof(std::int32_t));
 
@@ -384,9 +385,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -515,9 +514,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -658,9 +655,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -785,9 +780,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -965,9 +958,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1137,9 +1128,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1372,9 +1361,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1527,9 +1514,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(result_binding.storage, result_desc.data, 0, result_binding.raw_bytes);
+        finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
         clear_last_error();
         return 1;
@@ -1711,9 +1696,7 @@ namespace {
             return 0;
         }
 
-        ggml_backend_synchronize(g_backend);
-        if (!use_zero_copy)
-            ggml_backend_tensor_get(grad_binding.storage, grad_desc.data, 0, grad_binding.raw_bytes);
+        finalize_compute(use_zero_copy, grad_binding.storage, grad_desc.data, grad_binding.raw_bytes);
 
         clear_last_error();
         return 1;

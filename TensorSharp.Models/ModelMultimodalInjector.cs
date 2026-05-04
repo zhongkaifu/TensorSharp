@@ -105,6 +105,9 @@ namespace TensorSharp.Models
                 case Mistral3Model m3:
                     m3.LoadVisionEncoder(mmProjPath);
                     break;
+                case NemotronModel nem:
+                    nem.LoadVisionEncoder(mmProjPath);
+                    break;
             }
         }
 
@@ -123,6 +126,8 @@ namespace TensorSharp.Models
                 return ProcessQwen35History(q35, history, inputTokens);
             if (_model is Mistral3Model m3)
                 return ProcessMistral3History(m3, history, inputTokens);
+            if (_model is NemotronModel nem)
+                return ProcessNemotronHistory(nem, history, inputTokens);
 
             return inputTokens;
         }
@@ -354,6 +359,106 @@ namespace TensorSharp.Models
             return inputTokens;
         }
 
+        private List<int> ProcessNemotronHistory(NemotronModel model, List<ChatMessage> history, List<int> inputTokens)
+        {
+            if (model.VisionEncoder == null)
+                return inputTokens;
+
+            int imageTokenId = _model.Tokenizer.LookupToken("<image>");
+            int imageStartId = _model.Tokenizer.LookupToken("<img>");
+            int imageEndId = _model.Tokenizer.LookupToken("</img>");
+            if (imageTokenId < 0) imageTokenId = 18;
+            if (imageStartId < 0) imageStartId = 19;
+            if (imageEndId < 0) imageEndId = 20;
+
+            // Audio tokens are emitted by the chat template per-message but we can only
+            // run the encoder if the mmproj actually shipped Parakeet weights. Detect
+            // upfront and skip silently otherwise (the CLI logs a warning).
+            int audioTokenId = _model.Tokenizer.LookupToken("<so_embedding>");
+            if (audioTokenId < 0) audioTokenId = 27;
+
+            int searchFrom = 0;
+            foreach (var message in history)
+            {
+                if (message.ImagePaths != null && message.ImagePaths.Count > 0)
+                {
+                    foreach (var imagePath in message.ImagePaths)
+                    {
+                        if (string.IsNullOrEmpty(imagePath))
+                            continue;
+
+                        CachedEmbedding cached = GetOrCreateNemotronVisionEmbedding(model, imagePath);
+                        int tokenPosition = FindTokenPosition(inputTokens, imageTokenId, searchFrom);
+                        if (tokenPosition < 0)
+                            continue;
+
+                        inputTokens = ExpandSingleTokenPlaceholder(
+                            inputTokens, tokenPosition, imageStartId, cached.TokenCount, imageEndId);
+
+                        // Insertion point is right after the start sentinel token.
+                        _preparedVisionEmbeddings.Add(new PreparedEmbeddingSpan(
+                            cached,
+                            tokenPosition + 1,
+                            tokenPosition,
+                            tokenPosition + cached.TokenCount + 2));
+
+                        searchFrom = tokenPosition + cached.TokenCount + 2;
+                    }
+                }
+
+                // Audio path: the chat template emits a `<so_embedding>` per uploaded
+                // audio file so the model "sees" the modality, but real inference is
+                // gated on a Parakeet audio mmproj that this distribution does not ship.
+                // The test data still gets preprocessed in the CLI for verification.
+            }
+
+            return inputTokens;
+        }
+
+        private CachedEmbedding GetOrCreateNemotronVisionEmbedding(NemotronModel model, string imagePath)
+        {
+            return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
+            {
+                var processor = model.ImageProcessor;
+                var tiles = processor.ProcessImage(fullPath);
+                if (tiles.Count == 0)
+                    throw new InvalidOperationException($"Image '{fullPath}' produced zero vision tiles.");
+
+                // Encode each tile and concatenate into a single [totalTokens, hidden] tensor
+                // so a single PreparedEmbeddingSpan covers the whole image.
+                var tileEmbeddings = new Tensor[tiles.Count];
+                int totalTokens = 0;
+                int hidden = 0;
+                try
+                {
+                    for (int i = 0; i < tiles.Count; i++)
+                    {
+                        var tile = tiles[i];
+                        tileEmbeddings[i] = model.VisionEncoder.Encode(tile.Pixels, tile.Width, tile.Height);
+                        totalTokens += (int)tileEmbeddings[i].Sizes[0];
+                        if (i == 0)
+                            hidden = (int)tileEmbeddings[i].Sizes[1];
+                    }
+
+                    var concatenated = new Tensor(tileEmbeddings[0].Allocator, DType.Float32, totalTokens, hidden);
+                    int offset = 0;
+                    for (int i = 0; i < tileEmbeddings.Length; i++)
+                    {
+                        int rows = (int)tileEmbeddings[i].Sizes[0];
+                        using var slice = concatenated.Narrow(0, offset, rows);
+                        Ops.Copy(slice, tileEmbeddings[i]);
+                        offset += rows;
+                    }
+
+                    return CreateCachedEmbedding(fullPath, concatenated);
+                }
+                finally
+                {
+                    foreach (var t in tileEmbeddings) t?.Dispose();
+                }
+            });
+        }
+
         private CachedEmbedding GetOrCreateGemma4VisionEmbedding(
             Gemma4Model model,
             Gemma4ImageProcessor processor,
@@ -504,6 +609,16 @@ namespace TensorSharp.Models
                             continue;
 
                         m3.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
+                        queued = true;
+                    }
+                    break;
+                case NemotronModel nem:
+                    foreach (var span in _preparedVisionEmbeddings)
+                    {
+                        if (span.EndPosition <= reusablePrefixTokenCount)
+                            continue;
+
+                        nem.SetVisionEmbeddings(CloneTensor(span.CacheEntry.Embeddings), span.InsertPosition - reusablePrefixTokenCount);
                         queued = true;
                     }
                     break;

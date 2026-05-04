@@ -31,6 +31,7 @@
 // (`CacheRecurrentLayerWeights`) called from the existing weight-cache loop.
 // ============================================================================
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Numerics;
@@ -67,6 +68,30 @@ namespace TensorSharp.Models
         private static readonly bool GdnChunkedPrefillDisabledEnv =
             string.Equals(Environment.GetEnvironmentVariable("GDN_DISABLE_CHUNKED_PREFILL"), "1",
                 StringComparison.Ordinal);
+
+        // GDN_VERIFY_CHUNKED=1 enables an inline correctness check that runs
+        // BOTH the chunked path and the per-token path on identical starting
+        // state and compares the resulting gated outputs and recurrent state
+        // tensor element-by-element. Tracking the maximum absolute / relative
+        // diff per call lets us catch regressions in the fused GGML kernel
+        // without a separate unit-test harness; the per-token path is treated
+        // as the ground truth and used downstream so a divergent chunked path
+        // never poisons subsequent layers. This roughly doubles the GDN time
+        // for a forward pass and is intended for CI / debugging only.
+        private static readonly bool GdnVerifyChunkedEnv =
+            string.Equals(Environment.GetEnvironmentVariable("GDN_VERIFY_CHUNKED"), "1",
+                StringComparison.Ordinal);
+
+        // Tolerance above which the verification mode logs a warning. A few
+        // ULPs of drift are normal because the chunked GGML path executes the
+        // recurrence in F32 on the GPU vs. scalar F32 on the CPU and the order
+        // of FP additions inside the per-chunk triangular solve is different.
+        // Empirically we observe |Δ| ~1e-3 over T=256 tokens of accumulation
+        // for Qwen3.6 on Metal; we set the warn threshold a few times above
+        // that so a real divergence (e.g. an off-by-one chunk index) rings
+        // loudly while normal FP noise is just summarised in the stats line.
+        private const float GdnVerifyAbsDiffWarn = 5e-3f;
+        private const float GdnVerifyRelDiffWarn = 5e-2f;
 
         // ====================================================================
         // Per-layer cached key strings for recurrent weights
@@ -185,6 +210,17 @@ namespace TensorSharp.Models
         private int _gdnChunkedCalls;        // Number of times the chunked path has been used
         private long _gdnChunkedCpuPrepTicks; // Time spent in CPU prep (Conv1D + memcpy + SiLU)
         private long _gdnChunkedKernelTicks; // Time spent in the GGML kernel call (incl. sync + download)
+
+        // Verification telemetry (only populated when GDN_VERIFY_CHUNKED=1).
+        // Captures the worst-case absolute and relative divergence we observed
+        // between the chunked and per-token paths over all verified calls so
+        // PrintGdnTimingStats can surface a single summary line.
+        private int _gdnVerifyCalls;
+        private float _gdnVerifyMaxOutAbs;
+        private float _gdnVerifyMaxOutRel;
+        private float _gdnVerifyMaxStateAbs;
+        private float _gdnVerifyMaxStateRel;
+        private int _gdnVerifyWarnings;
 
         // Reusable staging buffers for the chunked prefill path. These are sized for the
         // largest seqLen we have seen so far; subsequent calls reuse the same memory and
@@ -437,6 +473,14 @@ namespace TensorSharp.Models
                 Console.WriteLine($"    (chunked path disabled at runtime)");
             else
                 Console.WriteLine($"    (chunked threshold: seqLen >= {_gdnChunkPrefillThreshold}, chunkSize {GdnChunkSize})");
+
+            if (_gdnVerifyCalls > 0)
+            {
+                Console.WriteLine($"    verification: {_gdnVerifyCalls} calls, " +
+                    $"max output |Δ|={_gdnVerifyMaxOutAbs:E2} (rel {_gdnVerifyMaxOutRel:E2}), " +
+                    $"max state |Δ|={_gdnVerifyMaxStateAbs:E2} (rel {_gdnVerifyMaxStateRel:E2}), " +
+                    $"warnings={_gdnVerifyWarnings}");
+            }
         }
 
         /// <summary>
@@ -451,6 +495,12 @@ namespace TensorSharp.Models
             _gdnChunkedCpuPrepTicks = 0;
             _gdnChunkedKernelTicks = 0;
             _gdnPerTokenCalls = 0;
+            _gdnVerifyCalls = 0;
+            _gdnVerifyMaxOutAbs = 0f;
+            _gdnVerifyMaxOutRel = 0f;
+            _gdnVerifyMaxStateAbs = 0f;
+            _gdnVerifyMaxStateRel = 0f;
+            _gdnVerifyWarnings = 0;
         }
 
         // ====================================================================
@@ -737,7 +787,20 @@ namespace TensorSharp.Models
                 && _ssmAW[layer] != null
                 && _ssmNormW[layer] != null;
 
-            if (useChunked)
+            if (useChunked && GdnVerifyChunkedEnv && seqLen > 1)
+            {
+                // Verification mode: run the chunked path on a snapshot of the
+                // recurrent state, then restore the state, run the per-token
+                // path on the SAME starting state, and compare. Use the
+                // per-token path's output as the canonical forward result so
+                // that any regression in the chunked kernel is bounded to the
+                // verify counters and never leaks into downstream layers.
+                VerifyAndRunPerTokenAfterChunked(
+                    packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                    layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                    convWT, dtBiasPtr, aPtr, ssmNormPtr, gated, gatedBase);
+            }
+            else if (useChunked)
             {
                 long tChunk = Stopwatch.GetTimestamp();
                 bool chunkedOk = false;
@@ -830,6 +893,156 @@ namespace TensorSharp.Models
             if (profilePrefill) _prefillRecOutputTicks += Stopwatch.GetTimestamp() - stageStart;
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             return fusedAdd ? null : output;
+        }
+
+        /// <summary>
+        /// Verification harness for the chunked GatedDeltaNet prefill path. Snapshots
+        /// the recurrent state, runs the chunked kernel, then restores the snapshot,
+        /// runs the per-token loop on the same starting state, and compares the two
+        /// gated outputs and resulting recurrent states. The per-token result is left
+        /// in <paramref name="gated"/> so the rest of the forward pass uses the
+        /// well-tested code path even if the chunked kernel diverges.
+        ///
+        /// Enabled via <c>GDN_VERIFY_CHUNKED=1</c>; intended for CI / debugging.
+        /// </summary>
+        private unsafe void VerifyAndRunPerTokenAfterChunked(
+            float* packedPtr, float* qkvBase, float* zBase, float* betaBase, float* alphaBase,
+            int layer, int seqLen, int qkvDim, int qkDim, int vDim, int zDim, int packedDim,
+            float[] convWT, float* dtBiasPtr, float* aPtr, float* ssmNormPtr,
+            Tensor gated, float* gatedBase)
+        {
+            int convStateLen = _convState[layer].Length;
+            float[] convStateSnap = ArrayPool<float>.Shared.Rent(convStateLen);
+            Array.Copy(_convState[layer], convStateSnap, convStateLen);
+            int convWriteIdxSnap = _convStateWriteIdx[layer];
+
+            Tensor deltaState = _deltaStateTensor[layer];
+            int deltaStateLen = (int)deltaState.ElementCount();
+            float[] deltaStateSnap = ArrayPool<float>.Shared.Rent(deltaStateLen);
+            float* deltaStatePtr = GetFloatPtr(deltaState);
+            fixed (float* dst = deltaStateSnap)
+            {
+                long bytes = (long)deltaStateLen * sizeof(float);
+                Buffer.MemoryCopy(deltaStatePtr, dst, bytes, bytes);
+            }
+
+            // Run the chunked path. On failure we fall through to the per-token path
+            // below which is exactly the production fallback behaviour.
+            bool chunkedOk = false;
+            long tChunk = Stopwatch.GetTimestamp();
+            try
+            {
+                GatedDeltaNetChunkedPrefill(
+                    packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                    layer, seqLen, qkvDim, qkDim, zDim, packedDim, gated);
+                chunkedOk = true;
+            }
+            catch (Exception ex)
+            {
+                _gdnDisableChunkedPrefill = true;
+                Console.WriteLine($"[Qwen35][verify] GatedDeltaNetChunked failed (layer {layer}, seqLen {seqLen}): {ex.Message}");
+            }
+            if (chunkedOk)
+            {
+                _gdnChunkedTicks += Stopwatch.GetTimestamp() - tChunk;
+                _gdnChunkedCalls++;
+            }
+
+            int gatedLen = seqLen * _ssmDInner;
+            float[] chunkedGated = ArrayPool<float>.Shared.Rent(gatedLen);
+            float[] chunkedDelta = ArrayPool<float>.Shared.Rent(deltaStateLen);
+            if (chunkedOk)
+            {
+                fixed (float* dst = chunkedGated)
+                {
+                    long bytes = (long)gatedLen * sizeof(float);
+                    Buffer.MemoryCopy(gatedBase, dst, bytes, bytes);
+                }
+                fixed (float* dst = chunkedDelta)
+                {
+                    long bytes = (long)deltaStateLen * sizeof(float);
+                    Buffer.MemoryCopy(deltaStatePtr, dst, bytes, bytes);
+                }
+            }
+
+            // Restore conv state and delta state to the pre-chunked snapshot so the
+            // per-token loop sees the same starting conditions.
+            Array.Copy(convStateSnap, _convState[layer], convStateLen);
+            _convStateWriteIdx[layer] = convWriteIdxSnap;
+            fixed (float* src = deltaStateSnap)
+            {
+                long bytes = (long)deltaStateLen * sizeof(float);
+                Buffer.MemoryCopy(src, deltaStatePtr, bytes, bytes);
+            }
+            InvalidateTensorDeviceCache(deltaState);
+
+            // Per-token reference run.
+            long tLoop = Stopwatch.GetTimestamp();
+            RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
+            _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tLoop;
+            _gdnPerTokenCalls++;
+
+            if (chunkedOk)
+            {
+                ComputeAbsRelDiff(chunkedGated, gatedBase, gatedLen,
+                    out float outAbs, out float outRel);
+                ComputeAbsRelDiff(chunkedDelta, deltaStatePtr, deltaStateLen,
+                    out float stateAbs, out float stateRel);
+
+                _gdnVerifyCalls++;
+                if (outAbs > _gdnVerifyMaxOutAbs) _gdnVerifyMaxOutAbs = outAbs;
+                if (outRel > _gdnVerifyMaxOutRel) _gdnVerifyMaxOutRel = outRel;
+                if (stateAbs > _gdnVerifyMaxStateAbs) _gdnVerifyMaxStateAbs = stateAbs;
+                if (stateRel > _gdnVerifyMaxStateRel) _gdnVerifyMaxStateRel = stateRel;
+
+                if (outAbs > GdnVerifyAbsDiffWarn && outRel > GdnVerifyRelDiffWarn)
+                {
+                    _gdnVerifyWarnings++;
+                    if (_gdnVerifyWarnings <= 4)
+                    {
+                        Console.WriteLine($"[Qwen35][verify] layer {layer} seqLen={seqLen} " +
+                            $"output |Δ|max={outAbs:E2} rel={outRel:E2} " +
+                            $"state |Δ|max={stateAbs:E2} rel={stateRel:E2}");
+                    }
+                }
+            }
+
+            ArrayPool<float>.Shared.Return(convStateSnap);
+            ArrayPool<float>.Shared.Return(deltaStateSnap);
+            ArrayPool<float>.Shared.Return(chunkedGated);
+            ArrayPool<float>.Shared.Return(chunkedDelta);
+        }
+
+        /// <summary>
+        /// Compute the maximum absolute and relative element-wise difference between
+        /// a managed reference array <paramref name="reference"/> (sized
+        /// <paramref name="length"/>) and a native pointer <paramref name="actual"/>.
+        /// Returns 0/0 when the reference is identically zero so the metric stays
+        /// well-defined for a freshly reset state tensor.
+        /// </summary>
+        private static unsafe void ComputeAbsRelDiff(
+            float[] reference, float* actual, int length,
+            out float maxAbs, out float maxRel)
+        {
+            float absMax = 0f;
+            float relMax = 0f;
+            for (int i = 0; i < length; i++)
+            {
+                float r = reference[i];
+                float a = actual[i];
+                float d = MathF.Abs(r - a);
+                if (d > absMax) absMax = d;
+                float denom = MathF.Max(MathF.Abs(r), MathF.Abs(a));
+                if (denom > 1e-6f)
+                {
+                    float rel = d / denom;
+                    if (rel > relMax) relMax = rel;
+                }
+            }
+            maxAbs = absMax;
+            maxRel = relMax;
         }
 
         /// <summary>
