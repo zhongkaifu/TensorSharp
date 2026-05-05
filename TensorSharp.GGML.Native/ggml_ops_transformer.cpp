@@ -136,6 +136,19 @@ namespace
         if (tail == nullptr || head == nullptr)
             return nullptr;
 
+        // GPU concat kernels only implement F32 inputs. Wrapped circular windows may
+        // come from F16/Q8_0 KV caches, so materialize both slices as F32 first.
+        if (static_cast<ggml_type>(kv_cache_type) != GGML_TYPE_F32)
+        {
+            ggml_tensor* tail_f32 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, tail_length, kv_heads);
+            ggml_tensor* head_f32 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, head_length, kv_heads);
+            if (tail_f32 == nullptr || head_f32 == nullptr)
+                return nullptr;
+
+            tail = ggml_cpy(ctx, tail, tail_f32);
+            head = ggml_cpy(ctx, head, head_f32);
+        }
+
         return ggml_concat(ctx, tail, head, 1);
     }
 
