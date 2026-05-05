@@ -591,6 +591,61 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaGqaPrefillAttention_ReadsFloat16KvCache()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int seqLen = 3;
+        const int kvLen = 5;
+        const int headDim = 5;
+        const int maskStart = kvLen - seqLen;
+        const int windowSize = 3;
+
+        float[,,] q = new float[numQHeads, seqLen, headDim];
+        float[,,] k = new float[numKVHeads, kvLen, headDim];
+        float[,,] v = new float[numKVHeads, kvLen, headDim];
+
+        for (int h = 0; h < numQHeads; h++)
+            for (int t = 0; t < seqLen; t++)
+                for (int d = 0; d < headDim; d++)
+                    q[h, t, d] = MathF.Sin((h + 1) * (t + 2) * (d + 3) * 0.037f);
+
+        for (int h = 0; h < numKVHeads; h++)
+        {
+            for (int t = 0; t < kvLen; t++)
+            {
+                for (int d = 0; d < headDim; d++)
+                {
+                    k[h, t, d] = MathF.Cos((h + 2) * (t + 1) * (d + 1) * 0.041f);
+                    v[h, t, d] = MathF.Sin((h + 3) * (t + 2) * (d + 1) * 0.029f) * 0.5f;
+                }
+            }
+        }
+
+        using var allocator = new CudaAllocator();
+        using var qTensor = Tensor.FromArray(allocator, q);
+        using var kF32 = Tensor.FromArray(allocator, k);
+        using var vF32 = Tensor.FromArray(allocator, v);
+        using var kF16 = new Tensor(allocator, DType.Float16, numKVHeads, kvLen, headDim);
+        using var vF16 = new Tensor(allocator, DType.Float16, numKVHeads, kvLen, headDim);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kF16, kF32, 0, kvLen, kvLen, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vF16, vF32, 0, kvLen, kvLen, circular: false));
+
+        using var actualTensor = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaPrefillAttention(
+            actualTensor, qTensor, kF16, vF16,
+            numQHeads, numKVHeads, headDim,
+            seqLen, kvLen,
+            maskStart, windowSize, 1.0f));
+
+        float[] expected = GqaPrefillAttentionReference(q, k, v, numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize);
+        AssertClose(expected, actualTensor.GetElementsAsFloat(seqLen * numQHeads * headDim), 2e-3f);
+    }
+
+    [Fact]
     public void CudaFusedLayoutOps_MatchReference()
     {
         if (!CudaBackend.IsAvailable())
@@ -653,6 +708,45 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaGqaDecodeAttention_ReadsFloat16KvCache()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int headDim = 3;
+        const int cacheSize = 5;
+        const int attendStart = 3;
+        const int attendLen = 4;
+
+        using var allocator = new CudaAllocator();
+        using var q = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        using var kF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        using var vF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        FillSinusoidal(q, 0.07f);
+        FillSinusoidal(kF32, 0.11f);
+        FillSinusoidal(vF32, -0.13f);
+
+        using var kF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        using var vF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kF16, kF32, 0, cacheSize, cacheSize, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vF16, vF32, 0, cacheSize, cacheSize, circular: false));
+
+        using var actual = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaDecodeAttention(
+            actual, q, kF16, vF16, numQHeads, numKVHeads, headDim,
+            attendStart, attendLen, cacheSize, circular: true, scale: 1.0f));
+
+        float[] expected = GqaDecodeAttentionReference(
+            q.GetElementsAsFloat(numQHeads * headDim),
+            kF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            vF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            numQHeads, numKVHeads, headDim, attendStart, attendLen, cacheSize, circular: true);
+        AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
+    }
+
+    [Fact]
     public void CudaFusedCacheOps_MatchReference()
     {
         if (!CudaBackend.IsAvailable())
@@ -680,6 +774,30 @@ public class CudaBackendTests
             10f, 11f, 12f, 13f, 14f, 15f, 100f, 101f, 102f, 103f, 104f, 105f, 106f, 107f, 108f,
             16f, 17f, 18f, 19f, 20f, 21f, 109f, 110f, 111f, 112f, 113f, 114f, 115f, 116f, 117f,
         }, concat.GetElementsAsFloat(30));
+    }
+
+    [Fact]
+    public void CudaFusedFloat16CacheOps_MatchReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var filled = new Tensor(allocator, DType.Float16, 1, 4, 2);
+        Ops.Fill(filled, 1.5f);
+        using var filledGathered = new Tensor(allocator, DType.Float32, 1, 4, 2);
+        Assert.True(CudaFusedOps.TryGatherCircularHeadFirst(filledGathered, filled, 0, 4, 4));
+        AssertClose(Enumerable.Repeat(1.5f, 8).ToArray(), filledGathered.GetElementsAsFloat(8), 1e-4f);
+
+        using var src = new Tensor(allocator, DType.Float32, 2, 4, 3);
+        FillSequential(src, scale: 1f, offset: 1f);
+        using var cache = new Tensor(allocator, DType.Float16, 2, 5, 3);
+        Ops.Fill(cache, -1f);
+
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(cache, src, 3, 4, 5, circular: true));
+        using var gathered = new Tensor(allocator, DType.Float32, 2, 4, 3);
+        Assert.True(CudaFusedOps.TryGatherCircularHeadFirst(gathered, cache, 3, 4, 5));
+        AssertClose(src.GetElementsAsFloat(24), gathered.GetElementsAsFloat(24), 1e-3f);
     }
 
     [Fact]

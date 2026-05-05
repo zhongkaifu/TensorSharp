@@ -10,6 +10,7 @@ namespace TensorSharp.Cuda
 
         private readonly CudaModule module;
         private readonly IntPtr fillF32;
+        private readonly IntPtr fillF16;
         private readonly IntPtr unaryF32;
         private readonly IntPtr binaryF32;
         private readonly IntPtr scalarF32;
@@ -23,12 +24,16 @@ namespace TensorSharp.Cuda
         private readonly IntPtr softmaxF32;
         private readonly IntPtr scaledDotProductAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF32;
+        private readonly IntPtr gqaPrefillAttentionF16;
         private readonly IntPtr gqaDecodeAttentionF32;
+        private readonly IntPtr gqaDecodeAttentionF16;
         private readonly IntPtr sliceColumnsF32;
         private readonly IntPtr flatToHeadFirstF32;
         private readonly IntPtr splitQkvHeadFirstF32;
         private readonly IntPtr copyHeadFirstToCacheF32;
+        private readonly IntPtr copyHeadFirstToCacheF16;
         private readonly IntPtr gatherCircularHeadFirstF32;
+        private readonly IntPtr gatherCircularHeadFirstF16;
         private readonly IntPtr concatHeadFirstF32;
         private readonly IntPtr neoxRopeHeadFirstF32;
         private readonly IntPtr indexSelectF32;
@@ -45,6 +50,7 @@ namespace TensorSharp.Cuda
         {
             this.module = module;
             fillF32 = module.GetFunction("ts_fill_f32");
+            fillF16 = module.GetFunction("ts_fill_f16");
             unaryF32 = module.GetFunction("ts_unary_f32");
             binaryF32 = module.GetFunction("ts_binary_f32");
             scalarF32 = module.GetFunction("ts_scalar_f32");
@@ -58,12 +64,16 @@ namespace TensorSharp.Cuda
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
+            gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
             gqaDecodeAttentionF32 = module.GetFunction("ts_gqa_decode_attention_f32");
+            gqaDecodeAttentionF16 = module.GetFunction("ts_gqa_decode_attention_f16");
             sliceColumnsF32 = module.GetFunction("ts_slice_columns_f32");
             flatToHeadFirstF32 = module.GetFunction("ts_flat_to_head_first_f32");
             splitQkvHeadFirstF32 = module.GetFunction("ts_split_qkv_head_first_f32");
             copyHeadFirstToCacheF32 = module.GetFunction("ts_copy_head_first_to_cache_f32");
+            copyHeadFirstToCacheF16 = module.GetFunction("ts_copy_head_first_to_cache_f16");
             gatherCircularHeadFirstF32 = module.GetFunction("ts_gather_circular_head_first_f32");
+            gatherCircularHeadFirstF16 = module.GetFunction("ts_gather_circular_head_first_f16");
             concatHeadFirstF32 = module.GetFunction("ts_concat_head_first_f32");
             neoxRopeHeadFirstF32 = module.GetFunction("ts_neox_rope_head_first_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
@@ -100,6 +110,15 @@ namespace TensorSharp.Cuda
             float valueArg = value;
             void** args = stackalloc void*[] { &outArg, &countArg, &valueArg };
             Launch(fillF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchFillF16(IntPtr output, int count, float value, IntPtr stream)
+        {
+            IntPtr outArg = output;
+            int countArg = count;
+            float valueArg = value;
+            void** args = stackalloc void*[] { &outArg, &countArg, &valueArg };
+            Launch(fillF16, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchUnaryF32(IntPtr input, IntPtr output, int count, int op, IntPtr stream)
@@ -297,6 +316,41 @@ namespace TensorSharp.Cuda
             Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
 
+        public void LaunchGqaPrefillAttentionF16(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg
+            };
+            Launch(gqaPrefillAttentionF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
         public void LaunchGqaDecodeAttentionF32(
             IntPtr query,
             IntPtr keyCache,
@@ -330,6 +384,41 @@ namespace TensorSharp.Cuda
                 &headDimArg, &attendStartArg, &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg
             };
             Launch(gqaDecodeAttentionF32, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionF16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &headDimArg, &attendStartArg, &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg
+            };
+            Launch(gqaDecodeAttentionF16, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
         }
 
         public void LaunchSliceColumnsF32(
@@ -422,6 +511,33 @@ namespace TensorSharp.Cuda
             Launch(copyHeadFirstToCacheF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchCopyHeadFirstToCacheF16(
+            IntPtr source,
+            IntPtr cache,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int startPos,
+            int cacheSize,
+            int circular,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr cacheArg = cache;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int startPosArg = startPos;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            int count = checked(numHeads * seqLen * headDim);
+            void** args = stackalloc void*[]
+            {
+                &sourceArg, &cacheArg, &numHeadsArg, &seqLenArg, &headDimArg, &startPosArg, &cacheSizeArg, &circularArg
+            };
+            Launch(copyHeadFirstToCacheF16, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchGatherCircularHeadFirstF32(
             IntPtr cache,
             IntPtr output,
@@ -445,6 +561,31 @@ namespace TensorSharp.Cuda
                 &cacheArg, &outputArg, &numHeadsArg, &seqLenArg, &headDimArg, &startPosArg, &cacheSizeArg
             };
             Launch(gatherCircularHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchGatherCircularHeadFirstF16(
+            IntPtr cache,
+            IntPtr output,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int startPos,
+            int cacheSize,
+            IntPtr stream)
+        {
+            IntPtr cacheArg = cache;
+            IntPtr outputArg = output;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int startPosArg = startPos;
+            int cacheSizeArg = cacheSize;
+            int count = checked(numHeads * seqLen * headDim);
+            void** args = stackalloc void*[]
+            {
+                &cacheArg, &outputArg, &numHeadsArg, &seqLenArg, &headDimArg, &startPosArg, &cacheSizeArg
+            };
+            Launch(gatherCircularHeadFirstF16, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchConcatHeadFirstF32(

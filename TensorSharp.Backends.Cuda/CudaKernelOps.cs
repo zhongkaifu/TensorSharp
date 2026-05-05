@@ -48,15 +48,23 @@ namespace TensorSharp.Cuda
     {
         public static bool TryFill(Tensor result, float value)
         {
-            if (!TryGetContiguousFloat(result, out CudaStorage storage, out IntPtr ptr, out int count))
+            if (!TryGetContiguous(result, out CudaStorage storage, out IntPtr ptr, out long longCount) ||
+                longCount > int.MaxValue ||
+                (result.ElementType != DType.Float32 && result.ElementType != DType.Float16))
+            {
                 return false;
+            }
 
             CudaAllocator allocator = storage.AllocatorImpl;
             if (!TryGetKernels(allocator, out CudaKernels kernels))
                 return false;
 
+            int count = (int)longCount;
             allocator.Context.MakeCurrent();
-            kernels.LaunchFillF32(ptr, count, value, allocator.Stream.Handle);
+            if (result.ElementType == DType.Float32)
+                kernels.LaunchFillF32(ptr, count, value, allocator.Stream.Handle);
+            else
+                kernels.LaunchFillF16(ptr, count, value, allocator.Stream.Handle);
             storage.MarkDeviceModified();
             return true;
         }
@@ -453,8 +461,8 @@ namespace TensorSharp.Cuda
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out _) ||
                 !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out _) ||
-                !TryGetContiguousFloat(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
-                !TryGetContiguousFloat(value, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                !TryGetContiguousFloatOrHalf(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _, out bool keyIsHalf) ||
+                !TryGetContiguousFloatOrHalf(value, out CudaStorage valueStorage, out IntPtr valuePtr, out _, out bool valueIsHalf) ||
                 query.DimensionCount != 3 ||
                 key.DimensionCount != 3 ||
                 value.DimensionCount != 3 ||
@@ -478,7 +486,8 @@ namespace TensorSharp.Cuda
                 result.Sizes[0] != seqLen ||
                 result.Sizes[1] != numQHeads * headDim ||
                 maskStart < 0 ||
-                maskStart >= kvLen)
+                maskStart >= kvLen ||
+                keyIsHalf != valueIsHalf)
             {
                 return false;
             }
@@ -491,20 +500,40 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchGqaPrefillAttentionF32(
-                queryPtr,
-                keyPtr,
-                valuePtr,
-                resultPtr,
-                numQHeads,
-                numKVHeads,
-                seqLen,
-                kvLen,
-                headDim,
-                maskStart,
-                windowSize,
-                scale,
-                allocator.Stream.Handle);
+            if (keyIsHalf)
+            {
+                kernels.LaunchGqaPrefillAttentionF16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGqaPrefillAttentionF32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    allocator.Stream.Handle);
+            }
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -525,8 +554,8 @@ namespace TensorSharp.Cuda
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
                 !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out int queryCount) ||
-                !TryGetContiguousFloat(keyCache, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
-                !TryGetContiguousFloat(valueCache, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                !TryGetContiguousFloatOrHalf(keyCache, out CudaStorage keyStorage, out IntPtr keyPtr, out _, out bool keyIsHalf) ||
+                !TryGetContiguousFloatOrHalf(valueCache, out CudaStorage valueStorage, out IntPtr valuePtr, out _, out bool valueIsHalf) ||
                 query.DimensionCount != 2 ||
                 result.DimensionCount != 2 ||
                 keyCache.DimensionCount != 3 ||
@@ -551,7 +580,8 @@ namespace TensorSharp.Cuda
                 valueCache.Sizes[2] != headDim ||
                 queryCount != numQHeads * headDim ||
                 resultCount != queryCount ||
-                (!circular && attendStart + attendLen > cacheSize))
+                (!circular && attendStart + attendLen > cacheSize) ||
+                keyIsHalf != valueIsHalf)
             {
                 return false;
             }
@@ -564,20 +594,40 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchGqaDecodeAttentionF32(
-                queryPtr,
-                keyPtr,
-                valuePtr,
-                resultPtr,
-                numQHeads,
-                numKVHeads,
-                headDim,
-                attendStart,
-                attendLen,
-                cacheSize,
-                circular ? 1 : 0,
-                scale,
-                allocator.Stream.Handle);
+            if (keyIsHalf)
+            {
+                kernels.LaunchGqaDecodeAttentionF16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGqaDecodeAttentionF32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    allocator.Stream.Handle);
+            }
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -688,7 +738,7 @@ namespace TensorSharp.Cuda
 
         public static bool TryCopyHeadFirstToCache(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize, bool circular)
         {
-            if (!TryGetContiguousFloat(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _) ||
+            if (!TryGetContiguousFloatOrHalf(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _, out bool cacheIsHalf) ||
                 !TryGetContiguousFloat(src, out CudaStorage srcStorage, out IntPtr srcPtr, out int srcCount) ||
                 cache.DimensionCount != 3 ||
                 src.DimensionCount != 3 ||
@@ -711,16 +761,32 @@ namespace TensorSharp.Cuda
 
             srcStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchCopyHeadFirstToCacheF32(
-                srcPtr,
-                cachePtr,
-                checked((int)src.Sizes[0]),
-                seqLen,
-                checked((int)src.Sizes[2]),
-                startPos,
-                cacheSize,
-                circular ? 1 : 0,
-                allocator.Stream.Handle);
+            if (cacheIsHalf)
+            {
+                kernels.LaunchCopyHeadFirstToCacheF16(
+                    srcPtr,
+                    cachePtr,
+                    checked((int)src.Sizes[0]),
+                    seqLen,
+                    checked((int)src.Sizes[2]),
+                    startPos,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchCopyHeadFirstToCacheF32(
+                    srcPtr,
+                    cachePtr,
+                    checked((int)src.Sizes[0]),
+                    seqLen,
+                    checked((int)src.Sizes[2]),
+                    startPos,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    allocator.Stream.Handle);
+            }
             cacheStorage.MarkDeviceModified();
             return true;
         }
@@ -728,7 +794,7 @@ namespace TensorSharp.Cuda
         public static bool TryGatherCircularHeadFirst(Tensor result, Tensor cache, int startPos, int seqLen, int cacheSize)
         {
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
-                !TryGetContiguousFloat(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _) ||
+                !TryGetContiguousFloatOrHalf(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _, out bool cacheIsHalf) ||
                 result.DimensionCount != 3 ||
                 cache.DimensionCount != 3 ||
                 seqLen <= 0 ||
@@ -748,15 +814,30 @@ namespace TensorSharp.Cuda
 
             cacheStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            kernels.LaunchGatherCircularHeadFirstF32(
-                cachePtr,
-                resultPtr,
-                checked((int)result.Sizes[0]),
-                seqLen,
-                checked((int)result.Sizes[2]),
-                startPos,
-                cacheSize,
-                allocator.Stream.Handle);
+            if (cacheIsHalf)
+            {
+                kernels.LaunchGatherCircularHeadFirstF16(
+                    cachePtr,
+                    resultPtr,
+                    checked((int)result.Sizes[0]),
+                    seqLen,
+                    checked((int)result.Sizes[2]),
+                    startPos,
+                    cacheSize,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGatherCircularHeadFirstF32(
+                    cachePtr,
+                    resultPtr,
+                    checked((int)result.Sizes[0]),
+                    seqLen,
+                    checked((int)result.Sizes[2]),
+                    startPos,
+                    cacheSize,
+                    allocator.Stream.Handle);
+            }
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -991,6 +1072,24 @@ namespace TensorSharp.Cuda
             storage = null;
             ptr = IntPtr.Zero;
             count = 0;
+            return false;
+        }
+
+        internal static bool TryGetContiguousFloatOrHalf(Tensor tensor, out CudaStorage storage, out IntPtr ptr, out int count, out bool isHalf)
+        {
+            if (TryGetContiguous(tensor, out storage, out ptr, out long longCount) &&
+                (tensor.ElementType == DType.Float32 || tensor.ElementType == DType.Float16) &&
+                longCount <= int.MaxValue)
+            {
+                count = (int)longCount;
+                isHalf = tensor.ElementType == DType.Float16;
+                return true;
+            }
+
+            storage = null;
+            ptr = IntPtr.Zero;
+            count = 0;
+            isHalf = false;
             return false;
         }
 

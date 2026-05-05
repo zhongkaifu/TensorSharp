@@ -1462,14 +1462,14 @@ namespace TensorSharp.Models
 
         protected void CopyToCache(Tensor cache, Tensor src, int startPos, int seqLen)
         {
+            if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, (int)cache.Sizes[1], false))
+                return;
+
             if (cache.ElementType == DType.Float16)
             {
                 CopyToCacheF16(cache, src, startPos, seqLen);
                 return;
             }
-
-            if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, (int)cache.Sizes[1], false))
-                return;
 
             using var cacheSlice = cache.Narrow(1, startPos, seqLen);
             Ops.Copy(cacheSlice, src);
@@ -1546,12 +1546,6 @@ namespace TensorSharp.Models
         protected unsafe void CopyToCacheDecode(Tensor kCache, Tensor kTensor,
             Tensor vCache, Tensor vTensor, int numKVHeads, int headDim, int startPos)
         {
-            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
-            {
-                CopyToCacheDecodeF16(kCache, kTensor, vCache, vTensor, numKVHeads, headDim, startPos);
-                return;
-            }
-
             using (var kHeads = kTensor.View(numKVHeads, 1, headDim))
             using (var vHeads = vTensor.View(numKVHeads, 1, headDim))
             {
@@ -1561,6 +1555,12 @@ namespace TensorSharp.Models
                 {
                     return;
                 }
+            }
+
+            if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+            {
+                CopyToCacheDecodeF16(kCache, kTensor, vCache, vTensor, numKVHeads, headDim, startPos);
+                return;
             }
 
             float* kSrc = GetFloatPtr(kTensor);

@@ -249,6 +249,13 @@ extern "C" __global__ void ts_fill_f32(float* output, int count, float value)
         output[i] = value;
 }
 
+extern "C" __global__ void ts_fill_f16(half* output, int count, float value)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        output[i] = __float2half_rn(value);
+}
+
 extern "C" __global__ void ts_unary_f32(const float* input, float* output, int count, int op)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -616,6 +623,90 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     }
 }
 
+extern "C" __global__ void ts_gqa_prefill_attention_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale)
+{
+    int q_head = blockIdx.x;
+    int q_pos = blockIdx.y;
+    if (q_head >= num_q_heads || q_pos >= seq_len)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    int visible = mask_start + q_pos;
+    int min_visible = 0;
+    if (window_size > 0)
+        min_visible = max(0, visible - window_size + 1);
+
+    const float* q = query + ((size_t)q_head * seq_len + q_pos) * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = -FLT_MAX;
+    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    {
+        bool allowed = k_pos <= visible && k_pos >= min_visible;
+        float score = -FLT_MAX;
+        if (allowed)
+        {
+            const half* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[d] * __half2float(k[d]);
+            score = dot * scale;
+            max_v = fmaxf(max_v, score);
+        }
+        scores[k_pos] = score;
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    {
+        float score = scores[k_pos];
+        float p = score == -FLT_MAX ? 0.0f : expf(score - shared_max);
+        scores[k_pos] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + ((size_t)q_pos * num_q_heads + q_head) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k_pos = 0; k_pos < kv_len; k_pos++)
+        {
+            float p = scores[k_pos];
+            if (p != 0.0f)
+            {
+                const half* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+                acc += p * inv_sum * __half2float(v[d]);
+            }
+        }
+        out[d] = acc;
+    }
+}
+
 extern "C" __global__ void ts_gqa_decode_attention_f32(
     const float* query,
     const float* key_cache,
@@ -690,6 +781,85 @@ extern "C" __global__ void ts_gqa_decode_attention_f32(
 
             const float* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
             acc += scores[t] * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    const float* q = query + (size_t)q_head * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = -FLT_MAX;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        int logical_pos = attend_start + t;
+        int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+        if (cache_pos < 0)
+            cache_pos += cache_size;
+
+        const half* k = key_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * __half2float(k[d]);
+
+        float score = dot * scale;
+        scores[t] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        float p = expf(scores[t] - shared_max);
+        scores[t] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (size_t)q_head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int t = 0; t < attend_len; t++)
+        {
+            int logical_pos = attend_start + t;
+            int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+            if (cache_pos < 0)
+                cache_pos += cache_size;
+
+            const half* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+            acc += scores[t] * inv_sum * __half2float(v[d]);
         }
         out[d] = acc;
     }
@@ -776,6 +946,29 @@ extern "C" __global__ void ts_copy_head_first_to_cache_f32(
     cache[((size_t)head * cache_size + cache_pos) * head_dim + d] = source[idx];
 }
 
+extern "C" __global__ void ts_copy_head_first_to_cache_f16(
+    const float* source,
+    half* cache,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int start_pos,
+    int cache_size,
+    int circular)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    int cache_pos = circular ? ((start_pos + seq) % cache_size) : (start_pos + seq);
+    cache[((size_t)head * cache_size + cache_pos) * head_dim + d] = __float2half_rn(source[idx]);
+}
+
 extern "C" __global__ void ts_gather_circular_head_first_f32(
     const float* cache,
     float* output,
@@ -798,6 +991,30 @@ extern "C" __global__ void ts_gather_circular_head_first_f32(
     if (cache_pos < 0)
         cache_pos += cache_size;
     output[idx] = cache[((size_t)head * cache_size + cache_pos) * head_dim + d];
+}
+
+extern "C" __global__ void ts_gather_circular_head_first_f16(
+    const half* cache,
+    float* output,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int start_pos,
+    int cache_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int head = tmp / seq_len;
+    int cache_pos = (start_pos + seq) % cache_size;
+    if (cache_pos < 0)
+        cache_pos += cache_size;
+    output[idx] = __half2float(cache[((size_t)head * cache_size + cache_pos) * head_dim + d]);
 }
 
 extern "C" __global__ void ts_concat_head_first_f32(
