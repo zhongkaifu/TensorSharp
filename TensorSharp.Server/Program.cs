@@ -35,6 +35,15 @@ string baseDirectory = AppContext.BaseDirectory;
 ServerHostingOptions hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);
 LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
 string configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(args);
+// Translate --paged-kv* flags into env vars before any singleton that reads
+// PagedKvCacheConfig.FromEnvironment() is constructed (notably the
+// SessionKvCacheManager built lazily inside ModelService).
+bool pagedKvFlagsApplied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(args);
+// Translate --continuous-batching / --no-continuous-batching into env vars
+// that gate BatchExecutor (TS_SCHED_DISABLE_BATCHED) and Qwen3.5 ForwardBatch
+// (TS_QWEN35_BATCHED). Must run before InferenceEngine constructs its
+// BatchExecutor and the per-model batched-paged adapters initialise.
+bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
@@ -53,6 +62,11 @@ builder.Services.AddSingleton(hostingOptions);
 builder.Services.AddSingleton<ModelService>();
 builder.Services.AddSingleton<InferenceQueue>();
 builder.Services.AddSingleton<SessionManager>();
+// Engine is owned by ModelService now (so its lifecycle is tied to the
+// loaded model). Re-export it as a DI service for adapters that wish to
+// submit requests directly.
+builder.Services.AddSingleton<InferenceEngineHost>(sp =>
+    sp.GetRequiredService<ModelService>().EngineHost);
 
 // Demote the high-frequency status-polling endpoints to Debug so the
 // default Information-level log isn't dominated by their request entries.
@@ -77,6 +91,16 @@ startupLogger.LogInformation(LogEventIds.LoggingInitialized,
     "Logging initialized: minimumLevel={MinimumLevel} fileLogging={FileLogging} logDir={LogDir}",
     resolvedLogLevel, hostingOptions.FileLoggingEnabled,
     hostingOptions.FileLoggingEnabled ? hostingOptions.LogDirectory : "(disabled)");
+
+if (pagedKvFlagsApplied)
+{
+    var pagedCfg = PagedKvCacheConfig.FromEnvironment();
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "paged-kv configured via CLI: enabled={Enabled} blockSize={BlockSize} ramMB={RamMB} ssdDir={SsdDir} maxSsdMB={MaxSsdMB}",
+        pagedCfg.Enabled, pagedCfg.BlockSize, pagedCfg.MaxRamBytes / (1024 * 1024),
+        string.IsNullOrEmpty(pagedCfg.SsdDirectory) ? "(disabled)" : pagedCfg.SsdDirectory,
+        pagedCfg.MaxSsdBytes / (1024 * 1024));
+}
 
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 

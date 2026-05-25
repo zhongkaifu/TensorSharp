@@ -10,6 +10,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -25,8 +26,8 @@ namespace TensorSharp.Runtime
 
     public sealed class StructuredOutputFormat
     {
-        private StructuredOutputFormat(StructuredOutputKind kind, string name = null,
-            string schemaJson = null, bool strict = false, string description = null)
+        private StructuredOutputFormat(StructuredOutputKind kind, string? name = null,
+            string? schemaJson = null, bool strict = false, string? description = null)
         {
             Kind = kind;
             Name = name;
@@ -36,16 +37,16 @@ namespace TensorSharp.Runtime
         }
 
         public StructuredOutputKind Kind { get; }
-        public string Name { get; }
-        public string SchemaJson { get; }
+        public string? Name { get; }
+        public string? SchemaJson { get; }
         public bool Strict { get; }
-        public string Description { get; }
+        public string? Description { get; }
 
         public static StructuredOutputFormat JsonObject()
             => new(StructuredOutputKind.JsonObject);
 
         public static StructuredOutputFormat JsonSchema(string name, string schemaJson,
-            bool strict = true, string description = null)
+            bool strict = true, string? description = null)
             => new(StructuredOutputKind.JsonSchema, name, schemaJson, strict, description);
     }
 
@@ -62,14 +63,14 @@ namespace TensorSharp.Runtime
             if (messages != null && messages.Count > 0 &&
                 (messages[0].Role == "system" || messages[0].Role == "developer"))
             {
-                var first = CloneMessage(messages[0]);
+                var first = CloneMessage(messages[0])!;
                 first.Content = string.IsNullOrWhiteSpace(first.Content)
                     ? instruction
-                    : first.Content.TrimEnd() + "\n\n" + instruction;
+                    : first.Content!.TrimEnd() + "\n\n" + instruction;
                 result.Add(first);
 
                 for (int i = 1; i < messages.Count; i++)
-                    result.Add(CloneMessage(messages[i]));
+                    result.Add(CloneMessage(messages[i])!);
                 return result;
             }
 
@@ -77,7 +78,7 @@ namespace TensorSharp.Runtime
             if (messages != null)
             {
                 foreach (var msg in messages)
-                    result.Add(CloneMessage(msg));
+                    result.Add(CloneMessage(msg)!);
             }
             return result;
         }
@@ -117,7 +118,7 @@ namespace TensorSharp.Runtime
             return sb.ToString();
         }
 
-        private static ChatMessage CloneMessage(ChatMessage msg)
+        private static ChatMessage? CloneMessage(ChatMessage msg)
         {
             if (msg == null)
                 return null;
@@ -140,17 +141,17 @@ namespace TensorSharp.Runtime
         public bool IsValid { get; init; }
         public List<string> Errors { get; init; } = new();
 
-        public string ErrorMessage
+        public string? ErrorMessage
             => Errors.Count == 0 ? null : string.Join("; ", Errors);
     }
 
     public sealed class StructuredOutputNormalizationResult
     {
         public bool IsValid { get; init; }
-        public string NormalizedContent { get; init; }
+        public string NormalizedContent { get; init; } = string.Empty;
         public List<string> Errors { get; init; } = new();
 
-        public string ErrorMessage
+        public string? ErrorMessage
             => Errors.Count == 0 ? null : string.Join("; ", Errors);
     }
 
@@ -196,7 +197,7 @@ namespace TensorSharp.Runtime
             JsonDocument schemaDoc;
             try
             {
-                schemaDoc = JsonDocument.Parse(format.SchemaJson);
+                schemaDoc = JsonDocument.Parse(format.SchemaJson ?? "");
             }
             catch (Exception ex)
             {
@@ -268,7 +269,7 @@ namespace TensorSharp.Runtime
                 };
             }
 
-            if (!TryExtractJsonObject(rawOutput, out string candidateJson, out string extractError))
+            if (!TryExtractJsonObject(rawOutput, out string? candidateJson, out string? extractError))
             {
                 return new StructuredOutputNormalizationResult
                 {
@@ -279,11 +280,11 @@ namespace TensorSharp.Runtime
             try
             {
                 using var valueDoc = JsonDocument.Parse(candidateJson);
-                using var schemaDoc = JsonDocument.Parse(format.SchemaJson);
+                using var schemaDoc = JsonDocument.Parse(format.SchemaJson ?? "");
 
                 var errors = new List<string>();
                 if (!TryNormalizeValue(valueDoc.RootElement, schemaDoc.RootElement, schemaDoc.RootElement,
-                    "$", 1, errors, out JsonNode normalizedNode))
+                    "$", 1, errors, out JsonNode? normalizedNode))
                 {
                     return new StructuredOutputNormalizationResult { Errors = errors };
                 }
@@ -313,7 +314,7 @@ namespace TensorSharp.Runtime
 
         private static StructuredOutputNormalizationResult NormalizeJsonObject(string rawOutput)
         {
-            if (!TryExtractJsonObject(rawOutput, out string candidateJson, out string extractError))
+            if (!TryExtractJsonObject(rawOutput, out string? candidateJson, out string? extractError))
             {
                 return new StructuredOutputNormalizationResult
                 {
@@ -364,19 +365,19 @@ namespace TensorSharp.Runtime
 
             if (schema.TryGetProperty("$ref", out var refEl))
             {
-                string refPath = refEl.GetString();
-                if (!TryResolveRef(ctx.RootSchema, refPath, out JsonElement target, out string refError))
+                string? refPath = refEl.GetString();
+                if (!TryResolveRef(ctx.RootSchema, refPath, out JsonElement target, out string? refError))
                 {
                     ctx.Errors.Add($"{path}: {refError}");
                     return;
                 }
 
-                if (ctx.ActiveRefs.Contains(refPath))
+                if (ctx.ActiveRefs.Contains(refPath!))
                     return;
 
-                ctx.ActiveRefs.Add(refPath);
+                ctx.ActiveRefs.Add(refPath!);
                 ValidateSchemaNode(target, $"{path}->$ref({refPath})", depth + 1, false, ctx);
-                ctx.ActiveRefs.Remove(refPath);
+                ctx.ActiveRefs.Remove(refPath!);
                 return;
             }
 
@@ -521,7 +522,7 @@ namespace TensorSharp.Runtime
 
             if (typeEl.ValueKind == JsonValueKind.String)
             {
-                string typeName = typeEl.GetString();
+                string typeName = typeEl.GetString() ?? "";
                 if (SupportedPrimitiveTypes.Contains(typeName))
                     types.Add(typeName);
                 else
@@ -539,7 +540,7 @@ namespace TensorSharp.Runtime
                         continue;
                     }
 
-                    string typeName = item.GetString();
+                    string typeName = item.GetString() ?? "";
                     if (SupportedPrimitiveTypes.Contains(typeName))
                         types.Add(typeName);
                     else
@@ -553,7 +554,7 @@ namespace TensorSharp.Runtime
         }
 
         private static bool TryNormalizeValue(JsonElement value, JsonElement schema, JsonElement rootSchema,
-            string path, int depth, List<string> errors, out JsonNode normalized)
+            string path, int depth, List<string> errors, out JsonNode? normalized)
         {
             normalized = null;
             if (depth > 128)
@@ -564,8 +565,8 @@ namespace TensorSharp.Runtime
 
             if (schema.TryGetProperty("$ref", out var refEl))
             {
-                string refPath = refEl.GetString();
-                if (!TryResolveRef(rootSchema, refPath, out JsonElement target, out string refError))
+                string? refPath = refEl.GetString();
+                if (!TryResolveRef(rootSchema, refPath, out JsonElement target, out string? refError))
                 {
                     errors.Add($"{path}: {refError}");
                     return false;
@@ -610,7 +611,7 @@ namespace TensorSharp.Runtime
         }
 
         private static bool SchemaMatchesObject(JsonElement value, JsonElement schema, JsonElement rootSchema,
-            string path, int depth, List<string> errors, out JsonNode normalized)
+            string path, int depth, List<string> errors, out JsonNode? normalized)
         {
             normalized = null;
             bool objectLike = SchemaIsObjectLike(schema, rootSchema);
@@ -634,7 +635,7 @@ namespace TensorSharp.Runtime
             {
                 if (value.TryGetProperty(prop.Name, out var childValue))
                 {
-                    if (!TryNormalizeValue(childValue, prop.Value, rootSchema, $"{path}.{prop.Name}", depth + 1, errors, out JsonNode childNode))
+                    if (!TryNormalizeValue(childValue, prop.Value, rootSchema, $"{path}.{prop.Name}", depth + 1, errors, out JsonNode? childNode))
                         return false;
                     result[prop.Name] = childNode;
                 }
@@ -654,7 +655,7 @@ namespace TensorSharp.Runtime
         }
 
         private static bool SchemaMatchesArray(JsonElement value, JsonElement schema, JsonElement rootSchema,
-            string path, int depth, List<string> errors, out JsonNode normalized)
+            string path, int depth, List<string> errors, out JsonNode? normalized)
         {
             normalized = null;
             bool arrayLike = schema.TryGetProperty("items", out var itemsEl)
@@ -680,7 +681,7 @@ namespace TensorSharp.Runtime
             int index = 0;
             foreach (var item in value.EnumerateArray())
             {
-                if (!TryNormalizeValue(item, itemsEl, rootSchema, $"{path}[{index}]", depth + 1, errors, out JsonNode childNode))
+                if (!TryNormalizeValue(item, itemsEl, rootSchema, $"{path}[{index}]", depth + 1, errors, out JsonNode? childNode))
                     return false;
                 result.Add(childNode);
                 index++;
@@ -691,7 +692,7 @@ namespace TensorSharp.Runtime
         }
 
         private static bool TryNormalizePrimitive(JsonElement value, HashSet<string> types,
-            string path, List<string> errors, out JsonNode normalized)
+            string path, List<string> errors, out JsonNode? normalized)
         {
             normalized = null;
 
@@ -750,7 +751,7 @@ namespace TensorSharp.Runtime
             return false;
         }
 
-        private static bool CheckEnumAndConst(JsonElement schema, JsonNode normalized,
+        private static bool CheckEnumAndConst(JsonElement schema, JsonNode? normalized,
             List<string> errors, string path, bool allowNullFallback)
         {
             if (normalized == null && allowNullFallback)
@@ -758,7 +759,7 @@ namespace TensorSharp.Runtime
 
             if (schema.TryGetProperty("const", out var constEl))
             {
-                JsonNode constNode = JsonNode.Parse(constEl.GetRawText());
+                JsonNode? constNode = JsonNode.Parse(constEl.GetRawText());
                 if (!JsonNode.DeepEquals(normalized, constNode))
                 {
                     errors.Add($"{path}: value does not match the schema const.");
@@ -771,7 +772,7 @@ namespace TensorSharp.Runtime
                 bool matched = false;
                 foreach (var enumValue in enumEl.EnumerateArray())
                 {
-                    JsonNode enumNode = JsonNode.Parse(enumValue.GetRawText());
+                    JsonNode? enumNode = JsonNode.Parse(enumValue.GetRawText());
                     if (JsonNode.DeepEquals(normalized, enumNode))
                     {
                         matched = true;
@@ -871,8 +872,8 @@ namespace TensorSharp.Runtime
             return false;
         }
 
-        private static bool TryResolveRef(JsonElement rootSchema, string refPath,
-            out JsonElement target, out string error)
+        private static bool TryResolveRef(JsonElement rootSchema, string? refPath,
+            out JsonElement target, [NotNullWhen(false)] out string? error)
         {
             target = default;
             error = null;
@@ -911,7 +912,7 @@ namespace TensorSharp.Runtime
             return true;
         }
 
-        private static bool TryExtractJsonObject(string rawOutput, out string json, out string error)
+        private static bool TryExtractJsonObject(string rawOutput, [NotNullWhen(true)] out string? json, [NotNullWhen(false)] out string? error)
         {
             json = null;
             error = null;
@@ -933,7 +934,7 @@ namespace TensorSharp.Runtime
                 if (trimmed[i] != '{')
                     continue;
 
-                if (TryReadBalancedObject(trimmed, i, out string candidate) && TryParseCandidate(candidate, out json))
+                if (TryReadBalancedObject(trimmed, i, out string? candidate) && TryParseCandidate(candidate, out json))
                     return true;
             }
 
@@ -941,7 +942,7 @@ namespace TensorSharp.Runtime
             return false;
         }
 
-        private static bool TryParseCandidate(string candidate, out string json)
+        private static bool TryParseCandidate(string candidate, [NotNullWhen(true)] out string? json)
         {
             json = null;
             if (string.IsNullOrWhiteSpace(candidate))
@@ -961,7 +962,7 @@ namespace TensorSharp.Runtime
             }
         }
 
-        private static bool TryReadBalancedObject(string text, int startIndex, out string json)
+        private static bool TryReadBalancedObject(string text, int startIndex, [NotNullWhen(true)] out string? json)
         {
             json = null;
             bool inString = false;

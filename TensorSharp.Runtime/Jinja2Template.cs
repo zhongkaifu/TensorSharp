@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Text;
@@ -46,25 +47,25 @@ namespace TensorSharp.Runtime
         }
 
         private abstract class Node { }
-        private sealed class TextNode : Node { public string Text; }
-        private sealed class OutputNode : Node { public string Expr; }
-        private sealed class SetNode : Node { public string VarName; public string ValueExpr; }
+        private sealed class TextNode : Node { public string Text = string.Empty; }
+        private sealed class OutputNode : Node { public string Expr = string.Empty; }
+        private sealed class SetNode : Node { public string VarName = string.Empty; public string ValueExpr = string.Empty; }
         private sealed class ForNode : Node
         {
-            public string VarName;
-            public string VarName2; // optional second var for tuple unpacking (key, value)
-            public string IterExpr;
-            public List<Node> Body;
+            public string VarName = string.Empty;
+            public string? VarName2; // optional second var for tuple unpacking (key, value)
+            public string IterExpr = string.Empty;
+            public List<Node> Body = new();
         }
         private sealed class IfNode : Node
         {
-            public List<(string Cond, List<Node> Body)> Branches;
+            public List<(string? Cond, List<Node> Body)> Branches = new();
         }
         private sealed class MacroNode : Node
         {
-            public string Name;
-            public string Args;
-            public List<Node> Body;
+            public string Name = string.Empty;
+            public string Args = string.Empty;
+            public List<Node> Body = new();
         }
 
         #endregion
@@ -171,7 +172,7 @@ namespace TensorSharp.Runtime
             return ParseNodes(segs, ref pos, null);
         }
 
-        private static List<Node> ParseNodes(List<Seg> segs, ref int pos, string endTag)
+        private static List<Node> ParseNodes(List<Seg> segs, ref int pos, string? endTag)
         {
             var nodes = new List<Node>();
 
@@ -254,7 +255,8 @@ namespace TensorSharp.Runtime
             string varPart = rest.Substring(0, inIdx).Trim();
             string iterExpr = rest.Substring(inIdx + 4).Trim();
 
-            string var1 = varPart, var2 = null;
+            string var1 = varPart;
+            string? var2 = null;
             int comma = varPart.IndexOf(',');
             if (comma >= 0)
             {
@@ -314,7 +316,7 @@ namespace TensorSharp.Runtime
         private static IfNode ParseIf(string header, List<Seg> segs, ref int pos)
         {
             string cond = header.Length > 3 ? header.Substring(3).Trim() : "true";
-            var branches = new List<(string, List<Node>)>();
+            var branches = new List<(string? Cond, List<Node> Body)>();
 
             var body = ParseNodes(segs, ref pos, "endif");
             branches.Add((cond, body));
@@ -379,18 +381,21 @@ namespace TensorSharp.Runtime
             public void Set(string name, object value) =>
                 _scopes[_scopes.Count - 1][name] = value;
 
-            public bool TryGet(string name, out object value)
+            public bool TryGet(string name, [MaybeNullWhen(false)] out object value)
             {
                 for (int i = _scopes.Count - 1; i >= 0; i--)
                 {
-                    if (_scopes[i].TryGetValue(name, out value))
+                    if (_scopes[i].TryGetValue(name, out var v))
+                    {
+                        value = v;
                         return true;
+                    }
                 }
-                value = null;
+                value = null!;
                 return false;
             }
 
-            public object Get(string name) =>
+            public object? Get(string name) =>
                 TryGet(name, out var v) ? v : null;
 
             public bool IsDefined(string name)
@@ -416,18 +421,18 @@ namespace TensorSharp.Runtime
                         break;
                     case SetNode sn:
                     {
-                        object setVal = EvalExpr(sn.ValueExpr, ctx);
+                        object? setVal = EvalExpr(sn.ValueExpr, ctx);
                         int dotIdx = sn.VarName.IndexOf('.');
                         if (dotIdx > 0)
                         {
                             string nsName = sn.VarName.Substring(0, dotIdx);
                             string attrName = sn.VarName.Substring(dotIdx + 1);
                             if (ctx.Get(nsName) is IDictionary<string, object> nsDict)
-                                nsDict[attrName] = setVal;
+                                nsDict[attrName] = setVal!;
                         }
                         else
                         {
-                            ctx.Set(sn.VarName, setVal);
+                            ctx.Set(sn.VarName, setVal!);
                         }
                         break;
                     }
@@ -550,21 +555,21 @@ namespace TensorSharp.Runtime
             for (int j = 0; j < paramNames.Count; j++)
             {
                 string pname = paramNames[j];
-                if (namedArgs.TryGetValue(pname, out string namedExpr))
+                if (namedArgs.TryGetValue(pname, out string? namedExpr))
                 {
-                    ctx.Set(pname, EvalExpr(namedExpr, ctx));
+                    ctx.Set(pname, EvalExpr(namedExpr, ctx)!);
                 }
                 else if (j < positionalArgs.Count)
                 {
-                    ctx.Set(pname, EvalExpr(positionalArgs[j], ctx));
+                    ctx.Set(pname, EvalExpr(positionalArgs[j], ctx)!);
                 }
-                else if (paramDefaults.TryGetValue(pname, out string defaultExpr))
+                else if (paramDefaults.TryGetValue(pname, out string? defaultExpr))
                 {
-                    ctx.Set(pname, EvalExpr(defaultExpr, ctx));
+                    ctx.Set(pname, EvalExpr(defaultExpr, ctx)!);
                 }
                 else
                 {
-                    ctx.Set(pname, null);
+                    ctx.Set(pname, null!);
                 }
             }
 
@@ -578,7 +583,7 @@ namespace TensorSharp.Runtime
 
         #region Expression Evaluator
 
-        private static object EvalExpr(string expr, Context ctx)
+        private static object? EvalExpr(string expr, Context ctx)
         {
             expr = expr.Trim();
             if (expr.Length == 0) return null;
@@ -609,7 +614,7 @@ namespace TensorSharp.Runtime
             return EvalOr(expr, ctx);
         }
 
-        private static object EvalOr(string expr, Context ctx)
+        private static object? EvalOr(string expr, Context ctx)
         {
             var parts = SplitTopLevel(expr, " or ");
             if (parts.Count == 1) return EvalAnd(parts[0], ctx);
@@ -618,7 +623,7 @@ namespace TensorSharp.Runtime
             return false;
         }
 
-        private static object EvalAnd(string expr, Context ctx)
+        private static object? EvalAnd(string expr, Context ctx)
         {
             var parts = SplitTopLevel(expr, " and ");
             if (parts.Count == 1) return EvalNot(parts[0], ctx);
@@ -627,7 +632,7 @@ namespace TensorSharp.Runtime
             return true;
         }
 
-        private static object EvalNot(string expr, Context ctx)
+        private static object? EvalNot(string expr, Context ctx)
         {
             expr = expr.Trim();
             if (expr.StartsWith("not "))
@@ -635,7 +640,7 @@ namespace TensorSharp.Runtime
             return EvalComparison(expr, ctx);
         }
 
-        private static object EvalComparison(string expr, Context ctx)
+        private static object? EvalComparison(string expr, Context ctx)
         {
             // Handle 'is' type tests: defined, mapping, string, boolean, sequence, none, etc.
             int isIdx = FindTopLevelKeyword(expr, " is ");
@@ -713,7 +718,7 @@ namespace TensorSharp.Runtime
             return EvalPrimary(expr, ctx);
         }
 
-        private static object EvalPrimary(string expr, Context ctx)
+        private static object? EvalPrimary(string expr, Context ctx)
         {
             expr = expr.Trim();
             if (expr.Length == 0) return null;
@@ -756,7 +761,7 @@ namespace TensorSharp.Runtime
                 if (inner.Length == 0) return new List<object>();
                 var items = SplitArgs(inner);
                 var list = new List<object>();
-                foreach (var item in items) list.Add(EvalExpr(item, ctx));
+                foreach (var item in items) list.Add(EvalExpr(item, ctx)!);
                 return list;
             }
 
@@ -775,7 +780,7 @@ namespace TensorSharp.Runtime
                         {
                             string k = item.Substring(0, colon).Trim().Trim('\'', '"');
                             string v = item.Substring(colon + 1).Trim();
-                            dict[k] = EvalExpr(v, ctx);
+                            dict[k] = EvalExpr(v, ctx)!;
                         }
                     }
                 }
@@ -795,7 +800,7 @@ namespace TensorSharp.Runtime
                     {
                         string k = arg.Substring(0, eq).Trim();
                         string v = arg.Substring(eq + 1).Trim();
-                        dict[k] = EvalExpr(v, ctx);
+                        dict[k] = EvalExpr(v, ctx)!;
                     }
                 }
                 return dict;
@@ -827,7 +832,7 @@ namespace TensorSharp.Runtime
             return EvalAccessChain(expr, ctx);
         }
 
-        private static object EvalAccessChain(string expr, Context ctx)
+        private static object? EvalAccessChain(string expr, Context ctx)
         {
             // Parse the root variable name
             int i = 0;
@@ -840,7 +845,7 @@ namespace TensorSharp.Runtime
             string rootName = expr.Substring(start, i);
             if (rootName.Length == 0) return null;
 
-            object current = ctx.Get(rootName);
+            object? current = ctx.Get(rootName);
 
             while (i < expr.Length)
             {
@@ -960,15 +965,15 @@ namespace TensorSharp.Runtime
             }
         }
 
-        private static string Stringify(object val)
+        private static string Stringify(object? val)
         {
             if (val == null) return "";
             if (val is bool b) return b ? "True" : "False";
             if (val is string s) return s;
-            return Convert.ToString(val, CultureInfo.InvariantCulture);
+            return Convert.ToString(val, CultureInfo.InvariantCulture) ?? "";
         }
 
-        private static string ToJson(object val)
+        private static string ToJson(object? val)
         {
             if (val == null) return "null";
             if (val is bool b) return b ? "true" : "false";
@@ -1004,7 +1009,7 @@ namespace TensorSharp.Runtime
             return System.Text.Json.JsonSerializer.Serialize(val.ToString());
         }
 
-        private static bool Truthy(object val)
+        private static bool Truthy(object? val)
         {
             if (val == null) return false;
             if (val is bool b) return b;
@@ -1016,7 +1021,7 @@ namespace TensorSharp.Runtime
             return true;
         }
 
-        private static double ToNumber(object val)
+        private static double ToNumber(object? val)
         {
             if (val is int i) return i;
             if (val is double d) return d;
@@ -1025,7 +1030,7 @@ namespace TensorSharp.Runtime
             return 0;
         }
 
-        private static bool Compare(object lhs, object rhs, string op)
+        private static bool Compare(object? lhs, object? rhs, string op)
         {
             if (op == "==") return Equals(lhs, rhs);
             if (op == "!=") return !Equals(lhs, rhs);
@@ -1040,7 +1045,7 @@ namespace TensorSharp.Runtime
             };
         }
 
-        private static new bool Equals(object a, object b)
+        private static new bool Equals(object? a, object? b)
         {
             if (a == null && b == null) return true;
             if (a == null || b == null) return false;
@@ -1050,7 +1055,7 @@ namespace TensorSharp.Runtime
             return a.ToString() == b.ToString();
         }
 
-        private static bool ContainsValue(object collection, object needle)
+        private static bool ContainsValue(object? collection, object? needle)
         {
             if (collection is string s && needle is string sub)
                 return s.Contains(sub);
@@ -1065,14 +1070,14 @@ namespace TensorSharp.Runtime
             return false;
         }
 
-        private static object GetAttr(object obj, string attr)
+        private static object? GetAttr(object? obj, string attr)
         {
             if (obj is IDictionary<string, object> dict)
                 return dict.TryGetValue(attr, out var v) ? v : null;
             return null;
         }
 
-        private static object GetItem(object obj, object key)
+        private static object? GetItem(object? obj, object? key)
         {
             if (obj is IDictionary<string, object> dict && key is string sk)
                 return dict.TryGetValue(sk, out var v) ? v : null;
@@ -1089,7 +1094,7 @@ namespace TensorSharp.Runtime
             return null;
         }
 
-        private static object SliceCollection(object obj, string sliceExpr, Context ctx)
+        private static object? SliceCollection(object? obj, string sliceExpr, Context ctx)
         {
             // Handle step-based slicing like [::-1]
             var colonParts = sliceExpr.Split(':');
@@ -1140,7 +1145,7 @@ namespace TensorSharp.Runtime
             return null;
         }
 
-        private static object CallMethod(object obj, string method, string argsStr, Context ctx)
+        private static object? CallMethod(object? obj, string method, string argsStr, Context ctx)
         {
             switch (method)
             {
@@ -1149,7 +1154,7 @@ namespace TensorSharp.Runtime
                     var args = SplitArgs(argsStr);
                     if (args.Count == 0) return null;
                     var key = EvalExpr(args[0], ctx);
-                    object result = GetItem(obj, key);
+                    object? result = GetItem(obj, key);
                     if (result == null && args.Count > 1)
                         result = EvalExpr(args[1], ctx);
                     return result;
@@ -1203,7 +1208,7 @@ namespace TensorSharp.Runtime
                     if (obj is IList<object> list)
                     {
                         var args = SplitArgs(argsStr);
-                        if (args.Count > 0) list.Add(EvalExpr(args[0], ctx));
+                        if (args.Count > 0) list.Add(EvalExpr(args[0], ctx)!);
                     }
                     return obj;
                 }
@@ -1212,11 +1217,11 @@ namespace TensorSharp.Runtime
             }
         }
 
-        private static object ApplyFilter(object val, string filter, Context ctx)
+        private static object? ApplyFilter(object? val, string filter, Context ctx)
         {
             // filter might have args: default('value')
             string filterName = filter;
-            string filterArgs = null;
+            string? filterArgs = null;
             int paren = filter.IndexOf('(');
             if (paren > 0)
             {
@@ -1292,7 +1297,7 @@ namespace TensorSharp.Runtime
             }
         }
 
-        private static List<object> ToList(object val)
+        private static List<object> ToList(object? val)
         {
             if (val is IList<object> list) return new List<object>(list);
             if (val is IDictionary<string, object> dict)

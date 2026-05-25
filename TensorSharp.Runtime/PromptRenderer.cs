@@ -17,8 +17,8 @@ namespace TensorSharp.Runtime
             string template,
             List<ChatMessage> messages,
             bool addGenerationPrompt = true,
-            string architecture = null,
-            List<ToolFunction> tools = null,
+            string? architecture = null,
+            List<ToolFunction>? tools = null,
             bool enableThinking = false)
         {
             return ChatTemplate.RenderFromGgufTemplate(

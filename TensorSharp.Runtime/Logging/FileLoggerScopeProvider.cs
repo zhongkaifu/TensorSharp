@@ -27,12 +27,12 @@ namespace TensorSharp.Runtime.Logging
     /// </summary>
     internal sealed class FileLoggerScopeProvider
     {
-        private static readonly AsyncLocal<Scope> Current = new();
+        private static readonly AsyncLocal<Scope?> Current = new();
 
         public IDisposable Push<TState>(TState state)
         {
             var parent = Current.Value;
-            var scope = new Scope(state, parent);
+            var scope = new Scope(state!, parent);
             Current.Value = scope;
             return scope;
         }
@@ -76,10 +76,10 @@ namespace TensorSharp.Runtime.Logging
         private sealed class Scope : IDisposable
         {
             public object State { get; }
-            public Scope Parent { get; }
+            public Scope? Parent { get; }
             public bool Disposed { get; private set; }
 
-            public Scope(object state, Scope parent)
+            public Scope(object state, Scope? parent)
             {
                 State = state;
                 Parent = parent;

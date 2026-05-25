@@ -19,6 +19,7 @@
 //   - GEGLU split: out = gelu(gate) * up          (Gemma 4 MoE; tanh-approx
 //                                                  GELU matching llama.cpp's
 //                                                  GGML_GLU_OP_GEGLU)
+//   - ReLU squared: out = relu(up)^2              (Nemotron-H MoE)
 //
 // Two weight layouts are supported:
 //   - Fused gate_up: gate weight has ne1 = 2*n_ff, up_data is null.
@@ -147,6 +148,7 @@ namespace
             MOE_ACT_SWIGLU_SPLIT = 0, // silu(gate) * up
             MOE_ACT_SWIGLU_OAI   = 1, // gpt-oss clamped variant
             MOE_ACT_GEGLU_SPLIT  = 2, // gelu(gate) * up   (Gemma 4 MoE)
+            MOE_ACT_RELU_SQUARED = 3, // relu(up)^2        (Nemotron-H MoE)
         };
 
     // Parameter bag for the unified MoE FFN graph builder. The two public
@@ -281,7 +283,8 @@ namespace
             return 0;
         }
 
-        const bool fused_gate_up = (up_data == nullptr);
+        const bool single_projection_activation = (activation_type == MOE_ACT_RELU_SQUARED);
+        const bool fused_gate_up = (up_data == nullptr) && !single_projection_activation;
         const std::int64_t expected_gate_ne1 = fused_gate_up
             ? static_cast<std::int64_t>(2) * n_ff
             : static_cast<std::int64_t>(n_ff);
@@ -294,7 +297,12 @@ namespace
             set_last_error("MoE prefill: gate weight pointer/shape mismatch.");
             return 0;
         }
-        if (!fused_gate_up &&
+        if (single_projection_activation && up_data != nullptr)
+        {
+            set_last_error("MoE prefill: ReLU-squared activation expects up_data to be null; pass the up projection as gate_data.");
+            return 0;
+        }
+        if (!fused_gate_up && !single_projection_activation &&
             (up_ne0 != static_cast<std::int64_t>(hidden_dim) ||
              up_ne1 != static_cast<std::int64_t>(n_ff) ||
              up_total_bytes <= 0))
@@ -355,7 +363,7 @@ namespace
             ctx, static_cast<ggml_type>(gate_type),
             gate_ne0, gate_ne1, num_experts);
         ggml_tensor* up_w = nullptr;
-        if (!fused_gate_up)
+        if (!fused_gate_up && !single_projection_activation)
         {
             up_w = ggml_new_tensor_3d(
                 ctx, static_cast<ggml_type>(up_type),
@@ -387,7 +395,7 @@ namespace
         {
             gate_bias_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gate_bias_dim, num_experts);
         }
-        if (!fused_gate_up && up_bias != nullptr)
+        if (!fused_gate_up && !single_projection_activation && up_bias != nullptr)
         {
             up_bias_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, num_experts);
         }
@@ -399,7 +407,7 @@ namespace
         if (hidden_t == nullptr || hidden_out_t == nullptr ||
             gate_w == nullptr || down_w == nullptr ||
             ids_t == nullptr || weights_t == nullptr ||
-            (!fused_gate_up && up_w == nullptr))
+            (!fused_gate_up && !single_projection_activation && up_w == nullptr))
         {
             set_last_error("MoE prefill: failed to create ggml tensors.");
             return 0;
@@ -418,7 +426,25 @@ namespace
         ggml_tensor* gate_proj = nullptr;
         ggml_tensor* up_proj = nullptr;
 
-        if (fused_gate_up)
+        if (single_projection_activation)
+        {
+            gate_proj = ggml_mul_mat_id(ctx, gate_w, cur_3d, ids_t);
+            if (gate_proj == nullptr)
+            {
+                set_last_error("MoE prefill: ggml_mul_mat_id(up) failed.");
+                return 0;
+            }
+            if (gate_bias_t != nullptr)
+            {
+                gate_proj = ggml_add_id(ctx, gate_proj, gate_bias_t, ids_t);
+                if (gate_proj == nullptr)
+                {
+                    set_last_error("MoE prefill: ggml_add_id(up_bias) failed.");
+                    return 0;
+                }
+            }
+        }
+        else if (fused_gate_up)
         {
             // gate_w shape: [hidden_dim, 2*n_ff, num_experts]
             // result shape: [2*n_ff, n_used, seq_len]
@@ -473,7 +499,7 @@ namespace
             }
         }
 
-        if (gate_proj == nullptr || up_proj == nullptr)
+        if (gate_proj == nullptr || (!single_projection_activation && up_proj == nullptr))
         {
             set_last_error("MoE prefill: failed to build gate/up projections.");
             return 0;
@@ -491,6 +517,17 @@ namespace
             case MOE_ACT_GEGLU_SPLIT:
                 activated = ggml_geglu_split(ctx, gate_proj, up_proj);
                 break;
+            case MOE_ACT_RELU_SQUARED:
+            {
+                ggml_tensor* relu_out = ggml_relu(ctx, gate_proj);
+                if (relu_out == nullptr)
+                {
+                    set_last_error("MoE prefill: ReLU activation node creation failed.");
+                    return 0;
+                }
+                activated = ggml_sqr(ctx, relu_out);
+                break;
+            }
             default:
                 set_last_error("MoE prefill: unknown activation_type.");
                 return 0;
@@ -498,7 +535,7 @@ namespace
 
         if (activated == nullptr)
         {
-            set_last_error("MoE prefill: SwiGLU activation node creation failed.");
+            set_last_error("MoE prefill: activation node creation failed.");
             return 0;
         }
 
@@ -649,7 +686,7 @@ namespace
         // calls), falling back to host-ptr mapping or deferred upload.
         bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
             static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers);
-        if (!fused_gate_up)
+        if (!fused_gate_up && !single_projection_activation)
         {
             bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
                 static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers);
@@ -913,12 +950,15 @@ extern "C"
     //                          pointer of expert 0 for free; otherwise the
     //                          caller stacks them at model load time.
     // up_data == nullptr:      indicates a fused gate_up weight (gate_ne1 must
-    //                          be 2 * n_ff). Mirrors llama.cpp's gate_up_exps
-    //                          path where supported.
+    //                          be 2 * n_ff), except for activation_type=3
+    //                          where gate_data is the single up projection.
+    //                          Mirrors llama.cpp's gate_up_exps path where
+    //                          supported.
     // activation_type:         0 = silu(gate) * up (regular SwiGLU split)
     //                          1 = swiglu_oai (gpt-oss clamped variant). Uses
     //                              oai_alpha and oai_limit.
     //                          2 = gelu(gate) * up (Gemma 4 MoE GEGLU split).
+    //                          3 = relu(up)^2 (Nemotron-H MoE).
     TSG_EXPORT int TSGgml_MoEFFNPrefillSwiGLUQuantF32(
         float* hidden_in,
         float* hidden_out,

@@ -47,7 +47,7 @@ namespace TensorSharp.Runtime
 
         public BpeTokenizer(string[] vocab, int[] tokenTypes, string[] merges,
             int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos,
-            string preTokenizerType = null)
+            string? preTokenizerType = null)
         {
             _vocab = vocab;
             _tokenTypes = tokenTypes;
@@ -100,7 +100,7 @@ namespace TensorSharp.Runtime
         public List<int> Encode(string text, bool addSpecial = true)
         {
             var specials = GetSpecialTokens();
-            var fragments = new List<(string text, List<int> ids)>();
+            var fragments = new List<(string text, List<int>? ids)>();
             fragments.Add((text, null));
 
             foreach (var special in specials)
@@ -108,7 +108,7 @@ namespace TensorSharp.Runtime
                 int id = _vocabLookup.TryGetValue(special, out var sid) ? sid : -1;
                 if (id < 0) continue;
 
-                var newFragments = new List<(string text, List<int> ids)>();
+                var newFragments = new List<(string text, List<int>? ids)>();
                 foreach (var frag in fragments)
                 {
                     if (frag.ids != null)

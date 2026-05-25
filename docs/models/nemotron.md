@@ -6,7 +6,7 @@
 |---|---|
 | Provider | NVIDIA |
 | GGUF architecture keys | `nemotron_h`, `nemotron_h_moe` |
-| Source class | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs) |
+| Source class | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs) (legacy per-seq) + [`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs) (RADIO / v2_vl ViT) |
 | Image processor | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | Audio frontend | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs) (Parakeet-style log-mel) |
@@ -14,6 +14,7 @@
 | Modalities | Text, image (Omni-class with `mmproj` loaded). Audio is preprocessed for Omni distributions but inference requires a Parakeet `mmproj` that is not shipped with these GGUFs. |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
+| Batched / paged forward | **Opt-in** — set `TS_NEMOTRON_BATCHED=1`. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
 | Output parser | `Qwen3OutputParser` |
 
 ## 1. Origin and intent
@@ -238,7 +239,10 @@ Mirrors NVIDIA's RADIO / CLIP-style ViT used by the v2_vl projector:
 1. Composite RGBA over white background.
 2. Choose a tile grid that best matches the source aspect ratio (max
    `maxTiles`), or run dynamic-resolution mode if min/max patches metadata
-   is present.
+   is present. Runtime inference caps tiled images to 1 tile by default to
+   keep first-token latency practical for server image chats; set
+   `TS_NEMOTRON_IMAGE_MAX_TILES=12` (or the model's advertised max) to restore
+   full-resolution tiling.
 3. Bicubic resize to `gridW * imageSize × gridH * imageSize` (or dynamic
    patch grid).
 4. Crop into `imageSize × imageSize` tiles, channel-first `[C, H, W]`.
@@ -378,6 +382,13 @@ when a GPU backend is selected.
 - **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
   through the SSM scan; chunked parallel scanning is on the optimization
   list.
+- **Multimodal prefill** supports chunked server prefill by slicing prepared
+  image/audio embedding spans per prompt chunk, so long image prompts no longer
+  have to run as one monolithic forward pass.
+- **Multimodal warmup** runs a tiny vision encode plus an image-token prefill
+  during server startup when a Nemotron `mmproj` is loaded. This shifts Metal
+  pipeline setup away from the first real image request; set
+  `TS_NEMOTRON_MULTIMODAL_WARMUP=0` to disable it.
 
 ## 9. Decode optimization
 
@@ -432,7 +443,95 @@ near-peak vector throughput.
   therefore is not enabled for Nemotron-H — the server falls back to a full
   reset between turns.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+Nemotron-H ships an opt-in `IBatchedPagedModel.ForwardBatch`
+([`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs))
+that runs through the shared `InferenceEngine` continuous-batching stack
+([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
+Enable it by setting `TS_NEMOTRON_BATCHED=1` (default OFF).
+
+Nemotron-H is the most demanding of the batched ports because it
+combines **three different layer types** — Mamba2 SSM, attention-only,
+and FFN (dense or MoE) — and Mamba2 is recurrent (per-sequence state).
+The batched path therefore needs two orthogonal caches:
+
+### Attention layers — paged K/V
+
+- Mirrors Mistral 3 layout
+  (`[numBlocks * blockSize * numKvHeads * headDim]` per layer).
+- No RoPE — Nemotron-H attention layers carry no positional encoding.
+- Per-sequence attention dispatch via `ManagedPagedAttention.Forward`
+  (the pure-C# online-softmax kernel) as the correctness reference. The
+  native paged kernel path is also wired through `GgmlBasicOps`.
+
+### Mamba2 layers — per-slot conv + SSM state pool
+
+Each sequence's recurrent state lives in a slot keyed on its **primary
+block id** (matching vLLM's `state_indices_tensor`):
+
+- `_nemoSlotMamba2NativeDecodeProjected[layer][slot]` — per-slot conv
+  ring buffer.
+- `_nemoSlotMamba2NativeDecodeHidden[layer][slot]` — per-slot SSM state.
+- `_nemoSlotMamba2NativeDecodeStateInitialized[layer][slot]` —
+  initialization flag.
+
+Slots are allocated lazily on first touch and freed when the engine
+retires the sequence.
+
+A **native batched Mamba2 step kernel** —
+`TSGgml_NemotronMamba2BatchedStepF32`
+([`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp))
+— is gated behind `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`. It uses NEON
+SIMD + GCD per-head parallelism (mirrors the Qwen 3.5 batched GDN
+kernel structure) and replaces N C# `Mamba2Block` calls with one native
+dispatch plus batched `ssm_in` / `ssm_out` projections. Exposed through
+`GgmlBasicOps.NemotronMamba`.
+
+### FFN — dense and MoE
+
+- Dense FFN runs token-parallel ReLU² (`up → ReLU² → down`) across the
+  entire batched token axis in a single matmul per projection.
+- MoE FFN runs through the existing `MoEForward` token-parallel router
+  + per-token expert dispatch (no new batched-MoE kernel for
+  Nemotron-H yet).
+
+### Multimodal in the batched path
+
+Vision and audio embeddings inject directly into the batched
+`[numTokens, hidden]` tensor via the same row-wise
+`InjectMultimodalEmbeddings` path the legacy forward uses.
+`SupportsBatchedMultimodal` returns true when the opt-in env var is set.
+
+### Verified correctness and throughput
+
+- **100% greedy match** vs legacy on text-only prompts
+  ([`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)).
+- Multimodal-prompt correctness is structurally validated (text-only
+  stays 100% after removing the multimodal pre-flight rejection) but
+  lacks a local audio/image fixture for end-to-end verification.
+
+**Throughput on NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ2_XXS
+(Apple M4 Pro, GgmlMetal, legacy-vs-batched in-process toggle in
+[`NemotronBatchedPerfBench`](../../InferenceWeb.Tests/NemotronBatchedPerfBench.cs))**:
+
+| Path | n=1 | n=3 | n=5 |
+|---|---|---|---|
+| Batched + managed Mamba2 step | 1.94× | 3.43× | 1.67× |
+| Batched + native Mamba2 step (`*_NATIVE=1`) | 0.75× | **3.95×** | 2.93× |
+
+`n=1` is the only regression: batched scaffolding outweighs the benefit
+for single-sequence decode. From `n=2` onward the batched path wins
+across the board. `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` extends the
+win to multi-batch decode by replacing the C# Mamba2 inner loop with the
+native NEON kernel.
+
+A latent bug was also fixed during the port: `s_nemoBatchedOptIn` used to
+be `static readonly`, which captured the env var at class-load time —
+tests setting `TS_NEMOTRON_BATCHED=1` at runtime never actually toggled
+the path. Now exposed as a method getter (same pattern as Qwen 3.5).
+
+## 12. Output parser and chat template
 
 - `Qwen3OutputParser` is reused: `<think> ... </think>` for chain-of-thought
   reasoning and `<tool_call>{...}</tool_call>` for tool calls.
@@ -440,14 +539,16 @@ near-peak vector throughput.
   `<|im_end|>`). Multimodal placeholders include `<image>` (later expanded
   into `<img>` + N + `</img>`) and `<so_embedding>` (audio).
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
-- **Native whole-model decode** — the entire forward pass runs in managed
-  C# today. A native `NemotronModelDecode` (analogous to Qwen 3) would
-  eliminate the managed loop overhead.
-- **Native Mamba2 decode** — the SIMD-vectorized scan in
-  `Mamba2SSMStepSIMD` is already fast on CPU, but a native CUDA / Metal
-  kernel would unblock GPU-side execution of the full Mamba2 path.
+- **Native whole-model decode** — the entire legacy forward pass runs
+  in managed C# today. A native `NemotronModelDecode` (analogous to
+  Qwen 3) would eliminate the managed loop overhead on the per-seq path.
+- **Native Mamba2 decode for the legacy path** — the SIMD-vectorized
+  scan in `Mamba2SSMStepSIMD` is already fast on CPU, but a native CUDA
+  / Metal kernel would unblock GPU-side execution of the full Mamba2
+  path on the per-seq path. The batched path already has the native
+  kernel under `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`.
 - **Chunked parallel SSM scanning** — Mamba2 prefill processes tokens
   sequentially. A chunked parallel scan (à la Mamba's reference CUDA
   implementation) would dramatically improve TTFT.

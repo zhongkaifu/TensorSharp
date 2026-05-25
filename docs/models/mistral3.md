@@ -6,13 +6,14 @@
 |---|---|
 | Provider | Mistral AI |
 | GGUF architecture key | `mistral3` |
-| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) |
+| Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (legacy per-seq) + [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs) (Pixtral) |
 | Image processor | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
-| Example models | Mistral-Small-3.1-24B-Instruct |
+| Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct |
 | Modalities | Text, image |
 | Thinking mode | No |
 | Tool calling | No |
+| Batched / paged forward | **Default** — reference `IBatchedPagedModel.ForwardBatch`. Verified end-to-end on Ministral-3-14B; native paged-attention kernel ~21% faster than legacy on long context. See §11. |
 | Output parser | `PassthroughOutputParser` |
 
 ## 1. Origin and intent
@@ -308,7 +309,79 @@ Adding either would shrink decode latency and TTFT.
 - The Pixtral vision encoder dequantizes its weights to F32 at load time;
   the LM weights stay quantized when supported by the backend.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+Mistral 3 is the **reference implementation** of `IBatchedPagedModel.ForwardBatch`
+in TensorSharp ([`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)).
+It runs through the shared continuous-batching engine (`InferenceEngine` +
+`ContinuousBatchScheduler` + `BatchExecutor`) described in
+[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+
+Key properties:
+
+- **Default-on, no opt-in env var.** Continuous batching for Mistral 3 is
+  always available; the server's `--no-continuous-batching` flag forces the
+  legacy per-seq KV-swap path for every model, including Mistral 3.
+- **Per-layer paged K/V buffers** of layout
+  `[numBlocks * blockSize * numKvHeads * headDim]`, lazily grown by
+  `EnsurePagedBuffersAllocated`. The "grow" path copies existing K/V into
+  the new buffer so already-scheduled sequences don't lose their state.
+- **Fused vs. unfused QKV per layer** — `ForwardBatch` branches on
+  `_layerQkvFused[layer]` to pick between the fused `attn_qkv.weight`
+  matmul and the three independent `attn_q/k/v.weight` matmuls. Both paths
+  batch across the entire token axis in a single GEMM per layer.
+- **Per-token YaRN RoPE.** The `_ropeFreqs[]` array built at load time is
+  applied through `Ops.RoPEEx` with an explicit `positions[]` array, and
+  per-token YaRN position-dependent Q scaling
+  (`q *= 1 + beta * log(1 + floor(pos / orig_ctx))`) is performed inside
+  the batched loop so each token in the batch picks its own scale factor.
+- **K/V scatter via `slotMapping`** writes fresh K and V into the layer's
+  paged buffer at `blockId * blockSize + offset`. No KV-state extract /
+  inject between sequences in the batched path.
+- **Three paged-attention kernels selectable via `TS_PAGED_ATTN_KERNEL`**:
+  - `native` (default): `TSGgml_PagedAttentionForward` —
+    C++ memcpy gather of K/V from the paged buffer per sequence, then
+    dispatch `ggml_flash_attn_ext` (the same fused Metal/CUDA flash
+    attention kernel the legacy per-seq path uses).
+  - `tensor`: `TensorPagedAttention.Forward` — C# Tensor-based gather plus
+    `Ops.AddmmBatch` + `GgmlBasicOps.AttentionSoftmaxWithSinks` per
+    sequence. Slower than `native` because of repeated GPU dispatches.
+  - `managed`: `ManagedPagedAttention.Forward` — pure-C# online-softmax
+    loop, parallelised over `(seq, head)`. Correctness fallback on any
+    backend.
+- **Vision-embedding injection** runs upstream of the per-layer loop
+  (same path as legacy forward). The multimodal injector serialises
+  prompt preparation behind a lock for multimodal turns; text-only turns
+  prepare in parallel.
+
+**Verified correctness on the real GGUF**
+([`Mistral3BatchedForwardTests`](../../InferenceWeb.Tests/Mistral3BatchedForwardTests.cs)):
+- `Mistral3_BatchSize1_ForwardBatchMatchesLegacyTop1` — legacy top-1 =
+  batched top-1 = 1091 on a 6-token probe prompt.
+- `Mistral3_BatchSize2_DistinctSequencesProduceDistinctLogits` — two
+  diverging prompts in one batch produce distinct top-1 tokens, proving
+  the K/V is correctly partitioned.
+
+**Measured throughput on Ministral-3-14B-Instruct-2512-Q4_K_M (Apple
+M4 Pro, GgmlMetal, 4 parallel chat-style prompts)**:
+
+| Path | Long context (~800 tok/seq) wall | Tokens/sec | vs. legacy |
+|---|---|---|---|
+| Batched + Native kernel (default) | **42.37 s** | **0.6** | **1.21×** |
+| Per-sequence KV-swap (legacy GGML) | 53.95 s | 0.4 | 1.0× |
+| Batched + Tensor kernel | 71.42 s | 0.3 | 0.76× |
+| Batched + Managed kernel | 111.02 s | 0.2 | 0.49× |
+
+The native kernel beats the legacy GGML per-sequence path by ~21% on
+long context — the headline result the whole continuous-batching effort
+has been building toward.
+
+**Prefix-cache validation**: in the same long-context run the engine
+shared six full prompt blocks across the four sequences
+(`reused=1536`, `hashedCached=3`), exercising the block-hash prefix
+cache end-to-end on a real GGUF.
+
+## 12. Output parser and chat template
 
 - `PassthroughOutputParser` — Mistral 3 has no thinking / tool-call wire
   format.
@@ -319,18 +392,22 @@ Adding either would shrink decode latency and TTFT.
   expands one `<image_pad>` into the right number of placeholder tokens for
   the corresponding image's encoded length.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
-- **Native whole-model decode** — the entire forward pass is managed C#
-  with backend-dispatched matmul. A native single-call decode path
-  (analogous to Qwen 3's `TransformerModelDecode`) would remove most of the
-  managed overhead.
+- **Native whole-model decode** — the entire legacy forward pass is
+  managed C# with backend-dispatched matmul. A native single-call decode
+  path (analogous to Qwen 3's `TransformerModelDecode`) would remove most
+  of the managed overhead from the per-seq path.
 - **Fused single-graph decode** — a `Mistral3ModelDecode` GGML kernel
   would significantly improve Metal / CUDA throughput by collapsing the
-  per-layer dispatches.
+  per-layer dispatches in the legacy path.
 - **Quantized vision encoder** — Pixtral weights are currently
   dequantized to F32 at load time, increasing memory usage for image-heavy
   workloads. Supporting quantized vision weights directly would shrink the
   resident set and cut load time.
 - **Fused prefill attention** — adopting Qwen 3.5's `FusedPrefillAttention`
   approach would reduce per-layer prefill round-trips on GGML / CUDA.
+- **One batched ggml graph for the whole batch** — `ForwardBatch`
+  currently builds a separate paged-attention graph per sequence per
+  layer. Folding them into a single per-layer graph would amortise the
+  compile / launch overhead for batches with many short sequences.

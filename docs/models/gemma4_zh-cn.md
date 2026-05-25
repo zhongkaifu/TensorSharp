@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | Google |
 | GGUF 架构标识 | `gemma4` |
-| 模型类 | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs) |
+| 模型类 | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs)（旧单序列路径）+ [`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`Gemma4VisionEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.cs)（SigLIP 风格 ViT） |
 | 音频编码器 | [`Gemma4AudioEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioEncoder.cs)（USM 风格 chunked transformer） |
 | 音频前端 | [`Gemma4AudioPreprocessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioPreprocessor.cs)（16 kHz 单声道 → 128 bin log-mel） |
@@ -15,6 +15,7 @@
 | 模态 | 文本、图像、视频（帧栈）、音频 |
 | 思维链模式 | 是（`<\|channel>thought ... <channel\|>`） |
 | 工具调用 | 是（`<\|tool_call>call:name{...}<tool_call\|>`） |
+| 批处理 / 分页前向 | **默认启用** —— `IBatchedPagedModel.ForwardBatch` 处理双 head_dim、KV donor 共享、PLE 注入、SWA + 全局混合的分页 K/V 缓冲。设置 `TS_GEMMA4_BATCHED=0` 可强制回退到旧单序列 KV 交换路径。详见 §11。 |
 | 输出解析器 | `Gemma4OutputParser` |
 
 ## 1. 来源与目标
@@ -367,7 +368,80 @@ SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，
 - **共享层**：alias 到 donor 的 cache，无独立分配。
 - **量化权重绑定**：在 GGML CPU / Metal / CUDA 上零拷贝 mmap（GGUF 文件用 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`）。Direct CUDA 把量化数据上传到设备一次，释放 host 拷贝。
 
-## 11. 输出解析器与聊天模板
+## 11. 批处理 / 分页前向（连续批处理）
+
+Gemma 4 提供完整的 `IBatchedPagedModel.ForwardBatch` 移植
+（[`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs)），
+通过共享 `InferenceEngine` 连续批处理栈执行
+（[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)）。
+与多数批处理移植不同，Gemma 4 **默认启用**；设置 `TS_GEMMA4_BATCHED=0`
+可强制回退到旧单序列 KV 交换路径，用于调试或者旧的融合单调用 decode 更快
+的 batch=1 工作负载。
+
+Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它有三种引擎默认
+假设跨层一致而 Gemma 4 实际不一致的异构源：
+
+- **异构 head dim 与 KV head 数量**：local 层用 `head_dim_local`（通常
+  256）和与 global 层不同的 `num_kv_heads`（`head_dim_global` 通常 512）。
+  `EnsureGemma4PagedBuffers` 为每层分配各自的 `numKvHeads * headDim` 大小
+  的分页 K/V 缓冲。`_g4PagedKvDimPerLayer[layer]` 记录每层维度，方便
+  scatter / gather 步骤知道每层缓冲的 stride。
+- **逐层 SWA 派发**：原生分页注意力内核每次调用接受一个 `sliding_window`
+  参数。批处理路径会逐层计算 `IsLocalLayer(l) ? _slidingWindow : 0`，并
+  把它传给 `GgmlBasicOps.PagedAttentionForward` —— 这样 local 层得到 SWA
+  窗口掩码、global 层得到完整注意力 —— 都发生在同一次 `ForwardBatch` 调用
+  内部。
+- **KV donor 层别名**：24-41 层和更早的层共享 K/V。"receiver" 层的批处理缓
+  冲是 donor 层缓冲的指针别名（`BlockPool` 内部的引用计数共享），而不是单
+  独的分配。这保留了旧的 KV 共享语义，调度器无需感知别名。
+
+其余的批处理路径机制与 Mistral 3 一致：
+
+- **逐 token NeoX RoPE** 通过 `Ops.RoPEExWithFreqFactors` 派发，使用每层比例
+  / 部分频率因子与显式 `positions[]` tensor。
+- **基于 `slotMapping` 的 K/V 写入** 进入每层的分页缓冲。
+  `EnsureGemma4PagedBuffers` 在扩容时拷贝已有 K/V，保证已经在调度中的序列
+  保留状态。
+- **Per-Layer Embedding（PLE）** 在 `ForwardBatch` 开头**整批计算一次**
+  （`ComputePLE(flatTokens, hiddenStates, numTokens)`），其每层切片在 post-
+  attention residual 之后被加上，与旧路径的注入点一致。
+- **多模态嵌入注入** 走与旧 forward 相同的逐行 `InjectMultimodalEmbeddings`
+  路径；嵌入会按正确的绝对 token 位置写入拼接后的批处理 hidden state。
+
+**已验证的正确性**
+（[`Gemma4BatchedForwardTests`](../../InferenceWeb.Tests/Gemma4BatchedForwardTests.cs)）：
+- 全部 42 层（SWA + GQA + PLE + KV-donor 共享自 L24+）的逐层校验和与旧
+  unfused 路径在 FP 噪声范围内一致。
+- Logit cosine ≥ 0.99，与旧的非批处理路径对比。
+- `EngineParallelInferenceTests.Gemma4_ThreeLongGenerationsParallel` 通过引擎
+  验证多序列批处理路径。
+
+**吞吐**（gemma-4-E4B-it-Q8_0、Apple M4 Pro、GgmlMetal —— 进程内切换
+`TS_GEMMA4_BATCHED`，详见
+[`Gemma4BatchedPerfBench.cs`](../../InferenceWeb.Tests/Gemma4BatchedPerfBench.cs)）：
+
+| 工作负载 | n | Prompt token | 旧 tps | 批处理 tps | 加速 |
+|---|---|---|---|---|---|
+| 单序列短 prompt | 1 | 29 | 14.0 | 4.9 | **0.35×**（批处理慢） |
+| 5 个并行短 prompt | 5 | 142 | 10.2 | 13.5 | **1.32×** |
+| 8 个并行短 prompt | 8 | 218 | 10.0 | 15.1 | **1.51×** |
+| 4 个并行长 prompt | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
+
+加速随 batch 大小增长：batch=8 短 prompt 时分页图构建 / gather 开销已被完
+全摊销。单序列是净亏，因为旧的融合单调用 decode 在没有批处理摊销的情况下
+快约 3 倍 —— 这也是 `TS_GEMMA4_BATCHED=0` 存在的原因（用于 batch=1 工作
+负载）。
+
+**移植过程中修复的两个已知 bring-up bug**（现已纳入回归测试）：
+
+1. `TSGgml_PagedAttentionForward` 在 permute Q 后没有调用 `ggml_cont`。当
+   Q 是非连续 view 时，Metal 上的 `ggml_flash_attn_ext` 会静默产出错误结果。
+2. `EnsurePagedBuffers` 之前在扩容时会破坏性重建 K/V 数组，把同一 batch 中
+   先调度过的序列已经写入的 K/V 抹掉。第一个序列在后续序列加入后做首次
+   decode 时会退化为单 token 循环。修复（grow-on-copy）也用于 Mistral 3
+   和 Qwen 3。
+
+## 12. 输出解析器与聊天模板
 
 `Gemma4OutputParser` 处理两种结构化包装：
 
@@ -376,7 +450,7 @@ SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，
 
 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
 
-## 12. 优化机会
+## 13. 优化机会
 
 - **Gemma 4 融合 MoE GPU kernel** —— MoE 层目前会让 `Gemma4ModelDecode` 与 `Gemma4LayerPrefill` 都不可用。仿照 Qwen 3.5 的 `MoEExpertsSwiGLUResidual` 实现一套批量 expert kernel 可以恢复融合 decode / prefill 图的加速。（下文的 expert-batched FFN 已经把未融合路径里的顺序 per-expert 派发去掉了。）
 - **GPU 上的音频 prefill** —— 音频编码器的 conv 子采样仍跑在 CPU。把 conv 栈搬到 Metal / CUDA 可以降低长音频提示的 TTFT。

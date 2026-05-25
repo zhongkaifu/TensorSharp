@@ -62,6 +62,7 @@ namespace TensorSharp.Models
         public int HiddenSize => _hiddenSize;
         public int PatchSize => _patchSize;
         public int ImageSize => _imageSize;
+        public int NumChannels => _numChannels;
         public int ProjectionDim => _projectionDim;
         public int ScaleFactor => _scaleFactor;
         public NemotronImageProcessor ImageProcessor => _imageProcessor;
@@ -122,6 +123,11 @@ namespace TensorSharp.Models
                 projectorScaleFactor: _scaleFactor,
                 imageMean: mean,
                 imageStd: std);
+            if (_imageProcessor.MaxTiles != (int)maxTiles)
+            {
+                Console.WriteLine($"  Image tiling cap: maxTiles={_imageProcessor.MaxTiles} " +
+                    $"(model={maxTiles}; set TS_NEMOTRON_IMAGE_MAX_TILES={maxTiles} for full-resolution tiling)");
+            }
         }
 
         private void LoadWeights(GgufFile gguf)

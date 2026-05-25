@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Server
 {
@@ -14,6 +15,7 @@ namespace TensorSharp.Server
         // `ggml_cpu` is the native GGML CPU backend, while `cpu` is the pure C# backend.
         private static readonly BackendDescriptor[] BackendDescriptors =
         {
+            new("mlx", "MLX Metal (GPU)", null, AlwaysAvailable: false),
             new("cuda", "CUDA (cuBLAS GPU)", null, AlwaysAvailable: false),
             new("ggml_metal", "GGML Metal (GPU)", GgmlBackendType.Metal, AlwaysAvailable: false),
             new("ggml_cuda", "GGML CUDA (GPU)", GgmlBackendType.Cuda, AlwaysAvailable: false),
@@ -23,14 +25,18 @@ namespace TensorSharp.Server
 
         internal static IReadOnlyList<BackendOption> GetSupportedBackends(
             Func<GgmlBackendType, bool> isGgmlBackendAvailable = null,
-            Func<bool> isCudaBackendAvailable = null)
+            Func<bool> isCudaBackendAvailable = null,
+            Func<bool> isMlxBackendAvailable = null)
         {
             isGgmlBackendAvailable ??= IsGgmlBackendAvailable;
             isCudaBackendAvailable ??= CudaBackend.IsAvailable;
+            isMlxBackendAvailable ??= MlxBackend.IsAvailable;
 
             return BackendDescriptors
                 .Where(descriptor => descriptor.AlwaysAvailable ||
-                    (descriptor.GgmlBackendType.HasValue
+                    (string.Equals(descriptor.Value, "mlx", StringComparison.OrdinalIgnoreCase)
+                        ? isMlxBackendAvailable()
+                        : descriptor.GgmlBackendType.HasValue
                         ? isGgmlBackendAvailable(descriptor.GgmlBackendType.Value)
                         : isCudaBackendAvailable()))
                 .Select(descriptor => new BackendOption(descriptor.Value, descriptor.Label))
@@ -56,6 +62,7 @@ namespace TensorSharp.Server
 
             return backend.Trim().ToLowerInvariant() switch
             {
+                "mlx" or "mlx_metal" or "mlx-metal" => "mlx",
                 "cuda" or "direct_cuda" or "direct-cuda" => "cuda",
                 "ggml_cuda" or "ggml-cuda" => "ggml_cuda",
                 "ggml_metal" => "ggml_metal",
@@ -69,6 +76,7 @@ namespace TensorSharp.Server
         {
             return backendType switch
             {
+                BackendType.Mlx => "mlx",
                 BackendType.Cuda => "cuda",
                 BackendType.GgmlMetal => "ggml_metal",
                 BackendType.GgmlCuda => "ggml_cuda",

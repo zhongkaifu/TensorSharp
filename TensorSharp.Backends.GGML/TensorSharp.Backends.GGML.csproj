@@ -6,6 +6,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
     <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
     <Description>GGML backend integration for TensorSharp, including native interop for CPU, Metal, and GGML CUDA execution.</Description>
     <PackageTags>$(TensorSharpPackageTags);backend;ggml;metal;native;cuda</PackageTags>
   </PropertyGroup>

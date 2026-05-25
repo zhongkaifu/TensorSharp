@@ -81,7 +81,7 @@ namespace TensorSharp.Runtime.Logging
             }
         }
 
-        public bool TryDequeue(out LogEntry entry) => _entries.TryDequeue(out entry);
+        public bool TryDequeue(out LogEntry? entry) => _entries.TryDequeue(out entry);
 
         public void SignalShutdown()
         {

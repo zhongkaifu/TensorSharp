@@ -19,6 +19,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -176,8 +177,11 @@ namespace TensorSharp.Models
                 return;
 
             IntPtr currentData = _data;
+            bool wasExternalView = !_ownsBuffer && _ownerToken != null;
             if (_ownsBuffer)
                 FreeBuffer(currentData);
+            else if (wasExternalView)
+                AdviseExternalViewCanBePagedOut(currentData, RawBytes);
 
             if (CacheKey == currentData)
                 CacheKey = IntPtr.Zero;
@@ -200,6 +204,38 @@ namespace TensorSharp.Models
             if (ptr != IntPtr.Zero)
                 NativeMemory.AlignedFree(ptr.ToPointer());
         }
+
+        private static unsafe void AdviseExternalViewCanBePagedOut(IntPtr data, long byteCount)
+        {
+            if (data == IntPtr.Zero || byteCount <= 0)
+                return;
+            if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsLinux())
+                return;
+
+            long pageSize = Environment.SystemPageSize;
+            long address = data.ToInt64();
+            long pageMask = ~(pageSize - 1);
+            long alignedAddress = address & pageMask;
+            long prefixBytes = address - alignedAddress;
+            ulong length = checked((ulong)(byteCount + prefixBytes));
+            ulong roundedLength = (length + (ulong)pageSize - 1) & ~((ulong)pageSize - 1);
+
+            try
+            {
+                _ = madvise((void*)alignedAddress, (nuint)roundedLength, MadvDontNeed);
+            }
+            catch (DllNotFoundException)
+            {
+            }
+            catch (EntryPointNotFoundException)
+            {
+            }
+        }
+
+        private const int MadvDontNeed = 4;
+
+        [DllImport("libc", SetLastError = true, EntryPoint = "madvise")]
+        private static extern unsafe int madvise(void* addr, nuint len, int advice);
     }
 
     /// <summary>
@@ -288,6 +324,7 @@ namespace TensorSharp.Models
         protected readonly Dictionary<string, StackedExpertWeights> _stackedExpertWeights = new();
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
+        private bool _mlxQuantWeightsPrepared;
 
         protected int _cacheSeqLen;
         protected int _maxContextLength;
@@ -339,6 +376,20 @@ namespace TensorSharp.Models
 
         public KvCacheDtype KvCacheDtype => _kvCacheDtype;
 
+        /// <summary>
+        /// Map the model's KV-cache storage dtype to the codec element type
+        /// the paged tier's optional TurboQuant codec uses to interpret the
+        /// raw block bytes. Q8_0 caches bypass the codec entirely (the bytes
+        /// are already 8-bit quantized with their own per-block scale).
+        /// </summary>
+        public virtual KvCodecElementType KVStateElementType => _kvCacheDtype switch
+        {
+            KvCacheDtype.F32 => KvCodecElementType.Float32,
+            KvCacheDtype.F16 => KvCodecElementType.Float16,
+            KvCacheDtype.Q8_0 => KvCodecElementType.Q8_0,
+            _ => KvCodecElementType.Float32,
+        };
+
         public int MaxContextLength => _maxContextLength;
         public int CacheSeqLen => _cacheSeqLen;
 
@@ -371,6 +422,10 @@ namespace TensorSharp.Models
                     break;
                 case BackendType.Cuda:
                     _allocator = new CudaAllocator(0);
+                    break;
+                case BackendType.Mlx:
+                    MlxBackend.Register();
+                    _allocator = new MlxAllocator(0);
                     break;
                 case BackendType.Cpu:
                     _allocator = new CpuAllocator(BlasEnum.DotNet);
@@ -446,11 +501,20 @@ namespace TensorSharp.Models
 
         protected int ResolveInitialCacheAllocationLength(int requestedContextLength, int gpuDefault = 8192)
         {
-            // GPU backends (CUDA, Metal) can be sensitive to allocating a multi-gigabyte KV
+            return ResolveInitialCacheAllocationLength(_backend, requestedContextLength, gpuDefault);
+        }
+
+        internal static int ResolveInitialCacheAllocationLength(BackendType backend, int requestedContextLength, int gpuDefault = 8192)
+        {
+            // GPU backends can be sensitive to allocating a multi-gigabyte KV
             // cache up-front when the model advertises a 256K+ context window. Cap the initial
             // allocation and let the cache grow on demand when actual prompts approach the
             // limit. CPU backends have no such constraint and use the full requested length.
-            bool isGpuBackend = _backend == BackendType.GgmlCuda || _backend == BackendType.GgmlMetal;
+            bool isGpuBackend =
+                backend == BackendType.Cuda ||
+                backend == BackendType.Mlx ||
+                backend == BackendType.GgmlCuda ||
+                backend == BackendType.GgmlMetal;
             if (isGpuBackend &&
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
             {
@@ -460,7 +524,8 @@ namespace TensorSharp.Models
             return requestedContextLength;
         }
 
-        protected bool ShouldZeroFillCacheTensors => _backend != BackendType.GgmlCuda;
+        protected bool ShouldZeroFillCacheTensors =>
+            _backend != BackendType.GgmlCuda && _backend != BackendType.Mlx;
 
         protected void InitializeCacheTensor(Tensor tensor)
         {
@@ -627,6 +692,9 @@ namespace TensorSharp.Models
             if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
                 return false;
 
+            if (backend == BackendType.Mlx && !MlxQuantizedOps.SupportsQuantizedType(info.Type))
+                return false;
+
             if (info.Shape.Length == 2)
                 return true;
 
@@ -650,6 +718,7 @@ namespace TensorSharp.Models
         protected bool CanUseFileMappedQuantizedWeights
             => _backend == BackendType.GgmlCuda
             || _backend == BackendType.Cuda
+            || _backend == BackendType.Mlx
             || _backend == BackendType.GgmlMetal
             || _backend == BackendType.GgmlCpu;
 
@@ -795,9 +864,21 @@ namespace TensorSharp.Models
 
         protected void PrepareCudaQuantizedWeightsForInference()
         {
+            if (_backend == BackendType.Mlx)
+            {
+                PrepareMlxQuantizedWeightsForInference();
+                return;
+            }
+
             if (_backend == BackendType.Cuda)
             {
                 PrepareDirectCudaQuantizedWeightsForInference();
+                return;
+            }
+
+            if (_backend == BackendType.GgmlMetal)
+            {
+                PrepareGgmlMetalQuantizedWeightsForInference();
                 return;
             }
 
@@ -845,6 +926,233 @@ namespace TensorSharp.Models
 
             if (preloadedCount > 0)
                 Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+        }
+
+        private void PrepareMlxQuantizedWeightsForInference()
+        {
+            if (_mlxQuantWeightsPrepared || _quantWeights.Count == 0)
+                return;
+
+            if (_allocator is not MlxAllocator mlxAllocator)
+                return;
+
+            long fallbackBytes = MlxHostFallbackQuantizedBytes();
+            long nativeBytes = MlxNativePreloadableQuantizedBytes();
+            if (fallbackBytes > 0)
+            {
+                Console.WriteLine(
+                    $"  MLX eager quantized preload: {nativeBytes / 1024 / 1024} MB native-capable weights will be device-resident; " +
+                    $"{fallbackBytes / 1024 / 1024} MB fallback quantized weights remain file-backed.");
+            }
+
+            bool offloadEnabled = MoeExpertOffload.IsEnabled;
+            long preloadedBytes = 0;
+            int preloadedCount = 0;
+            long deferredBytes = 0;
+            int deferredCount = 0;
+            long zeroCopyExpertBytes = 0;
+            int zeroCopyExpertCount = 0;
+            long fallbackExpertBytes = 0;
+            int fallbackExpertCount = 0;
+            int mappedHostViews = 0;
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                if (qw.HasExternalHostView)
+                    mappedHostViews++;
+            }
+
+            foreach (var kv in _quantWeights)
+            {
+                string weightName = kv.Key;
+                QuantizedWeight qw = kv.Value;
+                if (!qw.HasHostData)
+                    continue;
+
+                bool isExpert = offloadEnabled && MoeExpertOffload.IsExpertWeightName(weightName);
+                bool canPreload = MlxQuantizedOps.CanPreloadQuantizedType(qw.GgmlType);
+                bool preloadCopies = canPreload && MlxQuantizedOps.PreloadDuplicatesHostMemory(qw.GgmlType);
+
+                if (isExpert && !canPreload)
+                {
+                    // Host-fallback expert (e.g. IQ1_S / IQ2_XS / IQ1_M in
+                    // Nemotron's UD-IQ2_XXS): matmul runs the host-side
+                    // dequant path and never enters the MLX cache. Track for
+                    // accounting only.
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    MoeExpertOffload.RegisterOffloadable(cacheKey);
+                    if (qw.HasExternalHostView)
+                        MoeExpertOffload.AdvisePagesNotNeeded(qw.Data, qw.RawBytes);
+                    fallbackExpertBytes += qw.RawBytes;
+                    fallbackExpertCount++;
+                    continue;
+                }
+
+                if (isExpert && canPreload && preloadCopies)
+                {
+                    // Repack-kernel expert (Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 /
+                    // MXFP4, or Q5_K with TS_MLX_Q5K_RAW=0). The MLX preload
+                    // would allocate fresh MLX-managed memory and double the
+                    // residency cost; offload bypasses that by deferring the
+                    // upload to first use and bounding total residency via the
+                    // LRU. This is where the offload mechanism produces the
+                    // largest measured memory savings.
+                    IntPtr cacheKey = qw.EnsureDeviceCacheKey();
+                    MoeExpertOffload.RegisterOffloadable(cacheKey);
+                    if (qw.HasExternalHostView)
+                        MoeExpertOffload.AdvisePagesNotNeeded(qw.Data, qw.RawBytes);
+                    deferredBytes += qw.RawBytes;
+                    deferredCount++;
+                    continue;
+                }
+
+                if (isExpert && canPreload && !preloadCopies)
+                {
+                    // Raw-wrap kernel expert (Q4_K / Q6_K, IQ2_XXS / IQ2_S /
+                    // IQ3_S / IQ4_XS, or Q5_K when raw mode is enabled). The
+                    // MLX preload does NOT allocate fresh memory — it just
+                    // wraps the GGUF mmap pointer as an MLX array. The
+                    // baseline preload path's qw.ReleaseHostData() call after
+                    // upload already issues madvise(DONTNEED) on the mmap
+                    // region, letting the OS evict page-cache pages between
+                    // accesses. Routing these experts through the offload LRU
+                    // instead would just churn MlxArray wrappers without any
+                    // memory-residency win, and on Apple Silicon makes
+                    // measured RSS WORSE because lazy wrappers prevent the
+                    // OS from settling its page-cache eviction policy.
+                    //
+                    // → Fall through to the baseline-preload path below.
+                    zeroCopyExpertBytes += qw.RawBytes;
+                    zeroCopyExpertCount++;
+                }
+
+                if (!canPreload)
+                    continue;
+
+                IntPtr preloadKey = qw.EnsureDeviceCacheKey();
+                MlxQuantizedOps.PreloadQuantizedWeight(
+                    mlxAllocator,
+                    preloadKey,
+                    qw.Data,
+                    qw.GgmlType,
+                    qw.Ne0,
+                    qw.Ne1,
+                    qw.RawBytes);
+
+                preloadedBytes += qw.RawBytes;
+                preloadedCount++;
+
+                bool wasMappedView = qw.HasExternalHostView;
+                qw.ReleaseHostData();
+                if (wasMappedView)
+                    mappedHostViews--;
+            }
+
+            // Stacked-experts views are lazily uploaded by the batched-MoE matmul
+            // path (no explicit preload). Register them as offloadable so any
+            // repack-kernel batched-MoE uploads are governed by the LRU. For
+            // raw-wrap kernel stacked views (the common case — IQ2_XXS, Q4_K
+            // etc.) the LRU does no harm because no MLX-allocator memory is
+            // duplicated, and the registration is essentially a no-op there.
+            if (offloadEnabled)
+            {
+                foreach (var stacked in _stackedExpertWeights.Values)
+                    MoeExpertOffload.RegisterOffloadable(stacked.Data);
+            }
+
+            _mlxQuantWeightsPrepared = true;
+            // Keep the GGUF mmap alive whenever any quantized weight still has a
+            // file-backed view — both the existing fallback path (unpreloadable
+            // types) AND the offload path (expert weights with retained host
+            // pointers) need it to remain mapped.
+            if (mappedHostViews == 0 && preloadedCount > 0)
+                _gguf?.Dispose();
+
+            if (preloadedCount > 0 || deferredCount > 0 || zeroCopyExpertCount > 0 || fallbackExpertCount > 0)
+            {
+                var snapshot = mlxAllocator.GetMemorySnapshot();
+                Console.WriteLine(
+                    $"  MLX resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors " +
+                    $"(active {snapshot.ActiveBytes / 1024 / 1024} MB, cache {snapshot.CacheBytes / 1024 / 1024} MB, peak {snapshot.PeakBytes / 1024 / 1024} MB)");
+                if (deferredCount > 0 || zeroCopyExpertCount > 0 || fallbackExpertCount > 0)
+                {
+                    long capMb = MoeExpertOffload.MaxCacheBytes / 1024 / 1024;
+                    long totalExpertMb = (deferredBytes + zeroCopyExpertBytes + fallbackExpertBytes) / 1024 / 1024;
+                    int totalExpertCount = deferredCount + zeroCopyExpertCount + fallbackExpertCount;
+                    Console.WriteLine(
+                        $"  MoE expert weights detected: {totalExpertMb} MB across {totalExpertCount} tensors " +
+                        $"(TS_MLX_EXPERT_OFFLOAD_MB={(offloadEnabled ? capMb.ToString() : "0")})");
+                    if (deferredCount > 0)
+                    {
+                        Console.WriteLine(
+                            $"    Offload-LRU: {deferredBytes / 1024 / 1024} MB / {deferredCount} tensors are " +
+                            $"repack-kernel quants (LRU bounds MLX-allocator residency to ~{capMb} MB).");
+                    }
+                    if (zeroCopyExpertCount > 0)
+                    {
+                        Console.WriteLine(
+                            $"    Zero-copy preload: {zeroCopyExpertBytes / 1024 / 1024} MB / {zeroCopyExpertCount} tensors are " +
+                            $"raw-wrap kernel quants (no MLX allocator copy; baseline madvise upfront, OS page-cache evicts cold pages).");
+                    }
+                    if (fallbackExpertCount > 0)
+                    {
+                        Console.WriteLine(
+                            $"    Host fallback: {fallbackExpertBytes / 1024 / 1024} MB / {fallbackExpertCount} tensors use " +
+                            $"unpreloadable quant types (matmul runs via host-side dequant; OS page cache governs residency).");
+                    }
+                }
+                MlxBackend.ClearCache();
+            }
+        }
+
+        // GGML_METAL doesn't perform an eager device upload — weights are
+        // wrapped as MTLBuffer pointers around the GGUF mmap via
+        // ggml_backend_dev_buffer_from_host_ptr, so they already live in
+        // unified memory at zero extra bytes. The wrapper itself, cached
+        // in the native g_host_buffer_cache, can still keep Metal's claim
+        // on those pages and prevent the OS from paging them out. When
+        // TS_MLX_EXPERT_OFFLOAD_MB is set, we register expert host pointers
+        // with the native cache so it LRU-bounds their MTLBuffer wrappers
+        // and frees the oldest ones when the budget is exceeded.
+        private void PrepareGgmlMetalQuantizedWeightsForInference()
+        {
+            if (_quantWeights.Count == 0)
+                return;
+            if (!MoeExpertOffload.IsEnabled)
+                return;
+
+            EnsureQuantBackendAvailable();
+
+            long offloadedBytes = 0;
+            int offloadedCount = 0;
+            foreach (var kv in _quantWeights)
+            {
+                QuantizedWeight qw = kv.Value;
+                if (!qw.HasHostData)
+                    continue;
+                if (!MoeExpertOffload.IsExpertWeightName(kv.Key))
+                    continue;
+                GgmlBasicOps.RegisterOffloadable(qw.Data);
+                offloadedBytes += qw.RawBytes;
+                offloadedCount++;
+            }
+
+            // The native MoE FFN kernels look up each expert weight via
+            // try_get_cacheable_tensor_buffer keyed by `data` — the GGUF
+            // mmap pointer. The stacked-experts view points at the SAME
+            // bytes (its Data is the start of the 3D GGUF tensor, which is
+            // also the first per-expert tile's address), so the per-expert
+            // RegisterOffloadable above already covers it. We do not
+            // register stacked.Data separately because doing so would
+            // double-count the resident bytes.
+
+            if (offloadedCount > 0)
+            {
+                GgmlBasicOps.SetOffloadableBudget(MoeExpertOffload.MaxCacheBytes);
+                long capMb = MoeExpertOffload.MaxCacheBytes / 1024 / 1024;
+                Console.WriteLine(
+                    $"  GGML_METAL MoE expert offload: {offloadedBytes / 1024 / 1024} MB across {offloadedCount} tensors registered " +
+                    $"(LRU cap {capMb} MB, set TS_MLX_EXPERT_OFFLOAD_MB=0 to disable)");
+            }
         }
 
         private void PrepareDirectCudaQuantizedWeightsForInference()
@@ -921,6 +1229,59 @@ namespace TensorSharp.Models
             };
         }
 
+        protected bool TryCreateFusedQuantizedWeight(out QuantizedWeight fused, params QuantizedWeight[] weights)
+        {
+            if (_backend == BackendType.Mlx)
+                return QuantizedWeight.TryCreateConcatenatedView(out fused, weights);
+
+            fused = QuantizedWeight.ConcatOrCreateCopy(weights);
+            return true;
+        }
+
+        protected bool HasMlxHostFallbackQuantizedWeights()
+        {
+            if (_backend != BackendType.Mlx)
+                return false;
+
+            foreach (QuantizedWeight weight in _quantWeights.Values)
+            {
+                if (!MlxQuantizedOps.CanPreloadQuantizedType(weight.GgmlType))
+                    return true;
+            }
+
+            return false;
+        }
+
+        protected long MlxHostFallbackQuantizedBytes()
+        {
+            if (_backend != BackendType.Mlx)
+                return 0;
+
+            long bytes = 0;
+            foreach (QuantizedWeight weight in _quantWeights.Values)
+            {
+                if (!MlxQuantizedOps.CanPreloadQuantizedType(weight.GgmlType))
+                    bytes += weight.RawBytes;
+            }
+
+            return bytes;
+        }
+
+        protected long MlxNativePreloadableQuantizedBytes()
+        {
+            if (_backend != BackendType.Mlx)
+                return 0;
+
+            long bytes = 0;
+            foreach (QuantizedWeight weight in _quantWeights.Values)
+            {
+                if (MlxQuantizedOps.CanPreloadQuantizedType(weight.GgmlType))
+                    bytes += weight.RawBytes;
+            }
+
+            return bytes;
+        }
+
         protected unsafe void PopulateQuantizedRows(Tensor result, QuantizedWeight weight, int[] rowIndices)
         {
             if (result == null)
@@ -968,7 +1329,15 @@ namespace TensorSharp.Models
                     _quantWeights.TryGetValue(upName, out var uw) &&
                     gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                 {
-                    _quantWeights[guName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+                    // Gate-up fusion must always succeed: model FFN code expects
+                    // a single fused tensor at guName. If MLX view-fusion fails
+                    // (gate/up not contiguous in the GGUF file), fall back to a
+                    // copy. Cost is bounded — 2 tensors × per-layer, host memory
+                    // released after the MLX device upload.
+                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, gw, uw))
+                        fusedWeight = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+
+                    _quantWeights[guName] = fusedWeight;
                     _quantWeights.Remove(gateName); gw.Dispose();
                     _quantWeights.Remove(upName); uw.Dispose();
                     fused++;
@@ -1117,6 +1486,29 @@ namespace TensorSharp.Models
                 resultCuda.Dispose();
             }
 
+            if (_backend == BackendType.Mlx)
+            {
+                var resultMlx = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                using var indicesMlx = CreateIntTensor(tokens, tokens.Length);
+                if (MlxQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    resultMlx,
+                    weight.EnsureDeviceCacheKey(),
+                    weight.Data,
+                    weight.GgmlType,
+                    weight.Ne0,
+                    weight.Ne1,
+                    weight.RawBytes,
+                    indicesMlx))
+                {
+                    return resultMlx;
+                }
+
+                resultMlx.Dispose();
+            }
+
+            if (!weight.HasHostData)
+                throw new InvalidOperationException($"Quantized embedding weight type {(GgmlTensorType)weight.GgmlType} is not available on the MLX device and its host copy has been released.");
+
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
             float* dst = GetFloatPtr(result);
@@ -1125,7 +1517,11 @@ namespace TensorSharp.Models
             for (int i = 0; i < tokens.Length; i++)
             {
                 byte* rowPtr = basePtr + (long)tokens[i] * rowBytes;
-                ManagedQuantizedOps.DequantizeRowToFloat32(weight.GgmlType, (IntPtr)rowPtr, dst + (long)i * dim, dim);
+                NativeDequant.DequantizeToFloat32Native(
+                    weight.GgmlType,
+                    (IntPtr)rowPtr,
+                    (IntPtr)(dst + (long)i * dim),
+                    dim);
             }
 
             return result;
@@ -1156,6 +1552,23 @@ namespace TensorSharp.Models
                 return;
             }
 
+            if (_backend == BackendType.Mlx &&
+                MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                    result,
+                    input,
+                    weight.EnsureDeviceCacheKey(),
+                    weight.Data,
+                    weight.GgmlType,
+                    weight.Ne0,
+                    weight.Ne1,
+                    weight.RawBytes))
+            {
+                return;
+            }
+
+            if (!weight.HasHostData)
+                throw new InvalidOperationException($"Quantized linear weight type {(GgmlTensorType)weight.GgmlType} is not available on the MLX device and its host copy has been released.");
+
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             float* inputPtr = GetFloatPtr(input);
             float* resultPtr = GetFloatPtr(result);
@@ -1178,22 +1591,57 @@ namespace TensorSharp.Models
 
             void RunRange(int start, int end, float* sums)
             {
+                float[] rowScratch = null;
+                float* rowScratchPtr = null;
+                GCHandle rowScratchHandle = default;
+                bool useNativeRowFallback = !ManagedQuantizedOps.SupportsDequantization((GgmlTensorType)weight.GgmlType);
+                if (useNativeRowFallback)
+                {
+                    rowScratch = ArrayPool<float>.Shared.Rent(inDim);
+                    rowScratchHandle = GCHandle.Alloc(rowScratch, GCHandleType.Pinned);
+                    rowScratchPtr = (float*)rowScratchHandle.AddrOfPinnedObject();
+                }
+
+                try
+                {
                 for (int col = start; col < end; col++)
                 {
                     byte* rowPtr = weightBase + (long)col * rowBytes;
-                    ManagedQuantizedOps.DotRowBatchToFloat32(
-                        weight.GgmlType,
-                        (IntPtr)rowPtr,
-                        inputPtr,
-                        inDim,
-                        seqLen,
-                        inDim,
-                        sums);
+                    if (useNativeRowFallback)
+                    {
+                        NativeDequant.DequantizeToFloat32Native(
+                            weight.GgmlType,
+                            (IntPtr)rowPtr,
+                            (IntPtr)rowScratchPtr,
+                            inDim);
+
+                        for (int row = 0; row < seqLen; row++)
+                            sums[row] = VecDot(inputPtr + (long)row * inDim, rowScratchPtr, inDim);
+                    }
+                    else
+                    {
+                        ManagedQuantizedOps.DotRowBatchToFloat32(
+                            weight.GgmlType,
+                            (IntPtr)rowPtr,
+                            inputPtr,
+                            inDim,
+                            seqLen,
+                            inDim,
+                            sums);
+                    }
 
                     for (int row = 0; row < seqLen; row++)
                     {
                         resultPtr[(long)row * outDim + col] = sums[row];
                     }
+                }
+                }
+                finally
+                {
+                    if (rowScratchHandle.IsAllocated)
+                        rowScratchHandle.Free();
+                    if (rowScratch != null)
+                        ArrayPool<float>.Shared.Return(rowScratch);
                 }
             }
 
@@ -1443,6 +1891,8 @@ namespace TensorSharp.Models
             var result = new Tensor(_allocator, data.ElementType, numHeads, seqLen, headDim);
             if (CudaFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
                 return result;
+            if (MlxFusedOps.TryFlatToHeadFirst(result, data, numHeads, seqLen, headDim))
+                return result;
             result.Dispose();
 
             using var reshaped = data.View(seqLen, numHeads, headDim);
@@ -1462,6 +1912,9 @@ namespace TensorSharp.Models
 
         protected void CopyToCache(Tensor cache, Tensor src, int startPos, int seqLen)
         {
+            if (TryCopyHeadFirstToCacheMlx(cache, src, startPos, seqLen))
+                return;
+
             if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, (int)cache.Sizes[1], false))
                 return;
 
@@ -1549,6 +2002,12 @@ namespace TensorSharp.Models
             using (var kHeads = kTensor.View(numKVHeads, 1, headDim))
             using (var vHeads = vTensor.View(numKVHeads, 1, headDim))
             {
+                if (TryCopyHeadFirstToCacheMlx(kCache, kHeads, startPos, 1) &&
+                    TryCopyHeadFirstToCacheMlx(vCache, vHeads, startPos, 1))
+                {
+                    return;
+                }
+
                 int cacheSize = (int)kCache.Sizes[1];
                 if (CudaFusedOps.TryCopyHeadFirstToCache(kCache, kHeads, startPos, 1, cacheSize, false) &&
                     CudaFusedOps.TryCopyHeadFirstToCache(vCache, vHeads, startPos, 1, cacheSize, false))
@@ -1580,6 +2039,102 @@ namespace TensorSharp.Models
 
             InvalidateTensorDeviceCache(kCache);
             InvalidateTensorDeviceCache(vCache);
+        }
+
+        protected bool TryCopyHeadFirstToCacheMlx(Tensor cache, Tensor src, int startPos, int seqLen, bool circular = false)
+        {
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DEVICE_KV_COPY"), "0", StringComparison.Ordinal))
+                return false;
+
+            if (circular)
+                return TryCopyHeadFirstToCacheCircularMlx(cache, src, startPos, seqLen);
+
+            if (_backend != BackendType.Mlx
+                || cache == null
+                || src == null
+                || cache.Storage is not MlxStorage
+                || src.Storage is not MlxStorage
+                || cache.DimensionCount != 3
+                || src.DimensionCount != 3
+                || cache.Sizes[0] != src.Sizes[0]
+                || src.Sizes[1] != seqLen
+                || cache.Sizes[2] != src.Sizes[2]
+                || startPos < 0
+                || startPos + seqLen > cache.Sizes[1])
+            {
+                return false;
+            }
+
+            int heads = (int)cache.Sizes[0];
+            for (int h = 0; h < heads; h++)
+            {
+                using Tensor cacheHead = cache.Select(0, h);
+                using Tensor cacheSlice = cacheHead.Narrow(0, startPos, seqLen);
+                using Tensor srcHead = src.Select(0, h);
+                Ops.Copy(cacheSlice, srcHead);
+            }
+
+            return true;
+        }
+
+        private bool TryCopyHeadFirstToCacheCircularMlx(Tensor cache, Tensor src, int startPos, int seqLen)
+        {
+            if (_backend != BackendType.Mlx
+                || cache == null
+                || src == null
+                || cache.Storage is not MlxStorage
+                || src.Storage is not MlxStorage
+                || cache.DimensionCount != 3
+                || src.DimensionCount != 3
+                || cache.Sizes[0] != src.Sizes[0]
+                || src.Sizes[1] != seqLen
+                || cache.Sizes[2] != src.Sizes[2]
+                || startPos < 0
+                || seqLen <= 0
+                || cache.Sizes[1] <= 0)
+            {
+                return false;
+            }
+
+            int cacheSize = checked((int)cache.Sizes[1]);
+            int srcOffset = 0;
+            int remaining = seqLen;
+            int logicalStart = startPos;
+            if (remaining > cacheSize)
+            {
+                srcOffset = remaining - cacheSize;
+                logicalStart += srcOffset;
+                remaining = cacheSize;
+            }
+
+            while (remaining > 0)
+            {
+                int dstOffset = logicalStart % cacheSize;
+                int chunk = Math.Min(remaining, cacheSize - dstOffset);
+                if (!TryCopyHeadFirstRangeToCacheMlx(cache, src, srcOffset, dstOffset, chunk))
+                    return false;
+
+                srcOffset += chunk;
+                logicalStart += chunk;
+                remaining -= chunk;
+            }
+
+            return true;
+        }
+
+        private bool TryCopyHeadFirstRangeToCacheMlx(Tensor cache, Tensor src, int srcOffset, int dstOffset, int length)
+        {
+            int heads = checked((int)cache.Sizes[0]);
+            for (int h = 0; h < heads; h++)
+            {
+                using Tensor cacheHead = cache.Select(0, h);
+                using Tensor cacheSlice = cacheHead.Narrow(0, dstOffset, length);
+                using Tensor srcHead = src.Select(0, h);
+                using Tensor srcSlice = srcHead.Narrow(0, srcOffset, length);
+                Ops.Copy(cacheSlice, srcSlice);
+            }
+
+            return true;
         }
 
         private unsafe void CopyToCacheDecodeF16(Tensor kCache, Tensor kTensor,
@@ -2279,6 +2834,22 @@ namespace TensorSharp.Models
         public virtual float[] ForwardRefill(int[] tokens) => Forward(tokens);
         public abstract void ResetKVCache();
 
+        // Pipelined greedy decode (overridden by models that support it,
+        // e.g. Qwen35Model on MLX). When SupportsPipelinedGreedy is true,
+        // the inference loop can call SubmitGreedyDecodeStep to issue a
+        // decode forward that returns its predicted token as a [1] int32
+        // device tensor (host-readable via Tensor.GetElementsAsInt). This
+        // lets the loop queue the next step before host-syncing the
+        // current one — overlapping the LM-head sync wait with the next
+        // forward's first kernels.
+        public virtual bool SupportsPipelinedGreedy => false;
+        public virtual Tensor SubmitGreedyDecodeStep(int? firstTokenForBegin)
+        {
+            throw new NotSupportedException(
+                $"{GetType().Name} does not implement SubmitGreedyDecodeStep.");
+        }
+        public virtual void ResetPipelinedGreedyState() { }
+
         /// <summary>
         /// Run a tiny forward pass to force lazy kernel compilation (Metal pipelines,
         /// CUDA JIT, memory pool warm-up, etc.) so the first real inference request
@@ -2287,10 +2858,53 @@ namespace TensorSharp.Models
         /// </summary>
         public void WarmUpKernels()
         {
-            int safeToken = Math.Min(1, Config.VocabSize - 1);
+            if (_backend == BackendType.Mlx && !IsMlxKernelWarmupEnabled())
+            {
+                long nativeBytes = MlxNativePreloadableQuantizedBytes();
+                Console.WriteLine(
+                    $"  Skipping MLX kernel warmup by default ({nativeBytes / 1024 / 1024} MB of resident quantized weights). Set TS_MLX_KERNEL_WARMUP=1 to force it.");
+                ResetForwardTiming();
+                return;
+            }
+
+            if (HasMlxHostFallbackQuantizedWeights())
+            {
+                long fallbackBytes = MlxHostFallbackQuantizedBytes();
+                Console.WriteLine(
+                    $"  Skipping MLX kernel warmup: {fallbackBytes / 1024 / 1024} MB of quantized weights use GGUF row-dequant fallback.");
+                ResetForwardTiming();
+                return;
+            }
+
+            int safeToken = (Config?.VocabSize ?? 0) > 1 ? 1 : 0;
             Forward(new[] { safeToken });
             ResetKVCache();
+
+            if (_backend == BackendType.Mlx)
+            {
+                int warmupLength = 32;
+                if (MaxContextLength > 0)
+                    warmupLength = Math.Min(warmupLength, Math.Max(2, MaxContextLength / 4));
+
+                int[] warmupPrompt = new int[warmupLength];
+                Array.Fill(warmupPrompt, safeToken);
+
+                ForwardRefill(warmupPrompt);
+                Forward(new[] { safeToken });
+                ResetKVCache();
+            }
+
+            WarmUpMultimodalKernels();
             ResetForwardTiming();
+        }
+
+        public virtual void WarmUpMultimodalKernels()
+        {
+        }
+
+        private static bool IsMlxKernelWarmupEnabled()
+        {
+            return string.Equals(Environment.GetEnvironmentVariable("TS_MLX_KERNEL_WARMUP"), "1", StringComparison.Ordinal);
         }
 
         /// <summary>
@@ -2329,6 +2943,67 @@ namespace TensorSharp.Models
             Console.WriteLine($"[KV cache] Truncating from {_cacheSeqLen} to {tokenCount}");
             _cacheSeqLen = tokenCount;
         }
+
+        /// <summary>
+        /// Process-wide GPU-compute serialisation lock. The GGML Metal backend
+        /// is *not* thread-safe (concurrent <c>ggml_backend_graph_compute</c>
+        /// from two threads will silently corrupt the command queue and
+        /// eventually <c>ggml_abort</c> on a command-buffer status=1/2).
+        /// Every callsite that drives the backend through this model must
+        /// take this lock for the duration of the GPU work.
+        ///
+        /// Today that's two callers: the InferenceEngine's worker thread
+        /// (around its per-step ForwardBatch / Forward) and
+        /// ChatGenerationPipeline (around the multimodal vision/audio
+        /// encoder it invokes at prompt-prep time, which runs many GGML ops
+        /// of its own). Without the lock, a parallel image-bearing request
+        /// arriving while the engine is mid-batch races the engine's
+        /// command buffer and aborts the process.
+        /// </summary>
+        public object GpuComputeLock { get; } = new object();
+
+        /// <summary>
+        /// Whether this architecture exposes block-level snapshot / restore for use
+        /// by the paged KV cache. Default: not supported. Pure-attention models
+        /// opt in by overriding alongside the four members below.
+        /// </summary>
+        public virtual bool SupportsKVStateSnapshot => false;
+
+        /// <summary>
+        /// Stable identifier tying snapshots to a specific (model, layer count,
+        /// head counts, head dim, KV dtype) tuple. The paged cache stores blocks
+        /// keyed by SHA-256 chain over this fingerprint, so changing it
+        /// effectively invalidates the cache for the previous model variant.
+        /// </summary>
+        public virtual string KVStateFingerprint => string.Empty;
+
+        /// <summary>
+        /// Bytes occupied by a block of <paramref name="tokenCount"/> tokens worth
+        /// of K/V state across all layers, or 0 when snapshotting is unsupported.
+        /// </summary>
+        public virtual long ComputeKVBlockByteSize(int tokenCount) => 0;
+
+        /// <summary>
+        /// Whether this architecture must capture state at every block boundary
+        /// during prefill (true for models with recurrent / SSM layers whose state
+        /// is a function of all preceding tokens). See <see cref="IModelArchitecture"/>.
+        /// </summary>
+        public virtual bool RequiresPerBlockCapture => false;
+
+        /// <summary>
+        /// Copy bytes for token positions <c>[startToken, startToken+tokenCount)</c>
+        /// into <paramref name="destination"/>. Returns false if the range is not
+        /// valid or the model does not support snapshots. See <see cref="IModelArchitecture"/>.
+        /// </summary>
+        public virtual bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination) => false;
+
+        /// <summary>
+        /// Write a block of K/V bytes at token position <paramref name="destToken"/>.
+        /// After a successful call the model behaves as if <paramref name="tokenCount"/>
+        /// tokens had been forwarded into the cache at that position. See
+        /// <see cref="IModelArchitecture"/>.
+        /// </summary>
+        public virtual bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source) => false;
 
         /// <summary>
         /// Check if this model has vision encoder weights (v.* prefix tensors).
@@ -2402,12 +3077,25 @@ namespace TensorSharp.Models
             _weights.Clear();
 
             if (IsGgmlBackend)
+            {
+                // Clear offloadable registrations FIRST so they don't outlive
+                // the host pointers (which become invalid once the GgufFile
+                // mmap below is disposed). ClearHostBufferCache then frees the
+                // MTLBuffer wrappers; the LRU state goes with it.
+                GgmlBasicOps.ClearOffloadableState();
                 GgmlBasicOps.ClearHostBufferCache();
+            }
 
             if (_backend == BackendType.Cuda && _allocator is CudaAllocator cudaAllocator)
             {
                 foreach (var qw in _quantWeights.Values)
                     CudaQuantizedOps.ReleaseQuantizedWeight(cudaAllocator, qw.CacheKey);
+            }
+
+            if (_backend == BackendType.Mlx && _allocator is MlxAllocator mlxAllocator)
+            {
+                foreach (var qw in _quantWeights.Values)
+                    MlxQuantizedOps.ReleaseQuantizedWeight(mlxAllocator, qw.CacheKey);
             }
 
             foreach (var qw in _quantWeights.Values)

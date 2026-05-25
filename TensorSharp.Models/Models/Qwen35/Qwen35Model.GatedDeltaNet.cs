@@ -40,6 +40,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -150,6 +151,7 @@ namespace TensorSharp.Models
         private float[][] _convState;  // [layer][convChannels * (convKernelSize-1)]
         private int[] _convStateWriteIdx;
         private Tensor[] _deltaStateTensor; // [layer]: Tensor[numVHeads, headVDim, headKDim]
+        private MlxFusedOps.GatedDeltaNetCache[] _mlxGdnCache;
 
         // [1, packedDim] - reused fused norm + input proj output for GatedDeltaNet decode.
         private Tensor _gdnDecodePackedBuf;
@@ -369,6 +371,8 @@ namespace TensorSharp.Models
             _convStateWriteIdx[l] = 0;
             _deltaStateTensor[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
             Ops.Fill(_deltaStateTensor[l], 0);
+            if (_mlxGdnCache != null)
+                _mlxGdnCache[l] = new MlxFusedOps.GatedDeltaNetCache();
         }
 
         /// <summary>
@@ -380,6 +384,9 @@ namespace TensorSharp.Models
             _convState = new float[numLayers][];
             _convStateWriteIdx = new int[numLayers];
             _deltaStateTensor = new Tensor[numLayers];
+            _mlxGdnCache = _backend == BackendType.Mlx
+                ? new MlxFusedOps.GatedDeltaNetCache[numLayers]
+                : null;
         }
 
         /// <summary>
@@ -390,6 +397,7 @@ namespace TensorSharp.Models
             Array.Clear(_convState[l]);
             _convStateWriteIdx[l] = 0;
             Ops.Fill(_deltaStateTensor[l], 0);
+            _mlxGdnCache?[l]?.Reset();
         }
 
         /// <summary>
@@ -432,6 +440,8 @@ namespace TensorSharp.Models
         {
             if (_deltaStateTensor != null)
                 foreach (var t in _deltaStateTensor) t?.Dispose();
+            if (_mlxGdnCache != null)
+                foreach (var cache in _mlxGdnCache) cache?.Dispose();
 
             _gdnGatedOutT?.Dispose();
             _gdnChunkedQBuf?.Dispose();
@@ -706,13 +716,13 @@ namespace TensorSharp.Models
             int zDim = _headVDim * _numVHeads;
             int packedDim = qkvDim + zDim + _numVHeads * 2;
 
-            // Fused input norm + packed input projection (single GGML kernel). Decode reuses
-            // a pre-allocated [1, packedDim] buffer to avoid one tensor allocation per layer
-            // per token.
             Tensor packedInput = null;
             bool ownsPackedInput = true;
             if (inputNormW != null && _ssmInProjQW[layer] != null && IsGgmlBackend)
             {
+                // Fused input norm + packed input projection (single GGML kernel).
+                // Decode reuses a pre-allocated [1, packedDim] buffer to avoid one
+                // tensor allocation per layer per token.
                 if (seqLen == 1 && _gdnDecodePackedBuf != null
                     && _gdnDecodePackedBuf.Sizes[1] == _ssmInProjQW[layer].Ne1)
                 {
@@ -743,10 +753,49 @@ namespace TensorSharp.Models
             float* zBase = null;
             float* betaBase = null;
             float* alphaBase = null;
+            Tensor gated = null;
+            float* gatedBase = null;
+            bool ranMlxNativeGdn = false;
 
             if (packedInput != null)
             {
-                packedPtr = GetFloatPtr(packedInput);
+                if (_backend == BackendType.Mlx
+                    && _mlxGdnCache?[layer] != null
+                    && _ssmConv1dW[layer] != null
+                    && _ssmDtBiasW[layer] != null
+                    && _ssmAW[layer] != null
+                    && _ssmNormW[layer] != null
+                    && (seqLen == 1 || string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QWEN35_GDN_PACKED_KERNELS"), "1", StringComparison.Ordinal)))
+                {
+                    gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+                    ranMlxNativeGdn = _mlxGdnCache[layer].TryRunQwen35Packed(
+                        gated,
+                        packedInput,
+                        _ssmConv1dW[layer],
+                        _ssmDtBiasW[layer],
+                        _ssmAW[layer],
+                        _ssmNormW[layer],
+                        seqLen,
+                        packedDim,
+                        qkvDim,
+                        qkDim,
+                        vDim,
+                        _numKHeads,
+                        _numVHeads,
+                        _headKDim,
+                        _headVDim,
+                        _convKernel,
+                        Config.Eps);
+                    if (!ranMlxNativeGdn)
+                    {
+                        if (seqLen > 1)
+                            gated.Dispose();
+                        gated = null;
+                    }
+                }
+
+                if (!ranMlxNativeGdn)
+                    packedPtr = GetFloatPtr(packedInput);
             }
             else
             {
@@ -758,95 +807,137 @@ namespace TensorSharp.Models
                 betaRaw = LinearForwardCached(normedInput, _ssmBetaQW[layer], _ssmBetaF32[layer]);
                 alphaRaw = LinearForwardCached(normedInput, _ssmAlphaQW[layer], _ssmAlphaF32[layer]);
 
-                qkvBase = GetFloatPtr(qkvRaw);
-                zBase = GetFloatPtr(zRaw);
-                betaBase = GetFloatPtr(betaRaw);
-                alphaBase = GetFloatPtr(alphaRaw);
-            }
-
-            // Pre-resolved layer constants (cached at construction; no dictionary lookup here).
-            float* dtBiasPtr = GetFloatPtr(_ssmDtBiasW[layer]);
-            float* aPtr = GetFloatPtr(_ssmAW[layer]);
-            float* ssmNormPtr = GetFloatPtr(_ssmNormW[layer]);
-
-            Tensor gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
-            float* gatedBase = GetFloatPtr(gated);
-
-            float[] convWT = _gdnConvWT[layer];
-
-            // Prefer the fused chunked GGML kernel when running on a GGML backend with
-            // sufficient sequence length and matching K/V head dims. The chunked kernel
-            // packs the entire delta-net block (L2Norm, mul_mat, triangular solve, RMSNorm,
-            // gating) into a single GPU dispatch per layer, drastically reducing CPU work
-            // during prefill.
-            bool useChunked = !_gdnDisableChunkedPrefill
-                && IsGgmlBackend
-                && seqLen >= _gdnChunkPrefillThreshold
-                && _headKDim == _headVDim
-                && _ssmDtBiasW[layer] != null
-                && _ssmAW[layer] != null
-                && _ssmNormW[layer] != null;
-
-            if (useChunked && GdnVerifyChunkedEnv && seqLen > 1)
-            {
-                // Verification mode: run the chunked path on a snapshot of the
-                // recurrent state, then restore the state, run the per-token
-                // path on the SAME starting state, and compare. Use the
-                // per-token path's output as the canonical forward result so
-                // that any regression in the chunked kernel is bounded to the
-                // verify counters and never leaks into downstream layers.
-                VerifyAndRunPerTokenAfterChunked(
-                    packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                    layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
-                    convWT, dtBiasPtr, aPtr, ssmNormPtr, gated, gatedBase);
-            }
-            else if (useChunked)
-            {
-                long tChunk = Stopwatch.GetTimestamp();
-                bool chunkedOk = false;
-                try
+                if (_backend == BackendType.Mlx
+                    && _mlxGdnCache?[layer] != null
+                    && _ssmConv1dW[layer] != null
+                    && _ssmDtBiasW[layer] != null
+                    && _ssmAW[layer] != null
+                    && _ssmNormW[layer] != null)
                 {
-                    GatedDeltaNetChunkedPrefill(
+                    gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+                    ranMlxNativeGdn = _mlxGdnCache[layer].TryRunQwen35(
+                        gated,
+                        qkvRaw,
+                        zRaw,
+                        betaRaw,
+                        alphaRaw,
+                        _ssmConv1dW[layer],
+                        _ssmDtBiasW[layer],
+                        _ssmAW[layer],
+                        _ssmNormW[layer],
+                        seqLen,
+                        qkvDim,
+                        qkDim,
+                        vDim,
+                        _numKHeads,
+                        _numVHeads,
+                        _headKDim,
+                        _headVDim,
+                        _convKernel,
+                        Config.Eps);
+                    if (!ranMlxNativeGdn)
+                    {
+                        if (seqLen > 1)
+                            gated.Dispose();
+                        gated = null;
+                    }
+                }
+
+                if (!ranMlxNativeGdn)
+                {
+                    qkvBase = GetFloatPtr(qkvRaw);
+                    zBase = GetFloatPtr(zRaw);
+                    betaBase = GetFloatPtr(betaRaw);
+                    alphaBase = GetFloatPtr(alphaRaw);
+                }
+            }
+
+            if (!ranMlxNativeGdn)
+            {
+                // Pre-resolved layer constants (cached at construction; no dictionary lookup here).
+                float* dtBiasPtr = GetFloatPtr(_ssmDtBiasW[layer]);
+                float* aPtr = GetFloatPtr(_ssmAW[layer]);
+                float* ssmNormPtr = GetFloatPtr(_ssmNormW[layer]);
+
+                gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+                gatedBase = GetFloatPtr(gated);
+
+                float[] convWT = _gdnConvWT[layer];
+
+                // Prefer the fused chunked GGML kernel when running on a GGML backend with
+                // sufficient sequence length and matching K/V head dims. The chunked kernel
+                // packs the entire delta-net block (L2Norm, mul_mat, triangular solve, RMSNorm,
+                // gating) into a single GPU dispatch per layer, drastically reducing CPU work
+                // during prefill.
+                bool useChunked = !_gdnDisableChunkedPrefill
+                    && IsGgmlBackend
+                    && seqLen >= _gdnChunkPrefillThreshold
+                    && _headKDim == _headVDim
+                    && _ssmDtBiasW[layer] != null
+                    && _ssmAW[layer] != null
+                    && _ssmNormW[layer] != null;
+
+                if (useChunked && GdnVerifyChunkedEnv && seqLen > 1)
+                {
+                    // Verification mode: run the chunked path on a snapshot of the
+                    // recurrent state, then restore the state, run the per-token
+                    // path on the SAME starting state, and compare. Use the
+                    // per-token path's output as the canonical forward result so
+                    // that any regression in the chunked kernel is bounded to the
+                    // verify counters and never leaks into downstream layers.
+                    VerifyAndRunPerTokenAfterChunked(
                         packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                        layer, seqLen, qkvDim, qkDim, zDim, packedDim, gated);
-                    chunkedOk = true;
+                        layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                        convWT, dtBiasPtr, aPtr, ssmNormPtr, gated, gatedBase);
                 }
-                catch (Exception ex)
+                else if (useChunked)
                 {
-                    // First failure trips the kill switch so subsequent layers / forwards
-                    // do not pay the same overhead twice. Fall back to the per-token loop.
-                    _gdnDisableChunkedPrefill = true;
-                    Console.WriteLine($"[Qwen35] GatedDeltaNetChunked disabled (layer {layer}, seqLen {seqLen}): {ex.Message}");
-                }
+                    long tChunk = Stopwatch.GetTimestamp();
+                    bool chunkedOk = false;
+                    try
+                    {
+                        GatedDeltaNetChunkedPrefill(
+                            packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                            layer, seqLen, qkvDim, qkDim, zDim, packedDim, gated);
+                        chunkedOk = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        // First failure trips the kill switch so subsequent layers / forwards
+                        // do not pay the same overhead twice. Fall back to the per-token loop.
+                        _gdnDisableChunkedPrefill = true;
+                        Console.WriteLine($"[Qwen35] GatedDeltaNetChunked disabled (layer {layer}, seqLen {seqLen}): {ex.Message}");
+                    }
 
-                if (chunkedOk)
-                {
-                    _gdnChunkedTicks += Stopwatch.GetTimestamp() - tChunk;
-                    _gdnChunkedCalls++;
+                    if (chunkedOk)
+                    {
+                        _gdnChunkedTicks += Stopwatch.GetTimestamp() - tChunk;
+                        _gdnChunkedCalls++;
+                    }
+                    else
+                    {
+                        // Fall back: clean state was already mutated only inside the helper. Run
+                        // the per-token path on the same gated buffer.
+                        long tFallback = Stopwatch.GetTimestamp();
+                        RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
+                            layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
+                            convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
+                        _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tFallback;
+                        if (seqLen > 1) _gdnPerTokenCalls++;
+                    }
                 }
                 else
                 {
-                    // Fall back: clean state was already mutated only inside the helper. Run
-                    // the per-token path on the same gated buffer.
-                    long tFallback = Stopwatch.GetTimestamp();
+                    long tLoop = Stopwatch.GetTimestamp();
                     RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
                         layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
                         convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
-                    _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tFallback;
+                    _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tLoop;
                     if (seqLen > 1) _gdnPerTokenCalls++;
                 }
-            }
-            else
-            {
-                long tLoop = Stopwatch.GetTimestamp();
-                RunPerTokenLoop(packedPtr, qkvBase, zBase, betaBase, alphaBase,
-                    layer, seqLen, qkvDim, qkDim, vDim, zDim, packedDim,
-                    convWT, dtBiasPtr, aPtr, ssmNormPtr, gatedBase);
-                _gdnPerTokenTicks += Stopwatch.GetTimestamp() - tLoop;
-                if (seqLen > 1) _gdnPerTokenCalls++;
-            }
 
-            InvalidateTensorDeviceCache(gated);
+                InvalidateTensorDeviceCache(gated);
+            }
             if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillRecCoreTicks += now - stageStart; stageStart = now; }
 
             // When skipOutputProj is set, return the raw gated output so the caller
@@ -1715,18 +1806,39 @@ namespace TensorSharp.Models
         {
             int vLen = Vector<float>.Count;
 
-            VecZero(convOutPtr, qkvDim);
-
             fixed (float* statePtr = convState, wtPtr = convWT)
             {
-                // Kernel taps 0..convDim-1 sample from the previous (ring buffered) state.
-                // The element written most recently is at slot ((writeIdx + convDim - 1) % convDim)
-                // and corresponds to the newest historical input (kernel position convDim-1).
-                for (int ki = 0; ki < convDim; ki++)
+                int firstAccumTap = 1;
+
+                if (convDim > 0)
+                {
+                    // Kernel taps 0..convDim-1 sample from the previous (ring buffered) state.
+                    // Initialise from the first tap directly; this saves a full zero pass plus
+                    // one read/modify/write pass over qkvDim on every decode step.
+                    int slot = writeIdx;
+                    float* statePos = statePtr + slot * qkvDim;
+                    float* wtPos = wtPtr;
+
+                    int ch = 0;
+                    for (; ch <= qkvDim - vLen; ch += vLen)
+                    {
+                        var sv = LdVecLocal(statePos + ch);
+                        var wv = LdVecLocal(wtPos + ch);
+                        StVecLocal(convOutPtr + ch, sv * wv);
+                    }
+                    for (; ch < qkvDim; ch++)
+                        convOutPtr[ch] = statePos[ch] * wtPos[ch];
+                }
+                else
+                {
+                    firstAccumTap = 0;
+                }
+
+                for (int ki = firstAccumTap; ki < convDim; ki++)
                 {
                     int slot = (writeIdx + ki) % convDim;
                     float* statePos = statePtr + slot * qkvDim;
-                    float* wtPos = wtPtr + ki * qkvDim;
+                    float* wtPos = wtPtr + (long)ki * qkvDim;
 
                     int ch = 0;
                     for (; ch <= qkvDim - vLen; ch += vLen)
@@ -1740,19 +1852,34 @@ namespace TensorSharp.Models
                         convOutPtr[ch] += statePos[ch] * wtPos[ch];
                 }
 
-                // Final tap reads the new input qkvPtr.
+                // Final tap reads the new input qkvPtr. If there is no historical state
+                // (convKernel=1), initialise from this tap directly.
                 {
-                    float* wtPos = wtPtr + convDim * qkvDim;
+                    float* wtPos = wtPtr + (long)convDim * qkvDim;
                     int ch = 0;
-                    for (; ch <= qkvDim - vLen; ch += vLen)
+                    if (convDim > 0)
                     {
-                        var acc = LdVecLocal(convOutPtr + ch);
-                        var iv = LdVecLocal(qkvPtr + ch);
-                        var wv = LdVecLocal(wtPos + ch);
-                        StVecLocal(convOutPtr + ch, acc + iv * wv);
+                        for (; ch <= qkvDim - vLen; ch += vLen)
+                        {
+                            var acc = LdVecLocal(convOutPtr + ch);
+                            var iv = LdVecLocal(qkvPtr + ch);
+                            var wv = LdVecLocal(wtPos + ch);
+                            StVecLocal(convOutPtr + ch, acc + iv * wv);
+                        }
+                        for (; ch < qkvDim; ch++)
+                            convOutPtr[ch] += qkvPtr[ch] * wtPos[ch];
                     }
-                    for (; ch < qkvDim; ch++)
-                        convOutPtr[ch] += qkvPtr[ch] * wtPos[ch];
+                    else
+                    {
+                        for (; ch <= qkvDim - vLen; ch += vLen)
+                        {
+                            var iv = LdVecLocal(qkvPtr + ch);
+                            var wv = LdVecLocal(wtPos + ch);
+                            StVecLocal(convOutPtr + ch, iv * wv);
+                        }
+                        for (; ch < qkvDim; ch++)
+                            convOutPtr[ch] = qkvPtr[ch] * wtPos[ch];
+                    }
                 }
             }
 

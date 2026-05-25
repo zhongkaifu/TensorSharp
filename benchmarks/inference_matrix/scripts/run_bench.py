@@ -10,7 +10,7 @@ TensorSharp is tested with multiple KV cache data types (f32, f16, q8_0)
 to measure the performance impact of KV cache precision.
 
 Usage:
-    python3 run_bench.py [--engines tensorsharp_f32,tensorsharp_f16,tensorsharp_q8,llamacpp,ollama]
+    python3 run_bench.py [--engines tensorsharp_f32,tensorsharp_f16,tensorsharp_q8,tensorsharp_mlx,llamacpp,ollama]
                         [--models gemma4]
                         [--tasks pp512,tg128,...]
                         [--quick]            # smaller token counts for smoke test
@@ -171,8 +171,10 @@ TS_INFER_DECODE_RE = re.compile(
 
 
 def run_tensorsharp(model: ModelSpec, task: TaskSpec, results_dir: Path,
-                    kv_cache_dtype: str = "f32") -> BenchResult:
-    engine_id = f"tensorsharp_{kv_cache_dtype.replace('_', '')}"
+                    kv_cache_dtype: str = "f32",
+                    backend: str = "ggml_metal",
+                    engine_id: Optional[str] = None) -> BenchResult:
+    engine_id = engine_id or f"tensorsharp_{kv_cache_dtype.replace('_', '')}"
     res = BenchResult(engine=engine_id, model=model.short_id, task=task.short_id,
                       ok=False, kv_cache_dtype=kv_cache_dtype)
 
@@ -181,7 +183,7 @@ def run_tensorsharp(model: ModelSpec, task: TaskSpec, results_dir: Path,
         cmd = [
             str(TENSORSHARP_BIN),
             "--model", str(model.gguf),
-            "--backend", "ggml_metal",
+            "--backend", backend,
             "--benchmark",
             "--bench-prefill", str(task.pp if task.pp else 32),
             "--bench-decode", str(task.tg if task.tg else 1),
@@ -195,7 +197,7 @@ def run_tensorsharp(model: ModelSpec, task: TaskSpec, results_dir: Path,
         cmd = [
             str(TENSORSHARP_BIN),
             "--model", str(model.gguf),
-            "--backend", "ggml_metal",
+            "--backend", backend,
             "--input", str(prompt_path),
             "--max-tokens", str(task.max_tokens),
             "--temperature", "0",
@@ -562,15 +564,22 @@ def run_ollama(model: ModelSpec, task: TaskSpec, results_dir: Path) -> BenchResu
 # TensorSharp KV cache dtype variants are handled by wrapping run_tensorsharp
 # with the appropriate dtype argument.
 
-def _make_ts_runner(kv_dtype: str):
+def _make_ts_runner(kv_dtype: str, backend: str = "ggml_metal", engine_id: Optional[str] = None):
     def runner(model, task, results_dir):
-        return run_tensorsharp(model, task, results_dir, kv_cache_dtype=kv_dtype)
+        return run_tensorsharp(
+            model,
+            task,
+            results_dir,
+            kv_cache_dtype=kv_dtype,
+            backend=backend,
+            engine_id=engine_id)
     return runner
 
 ENGINES = {
     "tensorsharp_f32": _make_ts_runner("f32"),
     "tensorsharp_f16": _make_ts_runner("f16"),
     "tensorsharp_q80": _make_ts_runner("q8_0"),
+    "tensorsharp_mlx": _make_ts_runner("f32", backend="mlx", engine_id="tensorsharp_mlx"),
     "llamacpp": run_llamacpp,
     "ollama": run_ollama,
 }
@@ -596,7 +605,8 @@ def is_tensorsharp_engine(engine: str) -> bool:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--engines", default="ollama,llamacpp,tensorsharp_f32,tensorsharp_f16,tensorsharp_q80")
+    ap.add_argument("--engines",
+                    default="ollama,llamacpp,tensorsharp_f32,tensorsharp_f16,tensorsharp_q80,tensorsharp_mlx")
     ap.add_argument("--models", default="gemma4")
     ap.add_argument("--tasks", default="pp512,tg128,pp2048,short_text,long_text,image,audio,video")
     ap.add_argument("--results", default=str(ROOT / "results"))

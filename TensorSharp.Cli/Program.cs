@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -89,6 +90,20 @@ namespace TensorSharp.Cli
             int correctnessDecode = 8;
             bool runKvCacheBenchmark = false;
             int kvCacheBenchTurns = 4;
+            bool runPagedKvBenchmark = false;
+            int pagedKvBenchPrompt = 2048;
+            int pagedKvBenchTrials = 3;
+            // Cross-session paged KV cache knobs. Each flag is plumbed through to
+            // the matching env var so any code that calls
+            // PagedKvCacheConfig.FromEnvironment() picks it up - that's the same
+            // path the benchmark and (in TensorSharp.Server) the SessionKvCacheManager
+            // both use, so a single set of flags configures everything consistently.
+            bool? pagedKvEnableOverride = null;
+            int? pagedKvBlockSizeOverride = null;
+            long? pagedKvRamMbOverride = null;
+            string pagedKvSsdDirOverride = null;
+            long? pagedKvSsdMbOverride = null;
+            int? pagedKvQuantBitsOverride = null;
             bool runInteractive = false;
             string systemPrompt = null;
             int warmupInferenceRuns = 0;
@@ -125,6 +140,55 @@ namespace TensorSharp.Cli
                     case "--correct-decode": correctnessDecode = int.Parse(args[++i]); break;
                     case "--bench-kvcache": runKvCacheBenchmark = true; break;
                     case "--bench-kv-turns": kvCacheBenchTurns = int.Parse(args[++i]); break;
+                    case "--paged-bench": runPagedKvBenchmark = true; break;
+                    case "--paged-bench-prompt": pagedKvBenchPrompt = int.Parse(args[++i]); break;
+                    case "--paged-bench-trials": pagedKvBenchTrials = int.Parse(args[++i]); break;
+                    case "--paged-kv":
+                    case "--paged-kv-cache":
+                        pagedKvEnableOverride = true;
+                        break;
+                    case "--no-paged-kv":
+                    case "--no-paged-kv-cache":
+                        pagedKvEnableOverride = false;
+                        break;
+                    case "--continuous-batching":
+                    case "--paged-batching":
+                        // Paged-attention continuous batching path. Gates two
+                        // env vars: TS_SCHED_DISABLE_BATCHED (scheduler — falls
+                        // through to per-seq KV-swap when set) and
+                        // TS_QWEN35_BATCHED (Qwen3.5 ForwardBatch opt-in). Set
+                        // here so InferenceEngine + the model adapters read
+                        // the right state at construction.
+                        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "0");
+                        Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "1");
+                        break;
+                    case "--no-continuous-batching":
+                    case "--no-paged-batching":
+                        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+                        Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "0");
+                        break;
+                    case "--paged-kv-block-size":
+                        pagedKvBlockSizeOverride = int.Parse(args[++i]);
+                        break;
+                    case "--paged-kv-ram-mb":
+                        pagedKvRamMbOverride = long.Parse(args[++i]);
+                        break;
+                    case "--paged-kv-ssd-dir":
+                        pagedKvSsdDirOverride = args[++i];
+                        break;
+                    case "--paged-kv-ssd-mb":
+                        pagedKvSsdMbOverride = long.Parse(args[++i]);
+                        break;
+                    case "--paged-kv-quant-bits":
+                    {
+                        string bitsStr = args[++i];
+                        if (!int.TryParse(bitsStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int bitsVal))
+                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: '{bitsStr}'. Expected 0 (off), 4, or 8.");
+                        if (bitsVal != 0 && bitsVal != 4 && bitsVal != 8)
+                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: {bitsVal}. Expected 0 (off), 4, or 8.");
+                        pagedKvQuantBitsOverride = bitsVal;
+                        break;
+                    }
                     case "--warmup-runs": warmupInferenceRuns = int.Parse(args[++i]); break;
                     case "--kv-cache-dtype":
                         {
@@ -200,24 +264,32 @@ namespace TensorSharp.Cli
                 "Model file not found: {ModelPath}", modelPath ?? "(none)");
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
-                    "[--max-tokens N] [--test] [--backend cpu|cuda|ggml_cpu|ggml_metal|ggml_cuda] " +
+                    "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
                     "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
                     "[--seed N] [--stop <text>] [--think] [--warmup-runs N] " +
+                    "[--paged-kv | --no-paged-kv] [--paged-kv-block-size N] [--paged-kv-ram-mb N] " +
+                    "[--paged-kv-ssd-dir <path>] [--paged-kv-ssd-mb N] [--paged-kv-quant-bits 0|4|8] " +
                     "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
                 return;
             }
 
             BackendType backend = backendStr switch
             {
+                "mlx" or "mlx_metal" or "mlx-metal" => BackendType.Mlx,
                 "cpu" => BackendType.Cpu,
                 "cuda" or "direct_cuda" or "direct-cuda" => BackendType.Cuda,
                 "ggml_cpu" => BackendType.GgmlCpu,
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cuda" or "ggml-cuda" => BackendType.GgmlCuda,
-                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, ggml_cpu, ggml_metal, ggml_cuda"),
+                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, mlx, ggml_cpu, ggml_metal, ggml_cuda"),
             };
+
+            ApplyPagedKvCacheCliOverrides(
+                pagedKvEnableOverride, pagedKvBlockSizeOverride,
+                pagedKvRamMbOverride, pagedKvSsdDirOverride, pagedKvSsdMbOverride,
+                pagedKvQuantBitsOverride);
 
             string requestedDtype = KvCacheDtypeConfig.IsExplicitlySet
                 ? KvCacheDtypeConfig.Current.ToShortString()
@@ -338,6 +410,12 @@ namespace TensorSharp.Cli
             if (runKvCacheBenchmark)
             {
                 RunKvCacheBenchmark(model, kvCacheBenchTurns, maxTokens, samplingConfig, enableThinking);
+                return;
+            }
+
+            if (runPagedKvBenchmark)
+            {
+                RunPagedKvBenchmark(model, pagedKvBenchPrompt, pagedKvBenchTrials);
                 return;
             }
 
@@ -1525,54 +1603,132 @@ namespace TensorSharp.Cli
 
             string finishReason = "max_tokens";
             var decodeSw = Stopwatch.StartNew();
-            for (int step = 0; step < maxTokens; step++)
-            {
-                int nextToken = sampler.Sample(logits, generatedTokens);
-                _log.LogTrace(LogEventIds.GenerationProgress,
-                    "step={Step} token={TokenId} text={TokenText}",
-                    step, nextToken, model.Tokenizer.Vocab[nextToken]);
 
-                if (model.Tokenizer.IsEos(nextToken))
+            // Pipelined greedy decode: when the model supports a device-side
+            // argmax + embedding lookup, queue forward N+1 BEFORE syncing
+            // forward N's predicted token. This overlaps the ~8 ms LM-head
+            // sync wait with the next forward's first kernels.
+            // Gated by TS_MLX_PIPELINED_DECODE=1, and only used when:
+            //   - greedy sampling (no top-K / temperature)
+            //   - no stop sequences (the pipeline issues one extra forward
+            //     that we'd waste on a mid-stream stop)
+            //   - model.SupportsPipelinedGreedy
+            bool pipelinedGreedy = cfg.IsGreedy
+                && (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
+                && model.SupportsPipelinedGreedy
+                && string.Equals(Environment.GetEnvironmentVariable("TS_MLX_PIPELINED_DECODE"), "1", StringComparison.Ordinal);
+
+            if (pipelinedGreedy)
+            {
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "cli.inference using pipelined greedy decode (TS_MLX_PIPELINED_DECODE=1)");
+
+                // Bootstrap: sample the FIRST decode token from prefill logits.
+                int firstToken = sampler.Sample(logits, generatedTokens);
+                if (model.Tokenizer.IsEos(firstToken))
                 {
                     finishReason = "eos";
-                    break;
                 }
-
-                generatedTokens.Add(nextToken);
-
-                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                else
                 {
-                    string partial = model.Tokenizer.Decode(generatedTokens);
-                    var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
-                    if (shouldStop)
-                    {
-                        decodeSw.Stop();
-                        double sdMs = decodeSw.Elapsed.TotalMilliseconds;
-                        double sdTps = generatedTokens.Count > 0 && sdMs > 0
-                            ? generatedTokens.Count / (sdMs / 1000.0)
-                            : 0.0;
-                        if (!silent)
-                        {
-                            _log.LogInformation(LogEventIds.CliBenchmark,
-                                "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                                generatedTokens.Count, sdMs, sdTps);
-                        }
-                        finishReason = "stop_sequence";
-                        _log.LogInformation(LogEventIds.ChatCompleted,
-                            "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                            finishReason, generatedTokens.Count);
-                        if (useParser)
-                        {
-                            var finalParsed = parser.Add(trimmed, true);
-                            return FormatParsedResult(finalParsed, showThinking);
-                        }
-                        return trimmed;
-                    }
-                }
+                    generatedTokens.Add(firstToken);
 
-                logits = model.Forward(new[] { nextToken });
-                if (step < 3)
-                    LogTopLogits(logits, model, $"decode_{step}");
+                    // Submit decode step that will predict the SECOND decode
+                    // token. Returns a [1] int32 device tensor we'll sync later.
+                    Tensor pending = model.SubmitGreedyDecodeStep(firstToken);
+
+                    int step = 1;
+                    for (; step < maxTokens; step++)
+                    {
+                        // Issue the NEXT forward (using cached device embedding).
+                        // Its argmax + next-embedding queueing runs on GPU while
+                        // we host-wait on `pending` below.
+                        Tensor next = model.SubmitGreedyDecodeStep(null);
+
+                        // Sync the previously submitted prediction.
+                        int tok = pending.GetElementsAsInt(1)[0];
+                        pending.Dispose();
+                        pending = next;
+
+                        if (model.Tokenizer.IsEos(tok))
+                        {
+                            pending.Dispose();
+                            pending = null;
+                            finishReason = "eos";
+                            break;
+                        }
+                        generatedTokens.Add(tok);
+                    }
+
+                    if (pending != null)
+                    {
+                        // Drain the last queued forward; if non-EOS and we still
+                        // have room, emit it as the final token.
+                        int tok = pending.GetElementsAsInt(1)[0];
+                        pending.Dispose();
+                        if (step <= maxTokens && !model.Tokenizer.IsEos(tok))
+                        {
+                            generatedTokens.Add(tok);
+                        }
+                        else if (model.Tokenizer.IsEos(tok))
+                        {
+                            finishReason = "eos";
+                        }
+                    }
+                    model.ResetPipelinedGreedyState();
+                }
+            }
+            else
+            {
+                for (int step = 0; step < maxTokens; step++)
+                {
+                    int nextToken = sampler.Sample(logits, generatedTokens);
+                    _log.LogTrace(LogEventIds.GenerationProgress,
+                        "step={Step} token={TokenId} text={TokenText}",
+                        step, nextToken, model.Tokenizer.Vocab[nextToken]);
+
+                    if (model.Tokenizer.IsEos(nextToken))
+                    {
+                        finishReason = "eos";
+                        break;
+                    }
+
+                    generatedTokens.Add(nextToken);
+
+                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                    {
+                        string partial = model.Tokenizer.Decode(generatedTokens);
+                        var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
+                        if (shouldStop)
+                        {
+                            decodeSw.Stop();
+                            double sdMs = decodeSw.Elapsed.TotalMilliseconds;
+                            double sdTps = generatedTokens.Count > 0 && sdMs > 0
+                                ? generatedTokens.Count / (sdMs / 1000.0)
+                                : 0.0;
+                            if (!silent)
+                            {
+                                _log.LogInformation(LogEventIds.CliBenchmark,
+                                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                                    generatedTokens.Count, sdMs, sdTps);
+                            }
+                            finishReason = "stop_sequence";
+                            _log.LogInformation(LogEventIds.ChatCompleted,
+                                "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                                finishReason, generatedTokens.Count);
+                            if (useParser)
+                            {
+                                var finalParsed = parser.Add(trimmed, true);
+                                return FormatParsedResult(finalParsed, showThinking);
+                            }
+                            return trimmed;
+                        }
+                    }
+
+                    logits = model.Forward(new[] { nextToken });
+                    if (step < 3)
+                        LogTopLogits(logits, model, $"decode_{step}");
+                }
             }
             decodeSw.Stop();
             double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
@@ -2082,6 +2238,264 @@ namespace TensorSharp.Cli
             return (prefillMs, promptTokens);
         }
 
+        /// <summary>
+        /// Paged KV-cache benchmark. Simulates a cross-session scenario: the first
+        /// user pays the full prefill cost, then a second user arrives with the
+        /// same prompt prefix. Without the paged cache the second user repays the
+        /// full cost; with it, most of the prefill is recovered from RAM blocks.
+        ///
+        /// We measure both halves in-process so the comparison is apples-to-apples
+        /// on the same warm-loaded weights. Memory is read from the manager itself
+        /// (the bytes it has resident) and from <see cref="GC"/> (managed heap).
+        /// </summary>
+        static void RunPagedKvBenchmark(ModelBase model, int promptTokens, int trials)
+        {
+            if (!model.SupportsKVStateSnapshot)
+            {
+                _log.LogError(LogEventIds.CliBenchmark,
+                    "paged-bench: model architecture '{Arch}' does not support KV snapshot. Use Qwen3, Gemma3, GptOss, or Mistral3.",
+                    model.Config.Architecture);
+                return;
+            }
+            if (trials <= 0) trials = 1;
+            if (promptTokens <= 0) promptTokens = 2048;
+
+            // Pick up --paged-kv-block-size / --paged-kv-ram-mb / --paged-kv-ssd-* (or
+            // their env var equivalents) so the bench mirrors what the server
+            // would do at runtime instead of using a hard-coded config.
+            var envCfg = PagedKvCacheConfig.FromEnvironment();
+            int blockSize = envCfg.BlockSize;
+            int safeBase = Math.Max(0, 1);
+            int vocab = Math.Max(safeBase + 2, model.Config.VocabSize);
+            int[] prompt = new int[promptTokens];
+            var rng = new Random(unchecked((int)0xCAFEBABE));
+            for (int i = 0; i < promptTokens; i++)
+                prompt[i] = rng.Next(safeBase, vocab - 1);
+
+            _log.LogInformation(LogEventIds.CliBenchmark,
+                "paged-bench starting: promptTokens={Prompt} trials={Trials} blockSize={BlockSize} arch={Arch} kvDtype={Dtype}",
+                promptTokens, trials, blockSize, model.Config.Architecture, model.KvCacheDtype);
+
+            // Warm up - resolves Metal JIT, allocator pools, etc., so the first
+            // measurement isn't dominated by setup cost.
+            model.ResetKVCache();
+            model.ForwardRefill(prompt);
+            model.ResetKVCache();
+
+            long warmRss = WorkingSetBytes();
+            long warmManagedAlloc = GC.GetTotalAllocatedBytes(precise: true);
+
+            // ===== Baseline: paged cache disabled =====
+            var baselineMs = new double[trials];
+            for (int t = 0; t < trials; t++)
+            {
+                model.ResetKVCache();
+                var sw = Stopwatch.StartNew();
+                model.ForwardRefill(prompt);
+                sw.Stop();
+                baselineMs[t] = sw.Elapsed.TotalMilliseconds;
+                _log.LogDebug(LogEventIds.CliBenchmark,
+                    "paged-bench baseline trial {Trial}: {Ms:F1} ms", t + 1, baselineMs[t]);
+            }
+            long rssAfterBaseline = WorkingSetBytes();
+
+            // ===== With paged cache: prime the store, then measure restore =====
+            // Start from the env-resolved config so CLI overrides
+            // (--paged-kv-ram-mb, --paged-kv-ssd-dir, ...) carry through. We
+            // force Enabled=true here because the bench is, by definition, a
+            // measurement of the paged path - regardless of whether the user
+            // happened to also pass --paged-kv.
+            var pagedConfig = new PagedKvCacheConfig
+            {
+                Enabled = true,
+                BlockSize = blockSize,
+                MaxRamBytes = envCfg.MaxRamBytes > 0 ? envCfg.MaxRamBytes : 4L * 1024 * 1024 * 1024,
+                SsdDirectory = envCfg.SsdDirectory,
+                MaxSsdBytes = envCfg.MaxSsdBytes,
+            };
+            // Pick up the TurboQuant codec from TS_KV_PAGED_QUANT_BITS so the
+            // benchmark exercises the same compression path the server uses.
+            // FromEnvironment(model) returns null both when the env var is
+            // unset and when the model has recurrent SSM state that
+            // quantization would corrupt (Qwen3.5/3.6 GatedDeltaNet,
+            // Nemotron Mamba2). See TurboQuantKvCodec docs for details.
+            IKvBlockCodec pagedCodec = TurboQuantKvCodec.FromEnvironment(model);
+            if (pagedCodec != null)
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench codec={Codec} (bitsPerElement={Bits}, kvDtype={Dtype})",
+                    pagedCodec.Name, pagedCodec.BitsPerElement, model.KVStateElementType);
+            }
+            else if (model.RequiresPerBlockCapture &&
+                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS")))
+            {
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench codec=passthrough (model {Arch} has RequiresPerBlockCapture=true; TurboQuant disabled to protect recurrent state)",
+                    model.Config.Architecture);
+            }
+            var pagedManager = new PagedKvCacheManager(pagedConfig, model.KVStateFingerprint,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, pagedCodec);
+            try
+            {
+                // Prime - what the FIRST user pays. Subsequent users get the speedup.
+                // Recurrent models (RequiresPerBlockCapture=true) must be captured at
+                // every block boundary because their running state isn't decomposable
+                // into per-position slices; we chunk the prefill into block-sized
+                // pieces here so each chunk leaves _cacheSeqLen on a block boundary
+                // before Capture extracts the layer state.
+                model.ResetKVCache();
+                var primeSw = Stopwatch.StartNew();
+                if (model.RequiresPerBlockCapture)
+                {
+                    for (int start = 0; start < promptTokens; start += blockSize)
+                    {
+                        int len = Math.Min(blockSize, promptTokens - start);
+                        int[] chunk = new int[len];
+                        Array.Copy(prompt, start, chunk, 0, len);
+                        model.ForwardRefill(chunk);
+                        pagedManager.Capture(model, prompt, start + len);
+                    }
+                }
+                else
+                {
+                    model.ForwardRefill(prompt);
+                    pagedManager.Capture(model, prompt, promptTokens);
+                }
+                primeSw.Stop();
+
+                var pagedStats = pagedManager.GetStats();
+
+                var pagedMs = new double[trials];
+                int restoredTokens = 0;
+                float[] postRestoreLogits = null;
+                for (int t = 0; t < trials; t++)
+                {
+                    model.ResetKVCache();
+                    var sw = Stopwatch.StartNew();
+                    restoredTokens = pagedManager.TryRestorePrefix(model, prompt);
+                    if (restoredTokens < promptTokens)
+                    {
+                        int[] suffix = new int[promptTokens - restoredTokens];
+                        Array.Copy(prompt, restoredTokens, suffix, 0, suffix.Length);
+                        postRestoreLogits = model.ForwardRefill(suffix);
+                    }
+                    else
+                    {
+                        // The restore alone left us no token to forward, so the
+                        // model never produced fresh logits this trial. The
+                        // manager keeps one trailing block specifically to
+                        // avoid this; reaching here means a non-block-aligned
+                        // prompt. Fall back to a single-token forward.
+                        postRestoreLogits = model.Forward(new[] { prompt[promptTokens - 1] });
+                    }
+                    sw.Stop();
+                    pagedMs[t] = sw.Elapsed.TotalMilliseconds;
+                    _log.LogDebug(LogEventIds.CliBenchmark,
+                        "paged-bench paged trial {Trial}: {Ms:F1} ms (restored {Restored}/{Total})",
+                        t + 1, pagedMs[t], restoredTokens, promptTokens);
+                }
+
+                // Quality probe: sample 8 greedy tokens from the last trial's
+                // logits so the user can eyeball whether the codec preserved
+                // generation behaviour. With passthrough vs int4 vs int8 the
+                // token sequences should be identical (or near-identical) if
+                // the codec error stays inside the softmax noise floor.
+                if (postRestoreLogits != null)
+                {
+                    int sampleCount = 8;
+                    var sampled = new int[sampleCount];
+                    int next = SampleGreedyFromLogits(postRestoreLogits, model.Config.VocabSize);
+                    for (int i = 0; i < sampleCount; i++)
+                    {
+                        sampled[i] = next;
+                        float[] logits = model.Forward(new[] { next });
+                        next = SampleGreedyFromLogits(logits, model.Config.VocabSize);
+                    }
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "paged-bench quality probe: sampledTokens=[{Sampled}] (greedy from post-restore logits; same across codecs => quality preserved)",
+                        string.Join(",", sampled));
+                }
+
+                long rssAfterPaged = WorkingSetBytes();
+                double baselineMedian = Median(baselineMs);
+                double pagedMedian = Median(pagedMs);
+                double speedup = pagedMedian > 0 ? baselineMedian / pagedMedian : 0;
+                double pagedTokensPerMs = pagedMedian > 0 ? promptTokens / pagedMedian : 0;
+                double baselineTokensPerMs = baselineMedian > 0 ? promptTokens / baselineMedian : 0;
+
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench RESULTS arch={Arch} dtype={Dtype} promptTokens={Prompt} blockSize={BlockSize} trials={Trials}",
+                    model.Config.Architecture, model.KvCacheDtype, promptTokens, blockSize, trials);
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench prefill ms (median of {Trials}): baseline={Baseline:F1} primingFirst={Prime:F1} pagedRestore={Paged:F1} speedup={Speedup:F2}x",
+                    trials, baselineMedian, primeSw.Elapsed.TotalMilliseconds, pagedMedian, speedup);
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench restored={Restored}/{Prompt} tokens ({Pct:F1}% recovered) tokensPerMs baseline={Bppm:F1} paged={Pppm:F1}",
+                    restoredTokens, promptTokens, 100.0 * restoredTokens / promptTokens, baselineTokensPerMs, pagedTokensPerMs);
+                _log.LogInformation(LogEventIds.CliBenchmark,
+                    "paged-bench memory: paged store={PagedMB:F1} MB ({Blocks} blocks) processRSS warm={WarmRssMB:F0} MB afterBaseline={AfterBaseRssMB:F0} MB afterPaged={AfterPagedRssMB:F0} MB delta={DeltaMB:F0} MB",
+                    pagedStats.ramBytes / 1024.0 / 1024.0, pagedStats.ramBlocks,
+                    warmRss / 1024.0 / 1024.0, rssAfterBaseline / 1024.0 / 1024.0,
+                    rssAfterPaged / 1024.0 / 1024.0, (rssAfterPaged - warmRss) / 1024.0 / 1024.0);
+            }
+            finally
+            {
+                pagedManager.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Reflect <c>--paged-kv*</c> CLI overrides onto the env vars that
+        /// <see cref="PagedKvCacheConfig.FromEnvironment"/> reads. We funnel
+        /// through env vars (instead of a separate config-passing path) so the
+        /// in-process benchmark, the production session manager, and any future
+        /// reader all see the same configuration without a divergent code path.
+        /// </summary>
+        static void ApplyPagedKvCacheCliOverrides(
+            bool? enable, int? blockSize, long? ramMb, string ssdDir, long? ssdMb, int? quantBits)
+        {
+            if (enable.HasValue)
+                Environment.SetEnvironmentVariable("TS_KV_PAGED_CACHE", enable.Value ? "1" : "0");
+            if (blockSize.HasValue)
+                Environment.SetEnvironmentVariable("TS_KV_BLOCK_SIZE", blockSize.Value.ToString(CultureInfo.InvariantCulture));
+            if (ramMb.HasValue)
+                Environment.SetEnvironmentVariable("TS_KV_CACHE_MAX_RAM_MB", ramMb.Value.ToString(CultureInfo.InvariantCulture));
+            if (ssdDir != null)
+                Environment.SetEnvironmentVariable("TS_KV_CACHE_SSD_DIR", ssdDir);
+            if (ssdMb.HasValue)
+                Environment.SetEnvironmentVariable("TS_KV_CACHE_MAX_SSD_MB", ssdMb.Value.ToString(CultureInfo.InvariantCulture));
+            if (quantBits.HasValue)
+                Environment.SetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS", quantBits.Value.ToString(CultureInfo.InvariantCulture));
+
+            if (enable == true)
+            {
+                var cfg = PagedKvCacheConfig.FromEnvironment();
+                string codecLabel = quantBits.HasValue && quantBits.Value > 0
+                    ? $"turboquant-int{quantBits.Value}"
+                    : "passthrough";
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "paged-kv enabled via CLI: blockSize={BlockSize} ramMB={RamMB} ssdDir={SsdDir} maxSsdMB={MaxSsdMB} codec={Codec}",
+                    cfg.BlockSize, cfg.MaxRamBytes / (1024 * 1024),
+                    string.IsNullOrEmpty(cfg.SsdDirectory) ? "(disabled)" : cfg.SsdDirectory,
+                    cfg.MaxSsdBytes / (1024 * 1024), codecLabel);
+            }
+        }
+
+        private static double Median(double[] values)
+        {
+            if (values == null || values.Length == 0) return 0;
+            var copy = (double[])values.Clone();
+            Array.Sort(copy);
+            int n = copy.Length;
+            return n % 2 == 0 ? (copy[n / 2 - 1] + copy[n / 2]) / 2.0 : copy[n / 2];
+        }
+
+        private static long WorkingSetBytes()
+        {
+            try { return Process.GetCurrentProcess().WorkingSet64; }
+            catch { return 0; }
+        }
+
         static void TestTokenizer(ModelBase model)
         {
             _log.LogInformation(LogEventIds.CliBenchmark, "tokenizer test starting");
@@ -2387,5 +2801,4 @@ namespace TensorSharp.Cli
         }
     }
 }
-
 

@@ -5,6 +5,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
     <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
     <Description>Command-line host for TensorSharp local inference, diagnostics, prompt inspection, and JSONL batch processing.</Description>
     <PackageTags>$(TensorSharpPackageTags);cli;console;batch;diagnostics</PackageTags>
   </PropertyGroup>
@@ -14,12 +15,17 @@
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+    <MlxNativeInstallDir>$(MSBuildProjectDirectory)/../TensorSharp.Backends.MLX/Native/dist</MlxNativeInstallDir>
+    <MlxNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlxc.dylib</MlxNativeBinaryName>
+    <MlxNativeDependencyName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlx.dylib</MlxNativeDependencyName>
+    <MlxNativeJacclName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libjaccl.dylib</MlxNativeJacclName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
     <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.6" />
@@ -31,5 +37,14 @@
       <GgmlNativeBinary Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')" />
     </ItemGroup>
     <Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyMlxNativeBinary" AfterTargets="Build" Condition="'$(MlxNativeBinaryName)' != ''">
+    <ItemGroup>
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeBinaryName)" Condition="Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeDependencyName)" Condition="'$(MlxNativeDependencyName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeDependencyName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeJacclName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

@@ -112,7 +112,7 @@ namespace TensorSharp.Runtime.Logging
             // structured message template is used (e.g. "Sent {Count} bytes"). It's
             // useful for downstream processing but is noisy when humans grep, so we
             // separate it under "template" and put the rest under "props".
-            string template = null;
+            string? template = null;
             int realCount = 0;
             for (int i = 0; i < state.Count; i++)
             {

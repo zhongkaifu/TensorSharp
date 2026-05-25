@@ -33,7 +33,7 @@ namespace TensorSharp.Runtime
         /// <param name="logits">Raw logits from the model (vocabSize elements).</param>
         /// <param name="generatedTokenIds">Previously generated token ids for penalty computation.</param>
         /// <returns>Selected token id.</returns>
-        public int Sample(float[] logits, IList<int> generatedTokenIds = null)
+        public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
         {
             int vocabSize = logits.Length;
 
@@ -87,7 +87,7 @@ namespace TensorSharp.Runtime
 
         #region Penalty Application
 
-        private void ApplyPenalties(float[] scores, IList<int> generatedTokenIds)
+        private void ApplyPenalties(float[] scores, IList<int>? generatedTokenIds)
         {
             if (generatedTokenIds == null || generatedTokenIds.Count == 0)
                 return;

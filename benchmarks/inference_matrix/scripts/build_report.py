@@ -12,11 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results"
 REPORT_PATH = ROOT.parents[1] / "docs" / "inference_benchmark_matrix.md"
 
-ENGINES = ["tensorsharp_f32", "tensorsharp_f16", "tensorsharp_q80", "llamacpp", "ollama"]
+ENGINES = ["tensorsharp_f32", "tensorsharp_f16", "tensorsharp_q80", "tensorsharp_mlx", "llamacpp", "ollama"]
 ENGINE_LABEL = {
-    "tensorsharp_f32": "TensorSharp (F32 KV)",
-    "tensorsharp_f16": "TensorSharp (F16 KV)",
-    "tensorsharp_q80": "TensorSharp (Q8 KV)",
+    "tensorsharp_f32": "TensorSharp (ggml_metal, F32 KV)",
+    "tensorsharp_f16": "TensorSharp (ggml_metal, F16 KV)",
+    "tensorsharp_q80": "TensorSharp (ggml_metal, Q8 KV)",
+    "tensorsharp_mlx": "TensorSharp (mlx, F32 KV)",
     "llamacpp": "llama.cpp",
     "ollama": "Ollama",
 }
@@ -93,7 +94,7 @@ def engine_versions_block() -> str:
     return (
         "| Engine | Version / build |\n"
         "|--------|-----------------|\n"
-        f"| TensorSharp | git `{ts_rev}` (this repo), .NET {dotnet_v}, ggml_metal backend |\n"
+        f"| TensorSharp | git `{ts_rev}` (this repo), .NET {dotnet_v}, ggml_metal and mlx backends |\n"
         f"| llama.cpp   | brew package, {llama_v or 'unknown'} (Metal + BLAS) |\n"
         f"| Ollama      | {ollama_v or 'unknown'} |\n"
     )
@@ -197,10 +198,14 @@ def main():
         " (image / audio / video) workloads."
     )
     out.append("")
-    out.append("TensorSharp is tested with three KV cache data types (F32, F16, Q8_0)"
-               " to measure the performance impact of KV cache precision.")
+    out.append(
+        "TensorSharp is represented by four variants: three on the **GGML Metal**"
+        " backend with three KV-cache dtypes (F32, F16, Q8_0) to measure the"
+        " impact of KV-cache precision, and one on the **MLX** backend (mlx-c /"
+        " Apple Metal, F32 KV) to compare against the GGML Metal path."
+    )
     out.append("")
-    out.append("All three engines were pointed at the same on-disk `.gguf` files."
+    out.append("All engines were pointed at the same on-disk `.gguf` file."
                " For Ollama this required registering a custom Modelfile (`ts-gemma4-e4b-q8`)"
                " so that no quantisation differences would skew the comparison.")
     out.append("")
@@ -209,12 +214,16 @@ def main():
     out.append("## TL;DR\n")
     out.append(
         "Headline numbers on Gemma 4 E4B Q8_0, decode throughput on a real text prompt"
-        " (`long_text`, ~1043-token prompt -> 64 tokens generated), in tokens/second:"
+        " (`long_text`, ~1043-token prompt -> 64 tokens generated), in tokens/second."
+        " TensorSharp is represented by four backend / KV-dtype variants (three on the"
+        " GGML Metal backend with F32 / F16 / Q8 KV, and one on the MLX backend with"
+        " F32 KV)."
     )
     out.append("")
-    head = "| TensorSharp (F32 KV) | TensorSharp (F16 KV) | TensorSharp (Q8 KV) | llama.cpp | Ollama |"
+    head = ("| TensorSharp (ggml_metal, F32) | TensorSharp (ggml_metal, F16) |"
+            " TensorSharp (ggml_metal, Q8) | TensorSharp (mlx, F32) | llama.cpp | Ollama |")
     out.append(head)
-    out.append("|----:|----:|----:|----:|----:|")
+    out.append("|----:|----:|----:|----:|----:|----:|")
     cells = []
     for e in ENGINES:
         d = all_data.get(e, {}).get("gemma4", {}).get("long_text")
@@ -227,9 +236,8 @@ def main():
         "And prefill throughput on the synthetic 2048-token prompt (`pp2048`):"
     )
     out.append("")
-    head = "| TensorSharp (F32 KV) | TensorSharp (F16 KV) | TensorSharp (Q8 KV) | llama.cpp | Ollama |"
     out.append(head)
-    out.append("|----:|----:|----:|----:|----:|")
+    out.append("|----:|----:|----:|----:|----:|----:|")
     cells = []
     for e in ENGINES:
         d = all_data.get(e, {}).get("gemma4", {}).get("pp2048")
@@ -278,9 +286,9 @@ def main():
     out.append("")
     out.append("- **TensorSharp** uses its `--benchmark` mode for the synthetic `pp*`/`tg*`"
                " tasks (3 runs each, best-run is reported). For real text and multimodal"
-               " tasks it uses `--warmup-runs 1`. Each TensorSharp variant is run with"
-               " a specific `--kv-cache-dtype` (f32, f16, or q8_0) to measure the"
-               " impact of KV cache precision on throughput.")
+               " tasks it uses `--warmup-runs 1`. The three `ggml_metal` rows differ only in"
+               " `--kv-cache-dtype` (`f32`, `f16`, `q8_0`) so each row measures KV-cache"
+               " precision in isolation; the `mlx` row uses `--backend mlx` with F32 KV.")
     out.append("- **llama.cpp** uses `llama-bench -p N -n M -r 3` for synthetic,"
                " `llama-cli` for real text (`-st --no-warmup --no-display-prompt --jinja`),"
                " and `llama-mtmd-cli` for image/audio (with `--no-warmup`).")
@@ -341,24 +349,58 @@ def main():
                               ["tg128", "short_text", "long_text", "image"]))
     out.append("")
 
+    # ---- MLX backend ----
+    out.append("## 9. TensorSharp MLX backend\n")
+    out.append(
+        "TensorSharp also exposes an MLX backend ([mlx-c](https://github.com/ml-explore/mlx-c) /"
+        " Apple Metal). It uses a separate kernel set from the GGML Metal path and a different"
+        " allocator (`MlxAllocator`), so it's tracked as its own column rather than rolled into"
+        " the GGML Metal results. Activate it with `--backend mlx` in the CLI / server."
+    )
+    out.append("")
+    out.append("MLX vs. GGML Metal (F32 KV) on the same tasks (tokens / second, higher is better):")
+    out.append("")
+    out.append("| Task | TensorSharp ggml_metal (F32) prefill | TensorSharp ggml_metal (F32) decode | TensorSharp mlx (F32) prefill | TensorSharp mlx (F32) decode |")
+    out.append("|------|----:|----:|----:|----:|")
+    for t in TASKS_ORDER:
+        cells = [task_short(t)]
+        for e in ["tensorsharp_f32", "tensorsharp_mlx"]:
+            d = all_data.get(e, {}).get("gemma4", {}).get(t)
+            if d is None:
+                pref, dec = "n/a", "n/a"
+            elif not d.get("ok"):
+                pref, dec = "fail", "fail"
+            else:
+                pv = d.get("prefill_tps", 0.0) or 0.0
+                dv = d.get("decode_tps", 0.0) or 0.0
+                pref = "—" if t == "tg128" and pv <= 0 else _safe(pv)
+                dec = "—" if t in PREFILL_ONLY_TASKS else _safe(dv)
+            cells.extend([pref, dec])
+        out.append("| " + " | ".join(cells) + " |")
+    out.append("")
+
     # ---- Reproducing ----
-    out.append("## 9. Reproducing this report\n")
+    out.append("## 10. Reproducing this report\n")
     out.append("```bash")
-    out.append("# 1. register the Gemma4 GGUF inside Ollama")
+    out.append("# 1. register the Gemma4 GGUF inside Ollama (one-time)")
     out.append("cd benchmarks/inference_matrix")
     out.append("ollama create ts-gemma4-e4b-q8 -f modelfiles/Modelfile.gemma4-e4b-q8")
     out.append("")
-    out.append("# 2. (re)build the TensorSharp CLI")
+    out.append("# 2. drop required media files in <repo>/data/ (apple.png, obama_first_45_secs.mp3, concert.mp4)")
+    out.append("mkdir -p ../../data && ln -sf <your-path>/apple.png ../../data/apple.png  # etc.")
+    out.append("")
+    out.append("# 3. (re)build the TensorSharp CLI")
     out.append("dotnet build ../../TensorSharp.Cli/TensorSharp.Cli.csproj -c Release")
     out.append("")
-    out.append("# 3. run the matrix (one engine at a time keeps the GPU happy)")
+    out.append("# 4. run the matrix (one engine at a time keeps the GPU happy)")
     out.append("python3 scripts/run_bench.py --engines ollama")
     out.append("python3 scripts/run_bench.py --engines llamacpp")
     out.append("python3 scripts/run_bench.py --engines tensorsharp_f32")
     out.append("python3 scripts/run_bench.py --engines tensorsharp_f16")
     out.append("python3 scripts/run_bench.py --engines tensorsharp_q80")
+    out.append("python3 scripts/run_bench.py --engines tensorsharp_mlx")
     out.append("")
-    out.append("# 4. regenerate this report from the JSON results")
+    out.append("# 5. regenerate this report from the JSON results")
     out.append("python3 scripts/build_report.py")
     out.append("```")
     out.append("")

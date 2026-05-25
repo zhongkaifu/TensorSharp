@@ -13,6 +13,7 @@
 | Modalities | Text, image |
 | Thinking mode | No |
 | Tool calling | No |
+| Batched / paged forward | Not implemented. Runs through the per-sequence KV-swap fallback inside `BatchExecutor` when the continuous-batching engine is active. See §11. |
 | Output parser | `PassthroughOutputParser` |
 
 ## 1. Origin and intent
@@ -303,15 +304,40 @@ Quantized weights load through `LoadWeights()` and stay quantized in the
 `_quantWeights` dictionary; matmul calls run through the backend's native
 quantized matmul without dequantizing to FP32.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+Gemma 3 does **not** implement `IBatchedPagedModel.ForwardBatch`. When
+the continuous-batching engine is active (default in
+`TensorSharp.Server`), Gemma 3 sequences run through
+`BatchExecutor.ExecuteStepPerSequence` — the per-sequence KV-swap
+fallback that uses the model's `TryExtractKVBlock` /
+`TryInjectKVBlock` contract to move KV state in and out as the scheduler
+hands the model different sequences. The scheduler, paged block pool,
+prefix-cache index, and request streaming all still apply; the only
+difference vs. a true batched port (Mistral 3 / Gemma 4 / Qwen 3 / etc.)
+is that the model runs one sequence at a time inside each scheduler
+step instead of packing N sequences into one forward.
+
+Porting Gemma 3 to `IBatchedPagedModel` would mostly mirror Gemma 4's
+batched port, with simpler requirements (no PLE, no KV-donor aliasing,
+no per-layer head dim heterogeneity) but with the same alternating
+SWA / global attention dispatch and circular-cache considerations.
+It's a feasible follow-up, listed under §13 Optimization opportunities.
+
+## 12. Output parser and chat template
 
 - `Gemma3OutputParser` is the same as `PassthroughOutputParser` — Gemma 3 has
   no thinking / tool-call wire format.
 - Chat template falls back to the hardcoded Gemma chat template when the GGUF
   does not ship a Jinja2 template.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
+- **Batched / paged forward port** — implementing
+  `IBatchedPagedModel.ForwardBatch` would let Gemma 3 use the same
+  continuous-batching engine path that Mistral 3 / Gemma 4 / Qwen 3 use,
+  with the per-layer SWA dispatch already supported by the native paged
+  attention kernel.
 - **Fused QKV** — Q, K, V are still three separate projections. Concatenating
   them into a single matmul (the way Gemma 4 / Qwen 3 do) would halve the
   attention dispatch count.

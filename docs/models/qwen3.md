@@ -6,11 +6,12 @@
 |---|---|
 | Provider | Alibaba |
 | GGUF architecture key | `qwen3` |
-| Source class | [`Qwen3Model`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.cs) |
+| Source class | [`Qwen3Model`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.cs) (legacy per-seq) + [`Qwen3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Example models | Qwen3-4B, Qwen3-8B, Qwen3-14B, Qwen3-32B |
 | Modalities | Text only |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
+| Batched / paged forward | Reference port — first model in TensorSharp to implement `IBatchedPagedModel.ForwardBatch`. Template for Mistral 3 / Gemma 4 / Qwen 3.5 / Nemotron-H batched ports. See §11. |
 | Output parser | `Qwen3OutputParser` |
 
 ## 1. Origin and intent
@@ -265,7 +266,52 @@ without the matching native build), the managed decode loop:
 - Quantized weights stay quantized in `_quantWeights`; matmul calls run
   through the backend's native quantized matmul.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+`Qwen3Model.BatchedForward.cs` is the **reference implementation** of
+`IBatchedPagedModel.ForwardBatch` in TensorSharp — the simplest hybrid-
+free dense transformer port and the template Mistral 3, Gemma 4,
+Qwen 3.5/3.6, and Nemotron-H later built on top of. It runs through the
+shared `InferenceEngine` continuous-batching stack documented in
+[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+
+Implementation:
+
+- **Lazy per-layer paged K/V buffers** of layout
+  `[numBlocks * blockSize * numKvHeads * headDim]`, sized by the
+  engine's `BlockPool`. `AllocateLayerBuffer(numBlocks, blockSize,
+  numKvHeads, headDim)` is the helper used by every later batched
+  port.
+- **Per-token RoPE** built from `ctx.Positions` and dispatched through
+  `Ops.RoPEEx` (which already accepts an arbitrary positions tensor —
+  this is the kernel change Qwen 3's batched port introduced and the
+  other batched models reuse).
+- **K/V scatter via `PagedKvBatchOps.ScatterKv(slotMapping)`** writes
+  the layer's K and V at `blockId * blockSize + offset` in the layer's
+  paged buffer.
+- **Per-sequence attention** via the native paged kernel
+  `TSGgml_PagedAttentionForward` (default) or the C# fallback
+  `ManagedPagedAttention.Forward`. K/V are gathered per sequence from
+  `blockTables` + `seqLens`.
+- **Last-token gather** via
+  `PagedKvBatchOps.GatherLastTokenPerSeq` so only the LM head runs on
+  `numSeqs` rows instead of `numTokens`.
+- **Reuses existing helpers** — `Embedding`, `RMSNormOp`,
+  `LinearForward`, and `FFN` on `ModelBase` already operate over the
+  full token axis, so embeddings / projections / norms / FFN batch
+  automatically.
+
+### Verified correctness
+
+End-to-end logit-level correctness against a real base-Qwen3 GGUF is not
+yet verified in this tree (only Qwen 3.6 / GatedDeltaNet GGUFs are
+available locally). The opt-in
+[`Qwen3BatchedForwardTests`](../../InferenceWeb.Tests/Qwen3BatchedForwardTests.cs)
+self-validate as soon as a base Qwen3 GGUF is dropped into
+`TS_TEST_MODEL_DIR`. `EngineParallelInferenceTests` exercise the engine
+side of the path against the available Qwen GGUFs.
+
+## 12. Output parser and chat template
 
 - `Qwen3OutputParser` extracts:
   - Thinking content from `<think> ... </think>` blocks.
@@ -274,7 +320,7 @@ without the matching native build), the managed decode loop:
   message format. Falls back to the hardcoded template when the GGUF lacks a
   Jinja2 template; otherwise the embedded Jinja2 is rendered directly.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
 - **GPU-fused per-token decode** — the whole-model native path already
   eliminates managed overhead, but layers still run as separate GGML graphs
@@ -283,3 +329,7 @@ without the matching native build), the managed decode loop:
 - **Native prefill** — moving prefill into a native single-call path would
   significantly improve TTFT, especially on long prompts where the managed
   per-op overhead is not amortized away.
+- **Validate batched correctness on a real base-Qwen3 GGUF** — the
+  reference test exists but needs a model file checked into the test
+  fixture (or a CI helper that downloads one) to enforce the cosine
+  bound automatically.

@@ -74,7 +74,7 @@ namespace TensorSharp.Runtime
         /// Stop sequences: generation stops when any of these strings is produced.
         /// The stop string itself is not included in the output.
         /// </summary>
-        public List<string> StopSequences { get; set; }
+        public List<string>? StopSequences { get; set; }
 
         /// <summary>
         /// Maximum number of tokens to generate. 0 = use caller's default.

@@ -101,6 +101,130 @@ namespace TensorSharp.Server.Hosting
         }
 
         /// <summary>
+        /// Translate <c>--continuous-batching</c> / <c>--no-continuous-batching</c>
+        /// into the two env vars that gate the batched path:
+        /// <c>TS_SCHED_DISABLE_BATCHED</c> (scheduler — falls through to
+        /// per-sequence KV-swap when set) and <c>TS_QWEN35_BATCHED</c>
+        /// (model — Qwen3.5 ForwardBatch opt-in, since by default Qwen3.5
+        /// throws NotSupported and BatchExecutor falls through anyway).
+        /// Default is ON so operators get paged-attention continuous batching
+        /// without setting any env vars; <c>--no-continuous-batching</c>
+        /// forces the per-seq path for every model.
+        ///
+        /// Must run before <see cref="SessionKvCacheManager"/> /
+        /// <see cref="InferenceEngine"/> are constructed because both
+        /// <c>BatchExecutor</c> and Qwen3.5's <c>SupportsBatchedMultimodal</c>
+        /// read the env vars at runtime on each step.
+        /// </summary>
+        public static bool ApplyContinuousBatchingCliFlag(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            bool changed = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (string.Equals(a, "--continuous-batching", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(a, "--paged-batching", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "0");
+                    Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "1");
+                    changed = true;
+                    continue;
+                }
+                if (string.Equals(a, "--no-continuous-batching", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(a, "--no-paged-batching", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+                    Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "0");
+                    changed = true;
+                    continue;
+                }
+            }
+            return changed;
+        }
+
+        /// <summary>
+        /// Translate <c>--paged-kv*</c> CLI flags into the env vars consumed by
+        /// <see cref="PagedKvCacheConfig.FromEnvironment"/>. Returns true when at
+        /// least one flag was applied so the caller can emit a startup-log line.
+        /// Must run before <see cref="SessionKvCacheManager"/> is constructed -
+        /// the manager reads the env vars at field-initializer time.
+        /// </summary>
+        public static bool ApplyPagedKvCacheCliFlags(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            bool changed = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (string.Equals(a, "--paged-kv", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(a, "--paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_KV_PAGED_CACHE", "1");
+                    changed = true;
+                    continue;
+                }
+                if (string.Equals(a, "--no-paged-kv", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(a, "--no-paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_KV_PAGED_CACHE", "0");
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-block-size", out string blockSizeOpt))
+                {
+                    if (!int.TryParse(blockSizeOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int blockSize) || blockSize <= 0)
+                        throw new ArgumentException($"Invalid value for --paged-kv-block-size: '{blockSizeOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_KV_BLOCK_SIZE", blockSize.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-ram-mb", out string ramOpt))
+                {
+                    if (!long.TryParse(ramOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out long ramMb) || ramMb <= 0)
+                        throw new ArgumentException($"Invalid value for --paged-kv-ram-mb: '{ramOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_KV_CACHE_MAX_RAM_MB", ramMb.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-ssd-dir", out string ssdDirOpt))
+                {
+                    Environment.SetEnvironmentVariable("TS_KV_CACHE_SSD_DIR", ssdDirOpt);
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-ssd-mb", out string ssdMbOpt))
+                {
+                    if (!long.TryParse(ssdMbOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out long ssdMb) || ssdMb <= 0)
+                        throw new ArgumentException($"Invalid value for --paged-kv-ssd-mb: '{ssdMbOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_KV_CACHE_MAX_SSD_MB", ssdMb.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-quant-bits", out string quantBitsOpt))
+                {
+                    // Accepts 0 (explicit off), 4, or 8. The paged manager
+                    // gates the codec a second time on model.RequiresPerBlockCapture,
+                    // so requesting 4 / 8 on a recurrent-state model still
+                    // falls back to passthrough at runtime - the value here
+                    // just records the operator's intent.
+                    if (!int.TryParse(quantBitsOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int quantBits))
+                        throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: '{quantBitsOpt}'. Expected 0 (off), 4, or 8.");
+                    if (quantBits != 0 && quantBits != 4 && quantBits != 8)
+                        throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: {quantBits}. Expected 0 (off), 4, or 8.");
+                    Environment.SetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS", quantBits.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+            }
+            return changed;
+        }
+
+        /// <summary>
         /// Bag of nullable sampling overrides captured from the CLI. We track
         /// each field separately (as <see cref="Nullable{T}"/>) so the caller
         /// can distinguish "operator pinned this value" from "operator didn't
@@ -218,7 +342,101 @@ namespace TensorSharp.Server.Hosting
                     configuredSampling.StopSequences.Add(stopOption);
                     continue;
                 }
+
+                // Paged-KV flags are consumed by ApplyPagedKvCacheCliFlags(args)
+                // in a separate earlier pass. They still appear in args[] when
+                // ParseArgs walks the list, so recognise + skip them here to
+                // keep them out of the unknown-arg trap below.
+                if (string.Equals(args[i], "--paged-kv", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--paged-kv-cache", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--no-paged-kv", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--no-paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                // Continuous-batching flag is also consumed by an earlier pass
+                // (ApplyContinuousBatchingCliFlag). Skip here so ParseArgs
+                // doesn't trip the unknown-arg trap.
+                if (string.Equals(args[i], "--continuous-batching", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--paged-batching", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--no-continuous-batching", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--no-paged-batching", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--paged-kv-block-size", out _)
+                    || TryReadOption(args, ref i, "--paged-kv-ram-mb", out _)
+                    || TryReadOption(args, ref i, "--paged-kv-ssd-dir", out _)
+                    || TryReadOption(args, ref i, "--paged-kv-ssd-mb", out _)
+                    || TryReadOption(args, ref i, "--paged-kv-quant-bits", out _))
+                {
+                    continue;
+                }
+
+                // Anything else that starts with `--` is an unknown flag and we
+                // refuse to start. Previously these were silently dropped, so a
+                // typo like `--mproj <path>` (instead of `--mmproj`) would launch
+                // the server with no vision projector and produce image-unrelated
+                // output later. Fail fast so the operator sees the typo at
+                // startup, not as a confusing inference bug.
+                if (args[i].StartsWith("--", StringComparison.Ordinal))
+                {
+                    string suggestion = SuggestFlagCorrection(args[i]);
+                    string suffix = suggestion != null ? $" Did you mean '{suggestion}'?" : string.Empty;
+                    throw new ArgumentException($"Unknown option '{args[i]}'.{suffix}");
+                }
+
+                // Bare positional arg (no '--' prefix) — also unsupported but
+                // produce a clearer error so the operator knows it's not a
+                // value attached to an above option.
+                throw new ArgumentException($"Unexpected positional argument '{args[i]}'.");
             }
+        }
+
+        /// <summary>Suggest a known flag that differs from the typo by one
+        /// character (insertion, deletion, or substitution) — covers `--mproj`
+        /// → `--mmproj`, `--temprature` → `--temperature`, etc. Returns null
+        /// when no flag is within edit distance 2.</summary>
+        private static string SuggestFlagCorrection(string typo)
+        {
+            string[] knownFlags = new[]
+            {
+                "--model", "--mmproj", "--backend", "--max-tokens",
+                "--temperature", "--top-k", "--top-p", "--min-p",
+                "--repeat-penalty", "--presence-penalty", "--frequency-penalty",
+                "--seed", "--stop",
+                "--paged-kv", "--paged-kv-cache", "--no-paged-kv", "--no-paged-kv-cache",
+                "--paged-kv-block-size", "--paged-kv-ram-mb",
+                "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
+                "--continuous-batching", "--no-continuous-batching",
+                "--paged-batching", "--no-paged-batching",
+            };
+            string best = null;
+            int bestDist = int.MaxValue;
+            foreach (var flag in knownFlags)
+            {
+                int d = LevenshteinDistance(typo, flag);
+                if (d < bestDist) { bestDist = d; best = flag; }
+            }
+            // Only suggest if it's a near-miss (≤ 2 edits) — beyond that the
+            // suggestion is more confusing than helpful.
+            return bestDist <= 2 ? best : null;
+        }
+
+        private static int LevenshteinDistance(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a)) return b?.Length ?? 0;
+            if (string.IsNullOrEmpty(b)) return a.Length;
+            int[,] d = new int[a.Length + 1, b.Length + 1];
+            for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+            for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+            for (int i = 1; i <= a.Length; i++)
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                }
+            return d[a.Length, b.Length];
         }
 
         private static float ParseFloat(string flag, string value)

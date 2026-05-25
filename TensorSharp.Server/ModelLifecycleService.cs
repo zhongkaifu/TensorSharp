@@ -111,6 +111,7 @@ namespace TensorSharp.Server
         {
             return BackendCatalog.Canonicalize(backendStr) switch
             {
+                "mlx" => BackendType.Mlx,
                 "cuda" => BackendType.Cuda,
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cpu" => BackendType.GgmlCpu,

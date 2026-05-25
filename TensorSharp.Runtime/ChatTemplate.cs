@@ -17,16 +17,16 @@ namespace TensorSharp.Runtime
 {
     public class ChatMessage
     {
-        public string Role { get; set; }
-        public string Content { get; set; }
+        public string Role { get; set; } = string.Empty;
+        public string Content { get; set; } = string.Empty;
         /// <summary>
         /// Optional list of image file paths for multimodal messages.
         /// </summary>
-        public List<string> ImagePaths { get; set; }
+        public List<string>? ImagePaths { get; set; }
         /// <summary>
         /// Optional list of audio file paths for multimodal messages.
         /// </summary>
-        public List<string> AudioPaths { get; set; }
+        public List<string>? AudioPaths { get; set; }
         /// <summary>
         /// Optional list of plain-text file paths whose contents have been inlined into
         /// <see cref="Content"/> (e.g. uploaded .txt / .md / .csv attachments). The paths
@@ -34,7 +34,7 @@ namespace TensorSharp.Runtime
         /// audit log can record which uploaded files belong to this message even though
         /// their contents have been folded into the prompt text.
         /// </summary>
-        public List<string> TextFilePaths { get; set; }
+        public List<string>? TextFilePaths { get; set; }
         /// <summary>
         /// True if ImagePaths represent video frames (inserts &lt;|video&gt; before frame &lt;|image&gt; tokens).
         /// </summary>
@@ -42,11 +42,11 @@ namespace TensorSharp.Runtime
         /// <summary>
         /// Tool calls made by assistant in this message (for multi-turn tool calling).
         /// </summary>
-        public List<ToolCall> ToolCalls { get; set; }
+        public List<ToolCall>? ToolCalls { get; set; }
         /// <summary>
         /// Thinking/reasoning content produced by the model in this message.
         /// </summary>
-        public string Thinking { get; set; }
+        public string? Thinking { get; set; }
         /// <summary>
         /// Raw output tokens produced directly by the model when this assistant message
         /// was generated (in generation order, INCLUDING any thinking/reasoning tokens
@@ -58,13 +58,13 @@ namespace TensorSharp.Runtime
         /// whose prefix exactly matches what the model previously generated, enabling
         /// reliable KV cache reuse across turns.
         /// </summary>
-        public List<int> RawOutputTokens { get; set; }
+        public List<int>? RawOutputTokens { get; set; }
     }
 
     public static class ChatTemplate
     {
         public static string RenderQwen3(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
 
@@ -99,7 +99,7 @@ namespace TensorSharp.Runtime
 
         private static string SerializeToolCall(ToolCall tc)
         {
-            var obj = new Dictionary<string, object> { ["name"] = tc.Name, ["arguments"] = tc.Arguments };
+            var obj = new Dictionary<string, object?> { ["name"] = tc.Name, ["arguments"] = tc.Arguments };
             return JsonSerializer.Serialize(obj);
         }
 
@@ -114,7 +114,7 @@ namespace TensorSharp.Runtime
         ///     otherwise "&lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;".
         /// </summary>
         public static string RenderNemotron(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
 
@@ -125,7 +125,7 @@ namespace TensorSharp.Runtime
             if (hasSystem)
             {
                 sb.Append("<|im_start|>system\n");
-                sb.Append(SanitizeNemotronContent(messages[0].Content ?? ""));
+                sb.Append(SanitizeNemotronContent(messages![0].Content ?? ""));
                 startIdx = 1;
             }
             else if (hasTools)
@@ -136,7 +136,7 @@ namespace TensorSharp.Runtime
             if (hasTools)
             {
                 if (hasSystem) sb.Append("\n\n");
-                sb.Append(BuildNemotronToolsPreamble(tools));
+                sb.Append(BuildNemotronToolsPreamble(tools!));
             }
 
             if (hasSystem || hasTools)
@@ -290,7 +290,7 @@ namespace TensorSharp.Runtime
         /// The single <|image_pad|> token is later expanded to N tokens based on image dimensions.
         /// </summary>
         public static string RenderQwen35(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            bool enableThinking = false, List<ToolFunction> tools = null)
+            bool enableThinking = false, List<ToolFunction>? tools = null)
         {
             var sb = new StringBuilder();
 
@@ -492,7 +492,7 @@ namespace TensorSharp.Runtime
             for (int i = 0; i < messages.Count; i++)
             {
                 var msg = messages[i];
-                string role = msg.Role == "assistant" ? "model" : msg.Role;
+                string role = msg.Role == "assistant" ? "model" : (msg.Role ?? "");
                 sb.Append($"<start_of_turn>{role}\n");
                 if (msg.ImagePaths != null)
                 {
@@ -515,8 +515,8 @@ namespace TensorSharp.Runtime
         /// before rendering so both Jinja2 and hardcoded paths produce correct output.
         /// </summary>
         public static string RenderFromGgufTemplate(string template, List<ChatMessage> messages,
-            bool addGenerationPrompt = true, string architecture = null,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            bool addGenerationPrompt = true, string? architecture = null,
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             if (IsQwen35Family(architecture) && !enableThinking)
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
@@ -556,8 +556,8 @@ namespace TensorSharp.Runtime
         }
 
         private static string RenderHardcoded(List<ChatMessage> messages,
-            bool addGenerationPrompt, string architecture,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            bool addGenerationPrompt, string? architecture,
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             if (architecture == "gemma3")
                 return RenderGemma3(messages, addGenerationPrompt);
@@ -583,7 +583,7 @@ namespace TensorSharp.Runtime
             return RenderQwen3(messages, addGenerationPrompt, tools, enableThinking);
         }
 
-        private static bool IsQwen35Family(string architecture)
+        private static bool IsQwen35Family(string? architecture)
         {
             return architecture == "qwen35" ||
                    architecture == "qwen35moe" ||
@@ -593,15 +593,15 @@ namespace TensorSharp.Runtime
         }
 
         private static Dictionary<string, object> BuildJinja2Context(
-            List<ChatMessage> messages, bool addGenerationPrompt, string architecture,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            List<ChatMessage> messages, bool addGenerationPrompt, string? architecture,
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var msgList = new List<object>();
             foreach (var m in messages)
             {
                 var dict = new Dictionary<string, object>
                 {
-                    ["role"] = m.Role,
+                    ["role"] = m.Role ?? "",
                     ["content"] = m.Content ?? ""
                 };
                 if (m.ToolCalls != null && m.ToolCalls.Count > 0)
@@ -687,7 +687,7 @@ namespace TensorSharp.Runtime
         /// Pre-process messages to inject multimodal placeholder tokens into the content string
         /// so the Jinja2 template's {{ message['content'] }} renders them correctly.
         /// </summary>
-        private static List<ChatMessage> InjectMultimodalTokens(List<ChatMessage> messages, string architecture)
+        private static List<ChatMessage> InjectMultimodalTokens(List<ChatMessage> messages, string? architecture)
         {
             var result = new List<ChatMessage>(messages.Count);
             foreach (var msg in messages)
@@ -790,7 +790,7 @@ namespace TensorSharp.Runtime
             var sb = new StringBuilder();
 
             int startIdx = 0;
-            string developerContent = null;
+            string? developerContent = null;
             if (messages.Count > 0 && (messages[0].Role == "system" || messages[0].Role == "developer"))
             {
                 developerContent = messages[0].Content;
@@ -846,7 +846,7 @@ namespace TensorSharp.Runtime
         /// (&lt;|channel&gt;thought\n&lt;channel|&gt;) so the model skips thinking.
         /// </summary>
         public static string RenderGemma4(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            List<ToolFunction> tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
 
@@ -868,7 +868,7 @@ namespace TensorSharp.Runtime
                 }
                 if (hasTools)
                 {
-                    foreach (var tool in tools)
+                    foreach (var tool in tools!)
                         sb.Append(RenderGemma4ToolDeclaration(tool));
                 }
                 sb.Append("<turn|>\n");
@@ -877,7 +877,7 @@ namespace TensorSharp.Runtime
             for (int i = startIdx; i < messages.Count; i++)
             {
                 var msg = messages[i];
-                string role = msg.Role == "assistant" ? "model" : msg.Role;
+                string role = msg.Role == "assistant" ? "model" : (msg.Role ?? "");
                 sb.Append($"<|turn>{role}\n");
 
                 if (msg.Role == "assistant" && msg.ToolCalls != null)
@@ -940,7 +940,7 @@ namespace TensorSharp.Runtime
                 if (hasParams)
                 {
                     sb.Append("properties:{");
-                    var sortedKeys = new List<string>(tool.Parameters.Keys);
+                    var sortedKeys = new List<string>(tool.Parameters!.Keys);
                     sortedKeys.Sort(StringComparer.Ordinal);
                     bool first = true;
                     foreach (var key in sortedKeys)

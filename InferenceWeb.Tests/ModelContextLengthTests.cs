@@ -45,4 +45,26 @@ public class ModelContextLengthTests
         Assert.Equal(4096, resolved);
         Assert.Equal("fallback", source);
     }
+
+    [Fact]
+    public void ResolveInitialCacheAllocationLength_CapsMlxGpuBackendsUnlessContextIsExplicit()
+    {
+        string previousMaxContext = Environment.GetEnvironmentVariable("MAX_CONTEXT");
+        try
+        {
+            Environment.SetEnvironmentVariable("MAX_CONTEXT", null);
+
+            Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
+            Assert.Equal(4096, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 4096));
+            Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
+            Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cpu, 262144));
+
+            Environment.SetEnvironmentVariable("MAX_CONTEXT", "262144");
+            Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("MAX_CONTEXT", previousMaxContext);
+        }
+    }
 }

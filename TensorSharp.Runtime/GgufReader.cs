@@ -38,8 +38,8 @@ namespace TensorSharp.Runtime
 
     public class GgufTensorInfo
     {
-        public string Name { get; set; }
-        public ulong[] Shape { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public ulong[] Shape { get; set; } = Array.Empty<ulong>();
         public GgmlTensorType Type { get; set; }
         public ulong Offset { get; set; }
 
@@ -63,8 +63,8 @@ namespace TensorSharp.Runtime
 
         private FileStream _stream;
         private string _path;
-        private MemoryMappedFile _mappedFile;
-        private MemoryMappedViewAccessor _mappedView;
+        private MemoryMappedFile? _mappedFile;
+        private MemoryMappedViewAccessor? _mappedView;
         private unsafe byte* _mappedBase;
         private bool _mappedPointerAcquired;
 
@@ -118,7 +118,7 @@ namespace TensorSharp.Runtime
             DataOffset = pos + (alignment - pos % alignment) % alignment;
         }
 
-        public string GetString(string key, string defaultValue = null)
+        public string? GetString(string key, string? defaultValue = null)
         {
             if (!Metadata.TryGetValue(key, out var v)) return defaultValue;
             return v as string ?? defaultValue;
@@ -145,21 +145,21 @@ namespace TensorSharp.Runtime
             return Convert.ToBoolean(v);
         }
 
-        public string[] GetStringArray(string key)
+        public string[]? GetStringArray(string key)
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is string[] sa) return sa;
             return null;
         }
 
-        public float[] GetFloatArray(string key)
+        public float[]? GetFloatArray(string key)
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is float[] fa) return fa;
             return null;
         }
 
-        public int[] GetInt32Array(string key)
+        public int[]? GetInt32Array(string key)
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is int[] ia) return ia;
@@ -172,14 +172,14 @@ namespace TensorSharp.Runtime
             return null;
         }
 
-        public bool[] GetBoolArray(string key)
+        public bool[]? GetBoolArray(string key)
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is bool[] ba) return ba;
             return null;
         }
 
-        public uint[] GetUint32Array(string key)
+        public uint[]? GetUint32Array(string key)
         {
             if (!Metadata.TryGetValue(key, out var v)) return null;
             if (v is uint[] ua) return ua;
@@ -495,7 +495,7 @@ namespace TensorSharp.Runtime
             _mappedFile?.Dispose();
             _mappedFile = null;
             _stream?.Dispose();
-            _stream = null;
+            _stream = null!;
         }
 
         private unsafe void EnsureMappedView()

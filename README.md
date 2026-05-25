@@ -14,9 +14,10 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 |---|---|
 | [Quick build and usage](#building) | Build the solution, compile the native GGML bridge, and run the CLI or server |
 | [Supported model architectures](#supported-model-architectures) | Check which GGUF architecture keys, modalities, thinking mode, and tool calling paths are implemented |
-| [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, GGML CPU, GGML Metal, and GGML CUDA |
+| [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, MLX Metal, GGML CPU, GGML Metal, and GGML CUDA |
 | [HTTP APIs](#http-apis) | Use the Ollama-compatible, OpenAI-compatible, or Web UI SSE endpoints |
 | [Per-model architecture cards](docs/models/README.md) | Read end-to-end documentation of one architecture (origin, forward graph, components, parameters, and how TensorSharp implements / optimizes prefill and decode) |
+| [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | Understand the vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
 | [Inference benchmark matrix](docs/inference_benchmark_matrix.md) | Compare TensorSharp against llama.cpp and Ollama across text / multimodal workloads, with KV-cache dtype sweeps |
 | [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Copy complete curl and Python examples for the server surface |
 | [Server integration tests](TensorSharp.Server/testdata/README.md) | Exercise the public API contract against a running server |
@@ -25,10 +26,11 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 
 | Area | Status |
 |---|---|
-| Model families | Gemma 3/4, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H, and Mistral 3 |
+| Model families | Gemma 3/4, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3 |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API |
-| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), GGML CPU, GGML Metal, GGML CUDA |
+| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
+| Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes |
 
@@ -39,18 +41,21 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
-- **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, and a direct CUDA/cuBLAS backend with PTX kernels plus CPU fallbacks for unsupported ops
+- **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
+- **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+- **Batched / parallel inference** -- `IBatchedPagedModel.ForwardBatch` implementations for Mistral 3 (default), Gemma 4 (default), GPT OSS (opt-in `TS_GPTOSS_BATCHED=1`), Qwen 3.5/3.6-family (opt-in `TS_QWEN35_BATCHED=1`), and Nemotron-H (opt-in `TS_NEMOTRON_BATCHED=1`) pack N sequences into a single forward pass with paged K/V scatter and per-sequence attention via the native kernel
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
-- **Request queue** -- FIFO inference queue ensures single-request execution for KV cache stability, with real-time position tracking for clients
+- **Inference engine** -- the new `InferenceEngine` (worker-thread scheduler + paged block pool) replaces the legacy single-request FIFO queue inside `TensorSharp.Server`. The HTTP adapters still emit queue-position chunks for backward compatibility but the engine itself handles concurrency.
 - **Batch processing** -- JSONL input support in the console application, plus a built-in inference benchmark for prefill/decode throughput
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
-- **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model
-- **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers
+- **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model. The Mamba2 step has both a per-sequence native kernel and a batched native kernel (`TSGgml_NemotronMamba2BatchedStepF32`, NEON SIMD + GCD parallelism) used by the batched path.
+- **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers; the batched path keeps recurrent running state in a per-slot recurrent-state pool
 - **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5/3.6-family MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
 - **Batched GPU MoE** -- a single fused GGML graph dispatch handles all selected experts (plus the optional shared expert and residual add) for Qwen 3.5/3.6-family and Nemotron-H decode, eliminating per-expert round-trips
+- **KV cache codecs** -- pluggable codec interface (`IKvBlockCodec`) with a built-in TurboQuant (Q4 / Q8) compressed codec for paged blocks, configurable via `--paged-kv-quant-bits`
 - **Message editing** -- edit or delete previous messages in the web chat UI and regenerate from that point
 - **Text/Image/Audio/Video uploads** -- the web UI accepts file uploads up to 500 MB, with automatic token-budget-aware truncation for large text files
 - **Per-turn observability** -- structured logs capture the full user input and the full raw assistant output (both `<think>` reasoning and the final result) plus the KV cache hit ratio. The same cache-hit stats are surfaced through every API: `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio` (Ollama), `usage.prompt_tokens_details.cached_tokens` (OpenAI), and `promptTokens` / `kvReusedTokens` / `kvReusePercent` in the Web UI SSE `done` event
@@ -93,8 +98,9 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 
 | Backend | Flag | Best fit | Description |
 |---|---|---|---|
-| Direct CUDA/cuBLAS | `--backend cuda` | NVIDIA experimentation and backend development | Uses the CUDA Driver API, cuBLAS GEMM, PTX kernels for common float32 ops, and native quantized matmul/get-rows for supported GGUF quant types. Unsupported ops route through CPU fallbacks while preserving tensor semantics. |
-| GGML Metal | `--backend ggml_metal` | Apple Silicon | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
+| Direct CUDA/cuBLAS | `--backend cuda` | NVIDIA inference and experimentation | Uses the CUDA Driver API, cuBLAS GEMM, PTX kernels for common float32 ops (fill, unary, binary, ternary, activations, RMSNorm, softmax, RoPE/RoPEEx, SDPA, GQA prefill/decode, causal mask, gather/concat), and native quantized matmul/get-rows for supported GGUF quant types. Unsupported ops route through CPU fallbacks while preserving tensor semantics. |
+| MLX Metal | `--backend mlx` | Apple Silicon (alternative to GGML Metal) | GPU-accelerated path built on [mlx-c](https://github.com/ml-explore/mlx-c). Implements quantized ops, fused ops, compiled kernels, async worker dispatch, MoE expert offload, and a CPU fallback for ops that aren't yet wired up. Requires `libmlxc` (built locally by `TensorSharp.Backends.MLX/build-native-macos.sh` or located via `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR`). |
+| GGML Metal | `--backend ggml_metal` | Apple Silicon (default on macOS) | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
 | GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
 | GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
 | Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. |
@@ -103,28 +109,57 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 
 ```
 TensorSharp/
-├── TensorSharp.Core/            # Core tensor library (Tensor, Ops, memory, device abstraction)
+├── TensorSharp.Core/            # Core tensor library (Tensor, Ops, memory, device abstraction, CPU SIMD/managed quantized kernels)
 ├── TensorSharp.Runtime/         # GGUF, tokenizers, templates, sampling, protocol parsing
+│   ├── Paged/                   # Paged KV cache primitives (BlockPool, BlockTable, KvBlock, BlockHashIndex, PagedKvStorage, PagedKvBatchOps, ManagedPagedAttention)
+│   ├── Scheduling/              # Continuous batching engine (InferenceEngine, BatchExecutor, ContinuousBatchScheduler, SequenceState, SchedulerConfig/Output, InferenceRequestHandle)
+│   ├── PagedKvCacheManager.cs   # Per-session paged KV manager (block allocation, prefix reuse)
+│   ├── PagedKvBlockStore.cs     # On-disk / RAM-tiered paged block storage with optional SSD spillover
+│   ├── SsdKvBlockTier.cs        # SSD-backed cold tier for paged blocks
+│   ├── TurboQuantKvCodec.cs     # Quantized KV block codec (Q4 / Q8) implementing IKvBlockCodec
+│   ├── PrefillChunking.cs       # Chunked-prefill helper used by SWA / very long prompts
+│   ├── KvBlockHash.cs           # Content-addressed block hash for prefix-cache sharing
+│   └── Logging/                 # JSON-line file logger + per-turn telemetry
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
+│   ├── Models/<Family>/         # One folder per architecture (Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35)
+│   │   ├── <Family>Model.cs                # Legacy per-sequence ModelBase implementation
+│   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
+│   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
+│   ├── KvBlockTransfer.cs       # Helpers for extract/inject of KV blocks across sequences
+│   └── ModelMultimodalInjector.cs # Vision / audio / video embedding injection
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/CPU via native library)
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA backend using CUDA Driver API, cuBLAS, and PTX kernels
+├── TensorSharp.Backends.MLX/    # Apple Silicon MLX backend (mlx-c / Metal). Native bridge is built via `build-native-macos.sh`.
 ├── TensorSharp.GGML.Native/     # Native C++ bridge to ggml (builds libGgmlOps, split into focused source files)
+│   ├── ggml_ops_core.cpp                  # Element-wise, reductions, basic shape ops
+│   ├── ggml_ops_elementwise.cpp           # Element-wise / activation fusions
+│   ├── ggml_ops_matmul.cpp                # GEMM / quantized matmul
+│   ├── ggml_ops_fused.cpp                 # Cross-cutting fused per-layer kernels
+│   ├── ggml_ops_norm_attn.cpp             # Norm + attention fusions
+│   ├── ggml_ops_transformer.cpp           # Full-layer fused transformer kernels (decode + prefill)
+│   ├── ggml_ops_moe.cpp                   # Mixture-of-Experts forward / fused router
+│   ├── ggml_ops_gated_delta_net.cpp       # Qwen 3.5/3.6 GatedDeltaNet kernels (per-seq + batched)
+│   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 kernels (per-seq + batched SIMD)
+│   ├── ggml_ops_paged_attention.cpp       # Paged-attention native kernel (drives ggml_flash_attn_ext + sinks variant)
+│   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
+│   └── tests/                              # Native unit + smoke tests
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
-│   ├── Program.cs               # Slim bootstrap: DI wiring, middleware, endpoint mapping
-│   ├── ModelService.cs          # Facade that keeps the public server inference API stable
-│   ├── ModelLifecycleService.cs # Model load/dispose and backend selection
-│   ├── SessionKvCacheManager.cs # Active session switching, KV reuse/truncate/reset, prefill chunking
-│   ├── ChatGenerationPipeline.cs # Prompt rendering, prefill, decode loop, stop handling
+│   ├── Program.cs               # Slim bootstrap: DI wiring, middleware, endpoint mapping, paged-KV + continuous-batching CLI translation
+│   ├── ModelService.cs          # Facade that keeps the public server inference API stable; owns the InferenceEngineHost
+│   ├── ModelLifecycleService.cs # Model load/dispose and backend selection (CPU / CUDA / MLX / GGML CPU/Metal/CUDA)
+│   ├── InferenceEngineHost.cs   # DI-registered per-model InferenceEngine singleton (continuous batching entry point)
+│   ├── SessionKvCacheManager.cs # Active session switching, KV reuse/truncate/reset, prefill chunking (legacy per-seq path)
+│   ├── ChatGenerationPipeline.cs # Prompt rendering, submits to InferenceEngine, streams tokens, stop handling
 │   ├── InferenceTelemetry.cs    # Prompt/eval timing, TTFT, tokens/sec, full input/output logs
 │   ├── ChatHistoryPreparer.cs   # History normalization, raw-token splice helpers, multimodal order helpers
 │   ├── ChatSession.cs           # Per-conversation KV cache + tracked history
 │   ├── SessionManager.cs        # Thread-safe session registry (default + per-tab sessions)
-│   ├── InferenceQueue.cs        # FIFO request queue with position tracking
-│   ├── BackendCatalog.cs        # Discovery of available compute backends
+│   ├── InferenceQueue.cs        # Backward-compatible queue-status surface (engine itself handles concurrency)
+│   ├── BackendCatalog.cs        # Discovery of available compute backends (CPU / CUDA / MLX / GGML*)
 │   ├── TextUploadHelper.cs      # Token-budget-aware text-file truncation
 │   ├── WebUiChatPolicy.cs       # Web UI chat request validation
 │   ├── OpenAIResponseFormatParser.cs  # OpenAI response_format (json_object / json_schema) parsing
-│   ├── Hosting/                 # Startup-time concerns: options, backend resolution, logging, web root
+│   ├── Hosting/                 # Startup-time concerns: options builder (ServerOptionsBuilder), backend resolution, logging, web root, paged-KV / continuous-batching CLI translation
 │   ├── RequestParsers/          # JSON request parsing (sampling, chat messages, tool functions)
 │   ├── ResponseSerializers/     # Per-protocol response shape factories (Ollama, OpenAI, Web UI)
 │   ├── StreamingWriters/        # SSE + NDJSON wire-format helpers
@@ -134,11 +169,12 @@ TensorSharp/
 │   ├── wwwroot/index.html       # Chat UI
 │   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
-├── TensorSharp.Cli/             # CLI application
-├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, web/server helpers
-├── AdvUtils/                    # Utility library
+├── TensorSharp.Cli/             # CLI application (one-shot generation, interactive REPL, batch JSONL, benchmarks)
+├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, paged scheduler, batched-model correctness, web/server helpers
+├── AdvUtils/                    # Utility library (logger)
 ├── docs/                        # Developer reference
 │   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
+│   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # Paged KV cache, prefix sharing, scheduler, per-model batched-forward status
 │   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
 ├── benchmarks/                  # Reproducible benchmark harnesses
 │   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
@@ -152,11 +188,12 @@ The repository is now split along package boundaries so consumers can depend on 
 | Project | NuGet package | Public namespace | Responsibility |
 |---|---|---|---|
 | `TensorSharp.Core` | `TensorSharp.Core` | `TensorSharp` | Tensor primitives, ops, allocators, storage, and device abstraction |
-| `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF parsing, tokenizers, prompt rendering, sampling, and output protocol parsing |
-| `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`, architecture implementations, multimodal encoders, and model-side execution helpers |
+| `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF parsing, tokenizers, prompt rendering, sampling, output protocol parsing, paged KV cache, continuous-batching scheduler |
+| `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`, architecture implementations, multimodal encoders, batched / paged forward passes, and model-side execution helpers |
 | `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML-backed execution and native interop |
 | `TensorSharp.Backends.Cuda` | `TensorSharp.Backends.Cuda` | `TensorSharp.Cuda` | Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, and quantized CUDA ops |
-| `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core server, OpenAI/Ollama adapters, queueing, and web UI |
+| `TensorSharp.Backends.MLX` | `TensorSharp.Backends.MLX` | `TensorSharp.MLX` | Apple Silicon MLX backend (mlx-c / Metal) with quantized / fused / compiled kernels and MoE expert offload |
+| `TensorSharp.Server` | `TensorSharp.Server` | `TensorSharp.Server` | ASP.NET Core server, OpenAI/Ollama adapters, inference engine host, web UI |
 | `TensorSharp.Cli` | `TensorSharp.Cli` | `TensorSharp.Cli` | Console host and debugging / batch tooling |
 
 This split keeps engine users off the web stack, keeps API-layer changes from leaking into core/runtime packages, and makes future benchmark or eval-harness projects easier to publish independently.
@@ -167,12 +204,12 @@ Validate package metadata and README dependency boundaries before publishing:
 pwsh ./eng/verify-packages.ps1
 ```
 
-The verifier runs `dotnet pack` for the seven public packages above and fails if an internal dependency such as `AdvUtils` leaks into the `.nuspec`, or if a TensorSharp package depends on a layer outside this table.
+The verifier runs `dotnet pack` for the public packages above and fails if an internal dependency such as `AdvUtils` leaks into the `.nuspec`, or if a TensorSharp package depends on a layer outside this table.
 
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
-- **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library
+- **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
 - **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
@@ -263,6 +300,16 @@ On macOS this compiles `libGgmlOps.dylib` with Metal GPU support. On Windows and
 
 The direct `cuda` backend is built as managed C# plus PTX kernels. During `dotnet build`, `TensorSharp.Backends.Cuda` compiles `native/kernels/*.cu` to `native/ptx/*.ptx` when `nvcc` is available; if `nvcc` is missing, the build continues and PTX-backed ops use CPU fallbacks. cuBLAS-backed GEMM still requires the CUDA runtime libraries to be discoverable at run time.
 
+### Build the native MLX library (macOS only)
+
+The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.com/ml-explore/mlx)). The repository pins a known-good tag of `mlx-c` in `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` and a helper script fetches and builds it:
+
+```bash
+bash TensorSharp.Backends.MLX/build-native-macos.sh
+```
+
+The script writes the resulting libraries (`libmlxc.dylib`, `libmlx.dylib`, and any backend deps) into `TensorSharp.Backends.MLX/Native/dist/`. At run time the backend probes the application directory first; you can also point it to a custom install with `TENSORSHARP_MLX_LIBRARY=<path-to-libmlxc.dylib>` or `TENSORSHARP_MLX_LIBRARY_DIR=<dir-with-libmlxc>`. If the library cannot be located the backend reports unavailable and `--backend mlx` is rejected at startup.
+
 ## Usage
 
 ### Console Application
@@ -342,7 +389,7 @@ cd TensorSharp.Cli/bin
 | `--audio <path>` | Audio file (WAV, MP3, OGG) for audio inference |
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--backend <type>` | Compute backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--kv-cache-dtype <type>` | KV cache precision: `f32` (default), `f16`, or `q8_0`. Quantized / half-precision KV caches reduce memory at the cost of small numerical drift; benchmarks live in [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -413,7 +460,7 @@ Model and runtime:
 |---|---|
 | `/info`, `/status` | Show the loaded model, backend, architecture, context/vocab size, projector, conversation depth, and pending attachments |
 | `/model <path>` | Load a different `.gguf` model on the current backend (resets the session) |
-| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector` |
 
 Sampling (live, persists across turns):
@@ -489,7 +536,7 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 |---|---|
 | `--model <path>` | GGUF file to host (required for inference; if omitted, the server starts but `/api/models/load` will report no hosted model) |
 | `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
-| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
 | `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
 | `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
 | `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
@@ -500,6 +547,13 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+| `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
+| `--paged-kv` / `--no-paged-kv` | Force enable or disable the vLLM-style paged KV cache for the active session. When enabled the KV blocks live in a global block pool with prefix-cache sharing. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
+| `--paged-kv-block-size <N>` | Tokens per paged KV block (default: `256`). Smaller blocks share more aggressively but pay more bookkeeping. |
+| `--paged-kv-ram-mb <N>` | Soft cap for the paged-block RAM working set in megabytes. Blocks beyond the cap spill to SSD when `--paged-kv-ssd-dir` is set. |
+| `--paged-kv-ssd-dir <dir>` | Directory used as the SSD cold tier for paged blocks. Optional but recommended for very large multi-session workloads. |
+| `--paged-kv-ssd-mb <N>` | Maximum SSD usage in megabytes for the cold tier. |
+| `--paged-kv-quant-bits <0\|4\|8>` | Optional KV block quantization (TurboQuantKvCodec). `0` (default) keeps blocks in their native dtype; `4` / `8` halve / quarter the per-block bandwidth at small numerical cost. Recurrent-state models silently fall back to passthrough. |
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
@@ -510,7 +564,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 
 | Variable | Description |
 |---|---|
-| `BACKEND` | Default compute backend (`cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
@@ -527,12 +581,122 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
 
+**Paged KV cache & continuous-batching tunables (read at process / model start)**
+
+These can be set with either the `--paged-kv*` / `--continuous-batching` CLI flags (which translate to the env vars below) or directly via the environment:
+
+| Variable | Description |
+|---|---|
+| `TS_KV_PAGED_CACHE` | `1` / `0` to force-enable / disable the paged KV cache for the active session. The CLI shortcuts are `--paged-kv` / `--no-paged-kv`. |
+| `TS_KV_BLOCK_SIZE` | Tokens per paged KV block (default: `256`). |
+| `TS_KV_CACHE_MAX_RAM_MB` | Soft cap for the paged-block RAM working set in megabytes. |
+| `TS_KV_CACHE_SSD_DIR` | Directory used as the SSD cold tier for paged blocks. |
+| `TS_KV_CACHE_MAX_SSD_MB` | Maximum SSD usage in megabytes for the cold tier. |
+| `TS_KV_PAGED_QUANT_BITS` | KV block quantization bits (`0` = passthrough, `4`, or `8`). |
+| `TS_SCHED_DISABLE_BATCHED` | `1` forces the per-sequence KV-swap fallback even when a model implements `IBatchedPagedModel`. The CLI shortcut is `--no-continuous-batching`. |
+| `TS_SCHED_MAX_BATCHED_TOKENS` | Scheduler per-step token budget (default: `4096`). |
+| `TS_SCHED_MAX_RUNNING_SEQS` | Maximum in-flight sequences (default: `16`). |
+| `TS_SCHED_PREFILL_CHUNK` | Maximum prefill tokens per step (default: `1024`). |
+| `TS_SCHED_NUM_BLOCKS` | Physical blocks in the engine block pool (default: `256`). |
+| `TS_SCHED_BLOCK_SIZE` | Tokens per block on the engine side (default: `256`). |
+| `TS_SCHED_PREFIX_CACHE` | `0` disables block-hash prefix sharing across requests. |
+| `TS_SCHED_DECODE_QUANTUM` | Tokens before a sequence-switch is allowed (default: block size). |
+| `TS_QWEN35_BATCHED` | Opt-in to the Qwen 3.5/3.6 batched / paged ForwardBatch path. Auto-enabled by `--continuous-batching`. |
+| `TS_QWEN35_BATCHED_GDN_NATIVE` | Use the native batched GatedDeltaNet kernel inside Qwen 3.5/3.6 batched path. |
+| `TS_GEMMA4_BATCHED` | Set to `0` to force Gemma 4 onto the legacy per-sequence KV-swap path (default: batched/paged). |
+| `TS_GPTOSS_BATCHED` | Opt-in to the GPT OSS batched / paged ForwardBatch path. |
+| `TS_GPTOSS_PAGED_ATTN_MANAGED` | Use the managed (C#) paged-attention-with-sinks kernel inside GPT OSS batched path. |
+| `TS_NEMOTRON_BATCHED` | Opt-in to the Nemotron-H batched / paged ForwardBatch path. |
+| `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Use the native Mamba2 batched step kernel inside Nemotron-H batched path. |
+| `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
+| `TS_MLX_PIPELINED_DECODE` | Set to `1` to enable pipelined greedy decode on the MLX backend (CLI only). |
+| `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
+
 Sampling parameter precedence (highest wins):
 
 1. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`).
 2. Server-wide CLI flags (e.g. `--temperature`, `--top-p`, `--stop`).
 3. `TENSORSHARP_*` environment variables listed above.
 4. Built-in `SamplingConfig` defaults (`temperature=1.0`, `top_k=0`, `top_p=1.0`, `min_p=0`, `repeat_penalty=1.0`, presence/frequency penalties `0`, `seed=-1`, no stop sequences).
+
+### Feature × environment variable matrix
+
+Quick reference for which environment variables (and matching CLI flags) gate each major feature. Variables in **bold** are required to turn the feature on; everything else is a tunable for a feature that's already enabled by default.
+
+#### Continuous batching & paged KV cache
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Continuous-batching engine (`InferenceEngine` + scheduler) | ON in `TensorSharp.Server` | `TS_SCHED_DISABLE_BATCHED=1` to force per-seq fallback | `--no-continuous-batching` / `--continuous-batching` |
+| Paged KV cache for the active session | ON | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
+| Paged KV SSD spillover (cold tier) | OFF | `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`, `--paged-kv-ssd-dir`, `--paged-kv-ssd-mb` |
+| Paged KV block quantization (TurboQuantKvCodec) | OFF (`0` = passthrough) | `TS_KV_PAGED_QUANT_BITS` (`0` / `4` / `8`) | `--paged-kv-quant-bits` |
+| Block-hash prefix sharing across requests | ON | `TS_SCHED_PREFIX_CACHE=0` to disable | — |
+| Scheduler tunables (per-step token budget, max in-flight seqs, prefill chunk, block pool size, decode quantum) | engine defaults | `TS_SCHED_MAX_BATCHED_TOKENS`, `TS_SCHED_MAX_RUNNING_SEQS`, `TS_SCHED_PREFILL_CHUNK`, `TS_SCHED_NUM_BLOCKS`, `TS_SCHED_BLOCK_SIZE`, `TS_SCHED_DECODE_QUANTUM` | — |
+
+#### Per-model batched / paged forward (`IBatchedPagedModel.ForwardBatch`)
+
+| Model | Default state | Env var to flip default | Native-kernel sub-toggle |
+|---|---|---|---|
+| Mistral 3 | ON (no opt-in needed) | — | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
+| Gemma 4 | ON | `TS_GEMMA4_BATCHED=0` to force legacy per-seq | — |
+| Qwen 3 | ON (reference port) | — | — |
+| Qwen 3.5 / 3.6 family | OFF | **`TS_QWEN35_BATCHED=1`** (auto-set by `--continuous-batching`) | `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables native batched GDN kernel; `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` overrides fused-attention engage threshold (default 4096) |
+| GPT OSS | OFF | **`TS_GPTOSS_BATCHED=1`** | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the managed (C#) sinks softmax instead of the native paged-attention-with-sinks kernel |
+| Nemotron-H | OFF | **`TS_NEMOTRON_BATCHED=1`** | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |
+| Gemma 3 | not implemented (per-seq fallback) | — | — |
+
+#### Backends
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Default compute backend | `ggml_metal` (macOS), `ggml_cpu` (Windows/Linux) | `BACKEND` | `--backend` |
+| MLX backend library lookup | probe app dir | `TENSORSHARP_MLX_LIBRARY` (full path to `libmlxc`), `TENSORSHARP_MLX_LIBRARY_DIR` (directory) | — |
+| MLX pipelined greedy decode (CLI only) | OFF | `TS_MLX_PIPELINED_DECODE=1` | — |
+
+#### Sampling defaults (server-only)
+
+These fill in fields the request body omits; per-request JSON always wins, CLI flags win over env vars.
+
+| Sampling field | Env var | CLI equivalent |
+|---|---|---|
+| `temperature` | `TENSORSHARP_TEMPERATURE` | `--temperature` |
+| `top_k` | `TENSORSHARP_TOP_K` | `--top-k` |
+| `top_p` | `TENSORSHARP_TOP_P` | `--top-p` |
+| `min_p` | `TENSORSHARP_MIN_P` | `--min-p` |
+| `repeat_penalty` | `TENSORSHARP_REPEAT_PENALTY` | `--repeat-penalty` |
+| `presence_penalty` | `TENSORSHARP_PRESENCE_PENALTY` | `--presence-penalty` |
+| `frequency_penalty` | `TENSORSHARP_FREQUENCY_PENALTY` | `--frequency-penalty` |
+| `seed` | `TENSORSHARP_SEED` | `--seed` |
+| max tokens | `MAX_TOKENS` | `--max-tokens` |
+| stop sequences | — (CLI / per-request only) | `--stop` (repeatable) |
+
+#### Hosting & uploads (server-only)
+
+| Feature | Default | Env vars |
+|---|---|---|
+| ASP.NET Core listener | `http://0.0.0.0:5000` | `PORT`, `ASPNETCORE_URLS` |
+| Plain-text upload character cap (when no tokenizer available) | 8000 chars | `MAX_TEXT_FILE_CHARS` |
+| Video-frame extraction count | 4 frames | `VIDEO_MAX_FRAMES` |
+
+#### Logging (server + CLI)
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Console + file log minimum level | `Information` | `TENSORSHARP_LOG_LEVEL` | `--log-level` |
+| File logger output directory | `<binDir>/logs` | `TENSORSHARP_LOG_DIR` | `--log-dir` |
+| File logger enabled | ON | `TENSORSHARP_LOG_FILE=0` to disable | `--log-file 0\|1` |
+| Console logger enabled | ON | — | `--log-console 0\|1` (CLI only) |
+
+#### Native build (compile-time only)
+
+These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during `dotnet build` for `TensorSharp.GGML.Native`, not at run time.
+
+| Feature | Default | Env vars | Build-script flag |
+|---|---|---|---|
+| Enable GGML CUDA in the native build | auto-detected from toolchain | `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` | `--cuda` / `--no-cuda` |
+| Narrow `CMAKE_CUDA_ARCHITECTURES` list | auto-detected from visible GPU | `TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES` | `--cuda-arch='86-real;89-real'` |
+| Native build parallelism cap | conservative auto-cap | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
 
 ### Server Logging
 
@@ -722,17 +886,19 @@ TensorSharp is structured as a layered system:
 
 1. **TensorSharp.Core** provides the core `Tensor` type, storage abstraction, and the extensible operation registry (`Ops`). CPU implementations use `System.Numerics.Vectors` for SIMD acceleration.
 
-2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, and reusable contracts such as `IModelArchitecture`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
+2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), the `IKvBlockCodec` interface plus the `TurboQuantKvCodec` Q4/Q8 implementation, and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Each architecture ships both the legacy per-sequence forward and an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
-4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32.
+4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 
 5. **TensorSharp.Backends.Cuda** is the direct CUDA path. It uses the CUDA Driver API for device/context/storage management, cuBLAS for float32 GEMM, PTX kernels for hot scalar and transformer helper ops, and CPU fallbacks where native kernels are not implemented yet.
 
-6. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, and the FIFO inference queue.
+6. **TensorSharp.Backends.MLX** is the Apple Silicon MLX path. It wraps [mlx-c](https://github.com/ml-explore/mlx-c) (`libmlxc`) with allocator, storage, async worker dispatch, quantized + fused + compiled kernels, MoE expert offload, and a CPU fallback layer for ops that aren't yet wired up.
 
-7. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, and JSONL batch workflows.
+7. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, an `InferenceEngineHost` that owns the per-model continuous-batching engine, and a thin queue-status surface for backward compatibility.
+
+8. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and the built-in prefill / decode benchmarks.
 
 ### Performance Optimizations
 
@@ -759,6 +925,9 @@ the fused path engages.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **KV-cache prefix reuse**: multi-turn conversations reuse the longest matching token prefix across turns. Truncation is automatically backed off by the sliding-window size for SWA models so the suffix can rebuild the SWA context.
+- **Paged KV cache & block-hash prefix sharing**: the continuous-batching engine partitions KV into fixed-size blocks, content-hashes each full block, and shares them across concurrent and sequential requests. Combined with a per-tier (RAM → SSD) `PagedKvBlockStore`, this gives vLLM-style memory efficiency without giving up the legacy per-session contiguous path.
+- **Native paged-attention kernel**: `TSGgml_PagedAttentionForward` (and the `WithSinks` variant for GPT OSS) does a C++ gather of K/V from the paged buffer, builds a small GGML graph per sequence, and dispatches `ggml_flash_attn_ext` — the same fused Metal/CUDA flash-attention kernel the legacy single-sequence path uses. On Ministral-3-14B long-context (4×~800 tokens) it is **~21 % faster than the legacy per-sequence GGML path**.
+- **Batched / paged forward passes**: Mistral 3, Gemma 4, GPT OSS, Qwen 3.5/3.6 (incl. GatedDeltaNet recurrent state pool), and Nemotron-H (incl. Mamba2 recurrent state pool + native batched Mamba2 kernel) pack N sequences into a single `ForwardBatch` call with one batched linear-projection matmul per layer, paged K/V scatter via `slotMapping`, and per-sequence attention via the native kernel. Gemma 4 batched path reaches **1.5×** legacy throughput at batch=8 short prompts and **1.6×** at 4×800-token prompts; Nemotron-H Mamba2 batched reaches **3.95×** at batch=3 on Apple M4 Pro. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **Kernel warmup**: both CLI and Server run a tiny forward pass at startup to pre-compile GPU kernels (Metal pipeline states, CUDA JIT) and warm the memory pool, avoiding cold-start latency on the first real inference request.
 - **Prefill caching** (Gemma 4, Qwen 3.5/3.6-family): per-forward-pass SWA mask cache (Gemma 4), NeoX RoPE cos/sin lookup table cache across global layers (Gemma 4), and RoPE position tensor cache across layers (Gemma 4, Qwen 3.5/3.6-family) eliminate redundant recomputation during prefill.
 - **In-place QK RMSNorm** (Qwen 3.5/3.6-family): per-head QK normalization is performed in-place using a `View`, avoiding one tensor allocation and copy per Q/K per layer.
@@ -769,6 +938,8 @@ the fused path engages.
 - **Best-fit memory pool**: the GGML host allocator uses a best-fit search across pooled blocks instead of first-fit, which avoids handing out a large scratch block to satisfy a tiny intermediate-tensor request and keeps the working-set tightly bounded across long-running inference.
 - **Bounded pool retention**: the integrated-GPU / CPU memory pool now caps individual retained blocks at 64 MB and the total pool at 32 blocks. Combined with mmap-backed weights, this keeps short-lived intermediate tensors recycled fast while bounding the peak resident set.
 - **Memory-efficient model loading**: large tensors are streamed directly to native memory without intermediate managed allocations. F32 weights and norms still load on demand; quantized weights are mmap-backed when supported by the backend.
+- **Paged KV block pool with optional SSD spillover**: paged KV blocks live in a per-engine `BlockPool` with LRU eviction; the `PagedKvBlockStore` keeps a configurable RAM cap (`TS_KV_CACHE_MAX_RAM_MB`) and spills cold blocks into an SSD tier (`TS_KV_CACHE_SSD_DIR`) up to `TS_KV_CACHE_MAX_SSD_MB`. Block content-hashes are kept in a global index so prefix matches are reused across sessions and requests without rematerialising the K/V.
+- **KV block codecs**: blocks can be optionally compressed in-place with `TurboQuantKvCodec` (Q4 or Q8) via `--paged-kv-quant-bits`, trading a small accuracy cost for half / quarter the per-block bandwidth and memory footprint. Recurrent-state models fall back to passthrough automatically.
 
 ## Benchmarks
 
@@ -800,7 +971,7 @@ For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the 
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, and backend catalog resolution.
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

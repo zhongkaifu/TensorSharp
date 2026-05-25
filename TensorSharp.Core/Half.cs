@@ -13,7 +13,9 @@ using System.Runtime.InteropServices;
 namespace TensorSharp
 {
     [StructLayout(LayoutKind.Sequential)]
+#pragma warning disable CS8981 // Type names should be PascalCase
     public struct half
+#pragma warning restore CS8981
     {
         public ushort x;
 

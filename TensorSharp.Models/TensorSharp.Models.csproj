@@ -4,6 +4,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
     <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
     <Description>Model architecture implementations, multimodal encoders, and model execution helpers for TensorSharp.</Description>
     <PackageTags>$(TensorSharpPackageTags);models;multimodal;architecture</PackageTags>
   </PropertyGroup>
@@ -15,6 +16,7 @@
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Magick.NET-Q8-AnyCPU" Version="14.12.0" />

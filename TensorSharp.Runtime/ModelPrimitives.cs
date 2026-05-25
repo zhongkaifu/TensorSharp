@@ -13,6 +13,7 @@ namespace TensorSharp.Runtime
     {
         Cpu,
         Cuda,
+        Mlx,
         GgmlCpu,
         GgmlMetal,
         GgmlCuda,
@@ -20,7 +21,7 @@ namespace TensorSharp.Runtime
 
     public class ModelConfig
     {
-        public string Architecture { get; set; }
+        public string Architecture { get; set; } = string.Empty;
         public int HiddenSize { get; set; }
         public int NumHeads { get; set; }
         public int NumKVHeads { get; set; }
@@ -32,7 +33,7 @@ namespace TensorSharp.Runtime
         public int NumLayers { get; set; }
         public int VocabSize { get; set; }
         public int IntermediateSize { get; set; }
-        public string ChatTemplate { get; set; }
+        public string ChatTemplate { get; set; } = string.Empty;
 
         public int NumExperts { get; set; }
         public int NumExpertsUsed { get; set; }

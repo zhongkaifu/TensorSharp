@@ -5,35 +5,47 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
+// Engine-backed implementation. Submits each chat / generate request to the
+// shared <see cref="TensorSharp.Runtime.Scheduling.InferenceEngine"/>, then
+// streams tokens off the returned <see cref="InferenceRequestHandle"/>. The
+// engine owns all KV-state lifecycle; sessions in this layer are pure
+// history-tracking containers used by the prompt renderer to reuse raw
+// assistant tokens across turns.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Server
 {
     internal sealed class ChatGenerationPipeline
     {
         private readonly ModelLifecycleService _lifecycle;
-        private readonly SessionKvCacheManager _sessions;
+        private readonly InferenceEngineHost _engineHost;
         private readonly KVCachePromptRenderer _kvCacheRenderer;
         private readonly InferenceTelemetry _telemetry;
         private readonly ILogger _logger;
 
+        // Per-pipeline lock guarding multimodal-prompt preparation. The
+        // multimodal-prep serialisation is now handled by
+        // ModelBase.GpuComputeLock (shared with the InferenceEngine worker)
+        // so a vision encoder on the request thread can't race the engine's
+        // batched forward on the GPU.
+
         public ChatGenerationPipeline(
             ModelLifecycleService lifecycle,
-            SessionKvCacheManager sessions,
+            InferenceEngineHost engineHost,
             KVCachePromptRenderer kvCacheRenderer,
             InferenceTelemetry telemetry,
             ILogger logger)
         {
             _lifecycle = lifecycle ?? throw new ArgumentNullException(nameof(lifecycle));
-            _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
+            _engineHost = engineHost ?? throw new ArgumentNullException(nameof(engineHost));
             _kvCacheRenderer = kvCacheRenderer ?? throw new ArgumentNullException(nameof(kvCacheRenderer));
             _telemetry = telemetry ?? throw new ArgumentNullException(nameof(telemetry));
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
@@ -66,71 +78,103 @@ namespace TensorSharp.Server
                 List<ToolFunction> tools = null,
                 bool enableThinking = false)
         {
-            _sessions.ActivateSession(session ?? _sessions.IntrinsicSession);
-            var activeSession = _sessions.ActiveSession;
-            var model = _lifecycle.Model;
+            session ??= new ChatSession("__svc_intrinsic__");
+            var model = _lifecycle.Model
+                ?? throw new InvalidOperationException("No model is loaded.");
+            var engine = _engineHost.TryGetEngine()
+                ?? throw new InvalidOperationException(
+                    "Continuous-batching engine is unavailable for this model " +
+                    "(the model supports neither IBatchedPagedModel.ForwardBatch " +
+                    "nor IModelArchitecture.SupportsKVStateSnapshot).");
 
             string arch = model.Config.Architecture;
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
-
-            // Project the incoming user-visible history onto our tracked conversation so
-            // that any assistant messages we previously generated carry their raw output
-            // tokens forward into the renderer.
-            var renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, activeSession.TrackedHistory);
+            var renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
 
             using var chatScope = _telemetry.BeginInferenceScope(
-                activeSession,
-                _lifecycle.LoadedModelName,
-                _lifecycle.LoadedBackend,
-                "chat.stream");
-
+                session, _lifecycle.LoadedModelName, _lifecycle.LoadedBackend, "chat.stream");
             _telemetry.LogChatStarted(arch, maxTokens, enableThinking, tools, preparedHistory, samplingConfig);
 
-            var inputTokens = _kvCacheRenderer.RenderToTokens(
-                model.Tokenizer,
-                model.Config.ChatTemplate,
-                renderHistory,
-                arch,
-                addGenerationPrompt: true,
-                tools: tools,
-                enableThinking: enableThinking);
+            // Pre-allocate the request id so the multimodal injector can
+            // bucket per-request prepared embeddings. Without this, two
+            // concurrent multimodal requests would share the same injector
+            // state, and either get their image embeddings consumed by the
+            // wrong sequence's Forward() call or vanish entirely (because
+            // the engine's per-sequence Forward path never queues from a
+            // shared bucket).
+            string requestId = $"chat-{Guid.NewGuid():N}";
+            bool injectorBucketCreated = false;
 
-            inputTokens = model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens);
-            inputTokens = _sessions.TruncatePromptToContext(activeSession, inputTokens, maxTokens);
+            var promptSw = Stopwatch.StartNew();
+            List<int> inputTokens;
+            bool hasMultimodal = RequiresMultimodalPreparation(renderHistory);
+            if (hasMultimodal)
+            {
+                // Multimodal prompt preparation drives the vision/audio
+                // encoder, which runs many GGML ops on the backend. Take
+                // the model-wide GPU compute lock so we don't race the
+                // engine's worker (which is doing the same thing for
+                // batched forward) - concurrent GGML on Metal/CUDA from
+                // two threads aborts the process via
+                // ggml_metal_synchronize. The lock also subsumes the
+                // injector-state serialisation that the old
+                // _multimodalGate provided, because the prepared-embedding
+                // list lives on the model.
+                lock (model.GpuComputeLock)
+                {
+                    inputTokens = _kvCacheRenderer.RenderToTokens(
+                        model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
+                        addGenerationPrompt: true, tools: tools, enableThinking: enableThinking);
+                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens, requestId);
+                    injectorBucketCreated = true;
+                    inputTokens = TruncatePromptToContext(session, inputTokens, maxTokens, requestId);
+                }
+            }
+            else
+            {
+                inputTokens = _kvCacheRenderer.RenderToTokens(
+                    model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
+                    addGenerationPrompt: true, tools: tools, enableThinking: enableThinking);
+                inputTokens = TruncatePromptToContext(session, inputTokens, maxTokens);
+            }
 
             int promptTokenCount = inputTokens.Count;
-            var sw = Stopwatch.StartNew();
-            float[] logits = _sessions.PrepareForGeneration(activeSession, inputTokens, out int kvCacheReusedTokens);
-            long promptNs = InferenceTelemetry.ToNanos(sw.ElapsedTicks);
-            double kvCacheReusePercent = promptTokenCount > 0
-                ? 100.0 * kvCacheReusedTokens / promptTokenCount
-                : 0.0;
-
-            var generatedTokens = new List<int>();
             var cfg = samplingConfig ?? SamplingConfig.Default;
-            var sampler = new TokenSampler(cfg);
-            var rawBytes = new List<byte>();
-            int prevCharLen = 0;
+
+            var seq = new SequenceState(
+                requestId: requestId,
+                promptTokens: inputTokens,
+                maxNewTokens: maxTokens,
+                blockSize: engine.PoolStats.blockSize,
+                samplingConfig: cfg,
+                userTag: session);
+
+            promptSw.Stop();
+            long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
 
             var evalSw = Stopwatch.StartNew();
-            bool firstTokenSampled = false;
+            var handle = engine.SubmitRequest(seq, cancellationToken);
+            var generatedTokens = new List<int>();
+            var rawBytes = new List<byte>();
+            int prevCharLen = 0;
             string finishReason = "max_tokens";
-            long timeToFirstTokenMs = 0;
             bool wasCancelled = false;
+            int kvCacheReusedTokens = 0;
+            long timeToFirstTokenMs = 0;
+            bool firstTokenSampled = false;
+            var totalSw = Stopwatch.StartNew();
 
-            for (int step = 0; step < maxTokens; step++)
+            try
+            {
+            // Stream tokens off the engine handle, doing UTF-8-valid piece
+            // accumulation and stop-sequence detection in this layer.
+            await foreach (var nextToken in handle.Tokens.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
                     wasCancelled = true;
                     finishReason = "cancelled";
-                    break;
-                }
-
-                int nextToken = sampler.Sample(logits, generatedTokens);
-                if (model.Tokenizer.IsEos(nextToken))
-                {
-                    finishReason = "eos";
+                    engine.Abort(seq.RequestId);
                     break;
                 }
 
@@ -141,9 +185,16 @@ namespace TensorSharp.Server
                 string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
                 prevCharLen = decoded.Length;
 
+                if (!firstTokenSampled)
+                {
+                    firstTokenSampled = true;
+                    timeToFirstTokenMs = (long)totalSw.Elapsed.TotalMilliseconds;
+                }
+
                 bool stopRequested = false;
                 if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
                 {
+                    var sampler = new TokenSampler(cfg);
                     var (_, shouldStop) = sampler.CheckStopSequences(decoded);
                     if (shouldStop)
                     {
@@ -152,54 +203,74 @@ namespace TensorSharp.Server
                     }
                 }
 
-                if (!firstTokenSampled)
-                {
-                    firstTokenSampled = true;
-                    timeToFirstTokenMs = (long)evalSw.Elapsed.TotalMilliseconds;
-                }
-
                 if (piece.Length > 0)
                     yield return (piece, false, 0, 0, 0, 0, 0, 0);
 
                 if (stopRequested)
+                {
+                    engine.Abort(seq.RequestId);
                     break;
+                }
+            }
 
-                logits = model.Forward(new[] { nextToken });
-                activeSession.KVCache.RecordAppend(nextToken, logits);
+            InferenceCompletion completion;
+            try
+            {
+                completion = await handle.Completion.ConfigureAwait(false);
+                kvCacheReusedTokens = completion.PrefixCacheReusedTokens;
+                if (!wasCancelled && finishReason == "max_tokens")
+                {
+                    finishReason = completion.FinishReason ?? finishReason;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                wasCancelled = true;
+                finishReason = "cancelled";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Engine submission failed for session {SessionId}", session.Id);
+                throw;
             }
 
             string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
             evalSw.Stop();
-            sw.Stop();
+            totalSw.Stop();
 
-            // Use the AUGMENTED history so raw tokens carry forward for all past
-            // assistant turns, not just the immediately previous one.
             ChatHistoryPreparer.UpdateTrackedHistory(
-                activeSession.TrackedHistory,
-                renderHistory,
-                assistantText,
-                generatedTokens);
+                session.TrackedHistory, renderHistory, assistantText, generatedTokens);
 
             double evalSeconds = evalSw.Elapsed.TotalSeconds;
             double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
                 ? generatedTokens.Count / evalSeconds
                 : 0;
+            double kvCacheReusePercent = promptTokenCount > 0
+                ? 100.0 * kvCacheReusedTokens / promptTokenCount
+                : 0.0;
 
             _telemetry.LogChatFinished(
-                wasCancelled,
-                generatedTokens.Count,
-                promptTokenCount,
-                kvCacheReusedTokens,
-                kvCacheReusePercent,
-                timeToFirstTokenMs,
-                sw.Elapsed.TotalMilliseconds,
-                tokensPerSecond,
-                finishReason,
-                assistantText);
+                wasCancelled, generatedTokens.Count, promptTokenCount, kvCacheReusedTokens,
+                kvCacheReusePercent, timeToFirstTokenMs, totalSw.Elapsed.TotalMilliseconds,
+                tokensPerSecond, finishReason, assistantText);
 
             long evalNs = InferenceTelemetry.ToNanos(evalSw.ElapsedTicks);
-            long totalNs = InferenceTelemetry.ToNanos(sw.ElapsedTicks);
-            yield return ("", true, promptTokenCount, generatedTokens.Count, kvCacheReusedTokens, totalNs, promptNs, evalNs);
+            long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
+            yield return ("", true, promptTokenCount, generatedTokens.Count, kvCacheReusedTokens,
+                          totalNs, promptNs, evalNs);
+            }
+            finally
+            {
+                if (injectorBucketCreated)
+                {
+                    // Drop the per-request prepared-embedding bucket so it
+                    // doesn't leak across requests. Runs on the happy path,
+                    // on cancellation, on early-stop, and on iterator
+                    // abandonment (the async iterator's Dispose runs the
+                    // finally block).
+                    model.MultimodalInjector.ClearPreparedPromptState(requestId);
+                }
+            }
         }
 
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
@@ -211,123 +282,68 @@ namespace TensorSharp.Server
                 [EnumeratorCancellation] CancellationToken cancellationToken,
                 SamplingConfig samplingConfig = null)
         {
-            _sessions.ActivateSession(session ?? _sessions.IntrinsicSession);
-            var activeSession = _sessions.ActiveSession;
-            var model = _lifecycle.Model;
-
-            string arch = model.Config.Architecture;
-            var messages = new List<ChatMessage>
+            // Generate uses the same engine path as chat - it just wraps the
+            // prompt in a single-message history and skips multi-turn history
+            // tracking. We do NOT update session.TrackedHistory here because
+            // GenerateStreamAsync is the non-conversational endpoint used by
+            // Ollama's /api/generate.
+            var oneShot = new List<ChatMessage>
             {
                 new ChatMessage { Role = "user", Content = prompt, ImagePaths = imagePaths }
             };
-
-            using var generateScope = _telemetry.BeginInferenceScope(
-                activeSession,
-                _lifecycle.LoadedModelName,
-                _lifecycle.LoadedBackend,
-                "generate.stream");
-
-            _telemetry.LogGenerateStarted(
-                arch,
-                maxTokens,
-                imagePaths?.Count ?? 0,
-                messages[0],
-                samplingConfig);
-
-            var preparedMessages = ChatHistoryPreparer.PrepareHistoryForInference(messages, arch, _logger);
-            var inputTokens = _kvCacheRenderer.RenderToTokens(
-                model.Tokenizer,
-                model.Config.ChatTemplate,
-                preparedMessages,
-                arch,
-                addGenerationPrompt: true);
-
-            inputTokens = model.MultimodalInjector.ProcessPromptTokens(preparedMessages, inputTokens);
-            inputTokens = _sessions.TruncatePromptToContext(activeSession, inputTokens, maxTokens);
-
-            _sessions.ResetSession(activeSession);
-
-            var sw = Stopwatch.StartNew();
-            bool queuedPromptEmbeddings = model.MultimodalInjector.QueuePromptEmbeddings(0);
-            var promptArray = inputTokens.ToArray();
-            float[] logits = _sessions.ForwardPromptPrefill(promptArray, allowChunking: !queuedPromptEmbeddings);
-            activeSession.KVCache.RecordAppend(promptArray, logits);
-            long promptNs = InferenceTelemetry.ToNanos(sw.ElapsedTicks);
-            int promptTokenCount = inputTokens.Count;
-
-            var cfg = samplingConfig ?? SamplingConfig.Default;
-            var sampler = new TokenSampler(cfg);
-            var generatedTokens = new List<int>();
-            var rawBytes = new List<byte>();
-            int prevCharLen = 0;
-
-            var evalSw = Stopwatch.StartNew();
-            string finishReason = "max_tokens";
-            bool wasCancelled = false;
-            for (int step = 0; step < maxTokens; step++)
+            var freshSession = new ChatSession("__generate_intrinsic__");
+            await foreach (var item in ChatStreamWithMetricsAsync(
+                freshSession, oneShot, maxTokens, cancellationToken, samplingConfig))
             {
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    wasCancelled = true;
-                    finishReason = "cancelled";
-                    break;
-                }
+                yield return item;
+            }
+        }
 
-                int nextToken = sampler.Sample(logits, generatedTokens);
-                if (model.Tokenizer.IsEos(nextToken))
-                {
-                    finishReason = "eos";
-                    break;
-                }
+        /// <summary>Trim the prompt so the prompt+max-tokens fits inside the
+        /// model's context window. Multimodal embedding spans are not split.</summary>
+        public List<int> TruncatePromptToContext(ChatSession session, List<int> inputTokens, int maxTokens, string requestId = null)
+        {
+            var model = _lifecycle.Model;
+            int maxCtx = model.MaxContextLength;
+            if (maxCtx <= 0 || inputTokens == null || inputTokens.Count + maxTokens <= maxCtx)
+                return inputTokens;
 
-                generatedTokens.Add(nextToken);
-                model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
-                int validLen = FindValidUtf8Length(rawBytes);
-                string decoded = Encoding.UTF8.GetString(rawBytes.GetRange(0, validLen).ToArray());
-                string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
-                prevCharLen = decoded.Length;
-
-                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                {
-                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
-                    if (shouldStop)
-                    {
-                        finishReason = "stop_sequence";
-                        break;
-                    }
-                }
-
-                if (piece.Length > 0)
-                    yield return (piece, false, 0, 0, 0, 0, 0, 0);
-                logits = model.Forward(new[] { nextToken });
-                activeSession.KVCache.RecordAppend(nextToken, logits);
+            int available = maxCtx - maxTokens;
+            if (available < 1)
+            {
+                throw new InvalidOperationException(
+                    $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                    "Please shorten the input or reduce attached file size.");
             }
 
-            evalSw.Stop();
-            sw.Stop();
-            long evalNs = InferenceTelemetry.ToNanos(evalSw.ElapsedTicks);
-            long totalNs = InferenceTelemetry.ToNanos(sw.ElapsedTicks);
+            int trimStart = inputTokens.Count - available;
+            trimStart = model.MultimodalInjector.ClampTrimStart(trimStart, requestId);
+            int kept = inputTokens.Count - trimStart;
+            if (kept < 1)
+            {
+                throw new InvalidOperationException(
+                    $"Prompt ({inputTokens.Count} tokens) exceeds the model's context limit ({maxCtx} tokens). " +
+                    "Please shorten the input or reduce attached file size.");
+            }
 
-            double evalSeconds = evalSw.Elapsed.TotalSeconds;
-            double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
-                ? generatedTokens.Count / evalSeconds
-                : 0;
-            string completionText = Encoding.UTF8.GetString(rawBytes.ToArray());
+            _logger.LogWarning(LogEventIds.PromptTruncated,
+                "prompt.truncated from {OriginalTokens} to {KeptTokens} tokens (contextLimit={ContextLimit}, generationReserve={MaxTokens}, sessionId={SessionId})",
+                inputTokens.Count, kept, maxCtx, maxTokens, session?.Id ?? "(none)");
+            model.MultimodalInjector.TrimPreparedPrompt(trimStart, requestId);
+            session?.TrackedHistory.Clear();
+            return inputTokens.GetRange(trimStart, kept);
+        }
 
-            const int kvCacheReusedTokens = 0;
-            const double kvCacheReusePercent = 0.0;
-            _telemetry.LogGenerateFinished(
-                wasCancelled,
-                generatedTokens.Count,
-                promptTokenCount,
-                kvCacheReusedTokens,
-                kvCacheReusePercent,
-                sw.Elapsed.TotalMilliseconds,
-                tokensPerSecond,
-                finishReason,
-                completionText);
-
-            yield return ("", true, promptTokenCount, generatedTokens.Count, kvCacheReusedTokens, totalNs, promptNs, evalNs);
+        private static bool RequiresMultimodalPreparation(List<ChatMessage> history)
+        {
+            if (history == null) return false;
+            foreach (var m in history)
+            {
+                if (m == null) continue;
+                if (m.ImagePaths != null && m.ImagePaths.Count > 0) return true;
+                if (m.AudioPaths != null && m.AudioPaths.Count > 0) return true;
+            }
+            return false;
         }
 
         /// <summary>

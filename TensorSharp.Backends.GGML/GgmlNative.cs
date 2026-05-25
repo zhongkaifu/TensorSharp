@@ -501,7 +501,7 @@ internal enum GgmlIndexReductionOp
             IntPtr gateBias,           // optional float* [biasDim, numExperts] (biasDim = nFf or 2*nFf for fused gate_up); IntPtr.Zero to skip
             IntPtr upBias,             // optional, only valid when up_data != null
             IntPtr downBias,           // optional float* [hiddenDim, numExperts]
-            int activationType,        // 0 = SwiGLU split, 1 = SwiGLU OAI (gpt-oss), 2 = GEGLU split (Gemma 4)
+            int activationType,        // 0 = SwiGLU split, 1 = SwiGLU OAI, 2 = GEGLU split, 3 = ReLU-squared
             float oaiAlpha,
             float oaiLimit);
 
@@ -705,6 +705,47 @@ internal enum GgmlIndexReductionOp
             float scale, int kvCacheType);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_PagedAttentionForward(
+            IntPtr qData,
+            IntPtr pagedKData,
+            IntPtr pagedVData,
+            IntPtr outData,
+            IntPtr queryStartLoc,
+            IntPtr seqLens,
+            IntPtr positions,
+            IntPtr blockTableFlat,
+            IntPtr blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            int slidingWindow,
+            float scale);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_PagedAttentionForwardWithSinks(
+            IntPtr qData,
+            IntPtr pagedKData,
+            IntPtr pagedVData,
+            IntPtr outData,
+            IntPtr queryStartLoc,
+            IntPtr seqLens,
+            IntPtr positions,
+            IntPtr blockTableFlat,
+            IntPtr blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            int slidingWindow,
+            float scale,
+            IntPtr sinksData);          // [numHeads] F32 or IntPtr.Zero
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Qwen35AttentionLayerDecode(
             IntPtr residualData, int hiddenSize,
             IntPtr attnNormData,
@@ -883,6 +924,104 @@ internal enum GgmlIndexReductionOp
             int chunkSize,
             float eps);
 
+        // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
+        // POD layout on 64-bit (two ints, two padding ints, two pointers).
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_NemotronMamba2BatchedStepF32(
+            int numSeqs,
+            [In, Out] NemoMamba2BatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int dInProjTotal,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            IntPtr convWt,
+            IntPtr convBias,
+            IntPtr dtBias,
+            IntPtr aLog,
+            IntPtr dData,
+            IntPtr ssmNormW,
+            float eps,
+            IntPtr outBatched);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GatedDeltaNetBatchedStepF32(
+            int numSeqs,
+            [In, Out] GdnBatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            int zDim,
+            int numKHeads,
+            int numVHeads,
+            int headKDim,
+            int headVDim,
+            int convKernel,
+            int ssmDInner,
+            IntPtr convWt,
+            IntPtr dtBias,
+            IntPtr aLog,
+            IntPtr ssmNormW,
+            float eps,
+            IntPtr gatedOut);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_NemotronMamba2PrefillF32(
+            GgmlTensorView2D projected,
+            GgmlTensorView2D hiddenOut,
+            IntPtr convStateData,
+            int convStateElements,
+            IntPtr ssmStateData,
+            int ssmStateElements,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_NemotronMamba2DecodeF32(
+            ulong stateKey,
+            GgmlTensorView2D projected,
+            GgmlTensorView2D hiddenOut,
+            IntPtr convStateData,
+            int convStateElements,
+            IntPtr ssmStateData,
+            int ssmStateElements,
+            int initializeState,
+            int downloadState,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_NemotronMamba2DecodeClear(ulong modelKey);
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern IntPtr TSGgml_AlignedAlloc(UIntPtr size);
 
@@ -914,6 +1053,15 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_RegisterOffloadable(IntPtr key);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_SetOffloadableBudget(long bytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_ClearOffloadableState();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern UIntPtr TSGgml_RowSize(int ggmlType, long ne);
@@ -1029,6 +1177,41 @@ internal enum GgmlIndexReductionOp
             float betaSlow,
             int addToResult,
             int invertPositions);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_RoPEMRoPEF32(
+            GgmlTensorView4D result,
+            GgmlTensorView4D src,
+            GgmlContiguousTensor positions,
+            int ropeDim,
+            int mode,
+            int sect0, int sect1, int sect2, int sect3,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_RoPEExFreqFactorsF32(
+            GgmlTensorView4D result,
+            GgmlTensorView4D src,
+            GgmlContiguousTensor positions,
+            int ropeDim,
+            int mode,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow,
+            int addToResult,
+            int invertPositions,
+            IntPtr freqFactors,
+            int freqFactorsLen);
 
         public static void EnsureAvailable(GgmlBackendType backendType)
         {
@@ -1528,6 +1711,72 @@ internal enum GgmlIndexReductionOp
                 "rope_ex");
         }
 
+        public static void RoPEMRoPE(
+            GgmlTensorView4D result,
+            GgmlTensorView4D src,
+            GgmlContiguousTensor positions,
+            int ropeDim,
+            int mode,
+            int sect0, int sect1, int sect2, int sect3,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow)
+        {
+            CheckResult(
+                TSGgml_RoPEMRoPEF32(
+                    result, src, positions,
+                    ropeDim, mode,
+                    sect0, sect1, sect2, sect3,
+                    originalContextLength,
+                    freqBase, freqScale,
+                    extFactor, attnFactor,
+                    betaFast, betaSlow),
+                "rope_mrope");
+        }
+
+        public static void RoPEExWithFreqFactors(
+            GgmlTensorView4D result,
+            GgmlTensorView4D src,
+            GgmlContiguousTensor positions,
+            int ropeDim,
+            int mode,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow,
+            bool addToResult,
+            bool invertPositions,
+            IntPtr freqFactors,
+            int freqFactorsLen)
+        {
+            CheckResult(
+                TSGgml_RoPEExFreqFactorsF32(
+                    result,
+                    src,
+                    positions,
+                    ropeDim,
+                    mode,
+                    originalContextLength,
+                    freqBase,
+                    freqScale,
+                    extFactor,
+                    attnFactor,
+                    betaFast,
+                    betaSlow,
+                    addToResult ? 1 : 0,
+                    invertPositions ? 1 : 0,
+                    freqFactors,
+                    freqFactorsLen),
+                "rope_ex_ff");
+        }
+
         public static void TransformerLayerDecode(
             IntPtr hiddenData, int hiddenSize,
             IntPtr attnNormData,
@@ -1594,6 +1843,108 @@ internal enum GgmlIndexReductionOp
                 outData,
                 numHeads, numKvHeads, headDim,
                 maxSeqLen, position, scale, kvCacheType), "flash_attn_decode");
+        }
+
+        /// <summary>
+        /// Native batched paged attention via <c>ggml_flash_attn_ext</c>. For
+        /// each sequence in the batch, the C++ side gathers K and V from the
+        /// paged buffer (walking the per-sequence block table), then runs the
+        /// backend's fused flash-attention kernel. One Metal/CUDA kernel per
+        /// sequence per layer, with the gather inside the native side so we
+        /// don't pay the managed↔native border crossing N×L times.
+        /// </summary>
+        /// <param name="qData">[numTokens, numHeads * headDim] row-major float[].</param>
+        /// <param name="pagedKData">[numBlocks * blockSize, numKvHeads, headDim] row-major.</param>
+        /// <param name="pagedVData">Same layout as pagedKData.</param>
+        /// <param name="outData">[numTokens, numHeads * headDim] (writes back).</param>
+        /// <param name="queryStartLoc">[numSeqs + 1] cumulative query offsets.</param>
+        /// <param name="seqLens">[numSeqs] total context length per sequence.</param>
+        /// <param name="positions">[numTokens] absolute position per query token (drives the causal mask).</param>
+        /// <param name="blockTableFlat">Concatenated per-sequence block tables.</param>
+        /// <param name="blockTableOffsets">[numSeqs] offset of each seq's table inside blockTableFlat.</param>
+        public static unsafe void PagedAttentionForward(
+            float[] qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            float[] outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow = 0)
+        {
+            fixed (float* q = qData)
+            fixed (float* kp = pagedKData)
+            fixed (float* vp = pagedVData)
+            fixed (float* o = outData)
+            fixed (int* qsl = queryStartLoc)
+            fixed (int* sl = seqLens)
+            fixed (int* pos = positions)
+            fixed (int* btf = blockTableFlat)
+            fixed (int* bto = blockTableOffsets)
+            {
+                CheckResult(TSGgml_PagedAttentionForward(
+                    (IntPtr)q, (IntPtr)kp, (IntPtr)vp, (IntPtr)o,
+                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos,
+                    (IntPtr)btf, (IntPtr)bto,
+                    numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                    blockSize, slidingWindow, scale), "paged_attention_forward");
+            }
+        }
+
+        /// <summary>Native paged-attention forward with per-head attention
+        /// sinks (gpt-oss style). Sinks is a [numHeads] F32 array; null
+        /// degenerates to the regular paged attention. Goes through
+        /// ggml_flash_attn_ext_add_sinks under the hood so the Metal/CUDA
+        /// flash-attn kernel includes the sink as a virtual softmax position.</summary>
+        public static unsafe void PagedAttentionForwardWithSinks(
+            float[] qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            float[] outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow,
+            float[] sinksData)
+        {
+            fixed (float* q = qData)
+            fixed (float* kp = pagedKData)
+            fixed (float* vp = pagedVData)
+            fixed (float* o = outData)
+            fixed (int* qsl = queryStartLoc)
+            fixed (int* sl = seqLens)
+            fixed (int* pos = positions)
+            fixed (int* btf = blockTableFlat)
+            fixed (int* bto = blockTableOffsets)
+            fixed (float* sink = sinksData)
+            {
+                CheckResult(TSGgml_PagedAttentionForwardWithSinks(
+                    (IntPtr)q, (IntPtr)kp, (IntPtr)vp, (IntPtr)o,
+                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos,
+                    (IntPtr)btf, (IntPtr)bto,
+                    numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                    blockSize, slidingWindow, scale,
+                    sinksData != null ? (IntPtr)sink : IntPtr.Zero),
+                    "paged_attention_forward_with_sinks");
+            }
         }
 
         public static void Qwen35AttentionLayerDecode(
@@ -1717,6 +2068,142 @@ internal enum GgmlIndexReductionOp
                 chunkSize, eps), "gated_delta_net_chunked");
         }
 
+        // Batched per-token Nemotron Mamba2 step. Runs all (seq, token) pairs
+        // for an active decode/prefill batch in one native call, indexing each
+        // seq's persistent conv FIFO + SSM state via the seqs[] descriptors.
+        public static void NemotronMamba2BatchedStep(
+            NemoMamba2BatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int dInProjTotal,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            IntPtr convWt,
+            IntPtr convBias,
+            IntPtr dtBias,
+            IntPtr aLog,
+            IntPtr dData,
+            IntPtr ssmNormW,
+            float eps,
+            IntPtr outBatched)
+        {
+            CheckResult(TSGgml_NemotronMamba2BatchedStepF32(
+                seqs?.Length ?? 0, seqs, numTokens,
+                packedBatched, dInProjTotal,
+                dInner, dState, nHead, headDim, nGroup, dConv,
+                convWt, convBias, dtBias, aLog, dData, ssmNormW,
+                eps, outBatched),
+                "nemotron_mamba2_batched_step");
+        }
+
+        // Batched per-token Qwen3.5 GDN step. Runs all (seq, token) pairs for
+        // an active decode/prefill batch in one native call, swapping in the
+        // matching per-slot conv ring + ssm state via the seqs[] descriptors.
+        // The descriptors' ConvWriteIdx field is updated in place — caller
+        // copies it back to its per-slot bookkeeping after the call returns.
+        public static void GatedDeltaNetBatchedStep(
+            GdnBatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            int zDim,
+            int numKHeads,
+            int numVHeads,
+            int headKDim,
+            int headVDim,
+            int convKernel,
+            int ssmDInner,
+            IntPtr convWt,
+            IntPtr dtBias,
+            IntPtr aLog,
+            IntPtr ssmNormW,
+            float eps,
+            IntPtr gatedOut)
+        {
+            CheckResult(TSGgml_GatedDeltaNetBatchedStepF32(
+                seqs?.Length ?? 0, seqs, numTokens,
+                packedBatched, packedDim, qkvDim, qkDim, vDim, zDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, ssmDInner,
+                convWt, dtBias, aLog, ssmNormW, eps, gatedOut),
+                "gated_delta_net_batched_step");
+        }
+
+        public static void NemotronMamba2Prefill(
+            GgmlTensorView2D projected,
+            GgmlTensorView2D hiddenOut,
+            IntPtr convStateData,
+            int convStateElements,
+            IntPtr ssmStateData,
+            int ssmStateElements,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps)
+        {
+            CheckResult(TSGgml_NemotronMamba2PrefillF32(
+                projected, hiddenOut,
+                convStateData, convStateElements,
+                ssmStateData, ssmStateElements,
+                convWeightData, convBiasData, dtBiasData, aData, dData, ssmNormData,
+                dInner, dState, nHead, headDim, nGroup, dConv, eps), "nemotron_mamba2_prefill");
+        }
+
+        public static void NemotronMamba2Decode(
+            ulong stateKey,
+            GgmlTensorView2D projected,
+            GgmlTensorView2D hiddenOut,
+            IntPtr convStateData,
+            int convStateElements,
+            IntPtr ssmStateData,
+            int ssmStateElements,
+            bool initializeState,
+            bool downloadState,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps)
+        {
+            CheckResult(TSGgml_NemotronMamba2DecodeF32(
+                stateKey, projected, hiddenOut,
+                convStateData, convStateElements,
+                ssmStateData, ssmStateElements,
+                initializeState ? 1 : 0,
+                downloadState ? 1 : 0,
+                convWeightData, convBiasData, dtBiasData, aData, dData, ssmNormData,
+                dInner, dState, nHead, headDim, nGroup, dConv, eps), "nemotron_mamba2_decode");
+        }
+
+        public static void NemotronMamba2DecodeClear(ulong modelKey)
+        {
+            TSGgml_NemotronMamba2DecodeClear(modelKey);
+        }
+
         /// <summary>Allocate memory with 16 KB alignment (page-aligned for Metal host_ptr).</summary>
         public static IntPtr AlignedAlloc(long size)
         {
@@ -1793,6 +2280,40 @@ internal enum GgmlIndexReductionOp
                 throw new ArgumentException("PreloadQuantizedWeight requires valid cache key, host data, and size.");
 
             CheckResult(TSGgml_PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes), "preload_quantized_weight");
+        }
+
+        /// <summary>
+        /// Mark a host data pointer as eligible for the MoE expert offload LRU.
+        /// After registration, the GGML native cache touches an LRU on lookup
+        /// hits for this pointer and evicts from the LRU tail when residency
+        /// exceeds the budget configured by <see cref="SetOffloadableBudget"/>.
+        /// Registration is sticky; call <see cref="ClearOffloadableState"/> on
+        /// model unload to reset.
+        /// </summary>
+        public static void RegisterOffloadable(IntPtr key)
+        {
+            if (key == IntPtr.Zero)
+                return;
+            TSGgml_RegisterOffloadable(key);
+        }
+
+        /// <summary>
+        /// Configure the byte ceiling for the offloadable cache LRU. Zero
+        /// disables eviction (registered entries still participate in the LRU
+        /// but nothing is freed).
+        /// </summary>
+        public static void SetOffloadableBudget(long bytes)
+        {
+            TSGgml_SetOffloadableBudget(bytes > 0 ? bytes : 0);
+        }
+
+        /// <summary>
+        /// Reset offloadable registrations, LRU state, and byte accounting.
+        /// Does not touch the underlying CachedHostBuffer entries.
+        /// </summary>
+        public static void ClearOffloadableState()
+        {
+            TSGgml_ClearOffloadableState();
         }
 
         /// <summary>Bytes for one row along ne[0]; 0 if type/shape invalid.</summary>

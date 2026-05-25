@@ -9,6 +9,11 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 // ============================================================================
 // ggml_pool implementation
 // ============================================================================
@@ -95,6 +100,13 @@ namespace tsg
     std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
     std::mutex g_preloaded_buffer_cache_mutex;
     std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
+
+    // MoE expert weight offload state — see ggml_ops_internal.h for the contract.
+    std::unordered_set<void*> g_offloadable_keys;
+    std::list<void*> g_offloadable_lru;
+    std::unordered_map<void*, std::list<void*>::iterator> g_offloadable_lru_map;
+    std::int64_t g_offloadable_resident_bytes = 0;
+    std::int64_t g_offloadable_budget = 0;
 
     // Async dispatch state. The defaults keep the legacy (eager-sync) behaviour;
     // C# enables async at backend init time via TSGgml_SetAsyncCompute(1).
@@ -517,6 +529,102 @@ namespace tsg
         return is_pointer_aligned(ptr, alignment);
     }
 
+    // Hint to the OS that the given file-backed mmap region is no longer
+    // needed. Pairs with offloadable LRU eviction: once Metal's MTLBuffer
+    // wrapper has been freed, calling MADV_DONTNEED tells the kernel it
+    // may immediately reclaim those pages without waiting for memory
+    // pressure. On the next access the pages page-fault back in from SSD.
+    // The range is rounded outward to whole page boundaries; for our use
+    // case (GGUF tensors aligned on 32-byte block boundaries in a file
+    // mmap'd read-only) the rounding may overlap adjacent tensors, which
+    // is fine — they're also file-backed and will page back in on next
+    // touch. Safe on Apple Silicon (16 KB pages) and Linux.
+    void advise_pages_dont_need(void* data, std::size_t bytes)
+    {
+#if defined(__APPLE__) || defined(__linux__)
+        if (data == nullptr || bytes == 0)
+            return;
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0)
+            return;
+        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(data);
+        const std::uintptr_t aligned_addr = addr & ~(static_cast<std::uintptr_t>(page_size) - 1);
+        const std::size_t prefix = static_cast<std::size_t>(addr - aligned_addr);
+        const std::size_t total = bytes + prefix;
+        const std::size_t mask = static_cast<std::size_t>(page_size) - 1;
+        const std::size_t rounded = (total + mask) & ~mask;
+        (void)madvise(reinterpret_cast<void*>(aligned_addr), rounded, MADV_DONTNEED);
+#else
+        (void)data;
+        (void)bytes;
+#endif
+    }
+
+    // --- Offloadable LRU helpers (caller holds g_host_buffer_cache_mutex) ---
+
+    void offloadable_lru_remove_locked(void* key)
+    {
+        auto it = g_offloadable_lru_map.find(key);
+        if (it == g_offloadable_lru_map.end())
+            return;
+        g_offloadable_lru.erase(it->second);
+        g_offloadable_lru_map.erase(it);
+    }
+
+    void offloadable_lru_touch_locked(void* key)
+    {
+        auto it = g_offloadable_lru_map.find(key);
+        if (it == g_offloadable_lru_map.end())
+            return;
+        g_offloadable_lru.erase(it->second);
+        g_offloadable_lru.push_front(key);
+        it->second = g_offloadable_lru.begin();
+    }
+
+    void offloadable_lru_insert_front_locked(void* key)
+    {
+        offloadable_lru_remove_locked(key);
+        g_offloadable_lru.push_front(key);
+        g_offloadable_lru_map[key] = g_offloadable_lru.begin();
+    }
+
+    // Drop an offloadable LRU entry: removes the cache entry, frees the
+    // backend buffer wrapper (releasing Metal's claim on the underlying
+    // host pages), and hints the OS that the pages can be reclaimed now.
+    // Returns the number of bytes freed.
+    std::size_t offloadable_evict_one_locked()
+    {
+        if (g_offloadable_lru.empty())
+            return 0;
+        void* key = g_offloadable_lru.back();
+        g_offloadable_lru.pop_back();
+        g_offloadable_lru_map.erase(key);
+
+        auto cit = g_host_buffer_cache.find(key);
+        if (cit == g_host_buffer_cache.end())
+            return 0;
+        std::size_t freed = cit->second.bytes;
+        ggml_backend_buffer_free(cit->second.buffer);
+        g_host_buffer_cache.erase(cit);
+        advise_pages_dont_need(key, freed);
+        if (g_offloadable_resident_bytes >= static_cast<std::int64_t>(freed))
+            g_offloadable_resident_bytes -= static_cast<std::int64_t>(freed);
+        else
+            g_offloadable_resident_bytes = 0;
+        return freed;
+    }
+
+    void offloadable_evict_to_budget_locked()
+    {
+        if (g_offloadable_budget <= 0)
+            return;
+        while (g_offloadable_resident_bytes > g_offloadable_budget && !g_offloadable_lru.empty())
+        {
+            if (offloadable_evict_one_locked() == 0)
+                break;
+        }
+    }
+
     void invalidate_cached_buffer(void* data)
     {
         if (data == nullptr)
@@ -538,6 +646,14 @@ namespace tsg
             auto it = g_host_buffer_cache.find(data);
             if (it == g_host_buffer_cache.end())
                 return;
+            offloadable_lru_remove_locked(data);
+            if (g_offloadable_keys.count(data))
+            {
+                if (g_offloadable_resident_bytes >= static_cast<std::int64_t>(it->second.bytes))
+                    g_offloadable_resident_bytes -= static_cast<std::int64_t>(it->second.bytes);
+                else
+                    g_offloadable_resident_bytes = 0;
+            }
             ggml_backend_buffer_free(it->second.buffer);
             g_host_buffer_cache.erase(it);
         }
@@ -561,6 +677,8 @@ namespace tsg
                 it->second.mode == CachedBufferMode::HostPtr)
             {
                 out_buffer = it->second.buffer;
+                if (g_offloadable_keys.count(data))
+                    offloadable_lru_touch_locked(data);
                 return true;
             }
         }
@@ -577,6 +695,18 @@ namespace tsg
                 ggml_backend_buffer_get_size(out_buffer),
                 CachedBufferMode::HostPtr
             };
+            if (g_offloadable_keys.count(data))
+            {
+                offloadable_lru_insert_front_locked(data);
+                g_offloadable_resident_bytes += static_cast<std::int64_t>(bytes);
+                // Evict from the tail of the LRU; the just-inserted entry is
+                // at the front and is safe (it's the one the caller will use
+                // for the in-progress graph build). Eviction of other tail
+                // entries frees their MTLBuffer wrappers; any kernel whose
+                // graph computed earlier has already released the references
+                // it captured at build time.
+                offloadable_evict_to_budget_locked();
+            }
         }
 
         return true;
@@ -679,8 +809,21 @@ namespace tsg
             auto it = g_host_buffer_cache.find(data);
             if (it == g_host_buffer_cache.end())
                 return true;
+            // Size mismatch means the C# pool recycled this host pointer for a
+            // larger tensor (typical: KV-cache resize). The cached Metal buffer
+            // belongs to the previous, smaller occupant — its contents are
+            // stale relative to the new tensor's host memory, so syncing it
+            // back would corrupt freshly-initialized data. Treat it as
+            // "nothing to sync"; try_get_cacheable_tensor_buffer rebuilds the
+            // binding when the next kernel uses this address.
+            //
+            // We do not eagerly ggml_backend_buffer_free the stale buffer here:
+            // pending Metal command buffers may still hold references under
+            // async compute, and freeing would race with their completion.
+            // try_get_cacheable_tensor_buffer evicts on demand (after the size
+            // check there) when it next encounters this address.
             if (bytes > it->second.bytes)
-                return false;
+                return true;
             buffer = it->second.buffer;
             mode = it->second.mode;
         }
@@ -1195,7 +1338,47 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         for (auto& [ptr, cached] : g_host_buffer_cache)
             ggml_backend_buffer_free(cached.buffer);
         g_host_buffer_cache.clear();
+        g_offloadable_lru.clear();
+        g_offloadable_lru_map.clear();
+        g_offloadable_resident_bytes = 0;
     }
+}
+
+// Mark a host data pointer as eligible for the MoE expert offload LRU.
+// Once registered, subsequent cache lookups for that pointer update an LRU,
+// and cache misses that grow the resident byte total beyond the configured
+// budget trigger eviction from the LRU tail. Registration is sticky — call
+// TSGgml_ClearOffloadableState to reset (typically on model unload).
+TSG_EXPORT void TSGgml_RegisterOffloadable(void* key)
+{
+    if (key == nullptr)
+        return;
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    g_offloadable_keys.insert(key);
+}
+
+// Set the byte ceiling for offloadable cache residency. Zero (or negative)
+// disables eviction (registered entries still participate in the LRU but
+// nothing is freed).
+TSG_EXPORT void TSGgml_SetOffloadableBudget(int64_t bytes)
+{
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    g_offloadable_budget = bytes > 0 ? bytes : 0;
+    offloadable_evict_to_budget_locked();
+}
+
+// Clear the offloadable registry, LRU, and byte accounting. Does NOT touch
+// the underlying CachedHostBuffer entries — they remain reachable via
+// g_host_buffer_cache and will be freed by TSGgml_ClearHostBufferCache or
+// when the process exits.
+TSG_EXPORT void TSGgml_ClearOffloadableState()
+{
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    g_offloadable_keys.clear();
+    g_offloadable_lru.clear();
+    g_offloadable_lru_map.clear();
+    g_offloadable_resident_bytes = 0;
+    g_offloadable_budget = 0;
 }
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)

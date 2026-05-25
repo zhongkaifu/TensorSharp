@@ -366,16 +366,113 @@ namespace TensorSharp
 
         #endregion
 
+        // True iff all three tensors are 2D contiguous float32 with matching
+        // outer shape (i.e. a typical [N,D] gather/scatter layout). The fast
+        // paths below bypass the generic TensorDimIterState walk: they iterate
+        // rows in the outer loop (cache-friendly writes) and detect the
+        // embedding-style "all indices in a row equal" pattern to emit a
+        // single row memcpy instead of D scalar copies.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe bool TryGetGatherScatter2DFast(
+            Tensor result, Tensor src, Tensor indices, int dim,
+            out float* rPtr, out float* sPtr, out float* iPtr,
+            out long N, out long D, out long otherDim)
+        {
+            rPtr = sPtr = iPtr = null;
+            N = D = otherDim = 0;
+
+            if (result == null || src == null || indices == null) return false;
+            if (result.DimensionCount != 2 || src.DimensionCount != 2 || indices.DimensionCount != 2) return false;
+            if (dim != 0 && dim != 1) return false;
+            if (result.ElementType != DType.Float32 || src.ElementType != DType.Float32) return false;
+            if (indices.ElementType != DType.Float32) return false;
+            if (!result.IsContiguous() || !src.IsContiguous() || !indices.IsContiguous()) return false;
+
+            // Shape preconditions match the public API: result.shape == indices.shape,
+            // and src/result agree on every dim except `dim`.
+            if (result.Sizes[0] != indices.Sizes[0] || result.Sizes[1] != indices.Sizes[1]) return false;
+            int otherIdx = dim == 0 ? 1 : 0;
+            if (src.Sizes[otherIdx] != result.Sizes[otherIdx]) return false;
+
+            N = result.Sizes[0];
+            D = result.Sizes[1];
+            otherDim = src.Sizes[dim];
+
+            rPtr = (float*)CpuNativeHelpers.GetBufferStart(result);
+            sPtr = (float*)CpuNativeHelpers.GetBufferStart(src);
+            iPtr = (float*)CpuNativeHelpers.GetBufferStart(indices);
+            return true;
+        }
+
         unsafe public static void Gather(Tensor result, Tensor src, int dim, Tensor indices)
 		{
+            if (TryGetGatherScatter2DFast(result, src, indices, dim,
+                out float* rPtr, out float* sPtr, out float* iPtr,
+                out long N, out long D, out long sSize))
+            {
+                if (dim == 0)
+                {
+                    // result[i, j] = src[indices[i, j], j]
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* indRow = iPtr + i * D;
+                        float* resRow = rPtr + i * D;
+                        long firstIdx = (long)indRow[0];
+                        if (firstIdx < 0 || firstIdx >= sSize)
+                            throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{firstIdx}', sSize = '{sSize}'");
+
+                        // Detect embedding-style uniform-row indices and emit
+                        // a single row memcpy.
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if ((long)indRow[j] != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            long bytes = D * sizeof(float);
+                            Buffer.MemoryCopy(sPtr + firstIdx * D, resRow, bytes, bytes);
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = (long)indRow[j];
+                                if (idx < 0 || idx >= sSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', sSize = '{sSize}'");
+                                resRow[j] = sPtr[idx * D + j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, j] = src[i, indices[i, j]]
+                {
+                    long srcCols = sSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* srcRow = sPtr + i * srcCols;
+                        float* indRow = iPtr + i * D;
+                        float* resRow = rPtr + i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = (long)indRow[j];
+                            if (idx < 0 || idx >= srcCols)
+                                throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', sSize = '{srcCols}'");
+                            resRow[j] = srcRow[idx];
+                        }
+                    }
+                }
+                return;
+            }
+
 			unsafe void func(float* rData, long rSize, long rStride,
-				float* sData, long sSize, long sStride,
+				float* sData, long sSize2, long sStride,
 				float* iData, long iSize, long iStride)
 			{
 				for (int i = 0; i < iSize; ++i)
 				{
 					long idx = (long)*(iData + i * iStride);
-					if (idx < 0 || idx >= sSize) { throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', sSize = '{sSize}'"); }
+					if (idx < 0 || idx >= sSize2) { throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', sSize = '{sSize2}'"); }
 
 					*(rData + i * rStride) = sData[idx * sStride];
 				}
@@ -388,7 +485,64 @@ namespace TensorSharp
 
 		unsafe public static void Scatter(Tensor result, Tensor src, int dim, Tensor indices)
 		{
-			unsafe void func(float* rData, long rSize, long rStride,
+            if (TryGetGatherScatter2DFast(result, src, indices, dim,
+                out float* rPtr, out float* sPtr, out float* iPtr,
+                out long N, out long D, out long rSize))
+            {
+                if (dim == 0)
+                {
+                    // result[indices[i, j], j] = src[i, j]
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* indRow = iPtr + i * D;
+                        float* srcRow = sPtr + i * D;
+                        long firstIdx = (long)indRow[0];
+                        if (firstIdx < 0 || firstIdx >= rSize)
+                            throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{firstIdx}', rSize = '{rSize}'");
+
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if ((long)indRow[j] != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            long bytes = D * sizeof(float);
+                            Buffer.MemoryCopy(srcRow, rPtr + firstIdx * D, bytes, bytes);
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = (long)indRow[j];
+                                if (idx < 0 || idx >= rSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize}'");
+                                rPtr[idx * D + j] = srcRow[j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, indices[i, j]] = src[i, j]
+                {
+                    long resCols = rSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* resRow = rPtr + i * resCols;
+                        float* indRow = iPtr + i * D;
+                        float* srcRow = sPtr + i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = (long)indRow[j];
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{resCols}'");
+                            resRow[idx] = srcRow[j];
+                        }
+                    }
+                }
+                return;
+            }
+
+			unsafe void func(float* rData, long rSize2, long rStride,
 				float* sData, long sSize, long sStride,
 				float* iData, long iSize, long iStride)
 			{
@@ -396,8 +550,8 @@ namespace TensorSharp
 				for (int i = 0; i < iSize; ++i)
 				{
 					long idx = (long)*(iData + i * iStride);
-					if (idx < 0 || idx >= rSize) { throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize}'"); }
-				
+					if (idx < 0 || idx >= rSize2) { throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize2}'"); }
+
 					rData[idx * rStride] = *(sData + i * sStride);
 				}
 
@@ -408,7 +562,74 @@ namespace TensorSharp
 
 		unsafe public static void ScatterAdd(Tensor result, Tensor src, int dim, Tensor indices)
 		{
-			unsafe void func(float* rData, long rSize, long rStride,
+            if (TryGetGatherScatter2DFast(result, src, indices, dim,
+                out float* rPtr, out float* sPtr, out float* iPtr,
+                out long N, out long D, out long rSize))
+            {
+                if (dim == 0)
+                {
+                    // result[indices[i, j], j] += src[i, j]
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* indRow = iPtr + i * D;
+                        float* srcRow = sPtr + i * D;
+                        long firstIdx = (long)indRow[0];
+                        if (firstIdx < 0 || firstIdx >= rSize)
+                            throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{firstIdx}', rSize = '{rSize}'");
+
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if ((long)indRow[j] != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            // Vectorized add for the destination row.
+                            int vectorSize = Vector<float>.Count;
+                            float* dst = rPtr + firstIdx * D;
+                            long j = 0;
+                            for (; j <= D - vectorSize; j += vectorSize)
+                            {
+                                Vector<float> a = LoadVec(dst + j);
+                                Vector<float> b = LoadVec(srcRow + j);
+                                StoreVec(dst + j, a + b);
+                            }
+                            for (; j < D; j++)
+                                dst[j] += srcRow[j];
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = (long)indRow[j];
+                                if (idx < 0 || idx >= rSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize}'");
+                                rPtr[idx * D + j] += srcRow[j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, indices[i, j]] += src[i, j]
+                {
+                    long resCols = rSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* resRow = rPtr + i * resCols;
+                        float* indRow = iPtr + i * D;
+                        float* srcRow = sPtr + i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = (long)indRow[j];
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{resCols}'");
+                            resRow[idx] += srcRow[j];
+                        }
+                    }
+                }
+                return;
+            }
+
+			unsafe void func(float* rData, long rSize2, long rStride,
 				float* sData, long sSize, long sStride,
 				float* iData, long iSize, long iStride)
 			{
@@ -416,7 +637,7 @@ namespace TensorSharp
 				for (int i = 0; i < iSize; ++i)
 				{
 					long idx = (long)*(iData + i * iStride);
-					if (idx < 0 || idx >= rSize) { throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize}'"); }
+					if (idx < 0 || idx >= rSize2) { throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', rSize = '{rSize2}'"); }
 
 					rData[idx * rStride] += *(sData + i * sStride);
 				}
@@ -428,6 +649,55 @@ namespace TensorSharp
 
 		unsafe public static void ScatterFill(Tensor result, float value, int dim, Tensor indices)
 		{
+            // 2D-contig fast path for ScatterFill (no src tensor).
+            if (result != null && indices != null
+                && result.DimensionCount == 2 && indices.DimensionCount == 2
+                && (dim == 0 || dim == 1)
+                && result.ElementType == DType.Float32 && indices.ElementType == DType.Float32
+                && result.IsContiguous() && indices.IsContiguous()
+                && indices.Sizes[1 - dim] == result.Sizes[1 - dim])
+            {
+                long N = indices.Sizes[0];
+                long D = indices.Sizes[1];
+                long otherDim = result.Sizes[dim];
+
+                float* rPtrFast = (float*)CpuNativeHelpers.GetBufferStart(result);
+                float* iPtrFast = (float*)CpuNativeHelpers.GetBufferStart(indices);
+
+                if (dim == 0)
+                {
+                    long resCols = result.Sizes[1];
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* indRow = iPtrFast + i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = (long)indRow[j];
+                            if (idx < 0 || idx >= otherDim)
+                                throw new IndexOutOfRangeException($"Invalid index in ScatterFill. Idx = '{idx}', rSize = '{otherDim}'");
+                            rPtrFast[idx * resCols + j] = value;
+                        }
+                    }
+                }
+                else // dim == 1
+                {
+                    long resCols = result.Sizes[1];
+                    for (long i = 0; i < N; i++)
+                    {
+                        float* resRow = rPtrFast + i * resCols;
+                        float* indRow = iPtrFast + i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = (long)indRow[j];
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in ScatterFill. Idx = '{idx}', rSize = '{resCols}'");
+                            resRow[idx] = value;
+                        }
+                    }
+                }
+                return;
+            }
+
 			unsafe void func(float* rData, long rSize, long rStride, float* iData, long iSize, long iStride)
 			{
 				for (int i = 0; i < iSize; ++i)

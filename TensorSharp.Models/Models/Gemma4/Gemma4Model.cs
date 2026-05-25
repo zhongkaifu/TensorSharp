@@ -15,6 +15,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -32,7 +33,7 @@ namespace TensorSharp.Models
     /// - Per-layer output scaling
     /// - Optional MoE (Mixture of Experts) layers
     /// </summary>
-    public class Gemma4Model : ModelBase
+    public partial class Gemma4Model : ModelBase
     {
         private bool[] _slidingWindowPattern;
         private int _slidingWindow;
@@ -104,6 +105,14 @@ namespace TensorSharp.Models
         private int _numExperts;
         private int _numExpertsUsed;
 
+        // Pooled per-call scratch for MoE routing. Reallocated lazily when the
+        // current request needs a larger seqLen (prefill). Decode reuses the
+        // same buffers across all layers/steps, eliminating the per-call
+        // float[]/int[] allocation in MoERoute().
+        private float[] _moeRoutingWeightsScratch;
+        private int[] _moeSelectedExpertsScratch;
+        private int[] _moeTopKScratch;
+
         // Per-layer caches for the fused expert-batched MoE FFN kernel
         // (GgmlBasicOps.MoEFFNPrefill with GEGLU activation). These are
         // zero-cost views into the original 3D <c>ffn_{gate,up,down}_exps.weight</c>
@@ -138,9 +147,33 @@ namespace TensorSharp.Models
         private Gemma4AudioEncoder _audioEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
         private List<(Tensor embeddings, int position)> _pendingAudioEmbeddingsList = new();
+        private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
+        private static readonly int MlxLocalKvMaterializeInterval = ResolveMlxLocalKvMaterializeInterval();
+        private static readonly bool MlxEvalDecodeLayerBoundaries =
+            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GEMMA4_EVAL_DECODE_LAYER_BOUNDARIES"), "1", StringComparison.Ordinal);
+        private static readonly bool MlxBaselineSyncLayerEval =
+            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BASELINE_ASYNC_LAYER"), "1", StringComparison.Ordinal);
 
         public Gemma4VisionEncoder VisionEncoder => _visionEncoder;
         public Gemma4AudioEncoder AudioEncoder => _audioEncoder;
+
+        private static int ResolveMlxEvalEveryNLayers()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS")
+                         ?? Environment.GetEnvironmentVariable("TS_MLX_EVAL_EVERY_N_LAYERS");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v >= 0)
+                return v;
+            return 8;
+        }
+
+        private static int ResolveMlxLocalKvMaterializeInterval()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_GEMMA4_LOCAL_KV_MATERIALIZE_INTERVAL")
+                         ?? Environment.GetEnvironmentVariable("TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v >= 0)
+                return v;
+            return 128;
+        }
 
         public void LoadVisionEncoder(string mmProjPath)
         {
@@ -220,6 +253,8 @@ namespace TensorSharp.Models
 
             _numExperts = (int)_gguf.GetUint32($"{arch}.expert_count", 0);
             _numExpertsUsed = (int)_gguf.GetUint32($"{arch}.expert_used_count", 0);
+            if (_numExpertsUsed > 0)
+                _moeTopKScratch = new int[_numExpertsUsed];
 
             Console.WriteLine($"Model: {arch}, Layers={Config.NumLayers}, " +
                 $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, " +
@@ -260,7 +295,11 @@ namespace TensorSharp.Models
             CacheMoEStackedWeights();
             PrepareCudaQuantizedWeightsForInference();
             PrecomputeRoPE();
-            InitKVCache(ResolveConfiguredContextLength());
+            int maxContextLength = ResolveConfiguredContextLength();
+            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+            if (initialCacheLength < maxContextLength)
+                Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens for global layers (grows on demand up to {maxContextLength}).");
+            InitKVCache(initialCacheLength, maxContextLength);
             BuildGemma4DecodeArrays();
         }
 
@@ -395,9 +434,14 @@ namespace TensorSharp.Models
             }
         }
 
-        private void InitKVCache(int maxSeqLen)
+        // Current capacity of global-attention layers (SWA layers stay at
+        // _slidingWindow and never grow).
+        private int _kvCacheGlobalCapacity;
+
+        private void InitKVCache(int initialGlobalSeqLen, int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            _kvCacheGlobalCapacity = initialGlobalSeqLen;
             _kvCacheK = new Tensor[Config.NumLayers];
             _kvCacheV = new Tensor[Config.NumLayers];
             _kvCacheSize = new int[Config.NumLayers];
@@ -416,7 +460,7 @@ namespace TensorSharp.Models
 
                 int kvHeads = KVHeadsForLayer(l);
                 int hd = HeadDimForLayer(l);
-                int cacheLen = IsLocalLayer(l) ? _slidingWindow : maxSeqLen;
+                int cacheLen = IsLocalLayer(l) ? _slidingWindow : initialGlobalSeqLen;
                 _kvCacheSize[l] = cacheLen;
                 _kvCacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
                 _kvCacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
@@ -436,7 +480,99 @@ namespace TensorSharp.Models
             }
 
             Console.WriteLine($"  KV cache: {totalCacheBytes / 1024 / 1024} MB " +
-                $"(dtype: {_kvCacheDtype.ToShortString()}, global layers: {maxSeqLen} seq, SWA layers: {_slidingWindow} seq)");
+                $"(dtype: {_kvCacheDtype.ToShortString()}, global layers: {initialGlobalSeqLen} seq, SWA layers: {_slidingWindow} seq)");
+        }
+
+        // Grow the global-attention layers' KV cache to fit requiredSeqLen
+        // (doubling, capped at _maxContextLength). SWA layers are left alone
+        // because they wrap circularly within _slidingWindow and never need
+        // more storage. Donor-shared layers track their donor — we only
+        // resize each underlying cache once and update the alias entries.
+        private void EnsureCacheCapacity(int requiredSeqLen)
+        {
+            if (requiredSeqLen <= _kvCacheGlobalCapacity)
+                return;
+            if (requiredSeqLen > _maxContextLength)
+                throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
+
+            // The resize loop below uses Ops.Copy to move existing K/V into the
+            // larger tensors, and Ops.Copy is a CPU memcpy. Under device-copy
+            // mode on the Metal backend the freshest cache writes may still
+            // live in the Metal buffer; sync them back to the host buffer
+            // first so the memcpy reads the right bytes.
+            EnsureKvCacheHostSynchronized();
+
+            int newCapacity = Math.Max(_kvCacheGlobalCapacity, 1);
+            while (newCapacity < requiredSeqLen)
+                newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
+
+            DType kvDtype = _kvCacheDtype.ToDType();
+            var resized = new HashSet<int>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l)) continue;
+                if (IsLocalLayer(l)) continue;          // SWA — never grows
+                if (!resized.Add(l)) continue;
+
+                int kvHeads = KVHeadsForLayer(l);
+                int hd = HeadDimForLayer(l);
+                var newK = new Tensor(_allocator, kvDtype, kvHeads, newCapacity, hd);
+                var newV = new Tensor(_allocator, kvDtype, kvHeads, newCapacity, hd);
+                InitializeCacheTensor(newK);
+                InitializeCacheTensor(newV);
+
+                if (_cacheSeqLen > 0)
+                {
+                    using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstK = newK.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstK, srcK);
+
+                    using var srcV = _kvCacheV[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstV, srcV);
+                }
+
+                _kvCacheK[l].Dispose();
+                _kvCacheV[l].Dispose();
+                _kvCacheK[l] = newK;
+                _kvCacheV[l] = newV;
+                _kvCacheSize[l] = newCapacity;
+            }
+
+            // Re-point donor aliases to the resized underlying caches.
+            foreach (var kv in _kvDonorMap)
+            {
+                if (IsLocalLayer(kv.Value)) continue;
+                _kvCacheK[kv.Key] = _kvCacheK[kv.Value];
+                _kvCacheV[kv.Key] = _kvCacheV[kv.Value];
+                _kvCacheSize[kv.Key] = _kvCacheSize[kv.Value];
+            }
+
+            // BuildGemma4DecodeArrays cached the K/V host pointers and capacity
+            // for the fused per-layer / full-model decode kernels at model load
+            // time. Those pointers refer to the storage we just disposed, so
+            // refresh them to the new tensors — otherwise the next layer kernel
+            // hands GGML a freed pointer and Metal reports "buffer is nil" for
+            // every K/V-derived intermediate.
+            RefreshDecodeArraysKvCache();
+
+            _kvCacheGlobalCapacity = newCapacity;
+            Console.WriteLine($"Expanded Gemma4 global attention cache to {newCapacity} tokens.");
+        }
+
+        private void RefreshDecodeArraysKvCache()
+        {
+            if (_decodeArrays == null) return;
+            var a = _decodeArrays;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                int kvSource = _kvDonorMap.TryGetValue(l, out int donor) ? donor : l;
+                if (_kvCacheK[kvSource] != null)
+                    a.KCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheK[kvSource]);
+                if (_kvCacheV[kvSource] != null)
+                    a.VCache[l] = TensorComputePrimitives.GetStoragePointer(_kvCacheV[kvSource]);
+                a.CacheSize[l] = _kvCacheSize[kvSource];
+            }
         }
 
         public override void ResetKVCache()
@@ -474,6 +610,67 @@ namespace TensorSharp.Models
             }
         }
 
+        // Gemma 4 hosts its local-attention layers in a circular slidingWindow-sized
+        // cache (see CopyToCacheDecode line ~2972: cachePos = startPos % cacheSize).
+        // Past that boundary the physical layout no longer matches logical positions,
+        // so a byte-slice snapshot at offset [0, N) is only well-defined when
+        // _cacheSeqLen never wrapped, i.e. when the prefill stayed within
+        // _slidingWindow. We expose the snapshot API only inside that regime.
+        public override bool SupportsKVStateSnapshot
+            => _kvCacheK != null && _kvCacheV != null && !HasLocalLayerCacheWrapped();
+
+        public override string KVStateFingerprint =>
+            $"gemma4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|gKV={_numGlobalKVHeads}|gD={_globalHeadDim}|lD={_localHeadDim}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            if (!SupportsKVStateSnapshot) return false;
+            if (startToken + tokenCount > _slidingWindow)
+                return false; // local layers' circular buffer would alias positions
+            EnsureKvCacheHostSynchronized();
+            return KvBlockTransfer.Extract(
+                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                startToken, tokenCount, destination);
+        }
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (_kvCacheK == null || _kvCacheV == null) return false;
+            if (destToken + tokenCount > _slidingWindow)
+                return false; // restoring past the window would write into wrap-aliased slots
+            EnsureCacheCapacity(destToken + tokenCount);
+            EnsureKvCacheHostSynchronized();
+            if (!KvBlockTransfer.Inject(
+                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    destToken, tokenCount, source))
+            {
+                return false;
+            }
+            _cacheSeqLen = destToken + tokenCount;
+            // Match TruncateKVCache: invalidate each unique storage exactly once.
+            var invalidated = new HashSet<int>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (invalidated.Contains(l)) continue;
+                if (_kvDonorMap.ContainsKey(l)) continue;
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+                invalidated.Add(l);
+            }
+            _kvCacheHostDirty = false;
+            return true;
+        }
+
+        private bool HasLocalLayerCacheWrapped()
+        {
+            if (_slidingWindowPattern == null || _slidingWindow <= 0)
+                return false;
+            return _cacheSeqLen > _slidingWindow;
+        }
+
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
@@ -490,11 +687,30 @@ namespace TensorSharp.Models
             // per-layer kernel for the dense majority).
             bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
 
+            EnsureCacheCapacity(startPos + seqLen);
+
+            // Optional tensor-level diag. Forces the non-fused per-op layer
+            // path so legacy and batched share the same code shape.
+            bool _g4DumpDiag = System.Environment.GetEnvironmentVariable("TS_GEMMA4_DIAG") == "1";
+            // The tests' batched-vs-legacy comparison sets TS_GEMMA4_FORCE_UNFUSED=1
+            // to make the legacy path fully deterministic (no fused layer prefill,
+            // no fused decode) without enabling the verbose per-layer checksum
+            // prints from TS_GEMMA4_DIAG.
+            bool _g4ForceUnfused = _g4DumpDiag ||
+                System.Environment.GetEnvironmentVariable("TS_GEMMA4_FORCE_UNFUSED") == "1";
+            if (_g4ForceUnfused)
+            {
+                System.Environment.SetEnvironmentVariable("TS_FUSED_LAYER_PREFILL", "0");
+                useFusedDecode = false;
+            }
+
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t0;
 
             ScaleEmbedding(hidden);
+
+            if (_g4DumpDiag) System.Console.WriteLine($"[g4-legacy ] after-embed: {DiagChecksum(hidden, "embed")}");
 
             HashSet<int> exceptPositions = null;
 
@@ -551,13 +767,19 @@ namespace TensorSharp.Models
                 // W positions only, breaking attention for queries near the
                 // start of the chunk. Pre-allocating the dict here means the
                 // donor's TransformerBlock will populate it on its way out.
-                if (seqLen > 1 && _swaKVDonorLayers.Count > 0)
+                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
+                bool useFusedLayerGraph = CanUseFusedLayerGraph(seqLen, exceptPositions, useFusedLayerPrefill);
+                if (_g4DumpDiag || System.Environment.GetEnvironmentVariable("TS_GEMMA4_PATH_TRACE") == "1")
+                    System.Console.WriteLine($"[g4-legacy ] path: useFusedLayerPrefill={useFusedLayerPrefill} useFusedLayerGraph={useFusedLayerGraph} TS_FUSED_LAYER_PREFILL={Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL")}");
+
+                if (_swaKVDonorLayers.Count > 0 && (seqLen > 1 || useFusedLayerGraph))
                     _prefillSWAKV = new Dictionary<int, (Tensor, Tensor)>();
 
                 // Capture the live SWA "previous window" from the rolling cache
                 // *before* any layer in this chunk overwrites it. This is what
                 // makes chunked SWA prefill produce the same logits as non-chunked.
-                PrepareSwaPrevWindowsForChunk(startPos, seqLen);
+                if (seqLen > 1 || useFusedLayerGraph)
+                    PrepareSwaPrevWindowsForChunk(startPos, seqLen);
 
                 // The fused per-layer prefill kernel runs the entire transformer
                 // block (attn + MLP + PLE) as a single GGML graph. It accepts the
@@ -566,8 +788,7 @@ namespace TensorSharp.Models
                 // layers see the full chunk's K/V rather than a partial rolling
                 // cache. Real-world prompts get a 45-50% speedup (chunked) over
                 // the per-op C# path. Set TS_FUSED_LAYER_PREFILL=0 to disable.
-                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
-
+                int _fusedHits = 0, _nonFusedHits = 0;
                 for (int l = 0; l < Config.NumLayers; l++)
                 {
                     Tensor perLayerInput = null;
@@ -576,19 +797,43 @@ namespace TensorSharp.Models
 
                     bool isShared = _kvDonorMap.ContainsKey(l);
 
-                    if (useFusedLayerPrefill && IsGgmlBackend && seqLen > 1 && !HasMoE(l) &&
-                        exceptPositions == null && _canUseFusedDecode)
+                    bool canUseLayerGraph = useFusedLayerGraph && !HasMoE(l);
+                    // Shared global layers must attend the donor's full prefix.
+                    // The fused layer graph currently accepts only donor K/V for
+                    // the current token/chunk, so keep that case on the C# path.
+                    if (canUseLayerGraph && seqLen == 1 && isShared && !IsLocalLayer(l) && startPos > 0)
+                        canUseLayerGraph = false;
+
+                    if (canUseLayerGraph)
                     {
                         if (TryFusedLayerPrefill(hidden, l, seqLen, startPos, perLayerInput))
                         {
+                            _fusedHits++;
                             perLayerInput?.Dispose();
                             continue;
                         }
                     }
 
+                    _nonFusedHits++;
                     hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
+                    TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
                     perLayerInput?.Dispose();
+                    if (_g4DumpDiag) System.Console.WriteLine($"[g4-legacy ] after-layer-{l}: {DiagChecksum(hidden, $"L{l}")}");
+                    else if (_g4ForceUnfused)
+                    {
+                        // Force a CPU read between layers when the test-only
+                        // FORCE_UNFUSED mode is on. Metal queues ops async by
+                        // default; without flushing, parallel reductions in
+                        // RMSNorm/softmax can give bit-different results
+                        // between runs and the test loses comparability with
+                        // the (eagerly-synced) batched path. The pinged byte
+                        // is discarded; only the implicit download-barrier
+                        // matters.
+                        _ = hidden.GetElementsAsFloat(1);
+                    }
                 }
+                if (_g4DumpDiag || System.Environment.GetEnvironmentVariable("TS_GEMMA4_PATH_TRACE") == "1")
+                    System.Console.WriteLine($"[g4-legacy ] _fusedHits={_fusedHits} _nonFusedHits={_nonFusedHits}");
 
                 if (_prefillSWAKV != null)
                 {
@@ -702,6 +947,9 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
+            bool _g4DumpDiag = false; // PrefillWithoutLogits doesn't dump diag
+
+            EnsureCacheCapacity(startPos + seqLen);
 
             long t0 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -755,12 +1003,14 @@ namespace TensorSharp.Models
             }
             else
             {
-                if (seqLen > 1 && _swaKVDonorLayers.Count > 0)
+                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
+                bool useFusedLayerGraph = CanUseFusedLayerGraph(seqLen, exceptPositions, useFusedLayerPrefill);
+
+                if (_swaKVDonorLayers.Count > 0 && (seqLen > 1 || useFusedLayerGraph))
                     _prefillSWAKV = new Dictionary<int, (Tensor, Tensor)>();
 
-                PrepareSwaPrevWindowsForChunk(startPos, seqLen);
-
-                bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
+                if (seqLen > 1 || useFusedLayerGraph)
+                    PrepareSwaPrevWindowsForChunk(startPos, seqLen);
 
                 for (int l = 0; l < Config.NumLayers; l++)
                 {
@@ -770,8 +1020,14 @@ namespace TensorSharp.Models
 
                     bool isShared = _kvDonorMap.ContainsKey(l);
 
-                    if (useFusedLayerPrefill && IsGgmlBackend && seqLen > 1 && !HasMoE(l) &&
-                        exceptPositions == null && _canUseFusedDecode)
+                    bool canUseLayerGraph = useFusedLayerGraph && !HasMoE(l);
+                    // Shared global layers must attend the donor's full prefix.
+                    // The fused layer graph currently accepts only donor K/V for
+                    // the current token/chunk, so keep that case on the C# path.
+                    if (canUseLayerGraph && seqLen == 1 && isShared && !IsLocalLayer(l) && startPos > 0)
+                        canUseLayerGraph = false;
+
+                    if (canUseLayerGraph)
                     {
                         if (TryFusedLayerPrefill(hidden, l, seqLen, startPos, perLayerInput))
                         {
@@ -781,7 +1037,9 @@ namespace TensorSharp.Models
                     }
 
                     hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
+                    TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
                     perLayerInput?.Dispose();
+                    if (_g4DumpDiag) System.Console.WriteLine($"[g4-legacy ] after-layer-{l}: {DiagChecksum(hidden, $"L{l}")}");
                 }
 
                 if (_prefillSWAKV != null)
@@ -809,6 +1067,28 @@ namespace TensorSharp.Models
             Ops.Mul(hidden, hidden, scale);
         }
 
+        // Diagnostic-only: per-tensor checksum for tensor-level diff between
+        // legacy and batched forward paths. Enable via TS_GEMMA4_DIAG=1.
+        // Sample the LAST token's state since the LM head reads from there.
+        internal static string DiagChecksum(Tensor t, string label)
+        {
+            int total = (int)t.ElementCount();
+            int hidden = t.DimensionCount >= 2 ? (int)t.Sizes[t.DimensionCount - 1] : total;
+            int numRows = total / hidden;
+            // Sample last row + first row to catch divergence anywhere.
+            float[] data = t.GetElementsAsFloat(total);
+            double sumFirst = 0, sumLast = 0, absFirst = 0, absLast = 0;
+            for (int i = 0; i < hidden; i++) {
+                sumFirst += data[i];
+                absFirst += Math.Abs(data[i]);
+                int lastIdx = (numRows - 1) * hidden + i;
+                sumLast += data[lastIdx];
+                absLast += Math.Abs(data[lastIdx]);
+            }
+            int lastTokOff = (numRows - 1) * hidden;
+            return $"{label}: rows={numRows} hidden={hidden} | tok0 sum={sumFirst:F3} abs={absFirst:F3} first3=[{data[0]:F3},{data[1]:F3},{data[2]:F3}] | tokN sum={sumLast:F3} abs={absLast:F3} first3=[{data[lastTokOff]:F3},{data[lastTokOff+1]:F3},{data[lastTokOff+2]:F3}]";
+        }
+
         private void ApplyLogitSoftcap(Tensor logits)
         {
             float cap = _finalLogitSoftcap;
@@ -833,6 +1113,15 @@ namespace TensorSharp.Models
                 Ops.Copy(target, deviceEmbeddings);
             }
             Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
+        }
+
+        private bool CanUseFusedLayerGraph(int seqLen, HashSet<int> exceptPositions, bool enabled)
+        {
+            return enabled
+                && IsGgmlBackend
+                && seqLen > 0
+                && exceptPositions == null
+                && _canUseFusedDecode;
         }
 
         #region Fused Decode
@@ -1101,7 +1390,9 @@ namespace TensorSharp.Models
 
             _decodeArrays = a;
             _canUseFusedDecode = true;
-            Console.WriteLine("  Gemma4 fused model decode enabled");
+            Console.WriteLine(_canUseFusedFullModelDecode
+                ? "  Gemma4 fused model decode enabled"
+                : "  Gemma4 fused dense-layer graph enabled (MoE layers use hybrid path)");
         }
 
         private unsafe void NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs)
@@ -1425,10 +1716,23 @@ namespace TensorSharp.Models
                     {
                         // PLE rows are now resident on the CUDA device; no host dequant needed.
                     }
+                    else if (_backend == BackendType.Mlx &&
+                        MlxQuantizedOps.TryGetRowsQuantizedToFloat32(
+                            pleTokenEmb,
+                            pleQw.EnsureDeviceCacheKey(),
+                            pleQw.Data,
+                            pleQw.GgmlType,
+                            pleQw.Ne0,
+                            pleQw.Ne1,
+                            pleQw.RawBytes,
+                            pleIdx))
+                    {
+                        // PLE rows are now resident on the MLX device; no host dequant needed.
+                    }
                     else
                     {
                         if (!pleQw.HasHostData)
-                            throw new InvalidOperationException("Direct CUDA PLE quantized row lookup failed and host quantized data has been released.");
+                            throw new InvalidOperationException("Native PLE quantized row lookup failed and host quantized data has been released.");
 
                         float* pleDst = GetFloatPtr(pleTokenEmb);
                         byte* pleBase = (byte*)pleQw.Data.ToPointer();
@@ -1551,20 +1855,39 @@ namespace TensorSharp.Models
 
             var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared, exceptPositions);
 
-            // In-place post-attention norm: attnOut is only consumed here,
-            // saving one tensor allocation (~14 MB) per layer.
-            Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, Config.Eps);
+            // When the test-only TS_GEMMA4_DIAG mode is on, force a CPU read
+            // here. Metal queues ops async; without flushing, parallel
+            // reductions in RMSNorm/softmax can give bit-different results
+            // run-to-run, breaking the batched-vs-legacy comparison. The
+            // returned byte is discarded; only the implicit download barrier
+            // matters.
+            bool _diagSync = seqLen > 1 &&
+                System.Environment.GetEnvironmentVariable("TS_GEMMA4_DIAG") == "1";
+            if (_diagSync) _ = attnOut.GetElementsAsFloat(1);
 
-            Ops.Add(attnOut, attnOut, hidden);
-            hidden.Dispose();
+            // Fold post-attention RMSNorm + residual add into one MLX Metal
+            // kernel. This mirrors the GGML fused graph shape and avoids one
+            // intermediate tensor / graph node chain per layer.
+            if (TryRmsNormAddInPlaceMlx(hidden, attnOut, $"{prefix}.post_attention_norm.weight"))
+            {
+                attnOut.Dispose();
+                attnOut = hidden;
+            }
+            else
+            {
+                Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, Config.Eps);
+                if (_diagSync) _ = attnOut.GetElementsAsFloat(1);
+                Ops.Add(attnOut, attnOut, hidden);
+                hidden.Dispose();
+            }
+            if (_diagSync) _ = attnOut.GetElementsAsFloat(1);
 
             Tensor result;
 
             if (HasMoE(layer))
             {
-                using var mlpNormed = RMSNormOp(attnOut, $"{prefix}.ffn_norm.weight");
-                var mlpOut = FFNGelu(mlpNormed, $"{prefix}.ffn_gate_up.weight",
-                    $"{prefix}.ffn_down.weight", seqLen);
+                var mlpOut = FFNGeluWithOptionalNorm(attnOut, $"{prefix}.ffn_norm.weight",
+                    $"{prefix}.ffn_gate_up.weight", $"{prefix}.ffn_down.weight", seqLen);
 
                 string postMlpNorm1Key = $"{prefix}.post_ffw_norm_1.weight";
                 if (!_weights.ContainsKey(postMlpNorm1Key))
@@ -1585,35 +1908,44 @@ namespace TensorSharp.Models
                 if (!TryMoEForwardResidual(attnOut, mlpOut, layer, prefix, seqLen, postMoeNormKey))
                 {
                     using var moeOut = MoEForward(attnOut, layer, prefix, seqLen);
-                    using var postMoeNormed = RMSNormOp(moeOut, postMoeNormKey);
-                    Ops.Add(mlpOut, mlpOut, postMoeNormed);
+                    if (!TryRmsNormAddInPlaceMlx(mlpOut, moeOut, postMoeNormKey))
+                    {
+                        using var postMoeNormed = RMSNormOp(moeOut, postMoeNormKey);
+                        Ops.Add(mlpOut, mlpOut, postMoeNormed);
+                    }
                 }
 
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
                     postFfnNormKey = $"{prefix}.ffn_post_norm.weight";
-                Ops.RMSNorm(mlpOut, mlpOut, _weights[postFfnNormKey], null, Config.Eps);
 
-                Ops.Add(attnOut, attnOut, mlpOut);
+                if (!TryRmsNormAddInPlaceMlx(attnOut, mlpOut, postFfnNormKey))
+                {
+                    Ops.RMSNorm(mlpOut, mlpOut, _weights[postFfnNormKey], null, Config.Eps);
+                    Ops.Add(attnOut, attnOut, mlpOut);
+                }
                 mlpOut.Dispose();
                 result = attnOut;
             }
             else
             {
-                using var ffnNormed = RMSNormOp(attnOut, $"{prefix}.ffn_norm.weight");
-                var ffnOut = FFNGelu(ffnNormed, $"{prefix}.ffn_gate_up.weight",
-                    $"{prefix}.ffn_down.weight", seqLen);
+                var ffnOut = FFNGeluWithOptionalNorm(attnOut, $"{prefix}.ffn_norm.weight",
+                    $"{prefix}.ffn_gate_up.weight", $"{prefix}.ffn_down.weight", seqLen);
+                if (_diagSync) _ = ffnOut.GetElementsAsFloat(1);
 
                 // In-place post-FFN norm: ffnOut is only consumed here
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
                     postFfnNormKey = $"{prefix}.ffn_post_norm.weight";
-                Ops.RMSNorm(ffnOut, ffnOut, _weights[postFfnNormKey], null, Config.Eps);
 
-                // In-place residual add: reuse attnOut as result, no new allocation
-                Ops.Add(attnOut, attnOut, ffnOut);
+                if (!TryRmsNormAddInPlaceMlx(attnOut, ffnOut, postFfnNormKey))
+                {
+                    Ops.RMSNorm(ffnOut, ffnOut, _weights[postFfnNormKey], null, Config.Eps);
+                    Ops.Add(attnOut, attnOut, ffnOut);
+                }
                 ffnOut.Dispose();
                 result = attnOut;
+                if (_diagSync) _ = result.GetElementsAsFloat(1);
             }
 
             // PLE injection
@@ -1623,13 +1955,18 @@ namespace TensorSharp.Models
                 using var gate = LinearForward(result, $"{prefix}.inp_gate.weight");
                 if (gate != null)
                 {
+                    if (_diagSync) _ = gate.GetElementsAsFloat(1);
                     Ops.GELUMul(gate, gate, perLayerInput);
+                    if (_diagSync) _ = gate.GetElementsAsFloat(1);
                     using var pleProj = LinearForward(gate, $"{prefix}.proj.weight");
                     if (pleProj != null)
                     {
                         string postPleNormKey = $"{prefix}.post_norm.weight";
-                        using var pleNormed = RMSNormOp(pleProj, postPleNormKey);
-                        Ops.Add(result, result, pleNormed);
+                        if (!TryRmsNormAddInPlaceMlx(result, pleProj, postPleNormKey))
+                        {
+                            using var pleNormed = RMSNormOp(pleProj, postPleNormKey);
+                            Ops.Add(result, result, pleNormed);
+                        }
                     }
                 }
             }
@@ -1654,6 +1991,13 @@ namespace TensorSharp.Models
 
             int hiddenDim = (int)moeInput.Sizes[1];
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+
+            if (_backend == BackendType.Mlx &&
+                TryMoEFusedGEGLUMlx(moeInput, output, selectedExperts, routingWeights,
+                                    layer, prefix, seqLen, hiddenDim))
+            {
+                return output;
+            }
 
             // Expert-batched fused path: one ggml_mul_mat_id-backed dispatch
             // replaces the per-expert batched matmul loop below. This is the
@@ -1811,7 +2155,8 @@ namespace TensorSharp.Models
             float[] perExpertScale = _layerPerExpertScale?[layer];
             if (perExpertScale != null)
             {
-                kernelWeights = new float[routingWeights.Length];
+                int totalRoutes = seqLen * nUsed;
+                kernelWeights = new float[totalRoutes];
                 for (int s = 0; s < seqLen; s++)
                 {
                     for (int k = 0; k < nUsed; k++)
@@ -1856,6 +2201,137 @@ namespace TensorSharp.Models
             }
         }
 
+        private bool TryMoEFusedGEGLUMlx(
+            Tensor moeInput,
+            Tensor output,
+            int[] selectedExperts,
+            float[] routingWeights,
+            int layer,
+            string prefix,
+            int seqLen,
+            int hiddenDim)
+        {
+            if (_backend != BackendType.Mlx
+                || selectedExperts == null
+                || routingWeights == null
+                || _numExperts <= 0
+                || _numExpertsUsed <= 0
+                || selectedExperts.Length < seqLen * _numExpertsUsed
+                || routingWeights.Length < seqLen * _numExpertsUsed)
+            {
+                return false;
+            }
+
+            int totalRoutes = checked(seqLen * _numExpertsUsed);
+            int[] expertCounts = new int[_numExperts];
+            for (int i = 0; i < totalRoutes; i++)
+            {
+                int expert = selectedExperts[i];
+                if ((uint)expert >= (uint)_numExperts)
+                    return false;
+                expertCounts[expert]++;
+            }
+
+            int[] expertOffsets = new int[_numExperts + 1];
+            for (int e = 0; e < _numExperts; e++)
+                expertOffsets[e + 1] = expertOffsets[e] + expertCounts[e];
+
+            int[] cursors = new int[_numExperts];
+            Array.Copy(expertOffsets, cursors, _numExperts);
+            int[] routedTokenRows = new int[totalRoutes];
+            float[] routedWeights = new float[totalRoutes];
+            float[] perExpertScale = GetMoEPerExpertScale(layer, prefix);
+
+            for (int s = 0; s < seqLen; s++)
+            {
+                int routeOffset = s * _numExpertsUsed;
+                for (int k = 0; k < _numExpertsUsed; k++)
+                {
+                    int src = routeOffset + k;
+                    int expert = selectedExperts[src];
+                    int dst = cursors[expert]++;
+                    float weight = routingWeights[src];
+                    if (perExpertScale != null)
+                        weight *= perExpertScale[expert];
+                    routedTokenRows[dst] = s;
+                    routedWeights[dst] = weight;
+                }
+            }
+
+            try
+            {
+                Ops.Fill(output, 0f);
+
+                for (int expertIdx = 0; expertIdx < _numExperts; expertIdx++)
+                {
+                    int start = expertOffsets[expertIdx];
+                    int batchSize = expertOffsets[expertIdx + 1] - start;
+                    if (batchSize == 0)
+                        continue;
+
+                    int[] rowBatch = new int[batchSize];
+                    float[] weightBatch = new float[batchSize];
+                    Array.Copy(routedTokenRows, start, rowBatch, 0, batchSize);
+                    Array.Copy(routedWeights, start, weightBatch, 0, batchSize);
+
+                    using var rowIndices = CreateIntTensor(rowBatch, batchSize);
+                    using var routeWeights = CreateFloatTensor(weightBatch, batchSize);
+                    using var batchInput = new Tensor(_allocator, DType.Float32, batchSize, hiddenDim);
+                    if (!MlxFusedOps.TryGatherRows(batchInput, moeInput, rowIndices))
+                        return false;
+
+                    Tensor expertOut = null;
+                    try
+                    {
+                        string fusedKey = $"{prefix}.ffn_gate_up_exps.{expertIdx}.weight";
+                        string downKey = $"{prefix}.ffn_down_exps.{expertIdx}.weight";
+                        expertOut = FFNGelu(batchInput, fusedKey, downKey, batchSize);
+                        if (expertOut == null)
+                            return false;
+
+                        if (!MlxFusedOps.TryScatterAddWeightedRows(output, expertOut, rowIndices, routeWeights))
+                            return false;
+                    }
+                    finally
+                    {
+                        expertOut?.Dispose();
+                    }
+                }
+
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+        }
+
+        private float[] GetMoEPerExpertScale(int layer, string prefix)
+        {
+            if (_layerPerExpertScale != null
+                && layer >= 0
+                && layer < _layerPerExpertScale.Length
+                && _layerPerExpertScale[layer] != null)
+            {
+                return _layerPerExpertScale[layer];
+            }
+
+            string scaleKey = $"{prefix}.ffn_down_exps.scale";
+            if (!_weights.ContainsKey(scaleKey))
+                scaleKey = $"{prefix}.ffn_gate_inp.per_expert_scale";
+            if (!_weights.TryGetValue(scaleKey, out var perExpertScale))
+                return null;
+
+            var scales = new float[_numExperts];
+            for (int expertIdx = 0; expertIdx < _numExperts; expertIdx++)
+                scales[expertIdx] = perExpertScale.GetElementAsFloat(expertIdx);
+            return scales;
+        }
+
         /// <summary>
         /// Single-dispatch MoE GEGLU + post_ffw_norm_2 + add-to-residual for
         /// Gemma 4 MoE layers. Folds three device dispatches (MoEForward +
@@ -1881,6 +2357,9 @@ namespace TensorSharp.Models
             int seqLen,
             string postMoeNormKey)
         {
+            if (_backend == BackendType.Mlx)
+                return TryMoEForwardResidualMlx(hiddenState, residual, layer, prefix, seqLen, postMoeNormKey);
+
             // Same gating as TryMoEFusedGEGLU: requires the GGML backend and
             // the stacked-experts cache populated by CacheMoEStackedWeights.
             // Falls back to the legacy split path on any miss so quantization
@@ -1923,7 +2402,8 @@ namespace TensorSharp.Models
             float[] perExpertScale = _layerPerExpertScale?[layer];
             if (perExpertScale != null)
             {
-                kernelWeights = new float[routingWeights.Length];
+                int totalRoutes = seqLen * nUsed;
+                kernelWeights = new float[totalRoutes];
                 for (int s = 0; s < seqLen; s++)
                 {
                     for (int k = 0; k < nUsed; k++)
@@ -1964,6 +2444,40 @@ namespace TensorSharp.Models
             }
         }
 
+        private bool TryMoEForwardResidualMlx(
+            Tensor hiddenState,
+            Tensor residual,
+            int layer,
+            string prefix,
+            int seqLen,
+            string postMoeNormKey)
+        {
+            if (!_weights.TryGetValue(postMoeNormKey, out var postNormW))
+                return false;
+
+            var (routingWeights, selectedExperts) = MoERoute(hiddenState, prefix, seqLen);
+
+            string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
+            if (!_weights.ContainsKey(moeNormKey))
+                moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
+
+            using var moeInput = RMSNormOp(hiddenState, moeNormKey);
+            int hiddenDim = (int)moeInput.Sizes[1];
+            using var moeOut = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+            if (!TryMoEFusedGEGLUMlx(moeInput, moeOut, selectedExperts, routingWeights,
+                                     layer, prefix, seqLen, hiddenDim))
+            {
+                return false;
+            }
+
+            if (MlxFusedOps.TryRmsNormAddInPlace(residual, moeOut, postNormW, Config.Eps))
+                return true;
+
+            Ops.RMSNorm(moeOut, moeOut, postNormW, null, Config.Eps);
+            Ops.Add(residual, residual, moeOut);
+            return true;
+        }
+
         private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(
             Tensor input, string prefix, int seqLen)
         {
@@ -1985,57 +2499,58 @@ namespace TensorSharp.Models
             // Project to expert logits
             using var expertScores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");
 
-            // Softmax over experts + TopK selection
             float* scoresPtr = GetFloatPtr(expertScores);
             int numExperts = (int)expertScores.Sizes[1];
+            int nUsed = _numExpertsUsed;
+            int needed = seqLen * nUsed;
 
-            float[] routingWeights = new float[seqLen * _numExpertsUsed];
-            int[] selectedExperts = new int[seqLen * _numExpertsUsed];
+            float[] routingWeights = _moeRoutingWeightsScratch;
+            int[] selectedExperts = _moeSelectedExpertsScratch;
+            if (routingWeights == null || routingWeights.Length < needed)
+                routingWeights = _moeRoutingWeightsScratch = new float[needed];
+            if (selectedExperts == null || selectedExperts.Length < needed)
+                selectedExperts = _moeSelectedExpertsScratch = new int[needed];
+            int[] topK = _moeTopKScratch;
 
             for (int s = 0; s < seqLen; s++)
             {
                 float* row = scoresPtr + s * numExperts;
+                int rowOff = s * nUsed;
 
-                // Softmax
+                // Softmax over all experts (in place).
                 float maxVal = float.NegativeInfinity;
                 for (int i = 0; i < numExperts; i++)
                     if (row[i] > maxVal) maxVal = row[i];
-                float sumExp = 0;
+                float sumExp = 0f;
                 for (int i = 0; i < numExperts; i++)
                 {
-                    row[i] = MathF.Exp(row[i] - maxVal);
-                    sumExp += row[i];
+                    float ex = MathF.Exp(row[i] - maxVal);
+                    row[i] = ex;
+                    sumExp += ex;
                 }
+                float invSum = sumExp > 0f ? 1f / sumExp : 0f;
                 for (int i = 0; i < numExperts; i++)
-                    row[i] /= sumExp;
+                    row[i] *= invSum;
 
-                // TopK
-                for (int k = 0; k < _numExpertsUsed; k++)
+                // O(n*k) top-k selection on the post-softmax probabilities.
+                TensorComputePrimitives.SelectTopKInPlace(row, numExperts, nUsed, topK);
+
+                // Gather selected probabilities + renormalize over selected.
+                float selectedSum = 0f;
+                for (int k = 0; k < nUsed; k++)
                 {
-                    int bestIdx = 0;
-                    float bestVal = float.NegativeInfinity;
-                    for (int i = 0; i < numExperts; i++)
-                    {
-                        bool alreadySelected = false;
-                        for (int j = 0; j < k; j++)
-                            if (selectedExperts[s * _numExpertsUsed + j] == i) { alreadySelected = true; break; }
-                        if (!alreadySelected && row[i] > bestVal)
-                        {
-                            bestVal = row[i];
-                            bestIdx = i;
-                        }
-                    }
-                    selectedExperts[s * _numExpertsUsed + k] = bestIdx;
-                    routingWeights[s * _numExpertsUsed + k] = row[bestIdx];
+                    int idx = topK[k];
+                    float v = row[idx];
+                    selectedExperts[rowOff + k] = idx;
+                    routingWeights[rowOff + k] = v;
+                    selectedSum += v;
                 }
-
-                // Renormalize selected routing weights
-                float selectedSum = 0;
-                for (int k = 0; k < _numExpertsUsed; k++)
-                    selectedSum += routingWeights[s * _numExpertsUsed + k];
-                if (selectedSum > 0)
-                    for (int k = 0; k < _numExpertsUsed; k++)
-                        routingWeights[s * _numExpertsUsed + k] /= selectedSum;
+                if (selectedSum > 0f)
+                {
+                    float invSel = 1f / selectedSum;
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[rowOff + k] *= invSel;
+                }
             }
 
             return (routingWeights, selectedExperts);
@@ -2066,9 +2581,14 @@ namespace TensorSharp.Models
                     if (qw.GgmlType == kw.GgmlType && qw.Ne0 == kw.Ne0 &&
                         (!hasQuantV || (vw.GgmlType == kw.GgmlType && vw.Ne0 == kw.Ne0)))
                     {
-                        _quantWeights[qkvName] = hasQuantV
-                            ? QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw)
-                            : QuantizedWeight.ConcatOrCreateCopy(qw, kw, kw);
+                        QuantizedWeight fusedWeight;
+                        bool fusedOk = hasQuantV
+                            ? TryCreateFusedQuantizedWeight(out fusedWeight, qw, kw, vw)
+                            : TryCreateFusedQuantizedWeight(out fusedWeight, qw, kw, kw);
+                        if (!fusedOk)
+                            continue;
+
+                        _quantWeights[qkvName] = fusedWeight;
                         _quantWeights.Remove(qName); qw.Dispose();
                         _quantWeights.Remove(kName); kw.Dispose();
                         if (hasQuantV) { _quantWeights.Remove(vName); vw.Dispose(); }
@@ -2122,7 +2642,10 @@ namespace TensorSharp.Models
                         _quantWeights.TryGetValue(upName, out var uw) &&
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
-                        _quantWeights[fusedName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+                        if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, gw, uw))
+                            continue;
+
+                        _quantWeights[fusedName] = fusedWeight;
                         _quantWeights.Remove(gateName); gw.Dispose();
                         _quantWeights.Remove(upName); uw.Dispose();
                         fused++;
@@ -2236,7 +2759,129 @@ namespace TensorSharp.Models
         private Tensor FFNGelu(Tensor input, string gateUpWeightName, string downWeightName, int seqLen)
         {
             Tensor gateUp = LinearForward(input, gateUpWeightName);
+            if (gateUp == null)
+            {
+                if (TryResolveSeparateGateUpWeights(gateUpWeightName, out string gateWeightName, out string upWeightName) &&
+                    HasLinearWeight(gateWeightName) &&
+                    HasLinearWeight(upWeightName))
+                {
+                    return FFNGeluSeparate(input, gateWeightName, upWeightName, downWeightName);
+                }
+
+                throw new InvalidOperationException(
+                    $"Missing FFN gate/up projection weight '{gateUpWeightName}' and no separate gate/up fallback was found.");
+            }
+
+            return FFNGeluProjected(gateUp, downWeightName, seqLen);
+        }
+
+        private Tensor FFNGeluWithOptionalNorm(
+            Tensor input,
+            string normWeightName,
+            string gateUpWeightName,
+            string downWeightName,
+            int seqLen)
+        {
+            if (TryFFNGeluWithNormMlx(input, normWeightName, gateUpWeightName, downWeightName, seqLen, out var fused))
+                return fused;
+
+            using var normed = RMSNormOp(input, normWeightName);
+            return FFNGelu(normed, gateUpWeightName, downWeightName, seqLen);
+        }
+
+        private bool TryFFNGeluWithNormMlx(
+            Tensor input,
+            string normWeightName,
+            string gateUpWeightName,
+            string downWeightName,
+            int seqLen,
+            out Tensor result)
+        {
+            result = null;
+            if (_backend != BackendType.Mlx
+                || input.DimensionCount != 2
+                || !_weights.TryGetValue(normWeightName, out var normW)
+                || !_quantWeights.TryGetValue(gateUpWeightName, out var gateUpQw))
+            {
+                return false;
+            }
+
+            var gateUp = new Tensor(_allocator, DType.Float32, input.Sizes[0], gateUpQw.Ne1);
+            long t0 = Stopwatch.GetTimestamp();
+            if (!MlxQuantizedOps.TryRmsNormAddmmQuantizedToFloat32(
+                    gateUp,
+                    input,
+                    normW,
+                    Config.Eps,
+                    gateUpQw.EnsureDeviceCacheKey(),
+                    gateUpQw.Data,
+                    gateUpQw.GgmlType,
+                    gateUpQw.Ne0,
+                    gateUpQw.Ne1,
+                    gateUpQw.RawBytes))
+            {
+                gateUp.Dispose();
+                return false;
+            }
+
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+            result = FFNGeluProjected(gateUp, downWeightName, seqLen);
+            return true;
+        }
+
+        private bool TryRmsNormAddInPlaceMlx(Tensor residual, Tensor input, string normWeightName)
+        {
+            return _backend == BackendType.Mlx
+                && _weights.TryGetValue(normWeightName, out var normW)
+                && MlxFusedOps.TryRmsNormAddInPlace(residual, input, normW, Config.Eps);
+        }
+
+        private void TryEvaluateMlxLayerBoundary(Tensor hidden, int layer, int seqLen)
+        {
+            if (_backend != BackendType.Mlx || MlxEvalEveryNLayers <= 0)
+                return;
+            if (seqLen == 1 && !MlxEvalDecodeLayerBoundaries)
+                return;
+            if ((layer + 1) % MlxEvalEveryNLayers != 0 && layer + 1 != Config.NumLayers)
+                return;
+
+            // Async at intermediate boundaries lets Metal keep issuing the next
+            // layer's commands while earlier graphs are still completing.
+            // The final layer must sync because the LM head reads hidden on host.
+            if (MlxBaselineSyncLayerEval || layer + 1 == Config.NumLayers)
+                MlxFusedOps.TryEvaluate(hidden);
+            else
+                MlxFusedOps.TryAsyncEvaluate(hidden);
+        }
+
+        /// <summary>
+        /// Consumes the already-projected [tokens, 2*intermediate] gate_up tensor.
+        /// </summary>
+        private Tensor FFNGeluProjected(Tensor gateUp, string downWeightName, int seqLen)
+        {
             int halfDim = (int)(gateUp.Sizes[1] / 2);
+
+            if (_backend == BackendType.Mlx)
+            {
+                var activated = new Tensor(_allocator, DType.Float32, gateUp.Sizes[0], halfDim);
+                if (MlxFusedOps.TryGeluMulSplit(activated, gateUp, halfDim))
+                {
+                    gateUp.Dispose();
+                    Tensor downMlx = null;
+                    try
+                    {
+                        downMlx = LinearForward(activated, downWeightName);
+                    }
+                    finally
+                    {
+                        activated.Dispose();
+                    }
+                    if (downMlx == null)
+                        throw new InvalidOperationException($"Missing FFN down projection weight '{downWeightName}'.");
+                    return downMlx;
+                }
+                activated.Dispose();
+            }
 
             if (_backend == BackendType.Cuda && seqLen > 1)
             {
@@ -2271,9 +2916,86 @@ namespace TensorSharp.Models
             up.Dispose();
             gateUp.Dispose();
 
-            Tensor down = LinearForward(gate, downWeightName);
-            gate.Dispose();
+            Tensor down = null;
+            try
+            {
+                down = LinearForward(gate, downWeightName);
+            }
+            finally
+            {
+                gate.Dispose();
+            }
+            if (down == null)
+                throw new InvalidOperationException($"Missing FFN down projection weight '{downWeightName}'.");
             return down;
+        }
+
+        private Tensor FFNGeluSeparate(Tensor input, string gateWeightName, string upWeightName, string downWeightName)
+        {
+            Tensor gate = LinearForward(input, gateWeightName);
+            if (gate == null)
+                throw new InvalidOperationException($"Missing FFN gate projection weight '{gateWeightName}'.");
+
+            Tensor up = null;
+            try
+            {
+                up = LinearForward(input, upWeightName);
+                if (up == null)
+                    throw new InvalidOperationException($"Missing FFN up projection weight '{upWeightName}'.");
+
+                Ops.GELUMul(gate, gate, up);
+            }
+            finally
+            {
+                up?.Dispose();
+            }
+
+            Tensor down = null;
+            try
+            {
+                down = LinearForward(gate, downWeightName);
+            }
+            finally
+            {
+                gate.Dispose();
+            }
+            if (down == null)
+                throw new InvalidOperationException($"Missing FFN down projection weight '{downWeightName}'.");
+            return down;
+        }
+
+        private bool HasLinearWeight(string weightName)
+        {
+            return _quantWeights.ContainsKey(weightName) || _weights.ContainsKey(weightName);
+        }
+
+        private static bool TryResolveSeparateGateUpWeights(string gateUpWeightName, out string gateWeightName, out string upWeightName)
+        {
+            gateWeightName = null;
+            upWeightName = null;
+
+            const string fusedDense = ".ffn_gate_up.weight";
+            int denseIndex = gateUpWeightName.IndexOf(fusedDense, StringComparison.Ordinal);
+            if (denseIndex >= 0)
+            {
+                string prefix = gateUpWeightName.Substring(0, denseIndex);
+                gateWeightName = prefix + ".ffn_gate.weight";
+                upWeightName = prefix + ".ffn_up.weight";
+                return true;
+            }
+
+            const string fusedExpert = ".ffn_gate_up_exps.";
+            int expertIndex = gateUpWeightName.IndexOf(fusedExpert, StringComparison.Ordinal);
+            if (expertIndex >= 0 && gateUpWeightName.EndsWith(".weight", StringComparison.Ordinal))
+            {
+                string prefix = gateUpWeightName.Substring(0, expertIndex);
+                string suffix = gateUpWeightName.Substring(expertIndex + fusedExpert.Length);
+                gateWeightName = prefix + ".ffn_gate_exps." + suffix;
+                upWeightName = prefix + ".ffn_up_exps." + suffix;
+                return true;
+            }
+
+            return false;
         }
 
         #region Attention
@@ -2418,6 +3140,14 @@ namespace TensorSharp.Models
                     int cachePos = isLocal ? (startPos % _kvCacheSize[layer]) : startPos;
                     CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
                         kvHeads, hd, cachePos);
+                    if (_backend == BackendType.Mlx
+                        && isLocal
+                        && MlxLocalKvMaterializeInterval > 0
+                        && ((startPos + 1 + layer) % MlxLocalKvMaterializeInterval) == 0)
+                    {
+                        MlxFusedOps.TryMaterialize(_kvCacheK[layer]);
+                        MlxFusedOps.TryMaterialize(_kvCacheV[layer]);
+                    }
                 }
 
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor) ? donor : layer;
@@ -2428,7 +3158,10 @@ namespace TensorSharp.Models
                     int attendLen = Math.Min(totalSeqLen, _slidingWindow);
                     result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
                     int attendStart = Math.Max(0, startPos + 1 - attendLen);
-                    if (!CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                    bool usedMlx = _backend == BackendType.Mlx &&
+                        MlxFusedOps.TryDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            Config.NumHeads, kvHeads, hd, attendStart, startPos + 1 - attendStart, cacheLen, true, 1f);
+                    if (!usedMlx && !CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
                             Config.NumHeads, kvHeads, hd, attendStart, startPos + 1 - attendStart, cacheLen, true, 1f))
                     {
                         AttentionDecodeCircular(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
@@ -2439,7 +3172,10 @@ namespace TensorSharp.Models
                 else
                 {
                     result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
-                    if (!CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                    bool usedMlx = _backend == BackendType.Mlx &&
+                        MlxFusedOps.TryDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            Config.NumHeads, kvHeads, hd, 0, totalSeqLen, cacheLen, false, 1f);
+                    if (!usedMlx && !CudaFusedOps.TryGqaDecodeAttention(result, q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
                             Config.NumHeads, kvHeads, hd, 0, totalSeqLen, cacheLen, false, 1f))
                     {
                         AttentionDecodeWithWindow(q, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer], result,
@@ -2585,6 +3321,25 @@ namespace TensorSharp.Models
                     int maskStart = kvLen - seqLen;
                     var fusedResult = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
                     if (CudaFusedOps.TryGqaPrefillAttention(
+                        fusedResult, qHeads, kvSrcK, kvSrcV,
+                        Config.NumHeads, kvHeads, hd,
+                        seqLen, kvLen,
+                        maskStart, windowSize, 1.0f))
+                    {
+                        result = fusedResult;
+                        qHeads.Dispose();
+                    }
+                    else
+                    {
+                        fusedResult.Dispose();
+                    }
+                }
+                else if (_backend == BackendType.Mlx && canUseFusedPrefillAttn)
+                {
+                    int windowSize = isLocal ? _slidingWindow : 0;
+                    int maskStart = kvLen - seqLen;
+                    var fusedResult = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                    if (MlxFusedOps.TryPrefillAttention(
                         fusedResult, qHeads, kvSrcK, kvSrcV,
                         Config.NumHeads, kvHeads, hd,
                         seqLen, kvLen,
@@ -2752,6 +3507,8 @@ namespace TensorSharp.Models
             var result = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
             if (CudaFusedOps.TrySplitQkvToHeadFirst(result, qkv, colOffset, numHeads, seqLen, headDim))
                 return result;
+            if (MlxFusedOps.TryFlatToHeadFirst(result, qkv, numHeads, seqLen, headDim, colOffset))
+                return result;
 
             float* src = GetFloatPtr(qkv);
             float* dst = GetFloatPtr(result);
@@ -2822,11 +3579,15 @@ namespace TensorSharp.Models
                 rebuiltTables = true;
             }
 
-            if (EnsureNeoXRopeDeviceTables(seqLen, startPos, freqs, rebuiltTables) &&
-                CudaFusedOps.TryNeoXRoPEHeadFirst(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
-                    numHeads, seqLen, headDim, ropeHalf))
+            if (EnsureNeoXRopeDeviceTables(seqLen, startPos, freqs, rebuiltTables))
             {
-                return;
+                if (CudaFusedOps.TryNeoXRoPEHeadFirst(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                        numHeads, seqLen, headDim, ropeHalf) ||
+                    MlxFusedOps.TryNeoXRoPEHeadFirstInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                        numHeads, seqLen, headDim, ropeHalf))
+                {
+                    return;
+                }
             }
 
             float* ptr = GetFloatPtr(data);
@@ -2876,7 +3637,7 @@ namespace TensorSharp.Models
 
         private bool EnsureNeoXRopeDeviceTables(int seqLen, int startPos, float[] freqs, bool rebuiltTables)
         {
-            if (_backend != BackendType.Cuda || _neoXRopeCos == null || _neoXRopeSin == null)
+            if ((_backend != BackendType.Cuda && _backend != BackendType.Mlx) || _neoXRopeCos == null || _neoXRopeSin == null)
                 return false;
 
             int tableSize = seqLen * freqs.Length;
@@ -2972,8 +3733,38 @@ namespace TensorSharp.Models
 
         private unsafe void ApplyNeoXRoPEDecode(Tensor data, int numHeads, int headDim, int position, float[] freqs)
         {
-            float* ptr = GetFloatPtr(data);
             int ropeHalf = freqs.Length;
+            bool rebuiltTables = false;
+            if (_neoXRopeCos == null || _neoXRopeCacheSeqLen != 1 ||
+                _neoXRopeCacheStartPos != position || _neoXRopeCacheFreqs != freqs)
+            {
+                if (_neoXRopeCos == null || _neoXRopeCos.Length != ropeHalf)
+                {
+                    _neoXRopeCos = new float[ropeHalf];
+                    _neoXRopeSin = new float[ropeHalf];
+                }
+
+                for (int j = 0; j < ropeHalf; j++)
+                {
+                    float angle = position * freqs[j];
+                    _neoXRopeCos[j] = MathF.Cos(angle);
+                    _neoXRopeSin[j] = MathF.Sin(angle);
+                }
+
+                _neoXRopeCacheSeqLen = 1;
+                _neoXRopeCacheStartPos = position;
+                _neoXRopeCacheFreqs = freqs;
+                rebuiltTables = true;
+            }
+
+            if (EnsureNeoXRopeDeviceTables(1, position, freqs, rebuiltTables) &&
+                MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    numHeads, 1, headDim, ropeHalf))
+            {
+                return;
+            }
+
+            float* ptr = GetFloatPtr(data);
 
             for (int h = 0; h < numHeads; h++)
             {
@@ -2994,8 +3785,8 @@ namespace TensorSharp.Models
         private unsafe Tensor ApplyNeoXRoPEPrefill(Tensor data, int numHeads, int headDim,
             int seqLen, int startPos, float[] freqs)
         {
-            float* ptr = GetFloatPtr(data);
             int ropeHalf = freqs.Length;
+            bool rebuiltTables = false;
 
             // Precompute cos/sin table once, reused across all global layers
             // in the same forward pass (same seqLen, startPos, freqs).
@@ -3022,7 +3813,17 @@ namespace TensorSharp.Models
                 _neoXRopeCacheSeqLen = seqLen;
                 _neoXRopeCacheStartPos = startPos;
                 _neoXRopeCacheFreqs = freqs;
+                rebuiltTables = true;
             }
+
+            if (EnsureNeoXRopeDeviceTables(seqLen, startPos, freqs, rebuiltTables) &&
+                MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    numHeads, seqLen, headDim, ropeHalf))
+            {
+                return data;
+            }
+
+            float* ptr = GetFloatPtr(data);
 
             // Parallel over sequence positions: each position's heads are independent
             if (seqLen >= 64)
@@ -3433,16 +4234,16 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// At the start of each prefill chunk, gather the SWA "previous window" K/V from
-        /// the rolling cache for every distinct cache-owning SWA layer. Done once per
-        /// chunk so KV-shared SWA layers can reuse the same gather as their donor.
-        /// Must be called *before* any layer in this chunk writes its fresh K/V to the
-        /// circular cache (otherwise the previous window has been overwritten).
+        /// At the start of each prefill chunk or fused decode step, gather the
+        /// SWA "previous window" K/V from the rolling cache for every distinct
+        /// cache-owning SWA layer. Done once per call so KV-shared SWA layers
+        /// can reuse the same gather as their donor. Must be called before any
+        /// layer writes fresh K/V to the circular cache.
         /// </summary>
         private void PrepareSwaPrevWindowsForChunk(int startPos, int seqLen)
         {
             DisposeSwaPrevWindows();
-            if (seqLen <= 1 || startPos <= 0 || _slidingWindow <= 0 || _kvCacheK == null) return;
+            if (seqLen <= 0 || startPos <= 0 || _slidingWindow <= 0 || _kvCacheK == null) return;
             int W = _slidingWindow;
             int prevWindowLen = Math.Min(startPos, W - 1);
             if (prevWindowLen <= 0) return;
@@ -3483,6 +4284,8 @@ namespace TensorSharp.Models
         private unsafe void CopyToCacheCircular(Tensor cache, Tensor src, int startPos, int seqLen, int cacheSize)
         {
             if (CudaFusedOps.TryCopyHeadFirstToCache(cache, src, startPos, seqLen, cacheSize, true))
+                return;
+            if (TryCopyHeadFirstToCacheMlx(cache, src, startPos, seqLen, circular: true))
                 return;
 
             int numHeads = (int)cache.Sizes[0];

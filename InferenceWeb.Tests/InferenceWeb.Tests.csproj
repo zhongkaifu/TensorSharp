@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <Nullable>annotations</Nullable>
     <Description>xUnit test suite for TensorSharp runtime, model, backend, and server behavior.</Description>
   </PropertyGroup>
   <ItemGroup>
@@ -20,7 +21,23 @@
     <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
     <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
+    <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
   </ItemGroup>
+  <PropertyGroup>
+    <MlxNativeInstallDir>$(MSBuildProjectDirectory)/../TensorSharp.Backends.MLX/Native/dist</MlxNativeInstallDir>
+    <MlxNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlxc.dylib</MlxNativeBinaryName>
+    <MlxNativeDependencyName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlx.dylib</MlxNativeDependencyName>
+    <MlxNativeJacclName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libjaccl.dylib</MlxNativeJacclName>
+  </PropertyGroup>
+  <Target Name="CopyMlxNativeBinary" AfterTargets="Build" Condition="'$(MlxNativeBinaryName)' != ''">
+    <ItemGroup>
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeBinaryName)" Condition="Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeDependencyName)" Condition="'$(MlxNativeDependencyName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeDependencyName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeJacclName)')" />
+      <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>

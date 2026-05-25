@@ -6,13 +6,14 @@
 |---|---|
 | Provider | Alibaba |
 | GGUF architecture keys | `qwen35`, `qwen35moe`, `qwen3next` |
-| Source class | [`Qwen35Model`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.cs) (+ partial in [`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs)) |
+| Source class | [`Qwen35Model`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.cs) (legacy per-seq) + partial in [`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs) + [`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | Image processor | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
 | Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-32B, Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family) |
 | Modalities | Text, image |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
+| Batched / paged forward | **Opt-in** — set `TS_QWEN35_BATCHED=1` (auto-enabled by the server's `--continuous-batching` flag). Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
 | Output parser | `Qwen35OutputParser` (inherits `Qwen3OutputParser`) |
 
 ## 1. Origin and intent
@@ -589,7 +590,78 @@ weights straight from the OS page cache. The peak resident set for
 `Qwen3.5-35B-A3B-IQ2_XXS` (~10 GB GGUF) drops from ~17 GB to ~7 GB on
 M-series Macs without any per-token copy.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+Qwen 3.5 / 3.6 ships an opt-in `IBatchedPagedModel.ForwardBatch` port
+([`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs)).
+Enable it by setting `TS_QWEN35_BATCHED=1` (auto-enabled by the server's
+`--continuous-batching` flag) — the default is OFF because the legacy
+fused per-layer kernels still win at batch=1 on this architecture.
+
+Qwen 3.5/3.6 is hybrid (FullAttention + GatedDeltaNet recurrent layers),
+so the batched port has to manage **two orthogonal kinds of cache** —
+paged K/V for attention layers, and a separate **per-slot recurrent
+state pool** for GatedDeltaNet layers:
+
+### FullAttention layers — paged K/V
+
+- Per-layer paged buffer of layout
+  `[numBlocks * blockSize * numKvHeads * headDim]`, lazily grown.
+- Per-token NeoX RoPE via `Ops.RoPEEx` with an explicit positions array.
+- Per-head QK RMSNorm performed in-place via `View` (same as legacy).
+- Q + sigmoid-gate are deinterleaved out of the fused
+  `[2 × qDim ‖ kDim ‖ vDim]` Q projection — same layout as the legacy
+  forward, walked per-token in the batched loop.
+- K/V scatter via `slotMapping` into the layer's paged buffer.
+- Attention via `GgmlBasicOps.PagedAttentionForward` (the native paged
+  kernel that drives `ggml_flash_attn_ext`), per sequence.
+
+### GatedDeltaNet layers — per-slot recurrent state pool
+
+The recurrent state is per-sequence and evolves across the entire input.
+Phase 5c introduced a per-slot state pool keyed on each sequence's
+**primary block id** (matching vLLM's `state_indices_tensor`):
+
+- `_q35GdnSlotConvBuf[layer][slot]` — per-slot conv1d ring buffer
+  (`float[(convKernel - 1) * qkvDim]`).
+- `_q35GdnSlotConvWriteIdx[layer][slot]` — per-slot ring write head.
+- `_q35GdnSlotSsmTensor[layer][slot]` — per-slot SSM state Tensor
+  shape `[numVHeads, headVDim, headKDim]`.
+- `_q35GdnSlotInit[layer][slot]` — initialization flag.
+
+Slots are allocated lazily on first touch and freed when the engine
+retires the sequence. Compared to the Phase-2 approach that copied state
+in / out of the per-model scratch buffer twice per layer, this avoids
+roughly **2 MB of SSM-tensor memcpy plus tens-of-KB conv memcpy per GDN
+layer per sequence** on every decode step.
+
+A **native batched GatedDeltaNet kernel** —
+`TSGgml_GatedDeltaNetBatchedStepF32`
+([`ggml_ops_gated_delta_net.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gated_delta_net.cpp))
+— is gated behind `TS_QWEN35_BATCHED_GDN_NATIVE=1`. When enabled,
+`GgmlBasicOps.GatedDeltaNetBatchedStep` replaces the managed per-token
+GDN step with one native dispatch that updates all in-flight sequences'
+conv + SSM state in parallel; when disabled (default), the batched
+forward calls the managed reference path through
+[`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs).
+
+### Multimodal in the batched path
+
+`SupportsBatchedMultimodal` returns true when `TS_QWEN35_BATCHED=1` is
+set. `ForwardBatch` builds a global MRoPE position table per batch:
+each sequence's MRoPE positions are fetched from the multimodal
+injector, globally offset into the batched hidden tensor, and threaded
+into the per-layer RoPE call. Vision embeddings are injected row-wise
+before the per-layer loop, exactly as in the legacy forward.
+
+### Verified correctness and throughput
+
+- 100% greedy-match against legacy on short prompts
+  ([`Qwen35BatchedCorrectnessTests`](../../InferenceWeb.Tests/Qwen35BatchedCorrectnessTests.cs)).
+- **~1.83× tps at n=3** on Qwen 3.6-27B (Apple M4 Pro, GgmlMetal,
+  legacy-vs-batched in-process toggle).
+
+## 12. Output parser and chat template
 
 - `Qwen35OutputParser` inherits `Qwen3OutputParser`, so the wire format is
   identical: `<think> ... </think>` for chain-of-thought reasoning, and
@@ -601,14 +673,18 @@ M-series Macs without any per-token copy.
   tokens for the corresponding image, and the multimodal injector then writes
   the encoded embeddings into those positions before `Forward()`.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
-- **Native GDN decode** — the GDN decode currently runs in managed C# (with
-  pre-allocated buffers and `Ops.AddmmBatch`). Moving the per-token
-  recurrent update into native C / CUDA would remove the remaining managed
-  overhead.
+- **Native GDN decode (legacy path)** — the legacy per-seq GDN decode
+  still runs in managed C# (with pre-allocated buffers and
+  `Ops.AddmmBatch`). Moving the per-token recurrent update into native
+  C / CUDA on that path would remove the remaining managed overhead.
 - **Vectorized conv1d** — `Conv1dStep` is a scalar loop. A SIMD or native
   vectorized version would shave a few percent off the decode hot path.
 - **MoE prefill batching** — MoE prefill currently iterates per token. A
-  batched expert prefill kernel (analogous to the decode path) would speed
-  up long prompts on MoE variants.
+  batched expert prefill kernel (analogous to the decode path) would
+  speed up long prompts on MoE variants.
+- **Promote native batched GDN out of opt-in.** The
+  `TS_QWEN35_BATCHED_GDN_NATIVE=1` kernel exists today but is gated on
+  perf verification. Once the n=1 regression is closed it becomes the
+  default GDN dispatch in the batched path.

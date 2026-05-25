@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 
 namespace TensorSharp.Runtime
 {
@@ -39,7 +40,7 @@ namespace TensorSharp.Runtime
     public sealed class KVCache
     {
         private readonly List<int> _tokens = new();
-        private float[] _nextLogits;
+        private float[]? _nextLogits;
 
         /// <summary>The number of tokens currently held in the model's KV state.</summary>
         public int Count => _tokens.Count;
@@ -52,7 +53,7 @@ namespace TensorSharp.Runtime
         /// Null if no logits were recorded for the current state (e.g. immediately after
         /// truncation, or if the most recent <see cref="RecordAppend"/> didn't supply them).
         /// </summary>
-        public float[] NextLogits => _nextLogits;
+        public float[]? NextLogits => _nextLogits;
 
         /// <summary>True if the cache contains no tokens.</summary>
         public bool IsEmpty => _tokens.Count == 0;
@@ -100,7 +101,7 @@ namespace TensorSharp.Runtime
         /// AND logits were recorded for the position right after it.
         /// In that case <paramref name="logits"/> receives a fresh copy of the cached logits.
         /// </summary>
-        public bool TryGetExactMatchLogits(IReadOnlyList<int> input, out float[] logits)
+        public bool TryGetExactMatchLogits(IReadOnlyList<int> input, [NotNullWhen(true)] out float[]? logits)
         {
             logits = null;
             if (_nextLogits == null || input == null || input.Count != _tokens.Count)
@@ -152,7 +153,7 @@ namespace TensorSharp.Runtime
         /// final forward call (logits for the next token to be generated). May be null when
         /// the caller does not need to cache them (e.g. mid-prefill chunks).
         /// </summary>
-        public void RecordAppend(IReadOnlyList<int> newTokens, float[] nextLogits)
+        public void RecordAppend(IReadOnlyList<int> newTokens, float[]? nextLogits)
         {
             if (newTokens == null)
                 return;
@@ -166,7 +167,7 @@ namespace TensorSharp.Runtime
         /// <summary>
         /// Convenience overload for appending a single token (typical decode step).
         /// </summary>
-        public void RecordAppend(int token, float[] nextLogits)
+        public void RecordAppend(int token, float[]? nextLogits)
         {
             _tokens.Add(token);
             _nextLogits = nextLogits;
@@ -190,7 +191,7 @@ namespace TensorSharp.Runtime
                 return ReusePlan.Reset(0);
 
             // Exact match: nothing to forward, hopefully cached logits are available.
-            if (TryGetExactMatchLogits(inputTokens, out float[] cachedLogits))
+            if (TryGetExactMatchLogits(inputTokens, out float[]? cachedLogits))
                 return ReusePlan.ExactMatch(cachedLogits);
 
             int common = CommonPrefixLength(inputTokens);
@@ -239,9 +240,9 @@ namespace TensorSharp.Runtime
         /// Pre-computed logits when <see cref="Kind"/> is <see cref="ReusePlanKind.ExactMatch"/>;
         /// otherwise null.
         /// </summary>
-        public float[] CachedLogits { get; }
+        public float[]? CachedLogits { get; }
 
-        private ReusePlan(ReusePlanKind kind, int reusedPrefix, int tokensToForward, float[] cachedLogits)
+        private ReusePlan(ReusePlanKind kind, int reusedPrefix, int tokensToForward, float[]? cachedLogits)
         {
             Kind = kind;
             ReusedPrefixLength = reusedPrefix;
@@ -249,7 +250,7 @@ namespace TensorSharp.Runtime
             CachedLogits = cachedLogits;
         }
 
-        public static ReusePlan ExactMatch(float[] cachedLogits)
+        public static ReusePlan ExactMatch(float[]? cachedLogits)
             => new(ReusePlanKind.ExactMatch, 0, 0, cachedLogits);
 
         public static ReusePlan Reuse(int reusedPrefix, int tokensToForward)

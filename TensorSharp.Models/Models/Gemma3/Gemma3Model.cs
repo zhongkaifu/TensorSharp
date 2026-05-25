@@ -154,6 +154,41 @@ namespace TensorSharp.Models
             }
         }
 
+        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+
+        public override string KVStateFingerprint =>
+            $"gemma3|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|kL={_attnKeyLen}|vL={_attnValLen}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            return KvBlockTransfer.Extract(
+                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                startToken, tokenCount, destination);
+        }
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            if (!KvBlockTransfer.Inject(
+                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    destToken, tokenCount, source))
+            {
+                return false;
+            }
+            _cacheSeqLen = destToken + tokenCount;
+            foreach (var k in _kvCacheK)
+                InvalidateTensorDeviceCache(k);
+            foreach (var v in _kvCacheV)
+                InvalidateTensorDeviceCache(v);
+            return true;
+        }
+
         public void LoadVisionEncoder(string mmProjPath)
         {
             _visionEncoder = new Gemma3VisionEncoder(mmProjPath, _allocator);

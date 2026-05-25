@@ -6,11 +6,12 @@
 |---|---|
 | 提供方 | 阿里巴巴 |
 | GGUF 架构标识 | `qwen3` |
-| 模型类 | [`Qwen3Model`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.cs) |
+| 模型类 | [`Qwen3Model`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.cs)（旧单序列路径）+ [`Qwen3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen3/Qwen3Model.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 示例模型 | Qwen3-4B、Qwen3-8B、Qwen3-14B、Qwen3-32B |
 | 模态 | 仅文本 |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
+| 批处理 / 分页前向 | 参考移植 —— TensorSharp 中第一个实现 `IBatchedPagedModel.ForwardBatch` 的模型。Mistral 3 / Gemma 4 / Qwen 3.5 / Nemotron-H 的批处理移植都以它为模板。详见 §11。 |
 | 输出解析器 | `Qwen3OutputParser` |
 
 ## 1. 来源与目标
@@ -210,14 +211,54 @@ Qwen 3 的 prefill 走标准托管循环 + 后端分发的算子：
 - `TruncateKVCache(int tokenCount)` 支持（先调 `EnsureKvCacheHostSynchronized()`），服务器多轮 KV cache 复用使用此 API。
 - 量化权重保留在 `_quantWeights`；matmul 走后端原生 quant matmul。
 
-## 11. 输出解析器与聊天模板
+## 11. 批处理 / 分页前向（连续批处理）
+
+`Qwen3Model.BatchedForward.cs` 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch`
+的**参考实现** —— 最简单的非混合密集 transformer 移植，Mistral 3、Gemma 4、
+Qwen 3.5/3.6、Nemotron-H 后续都在它的基础上扩展。它通过
+[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
+中描述的共享 `InferenceEngine` 连续批处理栈执行。
+
+实现要点：
+
+- **按需扩容的每层分页 K/V 缓冲**，布局
+  `[numBlocks * blockSize * numKvHeads * headDim]`，由引擎的 `BlockPool`
+  决定大小。`AllocateLayerBuffer(numBlocks, blockSize, numKvHeads, headDim)`
+  是后续所有批处理移植都复用的辅助函数。
+- **逐 token RoPE** 用 `ctx.Positions` 构建，通过 `Ops.RoPEEx` 派发（该算子
+  已经接受任意 positions tensor —— 这就是 Qwen 3 批处理移植引入、其他批
+  处理模型复用的内核改动）。
+- **基于 `slotMapping` 的 K/V 写入** 通过
+  `PagedKvBatchOps.ScatterKv(slotMapping)` 把每层的 K 与 V 写到分页缓冲中
+  `blockId * blockSize + offset` 位置。
+- **按序列的注意力** 通过原生分页内核 `TSGgml_PagedAttentionForward`
+  （默认）或 C# 回退 `ManagedPagedAttention.Forward`。K/V 按
+  `blockTables` + `seqLens` 按序列 gather。
+- **末 token gather** 通过 `PagedKvBatchOps.GatherLastTokenPerSeq`，让 LM
+  head 只在 `numSeqs` 行上跑，而不是 `numTokens` 行。
+- **复用已有辅助** —— `ModelBase` 上的 `Embedding`、`RMSNormOp`、
+  `LinearForward`、`FFN` 已经按完整 token 轴工作，因此嵌入 / 投影 / 归一化
+  / FFN 都能自动批处理。
+
+### 已验证的正确性
+
+针对真实 base-Qwen3 GGUF 的 logit 级正确性尚未在此 tree 中验证（本地只有
+Qwen 3.6 / GatedDeltaNet GGUF）。opt-in 的
+[`Qwen3BatchedForwardTests`](../../InferenceWeb.Tests/Qwen3BatchedForwardTests.cs)
+在把 base Qwen3 GGUF 放进 `TS_TEST_MODEL_DIR` 后会自我验证。
+`EngineParallelInferenceTests` 在已有的 Qwen GGUF 上验证了引擎侧路径。
+
+## 12. 输出解析器与聊天模板
 
 - `Qwen3OutputParser` 抽取：
   - `<think> ... </think>` 中的思维链内容。
   - `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` 中的工具调用。
 - 聊天模板使用标准 Qwen `<|im_start|>` / `<|im_end|>` 格式。GGUF 没带 Jinja2 模板时回退到内置；带了就直接渲染嵌入的 Jinja2。
 
-## 12. 优化机会
+## 13. 优化机会
 
 - **GPU 融合 per-token decode** —— whole-model 原生路径已经消除托管开销，但层与层之间仍是各自的 GGML 图。把它们融合到一张图里（参考 `Gemma4ModelDecode`）能进一步压低 Metal / CUDA 上的剩余往返开销。
 - **原生 prefill** —— 把 prefill 也搬到原生单次调用路径会显著降低长 prompt 的 TTFT，因为长上下文摊薄不掉逐算子托管开销。
+- **在真实 base-Qwen3 GGUF 上验证批处理正确性** —— 参考测试已存在，但需
+  要在测试 fixture 中放一个模型文件（或 CI 助手脚本下载），才能自动执行
+  cosine 校验。

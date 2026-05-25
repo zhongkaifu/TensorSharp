@@ -6,11 +6,12 @@
 |---|---|
 | Provider | OpenAI |
 | GGUF architecture keys | `gptoss`, `gpt-oss` |
-| Source class | [`GptOssModel`](../../TensorSharp.Models/Models/GptOss/GptOssModel.cs) |
+| Source class | [`GptOssModel`](../../TensorSharp.Models/Models/GptOss/GptOssModel.cs) (legacy per-seq) + [`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Example models | gpt-oss-20b |
 | Modalities | Text only |
 | Thinking mode | Yes (Harmony format: `<\|channel>analysis ... <\|channel>final`) |
 | Tool calling | No |
+| Batched / paged forward | **Opt-in** — set `TS_GPTOSS_BATCHED=1`. Per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). See §11. |
 | Output parser | `HarmonyOutputParser` (always required) |
 
 ## 1. Origin and intent
@@ -303,7 +304,57 @@ target.
   MoE prefill kernel can still address the original blocks directly via
   `_layerStackedGate` / `_layerStackedUp` / `_layerStackedDown`.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+GPT OSS ships an opt-in `IBatchedPagedModel.ForwardBatch`
+([`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs)).
+Enable with `TS_GPTOSS_BATCHED=1` (default OFF). The batched port has to
+preserve GPT OSS's three architecture-distinguishing features —
+**attention sinks**, **bias on every projection**, and **per-layer
+alternating SWA** — inside the paged scheduling stack:
+
+- **Per-layer paged K/V** of layout
+  `[numBlocks * blockSize * numKvHeads * headDim]`, lazily grown
+  copy-on-write.
+- **Batched QKV with bias** per token; NeoX + YaRN RoPE is dispatched
+  with an explicit `positions[]` array.
+- **Per-layer SWA window** — the same alternating local / global window
+  pattern as the legacy path is passed per-call into the paged kernel,
+  so the batched scheduler still sees one uniform model while each
+  layer respects its own attention horizon.
+- **Native paged attention with per-head sinks**:
+  `TSGgml_PagedAttentionForwardWithSinks`
+  ([`ggml_ops_paged_attention.cpp`](../../TensorSharp.GGML.Native/ggml_ops_paged_attention.cpp))
+  combines `ggml_flash_attn_ext` with the `add_sinks` variant so the
+  sink logits participate in softmax normalization without contributing
+  to V — the same numerical behaviour as the legacy CPU sinks softmax.
+  Exposed through `GgmlBasicOps.PagedAttentionForwardWithSinks`.
+  - The managed C# fallback,
+    [`ManagedPagedAttention.ForwardWithSinks`](../../TensorSharp.Runtime/Paged/ManagedPagedAttention.cs),
+    is selected when running on non-GGML backends or when
+    `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the C# path. Both produce
+    bit-identical greedy output.
+- **MoE FFN** runs through the existing `MoEForward(numTokens)`
+  token-parallel path; no GPT-OSS-specific batched MoE kernel.
+
+### Verified correctness and throughput
+
+- **100% greedy match** vs legacy (12/12 tokens) in
+  [`GptOssBatchedCorrectnessTests`](../../InferenceWeb.Tests/GptOssBatchedCorrectnessTests.cs)
+  — preserved across both the managed sinks fallback and the native
+  sinks kernel.
+- **Throughput remains flat** (~0.93–1.05× across n=1, 3, 5 in
+  [`GptOssBatchedPerfBench`](../../InferenceWeb.Tests/GptOssBatchedPerfBench.cs)).
+  The native sinks kernel didn't move the needle because the legacy
+  per-seq path already runs one fused per-layer kernel
+  (`TryFusedAttnLayerPrefill`: RMSNorm + fused QKV + RoPE + KV-append
+  + sinks-aware softmax + attn + output proj + residual in one
+  cgraph), whereas the batched path issues ~5 separate graphs per
+  layer (norm, QKV, RoPE, paged-attn, output, residual). Closing this
+  gap needs a fused-per-layer batched kernel for GPT OSS — substantial
+  follow-up work.
+
+## 12. Output parser and chat template
 
 - **Harmony format** is non-optional. The parser (`HarmonyOutputParser`) is
   marked `AlwaysRequired = true` because the model always wraps its output
@@ -319,17 +370,24 @@ target.
 - Chat template uses the GPT-4o pre-tokenizer and a Harmony-aware Jinja2
   template loaded from the GGUF.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
+- **Fused per-layer batched kernel** — the legacy path's
+  `TryFusedAttnLayerPrefill` does one cgraph per layer (norm + fused
+  QKV + RoPE + KV-append + sinks-aware softmax + attn + output proj +
+  residual). The batched path currently issues ~5 graphs per layer.
+  Folding them into one batched cgraph is the largest remaining win
+  for batched GPT OSS perf.
 - **Fused QKV in every release** — when the GGUF ships split Q / K / V the
   per-projection bias add still happens after each separate matmul. A
   `FusedQKVWithBias` graph would cut 3 dispatches into 1.
-- **Native whole-model decode** — like Qwen 3's `TransformerModelDecode`,
-  with attention sinks and bias support, would remove most managed
-  overhead.
-- **GPU-fused sinks softmax** — the current sinks softmax runs on CPU. A
-  custom Metal / CUDA kernel that fuses exp-with-sink, sum-with-sink, and
-  multiply-with-V would lift attention throughput considerably.
+- **Native whole-model decode** (legacy) — like Qwen 3's
+  `TransformerModelDecode`, with attention sinks and bias support, would
+  remove most managed overhead on the per-seq path.
+- **GPU-fused sinks softmax (legacy)** — the legacy CPU sinks softmax is
+  the per-seq counterpart to the batched native `*_WithSinks` kernel. A
+  custom Metal / CUDA fused kernel for the legacy path would close that
+  gap and let the per-seq path keep up at single-sequence workloads.
 - **Per-expert decode batching** — even with the stacked MoE prefill
   kernel, decode still runs experts sequentially per token. A batched
   decode path (analogous to Qwen 3.5's `MoEExpertsSwiGLUResidual`) would

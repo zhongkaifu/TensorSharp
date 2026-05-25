@@ -12,11 +12,23 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
-    public class Qwen3Model : ModelBase
+    public partial class Qwen3Model : ModelBase
     {
+        // Bound the MLX lazy-graph depth across the per-layer dispatch loop.
+        // Mirrors Qwen35's pattern; override via TS_MLX_EVAL_EVERY_N_LAYERS.
+        private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
+        private static int ResolveMlxEvalEveryNLayers()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_EVAL_EVERY_N_LAYERS");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 16;
+        }
+
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
 
@@ -48,7 +60,11 @@ namespace TensorSharp.Models
             FuseQKVWeights();
             FuseGateUpWeights();
             PrepareCudaQuantizedWeightsForInference();
-            InitKVCache(ResolveConfiguredContextLength());
+            int maxContextLength = ResolveConfiguredContextLength();
+            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+            if (initialCacheLength < maxContextLength)
+                Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
+            InitKVCache(initialCacheLength, maxContextLength);
             PrecomputeConstants();
             BuildModelDecodeArrays();
             DetermineNativeLayerDecodeAvailability();
@@ -70,7 +86,10 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
+                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
+                        continue;
+
+                    _quantWeights[qkvName] = fusedWeight;
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -129,9 +148,12 @@ namespace TensorSharp.Models
                 _ropeFreqs[i] = freqScale / MathF.Pow(Config.RopeBase, (2.0f * i) / headDim);
         }
 
-        private void InitKVCache(int maxSeqLen)
+        private int _kvCacheCapacity;
+
+        private void InitKVCache(int initialSeqLen, int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            _kvCacheCapacity = initialSeqLen;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
             ApplyModelAlignedKvCacheDefault(_quantWeights);
@@ -140,12 +162,54 @@ namespace TensorSharp.Models
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
-                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, headDim);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, headDim);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
+        }
+
+        private void EnsureCacheCapacity(int requiredSeqLen)
+        {
+            if (requiredSeqLen <= _kvCacheCapacity)
+                return;
+            if (requiredSeqLen > _maxContextLength)
+                throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
+
+            int newCapacity = Math.Max(_kvCacheCapacity, 1);
+            while (newCapacity < requiredSeqLen)
+                newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
+
+            int numKVHeads = Config.NumKVHeads;
+            int headDim = Config.HeadDim;
+            DType kvDtype = _kvCacheDtype.ToDType();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                var newK = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, headDim);
+                var newV = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, headDim);
+                InitializeCacheTensor(newK);
+                InitializeCacheTensor(newV);
+
+                if (_cacheSeqLen > 0)
+                {
+                    using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstK = newK.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstK, srcK);
+
+                    using var srcV = _kvCacheV[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstV, srcV);
+                }
+
+                _kvCacheK[l].Dispose();
+                _kvCacheV[l].Dispose();
+                _kvCacheK[l] = newK;
+                _kvCacheV[l] = newV;
+            }
+
+            _kvCacheCapacity = newCapacity;
+            Console.WriteLine($"Expanded Qwen3 attention cache to {newCapacity} tokens.");
         }
 
         public override void ResetKVCache()
@@ -174,11 +238,52 @@ namespace TensorSharp.Models
             _kvCacheHostDirty = false;
         }
 
+        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+
+        public override string KVStateFingerprint =>
+            $"qwen3|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|D={Config.HeadDim}|dtype={_kvCacheDtype.ToShortString()}";
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            EnsureKvCacheHostSynchronized();
+            return KvBlockTransfer.Extract(
+                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                startToken, tokenCount, destination);
+        }
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            EnsureCacheCapacity(destToken + tokenCount);
+            EnsureKvCacheHostSynchronized();
+            if (!KvBlockTransfer.Inject(
+                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    destToken, tokenCount, source))
+            {
+                return false;
+            }
+            _cacheSeqLen = destToken + tokenCount;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+            }
+            _kvCacheHostDirty = false;
+            return true;
+        }
+
         public override float[] Forward(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+            EnsureCacheCapacity(startPos + seqLen);
             bool useNativeModelDecode = seqLen == 1 && IsGgmlBackend && _modelDecodeArrays != null;
             bool useNativeDecode = seqLen == 1 && IsGgmlBackend && (_modelDecodeArrays != null || _canUseNativeLayerDecode);
 
@@ -201,6 +306,11 @@ namespace TensorSharp.Models
                 for (int layer = 0; layer < Config.NumLayers; layer++)
                 {
                     hidden = TransformerBlock(hidden, layer, seqLen, startPos);
+                    if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
+                        && layer + 1 != Config.NumLayers && hidden != null)
+                    {
+                        MlxFusedOps.TryAsyncEvaluate(hidden);
+                    }
                 }
             }
 
@@ -237,17 +347,38 @@ namespace TensorSharp.Models
             return _logitsBuffer;
         }
 
+        // Chunk size for ForwardRefill: long prompts are processed in this-many-token
+        // chunks so the per-layer attention-score allocation stays bounded.
+        // Override with TS_PREFILL_CHUNK when tuning.
+        private static int ResolvePrefillChunkSize()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
+            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 2048;
+        }
+
         public override float[] ForwardRefill(int[] tokens)
         {
-            if (tokens == null || tokens.Length <= 1 || !IsGgmlBackend || _modelDecodeArrays == null)
+            if (tokens == null || tokens.Length <= 1)
                 return Forward(tokens);
 
-            int prefixLen = tokens.Length - 1;
-            var prefixTokens = new int[prefixLen];
-            Array.Copy(tokens, prefixTokens, prefixLen);
+            int chunkSize = ResolvePrefillChunkSize();
+            int lastIdx = tokens.Length - 1;
 
-            PrefillWithoutLogits(prefixTokens);
-            return Forward(new[] { tokens[prefixLen] });
+            // For short prompts stay on the single-pass Forward — the extra
+            // PrefillWithoutLogits/Forward split is pure overhead.
+            if (tokens.Length <= chunkSize)
+                return Forward(tokens);
+
+            for (int pos = 0; pos < lastIdx; pos += chunkSize)
+            {
+                int chunkLen = Math.Min(chunkSize, lastIdx - pos);
+                var chunk = new int[chunkLen];
+                Array.Copy(tokens, pos, chunk, 0, chunkLen);
+                PrefillWithoutLogits(chunk);
+            }
+            return Forward(new[] { tokens[lastIdx] });
         }
 
         private void PrefillWithoutLogits(int[] tokens)
@@ -278,7 +409,14 @@ namespace TensorSharp.Models
             else
             {
                 for (int layer = 0; layer < Config.NumLayers; layer++)
+                {
                     hidden = TransformerBlock(hidden, layer, seqLen, startPos);
+                    if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
+                        && layer + 1 != Config.NumLayers && hidden != null)
+                    {
+                        MlxFusedOps.TryAsyncEvaluate(hidden);
+                    }
+                }
             }
 
             hidden.Dispose();
@@ -303,10 +441,24 @@ namespace TensorSharp.Models
             Tensor attnOut = Attention(normed, layer, wn, seqLen, startPos);
             normed.Dispose();
 
-            Ops.Add(hidden, hidden, attnOut);
+            // Fused (hidden += attnOut; normed2 = RmsNorm(hidden, ffnNormW)).
+            Tensor normed2 = null;
+            if (_backend == BackendType.Mlx && _weights.TryGetValue(wn[5], out var ffnNormW))
+            {
+                normed2 = new Tensor(_allocator, DType.Float32, hidden.Sizes[0], hidden.Sizes[1]);
+                if (!MlxFusedOps.TryAddRmsNorm(hidden, attnOut, ffnNormW, Config.Eps, normed2))
+                {
+                    normed2.Dispose();
+                    normed2 = null;
+                }
+            }
+            if (normed2 == null)
+            {
+                Ops.Add(hidden, hidden, attnOut);
+                normed2 = RMSNormOp(hidden, wn[5]);
+            }
             attnOut.Dispose();
 
-            Tensor normed2 = RMSNormOp(hidden, wn[5]);
             Tensor ffnOut = FFN(normed2, wn[6], wn[7], seqLen);
             normed2.Dispose();
 
@@ -370,8 +522,23 @@ namespace TensorSharp.Models
                 vTensor.Dispose();
 
                 var attnResult = new Tensor(_allocator, DType.Float32, 1, numHeads * headDim);
-                AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                    attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale);
+
+                // MLX path: keep K/V on device and run attention via mlx_fast_sdpa.
+                // Avoids the per-layer device→host copy of the KV cache that
+                // AttentionDecodePureCS triggers via GetHalfPointer/GetFloatPtr.
+                bool attnOk = false;
+                if (_backend == BackendType.Mlx)
+                {
+                    attnOk = MlxFusedOps.TryDecodeAttention(
+                        attnResult, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        numHeads, numKVHeads, headDim,
+                        0, totalSeqLen, _kvCacheCapacity, false, scale);
+                }
+                if (!attnOk)
+                {
+                    AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale);
+                }
                 qTensor.Dispose();
 
                 _attnTicks += Stopwatch.GetTimestamp() - t0;

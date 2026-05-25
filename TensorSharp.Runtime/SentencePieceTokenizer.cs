@@ -69,7 +69,7 @@ namespace TensorSharp.Runtime
 
         public List<int> Encode(string text, bool addSpecial = true)
         {
-            var fragments = new List<(string text, List<int> ids)>();
+            var fragments = new List<(string text, List<int>? ids)>();
             fragments.Add((text, null));
 
             foreach (var special in _specialTokens)
@@ -77,7 +77,7 @@ namespace TensorSharp.Runtime
                 if (!_vocabLookup.TryGetValue(special, out int specialId))
                     continue;
 
-                var newFragments = new List<(string text, List<int> ids)>();
+                var newFragments = new List<(string text, List<int>? ids)>();
                 foreach (var frag in fragments)
                 {
                     if (frag.ids != null)
@@ -300,7 +300,7 @@ namespace TensorSharp.Runtime
 
         private class MergeNode
         {
-            public string Text;
+            public string Text = string.Empty;
             public int Prev, Next;
             public bool Active;
         }

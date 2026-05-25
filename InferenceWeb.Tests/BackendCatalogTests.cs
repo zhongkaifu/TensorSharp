@@ -15,9 +15,15 @@ public class BackendCatalogTests
                 GgmlBackendType.Cpu => true,
                 _ => false,
             },
+            () => true,
             () => true);
 
         Assert.Collection(backends,
+            backend =>
+            {
+                Assert.Equal("mlx", backend.Value);
+                Assert.Equal("MLX Metal (GPU)", backend.Label);
+            },
             backend =>
             {
                 Assert.Equal("cuda", backend.Value);
@@ -43,7 +49,7 @@ public class BackendCatalogTests
     [Fact]
     public void GetSupportedBackends_AlwaysIncludesBothCpuBackends()
     {
-        var backends = BackendCatalog.GetSupportedBackends(_ => false, () => false);
+        var backends = BackendCatalog.GetSupportedBackends(_ => false, () => false, () => false);
 
         Assert.Collection(backends,
             backend =>
@@ -87,6 +93,7 @@ public class BackendCatalogTests
     }
 
     [Theory]
+    [InlineData(BackendType.Mlx, "mlx")]
     [InlineData(BackendType.Cuda, "cuda")]
     [InlineData(BackendType.GgmlMetal, "ggml_metal")]
     [InlineData(BackendType.GgmlCuda, "ggml_cuda")]
@@ -95,6 +102,15 @@ public class BackendCatalogTests
     public void ToBackendValue_ReturnsCanonicalBackendString(BackendType backendType, string expected)
     {
         Assert.Equal(expected, BackendCatalog.ToBackendValue(backendType));
+    }
+
+    [Theory]
+    [InlineData("mlx", "mlx")]
+    [InlineData("mlx_metal", "mlx")]
+    [InlineData("mlx-metal", "mlx")]
+    public void Canonicalize_MapsMlxAliases(string backend, string expected)
+    {
+        Assert.Equal(expected, BackendCatalog.Canonicalize(backend));
     }
 
     [Fact]
@@ -138,6 +154,36 @@ public class BackendCatalogTests
         };
 
         bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Cuda, info);
+
+        Assert.True(shouldStoreQuantized);
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_MlxKeepsSupportedWeightsCompressed()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.attn_q.weight",
+            Type = GgmlTensorType.Q8_0,
+            Shape = new ulong[] { 128, 256 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Mlx, info);
+
+        Assert.True(shouldStoreQuantized);
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_MlxKeepsIq4XsCompressed()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.attn_q.weight",
+            Type = GgmlTensorType.IQ4_XS,
+            Shape = new ulong[] { 256, 512 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Mlx, info);
 
         Assert.True(shouldStoreQuantized);
     }

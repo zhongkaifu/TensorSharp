@@ -27,6 +27,8 @@ namespace TensorSharp.Models
     /// </summary>
     public sealed class NemotronImageProcessor
     {
+        private const int DefaultLatencyMaxTiles = 1;
+
         public int ImageSize { get; }
         public int PatchSize { get; }
         public int NumChannels { get; }
@@ -53,13 +55,23 @@ namespace TensorSharp.Models
             ImageSize = imageSize > 0 ? imageSize : 512;
             PatchSize = patchSize > 0 ? patchSize : 16;
             NumChannels = numChannels > 0 ? numChannels : 3;
-            MaxTiles = maxTiles > 0 ? maxTiles : 12;
+            MaxTiles = ResolveRuntimeMaxTiles(maxTiles > 0 ? maxTiles : 12);
             MinNumPatches = Math.Max(0, minNumPatches);
             MaxNumPatches = Math.Max(0, maxNumPatches);
             UseThumbnail = useThumbnail;
             ProjectorScaleFactor = projectorScaleFactor > 0 ? projectorScaleFactor : 2;
             ImageMean = imageMean ?? new float[] { 0.48145466f, 0.4578275f, 0.40821073f };
             ImageStd = imageStd ?? new float[] { 0.26862954f, 0.26130258f, 0.27577711f };
+        }
+
+        public static int ResolveRuntimeMaxTiles(int modelMaxTiles)
+        {
+            int configured = modelMaxTiles > 0 ? modelMaxTiles : 12;
+            string env = Environment.GetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES");
+            if (int.TryParse(env, out int envMaxTiles) && envMaxTiles > 0)
+                return Math.Max(1, Math.Min(configured, envMaxTiles));
+
+            return Math.Max(1, Math.Min(configured, DefaultLatencyMaxTiles));
         }
 
         public sealed class ProcessedTile

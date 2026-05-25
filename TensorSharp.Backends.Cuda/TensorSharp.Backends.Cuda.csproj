@@ -6,6 +6,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
     <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
     <Description>Direct CUDA backend for TensorSharp using the CUDA Driver API, cuBLAS, PTX kernels, and quantized CUDA ops.</Description>
     <PackageTags>$(TensorSharpPackageTags);backend;cuda;cublas;gpu;ptx</PackageTags>
   </PropertyGroup>

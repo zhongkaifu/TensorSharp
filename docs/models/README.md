@@ -43,15 +43,15 @@ Each card follows the same shape so you can diff architectures cleanly:
 
 ## Implementation matrix
 
-| Architecture | Card | Source class | GGUF keys | Modalities | Reasoning | Tools | Notable acceleration |
-|---|---|---|---|---|---|---|---|
-| Gemma 3 | [gemma3.md](gemma3.md) | `Gemma3Model` | `gemma3` | Text, image | No | No | Alternating SWA / global attention, GeGLU FFN, QK-norm, V-norm |
-| Gemma 4 | [gemma4.md](gemma4.md) | `Gemma4Model` | `gemma4` | Text, image, video, audio | Yes | Yes | Single-graph fused decode (all layers in one GGML dispatch), fused per-layer prefill, chunked prefill, circular SWA cache, PLE, KV sharing, MoE variants |
-| Qwen 3 | [qwen3.md](qwen3.md) | `Qwen3Model` | `qwen3` | Text | Yes | Yes | Native whole-model decode with pre-resolved weight pointers |
-| Qwen 3.5 / 3.6 family | [qwen35.md](qwen35.md) | `Qwen35Model` | `qwen35`, `qwen35moe`, `qwen3next` | Text, image | Yes | Yes | Hybrid FullAttention + GatedDeltaNet recurrent, fused attention layer decode, fused prefill attention, fused output-projection + FFN, fused output-projection + norm + router, batched MoE (routed + shared + residual in a single kernel), fused vision encoder blocks |
-| GPT OSS | [gptoss.md](gptoss.md) | `GptOssModel` | `gptoss`, `gpt-oss` | Text | Yes (always) | No | Stacked MoE prefill kernel (mul_mat_id + add_id + swiglu_oai), attention sinks, MXFP4 expert weights |
-| Nemotron-H | [nemotron.md](nemotron.md) | `NemotronModel` | `nemotron_h`, `nemotron_h_moe` | Text, image (Omni-class) | Yes | Yes | Mamba2 + attention + MoE FFN hybrid stack, batched GPU MoE, optional Parakeet audio frontend, RADIO/v2_vl image encoder |
-| Mistral 3 | [mistral3.md](mistral3.md) | `Mistral3Model` | `mistral3` | Text, image | No | No | YaRN-corrected RoPE with position-dependent Q scaling, fused QKV / gate_up, Pixtral vision encoder |
+| Architecture | Card | Source class | GGUF keys | Modalities | Reasoning | Tools | Batched / paged forward | Notable acceleration |
+|---|---|---|---|---|---|---|---|---|
+| Gemma 3 | [gemma3.md](gemma3.md) | `Gemma3Model` | `gemma3` | Text, image | No | No | No (legacy per-seq) | Alternating SWA / global attention, GeGLU FFN, QK-norm, V-norm |
+| Gemma 4 | [gemma4.md](gemma4.md) | `Gemma4Model` | `gemma4` | Text, image, video, audio | Yes | Yes | **Default** (toggle off with `TS_GEMMA4_BATCHED=0`) | Single-graph fused decode (all layers in one GGML dispatch), fused per-layer prefill, chunked prefill, circular SWA cache, PLE, KV sharing, MoE variants. Batched path matches legacy logits within FP noise (`Gemma4BatchedForwardTests`); reaches ~1.5× legacy at batch=8 and ~1.6× at 4×800-token prompts. |
+| Qwen 3 | [qwen3.md](qwen3.md) | `Qwen3Model` | `qwen3` | Text | Yes | Yes | Reference port (`Qwen3Model.BatchedForward.cs`) — exercised by `Qwen3BatchedForwardTests` when a base-Qwen3 GGUF is provided | Native whole-model decode with pre-resolved weight pointers |
+| Qwen 3.5 / 3.6 family | [qwen35.md](qwen35.md) | `Qwen35Model` | `qwen35`, `qwen35moe`, `qwen3next` | Text, image | Yes | Yes | Opt-in (`TS_QWEN35_BATCHED=1`, auto-enabled by `--continuous-batching`). Per-slot recurrent-state pool + optional native GatedDeltaNet kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`) | Hybrid FullAttention + GatedDeltaNet recurrent, fused attention layer decode, fused prefill attention, fused output-projection + FFN, fused output-projection + norm + router, batched MoE (routed + shared + residual in a single kernel), fused vision encoder blocks |
+| GPT OSS | [gptoss.md](gptoss.md) | `GptOssModel` | `gptoss`, `gpt-oss` | Text | Yes (always) | No | Opt-in (`TS_GPTOSS_BATCHED=1`). Per-head attention sinks via `TSGgml_PagedAttentionForwardWithSinks` (or `TS_GPTOSS_PAGED_ATTN_MANAGED=1` for the C# fallback). 100% greedy match vs legacy in `GptOssBatchedCorrectnessTests`. | Stacked MoE prefill kernel (mul_mat_id + add_id + swiglu_oai), attention sinks, MXFP4 expert weights |
+| Nemotron-H | [nemotron.md](nemotron.md) | `NemotronModel` | `nemotron_h`, `nemotron_h_moe` | Text, image (Omni-class) | Yes | Yes | Opt-in (`TS_NEMOTRON_BATCHED=1`). Per-slot Mamba2 conv + SSM state pool; optional native batched Mamba2 step (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). 100% greedy match vs legacy; up to 3.95× tps at batch=3 on Apple M4 Pro. | Mamba2 + attention + MoE FFN hybrid stack, batched GPU MoE, optional Parakeet audio frontend, RADIO/v2_vl image encoder |
+| Mistral 3 | [mistral3.md](mistral3.md) | `Mistral3Model` | `mistral3` | Text, image | No | No | **Default** — reference IBatchedPagedModel implementation. End-to-end validated on Ministral-3-14B; native paged-attention kernel is ~21% faster than the legacy per-seq path on long context. | YaRN-corrected RoPE with position-dependent Q scaling, fused QKV / gate_up, Pixtral vision encoder |
 
 ## Backend notes
 
@@ -62,8 +62,9 @@ the actual ops to the backend that owns those allocators:
 | Backend type | Package | Notes |
 |---|---|---|
 | `Cpu` | `TensorSharp.Core` | Pure managed tensors with SIMD/managed quantized fast paths (RMSNorm, RoPE, softmax, fused activations, GEMM, dequant). |
-| `Cuda` | `TensorSharp.Backends.Cuda` | Direct CUDA Driver-API allocator and storage, cuBLAS GEMM, PTX kernels for hot ops, native quantized matmul / get_rows for supported quant types, CPU fallback for ops that are not yet implemented. |
-| `GgmlCpu` / `GgmlMetal` / `GgmlCuda` | `TensorSharp.Backends.GGML` + `TensorSharp.GGML.Native` | Native ggml bridge with quantized graph dispatch and platform backends. mmap-backed quantized weights are bound zero-copy through host-pointer buffers. |
+| `Cuda` | `TensorSharp.Backends.Cuda` | Direct CUDA Driver-API allocator and storage, cuBLAS GEMM, PTX kernels for hot ops (RMSNorm, softmax, RoPE/RoPEEx, SDPA, GQA prefill/decode, causal mask, gather/concat, activation fusions), native quantized matmul / get_rows for supported quant types, CPU fallback for ops that are not yet implemented. |
+| `Mlx` | `TensorSharp.Backends.MLX` | Apple Silicon `mlx-c` bridge with quantized / fused / compiled kernels, async worker dispatch, MoE expert offload, and a CPU fallback layer. Requires `libmlxc`. |
+| `GgmlCpu` / `GgmlMetal` / `GgmlCuda` | `TensorSharp.Backends.GGML` + `TensorSharp.GGML.Native` | Native ggml bridge with quantized graph dispatch and platform backends. mmap-backed quantized weights are bound zero-copy through host-pointer buffers. Includes the paged-attention kernel (`TSGgml_PagedAttentionForward`, plus the GPT OSS sinks variant) that powers the batched / paged execution path. |
 
 When a card mentions a fused GGML kernel (for example `Qwen35AttentionLayerDecode`,
 `Gemma4LayerPrefill`, or `MoEExpertsSwiGLUResidual`), the kernel is compiled from
@@ -71,6 +72,18 @@ When a card mentions a fused GGML kernel (for example `Qwen35AttentionLayerDecod
 `TensorSharp.Backends.GGML/GgmlBasicOps.cs`. The native bridge is the place to
 look when a fused path engages on GGML CPU / Metal / CUDA but not on the pure
 managed CPU or direct CUDA backends.
+
+## Continuous batching & paged KV cache
+
+All architectures listed above also run through the shared
+`InferenceEngine` + `ContinuousBatchScheduler` + `BatchExecutor` stack documented
+in [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+Models that implement `IBatchedPagedModel.ForwardBatch` execute one batched
+forward per scheduler step (with `slotMapping`-based K/V scatter into a
+shared paged buffer and per-sequence attention via the native paged kernel);
+the others run through the per-sequence KV-swap fallback inside the same engine.
+The opt-in env vars are summarised in the matrix above and in the project root
+README.
 
 ## Architecture comparison
 

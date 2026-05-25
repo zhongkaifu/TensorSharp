@@ -21,17 +21,17 @@ namespace TensorSharp.Runtime
     /// </summary>
     public class ToolFunction
     {
-        public string Name { get; set; }
-        public string Description { get; set; }
-        public Dictionary<string, ToolParameter> Parameters { get; set; }
-        public List<string> Required { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string Description { get; set; } = string.Empty;
+        public Dictionary<string, ToolParameter> Parameters { get; set; } = new();
+        public List<string> Required { get; set; } = new();
     }
 
     public class ToolParameter
     {
-        public string Type { get; set; }
-        public string Description { get; set; }
-        public List<string> Enum { get; set; }
+        public string Type { get; set; } = string.Empty;
+        public string Description { get; set; } = string.Empty;
+        public List<string> Enum { get; set; } = new();
     }
 
     /// <summary>
@@ -39,8 +39,8 @@ namespace TensorSharp.Runtime
     /// </summary>
     public class ToolCall
     {
-        public string Name { get; set; }
-        public Dictionary<string, object> Arguments { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public Dictionary<string, object> Arguments { get; set; } = new();
         public int Index { get; set; }
 
         public override string ToString()
@@ -57,7 +57,7 @@ namespace TensorSharp.Runtime
     {
         public string Content { get; set; } = "";
         public string Thinking { get; set; } = "";
-        public List<ToolCall> ToolCalls { get; set; }
+        public List<ToolCall>? ToolCalls { get; set; }
     }
 
     /// <summary>
@@ -257,7 +257,7 @@ namespace TensorSharp.Runtime
             return result;
         }
 
-        private ToolCall ParseQwen3ToolCall(string raw)
+        private ToolCall? ParseQwen3ToolCall(string raw)
         {
             raw = raw.Trim();
             if (raw.Length == 0) return null;
@@ -265,7 +265,7 @@ namespace TensorSharp.Runtime
             {
                 using var doc = JsonDocument.Parse(raw);
                 var root = doc.RootElement;
-                string name = root.GetProperty("name").GetString();
+                string? name = root.GetProperty("name").GetString();
                 if (string.IsNullOrEmpty(name)) return null;
 
                 var args = new Dictionary<string, object>();
@@ -304,11 +304,11 @@ namespace TensorSharp.Runtime
         {
             return el.ValueKind switch
             {
-                JsonValueKind.String => el.GetString(),
+                JsonValueKind.String => el.GetString() ?? string.Empty,
                 JsonValueKind.Number => el.TryGetInt64(out long l) ? (object)l : el.GetDouble(),
                 JsonValueKind.True => true,
                 JsonValueKind.False => false,
-                JsonValueKind.Null => null,
+                JsonValueKind.Null => null!,
                 JsonValueKind.Object => JsonElementToDict(el),
                 JsonValueKind.Array => JsonElementToList(el),
                 _ => el.GetRawText()
@@ -515,7 +515,7 @@ namespace TensorSharp.Runtime
         private static readonly Regex GemmaQuotedStringRe = new(@"<\|""\|>(.*?)<\|""\|>", RegexOptions.Singleline);
         private static readonly Regex GemmaBareKeyRe = new(@"([,{])(\w+):");
 
-        private static ToolCall ParseGemma4ToolCall(string content)
+        private static ToolCall? ParseGemma4ToolCall(string content)
         {
             content = content.Trim();
             if (!content.StartsWith("call:")) return null;
@@ -594,7 +594,7 @@ namespace TensorSharp.Runtime
         private HState _state;
         private readonly StringBuilder _buffer = new();
         private bool _thinkingEnabled;
-        private string _currentChannel;
+        private string? _currentChannel;
 
         private const string MsgStartTag = "<|start|>";
         private const string MsgEndTag = "<|end|>";

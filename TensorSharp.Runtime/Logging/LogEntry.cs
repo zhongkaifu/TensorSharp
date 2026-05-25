@@ -23,10 +23,10 @@ namespace TensorSharp.Runtime.Logging
     {
         public DateTimeOffset Timestamp { get; init; }
         public LogLevel Level { get; init; }
-        public string Category { get; init; }
+        public string Category { get; init; } = string.Empty;
         public EventId EventId { get; init; }
-        public string Message { get; init; }
-        public string Exception { get; init; }
+        public string Message { get; init; } = string.Empty;
+        public string? Exception { get; init; }
 
         /// <summary>
         /// Active scope state at the time the entry was created. Each entry is a
@@ -34,13 +34,13 @@ namespace TensorSharp.Runtime.Logging
         /// or, when the original scope was a single value, a <c>{ "scope": value }</c>
         /// wrapper so JSON output stays uniform.
         /// </summary>
-        public IReadOnlyList<KeyValuePair<string, object>> Scopes { get; init; }
+        public IReadOnlyList<KeyValuePair<string, object>> Scopes { get; init; } = Array.Empty<KeyValuePair<string, object>>();
 
         /// <summary>
         /// Structured state attached to the log call (e.g. via the
         /// <c>logger.LogInformation("...", a, b)</c> overload that bundles named
         /// arguments). Empty when the producer used a plain string.
         /// </summary>
-        public IReadOnlyList<KeyValuePair<string, object>> State { get; init; }
+        public IReadOnlyList<KeyValuePair<string, object>> State { get; init; } = Array.Empty<KeyValuePair<string, object>>();
     }
 }

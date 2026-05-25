@@ -6,7 +6,7 @@
 |---|---|
 | Provider | Google |
 | GGUF architecture key | `gemma4` |
-| Source class | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs) |
+| Source class | [`Gemma4Model`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.cs) (legacy per-seq) + [`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Gemma4VisionEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.cs) (SigLIP-style ViT) |
 | Audio encoder | [`Gemma4AudioEncoder`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioEncoder.cs) (USM-style chunked transformer) |
 | Audio frontend | [`Gemma4AudioPreprocessor`](../../TensorSharp.Models/Models/Gemma4/Gemma4AudioPreprocessor.cs) (16 kHz mono → 128-bin log-mel) |
@@ -15,6 +15,7 @@
 | Modalities | Text, image, video (frame stack), audio |
 | Thinking mode | Yes (`<\|channel>thought ... <channel\|>`) |
 | Tool calling | Yes (`<\|tool_call>call:name{...}<tool_call\|>`) |
+| Batched / paged forward | **Default-on** — `IBatchedPagedModel.ForwardBatch` with per-layer paged K/V (handles dual head dims, KV donor sharing, PLE injection, SWA + global mix). Set `TS_GEMMA4_BATCHED=0` to force the legacy per-seq KV-swap path. See §11. |
 | Output parser | `Gemma4OutputParser` |
 
 ## 1. Origin and intent
@@ -472,7 +473,95 @@ length — the resident set is bounded.
   Direct CUDA uploads quantized blobs to device memory once and frees the host
   copy.
 
-## 11. Output parser and chat template
+## 11. Batched / paged forward (continuous batching)
+
+Gemma 4 has a full `IBatchedPagedModel.ForwardBatch` port
+([`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs))
+that runs through the shared `InferenceEngine` continuous-batching stack
+([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
+Unlike most batched ports, Gemma 4 is enabled **by default**; set
+`TS_GEMMA4_BATCHED=0` to force the legacy per-seq KV-swap path for
+debugging or for batch-1 workloads where the legacy fused single-graph
+decode is faster.
+
+Gemma 4 is the hardest model TensorSharp ports to paged batching because
+of three sources of per-layer heterogeneity that the engine assumes is
+uniform across layers:
+
+- **Heterogeneous head dims and KV head counts.** Local layers use
+  `head_dim_local` (typically 256) and a different `num_kv_heads` than
+  global layers (`head_dim_global` 512). `EnsureGemma4PagedBuffers`
+  allocates one paged K/V buffer per layer with its own per-layer
+  `numKvHeads * headDim` size. `_g4PagedKvDimPerLayer[layer]` records the
+  dimensionality so the scatter / gather steps know how to stride into
+  each buffer.
+- **Per-layer SWA dispatch.** The native paged-attention kernel takes a
+  `sliding_window` parameter per call. The batched path computes
+  `IsLocalLayer(l) ? _slidingWindow : 0` per layer and threads it into
+  `GgmlBasicOps.PagedAttentionForward` so local layers get the SWA
+  window mask and global layers get full attention — within the same
+  `ForwardBatch` invocation.
+- **KV donor layer aliasing.** Layers 24-41 share K/V with earlier
+  layers. The batched buffer for a "receiver" layer is a pointer alias
+  of the donor layer's buffer (refcount-shared inside the `BlockPool`)
+  rather than a separate allocation. This preserves the legacy KV-share
+  behaviour while keeping the scheduler oblivious to the aliasing.
+
+The remaining batched-path mechanics mirror Mistral 3:
+
+- **Per-token NeoX RoPE** dispatched through `Ops.RoPEExWithFreqFactors`
+  with the per-layer proportional / partial frequency factors and an
+  explicit `positions[]` tensor.
+- **K/V scatter via `slotMapping`** into the per-layer paged buffer.
+  `EnsureGemma4PagedBuffers` copies existing K/V across grow events so
+  already-scheduled sequences keep their state.
+- **Per-Layer Embedding (PLE)** is computed **once per batch** at the
+  start of `ForwardBatch` (`ComputePLE(flatTokens, hiddenStates, numTokens)`)
+  and the per-layer slice is added after the post-attention residual,
+  matching the legacy injection point.
+- **Multimodal embedding injection** uses the same row-wise
+  `InjectMultimodalEmbeddings` path as the legacy forward; embeddings
+  land at the right absolute token positions inside the concatenated
+  batched hidden state.
+
+**Verified correctness**
+([`Gemma4BatchedForwardTests`](../../InferenceWeb.Tests/Gemma4BatchedForwardTests.cs)):
+- Per-layer checksum trace matches the legacy unfused path within FP
+  noise for all 42 layers (SWA + GQA + PLE + KV-donor sharing at L24+).
+- Logit-cosine ≥ 0.99 against the legacy non-batched path.
+- `EngineParallelInferenceTests.Gemma4_ThreeLongGenerationsParallel`
+  exercises the multi-sequence batched path through the engine.
+
+**Throughput** (gemma-4-E4B-it-Q8_0, Apple M4 Pro, GgmlMetal — toggling
+`TS_GEMMA4_BATCHED` in-process, see
+[`Gemma4BatchedPerfBench.cs`](../../InferenceWeb.Tests/Gemma4BatchedPerfBench.cs)):
+
+| Workload | n | Prompt tok | Legacy tps | Batched tps | Speedup |
+|---|---|---|---|---|---|
+| Single sequence, short prompt | 1 | 29 | 14.0 | 4.9 | **0.35×** (batched slower) |
+| 5 short prompts parallel | 5 | 142 | 10.2 | 13.5 | **1.32×** |
+| 8 short prompts parallel | 8 | 218 | 10.0 | 15.1 | **1.51×** |
+| 4 long-context prompts parallel | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
+
+The speedup grows with batch size: at batch=8 short prompts the per-call
+paged graph build / gather cost is fully amortised. Single-sequence is a
+net loss because the legacy fused single-graph decode wins by ~3×
+without any batching to amortise — which is why `TS_GEMMA4_BATCHED=0`
+exists for batch-1 workloads.
+
+**Two known bring-up bugs fixed during port** (now regressions-tested):
+
+1. `TSGgml_PagedAttentionForward` was missing `ggml_cont` on Q after the
+   permute. `ggml_flash_attn_ext` silently produced wrong output on
+   Metal when Q was a non-contiguous view.
+2. `EnsurePagedBuffers` previously rebuilt K/V arrays destructively on
+   grow, wiping K/V already written for previously-scheduled sequences
+   in the same batch. The first sequence in a multi-sequence batch
+   would then degenerate into a single-token loop on its first decode
+   after later sequences joined. The fix (copy-on-grow) applies to
+   Mistral 3 and Qwen 3 too.
+
+## 12. Output parser and chat template
 
 `Gemma4OutputParser` understands two structural framings:
 
@@ -485,7 +574,7 @@ length — the resident set is bounded.
 Chat template falls back to the hardcoded Gemma 4 template when the GGUF does
 not ship a Jinja2 one.
 
-## 12. Optimization opportunities
+## 13. Optimization opportunities
 
 - **Fused MoE GPU kernel** for Gemma 4 — MoE layers currently disable both
   `Gemma4ModelDecode` and `Gemma4LayerPrefill`. A batched expert kernel

@@ -18,11 +18,49 @@ namespace TensorSharp.Server
         private readonly ModelLifecycleService _lifecycle;
         private readonly ILogger _logger;
         private readonly ChatSession _intrinsicSession = new("__svc_intrinsic__");
+        private readonly PagedKvCacheConfig _pagedConfig = PagedKvCacheConfig.FromEnvironment();
+        private PagedKvCacheManager _pagedManager;
+        private string _pagedManagerFingerprint;
 
         public SessionKvCacheManager(ModelLifecycleService lifecycle, ILogger logger)
         {
             _lifecycle = lifecycle ?? throw new ArgumentNullException(nameof(lifecycle));
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        }
+
+        public PagedKvCacheManager PagedManager => _pagedManager;
+        public PagedKvCacheConfig PagedConfig => _pagedConfig;
+
+        private PagedKvCacheManager EnsurePagedManager()
+        {
+            if (!_pagedConfig.Enabled)
+                return null;
+            var model = _lifecycle.Model;
+            if (model == null || !model.SupportsKVStateSnapshot)
+                return null;
+
+            string fp = model.KVStateFingerprint;
+            if (_pagedManager == null || !string.Equals(_pagedManagerFingerprint, fp, StringComparison.Ordinal))
+            {
+                _pagedManager?.Dispose();
+                // The TurboQuant codec is opt-in via TS_KV_PAGED_QUANT_BITS;
+                // FromEnvironment(model) returns null both when the env var
+                // is unset and when the model has recurrent SSM state that
+                // quantization would corrupt (Qwen3.5/3.6 GatedDeltaNet,
+                // Nemotron Mamba2). See the codec's docs for the why.
+                IKvBlockCodec codec = TurboQuantKvCodec.FromEnvironment(model);
+                _pagedManager = new PagedKvCacheManager(_pagedConfig, fp, _logger, codec);
+                _pagedManagerFingerprint = fp;
+                string codecName = codec != null
+                    ? codec.Name
+                    : (model.RequiresPerBlockCapture ? "passthrough (recurrent-state model)" : "passthrough");
+                _logger.LogInformation(LogEventIds.PagedKvCacheTierInit,
+                    "kv.paged manager attached for {Fingerprint} (blockSize={BlockSize}, ramMB={RamMB}, ssd={SsdDir}, codec={Codec})",
+                    fp, _pagedConfig.BlockSize, _pagedConfig.MaxRamBytes / (1024 * 1024),
+                    string.IsNullOrEmpty(_pagedConfig.SsdDirectory) ? "(disabled)" : _pagedConfig.SsdDirectory,
+                    codecName);
+            }
+            return _pagedManager;
         }
 
         /// <summary>
@@ -48,6 +86,12 @@ namespace TensorSharp.Server
             ActiveSession = null;
             _intrinsicSession.TrackedHistory.Clear();
             _intrinsicSession.KVCache.Reset();
+            // The paged block tier holds (model, dtype, layout)-fingerprinted blobs;
+            // when the underlying model changes the fingerprints are stale and the
+            // cached bytes could even be wrong-shape for the new model.
+            _pagedManager?.Dispose();
+            _pagedManager = null;
+            _pagedManagerFingerprint = null;
         }
 
         public void InvalidateKVCache()
@@ -119,6 +163,13 @@ namespace TensorSharp.Server
         {
             var model = _lifecycle.Model;
             var cache = session.KVCache;
+
+            // Try cross-session paged restore *before* the per-session plan: when
+            // another tab / chat earlier paid the prefill cost for the same prompt
+            // prefix, the matching K/V blocks are already serialized and ready to
+            // inject - even when this session's local cache offers no reuse.
+            TryActivatePagedRestore(model, cache, inputTokens);
+
             ReusePlan plan = cache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation);
 
             switch (plan.Kind)
@@ -129,7 +180,6 @@ namespace TensorSharp.Server
                     _logger.LogDebug(LogEventIds.KvCacheReusePlan,
                         "kv.reuse exact match reusing {ReusedTokens}/{TotalTokens} cached tokens (saved 100%)",
                         inputTokens.Count, inputTokens.Count);
-                    model.MultimodalInjector.QueuePromptEmbeddings(inputTokens.Count);
                     return plan.CachedLogits;
                 }
 
@@ -142,14 +192,27 @@ namespace TensorSharp.Server
                     model.TruncateKVCache(reusedPrefix);
                     cache.TruncateTo(reusedPrefix);
 
-                    bool queuedPromptEmbeddings = model.MultimodalInjector.QueuePromptEmbeddings(reusedPrefix);
                     var suffixTokens = CopyTokenRange(inputTokens, reusedPrefix, suffixLength);
 
                     _logger.LogDebug(LogEventIds.KvCacheReusePlan,
                         "kv.reuse partial keeping {ReusedTokens}/{TotalTokens} tokens, forwarding {NewTokens} new tokens (saved {SavedPercent:F0}%)",
                         reusedPrefix, inputTokens.Count, suffixLength, 100.0 * reusedPrefix / inputTokens.Count);
-                    float[] logits = ForwardPromptPrefill(suffixTokens, allowChunking: !queuedPromptEmbeddings);
-                    cache.RecordAppend(suffixTokens, logits);
+                    Action<int, int> captureCb = BuildPerChunkCaptureCallback(model, cache, inputTokens, suffixTokens, reusedPrefix);
+                    float[] logits = ForwardPromptPrefill(suffixTokens, reusedPrefix, allowChunking: true, captureCb);
+                    if (captureCb == null)
+                    {
+                        cache.RecordAppend(suffixTokens, logits);
+                        CapturePagedBlocks(model, cache);
+                    }
+                    else
+                    {
+                        // The callback streamed tokens into the cache as each chunk
+                        // completed; refresh the trailing logits so they reflect the
+                        // last forward call rather than the (now-stale) null we
+                        // recorded mid-chunk.
+                        cache.TruncateTo(reusedPrefix + suffixLength - 1);
+                        cache.RecordAppend(suffixTokens[suffixLength - 1], logits);
+                    }
                     return logits;
                 }
 
@@ -167,31 +230,142 @@ namespace TensorSharp.Server
 
                     model.ResetKVCache();
                     cache.Reset();
-                    bool queuedPromptEmbeddings = model.MultimodalInjector.QueuePromptEmbeddings(0);
                     var allTokens = inputTokens.ToArray();
-                    float[] logits = ForwardPromptPrefill(allTokens, allowChunking: !queuedPromptEmbeddings);
-                    cache.RecordAppend(allTokens, logits);
+                    Action<int, int> captureCb = BuildPerChunkCaptureCallback(model, cache, inputTokens, allTokens, prefixOffset: 0);
+                    float[] logits = ForwardPromptPrefill(allTokens, 0, allowChunking: true, captureCb);
+                    if (captureCb == null)
+                    {
+                        cache.RecordAppend(allTokens, logits);
+                        CapturePagedBlocks(model, cache);
+                    }
+                    else
+                    {
+                        cache.TruncateTo(allTokens.Length - 1);
+                        cache.RecordAppend(allTokens[allTokens.Length - 1], logits);
+                    }
                     return logits;
                 }
             }
         }
 
+        /// <summary>
+        /// Build a per-chunk callback that records the tokens just forwarded into
+        /// <paramref name="cache"/> and invokes <see cref="PagedKvCacheManager.Capture"/>
+        /// so any block boundaries we just crossed get captured. Returns null
+        /// when the model doesn't need per-chunk capture (purely-attention models
+        /// can be captured once at the end - the callback would just add overhead).
+        /// </summary>
+        private Action<int, int> BuildPerChunkCaptureCallback(
+            IModelArchitecture model, KVCache cache, List<int> inputTokens, int[] suffixTokens, int prefixOffset)
+        {
+            var manager = EnsurePagedManager();
+            if (manager == null) return null;
+            if (!model.RequiresPerBlockCapture) return null;
+
+            return (chunkStart, chunkLength) =>
+            {
+                int suffixIndex = chunkStart - prefixOffset;
+                if (suffixIndex < 0 || suffixIndex + chunkLength > suffixTokens.Length)
+                    return;
+                // Record the chunk into the session's token list so the manager
+                // hashes the right prefix; logits are unknown until the last
+                // chunk so we pass null here and patch the final value above.
+                var chunkSlice = new int[chunkLength];
+                Array.Copy(suffixTokens, suffixIndex, chunkSlice, 0, chunkLength);
+                cache.RecordAppend(chunkSlice, null);
+                manager.Capture(model, cache.Tokens, cache.Count);
+            };
+        }
+
+        private void TryActivatePagedRestore(IModelArchitecture model, KVCache cache, List<int> inputTokens)
+        {
+            var manager = EnsurePagedManager();
+            if (manager == null)
+                return;
+
+            // Only adopt the paged plan when it strictly beats the in-session prefix
+            // length. Reusing the model's existing KV state is always cheaper than
+            // resetting + reinjecting bytes, so we never pay the swap cost for free.
+            int inSessionPrefix = cache.CommonPrefixLength(inputTokens);
+            if (!model.SupportsKVCacheTruncation && inSessionPrefix < cache.Count)
+                inSessionPrefix = 0;
+
+            int availableBlocks = manager.CountAvailableBlocks(model, inputTokens);
+            int availableTokens = availableBlocks * manager.BlockSize;
+            if (availableTokens <= inSessionPrefix)
+                return;
+
+            // Swap to the paged plan: drop the current cache and inject the matching
+            // blocks. The session's tracked history is preserved because the bytes we
+            // restore correspond to the prefix tokens the caller already supplied.
+            model.ResetKVCache();
+            cache.Reset();
+            int restored = manager.TryRestorePrefix(model, inputTokens);
+            if (restored > 0)
+            {
+                var restoredTokens = CopyTokenRange(inputTokens, 0, restored);
+                cache.RecordAppend(restoredTokens, null);
+                _logger.LogInformation(LogEventIds.PagedKvCacheRestore,
+                    "kv.paged adopted restore of {Restored}/{Total} tokens (beat in-session prefix of {InSession})",
+                    restored, inputTokens.Count, inSessionPrefix);
+            }
+        }
+
+        private void CapturePagedBlocks(IModelArchitecture model, KVCache cache)
+        {
+            var manager = EnsurePagedManager();
+            if (manager == null || cache.IsEmpty)
+                return;
+            manager.Capture(model, cache.Tokens, cache.Count);
+        }
+
         public float[] ForwardPromptPrefill(int[] tokens, bool allowChunking = true)
+            => ForwardPromptPrefill(tokens, 0, allowChunking, perChunkCallback: null);
+
+        public float[] ForwardPromptPrefill(int[] tokens, int promptStartToken, bool allowChunking = true)
+            => ForwardPromptPrefill(tokens, promptStartToken, allowChunking, perChunkCallback: null);
+
+        /// <summary>
+        /// Forward <paramref name="tokens"/> through the model in chunks. When
+        /// <paramref name="perChunkCallback"/> is supplied it is invoked after
+        /// each chunk's KV state has been written, so callers (notably the paged
+        /// cache) can checkpoint mid-prefill. For models with recurrent state
+        /// this is essential: the running state at position N must be captured
+        /// before the next chunk mutates it.
+        /// </summary>
+        public float[] ForwardPromptPrefill(int[] tokens, int promptStartToken, bool allowChunking, Action<int, int> perChunkCallback)
         {
             if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("Prompt token list cannot be null or empty.", nameof(tokens));
+            if (promptStartToken < 0)
+                throw new ArgumentOutOfRangeException(nameof(promptStartToken));
 
             var model = _lifecycle.Model;
+            int chunkSize;
             if (!allowChunking)
-                return model.ForwardRefill(tokens);
+            {
+                chunkSize = tokens.Length;
+            }
+            else
+            {
+                chunkSize = ResolvePrefillChunkSize(_lifecycle.Backend, tokens.Length);
+                // Recurrent models need their running state captured at every block
+                // boundary - shrink the chunks so callbacks land on those boundaries.
+                if (perChunkCallback != null && model.RequiresPerBlockCapture && _pagedConfig.Enabled)
+                {
+                    int blockSize = _pagedConfig.BlockSize;
+                    if (blockSize > 0 && blockSize < chunkSize)
+                        chunkSize = blockSize;
+                }
+            }
 
-            int chunkSize = ResolvePrefillChunkSize(_lifecycle.Backend, tokens.Length);
-            if (chunkSize >= tokens.Length)
-                return model.ForwardRefill(tokens);
+            if (chunkSize >= tokens.Length && perChunkCallback == null)
+                return ForwardPromptChunk(tokens, promptStartToken);
 
             _logger.LogInformation(LogEventIds.PromptChunking,
-                "prompt.chunking total={TotalTokens} chunkSize={ChunkSize} backend={Backend}",
-                tokens.Length, chunkSize, _lifecycle.LoadedBackend ?? _lifecycle.Backend.ToString());
+                "prompt.chunking total={TotalTokens} chunkSize={ChunkSize} backend={Backend} capture={Capture}",
+                tokens.Length, chunkSize, _lifecycle.LoadedBackend ?? _lifecycle.Backend.ToString(),
+                perChunkCallback != null);
 
             float[] logits = null;
             int chunkIndex = 0;
@@ -200,14 +374,22 @@ namespace TensorSharp.Server
                 int length = Math.Min(chunkSize, tokens.Length - start);
                 int[] chunk = new int[length];
                 Array.Copy(tokens, start, chunk, 0, length);
-                logits = model.ForwardRefill(chunk);
+                logits = ForwardPromptChunk(chunk, promptStartToken + start);
                 chunkIndex++;
+                perChunkCallback?.Invoke(promptStartToken + start, length);
                 _logger.LogTrace(LogEventIds.PromptChunking,
                     "prompt.chunking chunk={ChunkIndex} start={Start} length={Length}",
                     chunkIndex, start, length);
             }
 
             return logits;
+        }
+
+        private float[] ForwardPromptChunk(int[] tokens, int promptStartToken)
+        {
+            var model = _lifecycle.Model;
+            model.MultimodalInjector.QueuePromptEmbeddingsForSlice(promptStartToken, tokens.Length);
+            return model.ForwardRefill(tokens);
         }
 
         public List<int> TruncatePromptToContext(ChatSession session, List<int> inputTokens, int maxTokens)
@@ -246,21 +428,14 @@ namespace TensorSharp.Server
         }
 
         public static int ResolvePrefillChunkSize(BackendType backend, int tokenCount)
-        {
-            if (tokenCount <= 0)
-                return 0;
-
-            // Chunked prefill keeps attention score tensors bounded and avoids
-            // O(n^2) blowup for sliding-window layers on large prompts.
-            return backend == BackendType.GgmlCuda
-                ? Math.Min(tokenCount, 5120)
-                : Math.Min(tokenCount, 2048);
-        }
+            => PrefillChunking.ResolveChunkSize(backend, tokenCount);
 
         public void Dispose()
         {
             ActiveSession = null;
             _intrinsicSession.Dispose();
+            _pagedManager?.Dispose();
+            _pagedManager = null;
         }
 
         private static int[] CopyTokenRange(IList<int> tokens, int start, int length)

@@ -30,7 +30,7 @@ namespace TensorSharp.Runtime.Logging
         /// are permitted; callers usually combine this with the built-in console
         /// logger (<c>builder.AddConsole()</c>).
         /// </summary>
-        public static ILoggingBuilder AddTensorSharpFileLogger(this ILoggingBuilder builder, Action<FileLoggerOptions> configure = null)
+        public static ILoggingBuilder AddTensorSharpFileLogger(this ILoggingBuilder builder, Action<FileLoggerOptions>? configure = null)
         {
             if (builder == null)
                 throw new ArgumentNullException(nameof(builder));
@@ -190,7 +190,7 @@ namespace TensorSharp.Runtime.Logging
         {
             if (logger == null) throw new ArgumentNullException(nameof(logger));
             if (action == null) throw new ArgumentNullException(nameof(action));
-            logger.LogTimedOperation<object>(eventId, operationName, () => { action(); return null; });
+            logger.LogTimedOperation<object?>(eventId, operationName, () => { action(); return null; });
         }
 
         private sealed class NullScope : IDisposable

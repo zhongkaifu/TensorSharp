@@ -17,11 +17,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -211,6 +213,22 @@ namespace tsg
     extern std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
     extern std::mutex g_preloaded_buffer_cache_mutex;
     extern std::unordered_map<void*, CachedHostBuffer> g_preloaded_buffer_cache;
+
+    // --- MoE expert weight offload state ---
+    //
+    // When a host data pointer is registered as offloadable (via
+    // TSGgml_RegisterOffloadable, typically driven by C# for MoE expert
+    // weights), its CachedHostBuffer entry participates in an LRU that is
+    // bounded by g_offloadable_budget (set via TSGgml_SetOffloadableBudget).
+    // Entries past the budget are evicted from the tail of the LRU at the
+    // next cache-miss insert, which frees the MTLBuffer wrapper and releases
+    // Metal's claim on the underlying mmap pages so the OS may reclaim them.
+    // All of these are guarded by g_host_buffer_cache_mutex.
+    extern std::unordered_set<void*> g_offloadable_keys;
+    extern std::list<void*> g_offloadable_lru;
+    extern std::unordered_map<void*, std::list<void*>::iterator> g_offloadable_lru_map;
+    extern std::int64_t g_offloadable_resident_bytes;
+    extern std::int64_t g_offloadable_budget;
 
     // --- Backend constants ---
 

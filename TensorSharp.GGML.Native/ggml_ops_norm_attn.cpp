@@ -865,7 +865,9 @@ namespace {
         float beta_fast,
         float beta_slow,
         bool add_to_result,
-        bool invert_positions)
+        bool invert_positions,
+        const float* freq_factors,
+        int freq_factors_len)
     {
         if (!ensure_backend())
         {
@@ -902,6 +904,13 @@ namespace {
             return 0;
         }
 
+        const bool has_freq_factors = freq_factors != nullptr && freq_factors_len > 0;
+        if (has_freq_factors && freq_factors_len != rope_dim / 2)
+        {
+            set_last_error("rope_ex freq_factors length must equal rope_dim/2.");
+            return 0;
+        }
+
         const std::size_t ctx_size = 4 * 1024 * 1024;
         PooledContextHandle context;
         if (!context.init(ctx_size))
@@ -913,9 +922,13 @@ namespace {
         TensorBinding result_binding = create_standard_binding(context.value, result_desc);
         TensorBinding src_binding = create_standard_binding(context.value, src_desc);
         ggml_tensor* position_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_I32, rows);
+        ggml_tensor* freq_factors_tensor = has_freq_factors
+            ? ggml_new_tensor_1d(context.value, GGML_TYPE_F32, freq_factors_len)
+            : nullptr;
         if (result_binding.storage == nullptr || result_binding.tensor == nullptr ||
             src_binding.storage == nullptr || src_binding.tensor == nullptr ||
-            position_tensor == nullptr)
+            position_tensor == nullptr ||
+            (has_freq_factors && freq_factors_tensor == nullptr))
         {
             set_last_error("Failed to allocate ggml tensors.");
             return 0;
@@ -954,7 +967,7 @@ namespace {
             context.value,
             rope_input,
             position_tensor,
-            nullptr,
+            freq_factors_tensor,
             rope_dim,
             mode,
             original_context_length,
@@ -1004,6 +1017,11 @@ namespace {
 
         upload_binding(src_binding, src_desc.data, src_binding.raw_bytes);
         ggml_backend_tensor_set(position_tensor, positions.data(), 0, positions.size() * sizeof(std::int32_t));
+        if (has_freq_factors)
+        {
+            ggml_backend_tensor_set(freq_factors_tensor, freq_factors, 0,
+                static_cast<std::size_t>(freq_factors_len) * sizeof(float));
+        }
 
         if (add_to_result || result_binding.raw_bytes > logical_bytes(result_desc))
         {
@@ -1019,6 +1037,170 @@ namespace {
 
         finalize_compute_with_download(result_binding.storage, result_desc.data, result_binding.raw_bytes);
 
+        clear_last_error();
+        return 1;
+    }
+
+    // Native MRoPE: wraps ggml_rope_multi (kernel_rope_multi.metal). Unlike
+    // rope_ex which flattens [seqLen, numHeads] into ne[2], MRoPE keeps them
+    // separate so the per-axis position table is indexed by token (not by
+    // token*head row). Input shape is [headDim, numHeads, seqLen, 1] and the
+    // positions tensor is length 4*seqLen with per-axis-concatenated layout
+    //   pos[ 0 ..  n-1 ] = T axis positions (one per token)
+    //   pos[ n .. 2n-1 ] = H axis positions
+    //   pos[2n .. 3n-1 ] = W axis positions
+    //   pos[3n .. 4n-1 ] = 4th-axis positions (zeros for static images)
+    // matching ggml.c:4081's `a->ne[2] * 4 == b->ne[0]` and Metal
+    // kernel_rope_multi's `pos[i2 + ne02 * axis]` indexing.
+    int rope_mrope_f32_impl(
+        const TensorView4DDesc& result_desc,
+        const TensorView4DDesc& src_desc,
+        const ContiguousTensorDesc& positions_desc,
+        int rope_dim,
+        int mode,
+        const int sections[4],
+        int original_context_length,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow)
+    {
+        if (!ensure_backend())
+            return 0;
+
+        if (!validate_desc(result_desc, "result") || !validate_desc(src_desc, "src") || !validate_desc(positions_desc, "positions"))
+            return 0;
+
+        if (!same_shape(result_desc, src_desc))
+        {
+            set_last_error("Source tensor shape does not match result shape for ggml rope_mrope.");
+            return 0;
+        }
+
+        if (!can_map_standard_view(result_desc) || !can_map_standard_view(src_desc))
+        {
+            set_last_error("Tensor layout is not supported by the ggml rope_mrope Metal path.");
+            return 0;
+        }
+
+        if (rope_dim <= 0 || rope_dim > src_desc.ne0 || (rope_dim % 2) != 0)
+        {
+            set_last_error("rope_dim must be positive, even, and within the source embedding dimension.");
+            return 0;
+        }
+
+        // Expect 4-D input shape [headDim, numHeads, seqLen, 1].
+        const std::int64_t headDim  = src_desc.ne0;
+        const std::int64_t numHeads = src_desc.ne1;
+        const std::int64_t seqLen   = src_desc.ne2;
+        const std::int64_t batch    = src_desc.ne3;
+        if (batch != 1)
+        {
+            set_last_error("rope_mrope expects batch=1 input.");
+            return 0;
+        }
+        if (positions_desc.element_count != 4 * seqLen)
+        {
+            set_last_error("rope_mrope positions length must be 4 * seqLen.");
+            return 0;
+        }
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context.");
+            return 0;
+        }
+
+        TensorBinding result_binding = create_standard_binding(context.value, result_desc);
+        TensorBinding src_binding    = create_standard_binding(context.value, src_desc);
+        ggml_tensor* position_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_I32, 4 * seqLen);
+        if (result_binding.storage == nullptr || result_binding.tensor == nullptr ||
+            src_binding.storage == nullptr || src_binding.tensor == nullptr ||
+            position_tensor == nullptr)
+        {
+            set_last_error("Failed to allocate ggml tensors.");
+            return 0;
+        }
+
+        // Use the existing 4D shape (headDim, numHeads, seqLen, 1). The
+        // ggml_rope_multi assert is a->ne[2] * 4 == b->ne[0], i.e.
+        // seqLen * 4 == positions length, which we already enforce above.
+        ggml_tensor* contiguous_src = ggml_cont(context.value, src_binding.tensor);
+        if (contiguous_src == nullptr)
+        {
+            set_last_error("Failed to make ggml rope_mrope source contiguous.");
+            return 0;
+        }
+
+        std::vector<std::int32_t> positions;
+        if (!read_i32_values(positions, positions_desc, "positions"))
+            return 0;
+
+        int sections_local[4] = { sections[0], sections[1], sections[2], sections[3] };
+
+        ggml_tensor* rope_tensor = ggml_rope_multi(
+            context.value,
+            contiguous_src,
+            position_tensor,
+            /*freq_factors=*/nullptr,
+            rope_dim,
+            sections_local,
+            mode,
+            original_context_length,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+
+        if (rope_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml rope_multi node.");
+            return 0;
+        }
+
+        ggml_tensor* output_tensor = ggml_cpy(context.value, rope_tensor, result_binding.tensor);
+        if (output_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml rope_mrope output copy node.");
+            return 0;
+        }
+
+        ggml_set_output(output_tensor);
+
+        ggml_cgraph* graph = ggml_new_graph(context.value);
+        if (graph == nullptr)
+        {
+            set_last_error("Failed to create ggml graph.");
+            return 0;
+        }
+
+        ggml_build_forward_expand(graph, output_tensor);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate ggml backend buffer.");
+            return 0;
+        }
+
+        upload_binding(src_binding, src_desc.data, src_binding.raw_bytes);
+        ggml_backend_tensor_set(position_tensor, positions.data(), 0,
+            positions.size() * sizeof(std::int32_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed.");
+            return 0;
+        }
+
+        finalize_compute_with_download(result_binding.storage, result_desc.data, result_binding.raw_bytes);
         clear_last_error();
         return 1;
     }
@@ -1860,7 +2042,9 @@ TSG_EXPORT int TSGgml_RoPEExF32(
             beta_fast,
             beta_slow,
             add_to_result != 0,
-            invert_positions != 0);
+            invert_positions != 0,
+            nullptr,
+            0);
     }
     catch (const std::exception& ex)
     {
@@ -1870,6 +2054,101 @@ TSG_EXPORT int TSGgml_RoPEExF32(
     catch (...)
     {
         set_last_error("Unknown ggml rope_ex failure.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_RoPEExFreqFactorsF32(
+    TensorView4DDesc result,
+    TensorView4DDesc src,
+    ContiguousTensorDesc positions,
+    int rope_dim,
+    int mode,
+    int original_context_length,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    int add_to_result,
+    int invert_positions,
+    const float* freq_factors,
+    int freq_factors_len)
+{
+    try
+    {
+        return rope_ex_f32_impl(
+            result,
+            src,
+            positions,
+            rope_dim,
+            mode,
+            original_context_length,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            add_to_result != 0,
+            invert_positions != 0,
+            freq_factors,
+            freq_factors_len);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml rope_ex_ff failure.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_RoPEMRoPEF32(
+    TensorView4DDesc result,
+    TensorView4DDesc src,
+    ContiguousTensorDesc positions,
+    int rope_dim,
+    int mode,
+    int sect0, int sect1, int sect2, int sect3,
+    int original_context_length,
+    float freq_base,
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow)
+{
+    try
+    {
+        int sections[4] = { sect0, sect1, sect2, sect3 };
+        return rope_mrope_f32_impl(
+            result,
+            src,
+            positions,
+            rope_dim,
+            mode,
+            sections,
+            original_context_length,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml rope_mrope failure.");
         return 0;
     }
 }

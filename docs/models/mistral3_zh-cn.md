@@ -6,13 +6,14 @@
 |---|---|
 | 提供方 | Mistral AI |
 | GGUF 架构标识 | `mistral3` |
-| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) |
+| 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（旧单序列路径）+ [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs)（Pixtral） |
 | 图像处理器 | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
-| 示例模型 | Mistral-Small-3.1-24B-Instruct |
+| 示例模型 | Mistral-Small-3.1-24B-Instruct、Ministral-3-14B-Instruct |
 | 模态 | 文本、图像 |
 | 思维链模式 | 否 |
 | 工具调用 | 否 |
+| 批处理 / 分页前向 | **默认启用** —— `IBatchedPagedModel.ForwardBatch` 的参考实现。已在 Ministral-3-14B 上完成端到端验证；原生分页注意力内核在长上下文下比旧路径快约 21%。详见 §11。 |
 | 输出解析器 | `PassthroughOutputParser` |
 
 ## 1. 来源与目标
@@ -254,15 +255,85 @@ Mistral 3 没有分块 prefill（只有全因果 attention，没有 SWA），没
 - `TruncateKVCache(int tokenCount)` 支持（服务器多轮 KV cache 复用使用）。
 - Pixtral 视觉编码器在加载时把权重 dequantize 到 F32；语言模型权重当后端支持时保持量化。
 
-## 11. 输出解析器与聊天模板
+## 11. 批处理 / 分页前向（连续批处理）
+
+Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实现**
+（[`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)），
+通过 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
+中描述的共享连续批处理栈（`InferenceEngine` + `ContinuousBatchScheduler` +
+`BatchExecutor`）执行。
+
+关键特性：
+
+- **默认启用，无需 opt-in 环境变量。** Mistral 3 的连续批处理始终可用；服务的
+  `--no-continuous-batching` 会强制所有模型（包括 Mistral 3）走旧的单序列
+  KV 交换路径。
+- **每层分页 K/V 缓冲区**，布局 `[numBlocks * blockSize * numKvHeads * headDim]`，
+  由 `EnsurePagedBuffersAllocated` 按需扩容。"扩容"路径会把已有 K/V 拷贝到新
+  缓冲区，避免已经在调度中的序列丢失状态。
+- **逐层选择融合 vs 非融合 QKV**：`ForwardBatch` 根据 `_layerQkvFused[layer]`
+  决定走融合的 `attn_qkv.weight` matmul 还是三次独立的 `attn_q/k/v.weight`
+  matmul。两条路径都按 token 轴批量计算，每层只发起一次 GEMM。
+- **逐 token YaRN RoPE**。加载时建立的 `_ropeFreqs[]` 数组通过 `Ops.RoPEEx`
+  应用，并传入显式 `positions[]` 数组；逐 token 的 YaRN 位置相关 Q 缩放
+  （`q *= 1 + beta * log(1 + floor(pos / orig_ctx))`）在批处理循环中执行，
+  每个 token 取各自的缩放因子。
+- **基于 `slotMapping` 的 K/V 写入** 把新的 K 与 V 写入层的分页缓冲区在
+  `blockId * blockSize + offset` 位置。批处理路径下不再有序列间的 KV 状态
+  extract / inject。
+- **三种通过 `TS_PAGED_ATTN_KERNEL` 可选的分页注意力内核**：
+  - `native`（默认）：`TSGgml_PagedAttentionForward` —— 在 C++ 中按序列对
+    分页缓冲区做 memcpy gather，然后派发 `ggml_flash_attn_ext`（即旧单序列
+    路径使用的同一融合 Metal/CUDA flash 注意力内核）。
+  - `tensor`：`TensorPagedAttention.Forward` —— 基于 C# Tensor 的 gather
+    加按序列的 `Ops.AddmmBatch` + `GgmlBasicOps.AttentionSoftmaxWithSinks`。
+    比 `native` 慢，因为按序列重复派发 GPU。
+  - `managed`：`ManagedPagedAttention.Forward` —— 纯 C# 在线 softmax 循环，
+    按 `(seq, head)` 并行化。任意后端上的正确性回退。
+- **视觉嵌入注入** 仍在 per-layer 循环之前（与旧 forward 路径一致）。多模态
+  请求会被多模态注入器在 prompt 准备阶段串行化；纯文本请求可以并行准备。
+
+**在真实 GGUF 上验证的一致性**
+（[`Mistral3BatchedForwardTests`](../../InferenceWeb.Tests/Mistral3BatchedForwardTests.cs)）：
+- `Mistral3_BatchSize1_ForwardBatchMatchesLegacyTop1` —— 6 token 探针 prompt
+  上 legacy top-1 = 批处理 top-1 = 1091。
+- `Mistral3_BatchSize2_DistinctSequencesProduceDistinctLogits` —— 一次批处
+  理中的两个不同 prompt 产生不同的 top-1 token，证明 K/V 被正确分隔。
+
+**Ministral-3-14B-Instruct-2512-Q4_K_M（Apple M4 Pro、GgmlMetal、4 个并行
+聊天 prompt）实测吞吐**：
+
+| 路径 | 长上下文（~800 tok/seq）墙钟 | tokens/sec | vs 旧路径 |
+|---|---|---|---|
+| 批处理 + 原生内核（默认） | **42.37 s** | **0.6** | **1.21×** |
+| 单序列 KV 交换（旧 GGML） | 53.95 s | 0.4 | 1.0× |
+| 批处理 + Tensor 内核 | 71.42 s | 0.3 | 0.76× |
+| 批处理 + Managed 内核 | 111.02 s | 0.2 | 0.49× |
+
+在长上下文下原生内核比旧 GGML 单序列路径快约 21% —— 这是整个连续批处理工作
+的关键里程碑。
+
+**前缀缓存验证**：在同一组长上下文运行中，引擎在 4 个序列间共享了 6 个完整
+prompt 块（`reused=1536`、`hashedCached=3`），首次在真实 GGUF 上端到端验证
+前缀缓存路径。
+
+## 12. 输出解析器与聊天模板
 
 - `PassthroughOutputParser` —— Mistral 3 没有思维链 / 工具调用 wire 格式。
 - 聊天模板使用 Mistral 标准格式（`[INST]...[/INST]<s>...</s>`）。GGUF 缺少 Jinja2 模板时回退到内置硬编码模板。
 - 图像占位符为 `<image_pad>`，`ChatTemplate.ExpandImageTokens` 把每个 `<image_pad>` 展开为对应图像所需 token 数。
 
-## 12. 优化机会
+## 13. 优化机会
 
-- **原生 whole-model decode** —— 整个 forward pass 是托管 C# + 后端派发的 matmul。原生单调用 decode 路径（类比 Qwen 3 的 `TransformerModelDecode`）能消除大部分托管开销。
-- **融合单调用 decode** —— `Mistral3ModelDecode` GGML kernel 能通过把 per-layer 派发合并显著提升 Metal / CUDA 吞吐。
-- **量化视觉编码器** —— Pixtral 权重当前在加载时 dequantize 到 F32，图像繁重负载下显著增加内存占用。直接支持量化视觉权重能压低常驻内存并加快加载。
-- **融合 prefill attention** —— 引入 Qwen 3.5 的 `FusedPrefillAttention` 思路能减少 GGML / CUDA 上 per-layer prefill 往返次数。
+- **原生 whole-model decode** —— 旧单序列 forward 仍是托管 C# + 后端派发
+  matmul。原生单调用 decode 路径（类比 Qwen 3 的 `TransformerModelDecode`）
+  能消除单序列路径上的大部分托管开销。
+- **融合单调用 decode** —— `Mistral3ModelDecode` GGML kernel 能通过把
+  per-layer 派发合并显著提升旧单序列路径上的 Metal / CUDA 吞吐。
+- **量化视觉编码器** —— Pixtral 权重当前在加载时 dequantize 到 F32，图像繁
+  重负载下显著增加内存占用。直接支持量化视觉权重能压低常驻内存并加快加载。
+- **融合 prefill attention** —— 引入 Qwen 3.5 的 `FusedPrefillAttention` 思
+  路能减少 GGML / CUDA 上 per-layer prefill 往返次数。
+- **整批一次 ggml 计算图** —— `ForwardBatch` 当前为每个序列每层各建一张
+  分页注意力计算图。把它们合并为一张 per-layer 计算图能在短序列多的批量中
+  摊销编译 / 启动开销。

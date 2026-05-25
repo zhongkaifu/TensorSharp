@@ -1,0 +1,627 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Runtime.Paged;
+
+namespace TensorSharp.Runtime.Scheduling
+{
+    /// <summary>
+    /// Runs the work decided by <see cref="ContinuousBatchScheduler"/> against
+    /// a single <see cref="IModelArchitecture"/>. Owns the KV-state ownership
+    /// invariant: at any moment the model's KV tensors hold exactly one
+    /// sequence's state; switching sequences extracts the outgoing state into
+    /// paged blocks and injects the incoming state from paged blocks.
+    ///
+    /// In the future a batched-paged-attention path will allow N sequences to
+    /// share the model's KV tensors via a slot mapping and block table tensor;
+    /// see <see cref="IBatchedPagedModel"/> for the opt-in interface.
+    /// </summary>
+    public sealed class BatchExecutor
+    {
+        private readonly IModelArchitecture _model;
+        private readonly BlockPool _pool;
+        private readonly ContinuousBatchScheduler _scheduler;
+        private readonly int _blockSize;
+        private readonly ILogger _logger;
+
+        // Currently-owning sequence (whose K/V state is in the model's tensors).
+        private SequenceState _currentOwner;
+        // Number of tokens the model currently holds for the current owner.
+        // Equals model._cacheSeqLen for purely-attention models.
+        private int _ownerTokensInModel;
+
+        // Re-used scratch buffer for inject/extract. Sized to one full block.
+        private byte[] _scratch;
+
+        public BatchExecutor(
+            IModelArchitecture model,
+            BlockPool pool,
+            ContinuousBatchScheduler scheduler,
+            ILogger logger = null)
+        {
+            _model = model ?? throw new ArgumentNullException(nameof(model));
+            _pool = pool ?? throw new ArgumentNullException(nameof(pool));
+            _scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
+            _blockSize = pool.BlockSize;
+            _logger = logger ?? NullLogger.Instance;
+        }
+
+        public IModelArchitecture Model => _model;
+        public SequenceState CurrentOwner => _currentOwner;
+
+        /// <summary>Execute one scheduler step. When the underlying model
+        /// implements <see cref="IBatchedPagedModel"/> all scheduled sequences
+        /// are packed into a single <see cref="BatchedForwardContext"/> and
+        /// dispatched through <see cref="IBatchedPagedModel.ForwardBatch"/> -
+        /// this is the vLLM-style "one kernel many sequences" path. Otherwise
+        /// the executor falls back to per-sequence forward with KV-state
+        /// swap (the path that ships today).
+        ///
+        /// Set <c>TS_SCHED_DISABLE_BATCHED=1</c> to force the per-sequence
+        /// fallback even when the model declares <see cref="IBatchedPagedModel"/>.
+        /// Used to A/B the two paths on the same workload.</summary>
+        public List<SequenceStepResult> ExecuteStep(SchedulerOutput output)
+        {
+            // Serialise GGML backend access with anything else that calls
+            // into the same model (notably the chat pipeline's multimodal
+            // vision/audio encoder, which runs on the request-handling
+            // thread). Without this lock a parallel image-bearing request
+            // and the engine's worker race the Metal command queue and
+            // ggml_metal_synchronize aborts the process.
+            lock (_model.GpuComputeLock)
+            {
+                bool batchedEnabled = !IsBatchedPathDisabled();
+
+                // Split this step's work into:
+                //   - multimodalWork: seqs whose injector bucket still has
+                //     pending embeddings. These MUST go through per-sequence
+                //     forward so the model can inject vision/audio
+                //     embeddings at the right per-chunk positions (the
+                //     batched paged kernel has no hook for this).
+                //   - textWork: everything else; runs through the batched
+                //     paged path for full continuous-batching throughput.
+                // We route the two subsets separately rather than dragging
+                // healthy text seqs onto the per-seq swap path just because
+                // one image request happened to land in the same step -
+                // legacy per-seq with concurrent multi-seq scheduling
+                // produces garbled output on Gemma 4 (EnsureOwnership's
+                // byte-level state swap doesn't isolate cleanly across
+                // multi-seq iteration), so isolating multimodal here keeps
+                // text correctness intact.
+                // Models that handle multimodal in batched mode (e.g. Qwen3.5
+                // Phase 4) declare SupportsBatchedMultimodal=true and run the
+                // whole batch — multimodal + text — through ForwardBatch in
+                // one shot. Other models still get the multimodal/text split
+                // so per-seq Forward handles their vision-encoded sequences.
+                bool batchedModalSafe = _model is IBatchedPagedModel mmCheck && mmCheck.SupportsBatchedMultimodal;
+                var (multimodalWork, textWork) = batchedModalSafe
+                    ? (new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>(output.ScheduledWork))
+                    : SplitMultimodalWork(output);
+
+                if (batchedEnabled && _model is IBatchedPagedModel batched && textWork.Count > 0 && multimodalWork.Count > 0)
+                {
+                    // Mixed batch (only reachable when the model declines batched
+                    // multimodal): run each subset on its preferred path.
+                    var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
+                    results.AddRange(ExecuteStepPerSequence(MakeSubOutput(multimodalWork)));
+                    try
+                    {
+                        results.AddRange(ExecuteStepBatched(batched, MakeSubOutput(textWork)));
+                    }
+                    catch (NotSupportedException)
+                    {
+                        results.AddRange(ExecuteStepPerSequence(MakeSubOutput(textWork)));
+                    }
+                    return results;
+                }
+
+                if (batchedEnabled && _model is IBatchedPagedModel batched2 && multimodalWork.Count == 0 && output.ScheduledWork.Count > 0)
+                {
+                    try
+                    {
+                        return ExecuteStepBatched(batched2, output);
+                    }
+                    catch (NotSupportedException)
+                    {
+                        // The model declared support but bailed for this specific
+                        // batch. Fall through to the per-sequence swap path.
+                    }
+                }
+                return ExecuteStepPerSequence(output);
+            }
+        }
+
+        private static bool IsBatchedPathDisabled()
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED");
+            return !string.IsNullOrEmpty(raw) && raw != "0" && raw.ToLowerInvariant() != "false";
+        }
+
+        private bool HasAnyPendingMultimodal(SchedulerOutput output)
+        {
+            var injector = _model.MultimodalInjector;
+            if (injector == null) return false;
+            foreach (var work in output.ScheduledWork)
+            {
+                if (injector.HasPendingEmbeddings(work.Sequence.RequestId))
+                    return true;
+            }
+            return false;
+        }
+
+        private (List<ScheduledSequenceWork> multimodal, List<ScheduledSequenceWork> text) SplitMultimodalWork(SchedulerOutput output)
+        {
+            var multimodal = new List<ScheduledSequenceWork>();
+            var text = new List<ScheduledSequenceWork>();
+            var injector = _model.MultimodalInjector;
+            foreach (var work in output.ScheduledWork)
+            {
+                if (injector != null && injector.HasPendingEmbeddings(work.Sequence.RequestId))
+                    multimodal.Add(work);
+                else
+                    text.Add(work);
+            }
+            return (multimodal, text);
+        }
+
+        private static SchedulerOutput MakeSubOutput(List<ScheduledSequenceWork> work)
+        {
+            var sub = new SchedulerOutput();
+            foreach (var w in work) sub.ScheduledWork.Add(w);
+            return sub;
+        }
+
+        private List<SequenceStepResult> ExecuteStepBatched(IBatchedPagedModel batched, SchedulerOutput output)
+        {
+            int numSeqs = output.ScheduledWork.Count;
+            var ctx = new BatchedForwardContext
+            {
+                Sequences = new List<SequenceState>(numSeqs),
+                NumScheduledTokens = new List<int>(numSeqs),
+                QueryStartLoc = new List<int>(numSeqs + 1),
+                Positions = new List<int>(),
+                SlotMapping = new List<int>(),
+                BlockTables = new int[numSeqs][],
+                MaxQueryLen = 0,
+                MaxSeqLen = 0,
+            };
+
+            int cursor = 0;
+            ctx.QueryStartLoc.Add(0);
+
+            // Pre-fill tokens-to-forward array (decode samples a token first).
+            var pendingTokens = new List<int[]>(numSeqs);
+            for (int s = 0; s < numSeqs; s++)
+            {
+                var work = output.ScheduledWork[s];
+                var seq = work.Sequence;
+
+                int sampledFirst = -1;
+                int[] inputTokens;
+                if (work.IsPrefill)
+                {
+                    inputTokens = BuildPrefillChunk(seq, work);
+                }
+                else
+                {
+                    sampledFirst = SampleFromLogits(seq);
+                    seq.AppendOutputToken(sampledFirst);
+                    inputTokens = new[] { sampledFirst };
+                }
+                pendingTokens.Add(inputTokens);
+
+                ctx.Sequences.Add(seq);
+                ctx.NumScheduledTokens.Add(inputTokens.Length);
+
+                // Per-token positions for this sequence + slot mappings.
+                int startPos = seq.NumComputedTokens;
+                for (int t = 0; t < inputTokens.Length; t++)
+                {
+                    int absPos = startPos + t;
+                    ctx.Positions.Add(absPos);
+                    int blockIdx = absPos / _blockSize;
+                    int blockOffset = absPos % _blockSize;
+                    int physBlockId = seq.BlockTable.Blocks[blockIdx].Id;
+                    ctx.SlotMapping.Add(physBlockId * _blockSize + blockOffset);
+                    cursor++;
+                }
+                ctx.QueryStartLoc.Add(cursor);
+
+                int seqLen = startPos + inputTokens.Length;
+                if (inputTokens.Length > ctx.MaxQueryLen) ctx.MaxQueryLen = inputTokens.Length;
+                if (seqLen > ctx.MaxSeqLen) ctx.MaxSeqLen = seqLen;
+
+                // Block table for this sequence.
+                int numBlocks = seq.BlockTable.NumBlocks;
+                var table = new int[numBlocks];
+                for (int b = 0; b < numBlocks; b++)
+                    table[b] = seq.BlockTable.Blocks[b].Id;
+                ctx.BlockTables[s] = table;
+            }
+
+            // Dispatch the entire batch.
+            var swForward = Stopwatch.StartNew();
+            IReadOnlyList<float[]> perSeqLogits = batched.ForwardBatch(ctx);
+            swForward.Stop();
+            if (perSeqLogits == null || perSeqLogits.Count != numSeqs)
+                throw new InvalidOperationException(
+                    $"ForwardBatch returned {perSeqLogits?.Count ?? -1} results for {numSeqs} sequences.");
+
+            // Update per-sequence state and assemble results.
+            var results = new List<SequenceStepResult>(numSeqs);
+            for (int s = 0; s < numSeqs; s++)
+            {
+                var work = output.ScheduledWork[s];
+                var seq = work.Sequence;
+                var inputTokens = pendingTokens[s];
+
+                seq.LastLogits = perSeqLogits[s];
+                seq.AdvanceComputedTokens(inputTokens.Length);
+                // In the batched path the model owns its own K/V layout
+                // (paged storage referenced by slotMapping/block tables), so
+                // the executor does NOT need to extract/inject between
+                // sequences. _currentOwner stays null; subsequent batched
+                // steps don't pay any swap cost.
+                int sampled = work.IsPrefill ? -1 : inputTokens[0];
+                if (!seq.FirstTokenAt.HasValue && sampled >= 0)
+                    seq.FirstTokenAt = DateTime.UtcNow;
+
+                results.Add(new SequenceStepResult
+                {
+                    Sequence = seq,
+                    TokensForwarded = inputTokens.Length,
+                    SampledToken = sampled,
+                    IsPrefill = work.IsPrefill,
+                    FullBlocksCaptured = 0, // batched path writes directly to blocks via slotMapping
+                    ForwardElapsedTicks = swForward.ElapsedTicks / numSeqs,
+                });
+
+                // Notify the scheduler that any full blocks completed by
+                // this step should enter the prefix-cache index. We pass the
+                // pre-step computed-token count so it knows which blocks
+                // are "newly full".
+                int prevComputed = seq.NumComputedTokens - inputTokens.Length;
+                int prevFullBlocks = prevComputed / _blockSize;
+                _scheduler.OnBlocksCommitted(seq, prevFullBlocks * _blockSize);
+            }
+            return results;
+        }
+
+        private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
+        {
+            var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
+
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                int prevComputed = seq.NumComputedTokens;
+                try
+                {
+                    EnsureOwnership(seq);
+
+                    // For decode steps we sample the next token from the
+                    // sequence's last logits BEFORE forwarding it. The forward
+                    // then runs on the freshly-sampled token; its returned
+                    // logits drive the NEXT step's sample. For prefill we
+                    // pass the next chunk of prompt tokens unchanged.
+                    int sampledToken = -1;
+                    int[] inputTokens;
+                    if (work.IsPrefill)
+                    {
+                        inputTokens = BuildPrefillChunk(seq, work);
+                    }
+                    else
+                    {
+                        sampledToken = SampleFromLogits(seq);
+                        seq.AppendOutputToken(sampledToken);
+                        inputTokens = new[] { sampledToken };
+                    }
+
+                    // For multimodal sequences, queue the embeddings that
+                    // overlap this prefill chunk into the model so Forward()
+                    // can inject them at the right per-chunk positions.
+                    // Engine-path callers (ChatGenerationPipeline + tests)
+                    // bucket prepared embeddings by seq.RequestId so this
+                    // looks up only THIS sequence's embeddings, even when
+                    // other concurrent requests have their own pending media.
+                    if (_model.MultimodalInjector != null && work.IsPrefill)
+                    {
+                        _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(
+                            prevComputed, inputTokens.Length, seq.RequestId);
+                    }
+
+                    var swForward = Stopwatch.StartNew();
+                    float[] logits = _model.Forward(inputTokens);
+                    swForward.Stop();
+
+                    // Defensive copy: the model may return its internal logits
+                    // buffer which it reuses on the next call.
+                    seq.LastLogits = (float[])logits.Clone();
+
+                    seq.AdvanceComputedTokens(inputTokens.Length);
+                    _ownerTokensInModel += inputTokens.Length;
+
+                    // Capture any newly-completed full blocks into the prefix cache.
+                    int capturedFullBlocks = CaptureNewlyFullBlocks(seq);
+
+                    if (!seq.FirstTokenAt.HasValue && sampledToken >= 0)
+                        seq.FirstTokenAt = DateTime.UtcNow;
+
+                    var result = new SequenceStepResult
+                    {
+                        Sequence = seq,
+                        TokensForwarded = inputTokens.Length,
+                        SampledToken = sampledToken,
+                        IsPrefill = work.IsPrefill,
+                        FullBlocksCaptured = capturedFullBlocks,
+                        ForwardElapsedTicks = swForward.ElapsedTicks,
+                    };
+                    results.Add(result);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Step failed for sequence {RequestId}", seq.RequestId);
+                    results.Add(new SequenceStepResult
+                    {
+                        Sequence = seq,
+                        Error = ex,
+                    });
+                    // Reset ownership so the next step does a clean swap.
+                    _currentOwner = null;
+                    _ownerTokensInModel = 0;
+                    seq.Error = ex;
+                }
+            }
+
+            return results;
+        }
+
+        /// <summary>Ensure the model's K/V state belongs to <paramref name="seq"/>.
+        /// If a different sequence is the current owner, extract its state into
+        /// its blocks, reset the model, and inject this sequence's state from
+        /// its blocks.</summary>
+        private void EnsureOwnership(SequenceState seq)
+        {
+            if (ReferenceEquals(_currentOwner, seq))
+            {
+                // Same owner: nothing to do. (Sanity check: model's cached count
+                // should match the sequence's computed-token counter.)
+                return;
+            }
+
+            // Swap out the previous owner.
+            if (_currentOwner != null)
+            {
+                if (_model.SupportsKVStateSnapshot && _ownerTokensInModel > 0)
+                {
+                    ExtractAllBlocks(_currentOwner, _ownerTokensInModel);
+                }
+                // Else: model can't snapshot; the previous owner's state is
+                // lost. (This path forces re-prefill on the next admission.)
+            }
+
+            // Swap in the new owner.
+            _model.ResetKVCache();
+            _ownerTokensInModel = 0;
+            if (seq.NumComputedTokens > 0)
+            {
+                if (!_model.SupportsKVStateSnapshot)
+                {
+                    // The model can't accept injected state. We have to discard
+                    // the seq's "computed" claim and rerun. Mark it for re-prefill.
+                    seq.ResetForPreemption();
+                    var freed = seq.BlockTable.Clear();
+                    if (freed.Count > 0) _pool.Free(freed);
+                }
+                else
+                {
+                    InjectAllBlocks(seq, seq.NumComputedTokens);
+                    _ownerTokensInModel = seq.NumComputedTokens;
+                }
+            }
+            _currentOwner = seq;
+        }
+
+        private int[] BuildPrefillChunk(SequenceState seq, ScheduledSequenceWork work)
+        {
+            int want = work.NumScheduledTokens;
+            int[] buf = new int[want];
+            for (int i = 0; i < want; i++)
+                buf[i] = seq.TokenAt(seq.NumComputedTokens + i);
+            return buf;
+        }
+
+        private static int SampleFromLogits(SequenceState seq)
+        {
+            if (seq.LastLogits == null)
+                throw new InvalidOperationException(
+                    $"Sequence {seq.RequestId} has no LastLogits to sample from at position {seq.NumComputedTokens}.");
+            var sampler = new TokenSampler(seq.SamplingConfig);
+            return sampler.Sample(seq.LastLogits, seq.OutputTokens);
+        }
+
+        /// <summary>Extract all blocks for the current owner into PagedKvStorage.
+        /// Called when swapping out.</summary>
+        private void ExtractAllBlocks(SequenceState seq, int tokensInModel)
+        {
+            if (!_model.SupportsKVStateSnapshot) return;
+            if (tokensInModel <= 0) return;
+
+            int blocks = seq.BlockTable.NumBlocks;
+            for (int b = 0; b < blocks; b++)
+            {
+                int startToken = b * _blockSize;
+                if (startToken >= tokensInModel) break;
+                int tokensInBlock = Math.Min(_blockSize, tokensInModel - startToken);
+                var block = seq.BlockTable.Blocks[b];
+
+                long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
+                if (expectedBytes <= 0) break;
+
+                EnsureScratch((int)expectedBytes);
+                var dst = _scratch.AsSpan(0, (int)expectedBytes);
+                if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
+                {
+                    _logger.LogWarning("Extract failed for sequence {RequestId} block {Block}", seq.RequestId, b);
+                    return;
+                }
+
+                // Copy the bytes into the block's storage slab. For full blocks
+                // we use the full-block byte size (so partial-block layout is
+                // not confused with full-block layout). For the trailing
+                // partial block we use the partial-byte size; the storage slab
+                // is sized for one full block so partial fits.
+                var slab = _pool.Storage.GetSpan(block.Id);
+                dst.CopyTo(slab);
+                block.Used = tokensInBlock;
+            }
+        }
+
+        /// <summary>Inject all blocks for <paramref name="seq"/> into the model's
+        /// fresh KV state. Called when swapping in.</summary>
+        private void InjectAllBlocks(SequenceState seq, int tokensToInject)
+        {
+            if (!_model.SupportsKVStateSnapshot) return;
+            if (tokensToInject <= 0) return;
+
+            int blocks = seq.BlockTable.NumBlocks;
+            for (int b = 0; b < blocks; b++)
+            {
+                int startToken = b * _blockSize;
+                if (startToken >= tokensToInject) break;
+                int tokensInBlock = Math.Min(_blockSize, tokensToInject - startToken);
+                var block = seq.BlockTable.Blocks[b];
+
+                long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
+                if (expectedBytes <= 0) break;
+
+                var src = _pool.Storage.GetReadOnlySpan(block.Id);
+                if (src.Length < expectedBytes)
+                {
+                    _logger.LogWarning(
+                        "Inject would underflow for sequence {RequestId} block {Block}: have {Have} need {Need}",
+                        seq.RequestId, b, src.Length, expectedBytes);
+                    return;
+                }
+                var slice = src[..(int)expectedBytes];
+                if (!_model.TryInjectKVBlock(startToken, tokensInBlock, slice))
+                {
+                    _logger.LogWarning(
+                        "Inject failed for sequence {RequestId} block {Block} at {Start}",
+                        seq.RequestId, b, startToken);
+                    return;
+                }
+            }
+        }
+
+        /// <summary>For each newly-full block, extract its content into the
+        /// pool's storage and ask the scheduler to register the content hash
+        /// for prefix sharing.</summary>
+        private int CaptureNewlyFullBlocks(SequenceState seq)
+        {
+            if (!_model.SupportsKVStateSnapshot) return 0;
+
+            int fullBlocksNow = seq.NumComputedTokens / _blockSize;
+            int captured = 0;
+            int previouslyFull = fullBlocksNow;
+            for (int b = 0; b < fullBlocksNow && b < seq.BlockTable.NumBlocks; b++)
+            {
+                var block = seq.BlockTable.Blocks[b];
+                if (block.Used == _blockSize) continue; // already captured
+
+                int startToken = b * _blockSize;
+                long bytes = _model.ComputeKVBlockByteSize(_blockSize);
+                EnsureScratch((int)bytes);
+                var dst = _scratch.AsSpan(0, (int)bytes);
+                if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
+                    break;
+                dst.CopyTo(_pool.Storage.GetSpan(block.Id));
+                block.Used = _blockSize;
+                captured++;
+                if (b < previouslyFull) previouslyFull = b;
+            }
+
+            // Let the scheduler index the newly-full blocks (hash registration).
+            if (captured > 0)
+                _scheduler.OnBlocksCommitted(seq, previouslyFull * _blockSize);
+
+            return captured;
+        }
+
+        private void EnsureScratch(int bytes)
+        {
+            if (_scratch == null || _scratch.Length < bytes)
+                _scratch = new byte[bytes];
+        }
+
+        /// <summary>Reset internal state. Called by the engine on model reload.</summary>
+        public void Reset()
+        {
+            _currentOwner = null;
+            _ownerTokensInModel = 0;
+            _model.ResetKVCache();
+        }
+    }
+
+    /// <summary>Result of executing one ScheduledSequenceWork. Reported back
+    /// to the engine for streaming + stop detection.</summary>
+    public sealed class SequenceStepResult
+    {
+        public SequenceState Sequence { get; init; }
+        public int TokensForwarded { get; init; }
+        public int SampledToken { get; init; } = -1;
+        public bool IsPrefill { get; init; }
+        public int FullBlocksCaptured { get; init; }
+        public long ForwardElapsedTicks { get; init; }
+        public Exception Error { get; init; }
+
+        public bool IsNoOp => TokensForwarded == 0 && Error == null;
+
+        public static SequenceStepResult NoOp(SequenceState s) => new()
+        {
+            Sequence = s,
+            TokensForwarded = 0,
+        };
+    }
+
+    /// <summary>Future hook for true batched paged attention - opt-in marker
+    /// for models that have a native paged forward kernel taking a batch
+    /// metadata struct. Today nothing implements this; <see cref="BatchExecutor"/>
+    /// falls back to per-sequence swap.</summary>
+    public interface IBatchedPagedModel
+    {
+        /// <summary>Drive a single batched forward pass given the scheduler's
+        /// per-step metadata. Returns per-sequence logits.</summary>
+        IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx);
+
+        /// <summary>True iff <c>ForwardBatch</c> handles multimodal
+        /// (vision/audio embeddings + MRoPE positions) for batched
+        /// sequences. When false (default), <see cref="BatchExecutor"/>
+        /// peels multimodal sequences off into the per-sequence path so
+        /// the model's batched kernels never see them. Set true once the
+        /// per-batch position-table + embedding-inject plumbing is in place.</summary>
+        bool SupportsBatchedMultimodal => false;
+    }
+
+    /// <summary>Per-step metadata for the batched paged attention path.
+    /// Mirrors vLLM's <c>CommonAttentionMetadata</c>.</summary>
+    public sealed class BatchedForwardContext
+    {
+        public List<SequenceState> Sequences { get; init; }
+        public List<int> NumScheduledTokens { get; init; }
+        public List<int> QueryStartLoc { get; init; }
+        public List<int> Positions { get; init; }
+        public List<int> SlotMapping { get; init; }
+        public int[][] BlockTables { get; init; }
+        public int MaxQueryLen { get; set; }
+        public int MaxSeqLen { get; set; }
+    }
+}

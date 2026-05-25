@@ -63,6 +63,52 @@ public class ImageProcessorTests
     }
 
     [Fact]
+    public void NemotronImageProcessorCapsTilesForLatencyByDefault()
+    {
+        string path = WriteSyntheticPng(96, 64);
+        string? oldMaxTiles = Environment.GetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES");
+        try
+        {
+            Environment.SetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES", null);
+            var processor = CreateNemotronTestProcessor(maxTiles: 12);
+            var tiles = processor.ProcessImage(path);
+
+            Assert.Single(tiles);
+            Assert.All(tiles, tile =>
+            {
+                Assert.Equal(64, tile.Width);
+                Assert.Equal(64, tile.Height);
+                Assert.Equal(3 * 64 * 64, tile.Pixels.Length);
+            });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES", oldMaxTiles);
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void NemotronImageProcessorHonorsFullTileOverride()
+    {
+        string path = WriteSyntheticPng(96, 64);
+        string? oldMaxTiles = Environment.GetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES");
+        try
+        {
+            Environment.SetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES", "12");
+            var processor = CreateNemotronTestProcessor(maxTiles: 12);
+            var tiles = processor.ProcessImage(path);
+
+            Assert.Equal(7, tiles.Count); // 3x2 tiles plus thumbnail.
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_NEMOTRON_IMAGE_MAX_TILES", oldMaxTiles);
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void UserSuppliedJpegSmokeTestWhenConfigured()
     {
         string? path = Environment.GetEnvironmentVariable("TENSORSHARP_JPEG_SMOKE_PATH");
@@ -153,6 +199,30 @@ public class ImageProcessorTests
         return path;
     }
 
+    private static NemotronImageProcessor CreateNemotronTestProcessor(int maxTiles)
+    {
+        return new NemotronImageProcessor(
+            imageSize: 64,
+            patchSize: 16,
+            numChannels: 3,
+            maxTiles: maxTiles,
+            minNumPatches: 0,
+            maxNumPatches: 0,
+            useThumbnail: true,
+            projectorScaleFactor: 2,
+            imageMean: null,
+            imageStd: null);
+    }
+
+    private static string WriteSyntheticPng(uint width, uint height)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.png");
+        using var image = new MagickImage(MagickColors.Red, width, height);
+        image.Format = MagickFormat.Png;
+        image.Write(path);
+        return path;
+    }
+
     // Synthesize a HEIC file on disk so the round-trip exercise does not require
     // a vendored binary blob. Returns null when the bundled Magick.NET native
     // binaries cannot encode HEIC on this platform (e.g. when x265 is not
@@ -181,4 +251,3 @@ public class ImageProcessorTests
         }
     }
 }
-

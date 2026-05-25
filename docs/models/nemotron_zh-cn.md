@@ -6,7 +6,7 @@
 |---|---|
 | 提供方 | NVIDIA |
 | GGUF 架构标识 | `nemotron_h`、`nemotron_h_moe` |
-| 模型类 | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs) |
+| 模型类 | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs)（旧单序列路径）+ [`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs)（RADIO / v2_vl ViT） |
 | 图像处理器 | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | 音频前端 | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs)（Parakeet 风格 log-mel） |
@@ -14,6 +14,7 @@
 | 模态 | 文本、图像（Omni 版本配合 `mmproj`）。音频已经被预处理用于 Omni 发布版本，但推理需要一个尚未随这些 GGUF 一起发布的 Parakeet `mmproj`。 |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
+| 批处理 / 分页前向 | **可选启用** —— 设置 `TS_NEMOTRON_BATCHED=1`。每槽位 Mamba2 conv + SSM 状态池，注意力层使用分页 K/V。可选的原生批处理 Mamba2 步内核（`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`）。详见 §11。 |
 | 输出解析器 | `Qwen3OutputParser` |
 
 ## 1. 来源与目标
@@ -194,7 +195,7 @@ y   += x * ssm_d                                         # 当 `ssm_d` 存在时
 `NemotronImageProcessor`（镜像 `nemotronh.ImageProcessor`）：
 
 1. RGBA 合成到白底。
-2. 选择最匹配源图像比例的 tile 网格（最多 `maxTiles`），如有 min/max patches 元数据则走动态分辨率模式。
+2. 选择最匹配源图像比例的 tile 网格（最多 `maxTiles`），如有 min/max patches 元数据则走动态分辨率模式。运行时默认把 tiled 图像限制为 1 个 tile，以降低服务器图像聊天的首 token 延迟；设置 `TS_NEMOTRON_IMAGE_MAX_TILES=12`（或模型声明的最大值）可恢复完整分辨率 tiling。
 3. Bicubic resize 到 `gridW * imageSize × gridH * imageSize`（或动态 patch 网格）。
 4. 切成 `imageSize × imageSize` tile，channel-first `[C, H, W]`。
 5. 多于 1 个 tile 时附加可选缩略 tile。
@@ -298,6 +299,8 @@ blk.{L}.ffn_down_shexp.weight
 - **MoE prefill** 仍然 per token 迭代。每 token 用批量 MoE GPU kernel（`MoEExpertsForward`），所以一次派发跑完所有被选 expert，但 token 循环还是托管 C# —— 见下方优化机会。
 - **Attention prefill** 走标准托管循环。Nemotron-H 还没有融合 prefill attention kernel，因为 attention 层没有 RoPE，得分张量也比较小（不需要 SWA 窗口的 machinery）。
 - **Mamba2 prefill** 顺序处理 token（按 `seqLen` 循环）跑 SSM scan；分块并行扫描在优化清单上。
+- **多模态 prefill** 支持按 prompt chunk 切片已准备好的图像 / 音频 embedding span，因此长图像 prompt 不再必须作为一个超大的 forward pass 执行。
+- **多模态 warmup** 在加载 Nemotron `mmproj` 的服务器启动阶段运行一次小的视觉编码和 image-token prefill，把 Metal pipeline 初始化从第一个真实图像请求前移；设置 `TS_NEMOTRON_MULTIMODAL_WARMUP=0` 可关闭。
 
 ## 9. Decode 优化
 
@@ -336,16 +339,105 @@ decode 热路径上的小算子（RMSNorm、residual add、expert / router matmu
 - `ResetKVCache()` 同时清零三类缓存（KV cache、conv state、SSM state）。
 - `SupportsKVCacheTruncation` 返回 **false**，因为 SSM 状态是顺序的，不能部分复用。Nemotron-H 因此不启用多轮 KV cache 复用 —— 服务器在轮次之间回退到完整 reset。
 
-## 11. 输出解析器与聊天模板
+## 11. 批处理 / 分页前向（连续批处理）
+
+Nemotron-H 提供可选启用的 `IBatchedPagedModel.ForwardBatch`
+（[`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs)），
+通过共享 `InferenceEngine` 连续批处理栈执行
+（[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)）。
+设置 `TS_NEMOTRON_BATCHED=1` 启用（默认关闭）。
+
+Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种不同的层类型**
+（Mamba2 SSM、纯注意力、FFN 密集 / MoE），且 Mamba2 是递归（per-sequence
+状态）。批处理路径因此需要两种正交的缓存：
+
+### 注意力层 —— 分页 K/V
+
+- 与 Mistral 3 同构布局（`[numBlocks * blockSize * numKvHeads * headDim]`，
+  每层一份）。
+- 无 RoPE —— Nemotron-H 注意力层不带位置编码。
+- 按序列的注意力派发使用 `ManagedPagedAttention.Forward`（纯 C# 在线
+  softmax 内核）作为正确性参考；同时通过 `GgmlBasicOps` 接入了原生分页
+  内核路径。
+
+### Mamba2 层 —— 每槽位 conv + SSM 状态池
+
+每个序列的递归状态落在一个 slot 中，slot 由其**主块 id** 标识（与 vLLM 的
+`state_indices_tensor` 对齐）：
+
+- `_nemoSlotMamba2NativeDecodeProjected[layer][slot]` —— 每槽位 conv 环形
+  缓冲。
+- `_nemoSlotMamba2NativeDecodeHidden[layer][slot]` —— 每槽位 SSM 状态。
+- `_nemoSlotMamba2NativeDecodeStateInitialized[layer][slot]` —— 初始化
+  标志。
+
+槽位在首次访问时分配，序列在引擎中被回收时释放。
+
+**原生批处理 Mamba2 步内核** —— `TSGgml_NemotronMamba2BatchedStepF32`
+（[`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp)）
+—— 通过 `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 控制。使用 NEON SIMD + GCD
+按 head 并行（结构与 Qwen 3.5 的批处理 GDN 内核一致），把 N 次 C#
+`Mamba2Block` 调用替换为一次原生派发加批处理的 `ssm_in` / `ssm_out` 投
+影。通过 `GgmlBasicOps.NemotronMamba` 暴露。
+
+### FFN —— 密集与 MoE
+
+- 密集 FFN 在批处理 token 轴上跑 token-parallel ReLU²（`up → ReLU² → down`），
+  每个投影一次 matmul。
+- MoE FFN 通过已有的 `MoEForward` token-parallel router + 逐 token expert
+  派发执行（目前没有 Nemotron-H 专用的批处理 MoE 内核）。
+
+### 批处理路径下的多模态
+
+视觉与音频嵌入通过与旧 forward 相同的逐行 `InjectMultimodalEmbeddings`
+路径，直接注入批处理的 `[numTokens, hidden]` tensor。`SupportsBatchedMultimodal`
+在 opt-in 环境变量打开时返回 true。
+
+### 已验证的正确性与吞吐
+
+- 文本 prompt 上与旧路径**100% 贪心一致**
+  （[`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)）。
+- 多模态 prompt 的正确性已被结构性验证（在移除多模态预检拒绝后纯文本仍
+  100%），但缺少本地 audio/image fixture 用于端到端验证。
+
+**NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ2_XXS（Apple M4 Pro、
+GgmlMetal、进程内 legacy-vs-batched 切换；详见
+[`NemotronBatchedPerfBench`](../../InferenceWeb.Tests/NemotronBatchedPerfBench.cs)）
+吞吐**：
+
+| 路径 | n=1 | n=3 | n=5 |
+|---|---|---|---|
+| 批处理 + 托管 Mamba2 步 | 1.94× | 3.43× | 1.67× |
+| 批处理 + 原生 Mamba2 步（`*_NATIVE=1`） | 0.75× | **3.95×** | 2.93× |
+
+`n=1` 是唯一回退：批处理脚手架开销在单序列 decode 上盖过收益。`n=2` 起批
+处理路径全面胜出。`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 在多批 decode 上
+进一步扩大胜势，因为它把 C# Mamba2 内层循环替换为原生 NEON 内核。
+
+移植过程中还修了一个潜伏 bug：`s_nemoBatchedOptIn` 原本是 `static readonly`，
+在 class-load 时捕获环境变量 —— 测试在运行时设置 `TS_NEMOTRON_BATCHED=1`
+实际无法切换路径。现在改为方法 getter（与 Qwen 3.5 的写法一致）。
+
+## 12. 输出解析器与聊天模板
 
 - 复用 `Qwen3OutputParser`：`<think> ... </think>` 表示思维链，`<tool_call>{...}</tool_call>` 表示工具调用。
 - 聊天模板使用 Qwen 3 风格（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
 
-## 12. 优化机会
+## 13. 优化机会
 
-- **原生 whole-model decode** —— 当前整个 forward pass 跑在托管 C#。原生 `NemotronModelDecode`（类比 Qwen 3）能消除托管循环开销。
-- **原生 Mamba2 decode** —— `Mamba2SSMStepSIMD` 中的 SIMD 向量化扫描在 CPU 上已经很快，但原生 CUDA / Metal kernel 能解锁完整 Mamba2 路径在 GPU 上的执行。
-- **分块并行 SSM 扫描** —— Mamba2 prefill 顺序处理 token。分块并行扫描（参考 Mamba 官方 CUDA 实现）能显著降低 TTFT。
-- **向量化 conv1d** —— `Mamba2Conv1dStep` 是标量循环。SIMD 或原生向量化版本能进一步加速 Mamba2 层。
-- **Per-token MoE 批处理** —— 即使有 `MoEExpertsForward`，per-token 托管循环仍是外层驱动。能在单次派发处理多 token 的批量 kernel 对长 prompt 帮助很大。
-- **音频 mmproj 支持** —— 音频前端已经接好，但推理需要尚未在当前 GGUF 中发布的 Parakeet 音频 projector。届时只需把它接入 Gemma 4 同款的 `_pendingAudioEmbeddings` 注入路径，少量代码即可。
+- **原生 whole-model decode** —— 旧的单序列 forward 仍跑在托管 C#。原生
+  `NemotronModelDecode`（类比 Qwen 3）能消除单序列路径上的托管循环开销。
+- **旧路径的原生 Mamba2 decode** —— `Mamba2SSMStepSIMD` 中的 SIMD 向量化
+  扫描在 CPU 上已经很快，但原生 CUDA / Metal 内核能解锁完整 Mamba2 路径在
+  GPU 上的执行（针对单序列路径）。批处理路径已经在
+  `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 下提供了原生内核。
+- **分块并行 SSM 扫描** —— Mamba2 prefill 顺序处理 token。分块并行扫描
+  （参考 Mamba 官方 CUDA 实现）能显著降低 TTFT。
+- **向量化 conv1d** —— `Mamba2Conv1dStep` 是标量循环。SIMD 或原生向量化版
+  本能进一步加速 Mamba2 层。
+- **Per-token MoE 批处理** —— 即使有 `MoEExpertsForward`，per-token 托管循
+  环仍是外层驱动。能在单次派发处理多 token 的批量 kernel 对长 prompt 帮助
+  很大。
+- **音频 mmproj 支持** —— 音频前端已经接好，但推理需要尚未在当前 GGUF 中
+  发布的 Parakeet 音频 projector。届时只需把它接入 Gemma 4 同款的
+  `_pendingAudioEmbeddings` 注入路径，少量代码即可。

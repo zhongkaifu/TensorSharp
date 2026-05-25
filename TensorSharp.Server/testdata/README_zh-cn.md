@@ -27,7 +27,7 @@
 ./TensorSharp.Server --model ~/models/model.gguf --backend ggml_metal
 ```
 
-Windows/Linux + NVIDIA 可使用 `--backend cuda` 或 `--backend ggml_cuda`，macOS 可使用 `--backend ggml_metal`，CPU 测试可使用 `--backend ggml_cpu` 或 `--backend cpu`。
+Windows/Linux + NVIDIA 可使用 `--backend cuda` 或 `--backend ggml_cuda`，macOS 可使用 `--backend ggml_metal` 或 `--backend mlx`，CPU 测试可使用 `--backend ggml_cpu` 或 `--backend cpu`。
 
 2. 运行任一套件：
 

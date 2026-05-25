@@ -6,6 +6,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <OutputPath>bin\</OutputPath>
     <IsPackable>true</IsPackable>
+    <Nullable>disable</Nullable>
     <Description>Core tensor primitives, CPU operations, memory management, storage, and device abstractions for TensorSharp.</Description>
     <PackageTags>$(TensorSharpPackageTags);core;ops;memory;device;cpu</PackageTags>
   </PropertyGroup>
@@ -15,10 +16,8 @@
     <CodeAnalysisRuleSet>MinimumRecommendedRules.ruleset</CodeAnalysisRuleSet>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
     <PackageReference Include="System.Data.DataSetExtensions" Version="4.5.0" />
     <PackageReference Include="System.Numerics.Tensors" Version="10.0.7" />
-    <PackageReference Include="System.Numerics.Vectors" Version="4.5.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" PrivateAssets="all" />

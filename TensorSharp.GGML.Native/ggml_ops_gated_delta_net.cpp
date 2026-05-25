@@ -617,3 +617,418 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
         return 0;
     }
 }
+
+// ---------------------------------------------------------------------------
+// TSGgml_GatedDeltaNetBatchedStepF32
+// ---------------------------------------------------------------------------
+// vLLM-style batched per-token GDN compute. Replaces N separate calls to
+// the C# per-token loop (one per active sequence in a batched decode step)
+// with one native dispatch that walks every (seq, token) pair in a tight
+// loop, indexing into per-sequence state via the descriptors.
+//
+// API mirrors vLLM's fused_sigmoid_gating_delta_rule_update_cpu:
+//   - packed_batched: [num_tokens, packed_dim] row-major, layout per row is
+//       [qkv (qkv_dim) | z (z_dim) | beta (num_v_heads) | alpha (num_v_heads)]
+//   - seqs[i] gives seq_start (row offset), seq_len, and pointers to that
+//     sequence's conv state ring buffer ((conv_kernel-1) * qkv_dim floats)
+//     and ssm state (num_v_heads * head_v_dim * head_k_dim floats). The
+//     conv_write_idx field is updated in place.
+//   - gated_out: [num_tokens, ssm_d_inner] row-major output.
+//
+// The math is a faithful port of Qwen35Model.GatedDeltaNet.GatedDeltaNetStep
+// in C#: ring-buffered Conv1D + SiLU, optional GQA expand (when num_k_heads
+// != num_v_heads), per-head L2-norm + Q scale, per-head delta-rule scan
+// (state *= exp(gate); delta = (v - state·k) * beta; state += k⊗delta;
+// core = state·q), then RMSNorm + ssm_norm * SiLU(z) gating.
+//
+// Currently scalar; SIMD/parallelism can come later (the math is correct
+// regardless of vectorisation). Each sequence is independent so this is
+// trivially parallelisable across seqs.
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
+
+namespace
+{
+    struct GdnBatchedSeqDesc
+    {
+        int32_t seq_start;
+        int32_t seq_len;
+        int32_t conv_write_idx;  // in/out
+        int32_t pad;
+        void*   conv_state;      // float* — [conv_dim * qkv_dim], conv_dim = conv_kernel - 1
+        void*   ssm_state;       // float* — [num_v_heads, head_v_dim, head_k_dim]
+    };
+
+    static inline float softplus_scalar(float x)
+    {
+        // Numerically stable softplus matching the C# SoftplusScalar helper.
+        if (x > 20.0f) return x;
+        if (x < -20.0f) return std::exp(x);
+        return std::log1p(std::exp(x));
+    }
+
+    static inline float sigmoid_scalar(float x)
+    {
+        return 1.0f / (1.0f + std::exp(-x));
+    }
+
+    static inline float silu_scalar(float x)
+    {
+        return x * sigmoid_scalar(x);
+    }
+
+#if defined(__ARM_NEON)
+    static inline float vec_dot(const float* a, const float* b, int n)
+    {
+        int i = 0;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; i <= n - 8; i += 8)
+        {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        }
+        float32x4_t acc = vaddq_f32(acc0, acc1);
+        for (; i <= n - 4; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+        float s = vaddvq_f32(acc);
+        for (; i < n; i++) s += a[i] * b[i];
+        return s;
+    }
+
+    static inline void vec_scale(float* a, float s, int n)
+    {
+        int i = 0;
+        float32x4_t vs = vdupq_n_f32(s);
+        for (; i <= n - 8; i += 8)
+        {
+            vst1q_f32(a + i,     vmulq_f32(vld1q_f32(a + i),     vs));
+            vst1q_f32(a + i + 4, vmulq_f32(vld1q_f32(a + i + 4), vs));
+        }
+        for (; i <= n - 4; i += 4)
+            vst1q_f32(a + i, vmulq_f32(vld1q_f32(a + i), vs));
+        for (; i < n; i++) a[i] *= s;
+    }
+
+    static inline void vec_scale_add(float* a, const float* b, float s, int n)
+    {
+        int i = 0;
+        float32x4_t vs = vdupq_n_f32(s);
+        for (; i <= n - 8; i += 8)
+        {
+            vst1q_f32(a + i,     vfmaq_f32(vld1q_f32(a + i),     vld1q_f32(b + i),     vs));
+            vst1q_f32(a + i + 4, vfmaq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4), vs));
+        }
+        for (; i <= n - 4; i += 4)
+            vst1q_f32(a + i, vfmaq_f32(vld1q_f32(a + i), vld1q_f32(b + i), vs));
+        for (; i < n; i++) a[i] += b[i] * s;
+    }
+
+    static inline float vec_sumsq(const float* a, int n)
+    {
+        int i = 0;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        for (; i <= n - 8; i += 8)
+        {
+            float32x4_t v0 = vld1q_f32(a + i);
+            float32x4_t v1 = vld1q_f32(a + i + 4);
+            acc0 = vfmaq_f32(acc0, v0, v0);
+            acc1 = vfmaq_f32(acc1, v1, v1);
+        }
+        float32x4_t acc = vaddq_f32(acc0, acc1);
+        for (; i <= n - 4; i += 4)
+        {
+            float32x4_t v = vld1q_f32(a + i);
+            acc = vfmaq_f32(acc, v, v);
+        }
+        float s = vaddvq_f32(acc);
+        for (; i < n; i++) s += a[i] * a[i];
+        return s;
+    }
+
+    // Element-wise multiply-into: dst[i] = a[i] * b[i]
+    static inline void vec_mul_into(float* dst, const float* a, const float* b, int n)
+    {
+        int i = 0;
+        for (; i <= n - 8; i += 8)
+        {
+            vst1q_f32(dst + i,     vmulq_f32(vld1q_f32(a + i),     vld1q_f32(b + i)));
+            vst1q_f32(dst + i + 4, vmulq_f32(vld1q_f32(a + i + 4), vld1q_f32(b + i + 4)));
+        }
+        for (; i <= n - 4; i += 4)
+            vst1q_f32(dst + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+        for (; i < n; i++) dst[i] = a[i] * b[i];
+    }
+
+    // Element-wise FMA: dst[i] += a[i] * b[i]
+    static inline void vec_fma(float* dst, const float* a, const float* b, int n)
+    {
+        int i = 0;
+        for (; i <= n - 8; i += 8)
+        {
+            vst1q_f32(dst + i,     vfmaq_f32(vld1q_f32(dst + i),     vld1q_f32(a + i),     vld1q_f32(b + i)));
+            vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), vld1q_f32(a + i + 4), vld1q_f32(b + i + 4)));
+        }
+        for (; i <= n - 4; i += 4)
+            vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), vld1q_f32(a + i), vld1q_f32(b + i)));
+        for (; i < n; i++) dst[i] += a[i] * b[i];
+    }
+#else
+    static inline float vec_dot(const float* a, const float* b, int n)
+    {
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) s += a[i] * b[i];
+        return s;
+    }
+    static inline void vec_scale(float* a, float s, int n)
+    {
+        for (int i = 0; i < n; i++) a[i] *= s;
+    }
+    static inline void vec_scale_add(float* a, const float* b, float s, int n)
+    {
+        for (int i = 0; i < n; i++) a[i] += b[i] * s;
+    }
+    static inline float vec_sumsq(const float* a, int n)
+    {
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) s += a[i] * a[i];
+        return s;
+    }
+    static inline void vec_mul_into(float* dst, const float* a, const float* b, int n)
+    {
+        for (int i = 0; i < n; i++) dst[i] = a[i] * b[i];
+    }
+    static inline void vec_fma(float* dst, const float* a, const float* b, int n)
+    {
+        for (int i = 0; i < n; i++) dst[i] += a[i] * b[i];
+    }
+#endif
+
+    static inline void l2_normalize_in_place(float* x, int n)
+    {
+        float ss = vec_sumsq(x, n);
+        float inv = 1.0f / std::sqrt(ss + 1e-12f);
+        vec_scale(x, inv, n);
+    }
+}
+
+TSG_EXPORT int TSGgml_GatedDeltaNetBatchedStepF32(
+    int32_t                num_seqs,
+    GdnBatchedSeqDesc*     seqs,
+    int32_t                num_tokens,
+    const float*           packed_batched,
+    int32_t                packed_dim,
+    int32_t                qkv_dim,
+    int32_t                qk_dim,
+    int32_t                v_dim,
+    int32_t                z_dim,
+    int32_t                num_k_heads,
+    int32_t                num_v_heads,
+    int32_t                head_k_dim,
+    int32_t                head_v_dim,
+    int32_t                conv_kernel,
+    int32_t                ssm_d_inner,
+    const float*           conv_wt,
+    const float*           dt_bias,
+    const float*           a_log,
+    const float*           ssm_norm_w,
+    float                  eps,
+    float*                 gated_out)
+{
+    try
+    {
+        if (num_seqs <= 0 || seqs == nullptr ||
+            packed_batched == nullptr || gated_out == nullptr ||
+            conv_wt == nullptr || dt_bias == nullptr ||
+            a_log == nullptr || ssm_norm_w == nullptr)
+        {
+            set_last_error("GatedDeltaNetBatchedStep: null arg or num_seqs<=0.");
+            return 0;
+        }
+
+        const int conv_dim = conv_kernel - 1;
+        const int state_per_head = head_v_dim * head_k_dim;
+        const float q_scale = 1.0f / std::sqrt(static_cast<float>(head_v_dim));
+
+        // Scratch per call. Sized for the largest contiguous step we do; small
+        // enough to live on the stack-ish heap. Using std::vector keeps it simple.
+        std::vector<float> conv_out(qkv_dim);
+        std::vector<float> q_active(num_v_heads * head_k_dim);
+        std::vector<float> k_active(num_v_heads * head_k_dim);
+        std::vector<float> delta_buf(num_v_heads * head_v_dim);
+        std::vector<float> core_buf(num_v_heads * head_v_dim);
+
+        for (int si = 0; si < num_seqs; si++)
+        {
+            GdnBatchedSeqDesc& sd = seqs[si];
+            float* conv_state = static_cast<float*>(sd.conv_state);
+            float* ssm_state  = static_cast<float*>(sd.ssm_state);
+            int    write_idx  = sd.conv_write_idx;
+            const int seq_start = sd.seq_start;
+            const int seq_len   = sd.seq_len;
+            if (seq_len <= 0) continue;
+            if (conv_state == nullptr || ssm_state == nullptr)
+            {
+                set_last_error("GatedDeltaNetBatchedStep: per-seq state pointer is null.");
+                return 0;
+            }
+
+            for (int t = 0; t < seq_len; t++)
+            {
+                const float* row = packed_batched + static_cast<long>(seq_start + t) * packed_dim;
+                const float* qkv_in   = row;
+                const float* z_ptr    = row + qkv_dim;
+                const float* beta_ptr = z_ptr + z_dim;
+                const float* alpha_ptr= beta_ptr + num_v_heads;
+
+                // --- Conv1D step ---
+                // tap 0..conv_dim-1: from ring state; tap conv_dim: current input.
+                if (conv_dim > 0)
+                {
+                    int slot = write_idx;
+                    const float* sp = conv_state + static_cast<long>(slot) * qkv_dim;
+                    const float* wp = conv_wt; // tap 0
+                    vec_mul_into(conv_out.data(), sp, wp, qkv_dim);
+                    for (int ki = 1; ki < conv_dim; ki++)
+                    {
+                        slot = (write_idx + ki) % conv_dim;
+                        sp = conv_state + static_cast<long>(slot) * qkv_dim;
+                        wp = conv_wt + static_cast<long>(ki) * qkv_dim;
+                        vec_fma(conv_out.data(), sp, wp, qkv_dim);
+                    }
+                    const float* wp_now = conv_wt + static_cast<long>(conv_dim) * qkv_dim;
+                    vec_fma(conv_out.data(), qkv_in, wp_now, qkv_dim);
+                }
+                else
+                {
+                    vec_mul_into(conv_out.data(), qkv_in, conv_wt, qkv_dim);
+                }
+                // SiLU in place. Scalar — fine; qkv_dim is small per token.
+                for (int ch = 0; ch < qkv_dim; ch++) conv_out[ch] = silu_scalar(conv_out[ch]);
+
+                // Update ring state with current input (matches C# behavior:
+                // GatedDeltaNetStep writes qkvPtr to state[writeIdx] AFTER
+                // computing the conv output that already used that input as
+                // the "current" tap above).
+                if (conv_dim > 0)
+                {
+                    float* dst = conv_state + static_cast<long>(write_idx) * qkv_dim;
+                    std::memcpy(dst, qkv_in, qkv_dim * sizeof(float));
+                    write_idx = (write_idx + 1) % conv_dim;
+                }
+
+                // Split conv_out into Q (qk_dim), K (qk_dim), V (v_dim).
+                const float* q_raw = conv_out.data();
+                const float* k_raw = conv_out.data() + qk_dim;
+                const float* v_raw = conv_out.data() + 2 * qk_dim;
+
+                // Expand Q/K from KV-heads to V-heads if GQA differs.
+                float* q_active_ptr;
+                float* k_active_ptr;
+                if (num_k_heads == num_v_heads)
+                {
+                    // No expansion needed; use raw pointers but we still need
+                    // mutable arrays for L2-norm + scale. Copy into the active
+                    // buffers (cheap; qk_dim is small per token).
+                    std::memcpy(q_active.data(), q_raw, qk_dim * sizeof(float));
+                    std::memcpy(k_active.data(), k_raw, qk_dim * sizeof(float));
+                }
+                else
+                {
+                    for (int h = 0; h < num_v_heads; h++)
+                    {
+                        int src = h % num_k_heads;
+                        std::memcpy(q_active.data() + h * head_k_dim,
+                                    q_raw + src * head_k_dim,
+                                    head_k_dim * sizeof(float));
+                        std::memcpy(k_active.data() + h * head_k_dim,
+                                    k_raw + src * head_k_dim,
+                                    head_k_dim * sizeof(float));
+                    }
+                }
+                q_active_ptr = q_active.data();
+                k_active_ptr = k_active.data();
+
+                // L2 normalize per head, then scale Q by 1/sqrt(head_v_dim).
+                for (int h = 0; h < num_v_heads; h++)
+                {
+                    l2_normalize_in_place(q_active_ptr + h * head_k_dim, head_k_dim);
+                    l2_normalize_in_place(k_active_ptr + h * head_k_dim, head_k_dim);
+                }
+                vec_scale(q_active_ptr, q_scale, num_v_heads * head_k_dim);
+
+                // Per-head delta-rule scan. Heads are fully independent within a
+                // single token (each has its own state slice), so we run them in
+                // parallel via GCD on macOS — matching the C# Parallel.For path
+                // in Qwen35Model.GatedDeltaNet.GatedDeltaNetStep, which is what
+                // makes the legacy per-seq loop fast enough to be competitive.
+                float* gated_row = gated_out + static_cast<long>(seq_start + t) * ssm_d_inner;
+                auto head_body = [&](int h) {
+                    float* state_h  = ssm_state + static_cast<long>(h) * state_per_head;
+                    const float* qh = q_active_ptr + h * head_k_dim;
+                    const float* kh = k_active_ptr + h * head_k_dim;
+                    const float* vh = v_raw + h * head_v_dim;
+                    const float* zh = z_ptr + h * head_v_dim;
+                    float* delta_h  = delta_buf.data() + h * head_v_dim;
+                    float* core_h   = core_buf.data() + h * head_v_dim;
+                    float* gated_h  = gated_row + h * head_v_dim;
+
+                    float alpha_biased = alpha_ptr[h] + dt_bias[h];
+                    float gate_h = softplus_scalar(alpha_biased) * a_log[h];
+                    vec_scale(state_h, std::exp(gate_h), state_per_head);
+
+                    float beta_h = sigmoid_scalar(beta_ptr[h]);
+                    for (int row = 0; row < head_v_dim; row++)
+                    {
+                        float kv_mem = vec_dot(state_h + row * head_k_dim, kh, head_k_dim);
+                        delta_h[row] = (vh[row] - kv_mem) * beta_h;
+                    }
+                    for (int row = 0; row < head_v_dim; row++)
+                    {
+                        float* state_row = state_h + row * head_k_dim;
+                        vec_scale_add(state_row, kh, delta_h[row], head_k_dim);
+                        core_h[row] = vec_dot(state_row, qh, head_k_dim);
+                    }
+                    float rms_inv = 1.0f / std::sqrt((vec_sumsq(core_h, head_v_dim) / head_v_dim) + eps);
+                    for (int i = 0; i < head_v_dim; i++)
+                        gated_h[i] = core_h[i] * rms_inv * ssm_norm_w[i] * silu_scalar(zh[i]);
+                };
+#if defined(__APPLE__)
+                if (num_v_heads >= 4)
+                {
+                    dispatch_apply(static_cast<size_t>(num_v_heads),
+                                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                                   ^(size_t h) { head_body(static_cast<int>(h)); });
+                }
+                else
+                {
+                    for (int h = 0; h < num_v_heads; h++) head_body(h);
+                }
+#else
+                for (int h = 0; h < num_v_heads; h++) head_body(h);
+#endif
+            }
+
+            sd.conv_write_idx = write_idx;
+        }
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in GatedDeltaNetBatchedStep.");
+        return 0;
+    }
+}

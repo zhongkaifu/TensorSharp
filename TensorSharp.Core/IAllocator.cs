@@ -15,7 +15,8 @@ namespace TensorSharp
         MKL,
         CUDA,
         GGML_METAL,
-        GGML_CPU
+        GGML_CPU,
+        MLX
     }
 
 

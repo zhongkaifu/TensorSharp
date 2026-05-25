@@ -142,7 +142,7 @@ namespace TensorSharp.Runtime
             List<ChatMessage> messages,
             string architecture,
             bool addGenerationPrompt,
-            List<ToolFunction> tools = null,
+            List<ToolFunction>? tools = null,
             bool enableThinking = false)
         {
             if (tokenizer == null)
@@ -153,8 +153,8 @@ namespace TensorSharp.Runtime
             // Build a parallel list where each cached assistant message is replaced with a
             // placeholder ChatMessage. Track the raw tokens in render order so we can splice
             // them back in.
-            List<ChatMessage> renderedMessages = null;
-            List<List<int>> rawTokensByPlaceholderIndex = null;
+            List<ChatMessage>? renderedMessages = null;
+            List<List<int>>? rawTokensByPlaceholderIndex = null;
             int placeholderCount = 0;
 
             for (int i = 0; i < messages.Count; i++)
@@ -168,7 +168,7 @@ namespace TensorSharp.Runtime
                 if (!hasRawTokens)
                 {
                     if (renderedMessages != null)
-                        renderedMessages.Add(msg);
+                        renderedMessages.Add(msg!);
                     continue;
                 }
 
@@ -182,7 +182,7 @@ namespace TensorSharp.Runtime
 
                 renderedMessages.Add(new ChatMessage
                 {
-                    Role = msg.Role,
+                    Role = msg!.Role,
                     Content = MakePlaceholder(placeholderCount),
                     // Don't carry Thinking through the template - the raw tokens already contain it.
                     Thinking = null,
@@ -192,7 +192,7 @@ namespace TensorSharp.Runtime
                     IsVideo = msg.IsVideo,
                 });
 
-                rawTokensByPlaceholderIndex.Add(msg.RawOutputTokens);
+                rawTokensByPlaceholderIndex!.Add(msg.RawOutputTokens!);
                 placeholderCount++;
             }
 
@@ -236,7 +236,7 @@ namespace TensorSharp.Runtime
             if (rendererStrippedTrailingWhitespace)
                 text = TrimWhitespaceBeforeEachPlaceholder(text);
 
-            return TokenizeAndReplacePlaceholderSpans(tokenizer, text, rawTokensByPlaceholderIndex);
+            return TokenizeAndReplacePlaceholderSpans(tokenizer, text, rawTokensByPlaceholderIndex!);
         }
 
         private static string TrimWhitespaceBeforeEachPlaceholder(string text)

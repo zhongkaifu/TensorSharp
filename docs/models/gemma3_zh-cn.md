@@ -13,6 +13,7 @@
 | 模态 | 文本、图像 |
 | 思维链模式 | 不支持 |
 | 工具调用 | 不支持 |
+| 批处理 / 分页前向 | 未实现。当连续批处理引擎激活时，Gemma 3 走 `BatchExecutor` 的按序列 KV 交换回退路径。详见 §11。 |
 | 输出解析器 | `PassthroughOutputParser` |
 
 ## 1. 来源与目标
@@ -217,13 +218,32 @@ GGML CUDA / Metal 后端时每个 matmul、RMSNorm、RoPE、softmax、attention 
 
 量化权重通过 `LoadWeights()` 后保留在 `_quantWeights`；matmul 直接走后端的原生量化 matmul，不解压到 FP32。
 
-## 11. 输出解析器与聊天模板
+## 11. 批处理 / 分页前向（连续批处理）
+
+Gemma 3 **未实现** `IBatchedPagedModel.ForwardBatch`。当连续批处理引擎激
+活时（`TensorSharp.Server` 默认开启），Gemma 3 的序列走
+`BatchExecutor.ExecuteStepPerSequence` —— 即按序列 KV 交换回退路径，依靠
+模型的 `TryExtractKVBlock` / `TryInjectKVBlock` 协议在调度器把不同序列交
+给模型时搬入搬出 KV 状态。调度器、分页块池、前缀缓存索引、请求流式输出
+都仍然生效；与真正的批处理移植（Mistral 3 / Gemma 4 / Qwen 3 等）的区别
+只是 Gemma 3 在每个调度步骤内一次跑一个序列，而不是把 N 个序列打包成一
+次前向。
+
+把 Gemma 3 移植到 `IBatchedPagedModel` 主要是 Gemma 4 批处理移植的镜像，
+但需求更简单（无 PLE、无 KV donor 共享、无逐层 head dim 异构），同时仍需
+应对相同的 SWA / 全局注意力交替派发以及环形缓存考量。这是一个可行的后续
+工作，已列入 §13 优化机会。
+
+## 12. 输出解析器与聊天模板
 
 - `Gemma3OutputParser` 等同于 `PassthroughOutputParser` —— Gemma 3 没有思维链 / 工具调用 wire 格式。
 - 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置的 Gemma chat 模板。
 
-## 12. 优化机会
+## 13. 优化机会
 
+- **批处理 / 分页前向移植** —— 实现 `IBatchedPagedModel.ForwardBatch` 能
+  让 Gemma 3 使用与 Mistral 3 / Gemma 4 / Qwen 3 相同的连续批处理引擎路径，
+  并复用原生分页注意力内核已经支持的逐层 SWA 派发。
 - **融合 QKV** —— Q、K、V 仍是三个独立投影。仿照 Gemma 4 / Qwen 3 拼成单次 matmul 可以把注意力调度数减半。
 - **融合整模型 decode** —— 引入类似 `Gemma4ModelDecode` 的 `Gemma3ModelDecode` 可以消除 Metal / CUDA 上的 per-op CPU/GPU 往返。
 - **环形 SWA cache** —— SWA 层可以只分配 `slidingWindow` 个槽位（参考 Gemma 4 的 `CopyToCacheCircular()`）。

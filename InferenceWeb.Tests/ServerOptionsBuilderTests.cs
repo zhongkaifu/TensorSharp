@@ -133,6 +133,221 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.NotNull(options.DefaultSamplingConfig);
     }
 
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_PagedKvFlag_SetsEnabledEnvVar()
+    {
+        _env.Set("TS_KV_PAGED_CACHE", null);
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv" });
+        Assert.True(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_KV_PAGED_CACHE"));
+        var cfg = PagedKvCacheConfig.FromEnvironment();
+        Assert.True(cfg.Enabled);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_NoPagedKvFlag_DisablesEnabledEnvVar()
+    {
+        _env.Set("TS_KV_PAGED_CACHE", "1");
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--no-paged-kv" });
+        Assert.True(applied);
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_KV_PAGED_CACHE"));
+        Assert.False(PagedKvCacheConfig.FromEnvironment().Enabled);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_AppliesBlockSizeAndCaps()
+    {
+        _env.Set("TS_KV_PAGED_CACHE", null);
+        _env.Set("TS_KV_BLOCK_SIZE", null);
+        _env.Set("TS_KV_CACHE_MAX_RAM_MB", null);
+        _env.Set("TS_KV_CACHE_SSD_DIR", null);
+        _env.Set("TS_KV_CACHE_MAX_SSD_MB", null);
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[]
+        {
+            "--paged-kv",
+            "--paged-kv-block-size", "128",
+            "--paged-kv-ram-mb", "2048",
+            "--paged-kv-ssd-dir", "/tmp/ts-paged-ssd",
+            "--paged-kv-ssd-mb", "32768",
+        });
+        Assert.True(applied);
+        var cfg = PagedKvCacheConfig.FromEnvironment();
+        Assert.True(cfg.Enabled);
+        Assert.Equal(128, cfg.BlockSize);
+        Assert.Equal(2048L * 1024 * 1024, cfg.MaxRamBytes);
+        Assert.Equal("/tmp/ts-paged-ssd", cfg.SsdDirectory);
+        Assert.Equal(32768L * 1024 * 1024, cfg.MaxSsdBytes);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_NoFlags_LeavesEnvUnchanged()
+    {
+        _env.Set("TS_KV_PAGED_CACHE", "1");
+        _env.Set("TS_KV_BLOCK_SIZE", "256");
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--unrelated", "--value" });
+        Assert.False(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_KV_PAGED_CACHE"));
+        Assert.Equal("256", Environment.GetEnvironmentVariable("TS_KV_BLOCK_SIZE"));
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_RejectsBadInteger()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv-block-size", "abc" }));
+    }
+
+    [Fact]
+    public void ApplyContinuousBatchingCliFlag_OnFlag_EnablesBothEnvVars()
+    {
+        _env.Set("TS_SCHED_DISABLE_BATCHED", null);
+        _env.Set("TS_QWEN35_BATCHED", null);
+        bool applied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(new[] { "--continuous-batching" });
+        Assert.True(applied);
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED"));
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED"));
+    }
+
+    [Fact]
+    public void ApplyContinuousBatchingCliFlag_OffFlag_DisablesBatchedAtBothLayers()
+    {
+        _env.Set("TS_SCHED_DISABLE_BATCHED", null);
+        _env.Set("TS_QWEN35_BATCHED", "1");
+        bool applied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(new[] { "--no-continuous-batching" });
+        Assert.True(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED"));
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED"));
+    }
+
+    [Fact]
+    public void ApplyContinuousBatchingCliFlag_PagedBatchingAlias_BehavesSameAsCanonical()
+    {
+        _env.Set("TS_SCHED_DISABLE_BATCHED", null);
+        _env.Set("TS_QWEN35_BATCHED", null);
+        Assert.True(ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(new[] { "--paged-batching" }));
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED"));
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED"));
+        Assert.True(ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(new[] { "--no-paged-batching" }));
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED"));
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED"));
+    }
+
+    [Fact]
+    public void ApplyContinuousBatchingCliFlag_NoFlag_LeavesEnvUnchanged()
+    {
+        _env.Set("TS_SCHED_DISABLE_BATCHED", "0");
+        _env.Set("TS_QWEN35_BATCHED", "1");
+        bool applied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(new[] { "--unrelated", "value" });
+        Assert.False(applied);
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED"));
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED"));
+    }
+
+    [Fact]
+    public void ApplyContinuousBatchingCliFlag_OnFlag_ServerBuildDoesNotTripUnknownArgTrap()
+    {
+        // ParseArgs throws on unknown flags; this regression-tests that the
+        // continuous-batching flag is recognised in the skip list inside
+        // ParseArgs so the server boots cleanly when it's set.
+        _env.Set("TS_SCHED_DISABLE_BATCHED", null);
+        _env.Set("TS_QWEN35_BATCHED", null);
+        var options = ServerOptionsBuilder.Build(new[] { "--continuous-batching" }, _baseDir);
+        Assert.NotNull(options);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_QuantBits4_SetsEnvVarAndCodecPicksItUp()
+    {
+        _env.Set("TS_KV_PAGED_QUANT_BITS", null);
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[]
+        {
+            "--paged-kv",
+            "--paged-kv-quant-bits", "4",
+        });
+        Assert.True(applied);
+        Assert.Equal("4", Environment.GetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS"));
+
+        // End-to-end: the codec factory must materialize an int4 codec from
+        // the env var the flag just wrote.
+        var codec = TurboQuantKvCodec.FromEnvironment(KvCodecElementType.Float16);
+        Assert.NotNull(codec);
+        Assert.Equal(4, codec.BitsPerElement);
+        Assert.Equal("turboquant-int4", codec.Name);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_QuantBits8_SetsEnvVar()
+    {
+        _env.Set("TS_KV_PAGED_QUANT_BITS", null);
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[]
+        {
+            "--paged-kv-quant-bits", "8",
+        });
+        Assert.True(applied);
+        Assert.Equal("8", Environment.GetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS"));
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_QuantBits0_DisablesCodec()
+    {
+        _env.Set("TS_KV_PAGED_QUANT_BITS", "4");
+        bool applied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[]
+        {
+            "--paged-kv-quant-bits", "0",
+        });
+        Assert.True(applied);
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS"));
+        // 0 -> codec factory returns null (no quantization).
+        Assert.Null(TurboQuantKvCodec.FromEnvironment(KvCodecElementType.Float16));
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_QuantBits_RejectsUnsupportedBitWidth()
+    {
+        // Anything other than 0 / 4 / 8 is rejected with a clear error so
+        // operators don't silently get passthrough when they typed --quant-bits 6.
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv-quant-bits", "6" }));
+    }
+
+    [Fact]
+    public void Build_UnknownFlag_ThrowsWithTypoSuggestion()
+    {
+        // Repro for the user-reported bug: `--mproj` (single p) silently
+        // dropped under the previous arg-parser, so the server launched with
+        // no vision projector and produced text unrelated to the uploaded
+        // image. Fail fast now and tell the operator what they probably meant.
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.Build(new[] { "--mproj", "/tmp/foo.gguf" }, _baseDir));
+        Assert.Contains("--mproj", ex.Message);
+        Assert.Contains("--mmproj", ex.Message);
+    }
+
+    [Fact]
+    public void Build_PagedKvFlagsAlongsideMainFlags_DoNotTripUnknownArgCheck()
+    {
+        // The paged-kv flags are consumed by a separate pass before ParseArgs;
+        // ParseArgs's unknown-arg guard must recognise them so the two passes
+        // don't collide.
+        var options = ServerOptionsBuilder.Build(
+            new[]
+            {
+                "--paged-kv",
+                "--paged-kv-block-size", "128",
+                "--temperature", "0.42",
+                "--no-paged-kv-cache",
+            },
+            _baseDir);
+        Assert.Equal(0.42f, options.DefaultSamplingConfig.Temperature);
+    }
+
+    [Fact]
+    public void ApplyPagedKvCacheCliFlags_QuantBits_RejectsNonInteger()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv-quant-bits", "int4" }));
+    }
+
     /// <summary>
     /// Disposable helper that snapshots and restores environment variables
     /// touched during a test. Without this, the env vars set by one test could

@@ -906,7 +906,7 @@ public class PrefillOptimizationBenchmark
     {
         const int numQHeads = 16, numKVHeads = 4, seqLen = 512, hd = 128;
         int groupSize = numQHeads / numKVHeads;
-        const int warmup = 2, iters = 10;
+        const int iters = 10;
 
         using var Q = RandTensor(numQHeads, seqLen, hd);
         using var K = RandTensor(numKVHeads, seqLen, hd);

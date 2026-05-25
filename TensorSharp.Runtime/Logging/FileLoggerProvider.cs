@@ -40,9 +40,9 @@ namespace TensorSharp.Runtime.Logging
 
         private DateTime _currentDateUtc;
         private int _rolloverSuffix;
-        private string _currentFilePath;
+        private string? _currentFilePath;
         private long _currentFileBytes;
-        private FileStream _currentFile;
+        private FileStream? _currentFile;
         private bool _disposed;
 
         public FileLoggerProvider(FileLoggerOptions options)
@@ -127,6 +127,7 @@ namespace TensorSharp.Runtime.Logging
         {
             while (_queue.TryDequeue(out var entry))
             {
+                if (entry == null) continue;
                 try
                 {
                     WriteEntry(entry);
@@ -163,7 +164,7 @@ namespace TensorSharp.Runtime.Logging
             lock (_writeLock)
             {
                 EnsureFile(bytes.Length);
-                _currentFile.Write(bytes, 0, bytes.Length);
+                _currentFile!.Write(bytes, 0, bytes.Length);
                 _currentFileBytes += bytes.Length;
                 _currentFile.Flush();
             }

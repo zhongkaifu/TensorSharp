@@ -1,0 +1,147 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using TensorSharp.Runtime.Paged;
+
+namespace TensorSharp.Runtime.Scheduling
+{
+    /// <summary>
+    /// Per-request mutable state owned by the scheduler. Combines vLLM's
+    /// <c>Request</c> + <c>SequenceData</c> + <c>BlockTable</c> entry into one
+    /// object since TensorSharp does not split request and sequence the way
+    /// vLLM does (we don't yet support n&gt;1 sampling per request).
+    /// </summary>
+    public sealed class SequenceState
+    {
+        private static long _counter;
+
+        public SequenceState(
+            string requestId,
+            IReadOnlyList<int> promptTokens,
+            int maxNewTokens,
+            int blockSize,
+            SamplingConfig samplingConfig,
+            object userTag = null)
+        {
+            if (promptTokens == null) throw new ArgumentNullException(nameof(promptTokens));
+            if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
+            if (maxNewTokens <= 0) throw new ArgumentOutOfRangeException(nameof(maxNewTokens));
+
+            Sn = Interlocked.Increment(ref _counter);
+            RequestId = requestId ?? $"seq-{Sn:X}";
+            BlockTable = new BlockTable(blockSize);
+            PromptTokens = new List<int>(promptTokens);
+            OutputTokens = new List<int>(capacity: Math.Min(maxNewTokens, 256));
+            MaxNewTokens = maxNewTokens;
+            SamplingConfig = samplingConfig ?? SamplingConfig.Default;
+            Status = SequenceStatus.Waiting;
+            SubmittedAt = DateTime.UtcNow;
+            UserTag = userTag;
+        }
+
+        /// <summary>Monotonic submission sequence number. Used as FCFS tiebreaker
+        /// when multiple sequences share the same priority.</summary>
+        public long Sn { get; }
+
+        public string RequestId { get; }
+        public List<int> PromptTokens { get; }
+        public List<int> OutputTokens { get; }
+        public int MaxNewTokens { get; }
+        public SamplingConfig SamplingConfig { get; }
+
+        /// <summary>Sticky reference the caller can use to associate a session,
+        /// HTTP request, or telemetry context with this sequence.</summary>
+        public object UserTag { get; }
+
+        public SequenceStatus Status { get; internal set; }
+        public DateTime SubmittedAt { get; }
+        public int Priority { get; set; } = 0;
+
+        /// <summary>The sequence's logical→physical block mapping.</summary>
+        public BlockTable BlockTable { get; }
+
+        /// <summary>Total tokens whose K/V is committed to the block table. After
+        /// each step the executor calls <see cref="AdvanceComputedTokens"/>.</summary>
+        public int NumComputedTokens { get; private set; }
+
+        /// <summary>Total tokens in this sequence (prompt + generated so far).</summary>
+        public int NumTotalTokens => PromptTokens.Count + OutputTokens.Count;
+
+        /// <summary>Tokens that still need a forward pass to be committed
+        /// (prefill + any not-yet-decoded generation).</summary>
+        public int NumUncomputedTokens => NumTotalTokens - NumComputedTokens;
+
+        /// <summary>The logits produced by the most recent forward at the
+        /// sequence's "current" position. Used by the next step's sampler.</summary>
+        public float[] LastLogits { get; internal set; }
+
+        /// <summary>Reason the sequence finished, set when <see cref="Status"/>
+        /// becomes one of the Finished* values.</summary>
+        public string FinishReason { get; internal set; }
+
+        /// <summary>Optional exception when <see cref="Status"/> is FinishedError.</summary>
+        public Exception Error { get; internal set; }
+
+        /// <summary>Per-step telemetry: when scheduling started for this seq.</summary>
+        public DateTime? FirstScheduledAt { get; internal set; }
+
+        /// <summary>When the very first token of generation was produced.</summary>
+        public DateTime? FirstTokenAt { get; internal set; }
+
+        /// <summary>How many tokens were restored from prefix cache (block hash
+        /// hits) at admission time. Diagnostic only.</summary>
+        public int PrefixCacheReusedTokens { get; internal set; }
+
+        /// <summary>Returns the token at logical position <paramref name="pos"/>
+        /// (prompt or generated).</summary>
+        public int TokenAt(int pos)
+        {
+            if (pos < PromptTokens.Count) return PromptTokens[pos];
+            int outIdx = pos - PromptTokens.Count;
+            if (outIdx < OutputTokens.Count) return OutputTokens[outIdx];
+            throw new ArgumentOutOfRangeException(nameof(pos));
+        }
+
+        public void AdvanceComputedTokens(int n)
+        {
+            NumComputedTokens += n;
+            BlockTable.AdvanceTokens(n);
+        }
+
+        /// <summary>Set computed-token counter directly without touching the
+        /// block table. Used by the scheduler when admitting a sequence that
+        /// reused prefix-cache blocks - the blocks are already populated, so
+        /// we mark them as committed without going through AdvanceTokens (which
+        /// would double-count against the block table).</summary>
+        internal void SetComputedTokensForPrefixAdoption(int n)
+        {
+            NumComputedTokens = n;
+            BlockTable.AdvanceTokens(n);
+        }
+
+        /// <summary>Reset computed-token counter to 0. Called when the
+        /// sequence is preempted - its blocks were freed, the next admission
+        /// re-prefills from scratch (with the help of the prefix cache).</summary>
+        internal void ResetForPreemption()
+        {
+            NumComputedTokens = 0;
+            LastLogits = null;
+        }
+
+        public void AppendOutputToken(int token)
+        {
+            OutputTokens.Add(token);
+        }
+
+        public bool ShouldStopForLength() => OutputTokens.Count >= MaxNewTokens;
+
+        public override string ToString()
+            => $"Seq({RequestId}, sn={Sn}, status={Status}, prompt={PromptTokens.Count}, out={OutputTokens.Count}, computed={NumComputedTokens})";
+    }
+}

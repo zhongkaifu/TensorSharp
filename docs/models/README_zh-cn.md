@@ -23,15 +23,15 @@
 
 ## 实现矩阵
 
-| 架构 | 卡片 | 模型类 | GGUF keys | 模态 | 思维链 | 工具调用 | 主要加速路径 |
-|---|---|---|---|---|---|---|---|
-| Gemma 3 | [gemma3.md](gemma3.md) | `Gemma3Model` | `gemma3` | 文本、图像 | 否 | 否 | SWA / 全局注意力交替、GeGLU FFN、QK-norm、V-norm |
-| Gemma 4 | [gemma4.md](gemma4.md) | `Gemma4Model` | `gemma4` | 文本、图像、视频、音频 | 是 | 是 | 整模型融合 decode（一次 GGML 调度）、融合 per-layer prefill、分块 prefill、SWA 环形缓存、PLE、KV 共享、MoE 变体 |
-| Qwen 3 | [qwen3.md](qwen3.md) | `Qwen3Model` | `qwen3` | 文本 | 是 | 是 | 整模型原生 decode，权重指针在加载时预解析 |
-| Qwen 3.5 / 3.6 family | [qwen35.md](qwen35.md) | `Qwen35Model` | `qwen35`、`qwen35moe`、`qwen3next` | 文本、图像 | 是 | 是 | 全注意力 + GatedDeltaNet 递归混合、融合 attention 层 decode、融合 prefill attention、融合输出投影 + FFN、融合输出投影 + norm + router、批量 MoE（routed + shared + residual 一次完成）、融合视觉编码器 |
-| GPT OSS | [gptoss.md](gptoss.md) | `GptOssModel` | `gptoss`、`gpt-oss` | 文本 | 是（始终启用） | 否 | Stacked MoE prefill kernel（mul_mat_id + add_id + swiglu_oai）、attention sinks、MXFP4 专家权重 |
-| Nemotron-H | [nemotron.md](nemotron.md) | `NemotronModel` | `nemotron_h`、`nemotron_h_moe` | 文本、图像（Omni 版） | 是 | 是 | Mamba2 + 注意力 + MoE FFN 混合堆栈、批量 GPU MoE、可选 Parakeet 音频前端、RADIO/v2_vl 图像编码器 |
-| Mistral 3 | [mistral3.md](mistral3.md) | `Mistral3Model` | `mistral3` | 文本、图像 | 否 | 否 | YaRN 校正 RoPE 与位置相关 Q 缩放、融合 QKV / gate_up、Pixtral 视觉编码器 |
+| 架构 | 卡片 | 模型类 | GGUF keys | 模态 | 思维链 | 工具调用 | 批处理 / 分页前向 | 主要加速路径 |
+|---|---|---|---|---|---|---|---|---|
+| Gemma 3 | [gemma3.md](gemma3.md) | `Gemma3Model` | `gemma3` | 文本、图像 | 否 | 否 | 否（仅旧单序列路径） | SWA / 全局注意力交替、GeGLU FFN、QK-norm、V-norm |
+| Gemma 4 | [gemma4.md](gemma4.md) | `Gemma4Model` | `gemma4` | 文本、图像、视频、音频 | 是 | 是 | **默认启用**（可用 `TS_GEMMA4_BATCHED=0` 关闭） | 整模型融合 decode（一次 GGML 调度）、融合 per-layer prefill、分块 prefill、SWA 环形缓存、PLE、KV 共享、MoE 变体。批处理路径与旧路径 logits 在 FP 噪声内一致（`Gemma4BatchedForwardTests`）；batch=8 短 prompt 达 ~1.5×，4×800-token prompt 达 ~1.6×。 |
+| Qwen 3 | [qwen3.md](qwen3.md) | `Qwen3Model` | `qwen3` | 文本 | 是 | 是 | 参考实现（`Qwen3Model.BatchedForward.cs`）—— 当提供基础 Qwen3 GGUF 时由 `Qwen3BatchedForwardTests` 验证 | 整模型原生 decode，权重指针在加载时预解析 |
+| Qwen 3.5 / 3.6 family | [qwen35.md](qwen35.md) | `Qwen35Model` | `qwen35`、`qwen35moe`、`qwen3next` | 文本、图像 | 是 | 是 | 启用方式：`TS_QWEN35_BATCHED=1`（`--continuous-batching` 会自动开启）。带每槽位的递归状态池，可选原生 GatedDeltaNet 内核（`TS_QWEN35_BATCHED_GDN_NATIVE=1`）。 | 全注意力 + GatedDeltaNet 递归混合、融合 attention 层 decode、融合 prefill attention、融合输出投影 + FFN、融合输出投影 + norm + router、批量 MoE（routed + shared + residual 一次完成）、融合视觉编码器 |
+| GPT OSS | [gptoss.md](gptoss.md) | `GptOssModel` | `gptoss`、`gpt-oss` | 文本 | 是（始终启用） | 否 | 启用方式：`TS_GPTOSS_BATCHED=1`。通过 `TSGgml_PagedAttentionForwardWithSinks` 处理每头 attention sinks（或 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 使用 C# fallback）。在 `GptOssBatchedCorrectnessTests` 中与旧路径 100% 贪心一致。 | Stacked MoE prefill kernel（mul_mat_id + add_id + swiglu_oai）、attention sinks、MXFP4 专家权重 |
+| Nemotron-H | [nemotron.md](nemotron.md) | `NemotronModel` | `nemotron_h`、`nemotron_h_moe` | 文本、图像（Omni 版） | 是 | 是 | 启用方式：`TS_NEMOTRON_BATCHED=1`。带每槽位 Mamba2 conv + SSM 状态池，可选原生批处理 Mamba2 步（`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`）。与旧路径 100% 贪心一致；Apple M4 Pro 上 batch=3 最高可达 3.95× tps。 | Mamba2 + 注意力 + MoE FFN 混合堆栈、批量 GPU MoE、可选 Parakeet 音频前端、RADIO/v2_vl 图像编码器 |
+| Mistral 3 | [mistral3.md](mistral3.md) | `Mistral3Model` | `mistral3` | 文本、图像 | 否 | 否 | **默认启用** —— `IBatchedPagedModel` 的参考实现。在 Ministral-3-14B 上完成端到端验证；原生分页注意力内核在长上下文下比旧的单序列路径快 ~21%。 | YaRN 校正 RoPE 与位置相关 Q 缩放、融合 QKV / gate_up、Pixtral 视觉编码器 |
 
 ## 后端说明
 
@@ -40,10 +40,15 @@
 | 后端类型 | 包 | 说明 |
 |---|---|---|
 | `Cpu` | `TensorSharp.Core` | 纯托管张量，附带 SIMD / 托管量化快路径（RMSNorm、RoPE、softmax、融合激活、GEMM、dequant）。 |
-| `Cuda` | `TensorSharp.Backends.Cuda` | Direct CUDA Driver-API 分配器与存储、cuBLAS GEMM、热点算子的 PTX 内核、受支持量化类型的原生 quant matmul / get_rows，未实现的算子回退到 CPU。 |
-| `GgmlCpu` / `GgmlMetal` / `GgmlCuda` | `TensorSharp.Backends.GGML` + `TensorSharp.GGML.Native` | 原生 ggml 桥接，包括量化计算图调度与平台后端；mmap 量化权重通过 host 指针缓冲零拷贝绑定。 |
+| `Cuda` | `TensorSharp.Backends.Cuda` | Direct CUDA Driver-API 分配器与存储、cuBLAS GEMM、热点算子的 PTX 内核（RMSNorm、softmax、RoPE/RoPEEx、SDPA、GQA prefill/decode、causal mask、gather/concat、融合激活）、受支持量化类型的原生 quant matmul / get_rows，未实现的算子回退到 CPU。 |
+| `Mlx` | `TensorSharp.Backends.MLX` | Apple Silicon `mlx-c` 桥接，含量化 / 融合 / 编译内核、异步 worker 派发、MoE 专家 offload，以及 CPU 回退层。依赖 `libmlxc`。 |
+| `GgmlCpu` / `GgmlMetal` / `GgmlCuda` | `TensorSharp.Backends.GGML` + `TensorSharp.GGML.Native` | 原生 ggml 桥接，包括量化计算图调度与平台后端；mmap 量化权重通过 host 指针缓冲零拷贝绑定。还包含驱动批处理 / 分页执行路径的分页注意力内核（`TSGgml_PagedAttentionForward`，含 GPT OSS sinks 变体）。 |
 
 凡是卡片中提到融合 GGML kernel（例如 `Qwen35AttentionLayerDecode`、`Gemma4LayerPrefill`、`MoEExpertsSwiGLUResidual`），其源码都在 `TensorSharp.GGML.Native/ggml_ops_*.cpp`，并通过 `TensorSharp.Backends.GGML/GgmlBasicOps.cs` 暴露给托管侧。如果某个融合路径只在 GGML CPU / Metal / CUDA 上启用而在纯托管 CPU 或 direct CUDA 上没有启用，请到原生桥侧查看。
+
+## 连续批处理 & 分页 KV 缓存
+
+上表所列的全部架构都会经过共享的 `InferenceEngine` + `ContinuousBatchScheduler` + `BatchExecutor` 栈，详情见 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)。实现了 `IBatchedPagedModel.ForwardBatch` 的模型会在每个调度步骤中执行一次批处理前向（使用基于 `slotMapping` 的 K/V 写入与共享分页缓冲，并通过原生分页内核做按序列注意力）；其余模型则在同一引擎内沿用按序列 KV 交换。各模型的启用方式见上方实现矩阵以及项目根 README。
 
 ## 架构对比
 

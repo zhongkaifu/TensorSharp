@@ -20,7 +20,11 @@ namespace TensorSharp.Server
     public class ModelService : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
+        // Session registry retained for adapters and tests that track per-
+        // user conversation state. KV cache management has moved to the
+        // engine; this layer now only owns chat-history bookkeeping.
         private readonly SessionKvCacheManager _sessions;
+        private readonly InferenceEngineHost _engineHost;
         private readonly ChatGenerationPipeline _generation;
 
         public ModelService()
@@ -38,8 +42,14 @@ namespace TensorSharp.Server
 
             _lifecycle = new ModelLifecycleService(logger);
             _sessions = new SessionKvCacheManager(_lifecycle, logger);
-            _generation = new ChatGenerationPipeline(_lifecycle, _sessions, kvCacheRenderer, telemetry, logger);
+            _engineHost = new InferenceEngineHost(_lifecycle, logger);
+            _generation = new ChatGenerationPipeline(_lifecycle, _engineHost, kvCacheRenderer, telemetry, logger);
         }
+
+        /// <summary>The internal lifecycle service. Exposed so the
+        /// <see cref="InferenceEngineHost"/> can hook into model load/unload
+        /// transitions; do not call this from other code paths.</summary>
+        internal ModelLifecycleService LifecycleService => _lifecycle;
 
         public bool IsLoaded => _lifecycle.IsLoaded;
         public string LoadedModelName => _lifecycle.LoadedModelName;
@@ -73,8 +83,16 @@ namespace TensorSharp.Server
             return _lifecycle.IsModelAlreadyLoaded(modelName);
         }
 
+        /// <summary>Engine host exposed for adapters that submit requests
+        /// directly to the engine (e.g. multi-turn streaming clients that
+        /// want to manage their own session bookkeeping).</summary>
+        public InferenceEngineHost EngineHost => _engineHost;
+
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
+            // Tear down the per-model engine BEFORE the model is unloaded so
+            // the engine's worker thread doesn't race the model disposal.
+            _engineHost.Reset();
             _sessions.ClearForModelReload();
             _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
         }
@@ -271,6 +289,7 @@ namespace TensorSharp.Server
 
         public void Dispose()
         {
+            _engineHost.Dispose();
             _lifecycle.Dispose();
             _sessions.Dispose();
         }

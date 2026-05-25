@@ -8,11 +8,42 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using TensorSharp.Core;
 using TensorSharp.Cpu;
 
 namespace TensorSharp.GGML
 {
+    // Per-sequence descriptor for the batched Qwen3.5 GDN native step. Mirrors
+    // GdnBatchedSeqDesc in ggml_ops_gated_delta_net.cpp; layout must stay in
+    // sync with the native struct (32 bytes on 64-bit).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GdnBatchedSeqDesc
+    {
+        public int   SeqStart;
+        public int   SeqLen;
+        public int   ConvWriteIdx;  // in/out
+        public int   Pad;
+        public IntPtr ConvState;    // float* — [(convKernel-1) * qkvDim]
+        public IntPtr SsmState;     // float* — [numVHeads * headVDim * headKDim]
+    }
+
+    // Per-sequence descriptor for the batched Nemotron Mamba2 native step.
+    // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; 32 bytes on 64-bit.
+    // No write-index field because the Mamba2 conv state is a FIFO (memmove
+    // by one row per token), not a ring buffer.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NemoMamba2BatchedSeqDesc
+    {
+        public int    SeqStart;
+        public int    SeqLen;
+        public int    Pad0;
+        public int    Pad1;
+        public IntPtr ConvState;   // float* — [(dConv-1) * xbcSize]
+        public IntPtr SsmState;    // float* — [nHead * headDim * dState]
+    }
+
     [OpsClass]
     public class GgmlBasicOps
     {
@@ -245,12 +276,119 @@ namespace TensorSharp.GGML
             return result;
         }
 
+        // Detects the common 2D contiguous float32 layout that lets us
+        // bypass TensorDimIterState. result/src/indices must all be 2D
+        // contiguous and indices/result must share shape (the public API
+        // already guarantees this). The fast paths walk rows in the outer
+        // loop (cache-friendly writes) and, for dim==0, fall back to a
+        // single row memcpy when all indices in a row are equal (the
+        // embedding-lookup pattern).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe bool TryGather2DFastSetup(
+            Tensor result, Tensor src, Tensor indices, int dim,
+            out float* rPtr, out float* sPtr, out byte* iPtr, out bool indicesInt32,
+            out long N, out long D, out long otherDim)
+        {
+            rPtr = sPtr = null;
+            iPtr = null;
+            indicesInt32 = false;
+            N = D = otherDim = 0;
+
+            if (result == null || src == null || indices == null) return false;
+            if (result.DimensionCount != 2 || src.DimensionCount != 2 || indices.DimensionCount != 2) return false;
+            if (dim != 0 && dim != 1) return false;
+            if (result.ElementType != DType.Float32 || src.ElementType != DType.Float32) return false;
+
+            if (indices.ElementType == DType.Int32) indicesInt32 = true;
+            else if (indices.ElementType != DType.Float32) return false;
+
+            if (!IsContiguousNonNarrowed(result) || !IsContiguousNonNarrowed(src) || !IsContiguousNonNarrowed(indices))
+                return false;
+
+            if (result.Sizes[0] != indices.Sizes[0] || result.Sizes[1] != indices.Sizes[1]) return false;
+            int otherIdx = dim == 0 ? 1 : 0;
+            if (src.Sizes[otherIdx] != result.Sizes[otherIdx]) return false;
+
+            N = result.Sizes[0];
+            D = result.Sizes[1];
+            otherDim = src.Sizes[dim];
+
+            rPtr = (float*)GetBufferStart(result);
+            sPtr = (float*)GetBufferStart(src);
+            iPtr = (byte*)GetBufferStart(indices);
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe long ReadIndex(byte* iPtr, bool isInt32, long off)
+        {
+            return isInt32 ? ((int*)iPtr)[off] : (long)((float*)iPtr)[off];
+        }
+
         [RegisterOpStorageType("gather", typeof(GgmlStorage))]
         public static unsafe Tensor Gather(Tensor result, Tensor src, int dim, Tensor indices)
         {
             ValidateGatherArguments(result, src, dim, indices);
 
             Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, indices.Allocator, src.ElementType, false, indices.Sizes);
+
+            if (TryGather2DFastSetup(writeTarget, src, indices, dim,
+                out float* rPtr, out float* sPtr, out byte* iPtr, out bool isInt32,
+                out long N, out long D, out long sSize))
+            {
+                if (dim == 0)
+                {
+                    // result[i, j] = src[indices[i, j], j]
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* resRow = rPtr + rowOff;
+                        long firstIdx = ReadIndex(iPtr, isInt32, rowOff);
+                        if (firstIdx < 0 || firstIdx >= sSize)
+                            throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{firstIdx}', srcSize = '{sSize}'");
+
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if (ReadIndex(iPtr, isInt32, rowOff + j) != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            long bytes = D * sizeof(float);
+                            Buffer.MemoryCopy(sPtr + firstIdx * D, resRow, bytes, bytes);
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                                if (idx < 0 || idx >= sSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', srcSize = '{sSize}'");
+                                resRow[j] = sPtr[idx * D + j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, j] = src[i, indices[i, j]]
+                {
+                    long srcCols = sSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* srcRow = sPtr + i * srcCols;
+                        float* resRow = rPtr + rowOff;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                            if (idx < 0 || idx >= srcCols)
+                                throw new IndexOutOfRangeException($"Invalid index in gather. Idx = '{idx}', srcSize = '{srcCols}'");
+                            resRow[j] = srcRow[idx];
+                        }
+                    }
+                }
+                return writeTarget;
+            }
+
             TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(writeTarget), writeTarget.DimensionCount, writeTarget.SizesMemory, writeTarget.StridesMemory, dim);
             TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
             TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
@@ -276,6 +414,63 @@ namespace TensorSharp.GGML
         public static unsafe Tensor Scatter(Tensor result, Tensor src, int dim, Tensor indices)
         {
             ValidateScatterArguments(result, src, dim, indices, "scatter");
+
+            if (TryGather2DFastSetup(result, src, indices, dim,
+                out float* rPtr, out float* sPtr, out byte* iPtr, out bool isInt32,
+                out long N, out long D, out long rSize))
+            {
+                if (dim == 0)
+                {
+                    // result[indices[i, j], j] = src[i, j]
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* srcRow = sPtr + rowOff;
+                        long firstIdx = ReadIndex(iPtr, isInt32, rowOff);
+                        if (firstIdx < 0 || firstIdx >= rSize)
+                            throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{firstIdx}', resultSize = '{rSize}'");
+
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if (ReadIndex(iPtr, isInt32, rowOff + j) != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            long bytes = D * sizeof(float);
+                            Buffer.MemoryCopy(srcRow, rPtr + firstIdx * D, bytes, bytes);
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                                if (idx < 0 || idx >= rSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', resultSize = '{rSize}'");
+                                rPtr[idx * D + j] = srcRow[j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, indices[i, j]] = src[i, j]
+                {
+                    long resCols = rSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* resRow = rPtr + i * resCols;
+                        float* srcRow = sPtr + rowOff;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter. Idx = '{idx}', resultSize = '{resCols}'");
+                            resRow[idx] = srcRow[j];
+                        }
+                    }
+                }
+                return result;
+            }
 
             TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
             TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
@@ -303,6 +498,72 @@ namespace TensorSharp.GGML
         {
             ValidateScatterArguments(result, src, dim, indices, "scatter_add");
 
+            if (TryGather2DFastSetup(result, src, indices, dim,
+                out float* rPtr, out float* sPtr, out byte* iPtr, out bool isInt32,
+                out long N, out long D, out long rSize))
+            {
+                if (dim == 0)
+                {
+                    // result[indices[i, j], j] += src[i, j]
+                    int vectorSize = System.Numerics.Vector<float>.Count;
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* srcRow = sPtr + rowOff;
+                        long firstIdx = ReadIndex(iPtr, isInt32, rowOff);
+                        if (firstIdx < 0 || firstIdx >= rSize)
+                            throw new IndexOutOfRangeException($"Invalid index in scatter_add. Idx = '{firstIdx}', resultSize = '{rSize}'");
+
+                        bool uniform = true;
+                        for (long j = 1; j < D; j++)
+                        {
+                            if (ReadIndex(iPtr, isInt32, rowOff + j) != firstIdx) { uniform = false; break; }
+                        }
+                        if (uniform)
+                        {
+                            float* dst = rPtr + firstIdx * D;
+                            long j = 0;
+                            for (; j <= D - vectorSize; j += vectorSize)
+                            {
+                                var a = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(ref *(byte*)(dst + j));
+                                var b = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(ref *(byte*)(srcRow + j));
+                                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(ref *(byte*)(dst + j), a + b);
+                            }
+                            for (; j < D; j++)
+                                dst[j] += srcRow[j];
+                        }
+                        else
+                        {
+                            for (long j = 0; j < D; j++)
+                            {
+                                long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                                if (idx < 0 || idx >= rSize)
+                                    throw new IndexOutOfRangeException($"Invalid index in scatter_add. Idx = '{idx}', resultSize = '{rSize}'");
+                                rPtr[idx * D + j] += srcRow[j];
+                            }
+                        }
+                    }
+                }
+                else // dim == 1: result[i, indices[i, j]] += src[i, j]
+                {
+                    long resCols = rSize;
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* resRow = rPtr + i * resCols;
+                        float* srcRow = sPtr + rowOff;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = ReadIndex(iPtr, isInt32, rowOff + j);
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter_add. Idx = '{idx}', resultSize = '{resCols}'");
+                            resRow[idx] += srcRow[j];
+                        }
+                    }
+                }
+                return result;
+            }
+
             TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
             TensorDimIterState srcIter = new TensorDimIterState((float*)GetBufferStart(src), src.DimensionCount, src.SizesMemory, src.StridesMemory, dim);
             TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
@@ -328,6 +589,56 @@ namespace TensorSharp.GGML
         public static unsafe Tensor ScatterFill(Tensor result, float value, int dim, Tensor indices)
         {
             ValidateScatterFillArguments(result, dim, indices);
+
+            // 2D-contig fast path (no src tensor in the signature).
+            if (result.DimensionCount == 2 && indices.DimensionCount == 2
+                && (dim == 0 || dim == 1)
+                && result.ElementType == DType.Float32
+                && (indices.ElementType == DType.Int32 || indices.ElementType == DType.Float32)
+                && IsContiguousNonNarrowed(result) && IsContiguousNonNarrowed(indices)
+                && indices.Sizes[1 - dim] == result.Sizes[1 - dim])
+            {
+                bool isInt32 = indices.ElementType == DType.Int32;
+                long N = indices.Sizes[0];
+                long D = indices.Sizes[1];
+                long otherDim = result.Sizes[dim];
+
+                float* rPtrFast = (float*)GetBufferStart(result);
+                byte* iPtrFast = (byte*)GetBufferStart(indices);
+
+                if (dim == 0)
+                {
+                    long resCols = result.Sizes[1];
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = ReadIndex(iPtrFast, isInt32, rowOff + j);
+                            if (idx < 0 || idx >= otherDim)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter_fill. Idx = '{idx}', resultSize = '{otherDim}'");
+                            rPtrFast[idx * resCols + j] = value;
+                        }
+                    }
+                }
+                else // dim == 1
+                {
+                    long resCols = result.Sizes[1];
+                    for (long i = 0; i < N; i++)
+                    {
+                        long rowOff = i * D;
+                        float* resRow = rPtrFast + i * resCols;
+                        for (long j = 0; j < D; j++)
+                        {
+                            long idx = ReadIndex(iPtrFast, isInt32, rowOff + j);
+                            if (idx < 0 || idx >= resCols)
+                                throw new IndexOutOfRangeException($"Invalid index in scatter_fill. Idx = '{idx}', resultSize = '{resCols}'");
+                            resRow[idx] = value;
+                        }
+                    }
+                }
+                return result;
+            }
 
             TensorDimIterState resultIter = new TensorDimIterState((float*)GetBufferStart(result), result.DimensionCount, result.SizesMemory, result.StridesMemory, dim);
             TensorDimIterState indicesIter = new TensorDimIterState((float*)GetBufferStart(indices), indices.DimensionCount, indices.SizesMemory, indices.StridesMemory, dim);
@@ -785,6 +1096,10 @@ namespace TensorSharp.GGML
             GgmlNative.PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
         }
 
+        public static void RegisterOffloadable(IntPtr key) => GgmlNative.RegisterOffloadable(key);
+        public static void SetOffloadableBudget(long bytes) => GgmlNative.SetOffloadableBudget(bytes);
+        public static void ClearOffloadableState() => GgmlNative.ClearOffloadableState();
+
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
@@ -900,6 +1215,72 @@ namespace TensorSharp.GGML
                 kcPtr, vcPtr, outPtr,
                 numHeads, numKvHeads, headDim,
                 maxSeqLen, position, scale, kvGgmlType);
+        }
+
+        /// <summary>
+        /// Native batched paged-attention forward. Public wrapper around
+        /// <see cref="GgmlNative.PagedAttentionForward(float[], float[], float[], float[], int[], int[], int[], int[], int[], int, int, int, int, int, int, float)"/>.
+        /// Takes the paged K/V buffer as a flat row-major float[] (layout
+        /// [num_blocks * block_size, num_kv_heads, head_dim]) and a per-
+        /// sequence block table (concatenated flat ints + per-seq offsets).
+        /// One Metal/CUDA kernel per sequence per layer.
+        /// </summary>
+        public static void PagedAttentionForward(
+            float[] qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            float[] outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow = 0)
+        {
+            GgmlNative.PagedAttentionForward(
+                qData, pagedKData, pagedVData, outData,
+                queryStartLoc, seqLens, positions,
+                blockTableFlat, blockTableOffsets,
+                numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                blockSize, scale, slidingWindow);
+        }
+
+        /// <summary>Native paged-attention forward with per-head attention
+        /// sinks (gpt-oss style). Pass null for <paramref name="sinksData"/>
+        /// to degenerate to the regular paged attention.</summary>
+        public static void PagedAttentionForwardWithSinks(
+            float[] qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            float[] outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow,
+            float[] sinksData)
+        {
+            GgmlNative.PagedAttentionForwardWithSinks(
+                qData, pagedKData, pagedVData, outData,
+                queryStartLoc, seqLens, positions,
+                blockTableFlat, blockTableOffsets,
+                numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                blockSize, scale, slidingWindow, sinksData);
         }
 
         public static void Gemma4LayerPrefill(
@@ -1191,6 +1572,204 @@ namespace TensorSharp.GGML
                 chunkSize, eps);
         }
 
+        /// <summary>
+        /// Batched per-token Nemotron Mamba2 step. Runs all (sequence, token)
+        /// pairs in the batched decode/prefill step in one native call,
+        /// indexing each sequence's persistent conv FIFO + SSM state via the
+        /// <see cref="NemoMamba2BatchedSeqDesc"/> entries.
+        /// </summary>
+        public static void NemotronMamba2BatchedStep(
+            NemoMamba2BatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int dInProjTotal,
+            int dInner, int dState, int nHead, int headDim, int nGroup, int dConv,
+            IntPtr convWt, IntPtr convBias, IntPtr dtBias, IntPtr aLog,
+            IntPtr dData, IntPtr ssmNormW,
+            float eps,
+            IntPtr outBatched)
+        {
+            if (seqs == null || seqs.Length == 0)
+                throw new ArgumentException("seqs must be non-empty.", nameof(seqs));
+            if (packedBatched == IntPtr.Zero || outBatched == IntPtr.Zero)
+                throw new ArgumentException("packedBatched and outBatched must be non-null.");
+
+            GgmlNative.NemotronMamba2BatchedStep(
+                seqs, numTokens, packedBatched, dInProjTotal,
+                dInner, dState, nHead, headDim, nGroup, dConv,
+                convWt, convBias, dtBias, aLog, dData, ssmNormW,
+                eps, outBatched);
+        }
+
+        /// <summary>
+        /// Batched per-token Qwen3.5 GatedDeltaNet step. Runs all (sequence,
+        /// token) pairs in the batched decode/prefill step in one native call,
+        /// indexing each sequence's recurrent conv ring + SSM state via the
+        /// <see cref="GdnBatchedSeqDesc"/> entries. The descriptors' ConvWriteIdx
+        /// field is updated in place; callers copy it back to per-slot bookkeeping.
+        /// </summary>
+        public static void GatedDeltaNetBatchedStep(
+            GdnBatchedSeqDesc[] seqs,
+            int numTokens,
+            IntPtr packedBatched,
+            int packedDim, int qkvDim, int qkDim, int vDim, int zDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, int ssmDInner,
+            IntPtr convWt, IntPtr dtBias, IntPtr aLog, IntPtr ssmNormW,
+            float eps,
+            IntPtr gatedOut)
+        {
+            if (seqs == null || seqs.Length == 0)
+                throw new ArgumentException("seqs must be non-empty.", nameof(seqs));
+            if (packedBatched == IntPtr.Zero || gatedOut == IntPtr.Zero)
+                throw new ArgumentException("packedBatched and gatedOut must be non-null.");
+
+            GgmlNative.GatedDeltaNetBatchedStep(
+                seqs, numTokens,
+                packedBatched, packedDim, qkvDim, qkDim, vDim, zDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, ssmDInner,
+                convWt, dtBias, aLog, ssmNormW, eps, gatedOut);
+        }
+
+        /// <summary>
+        /// Native Nemotron Mamba2 prefill core. Runs the causal conv, SSM scan, gate,
+        /// and optional group RMSNorm as one GGML graph, updating the recurrent states
+        /// in place.
+        /// </summary>
+        public static unsafe void NemotronMamba2Prefill(
+            Tensor projected,
+            Tensor hiddenOut,
+            float[] convState,
+            float[] ssmState,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps)
+        {
+            if (projected == null || hiddenOut == null)
+                throw new ArgumentNullException(nameof(projected), "projected and hiddenOut must be non-null.");
+            if (convState == null || ssmState == null)
+                throw new ArgumentNullException(nameof(convState), "convState and ssmState must be non-null.");
+            if (convWeightData == IntPtr.Zero || dtBiasData == IntPtr.Zero || aData == IntPtr.Zero)
+                throw new ArgumentException("convWeightData, dtBiasData, and aData must be non-null pointers.");
+
+            if (!TryCreateStandardView(projected, out GgmlTensorView2D projectedView)
+                || !TryCreateStandardView(hiddenOut, out GgmlTensorView2D hiddenOutView))
+            {
+                throw new NotSupportedException("NemotronMamba2Prefill requires Float32 tensors with row-contiguous 2D layouts.");
+            }
+
+            fixed (float* convStatePtr = convState)
+            fixed (float* ssmStatePtr = ssmState)
+            {
+                GgmlNative.NemotronMamba2Prefill(
+                    projectedView,
+                    hiddenOutView,
+                    (IntPtr)convStatePtr,
+                    convState.Length,
+                    (IntPtr)ssmStatePtr,
+                    ssmState.Length,
+                    convWeightData,
+                    convBiasData,
+                    dtBiasData,
+                    aData,
+                    dData,
+                    ssmNormData,
+                    dInner,
+                    dState,
+                    nHead,
+                    headDim,
+                    nGroup,
+                    dConv,
+                    eps);
+            }
+        }
+
+        /// <summary>
+        /// Native Nemotron Mamba2 single-token decode core. The native side keeps
+        /// a persistent recurrent state cache keyed by <paramref name="stateKey"/>;
+        /// pass <paramref name="initializeState"/> after reset/prefill to upload
+        /// the managed state arrays once.
+        /// </summary>
+        public static unsafe void NemotronMamba2Decode(
+            ulong stateKey,
+            Tensor projected,
+            Tensor hiddenOut,
+            float[] convState,
+            float[] ssmState,
+            bool initializeState,
+            bool downloadState,
+            IntPtr convWeightData,
+            IntPtr convBiasData,
+            IntPtr dtBiasData,
+            IntPtr aData,
+            IntPtr dData,
+            IntPtr ssmNormData,
+            int dInner,
+            int dState,
+            int nHead,
+            int headDim,
+            int nGroup,
+            int dConv,
+            float eps)
+        {
+            if (stateKey == 0)
+                throw new ArgumentException("stateKey must be non-zero.", nameof(stateKey));
+            if (projected == null || hiddenOut == null)
+                throw new ArgumentNullException(nameof(projected), "projected and hiddenOut must be non-null.");
+            if (convState == null || ssmState == null)
+                throw new ArgumentNullException(nameof(convState), "convState and ssmState must be non-null.");
+            if (convWeightData == IntPtr.Zero || dtBiasData == IntPtr.Zero || aData == IntPtr.Zero)
+                throw new ArgumentException("convWeightData, dtBiasData, and aData must be non-null pointers.");
+
+            if (!TryCreateStandardView(projected, out GgmlTensorView2D projectedView)
+                || !TryCreateStandardView(hiddenOut, out GgmlTensorView2D hiddenOutView))
+            {
+                throw new NotSupportedException("NemotronMamba2Decode requires Float32 tensors with row-contiguous 2D layouts.");
+            }
+
+            fixed (float* convStatePtr = convState)
+            fixed (float* ssmStatePtr = ssmState)
+            {
+                GgmlNative.NemotronMamba2Decode(
+                    stateKey,
+                    projectedView,
+                    hiddenOutView,
+                    (IntPtr)convStatePtr,
+                    convState.Length,
+                    (IntPtr)ssmStatePtr,
+                    ssmState.Length,
+                    initializeState,
+                    downloadState,
+                    convWeightData,
+                    convBiasData,
+                    dtBiasData,
+                    aData,
+                    dData,
+                    ssmNormData,
+                    dInner,
+                    dState,
+                    nHead,
+                    headDim,
+                    nGroup,
+                    dConv,
+                    eps);
+            }
+        }
+
+        public static void NemotronMamba2DecodeClear(ulong modelKey) =>
+            GgmlNative.NemotronMamba2DecodeClear(modelKey);
+
         public static void Gemma4ModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -1397,11 +1976,13 @@ namespace TensorSharp.GGML
             SwiGLUOAI = 1,
             /// <summary>gelu(gate) * up tanh-approx GeGLU (Gemma 4 MoE).</summary>
             GEGLUSplit = 2,
+            /// <summary>relu(up)^2 single-projection FFN (Nemotron-H MoE).</summary>
+            ReluSquared = 3,
         }
 
         /// <summary>
-        /// Fused MoE FFN forward: gate + up projections, GLU activation
-        /// (SwiGLU split / SwiGLU OAI / GeGLU split), down projection,
+        /// Fused MoE FFN forward: expert projection(s), activation
+        /// (SwiGLU split / SwiGLU OAI / GeGLU split / ReLU-squared), down projection,
         /// per-token expert weighting, and cross-expert aggregation in a
         /// single GGML graph dispatch (one <c>ggml_mul_mat_id</c> per matmul,
         /// matching llama.cpp's <c>build_moe_ffn</c>).
@@ -1422,7 +2003,9 @@ namespace TensorSharp.GGML
         ///
         /// Set <paramref name="upData"/> to <see cref="IntPtr.Zero"/> when
         /// <paramref name="gateData"/> already contains a pre-fused gate+up
-        /// weight (gate_ne1 = 2*nFf), mirroring llama.cpp's gate_up_exps path.
+        /// weight (gate_ne1 = 2*nFf), mirroring llama.cpp's gate_up_exps path,
+        /// or when <paramref name="activation"/> is <see cref="MoEActivation.ReluSquared"/>
+        /// and <paramref name="gateData"/> is the single up projection.
         ///
         /// <paramref name="hiddenIn"/> and <paramref name="hiddenOut"/> must
         /// both be row-contiguous Float32 tensors of shape
@@ -1474,21 +2057,28 @@ namespace TensorSharp.GGML
             if (!hiddenIn.IsContiguous() || !hiddenOut.IsContiguous())
                 throw new ArgumentException("hidden tensors must be contiguous.");
 
-            if (selectedExperts.Length != seqLen * nUsed)
-                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} != seqLen*nUsed = {seqLen * nUsed}.");
-            if (routingWeights.Length != seqLen * nUsed)
-                throw new ArgumentException($"routingWeights length {routingWeights.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+            // Length check is >= rather than == so callers can pass pooled
+            // scratch buffers sized for the largest expected seqLen and reuse
+            // them across decode steps. The kernel only reads the first
+            // seqLen * nUsed entries.
+            if (selectedExperts.Length < seqLen * nUsed)
+                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} < seqLen*nUsed = {seqLen * nUsed}.");
+            if (routingWeights.Length < seqLen * nUsed)
+                throw new ArgumentException($"routingWeights length {routingWeights.Length} < seqLen*nUsed = {seqLen * nUsed}.");
 
             if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
                 throw new ArgumentException("gate and down weight pointers must be non-null.");
 
-            bool fusedGateUp = upData == IntPtr.Zero;
+            bool reluSquared = activation == MoEActivation.ReluSquared;
+            bool fusedGateUp = upData == IntPtr.Zero && !reluSquared;
+            if (reluSquared && upData != IntPtr.Zero)
+                throw new ArgumentException("ReluSquared MoE uses a single projection; pass it as gateData and leave upData as IntPtr.Zero.");
             int gateBiasDim = fusedGateUp ? 2 * nFf : nFf;
             if (gateBias != null && gateBias.Length != gateBiasDim * numExperts)
                 throw new ArgumentException($"gateBias length {gateBias.Length} != gateBiasDim * numExperts = {gateBiasDim * numExperts}.");
             if (upBias != null)
             {
-                if (fusedGateUp) throw new ArgumentException("upBias must be null when upData is null (fused gate_up).");
+                if (fusedGateUp || reluSquared) throw new ArgumentException("upBias must be null when upData is null.");
                 if (upBias.Length != nFf * numExperts)
                     throw new ArgumentException($"upBias length {upBias.Length} != nFf * numExperts = {nFf * numExperts}.");
             }
@@ -1602,21 +2192,28 @@ namespace TensorSharp.GGML
             if (!hiddenIn.IsContiguous() || !residual.IsContiguous())
                 throw new ArgumentException("hiddenIn and residual must be contiguous.");
 
-            if (selectedExperts.Length != seqLen * nUsed)
-                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} != seqLen*nUsed = {seqLen * nUsed}.");
-            if (routingWeights.Length != seqLen * nUsed)
-                throw new ArgumentException($"routingWeights length {routingWeights.Length} != seqLen*nUsed = {seqLen * nUsed}.");
+            // Length check is >= rather than == so callers can pass pooled
+            // scratch buffers sized for the largest expected seqLen and reuse
+            // them across decode steps. The kernel only reads the first
+            // seqLen * nUsed entries.
+            if (selectedExperts.Length < seqLen * nUsed)
+                throw new ArgumentException($"selectedExperts length {selectedExperts.Length} < seqLen*nUsed = {seqLen * nUsed}.");
+            if (routingWeights.Length < seqLen * nUsed)
+                throw new ArgumentException($"routingWeights length {routingWeights.Length} < seqLen*nUsed = {seqLen * nUsed}.");
 
             if (gateData == IntPtr.Zero || downData == IntPtr.Zero)
                 throw new ArgumentException("gate and down weight pointers must be non-null.");
 
-            bool fusedGateUp = upData == IntPtr.Zero;
+            bool reluSquared = activation == MoEActivation.ReluSquared;
+            bool fusedGateUp = upData == IntPtr.Zero && !reluSquared;
+            if (reluSquared && upData != IntPtr.Zero)
+                throw new ArgumentException("ReluSquared MoE uses a single projection; pass it as gateData and leave upData as IntPtr.Zero.");
             int gateBiasDim = fusedGateUp ? 2 * nFf : nFf;
             if (gateBias != null && gateBias.Length != gateBiasDim * numExperts)
                 throw new ArgumentException($"gateBias length {gateBias.Length} != gateBiasDim * numExperts = {gateBiasDim * numExperts}.");
             if (upBias != null)
             {
-                if (fusedGateUp) throw new ArgumentException("upBias must be null when upData is null (fused gate_up).");
+                if (fusedGateUp || reluSquared) throw new ArgumentException("upBias must be null when upData is null.");
                 if (upBias.Length != nFf * numExperts)
                     throw new ArgumentException($"upBias length {upBias.Length} != nFf * numExperts = {nFf * numExperts}.");
             }
@@ -1771,26 +2368,120 @@ namespace TensorSharp.GGML
                 return;
             }
 
-            float* resultBuffer = (float*)GetBufferStart(result);
-            float* srcBuffer = (float*)GetBufferStart(src);
+            DType dtype = result.ElementType;
+            byte* resultBuffer = (byte*)GetBufferStart(result);
+            byte* srcBuffer = (byte*)GetBufferStart(src);
 
             if (result.IsContiguous() && src.IsContiguous())
             {
-                long byteCount = checked(elementCount * result.ElementType.Size());
+                long byteCount = dtype.ByteLengthFor(elementCount);
                 Buffer.MemoryCopy(srcBuffer, resultBuffer, byteCount, byteCount);
                 return;
             }
 
-            TensorIterState resultIter = new TensorIterState(resultBuffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
-            TensorIterState srcIter = new TensorIterState(srcBuffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
-
-            do
+            // Float32 keeps the historical element-level iteration: callers
+            // build ad-hoc strided F32 tensors where strides aren't guaranteed
+            // to align to anything coarser than one float, so we walk element
+            // by element via TensorIterState's float* cursor.
+            if (dtype == DType.Float32)
             {
-                for (; !resultIter.ReachedBlockEnd() && !srcIter.ReachedBlockEnd(); resultIter.BlockStep(), srcIter.BlockStep())
+                TensorIterState resultIter = new TensorIterState((float*)resultBuffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
+                TensorIterState srcIter = new TensorIterState((float*)srcBuffer, src.DimensionCount, src.SizesMemory, src.StridesMemory);
+
+                do
                 {
-                    *resultIter.data = *srcIter.data;
+                    for (; !resultIter.ReachedBlockEnd() && !srcIter.ReachedBlockEnd(); resultIter.BlockStep(), srcIter.BlockStep())
+                    {
+                        *resultIter.data = *srcIter.data;
+                    }
+                } while (resultIter.NextBlock() && srcIter.NextBlock());
+                return;
+            }
+
+            // Strided Float16 / Q8_0 fallback: copy the largest inner contiguous
+            // block as raw bytes per outer index. KV-cache resize narrows a
+            // [heads, capacity, head_dim] tensor on the token dim, so each
+            // head's _cacheSeqLen * head_dim slice is contiguous in memory and
+            // gets memcpy'd in one shot; the outer walk just iterates heads.
+            // For Q8_0 the inner extent must align to the 32-element block
+            // boundary so byte offsets stay block-aligned.
+            CopyStridedBytes(result, src, resultBuffer, srcBuffer, dtype);
+        }
+
+        private static unsafe void CopyStridedBytes(Tensor result, Tensor src, byte* resultBuffer, byte* srcBuffer, DType dtype)
+        {
+            int dimCount = result.DimensionCount;
+            ReadOnlySpan<long> resultSizes = result.Sizes;
+            ReadOnlySpan<long> resultStrides = result.Strides;
+            ReadOnlySpan<long> srcStrides = src.Strides;
+
+            long innerElems = 1;
+            int outerDims = dimCount;
+            for (int d = dimCount - 1; d >= 0; d--)
+            {
+                if (resultStrides[d] != innerElems || srcStrides[d] != innerElems)
+                    break;
+                innerElems *= resultSizes[d];
+                outerDims = d;
+            }
+
+            if (outerDims == dimCount)
+            {
+                throw new NotSupportedException(
+                    $"copy of strided {dtype} tensors requires the innermost dimension to be contiguous on both sides.");
+            }
+
+            if (dtype == DType.Q8_0 && (innerElems % 32) != 0)
+            {
+                throw new NotSupportedException(
+                    $"copy of strided Q8_0 tensors requires the inner contiguous extent ({innerElems} elements) to be a multiple of 32.");
+            }
+
+            long innerBytes = dtype.ByteLengthFor(innerElems);
+
+            long[] counter = outerDims > 0 ? new long[outerDims] : System.Array.Empty<long>();
+            while (true)
+            {
+                long resultElemOffset = 0;
+                long srcElemOffset = 0;
+                for (int d = 0; d < outerDims; d++)
+                {
+                    resultElemOffset += counter[d] * resultStrides[d];
+                    srcElemOffset += counter[d] * srcStrides[d];
                 }
-            } while (resultIter.NextBlock() && srcIter.NextBlock());
+
+                long resultByteOffset = ElementOffsetToBytes(resultElemOffset, dtype);
+                long srcByteOffset = ElementOffsetToBytes(srcElemOffset, dtype);
+                Buffer.MemoryCopy(srcBuffer + srcByteOffset, resultBuffer + resultByteOffset, innerBytes, innerBytes);
+
+                int dim = outerDims - 1;
+                while (dim >= 0)
+                {
+                    counter[dim]++;
+                    if (counter[dim] < resultSizes[dim])
+                        break;
+                    counter[dim] = 0;
+                    dim--;
+                }
+                if (dim < 0)
+                    return;
+            }
+        }
+
+        private static long ElementOffsetToBytes(long elementOffset, DType dtype)
+        {
+            if (dtype == DType.Q8_0)
+            {
+                // Q8_0 stores 32 elements per 34-byte block; outer strides feeding
+                // into this helper are always multiples of 32 elements (validated
+                // by the inner-extent alignment check above for the typical KV
+                // cache layout [heads, capacity, head_dim] where head_dim % 32 == 0).
+                if ((elementOffset % 32) != 0)
+                    throw new InvalidOperationException(
+                        $"Q8_0 byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
+                return (elementOffset / 32) * 34;
+            }
+            return elementOffset * dtype.Size();
         }
 
         [RegisterOpStorageType("sum", typeof(GgmlStorage))]
@@ -2303,6 +2994,142 @@ namespace TensorSharp.GGML
                 betaSlow,
                 addToResult,
                 invertPositions);
+
+            return writeTarget;
+        }
+
+        // GGML-only helper: same as RoPEEx but additionally applies a
+        // per-dim freq_factors scaling (used by Gemma 4 global layers'
+        // proportional RoPE). `freqFactors` must be a contiguous Float32
+        // tensor of length ropeDim/2 (or null to skip scaling).
+        public static Tensor RoPEExWithFreqFactors(
+            Tensor result,
+            Tensor src,
+            Tensor positions,
+            Tensor freqFactors,
+            int ropeDim,
+            int mode,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor,
+            float attnFactor,
+            float betaFast,
+            float betaSlow,
+            bool addToResult = false,
+            bool invertPositions = false)
+        {
+            ValidateRoPEExArguments(result, src, positions, ropeDim, "rope_ex_ff");
+
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
+            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
+                || !TryCreateStandardView(src, out GgmlTensorView4D srcView)
+                || !TryCreateContiguousTensor(positions, out GgmlContiguousTensor positionTensor, DType.Float32, DType.Int32))
+            {
+                throw new NotSupportedException("GGML rope_ex_ff requires Float32 source/result tensors and contiguous Float32/Int32 positions.");
+            }
+
+            IntPtr freqFactorsPtr = IntPtr.Zero;
+            int freqFactorsLen = 0;
+            if (freqFactors != null)
+            {
+                if (freqFactors.ElementType != DType.Float32)
+                    throw new NotSupportedException("GGML rope_ex_ff freq_factors must be Float32.");
+                freqFactorsPtr = GetBufferStart(freqFactors);
+                freqFactorsLen = (int)freqFactors.ElementCount();
+            }
+
+            GgmlNative.RoPEExWithFreqFactors(
+                resultView,
+                srcView,
+                positionTensor,
+                ropeDim,
+                mode,
+                originalContextLength,
+                freqBase,
+                freqScale,
+                extFactor,
+                attnFactor,
+                betaFast,
+                betaSlow,
+                addToResult,
+                invertPositions,
+                freqFactorsPtr,
+                freqFactorsLen);
+
+            return writeTarget;
+        }
+
+        // GGML-only helper: interleaved/blocked multi-axis RoPE (ggml_rope_multi
+        // / kernel_rope_multi). Input shape must be [headDim, numHeads, seqLen, 1]
+        // (4-D, batch=1). Positions must be a contiguous I32 vector of length
+        // 4*seqLen, with per-axis-concatenated layout
+        //   pos[0..n-1]   = T  positions
+        //   pos[n..2n-1]  = H  positions
+        //   pos[2n..3n-1] = W  positions
+        //   pos[3n..4n-1] = 4th axis (zeros for static images)
+        // `sections` is the four mrope_section entries (Qwen3.5 ships
+        // [11,11,10,0]). `mode` should include GGML_ROPE_TYPE_MROPE (8) for
+        // blocked-section MRoPE or GGML_ROPE_TYPE_IMROPE (40) for interleaved.
+        public static Tensor RoPEMRoPE(
+            Tensor result,
+            Tensor src,
+            Tensor positions,
+            int[] sections,
+            int ropeDim,
+            int mode,
+            int originalContextLength,
+            float freqBase,
+            float freqScale,
+            float extFactor = 0f,
+            float attnFactor = 1f,
+            float betaFast = 0f,
+            float betaSlow = 0f)
+        {
+            if (sections == null || sections.Length != 4)
+                throw new ArgumentException("sections must be a length-4 int[] (Qwen3.5 ships [11,11,10,0]).", nameof(sections));
+            // Custom validation: ggml_rope_multi expects 4 positions per token
+            // (T, H, W, +1 extra axis), so the positions tensor length is 4*seqLen
+            // rather than the seqLen*numHeads rope_ex convention.
+            ValidateGgmlTensor(src, nameof(src), "rope_mrope");
+            ValidateGgmlIndexTensor(positions, nameof(positions), "rope_mrope");
+            if (src.DimensionCount != 4)
+                throw new NotSupportedException("rope_mrope requires a 4D input tensor [batch=1, seqLen, numHeads, headDim].");
+            if (ropeDim <= 0 || ropeDim > src.Sizes[^1] || (ropeDim & 1) != 0)
+                throw new ArgumentOutOfRangeException(nameof(ropeDim), "rope_mrope requires an even ropeDim within the last tensor dimension.");
+            long seqLen = src.Sizes[1]; // C# View(batch, seqLen, numHeads, headDim) → Sizes[1] = seqLen
+            if (positions.ElementCount() != 4 * seqLen)
+                throw new InvalidOperationException(
+                    $"rope_mrope expects positions length 4*seqLen ({4 * seqLen}); got {positions.ElementCount()}.");
+            if (result != null)
+            {
+                ValidateGgmlTensor(result, nameof(result), "rope_mrope");
+                if (!HasSameShape(result, src))
+                    throw new InvalidOperationException("rope_mrope expects result and src to have the same shape.");
+            }
+
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
+            if (!TryCreateStandardView(writeTarget, out GgmlTensorView4D resultView)
+                || !TryCreateStandardView(src, out GgmlTensorView4D srcView)
+                || !TryCreateContiguousTensor(positions, out GgmlContiguousTensor positionTensor, DType.Float32, DType.Int32))
+            {
+                throw new NotSupportedException("GGML rope_mrope requires Float32 source/result tensors and contiguous Float32/Int32 positions.");
+            }
+
+            GgmlNative.RoPEMRoPE(
+                resultView,
+                srcView,
+                positionTensor,
+                ropeDim,
+                mode,
+                sections[0], sections[1], sections[2], sections[3],
+                originalContextLength,
+                freqBase,
+                freqScale,
+                extFactor,
+                attnFactor,
+                betaFast,
+                betaSlow);
 
             return writeTarget;
         }
@@ -3214,9 +4041,35 @@ namespace TensorSharp.GGML
             {
                 throw new ArgumentNullException(nameof(result));
             }
+            if (src == null)
+            {
+                throw new ArgumentNullException(nameof(src));
+            }
+            if (!(result.Storage is GgmlStorage))
+            {
+                throw new ArgumentException("result must be a GGML tensor", nameof(result));
+            }
+            if (!(src.Storage is GgmlStorage))
+            {
+                throw new ArgumentException("src must be a GGML tensor", nameof(src));
+            }
 
-            ValidateGgmlTensor(result, nameof(result), "copy");
-            ValidateGgmlTensor(src, nameof(src), "copy");
+            // Copy is dtype-preserving: KV-cache resize and similar callers narrow
+            // the same storage on both sides, so cross-dtype copy here would just
+            // mask an upstream bug. Float32/Float16/Q8_0 are the storage classes
+            // models actually instantiate (see KvCacheStorage), so accept those.
+            if (result.ElementType != src.ElementType)
+            {
+                throw new InvalidOperationException(
+                    $"copy expects source and result to share an element type (result={result.ElementType}, src={src.ElementType}).");
+            }
+            if (result.ElementType != DType.Float32
+                && result.ElementType != DType.Float16
+                && result.ElementType != DType.Q8_0)
+            {
+                throw new InvalidOperationException(
+                    $"copy supports Float32, Float16, or Q8_0 tensors (got {result.ElementType}).");
+            }
 
             if (result.ElementCount() != src.ElementCount())
             {

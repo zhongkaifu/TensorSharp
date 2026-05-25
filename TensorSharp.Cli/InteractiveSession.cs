@@ -1245,10 +1245,6 @@ namespace TensorSharp.Cli
             switch (plan.Kind)
             {
                 case ReusePlanKind.ExactMatch:
-                    // Even on a full reuse the model needs the embedding spans
-                    // re-queued so the next Forward call's embedding lookup sees
-                    // them at their original positions.
-                    _model.MultimodalInjector.QueuePromptEmbeddings(inputTokens.Count);
                     return plan.CachedLogits;
 
                 case ReusePlanKind.PartialReuse:
@@ -1258,11 +1254,10 @@ namespace TensorSharp.Cli
                     _model.TruncateKVCache(reused);
                     _kvCache.TruncateTo(reused);
 
-                    _model.MultimodalInjector.QueuePromptEmbeddings(reused);
                     var suffix = new int[suffixLength];
                     for (int i = 0; i < suffixLength; i++)
                         suffix[i] = inputTokens[reused + i];
-                    float[] logits = _model.ForwardRefill(suffix);
+                    float[] logits = ForwardRefillChunked(suffix, promptStartToken: reused);
                     _kvCache.RecordAppend(suffix, logits);
                     return logits;
                 }
@@ -1272,13 +1267,44 @@ namespace TensorSharp.Cli
                 {
                     _model.ResetKVCache();
                     _kvCache.Reset();
-                    _model.MultimodalInjector.QueuePromptEmbeddings(0);
                     var allTokens = inputTokens.ToArray();
-                    float[] logits = _model.ForwardRefill(allTokens);
+                    float[] logits = ForwardRefillChunked(allTokens, promptStartToken: 0);
                     _kvCache.RecordAppend(allTokens, logits);
                     return logits;
                 }
             }
+        }
+
+        /// <summary>
+        /// Feed <paramref name="tokens"/> through the model in
+        /// <see cref="PrefillChunking.ResolveChunkSize"/>-sized chunks so the
+        /// attention score tensor stays bounded for long prompts. Each chunk
+        /// queues its own multimodal-embedding slice so vision spans line up
+        /// with the right forward call. Returns the next-token logits from the
+        /// final chunk (sampler only ever consumes the trailing logits anyway).
+        /// </summary>
+        private float[] ForwardRefillChunked(int[] tokens, int promptStartToken)
+        {
+            if (tokens == null || tokens.Length == 0)
+                throw new ArgumentException("Prompt token list cannot be null or empty.", nameof(tokens));
+
+            int chunkSize = PrefillChunking.ResolveChunkSize(_backend, tokens.Length);
+            if (chunkSize >= tokens.Length)
+            {
+                _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(promptStartToken, tokens.Length);
+                return _model.ForwardRefill(tokens);
+            }
+
+            float[] logits = null;
+            for (int start = 0; start < tokens.Length; start += chunkSize)
+            {
+                int length = Math.Min(chunkSize, tokens.Length - start);
+                int[] chunk = new int[length];
+                Array.Copy(tokens, start, chunk, 0, length);
+                _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(promptStartToken + start, length);
+                logits = _model.ForwardRefill(chunk);
+            }
+            return logits;
         }
 
         // ---- Helpers ---------------------------------------------------------

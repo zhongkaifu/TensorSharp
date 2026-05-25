@@ -15,6 +15,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -34,8 +35,36 @@ namespace TensorSharp.Models
     ///   - Cached attention sinks arrays
     ///   - SIMD-vectorized bias addition and activation
     /// </summary>
-    public class GptOssModel : ModelBase
+    public partial class GptOssModel : ModelBase
     {
+        // Bound the MLX lazy-graph depth across the per-layer dispatch loop.
+        // Override via TS_MLX_EVAL_EVERY_N_LAYERS. GptOss has 24 layers; eval=16
+        // means one boundary at layer 16.
+        private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
+        private static int ResolveMlxEvalEveryNLayers()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_EVAL_EVERY_N_LAYERS");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 16;
+        }
+
+        // Minimum total sequence length to use the MLX device-side decode
+        // attention with sinks. Default 1 (always-on). Empirically the
+        // device-side kernel beats the host SIMD CPU path even at short
+        // kvLen (~300) on M-series — measured +23% decode tok/s on
+        // gpt-oss-20B Q8_0 — and the win grows with kvLen since the host
+        // path scales linearly with kvLen on the multi-GB cache download.
+        // Override via TS_MLX_SINKS_ATTN_MIN_KV_LEN if a workload regresses.
+        private static readonly int MlxSinksAttnMinKvLen = ResolveMlxSinksAttnMinKvLen();
+        private static int ResolveMlxSinksAttnMinKvLen()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_MLX_SINKS_ATTN_MIN_KV_LEN");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 1;
+        }
+
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
         private int _numExperts;
@@ -49,6 +78,10 @@ namespace TensorSharp.Models
         private string[][] _layerNames;
         private string[][][] _expertNames;
         private float[][] _layerSinks;
+        // Per-layer MLX-backed 1D Float32 [numHeads] tensor mirror of
+        // _layerSinks for the device-side decode path. Lazily populated on
+        // first use; reused across decode calls.
+        private Tensor[] _layerSinksMlx;
         private int _qDim, _kDim;
         private bool _isQkvFused;
 
@@ -56,6 +89,14 @@ namespace TensorSharp.Models
         private int[] _moeExpertOffsets;
         private int[] _moeTokenMap;
         private float[] _moeWeightMap;
+
+        // Pooled per-call scratch for MoE routing. Reallocated lazily when the
+        // current request needs a larger seqLen (prefill). Decode reuses the
+        // same buffers across all layers/steps, eliminating the per-call
+        // float[]/int[] allocation in MoERoute().
+        private float[] _moeRoutingWeightsScratch;
+        private int[] _moeSelectedExpertsScratch;
+        private int[] _moeTopKScratch;
 
         // Per-layer stacked-along-experts views into the original `ffn_gate_exps.weight`,
         // `ffn_up_exps.weight`, `ffn_down_exps.weight` 3D blocks (loaded into
@@ -115,7 +156,11 @@ namespace TensorSharp.Models
             FuseExpertGateUpWeights();
             FuseQKVWeights();
             PrepareCudaQuantizedWeightsForInference();
-            InitKVCache(ResolveConfiguredContextLength());
+            int maxContextLength = ResolveConfiguredContextLength();
+            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+            if (initialCacheLength < maxContextLength)
+                Console.WriteLine($"Initial {_backend} KV cache allocation: {initialCacheLength} tokens (grows on demand up to {maxContextLength}).");
+            InitKVCache(initialCacheLength, maxContextLength);
             PrecomputeConstants();
             InitMoeStackedWeights(preFuseGateBias, preFuseUpBias);
         }
@@ -270,7 +315,13 @@ namespace TensorSharp.Models
                         _quantWeights.TryGetValue(upName, out var uw) &&
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
-                        _quantWeights[fusedName] = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+                        // ExpertFFN expects a fused gate_up tensor at fusedName. If
+                        // MLX view-fusion fails (gate/up not contiguous in GGUF),
+                        // fall back to copy — same rationale as FuseGateUpWeights.
+                        if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, gw, uw))
+                            fusedWeight = QuantizedWeight.ConcatOrCreateCopy(gw, uw);
+
+                        _quantWeights[fusedName] = fusedWeight;
                         _quantWeights.Remove(gateName); gw.Dispose();
                         _quantWeights.Remove(upName); uw.Dispose();
                         fused++;
@@ -327,7 +378,10 @@ namespace TensorSharp.Models
                     qw.GgmlType == kw.GgmlType && kw.GgmlType == vw.GgmlType &&
                     qw.Ne0 == kw.Ne0 && kw.Ne0 == vw.Ne0)
                 {
-                    _quantWeights[qkvName] = QuantizedWeight.ConcatOrCreateCopy(qw, kw, vw);
+                    if (!TryCreateFusedQuantizedWeight(out QuantizedWeight fusedWeight, qw, kw, vw))
+                        continue;
+
+                    _quantWeights[qkvName] = fusedWeight;
                     _quantWeights.Remove(qName); qw.Dispose();
                     _quantWeights.Remove(kName); kw.Dispose();
                     _quantWeights.Remove(vName); vw.Dispose();
@@ -455,13 +509,17 @@ namespace TensorSharp.Models
             _moeExpertOffsets = new int[_numExperts];
             _moeTokenMap = new int[maxBatchTokens];
             _moeWeightMap = new float[maxBatchTokens];
+            _moeTopKScratch = new int[_numExpertsUsed];
         }
 
         #endregion
 
-        private void InitKVCache(int maxSeqLen)
+        private int _kvCacheCapacity;
+
+        private void InitKVCache(int initialSeqLen, int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            _kvCacheCapacity = initialSeqLen;
             int numKVHeads = Config.NumKVHeads;
             int headDim = Config.HeadDim;
             // Pick model-aligned default. For F16-quantised GPT-OSS this gives
@@ -481,12 +539,54 @@ namespace TensorSharp.Models
             _kvCacheV = new Tensor[Config.NumLayers];
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
-                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, maxSeqLen, headDim);
+                _kvCacheK[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, headDim);
+                _kvCacheV[l] = new Tensor(_allocator, kvDtype, numKVHeads, initialSeqLen, headDim);
                 InitializeCacheTensor(_kvCacheK[l]);
                 InitializeCacheTensor(_kvCacheV[l]);
             }
             _cacheSeqLen = 0;
+        }
+
+        private void EnsureCacheCapacity(int requiredSeqLen)
+        {
+            if (requiredSeqLen <= _kvCacheCapacity)
+                return;
+            if (requiredSeqLen > _maxContextLength)
+                throw new InvalidOperationException($"Requested sequence length {requiredSeqLen} exceeds configured max context {_maxContextLength}.");
+
+            int newCapacity = Math.Max(_kvCacheCapacity, 1);
+            while (newCapacity < requiredSeqLen)
+                newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
+
+            int numKVHeads = Config.NumKVHeads;
+            int headDim = Config.HeadDim;
+            DType kvDtype = _kvCacheDtype.ToDType();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                var newK = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, headDim);
+                var newV = new Tensor(_allocator, kvDtype, numKVHeads, newCapacity, headDim);
+                InitializeCacheTensor(newK);
+                InitializeCacheTensor(newV);
+
+                if (_cacheSeqLen > 0)
+                {
+                    using var srcK = _kvCacheK[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstK = newK.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstK, srcK);
+
+                    using var srcV = _kvCacheV[l].Narrow(1, 0, _cacheSeqLen);
+                    using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dstV, srcV);
+                }
+
+                _kvCacheK[l].Dispose();
+                _kvCacheV[l].Dispose();
+                _kvCacheK[l] = newK;
+                _kvCacheV[l] = newV;
+            }
+
+            _kvCacheCapacity = newCapacity;
+            Console.WriteLine($"Expanded GPT-OSS attention cache to {newCapacity} tokens.");
         }
 
         public override void ResetKVCache()
@@ -512,11 +612,85 @@ namespace TensorSharp.Models
             }
         }
 
-        public override float[] Forward(int[] tokens)
+        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+
+        public override string KVStateFingerprint =>
+            $"gptoss|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|D={Config.HeadDim}|dtype={_kvCacheDtype.ToShortString()}";
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            return KvBlockTransfer.Extract(
+                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                startToken, tokenCount, destination);
+        }
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            EnsureCacheCapacity(destToken + tokenCount);
+            if (!KvBlockTransfer.Inject(
+                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    destToken, tokenCount, source))
+            {
+                return false;
+            }
+            _cacheSeqLen = destToken + tokenCount;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+            }
+            return true;
+        }
+
+        // Chunk size for ForwardRefill: long prompts are processed in this-many-token
+        // chunks so the per-layer attention-score allocation stays bounded.
+        // Override with TS_PREFILL_CHUNK when tuning.
+        private static int ResolvePrefillChunkSize()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
+            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 2048;
+        }
+
+        public override float[] ForwardRefill(int[] tokens)
+        {
+            if (tokens == null || tokens.Length <= 1)
+                return Forward(tokens);
+
+            int chunkSize = ResolvePrefillChunkSize();
+            int lastIdx = tokens.Length - 1;
+
+            if (tokens.Length <= chunkSize)
+                return Forward(tokens);
+
+            for (int pos = 0; pos < lastIdx; pos += chunkSize)
+            {
+                int chunkLen = Math.Min(chunkSize, lastIdx - pos);
+                var chunk = new int[chunkLen];
+                Array.Copy(tokens, pos, chunk, 0, chunkLen);
+                PrefillWithoutLogits(chunk);
+            }
+            return Forward(new[] { tokens[lastIdx] });
+        }
+
+        private void PrefillWithoutLogits(int[] tokens)
+        {
+            if (tokens == null || tokens.Length == 0)
+                return;
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+
+            EnsureCacheCapacity(startPos + seqLen);
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden = Embedding(tokens);
@@ -526,6 +700,39 @@ namespace TensorSharp.Models
             {
                 bool isLastLayer = (layer == Config.NumLayers - 1);
                 hidden = TransformerBlock(hidden, layer, seqLen, startPos, isLastLayer);
+                if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
+                    && !isLastLayer && hidden != null)
+                {
+                    MlxFusedOps.TryAsyncEvaluate(hidden);
+                }
+            }
+
+            hidden.Dispose();
+            _cacheSeqLen += seqLen;
+            _forwardSw.Stop();
+        }
+
+        public override float[] Forward(int[] tokens)
+        {
+            _forwardSw.Start();
+            int seqLen = tokens.Length;
+            int startPos = _cacheSeqLen;
+
+            EnsureCacheCapacity(startPos + seqLen);
+
+            long t1 = Stopwatch.GetTimestamp();
+            Tensor hidden = Embedding(tokens);
+            _embTicks += Stopwatch.GetTimestamp() - t1;
+
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                bool isLastLayer = (layer == Config.NumLayers - 1);
+                hidden = TransformerBlock(hidden, layer, seqLen, startPos, isLastLayer);
+                if (_backend == BackendType.Mlx && (layer + 1) % MlxEvalEveryNLayers == 0
+                    && !isLastLayer && hidden != null)
+                {
+                    MlxFusedOps.TryAsyncEvaluate(hidden);
+                }
             }
 
             Tensor normed = RMSNormOp(hidden, "output_norm.weight");
@@ -741,6 +948,24 @@ namespace TensorSharp.Models
             }
         }
 
+        // Returns an MLX-backed [numHeads] Float32 tensor populated from
+        // the host-side `_layerSinks[layer]` array, allocated on first
+        // call per layer and reused thereafter.
+        private Tensor GetOrCreateSinksMlxTensor(int layer, float[] sinksArray, int numHeads)
+        {
+            if (_layerSinksMlx == null)
+                _layerSinksMlx = new Tensor[Config.NumLayers];
+            if (_layerSinksMlx[layer] != null)
+                return _layerSinksMlx[layer];
+            if (sinksArray == null || sinksArray.Length < numHeads)
+                return null;
+
+            var t = new Tensor(_allocator, DType.Float32, numHeads);
+            t.SetElementsAsFloat(sinksArray);
+            _layerSinksMlx[layer] = t;
+            return t;
+        }
+
         // Per-layer cached pinned-handle for sinks arrays so we can hand the
         // kernel a stable IntPtr that the cacheable-host-ptr path recognises
         // across calls (and pin only once per layer).
@@ -813,8 +1038,36 @@ namespace TensorSharp.Models
                 vTensor.Dispose();
 
                 var attnResult = new Tensor(_allocator, DType.Float32, 1, numHeads * headDim);
-                AttentionDecodeWithSinks(qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                    attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA);
+
+                // MLX path: keep K/V on device, run the sinks-aware decode
+                // attention via a custom Metal kernel. Avoids the per-layer
+                // device→host KV cache pull that AttentionDecodeWithSinks
+                // triggers via GetFloatPtr/GetHalfPointer. Only worth it
+                // for long context — the kernel's per-K-step barriers
+                // outweigh the cache download cost for short kvLen, where
+                // the host SIMD CPU path is faster. Threshold tunable via
+                // TS_MLX_SINKS_ATTN_MIN_KV_LEN (default 2048).
+                bool attnOk = false;
+                if (_backend == BackendType.Mlx
+                    && sinks != null
+                    && totalSeqLen >= MlxSinksAttnMinKvLen)
+                {
+                    Tensor sinksMlx = GetOrCreateSinksMlxTensor(layer, sinks, numHeads);
+                    if (sinksMlx != null)
+                    {
+                        int sw = isSWA ? _slidingWindow : 0;
+                        attnOk = MlxFusedOps.TryDecodeAttentionWithSinks(
+                            attnResult, qTensor,
+                            _kvCacheK[layer], _kvCacheV[layer], sinksMlx,
+                            numHeads, numKVHeads, headDim,
+                            _kvCacheCapacity, totalSeqLen, sw, scale);
+                    }
+                }
+                if (!attnOk)
+                {
+                    AttentionDecodeWithSinks(qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        attnResult, numHeads, numKVHeads, headDim, totalSeqLen, scale, sinks, isSWA);
+                }
                 qTensor.Dispose();
 
                 _attnTicks += Stopwatch.GetTimestamp() - t0;
@@ -1335,47 +1588,51 @@ namespace TensorSharp.Models
 
             float* scoresPtr = GetFloatPtr(routerScores);
             int numExperts = (int)routerScores.Sizes[1];
+            int nUsed = _numExpertsUsed;
+            int needed = seqLen * nUsed;
 
-            float[] routingWeights = new float[seqLen * _numExpertsUsed];
-            int[] selectedExperts = new int[seqLen * _numExpertsUsed];
+            float[] routingWeights = _moeRoutingWeightsScratch;
+            int[] selectedExperts = _moeSelectedExpertsScratch;
+            if (routingWeights == null || routingWeights.Length < needed)
+                routingWeights = _moeRoutingWeightsScratch = new float[needed];
+            if (selectedExperts == null || selectedExperts.Length < needed)
+                selectedExperts = _moeSelectedExpertsScratch = new int[needed];
+            int[] topK = _moeTopKScratch;
 
             for (int s = 0; s < seqLen; s++)
             {
                 float* row = scoresPtr + s * numExperts;
+                int rowOff = s * nUsed;
 
-                for (int k = 0; k < _numExpertsUsed; k++)
+                // O(n*k) top-k selection (replaces the prior O(k^2*n) loop with
+                // an inline 'alreadySelected' scan).
+                TensorComputePrimitives.SelectTopKInPlace(row, numExperts, nUsed, topK);
+
+                // Gather selected logits.
+                float maxVal = float.NegativeInfinity;
+                for (int k = 0; k < nUsed; k++)
                 {
-                    int bestIdx = 0;
-                    float bestVal = float.NegativeInfinity;
-                    for (int i = 0; i < numExperts; i++)
-                    {
-                        bool alreadySelected = false;
-                        for (int j = 0; j < k; j++)
-                            if (selectedExperts[s * _numExpertsUsed + j] == i) { alreadySelected = true; break; }
-                        if (!alreadySelected && row[i] > bestVal)
-                        {
-                            bestVal = row[i];
-                            bestIdx = i;
-                        }
-                    }
-                    selectedExperts[s * _numExpertsUsed + k] = bestIdx;
-                    routingWeights[s * _numExpertsUsed + k] = row[bestIdx];
+                    int idx = topK[k];
+                    float v = row[idx];
+                    selectedExperts[rowOff + k] = idx;
+                    routingWeights[rowOff + k] = v;
+                    if (v > maxVal) maxVal = v;
                 }
 
-                float maxVal = float.NegativeInfinity;
-                for (int k = 0; k < _numExpertsUsed; k++)
-                    if (routingWeights[s * _numExpertsUsed + k] > maxVal)
-                        maxVal = routingWeights[s * _numExpertsUsed + k];
-                float sumExp = 0;
-                for (int k = 0; k < _numExpertsUsed; k++)
+                // Softmax-over-selected (numerically stable).
+                float sumExp = 0f;
+                for (int k = 0; k < nUsed; k++)
                 {
-                    float ex = MathF.Exp(routingWeights[s * _numExpertsUsed + k] - maxVal);
-                    routingWeights[s * _numExpertsUsed + k] = ex;
+                    float ex = MathF.Exp(routingWeights[rowOff + k] - maxVal);
+                    routingWeights[rowOff + k] = ex;
                     sumExp += ex;
                 }
-                if (sumExp > 0)
-                    for (int k = 0; k < _numExpertsUsed; k++)
-                        routingWeights[s * _numExpertsUsed + k] /= sumExp;
+                if (sumExp > 0f)
+                {
+                    float invSum = 1f / sumExp;
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[rowOff + k] *= invSum;
+                }
             }
 
             return (routingWeights, selectedExperts);

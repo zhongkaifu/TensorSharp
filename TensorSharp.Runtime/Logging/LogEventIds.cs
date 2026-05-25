@@ -76,6 +76,13 @@ namespace TensorSharp.Runtime.Logging
         public static readonly EventId VideoFrameDownsample = new(1513, nameof(VideoFrameDownsample));
         public static readonly EventId GenerationProgress = new(1520, nameof(GenerationProgress));
 
+        // Paged KV cache ---------------------------------------------------
+        public static readonly EventId PagedKvCacheTierInit = new(1530, nameof(PagedKvCacheTierInit));
+        public static readonly EventId PagedKvCacheCapture = new(1531, nameof(PagedKvCacheCapture));
+        public static readonly EventId PagedKvCacheCaptureSkip = new(1532, nameof(PagedKvCacheCaptureSkip));
+        public static readonly EventId PagedKvCacheRestore = new(1533, nameof(PagedKvCacheRestore));
+        public static readonly EventId PagedKvCacheRestoreSkip = new(1534, nameof(PagedKvCacheRestoreSkip));
+
         // Uploads / media --------------------------------------------------
         public static readonly EventId UploadReceived = new(1600, nameof(UploadReceived));
         public static readonly EventId UploadRejected = new(1601, nameof(UploadRejected));
