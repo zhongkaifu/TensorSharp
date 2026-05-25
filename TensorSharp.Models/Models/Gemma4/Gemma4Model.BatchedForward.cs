@@ -235,16 +235,30 @@ namespace TensorSharp.Models
                     v.Dispose();
                 }
 
-                // Native paged attention with this layer's sliding_window.
+                // Paged attention with this layer's sliding_window. Native
+                // paged attention is only valid when a GGML backend owns the
+                // model; direct CUDA/MLX/CPU runs fall back to managed
+                // attention to avoid the native bridge's default backend.
                 float[] qFlat = q.GetElementsAsFloat(numTokens * qDim);
                 q.Dispose();
                 float[] attnFlat = new float[numTokens * qDim];
-                GgmlBasicOps.PagedAttentionForward(
-                    qFlat, _g4PagedK[layer], _g4PagedV[layer], attnFlat,
-                    queryStartLoc, seqLens, positions,
-                    blockTableFlat, blockTableOffsets,
-                    numSeqs, numTokens, numHeads, kvHeads, hd,
-                    _g4PagedBlockSize, scale, slidingWindow);
+                if (IsGgmlBackend)
+                {
+                    GgmlBasicOps.PagedAttentionForward(
+                        qFlat, _g4PagedK[layer], _g4PagedV[layer], attnFlat,
+                        queryStartLoc, seqLens, positions,
+                        blockTableFlat, blockTableOffsets,
+                        numSeqs, numTokens, numHeads, kvHeads, hd,
+                        _g4PagedBlockSize, scale, slidingWindow);
+                }
+                else
+                {
+                    ManagedPagedAttention.Forward(
+                        qFlat, _g4PagedK[layer], _g4PagedV[layer], attnFlat,
+                        numTokens, numHeads, kvHeads, hd, _g4PagedBlockSize,
+                        queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
+                        scale, causal: true, slidingWindow: slidingWindow);
+                }
 
                 Tensor attnOut = CreateFloatTensor(attnFlat, numTokens, qDim);
                 Tensor attnProj = LinearForward(attnOut, $"{prefix}.attn_output.weight");

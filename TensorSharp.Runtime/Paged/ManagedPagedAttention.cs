@@ -15,8 +15,8 @@ namespace TensorSharp.Runtime.Paged
     /// shape and semantics of vLLM's <c>flash_attn_varlen_func</c>: a single
     /// kernel call handles many sequences of varying length, gathering K and V
     /// from a paged block pool via a per-sequence block table and a per-token
-    /// slot mapping. Causal-only masking, no ALiBi, no sliding window (yet) -
-    /// just the core building block.
+    /// slot mapping. Causal masking with an optional sliding-window bound,
+    /// no ALiBi - just the core building block.
     ///
     /// This is the **reference / correctness** implementation. Per-token
     /// throughput is far lower than a fused GGML/CUDA kernel; the value here
@@ -68,7 +68,8 @@ namespace TensorSharp.Runtime.Paged
             int[][] blockTables,
             int numSeqs,
             float scale,
-            bool causal = true)
+            bool causal = true,
+            int slidingWindow = 0)
         {
             if (numHeads % numKvHeads != 0)
                 throw new ArgumentException("numHeads must be divisible by numKvHeads.");
@@ -90,6 +91,11 @@ namespace TensorSharp.Runtime.Paged
                 for (int t = qStart; t < qEnd; t++)
                 {
                     int pos = positions[t];
+                    int contextEndExclusive = causal ? pos + 1 : seqLen;
+                    int contextStart = slidingWindow > 0
+                        ? Math.Max(0, contextEndExclusive - slidingWindow)
+                        : 0;
+
                     ComputeSingleQueryAttention(
                         q, kBlocks, vBlocks, output,
                         tokenIdx: t,
@@ -99,8 +105,8 @@ namespace TensorSharp.Runtime.Paged
                         numKvHeads: numKvHeads,
                         headDim: headDim,
                         blockSize: blockSize,
-                        contextEndExclusive: causal ? pos + 1 : seqLen,
-                        contextStart: 0,
+                        contextEndExclusive: contextEndExclusive,
+                        contextStart: contextStart,
                         blockTable: table,
                         scale: scale);
                 }

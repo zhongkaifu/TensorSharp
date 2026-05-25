@@ -101,6 +101,31 @@ public class BatchedExecutorTests
     }
 
     [Fact]
+    public void ManagedPagedAttention_SlidingWindow_TruncatesOldKeys()
+    {
+        int numHeads = 1, numKvHeads = 1, headDim = 1, blockSize = 4;
+        var q = new float[] { 1 };
+        var kBlocks = new float[] { 1, 1, 1, 1 };
+        var vBlocks = new float[] { 1, 3, 7, 9 };
+        var output = new float[1];
+
+        ManagedPagedAttention.Forward(
+            q, kBlocks, vBlocks, output,
+            numTokens: 1, numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+            blockSize: blockSize,
+            queryStartLoc: new[] { 0, 1 },
+            seqLens: new[] { 4 },
+            positions: new[] { 3 },
+            blockTables: new[] { new[] { 0 } },
+            numSeqs: 1,
+            scale: 1f,
+            causal: true,
+            slidingWindow: 2);
+
+        Assert.Equal(8f, output[0], 3);
+    }
+
+    [Fact]
     public void BatchExecutor_PrefersForwardBatch_WhenModelImplementsBatchedInterface()
     {
         var model = new BatchedStubModel("fp-batched", peakToken: 7);
