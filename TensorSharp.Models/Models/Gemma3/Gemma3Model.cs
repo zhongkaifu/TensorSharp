@@ -192,6 +192,7 @@ namespace TensorSharp.Models
         public void LoadVisionEncoder(string mmProjPath)
         {
             _visionEncoder = new Gemma3VisionEncoder(mmProjPath, _allocator);
+            _visionEncoder.SetHostModel(this);
         }
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)

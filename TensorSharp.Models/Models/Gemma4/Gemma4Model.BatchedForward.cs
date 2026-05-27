@@ -239,28 +239,44 @@ namespace TensorSharp.Models
                 // paged attention is only valid when a GGML backend owns the
                 // model; direct CUDA/MLX/CPU runs fall back to managed
                 // attention to avoid the native bridge's default backend.
-                float[] qFlat = q.GetElementsAsFloat(numTokens * qDim);
-                q.Dispose();
-                float[] attnFlat = new float[numTokens * qDim];
+                Tensor attnOut;
                 if (IsGgmlBackend)
                 {
-                    GgmlBasicOps.PagedAttentionForward(
-                        qFlat, _g4PagedK[layer], _g4PagedV[layer], attnFlat,
+                    // GPU-resident path: hand the kernel Q's tensor storage
+                    // pointer and a pre-allocated output tensor's storage
+                    // pointer so it can zero-copy bind them. This eliminates
+                    // the per-layer GetElementsAsFloat -> ggml_backend_synchronize
+                    // drain (which was waiting for the layer's projections /
+                    // RoPE / scatter) and the matching CreateFloatTensor
+                    // upload on the way out — both gone. Result stays on
+                    // GPU, the next LinearForward consumes it directly and
+                    // serialises behind us on the Metal/CUDA command queue.
+                    attnOut = new Tensor(_allocator, DType.Float32, numTokens, qDim);
+                    GgmlBasicOps.PagedAttentionForwardDevice(
+                        q.Storage.PtrAtElement(q.StorageOffset),
+                        _g4PagedK[layer], _g4PagedV[layer],
+                        attnOut.Storage.PtrAtElement(attnOut.StorageOffset),
                         queryStartLoc, seqLens, positions,
                         blockTableFlat, blockTableOffsets,
                         numSeqs, numTokens, numHeads, kvHeads, hd,
                         _g4PagedBlockSize, scale, slidingWindow);
+                    q.Dispose();
                 }
                 else
                 {
+                    // Non-GGML backends: managed scalar kernel walking host
+                    // float[] gather of paged K/V. Slow but portable; only
+                    // hit on the CUDA / MLX / pure-CPU paths.
+                    float[] qFlat = q.GetElementsAsFloat(numTokens * qDim);
+                    q.Dispose();
+                    float[] attnFlat = new float[numTokens * qDim];
                     ManagedPagedAttention.Forward(
                         qFlat, _g4PagedK[layer], _g4PagedV[layer], attnFlat,
                         numTokens, numHeads, kvHeads, hd, _g4PagedBlockSize,
                         queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
                         scale, causal: true, slidingWindow: slidingWindow);
+                    attnOut = CreateFloatTensor(attnFlat, numTokens, qDim);
                 }
-
-                Tensor attnOut = CreateFloatTensor(attnFlat, numTokens, qDim);
                 Tensor attnProj = LinearForward(attnOut, $"{prefix}.attn_output.weight");
                 attnOut.Dispose();
 
@@ -414,6 +430,159 @@ namespace TensorSharp.Models
             for (int s = 0; s < tables.Length; s++)
                 Array.Copy(tables[s], 0, flat, offsets[s], tables[s].Length);
             return (flat, offsets);
+        }
+
+        /// <summary>
+        /// True when this model can be asked to copy a sequence's K/V history
+        /// from the legacy linear cache (where <c>Forward()</c> writes it)
+        /// into the paged storage (where <c>ForwardBatch</c> reads from). The
+        /// batched path already rejects Q8_0 KV cache anyway, so we don't
+        /// claim migration support in that case.
+        /// </summary>
+        public bool SupportsLinearKVMigration =>
+            _kvCacheK != null && _kvCacheV != null && !_kvCacheDtype.IsBlockQuantized();
+
+        /// <summary>
+        /// Copy <paramref name="owner"/>'s K/V history out of the linear
+        /// per-layer cache <c>_kvCacheK</c>/<c>_kvCacheV</c> and into the
+        /// paged buffer <c>_g4PagedK</c>/<c>_g4PagedV</c> at slot positions
+        /// derived from <c>owner.BlockTable</c>.
+        ///
+        /// Used by <see cref="BatchExecutor"/> when a sequence that has been
+        /// running through the N=1 fast path (which writes only to the
+        /// linear cache) is about to be dispatched through
+        /// <see cref="ForwardBatch"/> alongside a second sequence. Without
+        /// this migration the batched paged-attention kernel would read
+        /// zeros for the owner's prior positions and the sequence would
+        /// degenerate into a token-repeat loop.
+        ///
+        /// Layout difference handled here:
+        ///   Linear:  [kvHeads, cacheLen, headDim] per layer Tensor
+        ///            (post-RoPE K, raw V; F16 by default, F32 also supported).
+        ///   Paged:   float[numBlocks * blockSize * kvHeads * headDim] per
+        ///            layer; slot s lives at offset s * kvHeads * headDim.
+        ///
+        /// SWA-local layers store positions circularly at index
+        /// (p % slidingWindow); only the last slidingWindow positions are
+        /// recoverable. Older positions are masked out by paged attention
+        /// anyway, so leaving their paged slots untouched (zero-initialised)
+        /// is correct.
+        /// </summary>
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
+        {
+            if (owner == null) return false;
+            if (!SupportsLinearKVMigration) return false;
+            int ownerTokens = _cacheSeqLen;
+            if (ownerTokens <= 0) return true;
+            if (owner.BlockTable.NumBlocks <= 0) return false;
+
+            // Make sure any pending device→host syncs of the linear cache
+            // are flushed before we read it as floats.
+            EnsureKvCacheHostSynchronized();
+
+            // Ensure the paged buffers cover every block id we need to
+            // write into. This also preserves any K/V already in paged
+            // storage (it's a copy-into-larger-buffer, not a wipe).
+            int maxBlockId = 0;
+            int numBlocks = owner.BlockTable.NumBlocks;
+            for (int b = 0; b < numBlocks; b++)
+            {
+                int id = owner.BlockTable.Blocks[b].Id;
+                if (id > maxBlockId) maxBlockId = id;
+            }
+            EnsureGemma4PagedBuffers(maxBlockId + 1, blockSize, Config.NumLayers);
+
+            int swa = _slidingWindow;
+
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                // Receivers alias the donor's _kvCacheK[layer] and
+                // _g4PagedK[layer] pointers, so migrating the donor
+                // already covered them.
+                if (_kvDonorMap != null && _kvDonorMap.ContainsKey(layer)) continue;
+
+                int kvHeads = KVHeadsForLayer(layer);
+                int hd = HeadDimForLayer(layer);
+                int cacheLen = _kvCacheSize[layer];
+                int stridePaged = kvHeads * hd;
+                bool isLocal = IsLocalLayer(layer);
+
+                // Dequantise the layer's K/V into F32 host buffers. F32
+                // caches use the existing Tensor.GetElementsAsFloat fast
+                // path; F16 caches go through F16ToF32 (the default for
+                // Q8_0-weight models — Tensor.GetElementsAsFloat throws
+                // "Element type Float16 not supported", so we read the
+                // raw ushort* and dequant ourselves, matching the
+                // pattern in ExpandKVHeadsF16).
+                int totalElems = kvHeads * cacheLen * hd;
+                if (!TryReadCacheAsF32(_kvCacheK[layer], totalElems, out float[] kFlat) ||
+                    !TryReadCacheAsF32(_kvCacheV[layer], totalElems, out float[] vFlat))
+                {
+                    return false;
+                }
+                float[] kPaged = _g4PagedK[layer];
+                float[] vPaged = _g4PagedV[layer];
+
+                // For SWA layers older positions have been overwritten in
+                // the circular cache. For global layers all positions are
+                // available.
+                int firstMigratable = (isLocal && swa > 0)
+                    ? Math.Max(0, ownerTokens - swa)
+                    : 0;
+
+                for (int p = firstMigratable; p < ownerTokens; p++)
+                {
+                    int srcPos = (isLocal && swa > 0) ? (p % swa) : p;
+
+                    int blockIdx = p / blockSize;
+                    int offsetInBlock = p % blockSize;
+                    int physBlockId = owner.BlockTable.Blocks[blockIdx].Id;
+                    int slot = physBlockId * blockSize + offsetInBlock;
+                    int slotOffset = slot * stridePaged;
+
+                    for (int h = 0; h < kvHeads; h++)
+                    {
+                        int srcOffset = (h * cacheLen + srcPos) * hd;
+                        int dstOffset = slotOffset + h * hd;
+                        Buffer.BlockCopy(
+                            kFlat, srcOffset * sizeof(float),
+                            kPaged, dstOffset * sizeof(float),
+                            hd * sizeof(float));
+                        Buffer.BlockCopy(
+                            vFlat, srcOffset * sizeof(float),
+                            vPaged, dstOffset * sizeof(float),
+                            hd * sizeof(float));
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>Read a linear KV cache tensor into a fresh F32 float[].
+        /// Handles both F32 (zero-copy via Tensor.GetElementsAsFloat) and
+        /// F16 (dequant via F16ToF32). Returns false for any other dtype —
+        /// quantised caches (Q8_0) are filtered out earlier by
+        /// SupportsLinearKVMigration so this path doesn't see them.</summary>
+        private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
+        {
+            if (cache.ElementType == DType.Float32)
+            {
+                flat = cache.GetElementsAsFloat(totalElems);
+                return true;
+            }
+            if (cache.ElementType == DType.Float16)
+            {
+                flat = new float[totalElems];
+                ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
+                fixed (float* dst = flat)
+                {
+                    TensorComputePrimitives.F16ToF32(dst, src, totalElems);
+                }
+                return true;
+            }
+            flat = null;
+            return false;
         }
 
         private void EnsureGemma4PagedBuffers(int numBlocks, int blockSize, int numLayers)

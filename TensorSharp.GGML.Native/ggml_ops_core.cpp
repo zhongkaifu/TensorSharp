@@ -213,21 +213,38 @@ namespace tsg
 
     bool can_initialize_backend(int backend_type)
     {
-        if (backend_type != BACKEND_TYPE_METAL &&
-            backend_type != BACKEND_TYPE_CPU &&
-            backend_type != BACKEND_TYPE_CUDA)
+        // Lightweight availability check: report only compile-time support so we
+        // don't spin up the actual GGML device (Metal MTLDevice / CUDA driver) at
+        // process start — important when a non-GGML backend (MLX, direct CUDA) is
+        // selected, otherwise the unrelated GGML init logs leak into that run.
+        // Real init still happens lazily via ensure_backend when a GGML backend
+        // is actually selected, and surfaces a clear error then if it fails.
+        clear_last_error();
+        if (backend_type == BACKEND_TYPE_CPU)
+            return true;
+
+        if (backend_type == BACKEND_TYPE_METAL)
         {
-            set_last_error("Invalid GGML backend type.");
+#if defined(TSG_GGML_USE_METAL)
+            return true;
+#else
+            set_last_error("The ggml-metal backend is not available in this build.");
             return false;
+#endif
         }
 
-        clear_last_error();
-        ggml_backend_t probe_backend = create_backend_instance(backend_type);
-        if (probe_backend == nullptr)
+        if (backend_type == BACKEND_TYPE_CUDA)
+        {
+#if defined(GGML_USE_CUDA)
+            return true;
+#else
+            set_last_error("The ggml-cuda backend is not available in this build.");
             return false;
+#endif
+        }
 
-        ggml_backend_free(probe_backend);
-        return true;
+        set_last_error("Invalid GGML backend type.");
+        return false;
     }
 
     bool backend_supports_op(ggml_tensor* op)
@@ -1342,6 +1359,50 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         g_offloadable_lru_map.clear();
         g_offloadable_resident_bytes = 0;
     }
+}
+
+// Tear down the process-global GGML backend and any state that holds device
+// resource references. Must be called before the process's C runtime
+// finalisers run. The .NET host wires this onto AppDomain.ProcessExit /
+// IHostApplicationLifetime.ApplicationStopped so SIGINT-driven shutdowns
+// reach it.
+//
+// Why this exists: on macOS the ggml-metal backend's device singleton is a
+// C++ static unique_ptr whose deleter asserts that the device's resource set
+// is empty (ggml-metal-device.m:608: GGML_ASSERT([rsets->data count] == 0)).
+// Without an explicit free, g_backend (and the MTLBuffer wrappers it holds
+// via g_host_buffer_cache / g_preloaded_buffer_cache) outlives the .NET host
+// and the assertion fires inside __cxa_finalize_ranges, aborting the
+// process. Freeing the backend here drains every Metal command buffer and
+// releases the resource-set entries before the device deleter runs.
+TSG_EXPORT void TSGgml_Shutdown()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
+        for (auto& [ptr, cached] : g_preloaded_buffer_cache)
+            ggml_backend_buffer_free(cached.buffer);
+        g_preloaded_buffer_cache.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+        for (auto& [ptr, cached] : g_host_buffer_cache)
+            ggml_backend_buffer_free(cached.buffer);
+        g_host_buffer_cache.clear();
+        g_offloadable_keys.clear();
+        g_offloadable_lru.clear();
+        g_offloadable_lru_map.clear();
+        g_offloadable_resident_bytes = 0;
+        g_offloadable_budget = 0;
+    }
+
+    if (g_backend != nullptr)
+    {
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_free(g_backend);
+        g_backend = nullptr;
+    }
+    g_pending_gpu_work.store(false, std::memory_order_release);
 }
 
 // Mark a host data pointer as eligible for the MoE expert offload LRU.

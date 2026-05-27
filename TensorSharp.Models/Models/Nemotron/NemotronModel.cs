@@ -189,6 +189,26 @@ namespace TensorSharp.Models
         private Tensor _latentAccumTensor;
         private Tensor _latentOutResult;
 
+        // Scratch tensors for the MLX batched-MoE decode path. Replaces the
+        // K-per-layer × {up matmul, ReLU², down matmul, scaled add} sequence
+        // — 18+ MLX kernel dispatches per layer — with a 4-dispatch batched
+        // chain (batched up · ReLU² · batched down · weighted sum). On
+        // Nemotron-H 30B Q2 with 23 MoE layers and K=6 this drops ~322 MLX
+        // kernel launches per generated token, which is where the per-token
+        // ms budget was going (matmul = 76% of token time, per the timer
+        // breakdown). All five tensors are sized once per layer's
+        // (intermediate, hidden) on first use and held until model
+        // teardown; the cost is ~one extra K×hidden + K×intermediate +
+        // small-control-tensor allocation, far less than the kernel-launch
+        // savings.
+        private Tensor _moeBatchedUp;          // [K, intermediate] F32 MLX
+        private Tensor _moeBatchedDown;        // [K, hidden]       F32 MLX
+        private Tensor _moeBatchedExpertIndices;  // [K]             I32 MLX
+        private Tensor _moeBatchedRouteWeights;   // [1, K]          F32 MLX
+        private Tensor _moeBatchedResult;      // [1, hidden]       F32 MLX
+        private int _moeBatchedIntermediate;   // last (intermediate, hidden) used so we
+        private int _moeBatchedHidden;         //  can detect a shape change and rebuild
+
         // Multimodal: pending injections to apply at the next Forward() call.
         private NemotronVisionEncoder _visionEncoder;
         private readonly List<(Tensor embeddings, int position)> _pendingVisionEmbeddings = new();
@@ -204,6 +224,7 @@ namespace TensorSharp.Models
                 ? new CpuAllocator(BlasEnum.DotNet)
                 : _allocator;
             _visionEncoder = new NemotronVisionEncoder(mmProjPath, visionAllocator);
+            _visionEncoder.SetHostModel(this);
         }
 
         public NemotronImageProcessor ImageProcessor =>
@@ -658,6 +679,81 @@ namespace TensorSharp.Models
 
             if (stackedCapable > 0)
                 Console.WriteLine($"  Nemotron batched MoE prefill kernel available on {stackedCapable}/{Config.NumLayers} layers (min tokens: {BatchedMoEPrefillMinTokens})");
+
+            // Diagnostic: also log Mamba2 ssm_in / ssm_out quant types.
+            // These matmuls run on every Mamba2 layer (23 layers in Nemotron-H
+            // Nano-Omni 30B); if they're IQ4_NL they benefit from the
+            // multi-row IQ4_NL kernel during prefill. If they use a different
+            // quant, the Rows kernel doesn't help prefill matmul perf.
+            if (_quantWeights != null)
+            {
+                var mamba2Types = new System.Collections.Generic.Dictionary<int, int>();
+                long mamba2Bytes = 0;
+                foreach (var kv in _quantWeights)
+                {
+                    if (kv.Key.Contains("ssm_in.weight") || kv.Key.Contains("ssm_out.weight"))
+                    {
+                        mamba2Types.TryGetValue(kv.Value.GgmlType, out int c);
+                        mamba2Types[kv.Value.GgmlType] = c + 1;
+                        mamba2Bytes += kv.Value.RawBytes;
+                    }
+                }
+                if (mamba2Types.Count > 0)
+                {
+                    var parts = new System.Collections.Generic.List<string>();
+                    foreach (var kv in mamba2Types) parts.Add($"ggml_type={kv.Key} ×{kv.Value}");
+                    Console.WriteLine($"  Nemotron Mamba2 ssm_in/ssm_out quant: {string.Join(", ", parts)} ({mamba2Bytes / (1024.0 * 1024.0):F0} MB total)");
+                }
+            }
+
+            // Diagnostic: log the quant types of MoE expert weights. Helps
+            // diagnose why the MLX batched-MoE decode kernel might not fire
+            // (it currently only supports IQ2_XXS). One-shot, only when
+            // experts exist on at least one layer (Nemotron-H's first
+            // layer is usually attention or Mamba2, not MoE).
+            if (_numExperts > 0 && _expertUpQW != null)
+            {
+                var upTypes = new System.Collections.Generic.Dictionary<int, int>();
+                var downTypes = new System.Collections.Generic.Dictionary<int, int>();
+                long upBytes = 0, downBytes = 0;
+                int upPerExpertNe0 = 0, upPerExpertNe1 = 0;
+                int downPerExpertNe0 = 0, downPerExpertNe1 = 0;
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    if (_expertUpQW[l] == null) continue;
+                    for (int e = 0; e < _numExperts; e++)
+                    {
+                        var up = _expertUpQW[l][e];
+                        var dn = _expertDownQW[l][e];
+                        if (up != null)
+                        {
+                            upTypes.TryGetValue(up.GgmlType, out int c1);
+                            upTypes[up.GgmlType] = c1 + 1;
+                            upBytes += up.RawBytes;
+                            upPerExpertNe0 = (int)up.Ne0;
+                            upPerExpertNe1 = (int)up.Ne1;
+                        }
+                        if (dn != null)
+                        {
+                            downTypes.TryGetValue(dn.GgmlType, out int c2);
+                            downTypes[dn.GgmlType] = c2 + 1;
+                            downBytes += dn.RawBytes;
+                            downPerExpertNe0 = (int)dn.Ne0;
+                            downPerExpertNe1 = (int)dn.Ne1;
+                        }
+                    }
+                }
+                static string FormatTypes(System.Collections.Generic.Dictionary<int, int> d)
+                {
+                    if (d.Count == 0) return "(none)";
+                    var parts = new System.Collections.Generic.List<string>();
+                    foreach (var kv in d)
+                        parts.Add($"ggml_type={kv.Key} ×{kv.Value}");
+                    return string.Join(", ", parts);
+                }
+                Console.WriteLine($"  Nemotron MoE expert quant: up={FormatTypes(upTypes)} (Ne0={upPerExpertNe0}, Ne1={upPerExpertNe1}, {upBytes / (1024.0 * 1024.0):F0} MB total)");
+                Console.WriteLine($"  Nemotron MoE expert quant: down={FormatTypes(downTypes)} (Ne0={downPerExpertNe0}, Ne1={downPerExpertNe1}, {downBytes / (1024.0 * 1024.0):F0} MB total)");
+            }
 
             _expertUpDim = maxUpDim;
             _expertDownDim = maxDownDim;
@@ -1705,6 +1801,20 @@ namespace TensorSharp.Models
                         }
                     }
 
+                    // Batched GPU path on MLX: 4 dispatches per layer instead of
+                    // K × 3 + K syncs through the per-expert fallback. Profiler
+                    // shows MoE matmul is ~76% of MLX decode token time on
+                    // Nemotron-H 30B with K=6 / 23 MoE layers, so collapsing
+                    // these per-expert dispatches into 4 batched ones is the
+                    // single biggest decode-perf win on MLX.
+                    if (!usedBatchedMoE && isDecode && _backend == BackendType.Mlx)
+                    {
+                        long t0exp = Stopwatch.GetTimestamp();
+                        usedBatchedMoE = TryRunMoEExpertsBatchedMlx(
+                            latentAccum, routedInput, layer, topExperts, routeW, outDim);
+                        _linearTicks += Stopwatch.GetTimestamp() - t0exp;
+                    }
+
                     if (!usedBatchedMoE)
                     {
                         for (int k = 0; k < _numExpertsUsed; k++)
@@ -2060,6 +2170,164 @@ namespace TensorSharp.Models
             return true;
         }
 
+        // ----- MLX batched-MoE decode path -----
+        //
+        // Mirrors the Qwen 3.5 MLX MoE decode pattern (TryRunMoEExpertsBatchedMlx)
+        // but with Nemotron-H's ReLU² activation (no gate projection / SiLU).
+        // The serial per-expert path through this layer issues, per K-active
+        // expert:
+        //   (a) up matmul              — 1 MLX dispatch
+        //   (b) ReluSquaredInPlace     — pulls the up tensor to host, runs
+        //                                 SIMD on CPU, marks device-stale
+        //                                 — forces a sync per expert
+        //   (c) down matmul            — 1 MLX dispatch
+        //   (d) VecScaleAdd into the CPU accumulator
+        // K=6 experts × 3 GPU+sync touches × 23 MoE layers = ~414 round
+        // trips per token. The batched path collapses all of that into 4
+        // dispatches per layer (batched up · device-side ReLU² · batched
+        // down · weighted sum) plus a single host download of the final
+        // [1, outDim] result. Eligibility requires IQ2_XXS stacked
+        // weights (the only quant type with a batched-MoE Metal kernel
+        // today) and a homogeneous (intermediate, hidden) shape across
+        // experts.
+        //
+        // `latentAccum` is the CPU float* the caller uses to accumulate
+        // expert outputs (sized `outDim` = hidden for non-latent layers,
+        // or latentDim for latent layers). We compute the weighted sum
+        // on the GPU into _moeBatchedResult and copy it into latentAccum
+        // — one sync per layer instead of K syncs.
+        private unsafe bool TryRunMoEExpertsBatchedMlx(
+            float* latentAccum,
+            Tensor routedInput,
+            int layer,
+            int[] topExperts,
+            float[] routeW,
+            int outDim)
+        {
+            if (_backend != BackendType.Mlx
+                || _layerStackedUp == null
+                || _layerStackedDown == null
+                || layer < 0
+                || layer >= _layerStackedUp.Length)
+            {
+                return false;
+            }
+
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+            if (upW == null
+                || downW == null
+                || upW.NumExperts != _numExperts
+                || downW.NumExperts != _numExperts
+                || !MLX.MlxQuantizedOps.SupportsBatchedMoeMatmul(upW.GgmlType)
+                || upW.GgmlType != downW.GgmlType)
+            {
+                return false;
+            }
+            // up: [hidden, intermediate] per expert (PerExpertNe0=hidden, PerExpertNe1=intermediate).
+            // down: [intermediate, hidden] per expert. They must form a
+            // consistent (hidden ↔ intermediate) pair.
+            int hidden = (int)upW.PerExpertNe0;
+            int intermediate = (int)upW.PerExpertNe1;
+            if (downW.PerExpertNe0 != intermediate || downW.PerExpertNe1 != hidden)
+                return false;
+            if (outDim != hidden)
+                return false;
+            if (routedInput == null
+                || routedInput.DimensionCount != 2
+                || routedInput.Sizes[0] != 1
+                || routedInput.Sizes[1] != hidden)
+            {
+                return false;
+            }
+
+            int K = _numExpertsUsed;
+
+            // Lazy-init / shape-change rebuild of scratch buffers.
+            if (_moeBatchedUp == null
+                || _moeBatchedIntermediate != intermediate
+                || _moeBatchedHidden != hidden
+                || _moeBatchedUp.Sizes[0] != K)
+            {
+                _moeBatchedUp?.Dispose();
+                _moeBatchedDown?.Dispose();
+                _moeBatchedExpertIndices?.Dispose();
+                _moeBatchedRouteWeights?.Dispose();
+                _moeBatchedResult?.Dispose();
+                _moeBatchedUp = new Tensor(_allocator, DType.Float32, K, intermediate);
+                _moeBatchedDown = new Tensor(_allocator, DType.Float32, K, hidden);
+                _moeBatchedExpertIndices = new Tensor(_allocator, DType.Int32, K);
+                _moeBatchedRouteWeights = new Tensor(_allocator, DType.Float32, 1, K);
+                _moeBatchedResult = new Tensor(_allocator, DType.Float32, 1, hidden);
+                _moeBatchedIntermediate = intermediate;
+                _moeBatchedHidden = hidden;
+            }
+
+            // Upload top-K expert indices + routing weights to device. Tiny
+            // (K ints + K floats), negligible vs the kernel-launch budget we
+            // are saving.
+            _moeBatchedExpertIndices.SetElementsAsInt(topExperts);
+            _moeBatchedRouteWeights.SetElementsAsFloat(routeW);
+
+            try
+            {
+                // 1. Batched up matmul: [1, hidden] × stacked_up → [K, intermediate].
+                //    sharedInput=true because every expert applies its own
+                //    weights to the SAME single decode token row.
+                if (!MLX.MlxQuantizedOps.TryMoeMatmulBatched(
+                        _moeBatchedUp,
+                        routedInput,
+                        _moeBatchedExpertIndices,
+                        upW.Data, upW.Data, upW.GgmlType,
+                        upW.PerExpertNe0, upW.PerExpertNe1, upW.NumExperts, upW.TotalRawBytes,
+                        sharedInput: true))
+                {
+                    return false;
+                }
+
+                // 2. ReLU² on the [K, intermediate] activations, ON DEVICE.
+                //    ReluSquared(x) = max(x, 0)² — squaring alone would
+                //    flip the sign of negative inputs, so we relu first and
+                //    then square. Two MLX dispatches (relu + mul) replace
+                //    the K host-side SIMD loops in the per-expert path.
+                Ops.Relu(_moeBatchedUp, _moeBatchedUp);
+                Ops.Mul(_moeBatchedUp, _moeBatchedUp, _moeBatchedUp);
+
+                // 3. Batched down matmul: [K, intermediate] × stacked_down → [K, hidden].
+                //    sharedInput=false because each row k of the input is
+                //    expert-k's post-activation output.
+                if (!MLX.MlxQuantizedOps.TryMoeMatmulBatched(
+                        _moeBatchedDown,
+                        _moeBatchedUp,
+                        _moeBatchedExpertIndices,
+                        downW.Data, downW.Data, downW.GgmlType,
+                        downW.PerExpertNe0, downW.PerExpertNe1, downW.NumExperts, downW.TotalRawBytes,
+                        sharedInput: false))
+                {
+                    return false;
+                }
+
+                // 4. Weighted sum: routeW[1, K] @ down[K, hidden] → [1, hidden],
+                //    written into _moeBatchedResult. We use Addmm with the
+                //    output's beta=0 so the destination's prior contents are
+                //    ignored (it's a scratch buffer; we own it).
+                Ops.Addmm(_moeBatchedResult, 0.0f, _moeBatchedResult,
+                          1.0f, _moeBatchedRouteWeights, _moeBatchedDown);
+
+                // 5. Single host download of the [1, hidden] result into the
+                //    caller's CPU accumulator. With the per-expert path this
+                //    same data movement happened K times — and was
+                //    interleaved with the actual GPU work.
+                float* resultPtr = GetFloatPtr(_moeBatchedResult);
+                Buffer.MemoryCopy(resultPtr, latentAccum, outDim * 4, outDim * 4);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private unsafe bool TryMoEPrefillFusedReluSquared(
             Tensor routedInput,
             Tensor moeOut,
@@ -2223,12 +2491,12 @@ namespace TensorSharp.Models
 
         #region Mamba2 Block
 
-        private Tensor Mamba2Block(Tensor hidden, int layer, int seqLen, bool isDecode)
+        private Tensor Mamba2Block(Tensor hidden, int layer, int seqLen, bool isDecode, int slot = 0)
         {
             string prefix = _layerPrefixes[layer];
 
             Tensor normed = RMSNormOp(hidden, prefix + "attn_norm.weight");
-            Tensor mamba2Out = Mamba2Forward(normed, layer, prefix, seqLen, hidden);
+            Tensor mamba2Out = Mamba2Forward(normed, layer, prefix, seqLen, hidden, slot);
             normed.Dispose();
 
             if (mamba2Out != null)
@@ -2242,7 +2510,11 @@ namespace TensorSharp.Models
         /// <summary>
         /// Mamba2 SSM forward pass with SIMD-optimized inner loops.
         /// </summary>
-        private unsafe Tensor Mamba2Forward(Tensor input, int layer, string prefix, int seqLen, Tensor residual = null)
+        /// <param name="slot">Per-active-sequence Mamba2 slot index used to key
+        /// the persistent GPU decode-state cache so concurrent sequences in
+        /// the batched path don't share GPU state via cache-key collision.
+        /// Pass 0 for the legacy single-sequence Forward path.</param>
+        private unsafe Tensor Mamba2Forward(Tensor input, int layer, string prefix, int seqLen, Tensor residual = null, int slot = 0)
         {
             long t0 = Stopwatch.GetTimestamp();
 
@@ -2259,7 +2531,7 @@ namespace TensorSharp.Models
 
             if (TryMamba2NativeDecode(input, residual, layer, prefix, seqLen,
                     dInner, dState, nHead, headDim, nGroup, dConv,
-                    out Tensor nativeDecodeOut))
+                    out Tensor nativeDecodeOut, slot))
             {
                 _attnTicks += Stopwatch.GetTimestamp() - t0;
                 return nativeDecodeOut;
@@ -2464,7 +2736,8 @@ namespace TensorSharp.Models
             int headDim,
             int nGroup,
             int dConv,
-            out Tensor output)
+            out Tensor output,
+            int slot = 0)
         {
             output = null;
             if (DisableNativeMamba2Decode
@@ -2497,7 +2770,7 @@ namespace TensorSharp.Models
                 LinearForwardInto(projected, input, prefix + "ssm_in.weight");
 
                 GgmlBasicOps.NemotronMamba2Decode(
-                    NativeMamba2DecodeStateKey(layer),
+                    NativeMamba2DecodeStateKey(layer, slot),
                     projected,
                     result,
                     _convState[layer],
@@ -2542,8 +2815,27 @@ namespace TensorSharp.Models
             }
         }
 
-        private ulong NativeMamba2DecodeStateKey(int layer) =>
-            (_nativeMamba2DecodeModelId << 32) | (uint)layer;
+        // Per-(layer, slot) state key for the persistent GPU decode-state cache
+        // (g_mamba2_decode_cache in ggml_ops_mamba2.cpp). Encoding:
+        //   bits 63..32 : model instance id
+        //   bits 31..16 : layer index
+        //   bits 15..0  : slot index
+        // The cache-clear API (TSGgml_NemotronMamba2DecodeClear) matches entries
+        // by `state_key >> 32 == model_key`, so the model id occupies the same
+        // upper-32-bit slot as before and the existing clear logic continues to
+        // work unchanged.
+        //
+        // CRITICAL: the slot MUST be part of the key. The C++ cache also keys
+        // on the host projected/hidden_out pointers, but only when zero-copy
+        // succeeds (Metal + 4KB+ tensor + aligned host ptr). When zero-copy
+        // fails the pointers are 0u in the cache key, and without slot here
+        // every concurrent batched sequence would collapse to the same cache
+        // entry and trample each other's GPU-side conv/SSM state across
+        // decode steps, producing garbled output for all participants.
+        private ulong NativeMamba2DecodeStateKey(int layer, int slot = 0) =>
+            (_nativeMamba2DecodeModelId << 32)
+            | ((ulong)(uint)(layer & 0xFFFF) << 16)
+            | (uint)(slot & 0xFFFF);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void Mamba2Conv1dStep(float* xBCPtr, int xBCSize,

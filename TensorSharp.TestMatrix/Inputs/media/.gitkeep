@@ -1,0 +1,8 @@
+Media files for the matrix runner (image / audio / video) go here. They are
+intentionally not committed — drop them in place on each runner, or set
+`media_dir` in the matrix config to point at a shared location.
+
+Expected files (or override via media_dir):
+  apple.png
+  sample.mp3
+  sample.mp4

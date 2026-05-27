@@ -1,0 +1,1 @@
+A train leaves station A at 09:00 traveling at 60 km/h toward station B, 200 km away. A second train leaves station B at 09:30 traveling at 90 km/h toward station A. At what time do they meet? Show your reasoning, then state the final time clearly.

@@ -37,6 +37,11 @@ namespace TensorSharp.Runtime.Scheduling
         // Number of tokens the model currently holds for the current owner.
         // Equals model._cacheSeqLen for purely-attention models.
         private int _ownerTokensInModel;
+        // Tokens forwarded for the current owner since the last ownership
+        // change. Used by ExecuteStepPerSequence to rotate ownership at
+        // DecodeQuantumTokens boundaries so a long-running owner doesn't
+        // starve other scheduled sequences on the serial per-seq path.
+        private int _ownerForwardedTokens;
 
         // Re-used scratch buffer for inject/extract. Sized to one full block.
         private byte[] _scratch;
@@ -110,11 +115,21 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     // Mixed batch (only reachable when the model declines batched
                     // multimodal): run each subset on its preferred path.
+                    // The multimodal per-seq pass below may extract the current
+                    // owner's linear K/V into pool blocks via EnsureOwnership
+                    // before the text batched pass reads paged storage; if the
+                    // owner's state was only ever in linear cache (came from the
+                    // N=1 fast path), the batched pass would then attend to
+                    // zeros for that owner. Migrate it up-front to keep the
+                    // batched read consistent with where its K/V history lives.
+                    TryMigrateOwnerToPagedIfNeeded(batched);
                     var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
                     results.AddRange(ExecuteStepPerSequence(MakeSubOutput(multimodalWork)));
                     try
                     {
                         results.AddRange(ExecuteStepBatched(batched, MakeSubOutput(textWork)));
+                        foreach (var work in textWork)
+                            work.Sequence.KvStateInPagedStorage = true;
                     }
                     catch (NotSupportedException)
                     {
@@ -125,9 +140,102 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (batchedEnabled && _model is IBatchedPagedModel batched2 && multimodalWork.Count == 0 && output.ScheduledWork.Count > 0)
                 {
+                    // N=1 fast path: when there's only one scheduled sequence
+                    // and the model has a fused single-pass decode kernel
+                    // (e.g. Gemma 4's NativeGemma4ModelDecode), the per-seq
+                    // Forward path is dramatically faster than the batched
+                    // op-by-op path — ForwardBatch makes ~10 Ops.* dispatches
+                    // per layer × 42 layers = ~420 kernel dispatches per token,
+                    // while Forward submits the whole 42-layer decode as a
+                    // single ggml graph compute. Profiling shows a ~4x speedup
+                    // (≈21 tok/s vs ≈5 tok/s for Gemma 4 E4B Q8_0 on Metal).
+                    //
+                    // Safety: Forward writes K/V into the model's LINEAR cache,
+                    // while ForwardBatch reads from PAGED buffers. When a
+                    // second concurrent request arrives mid-decode, the
+                    // scheduler emits both sequences in one step (N=2) which
+                    // falls through to ExecuteStepBatched - and the first
+                    // sequence's prior K/V is absent from paged storage,
+                    // producing a token-repeat loop. We avoid that two ways:
+                    //   1. Skip the fast path for sequences that have already
+                    //      committed state to paged storage
+                    //      (KvStateInPagedStorage), since Forward would attend
+                    //      against an empty linear cache.
+                    //   2. Restrict the fast path to models that implement
+                    //      TryMigrateLinearKVToPaged, so the upcoming N=2
+                    //      transition can copy the linear state across before
+                    //      the batched kernel reads it.
+                    //
+                    // Gate: SupportsKVStateSnapshot is only relevant when
+                    // ExecuteStepPerSequence has to *swap* ownership (i.e.
+                    // the scheduled sequence isn't the current owner). For
+                    // an in-progress single-seq decode the owner IS the
+                    // scheduled sequence, so no swap happens and the
+                    // snapshot capability is irrelevant.
+                    //
+                    // Disable entirely with TS_BATCHED_N1_FAST_PATH=0 if you
+                    // need to A/B against the batched-only path.
+                    if (IsBatchedN1FastPathEnabled()
+                        && output.ScheduledWork.Count == 1
+                        && batched2.SupportsLinearKVMigration)
+                    {
+                        var only = output.ScheduledWork[0].Sequence;
+                        bool noSwapNeeded =
+                            _currentOwner == null
+                            || ReferenceEquals(_currentOwner, only);
+                        bool sequenceStillInLinearCache = !only.KvStateInPagedStorage;
+                        if ((noSwapNeeded || _model.SupportsKVStateSnapshot)
+                            && sequenceStillInLinearCache)
+                        {
+                            return ExecuteStepPerSequence(output);
+                        }
+                    }
+
+                    // Before dispatching through ForwardBatch, make sure any
+                    // sequence whose K/V history only lives in the linear
+                    // cache (because it was being served by the N=1 fast
+                    // path, or by a previous step that fell through from a
+                    // model whose ForwardBatch threw NotSupported) is
+                    // migrated into paged storage. Without this the
+                    // batched paged-attention kernel would read zeros for
+                    // the owner's prior positions and the sequence would
+                    // emit a token-repeat loop.
+                    if (!TryMigrateOwnerToPagedIfNeeded(batched2))
+                    {
+                        // Two reasons we'd land here:
+                        //   1. Model exposes SupportsLinearKVMigration but
+                        //      TryMigrateLinearKVToPaged returned false for
+                        //      this owner (e.g. a transient layout edge
+                        //      case). Worth flagging so we can diagnose.
+                        //   2. Model doesn't expose migration at all and an
+                        //      owner accumulated linear-only state because
+                        //      its ForwardBatch keeps throwing NotSupported
+                        //      (e.g. a model whose batched path is gated off
+                        //      via env var so every step is served by the
+                        //      per-seq fallback anyway). This is expected,
+                        //      not a failure — silently route to per-seq.
+                        // In both cases the batched path would corrupt this
+                        // owner; serve via per-seq where the linear cache
+                        // is still authoritative.
+                        if (batched2.SupportsLinearKVMigration)
+                        {
+                            _logger.LogWarning(
+                                "BatchExecutor: linear→paged migration failed for {RequestId}; falling back to per-seq path.",
+                                _currentOwner?.RequestId);
+                        }
+                        return ExecuteStepPerSequence(output);
+                    }
+
                     try
                     {
-                        return ExecuteStepBatched(batched2, output);
+                        var results = ExecuteStepBatched(batched2, output);
+                        // Any sequence that just ran through the batched
+                        // path now has its K/V in paged storage; sticky-
+                        // mark it so future steps don't try to send it back
+                        // through the linear-cache-only N=1 fast path.
+                        foreach (var work in output.ScheduledWork)
+                            work.Sequence.KvStateInPagedStorage = true;
+                        return results;
                     }
                     catch (NotSupportedException)
                     {
@@ -137,6 +245,56 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 return ExecuteStepPerSequence(output);
             }
+        }
+
+        /// <summary>Migrate the current owner's K/V state from the legacy
+        /// linear cache (populated by Forward, including the N=1 fast path
+        /// and the per-seq fallback used when ForwardBatch throws
+        /// NotSupported) into the model's paged storage so the upcoming
+        /// ForwardBatch sees the owner's full history.
+        ///
+        /// Returns true when migration succeeded or no migration was needed
+        /// (no owner, or owner already in paged storage). Returns false
+        /// when migration was needed but cannot proceed — either because
+        /// the model doesn't expose migration at all (common case for
+        /// models whose batched path is gated off, so every step runs
+        /// per-seq and accumulates linear-only state) or because the model
+        /// supports migration but TryMigrateLinearKVToPaged bailed for this
+        /// owner.
+        /// The caller distinguishes the two via SupportsLinearKVMigration
+        /// to decide whether the situation is expected (silent fallback)
+        /// or worth logging (real migration failure).</summary>
+        private bool TryMigrateOwnerToPagedIfNeeded(IBatchedPagedModel batched)
+        {
+            if (_currentOwner == null
+                || _ownerTokensInModel <= 0
+                || _currentOwner.KvStateInPagedStorage)
+            {
+                return true;
+            }
+            if (!batched.SupportsLinearKVMigration)
+            {
+                return false;
+            }
+            if (batched.TryMigrateLinearKVToPaged(_currentOwner, _blockSize))
+            {
+                _currentOwner.KvStateInPagedStorage = true;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsBatchedN1FastPathEnabled()
+        {
+            // Default ON. The bug that previously made this dangerous (a
+            // second concurrent request corrupting the first's output via
+            // paged-vs-linear KV-cache divergence) is now handled by the
+            // linear→paged migration at the N=1→batched transition, gated
+            // on IBatchedPagedModel.SupportsLinearKVMigration. Disable via
+            // TS_BATCHED_N1_FAST_PATH=0 to A/B the fully-batched path.
+            string raw = Environment.GetEnvironmentVariable("TS_BATCHED_N1_FAST_PATH");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsBatchedPathDisabled()
@@ -297,10 +455,78 @@ namespace TensorSharp.Runtime.Scheduling
 
         private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
         {
-            var results = new List<SequenceStepResult>(output.ScheduledWork.Count);
+            var results = new List<SequenceStepResult>(1);
+            if (output.ScheduledWork.Count == 0)
+                return results;
 
-            foreach (var work in output.ScheduledWork)
+            // The byte-level KV-state extract/inject in EnsureOwnership does
+            // not correctly snapshot models with circular / sliding-window
+            // caches (e.g. Gemma 4's 512-token SWA window): swapping out
+            // mid-step and back in loses positions that have wrapped, so two
+            // sequences interleaving on the same step produce garbled output.
+            // Forward AT MOST ONE sequence per call here and let the
+            // scheduler re-emit the others on subsequent steps. This makes
+            // concurrent requests serially correct on this path (the price
+            // of running without continuous batching) instead of corrupting
+            // them. The batched paged path handles N-seq fan-out via slot
+            // mapping and is not affected.
+            //
+            // Selection policy:
+            //   1. Default to the first scheduled work.
+            //   2. If a freshly-admitted (IsNewAdmission) non-owner is in the
+            //      schedule AND the model can safely swap KV state, preempt
+            //      the owner to give the new request its first token within
+            //      one step (otherwise it would have to wait for the owner's
+            //      full DecodeQuantumTokens streak to elapse).
+            //   3. Else, when multiple sequences are scheduled and the
+            //      current owner has accumulated DecodeQuantumTokens
+            //      consecutive forwarded tokens, rotate to the first
+            //      non-owner. Without this, an in-progress decode keeps
+            //      pinning ownership and starves every other scheduled seq
+            //      indefinitely (e.g. seq1 streaming while seq2 sits in
+            //      prefill waiting for a turn it never gets).
+            //   4. Else, prefer the current owner to amortize swap cost.
+            //
+            // Rotation only fires when SupportsKVStateSnapshot is true; that
+            // gate preserves the original Gemma-4-with-wrapped-SWA-cache
+            // safety property — when the swap is unsafe the model reports
+            // false and we stay with the owner.
+            var picked = output.ScheduledWork[0];
+            if (_currentOwner != null && output.ScheduledWork.Count > 0)
             {
+                bool canSwap = _model.SupportsKVStateSnapshot;
+                int quantum = Math.Max(1, _scheduler.Config.DecodeQuantumTokens);
+                bool quantumExceeded = canSwap && _ownerForwardedTokens >= quantum;
+
+                ScheduledSequenceWork ownerWork = null;
+                ScheduledSequenceWork firstNonOwner = null;
+                ScheduledSequenceWork freshNonOwner = null;
+                foreach (var candidate in output.ScheduledWork)
+                {
+                    if (ReferenceEquals(candidate.Sequence, _currentOwner))
+                    {
+                        ownerWork = candidate;
+                    }
+                    else
+                    {
+                        firstNonOwner ??= candidate;
+                        if (canSwap && candidate.IsNewAdmission && freshNonOwner == null)
+                            freshNonOwner = candidate;
+                    }
+                }
+
+                if (freshNonOwner != null)
+                    picked = freshNonOwner;
+                else if (quantumExceeded && firstNonOwner != null)
+                    picked = firstNonOwner;
+                else if (ownerWork != null)
+                    picked = ownerWork;
+                else if (firstNonOwner != null)
+                    picked = firstNonOwner;
+            }
+
+            {
+                var work = picked;
                 var seq = work.Sequence;
                 int prevComputed = seq.NumComputedTokens;
                 try
@@ -348,6 +574,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                     seq.AdvanceComputedTokens(inputTokens.Length);
                     _ownerTokensInModel += inputTokens.Length;
+                    _ownerForwardedTokens += inputTokens.Length;
 
                     // Capture any newly-completed full blocks into the prefix cache.
                     int capturedFullBlocks = CaptureNewlyFullBlocks(seq);
@@ -377,6 +604,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // Reset ownership so the next step does a clean swap.
                     _currentOwner = null;
                     _ownerTokensInModel = 0;
+                    _ownerForwardedTokens = 0;
                     seq.Error = ex;
                 }
             }
@@ -428,6 +656,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
             }
             _currentOwner = seq;
+            _ownerForwardedTokens = 0;
         }
 
         private int[] BuildPrefillChunk(SequenceState seq, ScheduledSequenceWork work)
@@ -567,6 +796,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _currentOwner = null;
             _ownerTokensInModel = 0;
+            _ownerForwardedTokens = 0;
             _model.ResetKVCache();
         }
     }
@@ -609,6 +839,41 @@ namespace TensorSharp.Runtime.Scheduling
         /// the model's batched kernels never see them. Set true once the
         /// per-batch position-table + embedding-inject plumbing is in place.</summary>
         bool SupportsBatchedMultimodal => false;
+
+        /// <summary>True iff the model implements
+        /// <see cref="TryMigrateLinearKVToPaged"/> for transitioning a
+        /// sequence that has run through the N=1 fast path (which writes
+        /// only to the legacy linear KV cache) over to the paged storage
+        /// that <see cref="ForwardBatch"/> reads from. When false, the
+        /// executor must not use the N=1 fast path for this model — a
+        /// later second-sequence arrival would corrupt the first
+        /// sequence's attention.</summary>
+        bool SupportsLinearKVMigration => false;
+
+        /// <summary>Copy the given sequence's K/V history out of the legacy
+        /// linear KV cache (whatever per-model layout <c>Forward</c> writes)
+        /// and into paged storage at slots derived from
+        /// <c>owner.BlockTable</c> with the given block size. The model
+        /// must be the one holding the linear state right now (i.e. this
+        /// is called when the executor's <c>_currentOwner == owner</c>).
+        ///
+        /// Returns true on success. Returning false (or returning false
+        /// from <see cref="SupportsLinearKVMigration"/>) tells the
+        /// executor to keep the sequence on the per-seq path instead of
+        /// dispatching it through <see cref="ForwardBatch"/>.</summary>
+        bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => false;
+
+        /// <summary>Notify the model that a sequence has been released by
+        /// the scheduler (finished, aborted, errored, or preempted) so any
+        /// per-sequence state the model holds keyed by <c>RequestId</c> can
+        /// be reclaimed. Default no-op for models that don't keep such
+        /// state. Hybrid models (Nemotron-H, Qwen 3.5) that allocate Mamba2 /
+        /// GatedDeltaNet recurrent-state slots per active sequence MUST
+        /// implement this; otherwise two concurrent sequences whose first
+        /// attention block is shared via prefix-cache hit would collide on
+        /// the same recurrent-state slot and trample each other's hidden
+        /// state.</summary>
+        void OnSequenceReleased(string requestId) { }
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

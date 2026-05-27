@@ -1,0 +1,273 @@
+name: Test Matrix
+
+# Runs the full inference test/benchmark matrix
+# (TensorSharp.TestMatrix) on every PR and every push to main.
+#
+# Self-hosted runners required: this workflow drives real GGUF models on
+# real GPUs / Apple Silicon, neither of which is available on
+# github-hosted runners. The expected runner labels are:
+#
+#   - [self-hosted, tensorsharp-cuda]   Linux + NVIDIA GPU + CUDA toolkit
+#   - [self-hosted, tensorsharp-mlx]    macOS arm64 (Apple Silicon)
+#
+# Each runner must have:
+#   - .NET 10 SDK on PATH
+#   - The model directory populated at the path pointed to by the
+#     TESTMATRIX_MODEL_DIR env var (default: /Users/ZhongkaiFu/work/model)
+#   - The TensorSharp.GGML.Native build artifacts present
+#     (eng/verify-packages.ps1 or the equivalent build for Unix has run)
+#   - Sufficient disk in $GITHUB_WORKSPACE/results to hold ~MB of JSON
+#
+# See TensorSharp.TestMatrix/README.md for project-level docs.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: "Comma-separated backend ids (or empty = all available)"
+        required: false
+        default: ""
+      features:
+        description: "Comma-separated feature ids (or empty = all)"
+        required: false
+        default: ""
+      env_vars:
+        description: "Comma-separated env-var sweeps ('none' to disable)"
+        required: false
+        default: ""
+      update_baseline:
+        description: "Capture the current run as the new baseline for each host and open a PR with the updated files"
+        required: false
+        type: boolean
+        default: false
+      regression_threshold_pct:
+        description: "Throughput drop (percent) flagged as a regression"
+        required: false
+        default: "10"
+
+concurrency:
+  # Only one matrix run per PR. Cancel an in-flight run when new commits land.
+  group: test-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: tensorsharp-cuda
+            os_label: linux-cuda
+          - runner: tensorsharp-mlx
+            os_label: macos-mlx
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    timeout-minutes: 30
+    outputs:
+      build-success: ${{ steps.build.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          dotnet --info || true
+          uname -a || true
+          (which nvidia-smi >/dev/null 2>&1 && nvidia-smi) || true
+
+      - name: Build solution
+        id: build
+        run: |
+          dotnet restore TensorSharp.slnx
+          dotnet build TensorSharp.slnx -c Release --no-restore /p:WarningLevel=2
+
+      - name: Pack build outputs
+        run: |
+          tar -czf testmatrix-build-${{ matrix.os_label }}.tar.gz \
+            TensorSharp.Cli/bin \
+            TensorSharp.TestMatrix/bin \
+            TensorSharp.GGML.Native \
+            TensorSharp.Backends.MLX/Native/dist 2>/dev/null || \
+          tar -czf testmatrix-build-${{ matrix.os_label }}.tar.gz \
+            TensorSharp.Cli/bin \
+            TensorSharp.TestMatrix/bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testmatrix-build-${{ matrix.os_label }}
+          path: testmatrix-build-${{ matrix.os_label }}.tar.gz
+          retention-days: 7
+
+  matrix:
+    name: Matrix (${{ matrix.runner }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: tensorsharp-cuda
+            os_label: linux-cuda
+            default_backends: "cpu,ggml_cpu,ggml_cuda,cuda"
+          - runner: tensorsharp-mlx
+            os_label: macos-mlx
+            default_backends: "cpu,ggml_cpu,ggml_metal,mlx"
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    timeout-minutes: 480
+    env:
+      TESTMATRIX_MODEL_DIR: ${{ vars.TESTMATRIX_MODEL_DIR || '/Users/ZhongkaiFu/work/model' }}
+      TESTMATRIX_MEDIA_DIR: ${{ vars.TESTMATRIX_MEDIA_DIR || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: testmatrix-build-${{ matrix.os_label }}
+          path: .
+
+      - name: Unpack build
+        run: tar -xzf testmatrix-build-${{ matrix.os_label }}.tar.gz
+
+      - name: Show host info
+        run: |
+          echo "== runner =="
+          echo "label   : ${{ matrix.runner }}"
+          echo "model_dir: $TESTMATRIX_MODEL_DIR"
+          echo "media_dir: $TESTMATRIX_MEDIA_DIR"
+          echo "== disk =="
+          df -h . || true
+          echo "== models present =="
+          ls -lh "$TESTMATRIX_MODEL_DIR" 2>/dev/null | head -30 || echo "model dir does not exist on this runner"
+
+      - name: Resolve runtime options
+        id: opts
+        run: |
+          BACKENDS="${{ github.event.inputs.backends }}"
+          if [ -z "$BACKENDS" ]; then BACKENDS="${{ matrix.default_backends }}"; fi
+          FEATURES="${{ github.event.inputs.features }}"
+          ENV_VARS="${{ github.event.inputs.env_vars }}"
+          echo "backends=$BACKENDS" >> "$GITHUB_OUTPUT"
+          echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
+          echo "env_vars=$ENV_VARS" >> "$GITHUB_OUTPUT"
+
+      - name: Run test matrix
+        env:
+          TESTMATRIX_BACKENDS: ${{ steps.opts.outputs.backends }}
+          TESTMATRIX_FEATURES: ${{ steps.opts.outputs.features }}
+          TESTMATRIX_ENV_VARS: ${{ steps.opts.outputs.env_vars }}
+          TESTMATRIX_THRESHOLD: ${{ github.event.inputs.regression_threshold_pct || '10' }}
+          TESTMATRIX_HOST_LABEL: ${{ matrix.os_label }}
+          TESTMATRIX_UPDATE_BASELINE: ${{ github.event.inputs.update_baseline }}
+        run: |
+          set -euo pipefail
+          ARGS=(--model-dir "$TESTMATRIX_MODEL_DIR" \
+                --results-dir "$GITHUB_WORKSPACE/results/${{ matrix.os_label }}" \
+                --report      "$GITHUB_WORKSPACE/report-${{ matrix.os_label }}.md" \
+                --host-label  "$TESTMATRIX_HOST_LABEL" \
+                --regression-threshold-pct "$TESTMATRIX_THRESHOLD" \
+                --skip-existing)
+          if [ -n "$TESTMATRIX_MEDIA_DIR" ]; then
+            ARGS+=(--inputs-root "$TESTMATRIX_MEDIA_DIR")
+          fi
+          if [ -n "$TESTMATRIX_BACKENDS" ]; then
+            ARGS+=(--backends "$TESTMATRIX_BACKENDS")
+          fi
+          if [ -n "$TESTMATRIX_FEATURES" ]; then
+            ARGS+=(--features "$TESTMATRIX_FEATURES")
+          fi
+          if [ -n "$TESTMATRIX_ENV_VARS" ]; then
+            ARGS+=(--env-vars "$TESTMATRIX_ENV_VARS")
+          fi
+          # PRs and push-to-main: fail on regression. The workflow_dispatch
+          # "update_baseline" path also writes a fresh baseline file in place.
+          if [ "$TESTMATRIX_UPDATE_BASELINE" = "true" ]; then
+            ARGS+=(--update-baseline)
+          else
+            ARGS+=(--fail-on-regression)
+          fi
+          dotnet TensorSharp.TestMatrix/bin/TensorSharp.TestMatrix.dll "${ARGS[@]}"
+
+      - name: Upload markdown report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testmatrix-report-${{ matrix.os_label }}
+          path: report-${{ matrix.os_label }}.md
+          retention-days: 90
+
+      - name: Upload per-cell JSON results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testmatrix-results-${{ matrix.os_label }}
+          path: results/${{ matrix.os_label }}
+          retention-days: 30
+
+      - name: Upload refreshed baseline (only when --update-baseline was set)
+        if: github.event.inputs.update_baseline == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: testmatrix-baseline-${{ matrix.os_label }}
+          path: TensorSharp.TestMatrix/Baselines/baseline-${{ matrix.os_label }}.json
+          retention-days: 90
+
+      - name: Render report into job summary
+        if: always()
+        run: |
+          if [ -f "report-${{ matrix.os_label }}.md" ]; then
+            echo "## Test matrix report — ${{ matrix.os_label }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            # GitHub job summaries cap at 1 MiB; tail/truncate if needed.
+            head -c 900000 "report-${{ matrix.os_label }}.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no report produced)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  pr-comment:
+    name: PR comment
+    needs: matrix
+    if: github.event_name == 'pull_request' && always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: testmatrix-report-*
+          merge-multiple: true
+          path: reports
+      - name: Post or update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = 'reports';
+            let body = '## TensorSharp Test Matrix\n\n';
+            if (!fs.existsSync(dir)) {
+              body += '_No report artifacts produced._';
+            } else {
+              for (const f of fs.readdirSync(dir).sort()) {
+                const full = path.join(dir, f);
+                const txt = fs.readFileSync(full, 'utf8');
+                const tail = txt.length > 30000 ? txt.slice(0, 30000) + '\n\n_(truncated — see uploaded artifact for full report)_' : txt;
+                body += `\n<details><summary>${f}</summary>\n\n${tail}\n</details>\n`;
+              }
+            }
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const marker = '<!-- testmatrix-report -->';
+            body = marker + '\n' + body;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

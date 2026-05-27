@@ -745,6 +745,52 @@ internal enum GgmlIndexReductionOp
             float scale,
             IntPtr sinksData);          // [numHeads] F32 or IntPtr.Zero
 
+        // GPU-resident variant: qData and outData point to existing backend
+        // (Tensor storage) buffers, so the kernel can zero-copy bind them
+        // instead of round-tripping through host arrays + ggml_backend_synchronize.
+        // Eliminates the per-layer queue drain that GetElementsAsFloat would
+        // otherwise force.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_PagedAttentionForwardDevice(
+            IntPtr qData,
+            IntPtr pagedKData,
+            IntPtr pagedVData,
+            IntPtr outData,
+            IntPtr queryStartLoc,
+            IntPtr seqLens,
+            IntPtr positions,
+            IntPtr blockTableFlat,
+            IntPtr blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            int slidingWindow,
+            float scale);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_PagedAttentionForwardDeviceWithSinks(
+            IntPtr qData,
+            IntPtr pagedKData,
+            IntPtr pagedVData,
+            IntPtr outData,
+            IntPtr queryStartLoc,
+            IntPtr seqLens,
+            IntPtr positions,
+            IntPtr blockTableFlat,
+            IntPtr blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            int slidingWindow,
+            float scale,
+            IntPtr sinksData);
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Qwen35AttentionLayerDecode(
             IntPtr residualData, int hiddenSize,
@@ -1030,6 +1076,9 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_ClearHostBufferCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Shutdown();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_InvalidateHostBuffer(IntPtr ptr);
@@ -1947,6 +1996,96 @@ internal enum GgmlIndexReductionOp
             }
         }
 
+        /// <summary>
+        /// GPU-resident paged-attention forward. <paramref name="qData"/> and
+        /// <paramref name="outData"/> point to backend-allocated buffers
+        /// (typically <c>tensor.Storage.PtrAtElement(...)</c> on the Metal /
+        /// CUDA backend). The kernel zero-copy binds Q's tensor and writes
+        /// the attention output directly into the caller's output tensor —
+        /// no host-side memcpy round-trip, no per-layer
+        /// <c>ggml_backend_synchronize</c>. K/V paged storage is still passed
+        /// as host arrays.
+        /// </summary>
+        public static unsafe void PagedAttentionForwardDevice(
+            IntPtr qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            IntPtr outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow = 0)
+        {
+            fixed (float* kp = pagedKData)
+            fixed (float* vp = pagedVData)
+            fixed (int* qsl = queryStartLoc)
+            fixed (int* sl = seqLens)
+            fixed (int* pos = positions)
+            fixed (int* btf = blockTableFlat)
+            fixed (int* bto = blockTableOffsets)
+            {
+                CheckResult(TSGgml_PagedAttentionForwardDevice(
+                    qData, (IntPtr)kp, (IntPtr)vp, outData,
+                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos,
+                    (IntPtr)btf, (IntPtr)bto,
+                    numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                    blockSize, slidingWindow, scale),
+                    "paged_attention_forward_device");
+            }
+        }
+
+        /// <summary>GPU-resident paged-attention forward with per-head
+        /// attention sinks. Pass <c>null</c> for <paramref name="sinksData"/>
+        /// to match <see cref="PagedAttentionForwardDevice"/>.</summary>
+        public static unsafe void PagedAttentionForwardDeviceWithSinks(
+            IntPtr qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            IntPtr outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow,
+            float[] sinksData)
+        {
+            fixed (float* kp = pagedKData)
+            fixed (float* vp = pagedVData)
+            fixed (int* qsl = queryStartLoc)
+            fixed (int* sl = seqLens)
+            fixed (int* pos = positions)
+            fixed (int* btf = blockTableFlat)
+            fixed (int* bto = blockTableOffsets)
+            fixed (float* sink = sinksData)
+            {
+                CheckResult(TSGgml_PagedAttentionForwardDeviceWithSinks(
+                    qData, (IntPtr)kp, (IntPtr)vp, outData,
+                    (IntPtr)qsl, (IntPtr)sl, (IntPtr)pos,
+                    (IntPtr)btf, (IntPtr)bto,
+                    numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                    blockSize, slidingWindow, scale,
+                    sinksData != null ? (IntPtr)sink : IntPtr.Zero),
+                    "paged_attention_forward_device_with_sinks");
+            }
+        }
+
         public static void Qwen35AttentionLayerDecode(
             IntPtr residualData, int hiddenSize,
             IntPtr attnNormData,
@@ -2223,6 +2362,19 @@ internal enum GgmlIndexReductionOp
         public static void ClearHostBufferCache()
         {
             TSGgml_ClearHostBufferCache();
+        }
+
+        /// <summary>
+        /// Tear down the process-global GGML backend before the C runtime
+        /// finalisers run. On macOS the ggml-metal device singleton asserts
+        /// that its resource set is empty when its static destructor fires;
+        /// if the backend, host-buffer cache, and preloaded-buffer cache
+        /// outlive the .NET host the assertion aborts the process on exit.
+        /// Hook this onto AppDomain.ProcessExit / ApplicationStopped.
+        /// </summary>
+        public static void Shutdown()
+        {
+            TSGgml_Shutdown();
         }
 
         public static void InvalidateHostBuffer(IntPtr ptr)

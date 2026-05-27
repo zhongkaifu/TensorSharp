@@ -28,6 +28,9 @@ namespace TensorSharp.MLX
         private const int IQ2_SBlockBytes = 2 + QK_K / 4 + QK_K / 16;
         private const int IQ3_SBlockBytes = 2 + 13 * (QK_K / 32) + QK_K / 64;
         private const int IQ4_XSBlockBytes = 2 + 2 + QK_K / 64 + QK_K / 2;
+        // IQ4_NL: 32 elements per block (QK4_NL), 18 bytes = 2-byte F16 d + 16-byte qs.
+        private const int IQ4_NLBlockElements = 32;
+        private const int IQ4_NLBlockBytes = 18;
         private const int MlxAffineQ8GroupSize = 32;
         private const int MlxAffineQ8Bits = 8;
         private const int MlxAffineQ6GroupSize = 16;
@@ -124,6 +127,23 @@ namespace TensorSharp.MLX
             return Enum.IsDefined(typeof(GgmlTensorType), type) && SupportsQuantizedType((GgmlTensorType)type);
         }
 
+        // Opt-out for the MLX IQ4_NL preload + matmul path. Default ON. Set
+        // TS_MLX_IQ4NL_GPU=0 to disable, which forces IQ4_NL weights to
+        // stay file-backed (no MLX preload, no ReleaseHostData) so the C#
+        // `ManagedQuantizedOps` CPU matmul path remains usable. Useful
+        // when the workload is prefill-heavy (short generations): the
+        // GPU kernel currently issues one threadgroup per (out_col, row)
+        // and prefill regresses by ~40-50 % vs the CPU baseline on
+        // Nemotron-H 30B / IQ2_XXS-UD, where the MoE expert weights are
+        // IQ4_NL. Decode (rows=1, ~3× faster on GPU) is unaffected by
+        // this trade since it's outside the regressed regime.
+        private static bool Iq4NlGpuEnabled()
+        {
+            return !string.Equals(
+                Environment.GetEnvironmentVariable("TS_MLX_IQ4NL_GPU"),
+                "0", StringComparison.Ordinal);
+        }
+
         public static bool CanPreloadQuantizedType(int type)
         {
             return type == (int)GgmlTensorType.Q4_0 ||
@@ -138,6 +158,7 @@ namespace TensorSharp.MLX
                 type == (int)GgmlTensorType.IQ2_S ||
                 type == (int)GgmlTensorType.IQ3_S ||
                 type == (int)GgmlTensorType.IQ4_XS ||
+                (type == (int)GgmlTensorType.IQ4_NL && Iq4NlGpuEnabled()) ||
                 type == (int)GgmlTensorType.MXFP4;
         }
 
@@ -191,6 +212,18 @@ namespace TensorSharp.MLX
         // Returns true if a batched-MoE matmul kernel exists for this
         // ggml type. Currently only IQ2_XXS — extend as more custom
         // batched kernels are written.
+        //
+        // NOTE: An IQ4_NL batched-MoE kernel (`Iq4NlMoeMatmulBatched` /
+        // `Iq4NlMoeMatmulBatchedRowed` in MlxNative.cs) is written but
+        // currently SEGFAULTS Metal at runtime. The kernels assume a
+        // stacked weight layout of `[numExperts, outDim, blocksPerRow ×
+        // 18 bytes]` which matches what `_layerStackedUp[layer].Data`
+        // exposes for IQ2_XXS Qwen 3.5, but may not be how Nemotron-H
+        // stacks its `ffn_up_exps.weight` / `ffn_down_exps.weight` GGUF
+        // tensors. Left disabled here so the kernel code is preserved
+        // for future debugging — flip the IQ4_NL check on again once the
+        // stacked layout is verified and the kernel either passes the
+        // bounds check or is rewritten to match the actual GGUF layout.
         public static bool SupportsBatchedMoeMatmul(int ggmlType)
         {
             return ggmlType == (int)GgmlTensorType.IQ2_XXS;
@@ -319,7 +352,10 @@ namespace TensorSharp.MLX
             if (result.Sizes[0] != K || result.Sizes[1] != outDim) return false;
             int expectedInRows = sharedInput ? 1 : K;
             if (input.Sizes[0] != expectedInRows || input.Sizes[1] != inDim) return false;
-            if (inDim % 256 != 0) return false;
+            // Block-size alignment varies by quant type: IQ4_NL = 32-element
+            // blocks (so inDim % 32 == 0), all others use 256-element blocks.
+            int blockAlignment = ggmlType == (int)GgmlTensorType.IQ4_NL ? 32 : 256;
+            if (inDim % blockAlignment != 0) return false;
 
             // Ensure the stacked weight is uploaded as ONE MLX array.
             // Cache key is the stacked-bytes host pointer (unique per
@@ -343,9 +379,18 @@ namespace TensorSharp.MLX
             {
                 inputView = inputStorage.CreateArrayView(input);
                 indicesView = indicesStorage.CreateArrayView(expertIndices);
-                output = sharedInput
-                    ? MlxNative.Iq2XxsMoeMatmulBatched(inputView, weight.Weight, indicesView, K, inDim, outDim)
-                    : MlxNative.Iq2XxsMoeMatmulBatchedRowed(inputView, weight.Weight, indicesView, K, inDim, outDim);
+                if (ggmlType == (int)GgmlTensorType.IQ4_NL)
+                {
+                    output = sharedInput
+                        ? MlxNative.Iq4NlMoeMatmulBatched(inputView, weight.Weight, indicesView, K, inDim, outDim)
+                        : MlxNative.Iq4NlMoeMatmulBatchedRowed(inputView, weight.Weight, indicesView, K, inDim, outDim);
+                }
+                else
+                {
+                    output = sharedInput
+                        ? MlxNative.Iq2XxsMoeMatmulBatched(inputView, weight.Weight, indicesView, K, inDim, outDim)
+                        : MlxNative.Iq2XxsMoeMatmulBatchedRowed(inputView, weight.Weight, indicesView, K, inDim, outDim);
+                }
                 SetDeviceResult(result, output);
                 output = default;
                 return true;
@@ -457,6 +502,23 @@ namespace TensorSharp.MLX
                 if (ggmlType == (int)GgmlTensorType.IQ4_XS)
                 {
                     output = MlxNative.Iq4XsMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
+                    SetDeviceResult(result, output);
+                    output = default;
+                }
+                else if (ggmlType == (int)GgmlTensorType.IQ4_NL)
+                {
+                    // Per-call IQ4_NL matmul. Without this dispatch the call
+                    // would fall through to MLX's generic QuantizedMatmul, but
+                    // that wouldn't apply because IQ4_NL doesn't have an
+                    // MLX-native repacked weight — we wrap the GGUF mmap as a
+                    // raw uchar array and the Iq4NlMatmul Metal kernel
+                    // dequantises on the fly. The kernel handles `rows >= 1`
+                    // via the (256, outDim, rows) grid; multi-row prefill is
+                    // not as well-tuned as decode (no per-row weight reuse
+                    // yet) but always returns the correct result, which is
+                    // what matters once `ReleaseHostData` has run and the
+                    // CPU fallback is no longer reachable.
+                    output = MlxNative.Iq4NlMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
                     SetDeviceResult(result, output);
                     output = default;
                 }
@@ -893,6 +955,7 @@ namespace TensorSharp.MLX
                     (int)GgmlTensorType.IQ2_S => CreateIq2SRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ3_S => CreateIq3SRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ4_XS => CreateIq4XsRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
+                    (int)GgmlTensorType.IQ4_NL => CreateIq4NlRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.MXFP4 => CreateMxfp4Weight(deviceId, hostData, ne0, ne1, rawBytes),
                     _ => throw new NotSupportedException($"MLX quantized preload does not support GGML tensor type {(GgmlTensorType)ggmlType}."),
                 };
@@ -1499,6 +1562,54 @@ namespace TensorSharp.MLX
                     GroupSize = QK_K,
                     Bits = 4,
                     Mode = "iq4_xs",
+                };
+                rawWeight = default;
+                return entry;
+            }
+            finally
+            {
+                MlxNative.FreeArray(rawWeight);
+            }
+        }
+
+        // Wrap an IQ4_NL GGUF row group as a single MLX uchar array (one big
+        // [outDim * blocksPerRow * 18]-byte buffer) and hand it to
+        // `MlxNative.Iq4NlMatmul`. The buffer is created from the host mmap
+        // pointer with no copy — Apple Silicon unified memory makes this a
+        // zero-cost wrap, and the OS keeps the pages resident for the
+        // lifetime of the MlxArray reference.
+        private static DeviceWeight CreateIq4NlRawWeight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)
+        {
+            if (ne0 <= 0 || ne1 <= 0 || ne0 > int.MaxValue || ne1 > int.MaxValue || ne0 % IQ4_NLBlockElements != 0)
+                throw new NotSupportedException($"IQ4_NL MLX preload requires positive dimensions and input dim aligned to {IQ4_NLBlockElements}, got [{ne0}, {ne1}].");
+
+            int inDim = checked((int)ne0);
+            int outDim = checked((int)ne1);
+            long blocksPerRow = inDim / IQ4_NLBlockElements;
+            long expectedBytes = outDim * blocksPerRow * IQ4_NLBlockBytes;
+            if (rawBytes < expectedBytes)
+                throw new ArgumentException($"IQ4_NL raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
+            if (expectedBytes > int.MaxValue)
+                throw new NotSupportedException($"IQ4_NL raw MLX array exceeds the current Int32 shape limit: {expectedBytes} bytes.");
+
+            MlxNative.MlxArray rawWeight = default;
+            try
+            {
+                rawWeight = MlxNative.NewArrayFromHost(hostData, new[] { (int)expectedBytes }, DType.UInt8);
+                MlxNative.Eval(rawWeight);
+                var entry = new DeviceWeight
+                {
+                    Weight = rawWeight,
+                    Scales = default,
+                    Biases = default,
+                    DeviceId = deviceId,
+                    GgmlType = (int)GgmlTensorType.IQ4_NL,
+                    Ne0 = ne0,
+                    Ne1 = ne1,
+                    RawBytes = rawBytes,
+                    GroupSize = IQ4_NLBlockElements,
+                    Bits = 4,
+                    Mode = "iq4_nl",
                 };
                 rawWeight = default;
                 return entry;

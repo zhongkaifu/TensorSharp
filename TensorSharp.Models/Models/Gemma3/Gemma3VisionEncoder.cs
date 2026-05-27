@@ -20,6 +20,9 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        // Cooperative GpuComputeLock yielding (see Gemma4VisionEncoder).
+        private ModelBase _hostModel;
+        public void SetHostModel(ModelBase model) => _hostModel = model;
 
         private readonly int _imageSize;
         private readonly int _patchSize;
@@ -120,6 +123,9 @@ namespace TensorSharp.Models
                 hidden = EncoderBlock(hidden, i, numPatches, headDim);
                 if (debug && (i == 0 || i == _blockCount - 1))
                     DumpTensor(hidden, $"After block {i}", numPatches);
+                // Yield GpuComputeLock between encoder blocks (see
+                // Gemma4VisionEncoder).
+                _hostModel?.YieldGpuComputeLock();
             }
             Console.WriteLine(" done");
 

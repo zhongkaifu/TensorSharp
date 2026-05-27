@@ -9,4 +9,5 @@
   <Project Path="TensorSharp.Models/TensorSharp.Models.csproj" />
   <Project Path="TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
   <Project Path="TensorSharp.Server/TensorSharp.Server.csproj" />
+  <Project Path="TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj" />
 </Solution>

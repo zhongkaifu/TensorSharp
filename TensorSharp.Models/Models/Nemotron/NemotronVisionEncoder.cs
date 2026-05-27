@@ -37,6 +37,9 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        // Cooperative GpuComputeLock yielding (see Gemma4VisionEncoder).
+        private ModelBase _hostModel;
+        public void SetHostModel(ModelBase model) => _hostModel = model;
 
         private readonly int _hiddenSize;
         private readonly int _intermediateSize;
@@ -220,7 +223,12 @@ namespace TensorSharp.Models
 
             // 4. Run encoder blocks.
             for (int i = 0; i < _blockCount; i++)
+            {
                 hidden = EncoderBlock(hidden, i, totalTokens);
+                // Yield GpuComputeLock between encoder blocks (see
+                // Gemma4VisionEncoder).
+                _hostModel?.YieldGpuComputeLock();
+            }
 
             // 5. Drop the class tokens.
             if (_numClassTokens > 0)

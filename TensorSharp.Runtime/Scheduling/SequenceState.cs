@@ -98,6 +98,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// hits) at admission time. Diagnostic only.</summary>
         public int PrefixCacheReusedTokens { get; internal set; }
 
+        /// <summary>True once this sequence's K/V state has been written into
+        /// the model's paged storage (via <c>ForwardBatch</c> or an explicit
+        /// linear→paged migration). Prevents the executor from later routing
+        /// the same sequence back through the N=1 fast path's
+        /// <c>Forward()</c>, which would write into the disjoint linear KV
+        /// cache and corrupt the sequence's attention.</summary>
+        public bool KvStateInPagedStorage { get; internal set; }
+
         /// <summary>Returns the token at logical position <paramref name="pos"/>
         /// (prompt or generated).</summary>
         public int TokenAt(int pos)

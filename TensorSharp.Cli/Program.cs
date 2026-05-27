@@ -154,11 +154,12 @@ namespace TensorSharp.Cli
                     case "--continuous-batching":
                     case "--paged-batching":
                         // Paged-attention continuous batching path. Gates two
-                        // env vars: TS_SCHED_DISABLE_BATCHED (scheduler — falls
-                        // through to per-seq KV-swap when set) and
-                        // TS_QWEN35_BATCHED (Qwen3.5 ForwardBatch opt-in). Set
-                        // here so InferenceEngine + the model adapters read
-                        // the right state at construction.
+                        // env vars: TS_SCHED_DISABLE_BATCHED (scheduler —
+                        // falls through to per-seq KV-swap when set) and
+                        // TS_QWEN35_BATCHED (Qwen3.5 ForwardBatch gate). Both
+                        // default ON; this flag is idempotent with the default
+                        // and kept for explicit operator intent or for
+                        // overriding a previous --no-continuous-batching.
                         Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "0");
                         Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "1");
                         break;
@@ -1606,17 +1607,22 @@ namespace TensorSharp.Cli
 
             // Pipelined greedy decode: when the model supports a device-side
             // argmax + embedding lookup, queue forward N+1 BEFORE syncing
-            // forward N's predicted token. This overlaps the ~8 ms LM-head
+            // forward N's predicted token. This overlaps the LM-head host
             // sync wait with the next forward's first kernels.
-            // Gated by TS_MLX_PIPELINED_DECODE=1, and only used when:
+            // Used when:
             //   - greedy sampling (no top-K / temperature)
             //   - no stop sequences (the pipeline issues one extra forward
             //     that we'd waste on a mid-stream stop)
             //   - model.SupportsPipelinedGreedy
+            // Default ON; opt-out with TS_MLX_PIPELINED_DECODE=0.
+            string pipelinedEnv = Environment.GetEnvironmentVariable("TS_MLX_PIPELINED_DECODE");
+            bool pipelinedDecodeEnabled =
+                !string.Equals(pipelinedEnv, "0", StringComparison.Ordinal)
+                && !string.Equals(pipelinedEnv, "false", StringComparison.OrdinalIgnoreCase);
             bool pipelinedGreedy = cfg.IsGreedy
                 && (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
                 && model.SupportsPipelinedGreedy
-                && string.Equals(Environment.GetEnvironmentVariable("TS_MLX_PIPELINED_DECODE"), "1", StringComparison.Ordinal);
+                && pipelinedDecodeEnabled;
 
             if (pipelinedGreedy)
             {
@@ -1924,6 +1930,19 @@ namespace TensorSharp.Cli
             int[] firstRunDecodeTokens = null;
             int firstRunPrefillTopToken = -1;
 
+            // Decode kernel selection. The benchmark is greedy by definition
+            // (it argmaxes the prefill logits to seed the chain), so when the
+            // model exposes the pipelined-greedy device path use it: each
+            // decode step queues the next forward's input embedding from a
+            // device-side argmax, eliminating the per-token MLX→CPU sync of
+            // the full [vocab] logits tensor. Opt out with
+            // TS_MLX_PIPELINED_DECODE=0 to force the legacy host-sync path
+            // for A/B comparison.
+            string pipelinedEnv = Environment.GetEnvironmentVariable("TS_MLX_PIPELINED_DECODE");
+            bool usePipelinedGreedy = model.SupportsPipelinedGreedy
+                && !string.Equals(pipelinedEnv, "0", StringComparison.Ordinal)
+                && !string.Equals(pipelinedEnv, "false", StringComparison.OrdinalIgnoreCase);
+
             for (int run = 0; run < runs; run++)
             {
                 model.ResetKVCache();
@@ -1948,12 +1967,39 @@ namespace TensorSharp.Cli
                     firstRunDecodeTokens = new int[decodeTokens];
                 }
                 var decodeSw = Stopwatch.StartNew();
-                for (int i = 0; i < decodeTokens; i++)
+                if (usePipelinedGreedy && decodeTokens > 0)
                 {
-                    logits = model.Forward(new[] { next });
-                    next = SampleGreedyFromLogits(logits, vocab);
+                    // Submit decode step N+1 BEFORE host-syncing token N — overlaps
+                    // the MLX LM-head sync wait with the next forward's first
+                    // kernels. `pending` is a [1] int32 device tensor.
+                    Tensor pending = model.SubmitGreedyDecodeStep(next);
+                    int step = 1;
+                    for (; step < decodeTokens; step++)
+                    {
+                        Tensor nextDevice = model.SubmitGreedyDecodeStep(null);
+                        int tok = pending.GetElementsAsInt(1)[0];
+                        pending.Dispose();
+                        pending = nextDevice;
+                        if (run == 0)
+                            firstRunDecodeTokens[step - 1] = tok;
+                    }
+                    // Drain the last queued forward.
+                    int lastTok = pending.GetElementsAsInt(1)[0];
+                    pending.Dispose();
                     if (run == 0)
-                        firstRunDecodeTokens[i] = next;
+                        firstRunDecodeTokens[decodeTokens - 1] = lastTok;
+                    next = lastTok;
+                    model.ResetPipelinedGreedyState();
+                }
+                else
+                {
+                    for (int i = 0; i < decodeTokens; i++)
+                    {
+                        logits = model.Forward(new[] { next });
+                        next = SampleGreedyFromLogits(logits, vocab);
+                        if (run == 0)
+                            firstRunDecodeTokens[i] = next;
+                    }
                 }
                 decodeSw.Stop();
                 double decodeMs = decodeSw.Elapsed.TotalMilliseconds;

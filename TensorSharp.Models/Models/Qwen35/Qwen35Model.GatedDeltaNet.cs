@@ -442,6 +442,22 @@ namespace TensorSharp.Models
                 foreach (var t in _deltaStateTensor) t?.Dispose();
             if (_mlxGdnCache != null)
                 foreach (var cache in _mlxGdnCache) cache?.Dispose();
+            if (_q35GdnSlotMlxCache != null)
+            {
+                foreach (var layerSlots in _q35GdnSlotMlxCache)
+                {
+                    if (layerSlots == null) continue;
+                    foreach (var cache in layerSlots) cache?.Dispose();
+                }
+            }
+            if (_q35GdnSlotSsmTensor != null)
+            {
+                foreach (var layerSlots in _q35GdnSlotSsmTensor)
+                {
+                    if (layerSlots == null) continue;
+                    foreach (var t in layerSlots) t?.Dispose();
+                }
+            }
 
             _gdnGatedOutT?.Dispose();
             _gdnChunkedQBuf?.Dispose();

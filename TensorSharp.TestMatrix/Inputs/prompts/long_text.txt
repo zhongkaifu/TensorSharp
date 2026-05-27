@@ -1,0 +1,63 @@
+You are reviewing the following technical report. Read it carefully, then in one paragraph (no more than six sentences) summarize: (a) what problem the report is trying to solve, (b) the approach it proposes, (c) the most significant trade-offs the report acknowledges. Do not invent details that are not present in the text.
+
+REPORT BEGINS
+================================================================
+Title: Continuous batching and paged KV cache for local LLM inference
+
+Background. Decoder-only large language models serve interactive workloads
+where users send chat-style prompts and expect token streaming as fast as
+possible. Two cost centers dominate per-token latency: (1) the autoregressive
+forward pass and (2) the management of the key/value cache that carries
+attention state from one token to the next. Naive implementations allocate
+a contiguous KV buffer per active sequence, padded to the maximum context
+length. This is convenient but wasteful: most of the buffer is unused most
+of the time, and growing the working set means re-allocating, copying, and
+fragmenting GPU memory.
+
+Approach. The paged KV cache, popularized by the vLLM project, organizes
+all KV state into fixed-size blocks of contiguous memory drawn from a single
+pool. Each in-flight sequence holds a list of block handles rather than a
+slab of bytes. A small block table maps logical token positions back to
+physical blocks at attention-time. Block size is a tuning knob; small
+blocks give finer-grained reuse at the cost of more table lookups, large
+blocks reduce overhead at the cost of internal fragmentation. Because
+blocks are uniform and small, two sequences that begin with the same
+prompt prefix can share the underlying blocks via reference counting and
+block-hash matching, dramatically reducing memory for chat workloads where
+the same system prompt is sent repeatedly.
+
+Scheduling. Once memory is paged, the engine can schedule iteration-by-
+iteration rather than request-by-request. Each iteration the scheduler
+admits as many sequences as fit in the residual block budget, runs one
+forward step (a fused prefill chunk or one decode token per sequence),
+and may preempt a sequence by spilling its blocks back to the pool if a
+higher-priority arrival needs room. This is fundamentally different from
+the request-FIFO approach used by older serving stacks where a single slow
+generation blocks the entire queue.
+
+Trade-offs. Paged attention is not free. The attention kernel must learn
+to gather K/V from non-contiguous block lists, adding indexing overhead
+that hurts very short sequences disproportionately. The block table grows
+with concurrent users, putting pressure on the kernel's register and shared
+memory budget on consumer GPUs. The block-hash prefix sharing scheme is
+only safe across sequences if the tokenization and the position encoding
+are deterministic for the shared prefix, which constrains sampling-time
+mutations of the prompt (insertions, deletions). Quantizing the KV cache
+to lower bit widths recovers headroom but introduces precision drift that
+shows up on long-context generation as the model "forgets" earlier turns
+faster than it would in float16.
+
+Implementation experience. We integrated paged attention behind a feature
+flag and shipped it as the default after two months of A/B testing in
+production traffic. Prefill throughput on long prompts increased by 1.5x
+to 2.3x depending on prefix-share hit rate. Decode tokens/second held
+within 3% of the pre-paged baseline at single-user load and improved by
+1.4x at four concurrent sessions thanks to the iteration-level scheduler.
+On consumer Apple Silicon we observed a measurable regression on the
+shortest synthetic prompts (sub-32 tokens) where the per-block indexing
+overhead is not amortized; we now fall through to the per-sequence path
+when the active set is exactly one and the prompt is under a threshold.
+================================================================
+REPORT ENDS
+
+Write the summary now.

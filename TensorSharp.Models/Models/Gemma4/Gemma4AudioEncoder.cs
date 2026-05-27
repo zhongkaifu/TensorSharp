@@ -16,6 +16,11 @@ namespace TensorSharp.Models
 {
     public class Gemma4AudioEncoder : IDisposable
     {
+        // Optional ModelBase reference for cooperative GpuComputeLock
+        // yielding between conformer blocks. See Gemma4VisionEncoder.
+        private ModelBase _hostModel;
+        public void SetHostModel(ModelBase model) => _hostModel = model;
+
         private readonly Dictionary<string, Tensor> _weights = new();
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
@@ -223,6 +228,11 @@ namespace TensorSharp.Models
             {
                 Console.Write($"\r  Audio conformer block {i + 1}/{_numLayers}...                    ");
                 hiddenTensor = ConformerBlock(hiddenTensor, i, seqLen, hidDim, _causalMask);
+                // See Gemma4VisionEncoder for rationale: yield the GPU
+                // compute lock between conformer blocks so the engine
+                // worker can run an inference step. Keeps concurrent
+                // chat/decode requests responsive during long audio encodes.
+                _hostModel?.YieldGpuComputeLock();
             }
             Console.Write("\r  Audio conformer done.                                         \n");
 

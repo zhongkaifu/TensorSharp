@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
+using TensorSharp.GGML;
 using TensorSharp.Runtime.Logging;
 using TensorSharp.Runtime;
 using TensorSharp.Server;
@@ -126,5 +127,16 @@ StartupModelLoader.LoadIfConfigured(
     startupLogger);
 
 StartupBanner.Emit(startupLogger, hostingOptions, ListenAddress);
+
+// Tear down the process-global GGML backend after the host stops. On macOS
+// the ggml-metal device's C++ static destructor asserts that its resource
+// set is empty; if g_backend (and its MTLBuffer wrappers) outlive the .NET
+// host the assertion aborts the process during exit. ApplicationStopped
+// fires after all hosted services have shut down, so all in-flight
+// inference is already complete. The shutdown call is idempotent and a
+// no-op when no GGML backend was ever initialised. Also hooked onto
+// ProcessExit as a safety net for non-graceful exits.
+app.Lifetime.ApplicationStopped.Register(static () => GgmlBasicOps.Shutdown());
+AppDomain.CurrentDomain.ProcessExit += static (_, _) => GgmlBasicOps.Shutdown();
 
 app.Run(ListenAddress);

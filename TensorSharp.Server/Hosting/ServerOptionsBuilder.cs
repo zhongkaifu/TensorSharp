@@ -105,11 +105,13 @@ namespace TensorSharp.Server.Hosting
         /// into the two env vars that gate the batched path:
         /// <c>TS_SCHED_DISABLE_BATCHED</c> (scheduler — falls through to
         /// per-sequence KV-swap when set) and <c>TS_QWEN35_BATCHED</c>
-        /// (model — Qwen3.5 ForwardBatch opt-in, since by default Qwen3.5
-        /// throws NotSupported and BatchExecutor falls through anyway).
-        /// Default is ON so operators get paged-attention continuous batching
-        /// without setting any env vars; <c>--no-continuous-batching</c>
-        /// forces the per-seq path for every model.
+        /// (model — Qwen3.5 ForwardBatch gate; default ON, set to 0 to force
+        /// the per-seq fallback). Both default to ON, so operators get
+        /// paged-attention continuous batching without setting any env vars
+        /// and without passing any flag; <c>--continuous-batching</c> is
+        /// idempotent with the default, kept for explicit operator intent.
+        /// <c>--no-continuous-batching</c> forces the per-seq path for every
+        /// model.
         ///
         /// Must run before <see cref="SessionKvCacheManager"/> /
         /// <see cref="InferenceEngine"/> are constructed because both
@@ -138,6 +140,19 @@ namespace TensorSharp.Server.Hosting
                 {
                     Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
                     Environment.SetEnvironmentVariable("TS_QWEN35_BATCHED", "0");
+                    changed = true;
+                    continue;
+                }
+                // Tune chunked-prefill granularity. Each prefill chunk runs
+                // as a single ExecuteStep that holds ModelBase.GpuComputeLock
+                // for the duration of its forward pass, so smaller chunks
+                // give parallel decode requests more frequent turns at the
+                // GPU. Default 256 (see SchedulerConfig.MaxPrefillChunkSize).
+                if (TryReadOption(args, ref i, "--prefill-chunk-size", out string chunkOpt))
+                {
+                    if (!int.TryParse(chunkOpt, out int chunk) || chunk <= 0)
+                        throw new ArgumentException($"Invalid value for --prefill-chunk-size: '{chunkOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_SCHED_PREFILL_CHUNK", chunk.ToString());
                     changed = true;
                     continue;
                 }

@@ -34,6 +34,22 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel iq4XsMatmulRowsKernel;
         private static MlxFastMetalKernel iq4XsMatmulRows2Kernel;
         private static MlxFastMetalKernel iq4XsGetRowsKernel;
+        // IQ4_NL ("4-bit non-linear") matmul. Block layout per ggml-common.h:
+        //   struct block_iq4_nl { ggml_half d; uint8_t qs[QK4_NL/2]; }
+        //   QK4_NL = 32, sizeof(block) = 2 + 16 = 18 bytes.
+        // Dequantisation (see dequantize_row_iq4_nl in ggml-quants.c):
+        //   value[j]       = d * kIq4NlValues[qs[j] & 0x0f], j in 0..15
+        //   value[j + 16]  = d * kIq4NlValues[qs[j] >> 4]  , j in 0..15
+        // The Unsloth UD-IQ2_XXS Nemotron-H pack stores all MoE expert
+        // weights (~15.7 GB, 76% of token decode time) as IQ4_NL but MLX
+        // had no native kernel for this type — they fell through to the
+        // C# `ManagedQuantizedOps` matmul path on the CPU, which is the
+        // dominant cost. This kernel mirrors `Iq4XsMatmulSource` but with
+        // the 18-byte / 32-element IQ4_NL layout.
+        private static MlxFastMetalKernel iq4NlMatmulKernel;
+        private static MlxFastMetalKernel iq4NlMatmulRowsKernel;
+        private static MlxFastMetalKernel iq4NlMoeMatmulBatchedKernel;
+        private static MlxFastMetalKernel iq4NlMoeMatmulBatchedRowedKernel;
         private static MlxFastMetalKernel iq2XxsMatmulKernel;
         private static MlxFastMetalKernel iq2XxsMatmulSimdgroupKernel;
         private static MlxFastMetalKernel iq2XxsMoeMatmulBatchedKernel;
@@ -77,6 +93,10 @@ namespace TensorSharp.MLX
         private static bool iq4XsMatmulRowsKernelDisabled;
         private static bool iq4XsMatmulRows2KernelDisabled;
         private static bool iq4XsGetRowsKernelDisabled;
+        private static bool iq4NlMatmulKernelDisabled;
+        private static bool iq4NlMatmulRowsKernelDisabled;
+        private static bool iq4NlMoeMatmulBatchedKernelDisabled;
+        private static bool iq4NlMoeMatmulBatchedRowedKernelDisabled;
         private static bool iq2XxsMatmulKernelDisabled;
         private static bool iq2XxsMatmulSimdgroupKernelDisabled;
         private static bool iq2XxsMoeMatmulBatchedKernelDisabled;
@@ -1453,6 +1473,194 @@ if (tid < HeadValueDim) {
     int offset4 = (t * NumValueHeads + h) * HeadValueDim + tid;
     int offset2 = t * ValueDim + h * HeadValueDim + tid;
     y_out[offset2] = values[tid] * scale * norm_weight[tid] * z_silu[offset4];
+}
+";
+
+        // Multi-row IQ4_NL matmul kernel. One threadgroup per `out_col`
+        // processes ALL `Rows` rows at once — each thread loads the weight
+        // value ONCE for its (k, out_col) and reuses it across every row,
+        // accumulating per-row partial sums in thread-local arrays. Without
+        // this kernel, the basic single-row kernel issues `Rows × OutDim`
+        // threadgroups per matmul, each independently re-reading the same
+        // weight bytes — which is exactly why MLX prefill on Nemotron-H
+        // regressed when we shipped the basic IQ4_NL kernel. With this
+        // multi-row variant in place prefill goes back to GPU-bound speed
+        // (one weight read per (k, out_col) regardless of row count).
+        //
+        // `Rows` is a template int (recompiled per row-count value, cached
+        // by MLX); capped at 16 in the dispatcher so the threadgroup
+        // memory budget (Rows × 256 × 4 = 16 KB at Rows=16) stays safely
+        // under Apple GPU limits.
+        // Batched IQ4_NL MoE matmul — shared input variant. One Metal
+        // dispatch produces K outputs, one per (out_col, k_idx), where
+        // expert_indices[k_idx] selects the per-expert weight slice from a
+        // stacked weight buffer laid out as [numExperts, OutDim,
+        // BlocksPerRow * 18] bytes. Input x is shared across all K
+        // experts (decode case: one routed token routed to K experts).
+        //
+        // For each (k_idx, out_col):
+        //     y[k_idx, out_col] = dot(x[0, :], W[expert_indices[k_idx], out_col, :])
+        // Mirrors `Iq2XxsMoeMatmulBatchedSource` 's grid/threadgroup shape
+        // and partial-sum reduction, but with IQ4_NL's 18-byte / 32-element
+        // block layout and nibble extraction.
+        private const string Iq4NlMoeMatmulBatchedSource = @"
+auto tid = thread_position_in_threadgroup.x;
+auto out_col = thread_position_in_grid.y;
+auto k_idx = thread_position_in_grid.z;
+threadgroup float partial[256];
+
+int expert_idx = expert_indices[k_idx];
+
+float sum = 0.0f;
+for (int k = static_cast<int>(tid); k < InDim; k += 256) {
+    int block_in_row = k >> 5;       // k / 32
+    int within_block = k & 31;       // 0..31
+    auto block_offset = (uint)expert_idx * OutDim * BlocksPerRow + out_col * BlocksPerRow + block_in_row;
+    auto block = w + block_offset * 18;
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const int j = within_block & 15;
+    const uchar packed = block[2 + j];
+    const uchar q = within_block < 16 ? (packed & 0x0f) : (packed >> 4);
+    const float weight_value = static_cast<float>(d_half) * kIq4NlValues[q];
+    sum += x[k] * weight_value;
+}
+
+partial[tid] = sum;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        partial[tid] += partial[tid + stride];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (tid == 0) {
+    y[k_idx * OutDim + out_col] = partial[0];
+}
+";
+
+        // Batched IQ4_NL MoE matmul — per-row (rowed) variant. Each row k
+        // of input is the k-th expert's post-activation output and gets
+        // multiplied by the down-projection weight of expert
+        // `expert_indices[k]`. Used for the down matmul where K different
+        // input rows pair with K (possibly identical) expert ids.
+        private const string Iq4NlMoeMatmulBatchedRowedSource = @"
+auto tid = thread_position_in_threadgroup.x;
+auto out_col = thread_position_in_grid.y;
+auto k_idx = thread_position_in_grid.z;
+threadgroup float partial[256];
+
+int expert_idx = expert_indices[k_idx];
+
+float sum = 0.0f;
+for (int k = static_cast<int>(tid); k < InDim; k += 256) {
+    int block_in_row = k >> 5;
+    int within_block = k & 31;
+    auto block_offset = (uint)expert_idx * OutDim * BlocksPerRow + out_col * BlocksPerRow + block_in_row;
+    auto block = w + block_offset * 18;
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const int j = within_block & 15;
+    const uchar packed = block[2 + j];
+    const uchar q = within_block < 16 ? (packed & 0x0f) : (packed >> 4);
+    const float weight_value = static_cast<float>(d_half) * kIq4NlValues[q];
+    sum += x[k_idx * InDim + k] * weight_value;
+}
+
+partial[tid] = sum;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        partial[tid] += partial[tid + stride];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (tid == 0) {
+    y[k_idx * OutDim + out_col] = partial[0];
+}
+";
+
+        private const string Iq4NlMatmulRowsSource = @"
+auto tid = thread_position_in_threadgroup.x;
+auto out_col = thread_position_in_grid.y;
+threadgroup float partial[Rows][256];
+float sums[Rows];
+
+for (int r = 0; r < Rows; r++) {
+    sums[r] = 0.0f;
+}
+
+for (int k = static_cast<int>(tid); k < InDim; k += 256) {
+    int block_in_row = k >> 5;       // k / 32
+    int within_block = k & 31;       // 0..31
+    auto block = w + (out_col * BlocksPerRow + block_in_row) * 18;
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const int j = within_block & 15;
+    const uchar packed = block[2 + j];
+    const uchar q = within_block < 16 ? (packed & 0x0f) : (packed >> 4);
+    const float weight_value = static_cast<float>(d_half) * kIq4NlValues[q];
+    for (int r = 0; r < Rows; r++) {
+        sums[r] += x[r * InDim + k] * weight_value;
+    }
+}
+
+for (int r = 0; r < Rows; r++) {
+    partial[r][tid] = sums[r];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+for (uint stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        for (int r = 0; r < Rows; r++) {
+            partial[r][tid] += partial[r][tid + stride];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (tid == 0) {
+    for (int r = 0; r < Rows; r++) {
+        y[r * OutDim + out_col] = partial[r][0];
+    }
+}
+";
+
+        // IQ4_NL matmul kernel — 18-byte block per 32 elements, F16 scale + 16
+        // qs bytes. Element i (0..31): nibble = qs[i & 15] & 0x0f when i < 16,
+        // else qs[i & 15] >> 4. Then value = d * kIq4NlValues[nibble]. Mirrors
+        // the layout/threading of Iq4XsMatmulSource (256 threads per (row,
+        // out_col), shared-memory reduction across InDim).
+        private const string Iq4NlMatmulSource = @"
+auto tid = thread_position_in_threadgroup.x;
+auto out_col = thread_position_in_grid.y;
+auto row_idx = thread_position_in_grid.z;
+threadgroup float partial[256];
+
+float sum = 0.0f;
+for (int k = static_cast<int>(tid); k < InDim; k += 256) {
+    int block_in_row = k >> 5;       // k / 32  (IQ4_NL block size = 32 elements)
+    int within_block = k & 31;       // 0..31
+    // Each IQ4_NL block is 18 bytes: 2-byte F16 scale + 16-byte qs.
+    auto block = w + (out_col * BlocksPerRow + block_in_row) * 18;
+    const half d_half = *reinterpret_cast<const device half *>(block);
+    const int j = within_block & 15; // qs byte index 0..15
+    const uchar packed = block[2 + j];
+    const uchar q = within_block < 16 ? (packed & 0x0f) : (packed >> 4);
+    const float weight_value = static_cast<float>(d_half) * kIq4NlValues[q];
+    sum += x[row_idx * InDim + k] * weight_value;
+}
+
+partial[tid] = sum;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+        partial[tid] += partial[tid + stride];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+if (tid == 0) {
+    y[row_idx * OutDim + out_col] = partial[0];
 }
 ";
 
@@ -3845,6 +4053,112 @@ if (tid < HeadDim) {
             });
         }
 
+        // Per-call IQ4_NL matmul on MLX. Used by MlxQuantizedOps after the
+        // preload step (CreateIq4NlRawWeight) registers the GGUF mmap bytes
+        // as a single MLX uchar[1, ne0*ne1*18/32] array. Grid: 256-thread
+        // simdgroup per (row, out_col), reducing across InDim into shared
+        // memory. Requires InDim % 32 == 0 (IQ4_NL block size).
+        //
+        // For rows > 1 (prefill, multi-token MoE expert batching) the basic
+        // kernel issues `rows × outDim` threadgroups — each independently
+        // re-reads the weight bytes for its (k, out_col). A multi-row variant
+        // (`Iq4NlMatmulRows`) is available that batches across rows in one
+        // threadgroup with weight reuse, but on this model's typical
+        // workload (each MoE expert sees ~1-2 routed rows during
+        // `TryMoEPrefillBatchedByExpert`, plus Mamba2/attention matmuls
+        // aren't IQ4_NL) it failed to improve perf in benchmarks and
+        // measurably hurt it on some runs — so the dispatch deliberately
+        // stays on the basic kernel. The Rows kernel definition is kept in
+        // the source for future use.
+        internal static MlxArray Iq4NlMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+        {
+            if (!input.IsValid || !rawWeight.IsValid)
+                throw new ArgumentException("IQ4_NL matmul requires valid input and raw weight arrays.");
+            if (rows <= 0 || inDim <= 0 || outDim <= 0 || inDim % 32 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim), "IQ4_NL matmul requires positive dimensions and input dim aligned to 32.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureIq4NlMatmulKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "InDim", inDim);
+                    AddTemplateInt(config, "OutDim", outDim);
+                    // BlocksPerRow = inDim / 32 (IQ4_NL: 32 elements per block).
+                    AddTemplateInt(config, "BlocksPerRow", inDim / 32);
+                    int[] shape = { rows, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring IQ4_NL matmul output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, rows), "configuring IQ4_NL matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring IQ4_NL matmul threadgroup");
+
+                    inputs = CreateVectorArray(input, rawWeight);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running IQ4_NL matmul");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("IQ4_NL matmul produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading IQ4_NL matmul output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputs.IsValid)
+                        _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid)
+                        _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid)
+                        _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
+        // Multi-row IQ4_NL matmul. One threadgroup per `out_col` handles all
+        // `rows` rows, reusing the dequantised weight across rows. Caller
+        // must already have validated that 2 <= rows <= Iq4NlBatchedRowsMax.
+        private static MlxArray Iq4NlMatmulRows(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+        {
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureIq4NlMatmulRowsKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "Rows", rows);
+                    AddTemplateInt(config, "InDim", inDim);
+                    AddTemplateInt(config, "OutDim", outDim);
+                    AddTemplateInt(config, "BlocksPerRow", inDim / 32);
+                    int[] shape = { rows, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring IQ4_NL multi-row matmul output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, 1), "configuring IQ4_NL multi-row matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring IQ4_NL multi-row matmul threadgroup");
+
+                    inputs = CreateVectorArray(input, rawWeight);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running IQ4_NL multi-row matmul");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("IQ4_NL multi-row matmul produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), "reading IQ4_NL multi-row matmul output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputs.IsValid)
+                        _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid)
+                        _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid)
+                        _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
+
         private static MlxArray Iq4XsMatmul4Cols(MlxArray input, MlxArray rawWeight, int inDim, int outDim)
         {
             if (!input.IsValid || !rawWeight.IsValid)
@@ -4161,6 +4475,122 @@ if (tid < HeadDim) {
         // stackedWeight: stacked uint8 IQ2_XXS bytes for all experts
         // expertIndices: [K] int32 - which K experts to compute
         // Output: [K, outDim] - per-expert dense result
+        // Batched IQ4_NL MoE matmul — shared input. Per (k_idx, out_col):
+        //     y[k_idx, out_col] = dot(x[0, :], W[expert_indices[k_idx], out_col, :])
+        // Replaces K per-expert matmul dispatches with ONE kernel call for
+        // the up-projection of the MoE FFN block. Caller invariants match
+        // the IQ2_XXS variant: shared single-row input, [K, outDim] output,
+        // expert indices on device.
+        internal static MlxArray Iq4NlMoeMatmulBatched(
+            MlxArray input,
+            MlxArray stackedWeight,
+            MlxArray expertIndices,
+            int K,
+            int inDim,
+            int outDim)
+        {
+            if (!input.IsValid || !stackedWeight.IsValid || !expertIndices.IsValid)
+                throw new ArgumentException("IQ4_NL MoE batched matmul requires valid input, weight, and expertIndices arrays.");
+            if (K <= 0 || inDim <= 0 || outDim <= 0 || inDim % 32 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim),
+                    "IQ4_NL MoE batched matmul requires positive dimensions and input dim aligned to 32.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureIq4NlMoeMatmulBatchedKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "InDim", inDim);
+                    AddTemplateInt(config, "OutDim", outDim);
+                    AddTemplateInt(config, "BlocksPerRow", inDim / 32);
+                    int[] shape = { K, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)),
+                        "configuring IQ4_NL MoE batched matmul output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, K),
+                        "configuring IQ4_NL MoE batched matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1),
+                        "configuring IQ4_NL MoE batched matmul threadgroup");
+
+                    inputs = CreateVectorArray(input, stackedWeight, expertIndices);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()),
+                        "running IQ4_NL MoE batched matmul");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("IQ4_NL MoE batched matmul produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0),
+                        "reading IQ4_NL MoE batched matmul output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
+        // Batched IQ4_NL MoE matmul — per-row (rowed) variant for the
+        // down-projection. Input is [K, inDim] where row k holds expert
+        // `expert_indices[k]`'s post-activation output. The expert weight
+        // is looked up per row via the same indices tensor.
+        internal static MlxArray Iq4NlMoeMatmulBatchedRowed(
+            MlxArray input,
+            MlxArray stackedWeight,
+            MlxArray expertIndices,
+            int K,
+            int inDim,
+            int outDim)
+        {
+            if (!input.IsValid || !stackedWeight.IsValid || !expertIndices.IsValid)
+                throw new ArgumentException("IQ4_NL MoE batched (rowed) matmul requires valid input, weight, and expertIndices arrays.");
+            if (K <= 0 || inDim <= 0 || outDim <= 0 || inDim % 32 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim),
+                    "IQ4_NL MoE batched (rowed) matmul requires positive dimensions and input dim aligned to 32.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = EnsureIq4NlMoeMatmulBatchedRowedKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                try
+                {
+                    AddTemplateInt(config, "InDim", inDim);
+                    AddTemplateInt(config, "OutDim", outDim);
+                    AddTemplateInt(config, "BlocksPerRow", inDim / 32);
+                    int[] shape = { K, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)),
+                        "configuring IQ4_NL MoE batched (rowed) matmul output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 256, outDim, K),
+                        "configuring IQ4_NL MoE batched (rowed) matmul grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1),
+                        "configuring IQ4_NL MoE batched (rowed) matmul threadgroup");
+
+                    inputs = CreateVectorArray(input, stackedWeight, expertIndices);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()),
+                        "running IQ4_NL MoE batched (rowed) matmul");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException("IQ4_NL MoE batched (rowed) matmul produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0),
+                        "reading IQ4_NL MoE batched (rowed) matmul output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
         internal static MlxArray Iq2XxsMoeMatmulBatched(
             MlxArray input,
             MlxArray stackedWeight,
@@ -5266,6 +5696,106 @@ if (tid < HeadDim) {
                 }
 
                 return iq4XsMatmulKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4NlMatmulKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4NlMatmulKernel.IsValid)
+                    return iq4NlMatmulKernel;
+                if (iq4NlMatmulKernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_NL matmul kernel was disabled after initialization failed.");
+
+                iq4NlMatmulKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4nl_matmul",
+                    new[] { "x", "w" },
+                    new[] { "y" },
+                    Iq4NlMatmulSource,
+                    Iq4NlLookupHeader);
+                if (!iq4NlMatmulKernel.IsValid)
+                {
+                    iq4NlMatmulKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_NL matmul kernel.");
+                }
+
+                return iq4NlMatmulKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4NlMatmulRowsKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4NlMatmulRowsKernel.IsValid)
+                    return iq4NlMatmulRowsKernel;
+                if (iq4NlMatmulRowsKernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_NL multi-row matmul kernel was disabled after initialization failed.");
+
+                iq4NlMatmulRowsKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4nl_matmul_rows",
+                    new[] { "x", "w" },
+                    new[] { "y" },
+                    Iq4NlMatmulRowsSource,
+                    Iq4NlLookupHeader);
+                if (!iq4NlMatmulRowsKernel.IsValid)
+                {
+                    iq4NlMatmulRowsKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_NL multi-row matmul kernel.");
+                }
+
+                return iq4NlMatmulRowsKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4NlMoeMatmulBatchedKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4NlMoeMatmulBatchedKernel.IsValid)
+                    return iq4NlMoeMatmulBatchedKernel;
+                if (iq4NlMoeMatmulBatchedKernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_NL batched-MoE matmul kernel was disabled after initialization failed.");
+
+                iq4NlMoeMatmulBatchedKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4nl_moe_matmul_batched",
+                    new[] { "x", "w", "expert_indices" },
+                    new[] { "y" },
+                    Iq4NlMoeMatmulBatchedSource,
+                    Iq4NlLookupHeader);
+                if (!iq4NlMoeMatmulBatchedKernel.IsValid)
+                {
+                    iq4NlMoeMatmulBatchedKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_NL batched-MoE matmul kernel.");
+                }
+
+                return iq4NlMoeMatmulBatchedKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4NlMoeMatmulBatchedRowedKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4NlMoeMatmulBatchedRowedKernel.IsValid)
+                    return iq4NlMoeMatmulBatchedRowedKernel;
+                if (iq4NlMoeMatmulBatchedRowedKernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_NL batched-MoE (rowed) matmul kernel was disabled after initialization failed.");
+
+                iq4NlMoeMatmulBatchedRowedKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4nl_moe_matmul_batched_rowed",
+                    new[] { "x", "w", "expert_indices" },
+                    new[] { "y" },
+                    Iq4NlMoeMatmulBatchedRowedSource,
+                    Iq4NlLookupHeader);
+                if (!iq4NlMoeMatmulBatchedRowedKernel.IsValid)
+                {
+                    iq4NlMoeMatmulBatchedRowedKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_NL batched-MoE (rowed) matmul kernel.");
+                }
+
+                return iq4NlMoeMatmulBatchedRowedKernel;
             }
         }
 

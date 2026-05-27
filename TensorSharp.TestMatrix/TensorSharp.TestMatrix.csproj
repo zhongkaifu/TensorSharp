@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\</OutputPath>
+    <IsPackable>false</IsPackable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TensorSharp.TestMatrix</RootNamespace>
+    <AssemblyName>TensorSharp.TestMatrix</AssemblyName>
+    <Description>Inference test / benchmark matrix runner. Sweeps (model x backend x feature x prompt-type x env-var) and emits a markdown report.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="Defaults\matrix-config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Inputs\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>

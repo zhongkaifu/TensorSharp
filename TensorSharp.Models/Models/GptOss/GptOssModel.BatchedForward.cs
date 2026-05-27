@@ -36,18 +36,25 @@ namespace TensorSharp.Models
 {
     public partial class GptOssModel : IBatchedPagedModel
     {
-        // Opt-in env var. Default OFF — ForwardBatch throws NotSupported so
-        // BatchExecutor falls through to ExecuteStepPerSequence, preserving
-        // today's behaviour exactly. Set TS_GPTOSS_BATCHED=1 to exercise the
-        // batched path.
+        // Default ON. The batched paged-attention path is the only way two
+        // concurrent requests can be served truly in parallel on this model
+        // (the per-sequence fallback forwards at most one sequence per step,
+        // so a second request stalls until the first releases the executor).
+        // Correctness was previously validated against the legacy path by
+        // GptOssBatchedCorrectnessTests with TS_GPTOSS_BATCHED=1. Set
+        // TS_GPTOSS_BATCHED=0 (or "false") to force the legacy fallback for
+        // A/B comparison or to investigate a regression.
         //
         // Method getter (not static readonly) so tests can toggle after class
         // load — a static readonly would capture the env var at class-init
         // time, which is before tests get a chance to set it (same gotcha
         // that bit Nemotron). Mirrors Qwen 3.5's pattern.
-        private static bool GptOssBatchedOptIn() =>
-            string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_BATCHED"),
-                          "1", StringComparison.Ordinal);
+        private static bool GptOssBatchedOptIn()
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_GPTOSS_BATCHED");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
+        }
 
         // GptOss is text-only (no vision/audio), so SupportsBatchedMultimodal
         // is a non-issue — set to match the opt-in for symmetry with the other
@@ -69,7 +76,7 @@ namespace TensorSharp.Models
 
             if (!GptOssBatchedOptIn())
                 throw new NotSupportedException(
-                    "GptOss batched: disabled (set TS_GPTOSS_BATCHED=1 to opt in).");
+                    "GptOss batched: disabled (TS_GPTOSS_BATCHED=0 set, falling back to per-seq path).");
 
             int hidden = Config.HiddenSize;
             int numHeads = Config.NumHeads;
@@ -309,6 +316,126 @@ namespace TensorSharp.Models
             for (int s = 0; s < perSeq.Length; s++)
                 Array.Copy(perSeq[s], 0, flat, offsets[s], perSeq[s].Length);
             return (flat, offsets);
+        }
+
+        /// <summary>True when the model can migrate a sequence's K/V history
+        /// from the legacy linear cache (where <c>Forward()</c> writes it)
+        /// into paged storage (where <c>ForwardBatch</c> reads from). Required
+        /// so the N=1 fast path can hand off to the batched path when a
+        /// second concurrent sequence arrives — without migration the batched
+        /// kernel would read zeros for the first sequence's prior positions.
+        ///
+        /// Block-quantised caches (Q8_0) aren't supported by the migration
+        /// code (only F32/F16 dequant is implemented); the batched path
+        /// rejects them anyway.</summary>
+        public bool SupportsLinearKVMigration =>
+            _kvCacheK != null && _kvCacheV != null
+            && !_kvCacheDtype.IsBlockQuantized();
+
+        /// <summary>Copy <paramref name="owner"/>'s K/V history out of the
+        /// linear per-layer cache <c>_kvCacheK</c>/<c>_kvCacheV</c> (layout
+        /// <c>[numKVHeads, capacity, headDim]</c>) and into the paged buffer
+        /// <c>_gptOssPagedK</c>/<c>_gptOssPagedV</c> at slot positions
+        /// derived from <c>owner.BlockTable</c>. GptOss has no SWA wrap (SWA
+        /// is applied as an attention mask rather than via a circular cache),
+        /// so every position from 0..<c>_cacheSeqLen</c> is recoverable.</summary>
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
+        {
+            if (owner == null) return false;
+            if (!SupportsLinearKVMigration) return false;
+            int ownerTokens = _cacheSeqLen;
+            if (ownerTokens <= 0) return true;
+            if (owner.BlockTable.NumBlocks <= 0) return false;
+
+            // Flush any device-side cache writes to host so the float reads
+            // below see the freshest K/V. GGML Metal kernels may keep the
+            // cache hot in the Metal buffer while the host shadow is stale.
+            if (IsGgmlBackend)
+            {
+                var seen = new HashSet<Storage>();
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    if (_kvCacheK[l] != null && seen.Add(_kvCacheK[l].Storage))
+                        SyncTensorHostCache(_kvCacheK[l]);
+                    if (_kvCacheV[l] != null && seen.Add(_kvCacheV[l].Storage))
+                        SyncTensorHostCache(_kvCacheV[l]);
+                }
+            }
+
+            // Make sure paged buffers cover every block id we'll write into.
+            int maxBlockId = 0;
+            int numBlocks = owner.BlockTable.NumBlocks;
+            for (int b = 0; b < numBlocks; b++)
+            {
+                int id = owner.BlockTable.Blocks[b].Id;
+                if (id > maxBlockId) maxBlockId = id;
+            }
+            EnsureGptOssPagedBuffers(maxBlockId + 1, blockSize);
+
+            int kvHeads = Config.NumKVHeads;
+            int headDim = Config.HeadDim;
+            int stridePaged = kvHeads * headDim;
+            int numLayers = Config.NumLayers;
+
+            for (int layer = 0; layer < numLayers; layer++)
+            {
+                int cacheLen = (int)_kvCacheK[layer].Sizes[1];
+                int totalElems = kvHeads * cacheLen * headDim;
+                if (!TryReadCacheAsF32(_kvCacheK[layer], totalElems, out float[] kFlat) ||
+                    !TryReadCacheAsF32(_kvCacheV[layer], totalElems, out float[] vFlat))
+                {
+                    return false;
+                }
+
+                float[] kPaged = _gptOssPagedK[layer];
+                float[] vPaged = _gptOssPagedV[layer];
+
+                for (int p = 0; p < ownerTokens; p++)
+                {
+                    int blockIdx = p / blockSize;
+                    int offsetInBlock = p % blockSize;
+                    int physBlockId = owner.BlockTable.Blocks[blockIdx].Id;
+                    int slot = physBlockId * blockSize + offsetInBlock;
+                    int slotOffset = slot * stridePaged;
+
+                    for (int h = 0; h < kvHeads; h++)
+                    {
+                        int srcOffset = (h * cacheLen + p) * headDim;
+                        int dstOffset = slotOffset + h * headDim;
+                        Buffer.BlockCopy(
+                            kFlat, srcOffset * sizeof(float),
+                            kPaged, dstOffset * sizeof(float),
+                            headDim * sizeof(float));
+                        Buffer.BlockCopy(
+                            vFlat, srcOffset * sizeof(float),
+                            vPaged, dstOffset * sizeof(float),
+                            headDim * sizeof(float));
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
+        {
+            if (cache.ElementType == DType.Float32)
+            {
+                flat = cache.GetElementsAsFloat(totalElems);
+                return true;
+            }
+            if (cache.ElementType == DType.Float16)
+            {
+                flat = new float[totalElems];
+                ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
+                fixed (float* dst = flat)
+                {
+                    TensorComputePrimitives.F16ToF32(dst, src, totalElems);
+                }
+                return true;
+            }
+            flat = null;
+            return false;
         }
 
         private void EnsureGptOssPagedBuffers(int numBlocks, int blockSize)

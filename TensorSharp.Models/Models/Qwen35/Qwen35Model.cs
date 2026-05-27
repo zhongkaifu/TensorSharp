@@ -2313,13 +2313,24 @@ namespace TensorSharp.Models
                 return;
             }
 
-            // Decode hot path: reuse pre-allocated buffers; caller must NOT dispose them.
+            // Decode hot path: re-use the pre-allocated decode buffers'
+            // STORAGE but hand back a fresh Tensor object that AddRef'd it.
+            // Returning the bare _attnDecodeQBuf reference was a footgun:
+            // any unguarded qTensor.Dispose() in the caller would drop the
+            // storage's refcount to 0 and free the model's persistent
+            // decode buffer, then the next attention layer's
+            // DeinterleaveQGate would crash with a NullReferenceException
+            // when GetFloatPtr returned the now-null buffer pointer (the
+            // Qwen35 batched ForwardBatch hit exactly this on every
+            // decode token). The CopyRef'd handle owns its own refcount
+            // increment; caller can freely Dispose it and the underlying
+            // storage stays alive as long as _attnDecodeQBuf does.
             if (seqLen == 1 && _attnDecodeQBuf != null && _attnDecodeGBuf != null
                 && _attnDecodeQBuf.Sizes[1] == totalPerToken)
             {
-                qTensor = _attnDecodeQBuf;
-                gateTensor = _attnDecodeGBuf;
-                ownsBuffers = false;
+                qTensor = _attnDecodeQBuf.CopyRef();
+                gateTensor = _attnDecodeGBuf.CopyRef();
+                ownsBuffers = true;
             }
             else
             {
@@ -2331,6 +2342,16 @@ namespace TensorSharp.Models
             float* src = GetFloatPtr(qFull);
             float* qDst = GetFloatPtr(qTensor);
             float* gDst = GetFloatPtr(gateTensor);
+            if (src == null || qDst == null || gDst == null)
+            {
+                throw new InvalidOperationException(
+                    $"DeinterleaveQGate: null storage pointer "
+                    + $"(src={(IntPtr)src:x}, qDst={(IntPtr)qDst:x}, gDst={(IntPtr)gDst:x}). "
+                    + $"seqLen={seqLen}, numHeads={numHeads}, headDim={headDim}. "
+                    + $"qFull.Storage={qFull.Storage?.GetType().Name}, "
+                    + $"qTensor.Storage={qTensor.Storage?.GetType().Name}, "
+                    + $"gateTensor.Storage={gateTensor.Storage?.GetType().Name}.");
+            }
             int headBytes = headDim * sizeof(float);
 
             if (seqLen > 1)
@@ -4767,6 +4788,7 @@ namespace TensorSharp.Models
         public void LoadVisionEncoder(string mmProjPath)
         {
             VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
+            VisionEncoder.SetHostModel(this);
         }
 
         public void SetVisionEmbeddings(Tensor visionEmbeddings, int startPosition)

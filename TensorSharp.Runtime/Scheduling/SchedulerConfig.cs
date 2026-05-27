@@ -25,7 +25,17 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Maximum number of new tokens to schedule for a single
         /// sequence's prefill in one step. Chunked prefill caps the per-step
         /// work on long prompts and lets decode sequences interleave with
-        /// long prompts. Default 1024.</summary>
+        /// long prompts. Default 1024.
+        ///
+        /// Historical note: an earlier benchmark with the (since-disabled-by-
+        /// default) N=1 fast path in <see cref="BatchExecutor.ExecuteStep"/>
+        /// showed smaller chunks hurt wall-clock for mixed prefill+decode
+        /// workloads — that path got the first request through fused decode
+        /// before the second one arrived, and small chunks pushed more of
+        /// it onto the slow batched path. With the fast path off by default
+        /// the chunk-size sensitivity is much milder; 1024 is still a sane
+        /// default. Overridable via <c>TS_SCHED_PREFILL_CHUNK</c> env var
+        /// or the <c>--prefill-chunk-size</c> CLI flag.</summary>
         public int MaxPrefillChunkSize { get; init; } = 1024;
 
         /// <summary>Number of physical KV blocks in the pool. The total KV-cache

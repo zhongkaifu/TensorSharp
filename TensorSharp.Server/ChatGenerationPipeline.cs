@@ -120,6 +120,24 @@ namespace TensorSharp.Server
                 // injector-state serialisation that the old
                 // _multimodalGate provided, because the prepared-embedding
                 // list lives on the model.
+                //
+                // The encoder forward is long (image 100ms–2s, audio
+                // similar, video longer), so to keep concurrent in-flight
+                // decode requests from freezing we COOPERATIVELY YIELD
+                // the lock between encoder blocks. Each Gemma 4 vision /
+                // audio encoder calls ModelBase.YieldGpuComputeLock at
+                // its per-block boundary, which releases this lock, lets
+                // a waiting engine-worker thread run one ExecuteStep
+                // (~50–200ms of inference progress), then re-acquires.
+                // The encoder pays a few percent overhead per yield in
+                // exchange for in-flight decodes staying responsive.
+                // Disable via TS_ENCODER_YIELD=0 for A/B testing.
+                //
+                // Other models' encoders (Qwen3.5 vision, Mistral 3
+                // vision, etc.) currently DON'T yield — they still hold
+                // the lock for the full encode. Adding YieldGpuComputeLock
+                // calls to their per-layer/per-block loops is the same
+                // ~3-line change as for Gemma 4 and recommended.
                 lock (model.GpuComputeLock)
                 {
                     inputTokens = _kvCacheRenderer.RenderToTokens(

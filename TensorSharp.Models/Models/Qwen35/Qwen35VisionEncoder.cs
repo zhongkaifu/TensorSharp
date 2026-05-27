@@ -26,6 +26,10 @@ namespace TensorSharp.Models
         private readonly Dictionary<long, RopeCache> _ropeCache = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        // Optional ModelBase reference for cooperative GpuComputeLock
+        // yielding between encoder blocks. See Gemma4VisionEncoder.
+        private ModelBase _hostModel;
+        public void SetHostModel(ModelBase model) => _hostModel = model;
 
         private readonly int _imageSize;
         private readonly int _patchSize;
@@ -171,6 +175,9 @@ namespace TensorSharp.Models
                     ropeCache.CosTable, ropeCache.SinTable);
                 if (debug && (i == 0 || i == _blockCount - 1))
                     DumpTensor(blockOrdered, $"After block {i}", numPatches);
+                // Yield GpuComputeLock between encoder blocks so concurrent
+                // decode requests on the engine worker stay responsive.
+                _hostModel?.YieldGpuComputeLock();
             }
             long blocksTicks = Stopwatch.GetTimestamp() - blocksStart;
             Console.WriteLine(" done");

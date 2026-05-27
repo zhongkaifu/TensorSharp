@@ -14,6 +14,7 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
@@ -2961,6 +2962,45 @@ namespace TensorSharp.Models
         /// command buffer and aborts the process.
         /// </summary>
         public object GpuComputeLock { get; } = new object();
+
+        /// <summary>
+        /// Release <see cref="GpuComputeLock"/>, briefly yield, then re-acquire.
+        /// Designed to be called from inside a <c>lock(model.GpuComputeLock)</c>
+        /// scope by long-running GPU operations (vision / audio / video
+        /// encoders' per-block loops) so the engine worker's
+        /// <see cref="BatchExecutor.ExecuteStep"/> can grab the lock and run
+        /// one inference step in between. Without this, an encoder forward
+        /// holds the lock for its full duration (100ms–several seconds)
+        /// and all in-flight decode requests appear frozen.
+        ///
+        /// The <see cref="Monitor"/> wait queue is FIFO-ish on .NET, so a
+        /// waiting engine-worker thread typically wins the re-acquisition
+        /// race; the caller then blocks at <see cref="Monitor.Enter(object)"/>
+        /// until the engine's step completes. Net effect: encoder layer
+        /// → engine step → encoder layer → engine step → … instead of
+        /// encoder-blocks-everyone.
+        ///
+        /// Costs the encoder some wall-clock time per yield (one engine
+        /// step ≈ 50–200ms), but in exchange the engine never stalls. If
+        /// the engine has no work pending, the yield is a cheap no-op
+        /// (Monitor.Exit, Sleep(0), Monitor.Enter).
+        /// </summary>
+        public void YieldGpuComputeLock()
+        {
+            // Allow disabling via env var for A/B testing or troubleshooting.
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_ENCODER_YIELD"), "0", StringComparison.Ordinal))
+                return;
+            try { Monitor.Exit(GpuComputeLock); }
+            catch (SynchronizationLockException) { return; } // not held — nothing to yield
+            try
+            {
+                System.Threading.Thread.Sleep(0);
+            }
+            finally
+            {
+                Monitor.Enter(GpuComputeLock);
+            }
+        }
 
         /// <summary>
         /// Whether this architecture exposes block-level snapshot / restore for use

@@ -1,0 +1,26 @@
+[
+    {
+        "name": "get_current_weather",
+        "description": "Get the current weather in a given city. Returns temperature in Celsius and a one-word condition.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "The city name, e.g. 'Tokyo' or 'San Francisco'."
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": [
+                        "celsius",
+                        "fahrenheit"
+                    ],
+                    "description": "Temperature unit. Defaults to celsius."
+                }
+            },
+            "required": [
+                "city"
+            ]
+        }
+    }
+]

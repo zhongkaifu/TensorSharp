@@ -35,6 +35,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Models.Paged;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
@@ -43,14 +44,22 @@ namespace TensorSharp.Models
 {
     public partial class NemotronModel : IBatchedPagedModel
     {
-        // Opt-in env var, default OFF. Re-read each call so tests can toggle
-        // between paths after the model has already loaded — Qwen 3.5's
-        // batched partial uses the same pattern (vs a `static readonly` which
-        // would capture the env var at class-load time, before tests get a
-        // chance to set it).
-        private static bool NemoBatchedOptIn() =>
-            string.Equals(Environment.GetEnvironmentVariable("TS_NEMOTRON_BATCHED"),
-                          "1", StringComparison.Ordinal);
+        // Default ON. The batched paged-attention path is the only way two
+        // concurrent requests can be served truly in parallel on this model
+        // (the per-sequence fallback forwards at most one sequence per step,
+        // so a second request stalls until the first releases the executor).
+        // Set TS_NEMOTRON_BATCHED=0 (or "false") to force the legacy fallback
+        // for A/B comparison or to investigate a regression.
+        //
+        // Re-read each call so tests can toggle between paths after the model
+        // has already loaded — a static readonly would capture the env var at
+        // class-init time, before tests get a chance to set it.
+        private static bool NemoBatchedOptIn()
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_NEMOTRON_BATCHED");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
+        }
 
         // Phase 8: ForwardBatch handles multimodal injection directly (same
         // row-wise InjectMultimodalEmbeddings the legacy path uses; works on
@@ -73,14 +82,28 @@ namespace TensorSharp.Models
         //   Attention layers: vLLM-style block-paged K/V keyed by block id +
         //     slot offset. Sized [numBlocks * blockSize * numKVHeads * headDim]
         //     per layer. Multiple sequences index different blocks/slots via the
-        //     block table.
+        //     block table. Prefix-cache hits intentionally share blocks across
+        //     sequences here (attention K/V is content-deterministic given the
+        //     same token prefix).
         //
         //   Mamba2 layers: per-sequence recurrent state. Mirrors vLLM's
-        //     state_indices_tensor scheme — a slot pool keyed by sequence's
-        //     primary block id. Each slot owns its own conv ring buffer + SSM
-        //     state float[]; per-seq forward swaps the model-level pointers
-        //     to point at this slot's storage (same reference-swap pattern as
-        //     Qwen 3.5 Phase 5c — proven to give ~1.83× tps at n=3 there).
+        //     mamba_state_idx scheme — a slot pool keyed by RequestId, NOT by
+        //     attention block id. Each active sequence gets a unique slot
+        //     allocated by GetOrAllocateMambaSlot and freed by
+        //     OnSequenceReleased. Each slot owns its own conv ring buffer +
+        //     SSM state float[]; per-seq forward swaps the model-level
+        //     pointers to point at this slot's storage (same reference-swap
+        //     pattern as Qwen 3.5 Phase 5c — proven to give ~1.83× tps at
+        //     n=3 there).
+        //
+        //   IMPORTANT: Earlier versions of this code keyed the Mamba2 slot on
+        //   seq.BlockTable.Blocks[0].Id. That collides when two concurrent
+        //   sequences share the same first attention block via prefix-cache
+        //   hit (typical for chat: both requests share the system-prompt
+        //   prefix), causing them to trample each other's recurrent state —
+        //   garbled output for both. The dedicated per-request slot allocator
+        //   below mirrors vLLM's separation of attention-cache and mamba-cache
+        //   block groups and avoids that collision.
         private float[][] _nemoPagedK;            // [layer][numBlocks * blockSize * kvDim]
         private float[][] _nemoPagedV;            // [layer][numBlocks * blockSize * kvDim]
         private int _nemoPagedNumBlocks;
@@ -98,15 +121,29 @@ namespace TensorSharp.Models
         private Tensor[][] _nemoSlotMamba2NativeDecodeProjected;  // [layer][slot]
         private Tensor[][] _nemoSlotMamba2NativeDecodeHidden;     // [layer][slot]
         private bool[][]   _nemoSlotMamba2NativeDecodeStateInitialized; // [layer][slot]
+        private int _nemoMambaSlotCapacity;       // current allocated slot pool size (per layer)
 
-        /// <summary>Ensure per-layer paged K/V buffers exist for the given
-        /// block-pool shape. Grows with 2× slack; preserves previously-written
-        /// K/V on resize (a fresh sequence's prefill K/V depends on its
-        /// block's contents from the moment the block was first allocated).
-        /// Slot pool outer arrays are also extended here; per-slot inner
-        /// allocations are lazy in <see cref="EnsureNemoSlotAllocated"/>.</summary>
+        // Per-request Mamba2 slot allocator. RequestId → slot index.
+        // _nemoFreeMambaSlots is a stack of slot indices that have been
+        // released by OnSequenceReleased and are available for reuse.
+        // _nemoNextMambaSlot is the next never-allocated slot index; we
+        // bump this when the free stack is empty.
+        private readonly Dictionary<string, int> _nemoMambaSlotByReqId = new();
+        private readonly Stack<int> _nemoFreeMambaSlots = new();
+        private int _nemoNextMambaSlot;
+
+        /// <summary>Ensure per-layer attention paged K/V buffers exist for the
+        /// given block-pool shape. Grows with 2× slack; preserves previously-
+        /// written K/V on resize (a fresh sequence's prefill K/V depends on
+        /// its block's contents from the moment the block was first
+        /// allocated). The Mamba2 slot pool is sized independently in
+        /// <see cref="EnsureNemoMambaSlotCapacity"/> because Mamba2 slots are
+        /// allocated per active RequestId, not per attention block id.</summary>
         private void EnsureNemoPagedBuffers(int numBlocks, int blockSize, int numLayers)
         {
+            EnsureNemoLayerOuterArrays(numLayers);
+            EnsureNemoMambaSlotCapacity(numLayers, _nemoMambaSlotCapacity);
+
             bool needRebuild = _nemoPagedK == null
                 || _nemoPagedNumBlocks < numBlocks
                 || _nemoPagedBlockSize != blockSize;
@@ -116,59 +153,18 @@ namespace TensorSharp.Models
 
             float[][] oldPagedK = _nemoPagedK;
             float[][] oldPagedV = _nemoPagedV;
-            float[][][] oldConvBuf = _nemoSlotConvBuf;
-            float[][][] oldSsm = _nemoSlotSsmState;
-            bool[][] oldInit = _nemoSlotInit;
-            Tensor[][] oldNdProj = _nemoSlotMamba2NativeDecodeProjected;
-            Tensor[][] oldNdHidden = _nemoSlotMamba2NativeDecodeHidden;
-            bool[][] oldNdInit = _nemoSlotMamba2NativeDecodeStateInitialized;
             int oldNumBlocks = _nemoPagedNumBlocks;
             int oldBlockSize = _nemoPagedBlockSize;
 
-            _nemoPagedK = new float[numLayers][];
-            _nemoPagedV = new float[numLayers][];
-            _nemoSlotConvBuf = new float[numLayers][][];
-            _nemoSlotSsmState = new float[numLayers][][];
-            _nemoSlotInit = new bool[numLayers][];
-            _nemoSlotMamba2NativeDecodeProjected = new Tensor[numLayers][];
-            _nemoSlotMamba2NativeDecodeHidden = new Tensor[numLayers][];
-            _nemoSlotMamba2NativeDecodeStateInitialized = new bool[numLayers][];
-
-            if (_nemoPagedKvDimPerLayer == null || _nemoPagedKvDimPerLayer.Length != numLayers)
+            if (oldPagedK == null || oldPagedK.Length != numLayers)
             {
-                _nemoPagedKvDimPerLayer = new int[numLayers];
-                for (int l = 0; l < numLayers; l++)
-                {
-                    if (_layerTypes[l] == LayerType.Attention)
-                        _nemoPagedKvDimPerLayer[l] = _layerNumKVHeads[l] * Config.HeadDim;
-                    else
-                        _nemoPagedKvDimPerLayer[l] = 0;
-                }
+                _nemoPagedK = new float[numLayers][];
+                _nemoPagedV = new float[numLayers][];
             }
 
             for (int l = 0; l < numLayers; l++)
             {
-                if (_layerTypes[l] == LayerType.Mamba2)
-                {
-                    _nemoSlotConvBuf[l] = new float[targetBlocks][];
-                    _nemoSlotSsmState[l] = new float[targetBlocks][];
-                    _nemoSlotInit[l] = new bool[targetBlocks];
-                    _nemoSlotMamba2NativeDecodeProjected[l] = new Tensor[targetBlocks];
-                    _nemoSlotMamba2NativeDecodeHidden[l] = new Tensor[targetBlocks];
-                    _nemoSlotMamba2NativeDecodeStateInitialized[l] = new bool[targetBlocks];
-                    if (oldConvBuf != null && oldConvBuf[l] != null && oldNumBlocks > 0)
-                    {
-                        // Preserve previously-allocated slot references — sequences
-                        // in flight rely on their slot's persistent recurrent state.
-                        Array.Copy(oldConvBuf[l], 0, _nemoSlotConvBuf[l], 0, oldNumBlocks);
-                        Array.Copy(oldSsm[l],     0, _nemoSlotSsmState[l], 0, oldNumBlocks);
-                        Array.Copy(oldInit[l],    0, _nemoSlotInit[l],     0, oldNumBlocks);
-                        Array.Copy(oldNdProj[l],   0, _nemoSlotMamba2NativeDecodeProjected[l], 0, oldNumBlocks);
-                        Array.Copy(oldNdHidden[l], 0, _nemoSlotMamba2NativeDecodeHidden[l],    0, oldNumBlocks);
-                        Array.Copy(oldNdInit[l],   0, _nemoSlotMamba2NativeDecodeStateInitialized[l], 0, oldNumBlocks);
-                    }
-                }
-                else if (_layerTypes[l] == LayerType.Attention)
+                if (_layerTypes[l] == LayerType.Attention)
                 {
                     int perTokenStride = _nemoPagedKvDimPerLayer[l];
                     long bufSize = (long)targetBlocks * blockSize * perTokenStride;
@@ -182,11 +178,186 @@ namespace TensorSharp.Models
                         Array.Copy(oldPagedV[l], 0, _nemoPagedV[l], 0, copyCount);
                     }
                 }
-                // FFN layers have no per-layer paged state; nothing to allocate.
+                // Mamba2 and FFN layers have no attention-paged state; the
+                // Mamba2 slot pool lives separately.
             }
 
             _nemoPagedNumBlocks = targetBlocks;
             _nemoPagedBlockSize = blockSize;
+        }
+
+        /// <summary>Build outer per-layer arrays for the Mamba2 slot pool and
+        /// per-layer KV-dim cache. Idempotent once the layer-type vector is
+        /// known. Called from both <see cref="EnsureNemoPagedBuffers"/> and
+        /// <see cref="EnsureNemoMambaSlotCapacity"/> so each is safe to call
+        /// first.</summary>
+        private void EnsureNemoLayerOuterArrays(int numLayers)
+        {
+            if (_nemoSlotConvBuf == null || _nemoSlotConvBuf.Length != numLayers)
+            {
+                _nemoSlotConvBuf = new float[numLayers][][];
+                _nemoSlotSsmState = new float[numLayers][][];
+                _nemoSlotInit = new bool[numLayers][];
+                _nemoSlotMamba2NativeDecodeProjected = new Tensor[numLayers][];
+                _nemoSlotMamba2NativeDecodeHidden = new Tensor[numLayers][];
+                _nemoSlotMamba2NativeDecodeStateInitialized = new bool[numLayers][];
+            }
+            if (_nemoPagedKvDimPerLayer == null || _nemoPagedKvDimPerLayer.Length != numLayers)
+            {
+                _nemoPagedKvDimPerLayer = new int[numLayers];
+                for (int l = 0; l < numLayers; l++)
+                {
+                    if (_layerTypes[l] == LayerType.Attention)
+                        _nemoPagedKvDimPerLayer[l] = _layerNumKVHeads[l] * Config.HeadDim;
+                    else
+                        _nemoPagedKvDimPerLayer[l] = 0;
+                }
+            }
+        }
+
+        /// <summary>Ensure the per-layer Mamba2 slot pool can hold at least
+        /// <paramref name="requiredCapacity"/> slots. Grows with 2× slack and
+        /// preserves previously-allocated slot references — in-flight
+        /// sequences depend on their slot's persistent recurrent state.</summary>
+        private void EnsureNemoMambaSlotCapacity(int numLayers, int requiredCapacity)
+        {
+            EnsureNemoLayerOuterArrays(numLayers);
+            if (requiredCapacity <= _nemoMambaSlotCapacity && _nemoMambaSlotCapacity > 0)
+            {
+                // Outer per-layer arrays may exist with the current capacity
+                // already; only rebuild when growth is needed.
+                bool layerArraysReady = true;
+                for (int l = 0; l < numLayers; l++)
+                {
+                    if (_layerTypes[l] != LayerType.Mamba2) continue;
+                    if (_nemoSlotConvBuf[l] == null || _nemoSlotConvBuf[l].Length < _nemoMambaSlotCapacity)
+                    {
+                        layerArraysReady = false;
+                        break;
+                    }
+                }
+                if (layerArraysReady) return;
+            }
+
+            int targetCapacity = Math.Max(requiredCapacity, Math.Max(_nemoMambaSlotCapacity * 2, 4));
+
+            float[][][] oldConvBuf = _nemoSlotConvBuf;
+            float[][][] oldSsm = _nemoSlotSsmState;
+            bool[][] oldInit = _nemoSlotInit;
+            Tensor[][] oldNdProj = _nemoSlotMamba2NativeDecodeProjected;
+            Tensor[][] oldNdHidden = _nemoSlotMamba2NativeDecodeHidden;
+            bool[][] oldNdInit = _nemoSlotMamba2NativeDecodeStateInitialized;
+            int oldCapacity = _nemoMambaSlotCapacity;
+
+            // Outer arrays already sized to numLayers by EnsureNemoLayerOuterArrays;
+            // resize the inner [slot] arrays per layer.
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.Mamba2) continue;
+
+                var newConvBuf = new float[targetCapacity][];
+                var newSsm = new float[targetCapacity][];
+                var newInit = new bool[targetCapacity];
+                var newNdProj = new Tensor[targetCapacity];
+                var newNdHidden = new Tensor[targetCapacity];
+                var newNdInit = new bool[targetCapacity];
+
+                if (oldConvBuf != null && oldConvBuf[l] != null && oldCapacity > 0)
+                {
+                    int copy = Math.Min(oldCapacity, oldConvBuf[l].Length);
+                    Array.Copy(oldConvBuf[l], 0, newConvBuf, 0, copy);
+                    Array.Copy(oldSsm[l],     0, newSsm,     0, copy);
+                    Array.Copy(oldInit[l],    0, newInit,    0, copy);
+                    Array.Copy(oldNdProj[l],   0, newNdProj,   0, copy);
+                    Array.Copy(oldNdHidden[l], 0, newNdHidden, 0, copy);
+                    Array.Copy(oldNdInit[l],   0, newNdInit,   0, copy);
+                }
+
+                _nemoSlotConvBuf[l] = newConvBuf;
+                _nemoSlotSsmState[l] = newSsm;
+                _nemoSlotInit[l] = newInit;
+                _nemoSlotMamba2NativeDecodeProjected[l] = newNdProj;
+                _nemoSlotMamba2NativeDecodeHidden[l] = newNdHidden;
+                _nemoSlotMamba2NativeDecodeStateInitialized[l] = newNdInit;
+            }
+
+            _nemoMambaSlotCapacity = targetCapacity;
+        }
+
+        /// <summary>Return the Mamba2 state slot for <paramref name="seq"/>,
+        /// allocating one if this is the first time we've seen this RequestId
+        /// in a batched forward. Slots are released when the engine notifies
+        /// us via <see cref="OnSequenceReleased"/>. Critically, the slot is
+        /// keyed on <c>RequestId</c>, NOT on
+        /// <c>seq.BlockTable.Blocks[0].Id</c>, so two concurrent sequences
+        /// that happen to share their first attention block via the
+        /// prefix-cache hit (typical for chat workloads) still get distinct
+        /// Mamba2 recurrent-state slots and don't trample each other's
+        /// hidden state.</summary>
+        private int GetOrAllocateMambaSlot(SequenceState seq, int numLayers)
+        {
+            if (_nemoMambaSlotByReqId.TryGetValue(seq.RequestId, out int existing))
+                return existing;
+
+            int slot;
+            if (_nemoFreeMambaSlots.Count > 0)
+            {
+                slot = _nemoFreeMambaSlots.Pop();
+            }
+            else
+            {
+                slot = _nemoNextMambaSlot++;
+            }
+            EnsureNemoMambaSlotCapacity(numLayers, slot + 1);
+            _nemoMambaSlotByReqId[seq.RequestId] = slot;
+
+            // Reset any stale per-layer state for this slot — a slot just
+            // popped off the free stack may carry conv/SSM bytes from a
+            // previous tenant that finished. The init flag drives
+            // EnsureNemoSlotAllocated to zero the buffers on first touch.
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.Mamba2) continue;
+                if (_nemoSlotInit[l] != null && slot < _nemoSlotInit[l].Length)
+                {
+                    _nemoSlotInit[l][slot] = false;
+                    _nemoSlotMamba2NativeDecodeStateInitialized[l][slot] = false;
+                }
+            }
+            return slot;
+        }
+
+        /// <summary>Engine callback when a sequence terminates (finished,
+        /// preempted, errored, aborted). Releases the Mamba2 state slot back
+        /// to the free pool so a later sequence can reuse it. Idempotent —
+        /// safe to call multiple times for the same RequestId.</summary>
+        public void OnSequenceReleased(string requestId)
+        {
+            if (requestId == null) return;
+            if (!_nemoMambaSlotByReqId.TryGetValue(requestId, out int slot))
+                return;
+            _nemoMambaSlotByReqId.Remove(requestId);
+            _nemoFreeMambaSlots.Push(slot);
+
+            // Mark the slot's per-layer state as needing re-init on its next
+            // tenant. We don't free the float[] / Tensor allocations — they
+            // get reused on the next acquisition for the same shape.
+            int numLayers = _layerTypes?.Length ?? 0;
+            if (_nemoSlotInit == null) return;
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.Mamba2) continue;
+                if (l >= _nemoSlotInit.Length) break;
+                if (_nemoSlotInit[l] != null && slot < _nemoSlotInit[l].Length)
+                    _nemoSlotInit[l][slot] = false;
+                if (_nemoSlotMamba2NativeDecodeStateInitialized != null
+                    && l < _nemoSlotMamba2NativeDecodeStateInitialized.Length
+                    && _nemoSlotMamba2NativeDecodeStateInitialized[l] != null
+                    && slot < _nemoSlotMamba2NativeDecodeStateInitialized[l].Length)
+                {
+                    _nemoSlotMamba2NativeDecodeStateInitialized[l][slot] = false;
+                }
+            }
         }
 
         /// <summary>Lazily allocate this slot's Mamba2 conv ring + SSM state on
@@ -227,16 +398,205 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>True when the model can migrate a sequence's K/V history
+        /// (attention layers) and recurrent state (Mamba2 layers) from the
+        /// legacy per-model arrays into the paged / per-slot stores. Required
+        /// so the N=1 fast path can hand off to the batched path when a
+        /// second concurrent sequence arrives — without migration the batched
+        /// attention kernel would read zeros for the first sequence's
+        /// attention history, and the Mamba2 slot pool would start from
+        /// freshly-zeroed conv/SSM state.
+        ///
+        /// Block-quantised attention caches (Q8_0) aren't supported by the
+        /// migration code (only F32/F16 dequant is implemented).</summary>
+        public bool SupportsLinearKVMigration =>
+            _kvCacheK != null && _kvCacheV != null
+            && _convState != null && _ssmState != null
+            && !_kvCacheDtype.IsBlockQuantized();
+
+        /// <summary>Copy <paramref name="owner"/>'s in-progress state out of
+        /// the legacy per-model stores and into the paged / per-slot stores
+        /// the batched path reads from. Handles all three Nemotron-H layer
+        /// types:
+        ///   - Attention: linear <c>_kvCacheK/V[layer]</c>
+        ///       (<c>[numKVH_l, capacity, headDim]</c>) → paged
+        ///       <c>_nemoPagedK/V[layer]</c> at slots derived from
+        ///       <c>owner.BlockTable</c>.
+        ///   - Mamba2: model-level <c>_convState[layer]</c> /
+        ///       <c>_ssmState[layer]</c> → per-slot
+        ///       <c>_nemoSlotConvBuf/SsmState[layer][slot]</c>, where slot
+        ///       comes from <see cref="GetOrAllocateMambaSlot"/> so it stays
+        ///       unique per active RequestId even when the owner's first
+        ///       attention block is shared via prefix-cache hit.
+        ///   - FFN: stateless, nothing to migrate.</summary>
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
+        {
+            if (owner == null) return false;
+            if (!SupportsLinearKVMigration) return false;
+            int ownerTokens = _cacheSeqLen;
+            if (ownerTokens <= 0) return true;
+            if (owner.BlockTable.NumBlocks <= 0) return false;
+
+            int numLayers = Config.NumLayers;
+
+            // Flush any device-side cache writes for attention layers so the
+            // float reads below see the freshest K/V (GGML Metal kernels may
+            // keep the cache hot in the Metal buffer while the host shadow
+            // is stale).
+            if (IsGgmlBackend)
+            {
+                var seen = new HashSet<Storage>();
+                for (int l = 0; l < numLayers; l++)
+                {
+                    if (_layerTypes[l] != LayerType.Attention) continue;
+                    if (_kvCacheK[l] != null && seen.Add(_kvCacheK[l].Storage))
+                        SyncTensorHostCache(_kvCacheK[l]);
+                    if (_kvCacheV[l] != null && seen.Add(_kvCacheV[l].Storage))
+                        SyncTensorHostCache(_kvCacheV[l]);
+                }
+            }
+
+            // Cover every block id we'll write into for the attention paged
+            // buffer. The Mamba2 slot pool is sized independently by
+            // GetOrAllocateMambaSlot below.
+            int maxBlockId = 0;
+            int numBlocks = owner.BlockTable.NumBlocks;
+            for (int b = 0; b < numBlocks; b++)
+            {
+                int id = owner.BlockTable.Blocks[b].Id;
+                if (id > maxBlockId) maxBlockId = id;
+            }
+            EnsureNemoPagedBuffers(maxBlockId + 1, blockSize, numLayers);
+
+            int headDim = Config.HeadDim;
+            // Per-request Mamba2 slot — independent of attention block ids
+            // (see comment block at the top of this file for why block-id
+            // keying corrupts state when prefix-cache hits share block 0).
+            int slot = GetOrAllocateMambaSlot(owner, numLayers);
+
+            for (int layer = 0; layer < numLayers; layer++)
+            {
+                switch (_layerTypes[layer])
+                {
+                    case LayerType.Attention:
+                        if (!MigrateAttentionLayerToPaged(layer, owner, ownerTokens, headDim, blockSize))
+                            return false;
+                        break;
+
+                    case LayerType.Mamba2:
+                        MigrateMamba2LayerToSlot(layer, slot);
+                        break;
+
+                    case LayerType.FFN:
+                        // Stateless.
+                        break;
+                }
+            }
+            return true;
+        }
+
+        private bool MigrateAttentionLayerToPaged(
+            int layer, SequenceState owner, int ownerTokens, int headDim, int blockSize)
+        {
+            int kvHeads = _layerNumKVHeads[layer];
+            int cacheLen = (int)_kvCacheK[layer].Sizes[1];
+            int totalElems = kvHeads * cacheLen * headDim;
+            if (!TryReadCacheAsF32(_kvCacheK[layer], totalElems, out float[] kFlat) ||
+                !TryReadCacheAsF32(_kvCacheV[layer], totalElems, out float[] vFlat))
+            {
+                return false;
+            }
+
+            float[] kPaged = _nemoPagedK[layer];
+            float[] vPaged = _nemoPagedV[layer];
+            int stridePaged = kvHeads * headDim;
+
+            for (int p = 0; p < ownerTokens; p++)
+            {
+                int blockIdx = p / blockSize;
+                int offsetInBlock = p % blockSize;
+                int physBlockId = owner.BlockTable.Blocks[blockIdx].Id;
+                int pagedSlot = physBlockId * blockSize + offsetInBlock;
+                int slotOffset = pagedSlot * stridePaged;
+
+                for (int h = 0; h < kvHeads; h++)
+                {
+                    int srcOffset = (h * cacheLen + p) * headDim;
+                    int dstOffset = slotOffset + h * headDim;
+                    Buffer.BlockCopy(
+                        kFlat, srcOffset * sizeof(float),
+                        kPaged, dstOffset * sizeof(float),
+                        headDim * sizeof(float));
+                    Buffer.BlockCopy(
+                        vFlat, srcOffset * sizeof(float),
+                        vPaged, dstOffset * sizeof(float),
+                        headDim * sizeof(float));
+                }
+            }
+            return true;
+        }
+
+        private void MigrateMamba2LayerToSlot(int layer, int slot)
+        {
+            // EnsureNemoSlotAllocated lazily creates the slot's buffers AND
+            // zeroes them if not yet initialised; calling it first means our
+            // Array.Copy below lands on real allocated buffers. The
+            // EnsureNemoSlotAllocated zero-init only runs when init=false,
+            // and we overwrite the just-zeroed buffer immediately afterward,
+            // so the net effect is the correct legacy state in the slot.
+            EnsureNemoSlotAllocated(layer, slot);
+
+            float[] srcConv = _convState[layer];
+            float[] srcSsm = _ssmState[layer];
+            float[] dstConv = _nemoSlotConvBuf[layer][slot];
+            float[] dstSsm = _nemoSlotSsmState[layer][slot];
+
+            if (srcConv != null && dstConv != null && srcConv.Length == dstConv.Length)
+                Array.Copy(srcConv, dstConv, srcConv.Length);
+            if (srcSsm != null && dstSsm != null && srcSsm.Length == dstSsm.Length)
+                Array.Copy(srcSsm, dstSsm, srcSsm.Length);
+
+            // The slot now carries the legacy state, so subsequent batched
+            // calls must NOT zero it on the next first-touch.
+            _nemoSlotInit[layer][slot] = true;
+
+            // The GPU-side native-decode shadow on this slot was synced from
+            // whatever the slot held before (zeros, or stale state from a
+            // previous tenant). Force a re-sync from the host arrays we just
+            // populated. Matches the refresh pattern in TryInjectKVBlock.
+            _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] = false;
+        }
+
+        private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
+        {
+            if (cache.ElementType == DType.Float32)
+            {
+                flat = cache.GetElementsAsFloat(totalElems);
+                return true;
+            }
+            if (cache.ElementType == DType.Float16)
+            {
+                flat = new float[totalElems];
+                ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
+                fixed (float* dst = flat)
+                {
+                    TensorComputePrimitives.F16ToF32(dst, src, totalElems);
+                }
+                return true;
+            }
+            flat = null;
+            return false;
+        }
+
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
 
-            // Opt-in gate (Phase 1).
             if (!NemoBatchedOptIn())
                 throw new NotSupportedException(
-                    "Nemotron batched: disabled (set TS_NEMOTRON_BATCHED=1 to opt in).");
+                    "Nemotron batched: disabled (TS_NEMOTRON_BATCHED=0 set, falling back to per-seq path).");
 
             int numLayers = Config.NumLayers;
 
@@ -301,6 +661,8 @@ namespace TensorSharp.Models
 
             // ----- Per-layer transformer with hybrid dispatch -----
             int headDim = Config.HeadDim;
+            int evalEveryN = NemotronModelEvalConfig.MlxEvalEveryNLayers;
+            bool isMlx = _backend == BackendType.Mlx;
             for (int layer = 0; layer < numLayers; layer++)
             {
                 switch (_layerTypes[layer])
@@ -328,6 +690,19 @@ namespace TensorSharp.Models
                             ? RunBatchedMoELayer(hiddenStates, layer, numTokens)
                             : RunBatchedFFNLayer(hiddenStates, layer);
                         break;
+                }
+
+                // MLX-only: schedule pending Metal command buffers for
+                // execution at periodic layer boundaries so command-buffer
+                // issue overlaps with completion of earlier layers. Without
+                // this the MLX queue grows for the entire forward pass and
+                // doesn't start executing until the first host read at the
+                // end, which serialises kernel issue with kernel completion.
+                // Mirrors the same pattern in the legacy Forward path.
+                if (isMlx && (layer + 1) % evalEveryN == 0
+                    && layer + 1 != numLayers && hiddenStates != null)
+                {
+                    MlxFusedOps.TryAsyncEvaluate(hiddenStates);
                 }
             }
 
@@ -550,20 +925,37 @@ namespace TensorSharp.Models
         {
             int hidden = Config.HiddenSize;
 
+            // The native-decode shadow tensors are only allocated when the
+            // GGML backend is active (see InitCaches). On MLX / CPU backends
+            // these arrays are null and we don't swap any GPU-side state per
+            // slot — Mamba2Block runs the pure C# / MLX path that only
+            // touches the swapped _convState / _ssmState host arrays.
+            bool hasNativeDecodeShadow = _mamba2NativeDecodeProjected != null;
+
             float[] origConvState  = _convState[layer];
             float[] origSsmState   = _ssmState[layer];
-            Tensor  origNdProj     = _mamba2NativeDecodeProjected[layer];
-            Tensor  origNdHidden   = _mamba2NativeDecodeHidden[layer];
-            bool    origNdInit     = _mamba2NativeDecodeStateInitialized[layer];
+            Tensor  origNdProj     = hasNativeDecodeShadow ? _mamba2NativeDecodeProjected[layer] : null;
+            Tensor  origNdHidden   = hasNativeDecodeShadow ? _mamba2NativeDecodeHidden[layer] : null;
+            bool    origNdInit     = hasNativeDecodeShadow && _mamba2NativeDecodeStateInitialized[layer];
             int     savedCacheLen  = _cacheSeqLen;
 
-            float[] batchedOut = new float[numTokens * hidden];
+            // Pre-allocate the batched output on the backend's allocator
+            // (GPU on MLX/Metal) so each per-seq result can be written in
+                  // place via Ops.Copy instead of round-tripping through a CPU
+                  // float[]. Eliminates a GPU→CPU sync per (sequence, layer)
+                  // pair — on Nemotron-H 30B with ~30 Mamba2 layers and N=2
+                  // sequences that's ~60 syncs per generated token avoided.
+            Tensor batchedOutTensor = new Tensor(_allocator, DType.Float32, numTokens, hidden);
+            int numLayers = Config.NumLayers;
             try
             {
                 for (int s = 0; s < numSeqs; s++)
                 {
                     var seq = ctx.Sequences[s];
-                    int slot = seq.BlockTable.Blocks[0].Id;
+                    // Per-request Mamba2 slot (NOT seq.BlockTable.Blocks[0].Id —
+                    // that collides when two sequences share their first
+                    // attention block via prefix-cache hit).
+                    int slot = GetOrAllocateMambaSlot(seq, numLayers);
                     int seqStart = queryStartLoc[s];
                     int seqLen = ctx.NumScheduledTokens[s];
                     if (seqLen <= 0) continue;
@@ -574,40 +966,53 @@ namespace TensorSharp.Models
 
                     _convState[layer]                       = _nemoSlotConvBuf[layer][slot];
                     _ssmState[layer]                        = _nemoSlotSsmState[layer][slot];
-                    _mamba2NativeDecodeProjected[layer]     = _nemoSlotMamba2NativeDecodeProjected[layer][slot];
-                    _mamba2NativeDecodeHidden[layer]        = _nemoSlotMamba2NativeDecodeHidden[layer][slot];
-                    _mamba2NativeDecodeStateInitialized[layer] =
-                        _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot];
+                    if (hasNativeDecodeShadow)
+                    {
+                        _mamba2NativeDecodeProjected[layer]     = _nemoSlotMamba2NativeDecodeProjected[layer][slot];
+                        _mamba2NativeDecodeHidden[layer]        = _nemoSlotMamba2NativeDecodeHidden[layer][slot];
+                        _mamba2NativeDecodeStateInitialized[layer] =
+                            _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot];
+                    }
                     _cacheSeqLen = seq.NumComputedTokens;
 
                     using Tensor seqHidden = Ops.NewContiguous(hiddenStates.Narrow(0, seqStart, seqLen));
                     bool isDecode = seqLen == 1;
-                    using Tensor seqOut = Mamba2Block(seqHidden, layer, seqLen, isDecode);
+                    // Pass `slot` so the native decode kernel's persistent
+                    // GPU-state cache (g_mamba2_decode_cache) gets a distinct
+                    // entry per active sequence. Without this, concurrent
+                    // sequences collapse onto the same cache entry when
+                    // zero-copy host-ptr binding fails and trample each
+                    // other's recurrent state across decode steps.
+                    using Tensor seqOut = Mamba2Block(seqHidden, layer, seqLen, isDecode, slot);
 
-                    // Mamba2Block mutates state through the swapped references;
-                    // read back the native-decode init flag (the only by-value
-                    // field) into the per-slot store.
-                    _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] =
-                        _mamba2NativeDecodeStateInitialized[layer];
+                    if (hasNativeDecodeShadow)
+                    {
+                        // Mamba2Block mutates state through the swapped references;
+                        // read back the native-decode init flag (the only by-value
+                        // field) into the per-slot store.
+                        _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] =
+                            _mamba2NativeDecodeStateInitialized[layer];
+                    }
 
-                    float[] seqFlat = seqOut.GetElementsAsFloat(seqLen * hidden);
-                    Buffer.BlockCopy(seqFlat, 0,
-                        batchedOut, seqStart * hidden * sizeof(float),
-                        seqLen * hidden * sizeof(float));
+                    using Tensor dst = batchedOutTensor.Narrow(0, seqStart, seqLen);
+                    Ops.Copy(dst, seqOut);
                 }
             }
             finally
             {
                 _convState[layer]                              = origConvState;
                 _ssmState[layer]                               = origSsmState;
-                _mamba2NativeDecodeProjected[layer]            = origNdProj;
-                _mamba2NativeDecodeHidden[layer]               = origNdHidden;
-                _mamba2NativeDecodeStateInitialized[layer]     = origNdInit;
+                if (hasNativeDecodeShadow)
+                {
+                    _mamba2NativeDecodeProjected[layer]            = origNdProj;
+                    _mamba2NativeDecodeHidden[layer]               = origNdHidden;
+                    _mamba2NativeDecodeStateInitialized[layer]     = origNdInit;
+                }
                 _cacheSeqLen                                   = savedCacheLen;
             }
 
             hiddenStates.Dispose();
-            return CreateFloatTensor(batchedOut, numTokens, hidden);
+            return batchedOutTensor;
         }
 
         // Phase 9 (Nemotron native Mamba2): replace the N per-seq calls into
@@ -660,12 +1065,16 @@ namespace TensorSharp.Models
             var convHandles = new GCHandle[numSeqs];
             var ssmHandles  = new GCHandle[numSeqs];
             float[] outBatched = new float[numTokens * dInner];
+            int numLayersForSlot = Config.NumLayers;
             try
             {
                 for (int s = 0; s < numSeqs; s++)
                 {
                     var seq = ctx.Sequences[s];
-                    int slot = seq.BlockTable.Blocks[0].Id;
+                    // Per-request Mamba2 slot (NOT seq.BlockTable.Blocks[0].Id —
+                    // see file-level comment for the prefix-cache collision
+                    // this avoids).
+                    int slot = GetOrAllocateMambaSlot(seq, numLayersForSlot);
                     int seqStart = queryStartLoc[s];
                     int seqLen = ctx.NumScheduledTokens[s];
 

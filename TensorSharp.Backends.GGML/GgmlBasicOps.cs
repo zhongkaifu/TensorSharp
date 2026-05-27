@@ -1103,6 +1103,7 @@ namespace TensorSharp.GGML
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
+        public static void Shutdown() => GgmlNative.Shutdown();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
@@ -1276,6 +1277,73 @@ namespace TensorSharp.GGML
             float[] sinksData)
         {
             GgmlNative.PagedAttentionForwardWithSinks(
+                qData, pagedKData, pagedVData, outData,
+                queryStartLoc, seqLens, positions,
+                blockTableFlat, blockTableOffsets,
+                numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                blockSize, scale, slidingWindow, sinksData);
+        }
+
+        /// <summary>GPU-resident paged-attention forward. Q and OUT are
+        /// passed as <see cref="IntPtr"/> into existing backend storage
+        /// (typically <c>tensor.Storage.PtrAtElement(tensor.StorageOffset)</c>
+        /// for a GGML-backed <see cref="Tensor"/>). The kernel zero-copy
+        /// binds them to backend buffers so no host-side memcpy / sync
+        /// happens for Q or OUT, eliminating the per-layer queue drain that
+        /// <c>q.GetElementsAsFloat()</c> would otherwise force on the
+        /// Gemma 4 batched path. K/V paged buffers stay as host arrays.
+        /// </summary>
+        public static void PagedAttentionForwardDevice(
+            IntPtr qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            IntPtr outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow = 0)
+        {
+            GgmlNative.PagedAttentionForwardDevice(
+                qData, pagedKData, pagedVData, outData,
+                queryStartLoc, seqLens, positions,
+                blockTableFlat, blockTableOffsets,
+                numSeqs, numTokens, numHeads, numKvHeads, headDim,
+                blockSize, scale, slidingWindow);
+        }
+
+        /// <summary>GPU-resident paged-attention forward with per-head
+        /// attention sinks. Pass <c>null</c> for <paramref name="sinksData"/>
+        /// to match <see cref="PagedAttentionForwardDevice"/>.</summary>
+        public static void PagedAttentionForwardDeviceWithSinks(
+            IntPtr qData,
+            float[] pagedKData,
+            float[] pagedVData,
+            IntPtr outData,
+            int[] queryStartLoc,
+            int[] seqLens,
+            int[] positions,
+            int[] blockTableFlat,
+            int[] blockTableOffsets,
+            int numSeqs,
+            int numTokens,
+            int numHeads,
+            int numKvHeads,
+            int headDim,
+            int blockSize,
+            float scale,
+            int slidingWindow,
+            float[] sinksData)
+        {
+            GgmlNative.PagedAttentionForwardDeviceWithSinks(
                 qData, pagedKData, pagedVData, outData,
                 queryStartLoc, seqLens, positions,
                 blockTableFlat, blockTableOffsets,

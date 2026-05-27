@@ -90,8 +90,12 @@ namespace TensorSharp.Server
         {
             try
             {
-                // Backend discovery runs at web-app startup, so it must not claim the
-                // process-wide GGML backend before the user actually loads a model.
+                // Backend discovery runs at web-app startup, so it must not spin up
+                // any GGML device — otherwise picking a non-GGML backend (MLX,
+                // direct CUDA) would still trigger `ggml_metal_device_init` / etc.
+                // logs at startup. CanInitializeBackend is a lightweight compile-flag
+                // + platform check; the real GGML init is deferred until a GGML
+                // backend is actually selected.
                 return GgmlBasicOps.CanInitializeBackend(backendType);
             }
             catch

@@ -40,7 +40,8 @@ namespace TensorSharp.Server.Hosting
                 logger.LogInformation(LogEventIds.HostConfiguration,
                     "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000]" +
                     " [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--repeat-penalty F]" +
-                    " [--presence-penalty F] [--frequency-penalty F] [--seed N] [--stop <text>] to use the Web UI.");
+                    " [--presence-penalty F] [--frequency-penalty F] [--seed N] [--stop <text>]" +
+                    " [--prefill-chunk-size N] to use the Web UI.");
                 return;
             }
 

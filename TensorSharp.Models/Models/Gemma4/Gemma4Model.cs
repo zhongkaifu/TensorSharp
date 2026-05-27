@@ -184,11 +184,16 @@ namespace TensorSharp.Models
                 ? new CpuAllocator(BlasEnum.DotNet)
                 : _allocator;
             _visionEncoder = new Gemma4VisionEncoder(mmProjPath, visionAllocator);
+            // Give the encoder a reference back to us so its per-block loop
+            // can yield ModelBase.GpuComputeLock between blocks (keeps the
+            // engine worker responsive during long image encodes).
+            _visionEncoder.SetHostModel(this);
         }
 
         public void LoadAudioEncoder(string mmProjPath)
         {
             _audioEncoder = new Gemma4AudioEncoder(mmProjPath, _allocator);
+            _audioEncoder.SetHostModel(this);
         }
 
         public void SetAudioEmbeddings(Tensor embeddings, int insertPosition)

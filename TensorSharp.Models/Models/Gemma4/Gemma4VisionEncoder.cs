@@ -20,6 +20,11 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        // Optional ModelBase reference for cooperative GpuComputeLock yielding.
+        // When set, Encode() releases the lock between encoder blocks so the
+        // engine worker can run one inference step per block — keeping
+        // concurrent decode requests responsive during long image encodes.
+        private ModelBase _hostModel;
 
         private readonly int _hiddenSize;
         private readonly int _intermediateSize;
@@ -52,6 +57,11 @@ namespace TensorSharp.Models
         }
 
         public int ProjectionDim => _projectionDim;
+
+        /// <summary>Attach the model that owns this encoder so the per-block
+        /// loop in <see cref="Encode"/> can yield the GPU compute lock between
+        /// blocks. Set once after construction.</summary>
+        public void SetHostModel(ModelBase model) => _hostModel = model;
 
         public Gemma4VisionEncoder(string mmProjPath, IAllocator allocator)
         {
@@ -149,6 +159,15 @@ namespace TensorSharp.Models
             {
                 Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
                 hidden = EncoderBlock(hidden, i, numPatches, headDim, ropeCache);
+                // Yield the GPU compute lock between encoder blocks so the
+                // engine worker can run an inference step. Without this,
+                // a single image encode (16–32 blocks, 100ms–2s+ total)
+                // freezes every other in-flight chat/decode request for
+                // its entire duration; with this, each yield admits one
+                // engine step (≈50–200ms), interleaving encoder progress
+                // with inference progress. No-op when the encoder is
+                // running outside a GpuComputeLock scope.
+                _hostModel?.YieldGpuComputeLock();
             }
             Console.WriteLine(" done");
 

@@ -160,6 +160,29 @@ namespace TensorSharp.Runtime.Scheduling
 
                 // Post-step: emit tokens, detect stop conditions, finish sequences.
                 ApplyResults(results, output);
+
+                // Notify the model about sequences whose per-request state can
+                // now be reclaimed (finished, preempted, errored). Hybrid
+                // models (Nemotron-H, Qwen 3.5) allocate Mamba2 / GatedDeltaNet
+                // recurrent-state slots keyed by RequestId; without this
+                // notification the slot pool grows unbounded and slot indices
+                // get reused incorrectly across abandoned sequences.
+                NotifyReleasedSequences(output);
+            }
+        }
+
+        private void NotifyReleasedSequences(SchedulerOutput output)
+        {
+            if (_model is not Runtime.Scheduling.IBatchedPagedModel batched) return;
+            if (output.FinishedRequestIds != null)
+            {
+                foreach (var id in output.FinishedRequestIds)
+                    batched.OnSequenceReleased(id);
+            }
+            if (output.PreemptedRequestIds != null)
+            {
+                foreach (var id in output.PreemptedRequestIds)
+                    batched.OnSequenceReleased(id);
             }
         }
 
@@ -180,6 +203,8 @@ namespace TensorSharp.Runtime.Scheduling
                     _scheduler.Abort(cmd.RequestId);
                     if (_handles.TryRemove(cmd.RequestId, out var handle))
                         handle.CompleteAborted();
+                    if (_model is Runtime.Scheduling.IBatchedPagedModel batchedAbort)
+                        batchedAbort.OnSequenceReleased(cmd.RequestId);
                     break;
             }
         }
@@ -203,9 +228,11 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.SampledToken >= 0)
                 {
-                    handle?.PublishToken(r.SampledToken);
-
-                    // Stop on EOS.
+                    // Stop on EOS. Do NOT publish the EOS token to the
+                    // consumer channel: its textual form is a special
+                    // marker (e.g. <end_of_turn>, <|im_end|>) that would
+                    // otherwise be decoded by AppendTokenBytes and leak
+                    // into the streamed assistant output.
                     if (_model.Tokenizer != null && _model.Tokenizer.IsEos(r.SampledToken))
                     {
                         _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
@@ -214,6 +241,8 @@ namespace TensorSharp.Runtime.Scheduling
                         Interlocked.Increment(ref _totalCompleted);
                         continue;
                     }
+
+                    handle?.PublishToken(r.SampledToken);
 
                     // Stop on max-new-tokens.
                     if (seq.OutputTokens.Count >= seq.MaxNewTokens)

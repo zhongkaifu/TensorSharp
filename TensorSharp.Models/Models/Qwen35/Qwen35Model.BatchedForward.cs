@@ -6,33 +6,30 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
 // Qwen 3.5 batched paged-attention forward — vLLM-style continuous batching.
-// Phase 1b: attention-only path. Mirrors Gemma 4's batched template adapted for
-// Qwen 3.5-specific pieces (fused Q+gate projection, sigmoid-gated attention
-// output, full attention without SWA, no KV donor mapping).
+// Mirrors Gemma 4's batched template adapted for Qwen 3.5-specific pieces
+// (fused Q+gate projection, sigmoid-gated attention output, full attention
+// without SWA, no KV donor mapping) plus per-slot GDN state and MoE expert
+// routing for the hybrid 35B-A3B architecture.
 //
-// Opt-in: TS_QWEN35_BATCHED=1. Default OFF until Phase 2 (GDN per-block state)
-// lands and Qwen 3.5 actually runs end-to-end through this path. With the
-// opt-in unset (current state), ForwardBatch throws NotSupportedException and
-// BatchExecutor falls through to ExecuteStepPerSequence — identical behaviour
-// to before this file existed.
+// Default ON. Set TS_QWEN35_BATCHED=0 (or pass --no-continuous-batching to
+// the server) to force the per-seq KV-swap fallback instead — useful for
+// debugging or for single-stream workloads where the per-seq fast path is
+// faster than the op-by-op batched path.
 //
-// Coverage in this phase:
+// Coverage:
 //   - Per-layer paged K/V buffers (one block-table-flat slot per token)
 //   - Fused norm+QKV (gated Q + K + V) with Qwen 3.5's Q+gate interleaved layout
 //   - QK-norm via the existing ApplyQKNormCached helper (already per-token)
-//   - NeoX RoPE per layer over per-token positions (scalar positions; MRoPE
-//     for vision goes through the per-seq path until Phase 4)
+//   - NeoX RoPE per layer over per-token positions, with per-batch MRoPE
+//     position table for multimodal sequences
 //   - PagedAttentionForward via ScatterKv + GgmlBasicOps.PagedAttentionForward
 //   - Sigmoid-gated attention output via existing ApplySigmoidGate / SigmoidMul
 //   - Attention output projection + residual add
-//   - Dense SwiGLU FFN (FFNCached) — works per-token without modification
+//   - Dense SwiGLU FFN and MoE expert routing (FFNCached / MoEForward)
 //   - Per-seq LM head + tied/untied output weight
-//
-// NotSupported (throws → per-seq fallback handles them):
-//   - Any GDN (recurrent) layer → Phase 2 lands per-block conv/ssm state
-//   - Any MoE layer → Phase 3
-//   - Multimodal MRoPE positions pending → Phase 4
-//   - Block-quantised KV cache dtype → won't reach without those fused kernels
+//   - Per-slot GDN (recurrent) state with reference-swap into the model-level
+//     conv ring buffer + delta state tensor
+//   - Multimodal (vision/audio) embedding inject + per-batch MRoPE positions
 //
 // vLLM reference: vllm/model_executor/models/qwen3_5.py (Qwen3_5DecoderLayer
 // dispatch on layer_types[i]).
@@ -41,6 +38,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Models.Paged;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
@@ -76,6 +74,17 @@ namespace TensorSharp.Models
         //   _q35GdnSlotConvWriteIdx[layer][slot]: int (per-slot ring write head)
         //   _q35GdnSlotSsmTensor[layer][slot]  : Tensor[numVHeads, headVDim, headKDim]
         //   _q35GdnSlotInit[layer][slot]       : true once a slot has been used
+        //   _q35GdnSlotMlxCache[layer][slot]   : MLX-native GDN cache instance
+        //
+        // The MLX-native GDN kernel (MlxFusedOps.GatedDeltaNetCache) keeps its
+        // own MLX-managed convState / deltaState across calls. The legacy
+        // _mlxGdnCache[layer] is per-layer (single-seq) — using it from the
+        // batched per-seq loop would mix every scheduled sequence's state
+        // into one cache and corrupt every-but-the-first seq's output (each
+        // iteration would see the PREVIOUS seq's updated state instead of
+        // its own). The per-(layer, slot) cache here keeps each sequence's
+        // MLX state isolated across batched ExecuteSteps in the exact same
+        // way the conv ring buffer + SSM tensor are isolated.
         //
         // Per-slot buffers and tensors are allocated lazily on first access
         // so workloads that only use a few slots don't pre-allocate the full
@@ -84,20 +93,33 @@ namespace TensorSharp.Models
         private int[][]     _q35GdnSlotConvWriteIdx;
         private Tensor[][]  _q35GdnSlotSsmTensor;
         private bool[][]    _q35GdnSlotInit;
+        private MlxFusedOps.GatedDeltaNetCache[][] _q35GdnSlotMlxCache;
 
-        // Phase 4: yes, ForwardBatch handles multimodal sequences directly
-        // (vision embedding inject + per-batch MRoPE position table). The
-        // batched path requires the same opt-in env var as the rest of the
-        // Qwen3.5 batched plumbing — declining batched multimodal when the
-        // opt-in is off so BatchExecutor falls back to the per-seq split.
-        public bool SupportsBatchedMultimodal
+        // ForwardBatch handles multimodal sequences directly (vision
+        // embedding inject + per-batch MRoPE position table). Both this
+        // capability flag and ForwardBatch itself honour the same gate, so
+        // BatchExecutor's "use the batched path" decision is consistent
+        // with what ForwardBatch will actually accept.
+        public bool SupportsBatchedMultimodal => IsBatchedPathEnabled();
+
+        /// <summary>Default ON. The batched paged-attention path supports
+        /// every Qwen3.5 layer type (attention, GDN recurrent, MoE) and is
+        /// what continuous-batching multi-request workloads need. Set
+        /// <c>TS_QWEN35_BATCHED=0</c> (or pass <c>--no-continuous-batching</c>
+        /// to the server) to force the per-seq KV-swap fallback.
+        ///
+        /// History: an earlier attempt to default this OFF on MLX (so the
+        /// per-seq path's MLX-fast attention could replace the batched
+        /// path's slow C# <c>ManagedPagedAttention</c>) regressed the
+        /// Qwen3-Next hybrid 27B/30B-class models — the per-seq path on
+        /// MLX for those models is even slower than the batched path,
+        /// so the global default stays ON until the per-seq MLX path
+        /// is benchmarked and fixed for hybrid Qwen3-Next.</summary>
+        private static bool IsBatchedPathEnabled()
         {
-            get
-            {
-                string optIn = Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED");
-                return string.Equals(optIn, "1", StringComparison.Ordinal)
-                    || string.Equals(optIn, "true", StringComparison.OrdinalIgnoreCase);
-            }
+            string raw = Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
         }
 
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
@@ -106,14 +128,11 @@ namespace TensorSharp.Models
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
 
-            // Opt-in. Default off until Phase 2 lands. See file header.
-            string optIn = Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED");
-            bool batchedEnabled = string.Equals(optIn, "1", StringComparison.Ordinal)
-                || string.Equals(optIn, "true", StringComparison.OrdinalIgnoreCase);
-            if (!batchedEnabled)
+            if (!IsBatchedPathEnabled())
             {
                 throw new NotSupportedException(
-                    "Qwen 3.5 batched: not enabled. Set TS_QWEN35_BATCHED=1 to opt in (in progress).");
+                    "Qwen 3.5 batched path is disabled (TS_QWEN35_BATCHED=0 / --no-continuous-batching). "
+                    + "BatchExecutor will fall back to the per-seq KV-swap path.");
             }
 
             // Phase 4: multimodal sequences are now handled here. The injector
@@ -334,16 +353,43 @@ namespace TensorSharp.Models
                     kTensor.Dispose();
                     vTensor.Dispose();
 
-                    // Native paged attention. Full attention (no SWA).
+                    // Paged attention. Full attention (no SWA).
+                    // GGML backends call the native flash-attn kernel for
+                    // throughput. Non-GGML backends (MLX, direct CUDA, CPU)
+                    // route through the managed C# scalar kernel — the
+                    // native bridge would otherwise force-initialize its
+                    // default backend (e.g. ggml_metal_init logging during
+                    // an --backend mlx run), which the architecture
+                    // contract forbids: each backend stays independent.
                     float[] qFlat = qTensor.GetElementsAsFloat(numTokens * qDim);
-                    qTensor.Dispose();
+                    // DeinterleaveQGate now CopyRefs its decode-fast-path
+                    // outputs (see Qwen35Model.cs), so ownsQGateBuffers is
+                    // always true and this dispose only decrements the
+                    // CopyRef'd handle's refcount — the underlying storage
+                    // backing _attnDecodeQBuf stays alive for the next
+                    // attention layer's DeinterleaveQGate. The guard is
+                    // kept defensive in case a future caller passes a
+                    // borrowed handle without the CopyRef contract.
+                    if (ownsQGateBuffers)
+                        qTensor.Dispose();
                     float[] attnFlat = new float[numTokens * qDim];
-                    GgmlBasicOps.PagedAttentionForward(
-                        qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
-                        queryStartLoc, seqLens, positions,
-                        blockTableFlat, blockTableOffsets,
-                        numSeqs, numTokens, numHeads, numKVHeads, headDim,
-                        _q35PagedBlockSize, attentionScale, /*slidingWindow*/ 0);
+                    if (IsGgmlBackend)
+                    {
+                        GgmlBasicOps.PagedAttentionForward(
+                            qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
+                            queryStartLoc, seqLens, positions,
+                            blockTableFlat, blockTableOffsets,
+                            numSeqs, numTokens, numHeads, numKVHeads, headDim,
+                            _q35PagedBlockSize, attentionScale, /*slidingWindow*/ 0);
+                    }
+                    else
+                    {
+                        ManagedPagedAttention.Forward(
+                            qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
+                            numTokens, numHeads, numKVHeads, headDim, _q35PagedBlockSize,
+                            queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
+                            attentionScale, causal: true, slidingWindow: 0);
+                    }
 
                     Tensor attnOut = CreateFloatTensor(attnFlat, numTokens, qDim);
 
@@ -475,6 +521,7 @@ namespace TensorSharp.Models
             int[][] oldConvIdx = _q35GdnSlotConvWriteIdx;
             Tensor[][] oldSsm = _q35GdnSlotSsmTensor;
             bool[][] oldInit = _q35GdnSlotInit;
+            MlxFusedOps.GatedDeltaNetCache[][] oldMlxCache = _q35GdnSlotMlxCache;
             int oldNumBlocks = _q35PagedNumBlocks;
             int oldBlockSize = _q35PagedBlockSize;
 
@@ -488,6 +535,12 @@ namespace TensorSharp.Models
             _q35GdnSlotConvWriteIdx = new int[numLayers][];
             _q35GdnSlotSsmTensor = new Tensor[numLayers][];
             _q35GdnSlotInit = new bool[numLayers][];
+            // Only the MLX backend exercises the slot-indexed MLX GDN cache;
+            // leave it null for other backends to skip the swap entirely.
+            bool needMlxSlotCache = _backend == BackendType.Mlx && _mlxGdnCache != null;
+            _q35GdnSlotMlxCache = needMlxSlotCache
+                ? new MlxFusedOps.GatedDeltaNetCache[numLayers][]
+                : null;
 
             for (int l = 0; l < numLayers; l++)
             {
@@ -501,6 +554,8 @@ namespace TensorSharp.Models
                     _q35GdnSlotConvWriteIdx[l] = new int[targetBlocks];
                     _q35GdnSlotSsmTensor[l] = new Tensor[targetBlocks];
                     _q35GdnSlotInit[l] = new bool[targetBlocks];
+                    if (needMlxSlotCache)
+                        _q35GdnSlotMlxCache[l] = new MlxFusedOps.GatedDeltaNetCache[targetBlocks];
                     if (oldConvBuf != null && oldConvBuf[l] != null && oldNumBlocks > 0)
                     {
                         // Preserve previously-allocated slots — sequences in
@@ -512,6 +567,8 @@ namespace TensorSharp.Models
                         Array.Copy(oldConvIdx[l], 0, _q35GdnSlotConvWriteIdx[l], 0, oldNumBlocks);
                         Array.Copy(oldSsm[l], 0, _q35GdnSlotSsmTensor[l], 0, oldNumBlocks);
                         Array.Copy(oldInit[l], 0, _q35GdnSlotInit[l], 0, oldNumBlocks);
+                        if (needMlxSlotCache && oldMlxCache != null && oldMlxCache[l] != null)
+                            Array.Copy(oldMlxCache[l], 0, _q35GdnSlotMlxCache[l], 0, oldNumBlocks);
                     }
                 }
                 else
@@ -542,6 +599,8 @@ namespace TensorSharp.Models
         {
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int convStateLen = Math.Max(_convKernel - 1, 0) * qkvDim;
+            bool needsFreshState = _q35GdnSlotConvBuf[layer][slot] == null
+                || !_q35GdnSlotInit[layer][slot];
             if (_q35GdnSlotConvBuf[layer][slot] == null)
             {
                 _q35GdnSlotConvBuf[layer][slot] = new float[convStateLen];
@@ -561,6 +620,20 @@ namespace TensorSharp.Models
                             _q35GdnSlotConvBuf[layer][slot].Length);
                 _q35GdnSlotConvWriteIdx[layer][slot] = 0;
                 Ops.Fill(_q35GdnSlotSsmTensor[layer][slot], 0);
+            }
+            // Per-slot MLX GDN cache: lazy-create on first touch; reset
+            // when the slot is being recycled by a fresh sequence (init
+            // flag was cleared in RunBatchedGdnLayerPerSeq for
+            // NumComputedTokens==0). Reset() frees the MLX-managed
+            // convState/deltaState arrays so the next TryRunQwen35*
+            // call's EnsureState re-inits them to zeros — the same
+            // semantics as the C# conv ring buffer + SSM tensor above.
+            if (_q35GdnSlotMlxCache != null && _q35GdnSlotMlxCache[layer] != null)
+            {
+                if (_q35GdnSlotMlxCache[layer][slot] == null)
+                    _q35GdnSlotMlxCache[layer][slot] = new MlxFusedOps.GatedDeltaNetCache();
+                else if (needsFreshState)
+                    _q35GdnSlotMlxCache[layer][slot].Reset();
             }
             _q35GdnSlotInit[layer][slot] = true;
         }
@@ -617,6 +690,17 @@ namespace TensorSharp.Models
         // Phase 5c per-slot reference-swap (verified). Each seq's slice runs
         // through GatedDeltaNet against its own _convState/_deltaStateTensor
         // (swapped in via the array). Reference assignment, not memcpy.
+        //
+        // For the MLX backend the GDN kernel keeps its convState/deltaState
+        // inside MlxFusedOps.GatedDeltaNetCache. The model's
+        // _mlxGdnCache[layer] is per-LAYER (designed for the legacy
+        // single-seq forward), so using it as-is from this batched loop
+        // would let every iteration update the same MLX state and
+        // contaminate seq N's GDN math with seq N-1's leftover MLX state —
+        // visible as the second concurrent request hitting EOS within a
+        // handful of tokens. We swap _mlxGdnCache[layer] over to the
+        // per-slot instance in _q35GdnSlotMlxCache before each iteration
+        // and restore it after the loop, mirroring the C# state swap.
         private Tensor RunBatchedGdnLayerPerSeq(
             Tensor hiddenStates, BatchedForwardContext ctx, int layer,
             int numTokens, int numSeqs, int[] queryStartLoc)
@@ -627,6 +711,7 @@ namespace TensorSharp.Models
             Tensor  origSsmTensor    = _deltaStateTensor[layer];
             int     origConvWriteIdx = _convStateWriteIdx[layer];
             int     savedCacheSeqLen = _cacheSeqLen;
+            MlxFusedOps.GatedDeltaNetCache origMlxCache = _mlxGdnCache?[layer];
 
             float[] batchedGatedFlat = new float[numTokens * ssmDInner];
             try
@@ -647,6 +732,8 @@ namespace TensorSharp.Models
                     _deltaStateTensor[layer]  = _q35GdnSlotSsmTensor[layer][slot];
                     _convStateWriteIdx[layer] = _q35GdnSlotConvWriteIdx[layer][slot];
                     _cacheSeqLen = seq.NumComputedTokens;
+                    if (_mlxGdnCache != null && _q35GdnSlotMlxCache?[layer] != null)
+                        _mlxGdnCache[layer] = _q35GdnSlotMlxCache[layer][slot];
 
                     using Tensor seqHidden = Ops.NewContiguous(hiddenStates.Narrow(0, seqStart, seqLen));
                     using Tensor gated = GatedDeltaNet(
@@ -671,6 +758,8 @@ namespace TensorSharp.Models
                 _deltaStateTensor[layer]  = origSsmTensor;
                 _convStateWriteIdx[layer] = origConvWriteIdx;
                 _cacheSeqLen              = savedCacheSeqLen;
+                if (_mlxGdnCache != null)
+                    _mlxGdnCache[layer] = origMlxCache;
             }
 
             using Tensor batchedGated = CreateFloatTensor(batchedGatedFlat, numTokens, ssmDInner);
