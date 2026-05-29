@@ -55,13 +55,7 @@ namespace TensorSharp.Server
         /// Models that implement <see cref="IBatchedPagedModel"/> serve
         /// parallel requests via <c>ForwardBatch</c> and don't need to swap
         /// KV state between sequences, so they qualify even when
-        /// <see cref="ModelBase.SupportsKVStateSnapshot"/> reports false. (For
-        /// Gemma 4 specifically, snapshot flips to false as soon as the
-        /// SWA cache wraps past the sliding window, which a long
-        /// generation routinely does - if we still required snapshot here
-        /// the engine would become unavailable mid-conversation and every
-        /// subsequent request would fail with a misleading "engine
-        /// unavailable" error.)</summary>
+        /// <see cref="ModelBase.SupportsKVStateSnapshot"/> reports false.</summary>
         public InferenceEngine TryGetEngine()
         {
             var model = _lifecycle.Model;

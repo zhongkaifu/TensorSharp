@@ -15,6 +15,7 @@ using System.Numerics.Tensors;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 
 namespace TensorSharp.Models
 {
@@ -175,6 +176,17 @@ namespace TensorSharp.Models
                     ropeCache.CosTable, ropeCache.SinTable);
                 if (debug && (i == 0 || i == _blockCount - 1))
                     DumpTensor(blockOrdered, $"After block {i}", numPatches);
+                // Flush MLX's lazy graph at every block boundary. Without this
+                // the [numHeads, numPatches, numPatches] attention-scores
+                // intermediate (~340 MB at 768x768, multiple GB for larger
+                // images) from every previous block stays referenced as a
+                // graph input until the next forced host read in
+                // VisionSelfAttention. Evaluating them all together exceeds
+                // the Metal command-buffer budget and crashes with
+                // kIOGPUCommandBufferCallbackErrorOutOfMemory. AsyncEval kicks
+                // the GPU so block N's intermediates are freed while the host
+                // queues block N+1.
+                MlxFusedOps.TryAsyncEvaluate(blockOrdered);
                 // Yield GpuComputeLock between encoder blocks so concurrent
                 // decode requests on the engine worker stay responsive.
                 _hostModel?.YieldGpuComputeLock();
@@ -536,20 +548,89 @@ namespace TensorSharp.Models
             v.Dispose();
 
             using var kT = kHeads.Transpose(1, 2);
-            var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
-            Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
-            Ops.Softmax(scores, scores);
 
-            var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, headDim);
-            Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
-            scores.Dispose();
+            // For large images (high numPatches) the [numHeads, numPatches,
+            // numPatches] scores tensor exceeds the GPU's per-command-buffer
+            // working memory and trips OOM (~4 GB at numPatches=8000+). Chunk
+            // the query dimension whenever scores would exceed
+            // AttentionChunkBudgetBytes so peak working memory stays bounded.
+            int chunkSize = ComputeAttentionChunkSize(numPatches);
+            if (chunkSize >= numPatches)
+            {
+                var scores = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, numPatches);
+                Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+                Ops.Softmax(scores, scores);
 
-            using var transposed = attnOutput.Transpose(0, 1);
-            using var contiguous = Ops.NewContiguous(transposed);
-            using var flatContig = contiguous.View(numPatches, _hiddenSize);
-            attnOutput.Dispose();
+                var attnOutput = new Tensor(_allocator, DType.Float32, _numHeads, numPatches, headDim);
+                Ops.AddmmBatch(attnOutput, 0, attnOutput, 1.0f, scores, vHeads);
+                scores.Dispose();
 
-            return LinearForwardWithBias(flatContig, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+                using var transposed = attnOutput.Transpose(0, 1);
+                using var contiguous = Ops.NewContiguous(transposed);
+                using var flatContig = contiguous.View(numPatches, _hiddenSize);
+                attnOutput.Dispose();
+
+                return LinearForwardWithBias(flatContig, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+            }
+
+            // Chunked path: stream Q in chunks. attnFinal is allocated in
+            // seq-major [numPatches, _hiddenSize] layout so each chunk's rows
+            // map to a contiguous Narrow(0, qOff, qLen) slice that we can write
+            // into directly without a second transpose at the end.
+            var attnFinal = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+            try
+            {
+                for (int qOff = 0; qOff < numPatches; qOff += chunkSize)
+                {
+                    int qLen = Math.Min(chunkSize, numPatches - qOff);
+
+                    using var qChunkView = qHeads.Narrow(1, qOff, qLen);
+                    using var qChunkContig = Ops.NewContiguous(qChunkView);
+
+                    using var scoresChunk = new Tensor(_allocator, DType.Float32, _numHeads, qLen, numPatches);
+                    Ops.AddmmBatch(scoresChunk, 0, scoresChunk, scale, qChunkContig, kT);
+                    Ops.Softmax(scoresChunk, scoresChunk);
+
+                    using var outChunkHeadFirst = new Tensor(_allocator, DType.Float32, _numHeads, qLen, headDim);
+                    Ops.AddmmBatch(outChunkHeadFirst, 0, outChunkHeadFirst, 1.0f, scoresChunk, vHeads);
+
+                    using var outChunkSeqMajor = outChunkHeadFirst.Transpose(0, 1);
+                    using var outChunkContig = Ops.NewContiguous(outChunkSeqMajor);
+                    using var outChunkFlat = outChunkContig.View(qLen, _hiddenSize);
+
+                    using var attnSlice = attnFinal.Narrow(0, qOff, qLen);
+                    Ops.Copy(attnSlice, outChunkFlat);
+
+                    // Drain each chunk's graph before queuing the next so the
+                    // scoresChunk allocation cycles in/out of GPU memory rather
+                    // than accumulating across chunks.
+                    MlxFusedOps.TryAsyncEvaluate(attnFinal);
+                }
+
+                return LinearForwardWithBias(attnFinal, $"{prefix}.attn_out.weight", $"{prefix}.attn_out.bias");
+            }
+            finally
+            {
+                attnFinal.Dispose();
+            }
+        }
+
+        // Bound the [numHeads, chunkSize, numPatches] scores intermediate to
+        // ~AttentionChunkBudgetBytes so a single attention compute fits in the
+        // Metal command-buffer working set on Apple Silicon. Returns numPatches
+        // unchanged when the un-chunked path already fits — keeps the existing
+        // fast path active for typical image sizes.
+        private const long AttentionChunkBudgetBytes = 256L * 1024 * 1024;
+        private int ComputeAttentionChunkSize(int numPatches)
+        {
+            long perRowBytes = (long)_numHeads * numPatches * sizeof(float);
+            if (perRowBytes <= 0)
+                return numPatches;
+            long maxRows = AttentionChunkBudgetBytes / perRowBytes;
+            if (maxRows >= numPatches)
+                return numPatches;
+            // Keep chunks large enough that matmul stays GEMM-efficient.
+            return (int)Math.Max(64, Math.Min(numPatches, maxRows));
         }
 
         /// <summary>

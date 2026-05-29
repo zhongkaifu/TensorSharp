@@ -83,6 +83,24 @@ namespace TensorSharp.Runtime.Scheduling
             // ggml_metal_synchronize aborts the process.
             lock (_model.GpuComputeLock)
             {
+                // The scheduler freed the previous owner's blocks during
+                // FinishSequence / PreemptSequence, but our _currentOwner
+                // reference outlives that. Without this reset, the next
+                // step's TryMigrateOwnerToPagedIfNeeded would call into
+                // TryMigrateLinearKVToPaged with NumBlocks==0 (it returns
+                // false and the executor logs a misleading "linear→paged
+                // migration failed" warning), and EnsureOwnership on the
+                // new sequence would try to extract state out of the dead
+                // owner. Treat anything that's not Running as "no owner";
+                // the model's linear cache will be reset cleanly when the
+                // new sequence claims ownership.
+                if (_currentOwner != null && _currentOwner.Status != SequenceStatus.Running)
+                {
+                    _currentOwner = null;
+                    _ownerTokensInModel = 0;
+                    _ownerForwardedTokens = 0;
+                }
+
                 bool batchedEnabled = !IsBatchedPathDisabled();
 
                 // Split this step's work into:
@@ -568,9 +586,24 @@ namespace TensorSharp.Runtime.Scheduling
                     float[] logits = _model.Forward(inputTokens);
                     swForward.Stop();
 
-                    // Defensive copy: the model may return its internal logits
-                    // buffer which it reuses on the next call.
-                    seq.LastLogits = (float[])logits.Clone();
+                    // Sampling happens at the *start* of the next step (see
+                    // SampleFromLogits at the top of this branch), and
+                    // BatchExecutor calls _model.Forward only once per step.
+                    // The model's `_logitsBuffer` is overwritten on the next
+                    // Forward, but we always sample before that next Forward
+                    // fires — so a defensive 1 MB clone per token (Gemma 4
+                    // vocab = 262144 × 4 bytes) is wasted memcpy and GC
+                    // pressure (~20 µs / token). Borrow the model's buffer
+                    // directly; the contract is: callers must consume
+                    // LastLogits before this sequence's next forward.
+                    //
+                    // Exception: when a sequence is multi-step inactive
+                    // (ownership-swapped or preempted), another sequence's
+                    // forward could clobber our buffer. Clone in that case.
+                    if (output.ScheduledWork.Count > 1)
+                        seq.LastLogits = (float[])logits.Clone();
+                    else
+                        seq.LastLogits = logits;
 
                     seq.AdvanceComputedTokens(inputTokens.Length);
                     _ownerTokensInModel += inputTokens.Length;
@@ -699,8 +732,15 @@ namespace TensorSharp.Runtime.Scheduling
                 var dst = _scratch.AsSpan(0, (int)expectedBytes);
                 if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
                 {
-                    _logger.LogWarning("Extract failed for sequence {RequestId} block {Block}", seq.RequestId, b);
-                    return;
+                    // For SWA-bounded models (e.g. Gemma 4) blocks whose positions
+                    // have aged out of the sliding window can't be re-extracted —
+                    // their K/V is gone from the model's circular cache. Those
+                    // blocks were already captured into pool storage at the moment
+                    // they first became full (via CaptureNewlyFullBlocks), so the
+                    // pool slab still holds the correct bytes and skipping the
+                    // re-extract here is harmless. We continue so the trailing
+                    // in-window partial block still gets captured.
+                    continue;
                 }
 
                 // Copy the bytes into the block's storage slab. For full blocks

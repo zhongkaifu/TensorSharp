@@ -350,6 +350,19 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 var block = seq.BlockTable.Blocks[b];
                 if (block.ContentHash != null) continue;
+                // Only register blocks whose K/V was actually extracted into
+                // pool storage. CaptureNewlyFullBlocks sets Used==BlockSize
+                // after a successful TryExtractKVBlock; blocks where extract
+                // was declined (e.g. Gemma 4 SWA-local blocks past the
+                // sliding window, where the circular cache has wrapped and
+                // the byte-level snapshot is ill-defined) keep Used at 0.
+                // Registering those would seed the prefix-cache index with
+                // junk data — a future sequence with a matching prompt
+                // prefix would adopt them, claim NumComputedTokens past the
+                // SWA window, and then EnsureOwnership.InjectAllBlocks would
+                // fail on the same wrap-aliased positions (the "Inject
+                // failed for sequence X block 2 at 512" warning).
+                if (block.Used != _cfg.BlockSize) continue;
                 _pool.RegisterFullBlock(block, hashes[b], _cfg.BlockSize);
             }
         }

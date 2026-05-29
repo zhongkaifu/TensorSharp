@@ -58,6 +58,19 @@ namespace TensorSharp.Models
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
 
+            // Same rationale as Forward(): on MLX, collapse the entire batch
+            // forward into one worker round-trip so the hundreds of internal
+            // MlxWorker.Invoke calls run inline. Saves ~25µs × ~600 ops per
+            // sequence × N sequences of pure queue hand-off overhead.
+            if (_backend == BackendType.Mlx && !TensorSharp.MLX.MlxWorker.Shared.IsOnWorkerThread)
+                return TensorSharp.MLX.MlxWorker.Shared.Invoke(() => ForwardBatchCore(ctx));
+            return ForwardBatchCore(ctx);
+        }
+
+        private IReadOnlyList<float[]> ForwardBatchCore(BatchedForwardContext ctx)
+        {
+            int numSeqs = ctx.Sequences.Count;
+
             // Disable gate. The batched path is now the DEFAULT for Gemma 4
             // (correctness verified against legacy through 42 layers; see
             // Gemma4BatchedForwardTests). Set TS_GEMMA4_BATCHED=0 to opt OUT

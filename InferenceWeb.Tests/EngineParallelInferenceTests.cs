@@ -105,6 +105,12 @@ public class EngineParallelInferenceTests
     [Fact] public Task Mistral3_FourLongPromptsParallelBatched() => RunLongContextParallel("mistral3");
 
     [Fact] public Task Gemma4_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("gemma4");
+    // Direct repro for the low-kvReusePercent bug: a long first turn (whose
+    // K/V state wraps the SWA circular cache) followed by a same-session
+    // follow-up. Pre-fix, prefix-cache reuse capped at one sliding window
+    // (~10-20% for long histories); post-fix the per-seq extract/inject use
+    // modular SWA addressing so the whole history is reusable.
+    [Fact] public Task Gemma4_SwaPrefixCacheReuseAcrossLongTurn() => RunSwaPrefixReuseRepro("gemma4");
     [Fact] public Task Qwen36_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("qwen36");
     [Fact] public Task Nemotron3_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("nemotron3");
 
@@ -304,6 +310,85 @@ public class EngineParallelInferenceTests
                 $"image request output \"{imageResult.OutputText}\" doesn't mention apple/fruit - " +
                 "vision embeddings probably weren't injected (engine-path multimodal bug).");
         }
+    }
+
+    private async Task RunSwaPrefixReuseRepro(string key)
+    {
+        if (!TryLoad(key, out var ctx)) return;
+        using (ctx)
+        {
+            var sampling = SamplingConfig.Greedy;
+
+            // Turn 1: long generation that drives the SWA cache past one window
+            // (Gemma 4 default SWA = 512 tokens, so 600 new tokens guarantees wrap).
+            var turn1History = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍最终幻想7" },
+            };
+            var (t1, t1RawTokens) = await SubmitWithHistoryCapturingTokens(ctx, turn1History, maxNewTokens: 600, "turn1", sampling);
+            _output.WriteLine($"[{key}] turn1: prompt={t1.PromptTokenCount} reused={t1.PrefixCacheReusedTokens} out={t1.OutputTokenCount}");
+
+            // Turn 2: same session, follow-up "还有吗" appended after turn 1's output.
+            // Splice turn 1's raw output tokens into the assistant message so the
+            // chat template re-render produces an exact token prefix match (the
+            // production chat pipeline does this via ChatHistoryPreparer).
+            var turn2History = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍最终幻想7" },
+                new ChatMessage { Role = "assistant", Content = t1.OutputText, RawOutputTokens = t1RawTokens },
+                new ChatMessage { Role = "user", Content = "还有吗" },
+            };
+            var (t2, t2RawTokens) = await SubmitWithHistoryCapturingTokens(ctx, turn2History, maxNewTokens: 200, "turn2", sampling);
+            _output.WriteLine($"[{key}] turn2: prompt={t2.PromptTokenCount} reused={t2.PrefixCacheReusedTokens} out={t2.OutputTokenCount}");
+
+            // Turn 3: "请继续"
+            var turn3History = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍最终幻想7" },
+                new ChatMessage { Role = "assistant", Content = t1.OutputText, RawOutputTokens = t1RawTokens },
+                new ChatMessage { Role = "user", Content = "还有吗" },
+                new ChatMessage { Role = "assistant", Content = t2.OutputText, RawOutputTokens = t2RawTokens },
+                new ChatMessage { Role = "user", Content = "请继续" },
+            };
+            var (t3, _) = await SubmitWithHistoryCapturingTokens(ctx, turn3History, maxNewTokens: 200, "turn3", sampling);
+            _output.WriteLine($"[{key}] turn3: prompt={t3.PromptTokenCount} reused={t3.PrefixCacheReusedTokens} out={t3.OutputTokenCount}");
+
+            // Pre-fix: t2.PrefixCacheReusedTokens ≈ slidingWindow (512), giving 10-30% reuse for a long history.
+            // Post-fix: t2's prefix should match almost all of turn1's prompt+assistant block.
+            double t2Pct = 100.0 * t2.PrefixCacheReusedTokens / t2.PromptTokenCount;
+            double t3Pct = 100.0 * t3.PrefixCacheReusedTokens / t3.PromptTokenCount;
+            _output.WriteLine($"[{key}] reuse pct: t2={t2Pct:F1}% t3={t3Pct:F1}%");
+            _output.WriteLine($"[{key}] t2 sample: {Truncate(t2.OutputText, 200)}");
+            _output.WriteLine($"[{key}] t3 sample: {Truncate(t3.OutputText, 200)}");
+            // Output sanity: a token-repeat loop would manifest as long
+            // immediate repeats, which is how state-corruption bugs surface.
+            Assert.True(LongestImmediateRepeat(t2.OutputText ?? string.Empty) < 20,
+                $"turn2 output looks degenerate: {Truncate(t2.OutputText, 200)}");
+            Assert.True(LongestImmediateRepeat(t3.OutputText ?? string.Empty) < 20,
+                $"turn3 output looks degenerate: {Truncate(t3.OutputText, 200)}");
+            Assert.True(t2Pct >= 70.0, $"turn2 reuse {t2Pct:F1}% too low (expected ≥70% after SWA fix)");
+            Assert.True(t3Pct >= 70.0, $"turn3 reuse {t3Pct:F1}% too low (expected ≥70% after SWA fix)");
+        }
+    }
+
+    private async Task<(RequestResult result, List<int> rawTokens)> SubmitWithHistoryCapturingTokens(
+        EngineContext ctx, List<ChatMessage> history, int maxNewTokens, string reqId,
+        SamplingConfig sampling = null)
+    {
+        var tokens = RenderTokens(ctx, history);
+        var seq = new SequenceState(reqId, tokens, maxNewTokens, ctx.BlockSize, sampling ?? SamplingConfig.Default);
+        var handle = ctx.Engine.SubmitRequest(seq);
+        var outputTokens = await DrainHandle(handle);
+        var completion = await handle.Completion;
+        var result = new RequestResult
+        {
+            RequestId = reqId,
+            OutputTokenCount = outputTokens.Count,
+            OutputText = ctx.Model.Tokenizer.Decode(outputTokens),
+            PrefixCacheReusedTokens = completion.PrefixCacheReusedTokens,
+            PromptTokenCount = completion.PromptTokenCount,
+        };
+        return (result, outputTokens);
     }
 
     private async Task RunPrefixCacheBench(string key)

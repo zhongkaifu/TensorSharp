@@ -4,12 +4,27 @@ using System.Threading;
 
 namespace TensorSharp.MLX
 {
-    internal sealed class MlxWorker : IDisposable
+    public sealed class MlxWorker : IDisposable
     {
         private readonly BlockingCollection<IWorkItem> queue = new();
         private readonly Thread thread;
         private int workerThreadId;
         private int disposed;
+
+        // Diagnostic counters: every Invoke/Dispatch increments
+        // _dispatchCount; the queue-hopping (cross-thread) subset increments
+        // _queueCount. The gap between the two indicates how often
+        // re-entrant inline execution short-circuits the queue — i.e., how
+        // effective an outer Invoke wrapper is at batching its sub-calls.
+        private static long _dispatchCount;
+        private static long _queueCount;
+        public static long DispatchCount => Volatile.Read(ref _dispatchCount);
+        public static long QueueCount => Volatile.Read(ref _queueCount);
+        public static void ResetDispatchCount()
+        {
+            Volatile.Write(ref _dispatchCount, 0);
+            Volatile.Write(ref _queueCount, 0);
+        }
 
         public static MlxWorker Shared { get; } = new MlxWorker();
 
@@ -35,12 +50,14 @@ namespace TensorSharp.MLX
             if (func == null)
                 throw new ArgumentNullException(nameof(func));
             ThrowIfDisposed();
+            Interlocked.Increment(ref _dispatchCount);
 
             // Re-entrant: we're already on the worker. Run inline, otherwise
             // we'd block waiting for ourselves.
             if (IsOnWorkerThread)
                 return func();
 
+            Interlocked.Increment(ref _queueCount);
             var item = new WorkItem<T>(func);
             queue.Add(item);
             return item.GetResult();
@@ -69,6 +86,7 @@ namespace TensorSharp.MLX
             if (action == null)
                 throw new ArgumentNullException(nameof(action));
             ThrowIfDisposed();
+            Interlocked.Increment(ref _dispatchCount);
 
             // Re-entrant: run inline to preserve ordering with the synchronous
             // ops surrounding us on the worker thread.
@@ -79,6 +97,7 @@ namespace TensorSharp.MLX
                 return;
             }
 
+            Interlocked.Increment(ref _queueCount);
             queue.Add(new FireAndForgetItem(action));
         }
 

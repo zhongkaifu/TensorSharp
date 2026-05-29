@@ -147,10 +147,29 @@ namespace TensorSharp.Models
         private Gemma4AudioEncoder _audioEncoder;
         private List<(Tensor embeddings, int position)> _pendingVisionEmbeddingsList = new();
         private List<(Tensor embeddings, int position)> _pendingAudioEmbeddingsList = new();
+
+        // Pipelined greedy decode state. _pipelineNextInputHidden holds the
+        // scaled input embedding for the NEXT decode step, computed on-device
+        // from the previous step's argmax. _pipelineNextPLE holds the
+        // [1, _pleDim * numLayers] per-layer-input tensor for the same step
+        // (computed via the same device get_rows on per_layer_token_embd).
+        // When set, SubmitGreedyDecodeStep uses them instead of looking up
+        // host ints — so the inference loop can queue step N+1's forward
+        // BEFORE syncing step N's predicted token to host. See
+        // SubmitGreedyDecodeStep below for details.
+        private Tensor _pipelineNextInputHidden;
+        private Tensor _pipelineNextPLE;
+
+        // Set by Attention() when the fused MLX QKV preprocess kernel ran
+        // (Q/K/V split + RMSNorm + Q/K NeoX RoPE in one Metal dispatch). The
+        // RoPE block further down then skips its own Q/K RoPE since the
+        // kernel already applied it. Reset at the start of every Attention
+        // call so it doesn't leak across layers.
+        private bool _attnFusedDecodePreprocessApplied;
         private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
         private static readonly int MlxLocalKvMaterializeInterval = ResolveMlxLocalKvMaterializeInterval();
         private static readonly bool MlxEvalDecodeLayerBoundaries =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GEMMA4_EVAL_DECODE_LAYER_BOUNDARIES"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GEMMA4_EVAL_DECODE_LAYER_BOUNDARIES"), "0", StringComparison.Ordinal);
         private static readonly bool MlxBaselineSyncLayerEval =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BASELINE_ASYNC_LAYER"), "1", StringComparison.Ordinal);
 
@@ -163,7 +182,30 @@ namespace TensorSharp.Models
                          ?? Environment.GetEnvironmentVariable("TS_MLX_EVAL_EVERY_N_LAYERS");
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v >= 0)
                 return v;
-            return 8;
+            // Phase 7: every 4 layers, kick MLX's accumulated graph via
+            // mlx_async_eval. Without this MLX builds the whole 42-layer
+            // dependency chain in lazy form and the GPU sits idle until the
+            // host-side host sync at LM-head triggers evaluation — i.e.
+            // GPU/CPU work is serialized rather than overlapped. Periodic
+            // async_eval lets the GPU start the front half of the layer
+            // stack while the host is still queueing the back half.
+            //
+            // Sweep on gemma-4-E4B Q8_0 (42 layers, 256 prefill / 128 decode):
+            //   N=0  (disabled)  → 41.87 ms/tok
+            //   N=3              → 40.03 ms/tok
+            //   N=4              → 39.19 ms/tok  ← best
+            //   N=5              → 41.21 ms/tok
+            //   N=7              → 40.10 ms/tok
+            //   N=14             → 40.52 ms/tok
+            //   N=42 (once/tok)  → 42.82 ms/tok
+            //
+            // Best win comes from N≈4 (~11 evals per token). Smaller N
+            // wastes dispatches; larger N leaves more of the stack
+            // un-pipelined. The pre-Phase-6 default was 8, then 0 because
+            // the kernels' tree reductions hid the pipelining gain; now
+            // with simdgroup-fast kernels the bottleneck shifts to CPU/GPU
+            // overlap and async_eval becomes a real win.
+            return 4;
         }
 
         private static int ResolveMlxLocalKvMaterializeInterval()
@@ -172,7 +214,21 @@ namespace TensorSharp.Models
                          ?? Environment.GetEnvironmentVariable("TS_MLX_LOCAL_KV_MATERIALIZE_INTERVAL");
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v >= 0)
                 return v;
-            return 128;
+            // The materialize check fires whenever (startPos + 1 + layer) is a
+            // multiple of this interval. Disabled by default for the standard
+            // <c>Forward</c> path used by the server engine — the per-token
+            // LM-head host sync (<c>GetFloatPtr</c> on the logits tensor)
+            // already materializes the K/V slice_update chain through the
+            // attention dependency, so an additional periodic materialize
+            // is pure overhead. A sweep at interval ∈ {0, 8, 32, 64, 128}
+            // showed interval=8 (previous default) costing ~1.5 ms/token
+            // vs. interval=0 with no observable benefit even at long
+            // decodes (256–512 tokens). Re-enable via the env var when
+            // running the pipelined greedy decode path (<c>SubmitGreedyDecodeStep</c>),
+            // which only host-syncs a 1-int argmax per step and therefore
+            // does need a periodic graph drain to keep chain depth bounded
+            // — a value of 128 is a reasonable starting point there.
+            return 0;
         }
 
         public void LoadVisionEncoder(string mmProjPath)
@@ -617,12 +673,14 @@ namespace TensorSharp.Models
 
         // Gemma 4 hosts its local-attention layers in a circular slidingWindow-sized
         // cache (see CopyToCacheDecode line ~2972: cachePos = startPos % cacheSize).
-        // Past that boundary the physical layout no longer matches logical positions,
-        // so a byte-slice snapshot at offset [0, N) is only well-defined when
-        // _cacheSeqLen never wrapped, i.e. when the prefill stayed within
-        // _slidingWindow. We expose the snapshot API only inside that regime.
+        // The byte-level snapshot path below applies per-layer modular addressing so
+        // a position p is read/written at SWA slot (p % _slidingWindow) for local
+        // layers while global layers use linear addressing. This keeps the snapshot
+        // well-defined even after the SWA cache has wrapped, which is what lets
+        // multi-turn conversations achieve full prefix-cache reuse instead of
+        // capping at one sliding window.
         public override bool SupportsKVStateSnapshot
-            => _kvCacheK != null && _kvCacheV != null && !HasLocalLayerCacheWrapped();
+            => _kvCacheK != null && _kvCacheV != null;
 
         public override string KVStateFingerprint =>
             $"gemma4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|gKV={_numGlobalKVHeads}|gD={_globalHeadDim}|lD={_localHeadDim}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
@@ -632,28 +690,43 @@ namespace TensorSharp.Models
 
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
-            if (!SupportsKVStateSnapshot) return false;
-            if (startToken + tokenCount > _slidingWindow)
-                return false; // local layers' circular buffer would alias positions
+            if (_kvCacheK == null || _kvCacheV == null) return false;
+            if (startToken < 0 || tokenCount <= 0) return false;
+            if (startToken + tokenCount > _cacheSeqLen) return false;
+            // For SWA local layers, only positions in the current circular window are
+            // recoverable. Once a block's positions have been overwritten by later
+            // wrap-around writes we can't reconstruct them. Per-seq CaptureNewlyFullBlocks
+            // extracts blocks the moment they become full, which keeps them within
+            // [_cacheSeqLen - _slidingWindow, _cacheSeqLen) and avoids that edge case.
+            if (_slidingWindow > 0
+                && _cacheSeqLen > _slidingWindow
+                && startToken < _cacheSeqLen - _slidingWindow)
+            {
+                return false;
+            }
+            long expected = ComputeKVBlockByteSize(tokenCount);
+            if (destination.Length != expected) return false;
             EnsureKvCacheHostSynchronized();
-            return KvBlockTransfer.Extract(
-                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
-                startToken, tokenCount, destination);
+            return CopyKVBlockPerLayer(startToken, tokenCount, destination, ReadOnlySpan<byte>.Empty, copyOut: true);
         }
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
         {
             if (_kvCacheK == null || _kvCacheV == null) return false;
-            if (destToken + tokenCount > _slidingWindow)
-                return false; // restoring past the window would write into wrap-aliased slots
+            if (destToken < 0 || tokenCount <= 0) return false;
+            // Inject is called by BatchExecutor.InjectAllBlocks block-by-block in
+            // ascending order starting at destToken==0 after a ResetKVCache. The
+            // modular SWA writes wrap as the in-order injection progresses; the
+            // final cache state after N blocks is byte-identical to the state the
+            // original sequence would have left after forwarding tokens [0, N*BS)
+            // sequentially, which is what the new sequence's attention expects.
+            if (destToken != _cacheSeqLen) return false;
             EnsureCacheCapacity(destToken + tokenCount);
             EnsureKvCacheHostSynchronized();
-            if (!KvBlockTransfer.Inject(
-                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
-                    destToken, tokenCount, source))
-            {
+            long expected = ComputeKVBlockByteSize(tokenCount);
+            if (source.Length != expected) return false;
+            if (!CopyKVBlockPerLayer(destToken, tokenCount, Span<byte>.Empty, source, copyOut: false))
                 return false;
-            }
             _cacheSeqLen = destToken + tokenCount;
             // Match TruncateKVCache: invalidate each unique storage exactly once.
             var invalidated = new HashSet<int>();
@@ -669,11 +742,99 @@ namespace TensorSharp.Models
             return true;
         }
 
-        private bool HasLocalLayerCacheWrapped()
+        /// <summary>
+        /// Walks layer K/V tensors in the same unique-storage order
+        /// <see cref="KvBlockTransfer"/> uses (so the destination byte layout matches
+        /// what <see cref="ComputeKVBlockByteSize"/> reports), copying each per-layer
+        /// payload using a per-layer offset that is modular for SWA local layers and
+        /// linear for global layers. Pass <paramref name="copyOut"/>=true to extract
+        /// from cache into <paramref name="destination"/>, or false to inject from
+        /// <paramref name="source"/> into cache.
+        /// </summary>
+        private unsafe bool CopyKVBlockPerLayer(
+            int positionStart,
+            int tokenCount,
+            Span<byte> destination,
+            ReadOnlySpan<byte> source,
+            bool copyOut)
         {
-            if (_slidingWindowPattern == null || _slidingWindow <= 0)
-                return false;
-            return _cacheSeqLen > _slidingWindow;
+            int totalOffset = 0;
+            var seenStorages = new HashSet<Storage>(ReferenceEqualityComparer.Instance);
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                bool isLocal = IsLocalLayer(l);
+                int layerPos = (isLocal && _slidingWindow > 0)
+                    ? (positionStart % _slidingWindow)
+                    : positionStart;
+                if (layerPos + tokenCount > (isLocal && _slidingWindow > 0 ? _slidingWindow : int.MaxValue))
+                    return false; // block straddles a wrap boundary - blockSize must divide slidingWindow
+
+                var k = _kvCacheK[l];
+                if (k != null && seenStorages.Add(k.Storage))
+                {
+                    if (!CopyTensorBlock(k, layerPos, tokenCount, destination, source, totalOffset, copyOut, out int wrote))
+                        return false;
+                    totalOffset += wrote;
+                }
+                var v = _kvCacheV[l];
+                if (v != null && seenStorages.Add(v.Storage))
+                {
+                    if (!CopyTensorBlock(v, layerPos, tokenCount, destination, source, totalOffset, copyOut, out int wrote))
+                        return false;
+                    totalOffset += wrote;
+                }
+            }
+            int expectedLen = copyOut ? destination.Length : source.Length;
+            return totalOffset == expectedLen;
+        }
+
+        private static unsafe bool CopyTensorBlock(
+            Tensor t,
+            int startToken,
+            int tokenCount,
+            Span<byte> destination,
+            ReadOnlySpan<byte> source,
+            int bufferOffset,
+            bool copyOut,
+            out int bytesMoved)
+        {
+            t.Storage.EnsureHostReadable();
+            long numHeads = t.Sizes[0];
+            long capacity = t.Sizes[1];
+            long rowBytes = t.Storage.ByteLength / (numHeads * capacity);
+            long blockBytes = numHeads * tokenCount * rowBytes;
+            int bufLen = copyOut ? destination.Length : source.Length;
+            if (bufferOffset + blockBytes > bufLen) { bytesMoved = 0; return false; }
+            IntPtr storageBase = t.Storage.PtrAtElement(0);
+            if (storageBase == IntPtr.Zero) { bytesMoved = 0; return false; }
+            byte* storagePtr = (byte*)storageBase;
+            long perHead = tokenCount * rowBytes;
+            if (copyOut)
+            {
+                fixed (byte* dstBase = destination)
+                {
+                    for (long h = 0; h < numHeads; h++)
+                    {
+                        long srcOff = (h * capacity + startToken) * rowBytes;
+                        long dstOff = bufferOffset + h * perHead;
+                        Buffer.MemoryCopy(storagePtr + srcOff, dstBase + dstOff, bufLen - dstOff, perHead);
+                    }
+                }
+            }
+            else
+            {
+                fixed (byte* srcBase = source)
+                {
+                    for (long h = 0; h < numHeads; h++)
+                    {
+                        long dstOff = (h * capacity + startToken) * rowBytes;
+                        long srcOff = bufferOffset + h * perHead;
+                        Buffer.MemoryCopy(srcBase + srcOff, storagePtr + dstOff, t.Storage.ByteLength - dstOff, perHead);
+                    }
+                }
+            }
+            bytesMoved = (int)blockBytes;
+            return true;
         }
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
@@ -682,6 +843,63 @@ namespace TensorSharp.Models
         }
 
         public override float[] Forward(int[] tokens)
+        {
+            // On MLX, every public op routes through MlxWorker.Shared.Invoke
+            // which costs ~25µs per round-trip. Decode dispatches ~600 MLX
+            // calls per token across 42 layers, so the per-call hand-off
+            // dwarfs actual compute. Wrapping the whole forward in one Invoke
+            // moves ALL nested ops onto the worker thread — they detect
+            // IsOnWorkerThread and run inline, eliminating ~15 ms / token of
+            // queue overhead. Other backends are unaffected.
+            if (_backend == BackendType.Mlx && !MlxWorker.Shared.IsOnWorkerThread)
+                return MlxWorker.Shared.Invoke(() => ForwardCore(tokens));
+            return ForwardCore(tokens);
+        }
+
+        // Per-section decode profiler: gated by TS_MLX_DECODE_PROFILE=1.
+        // Each section is followed by a forced MLX eval so the wall-clock
+        // tick range reflects GPU work, not just dispatch overhead. The
+        // forced eval breaks MLX's normal pipelining, so this is a profiling
+        // mode only — turn off for steady-state perf measurement.
+        private static readonly bool s_DecodeProfileEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DECODE_PROFILE"), "1", StringComparison.Ordinal);
+        private long _profEmbedTicks, _profPleTicks, _profLayerTicks, _profFinalNormTicks, _profLmHeadTicks, _profSoftcapTicks, _profLogitsCopyTicks;
+        private long _profAttnPreTicks, _profAttnSdpaTicks, _profAttnOutTicks, _profFfnTicks, _profPleInjectTicks;
+        private int _profDecodeCalls;
+
+        private void ProfMark(ref long counter, long since, Tensor syncTensor)
+        {
+            if (!s_DecodeProfileEnabled || _backend != BackendType.Mlx) return;
+            if (syncTensor != null) MlxFusedOps.TryEvaluate(syncTensor);
+            counter += Stopwatch.GetTimestamp() - since;
+        }
+
+        public override void PrintTimingStats()
+        {
+            base.PrintTimingStats();
+            DumpDecodeProfile();
+        }
+
+        public void DumpDecodeProfile()
+        {
+            if (!s_DecodeProfileEnabled || _profDecodeCalls == 0) return;
+            double inv = 1000.0 / Stopwatch.Frequency / _profDecodeCalls;
+            Console.WriteLine($"=== MLX decode profile ({_profDecodeCalls} decode calls) ===");
+            Console.WriteLine($"  embed       : {_profEmbedTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  PLE compute : {_profPleTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  per-layer   : {_profLayerTicks * inv:F3} ms/tok");
+            Console.WriteLine($"    attn pre  : {_profAttnPreTicks * inv:F3} ms/tok  (norm+qkv+split+norms+RoPE+cache)");
+            Console.WriteLine($"    attn SDPA : {_profAttnSdpaTicks * inv:F3} ms/tok");
+            Console.WriteLine($"    attn out  : {_profAttnOutTicks * inv:F3} ms/tok  (output proj + post-attn-norm+add)");
+            Console.WriteLine($"    FFN       : {_profFfnTicks * inv:F3} ms/tok  (gate_up+gelu+down + post-ffn-norm+add)");
+            Console.WriteLine($"    PLE inject: {_profPleInjectTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  final norm  : {_profFinalNormTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  LM head     : {_profLmHeadTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  softcap     : {_profSoftcapTicks * inv:F3} ms/tok");
+            Console.WriteLine($"  logits copy : {_profLogitsCopyTicks * inv:F3} ms/tok  (forced sync to host)");
+        }
+
+        private float[] ForwardCore(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -710,10 +928,12 @@ namespace TensorSharp.Models
             }
 
             long t0 = Stopwatch.GetTimestamp();
+            long pStart = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t0;
 
             ScaleEmbedding(hidden);
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profEmbedTicks, pStart, hidden);
 
             if (_g4DumpDiag) System.Console.WriteLine($"[g4-legacy ] after-embed: {DiagChecksum(hidden, "embed")}");
 
@@ -748,11 +968,15 @@ namespace TensorSharp.Models
             }
 
             Tensor perLayerInputs = null;
+            long pPle = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
             if (_pleDim > 0)
                 perLayerInputs = ComputePLE(tokens, hidden, seqLen);
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profPleTicks, pPle, perLayerInputs);
 
             if (!useFusedDecode)
                 EnsureKvCacheHostSynchronized();
+
+            long pLayers = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
 
             if (useFusedDecode)
             {
@@ -852,7 +1076,11 @@ namespace TensorSharp.Models
                 DisposeSwaPrevWindows();
             }
 
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profLayerTicks, pLayers, hidden);
+
             perLayerInputs?.Dispose();
+
+            long pFinalNorm = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
 
             Tensor lastHidden;
             if (seqLen > 1)
@@ -868,17 +1096,23 @@ namespace TensorSharp.Models
                 hidden.Dispose();
                 lastHidden = normed;
             }
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profFinalNormTicks, pFinalNorm, lastHidden);
 
             t0 = Stopwatch.GetTimestamp();
+            long pLmHead = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
             string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
             Tensor logitsTensor = LinearForward(lastHidden, outputWeight);
             _lmHeadTicks += Stopwatch.GetTimestamp() - t0;
             lastHidden.Dispose();
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profLmHeadTicks, pLmHead, logitsTensor);
 
+            long pSoftcap = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
             if (_finalLogitSoftcap > 0f)
                 ApplyLogitSoftcap(logitsTensor);
+            if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profSoftcapTicks, pSoftcap, logitsTensor);
 
             t0 = Stopwatch.GetTimestamp();
+            long pCopy = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
             if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                 _logitsBuffer = new float[Config.VocabSize];
 
@@ -890,11 +1124,294 @@ namespace TensorSharp.Models
             }
             logitsTensor.Dispose();
             _logitsCopyTicks += Stopwatch.GetTimestamp() - t0;
+            if (s_DecodeProfileEnabled && seqLen == 1)
+            {
+                _profLogitsCopyTicks += Stopwatch.GetTimestamp() - pCopy;
+                _profDecodeCalls++;
+            }
 
             _cacheSeqLen += seqLen;
             _forwardCount++;
             _forwardSw.Stop();
             return _logitsBuffer;
+        }
+
+        // ===== Pipelined greedy decode =====
+        //
+        // Standard Forward(int[]) builds the layer graph, then host-syncs the
+        // [1, vocab] logits tensor (256K floats for gemma-4) at the LM head
+        // before returning. The sync drains all queued MLX kernels — pure
+        // GPU-idle wait from the host's perspective, ~30+ ms per token on
+        // gemma-4-E4B Q8_0.
+        //
+        // SubmitGreedyDecodeStep replaces that pattern with a deferred
+        // device-side token tensor: argmax runs on GPU, the predicted token
+        // is a [1] int32 device array, AND the next step's input embedding
+        // (+ per-layer-embedding) is pre-computed by a device get_rows on
+        // that same int tensor. The caller (CLI inference loop) can submit
+        // step N+1 BEFORE host-syncing step N's predicted int, so the LM
+        // head + sync wait at the end of step N overlaps with step N+1's
+        // first kernels — the textbook pipelined decode pattern that
+        // ollama's mlxrunner uses.
+        //
+        // Greedy only: top-K / temperature sampling still needs the full
+        // logits on host. Gated by model.SupportsPipelinedGreedy on the
+        // call site (returns true only when MLX backend + tied/quantized
+        // LM head + quantized token_embd are all available).
+        public override bool SupportsPipelinedGreedy =>
+            _backend == BackendType.Mlx
+            && _quantWeights.ContainsKey("token_embd.weight");
+
+        public override Tensor SubmitGreedyDecodeStep(int? firstTokenForBegin)
+        {
+            // Same wrapping rationale as Forward(): collapse all nested MLX
+            // worker round-trips into one big inline run on the worker thread.
+            if (_backend == BackendType.Mlx && !MlxWorker.Shared.IsOnWorkerThread)
+                return MlxWorker.Shared.Invoke(() => SubmitGreedyDecodeStepCore(firstTokenForBegin));
+            return SubmitGreedyDecodeStepCore(firstTokenForBegin);
+        }
+
+        private Tensor SubmitGreedyDecodeStepCore(int? firstTokenForBegin)
+        {
+            _forwardSw.Start();
+            int seqLen = 1;
+            int startPos = _cacheSeqLen;
+            EnsureCacheCapacity(startPos + seqLen);
+
+            Tensor hidden;
+            Tensor perLayerInputs;
+
+            if (firstTokenForBegin.HasValue)
+            {
+                // Begin path: starting from a host int (sampled from prefill
+                // logits via the CPU sampler). Drop any cached pipeline state
+                // — we're re-seeding the chain.
+                if (_pipelineNextInputHidden != null) { _pipelineNextInputHidden.Dispose(); _pipelineNextInputHidden = null; }
+                if (_pipelineNextPLE != null) { _pipelineNextPLE.Dispose(); _pipelineNextPLE = null; }
+
+                int[] beginTokens = new[] { firstTokenForBegin.Value };
+                long embT0 = Stopwatch.GetTimestamp();
+                hidden = Embedding(beginTokens);
+                ScaleEmbedding(hidden);
+                _embTicks += Stopwatch.GetTimestamp() - embT0;
+
+                perLayerInputs = _pleDim > 0 ? ComputePLE(beginTokens, hidden, seqLen) : null;
+            }
+            else if (_pipelineNextInputHidden != null)
+            {
+                // Steady state: the previous step pre-computed both the input
+                // embedding AND (if PLE applies) the per-layer-embedding via
+                // device get_rows on the previous argmax. Use them as-is.
+                hidden = _pipelineNextInputHidden;
+                _pipelineNextInputHidden = null;
+                perLayerInputs = _pipelineNextPLE;
+                _pipelineNextPLE = null;
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    "SubmitGreedyDecodeStep: no cached input embedding and no firstTokenForBegin provided. " +
+                    "Call with firstTokenForBegin set after prefill before any null-token continuations.");
+            }
+
+            // Run the layer stack. Same shape as the decode path in Forward —
+            // no chunked prefill, no fused-layer-prefill (which only fires for
+            // GGML anyway), no SWA prev-window gather (decode reads the rolling
+            // cache directly).
+            EnsureKvCacheHostSynchronized();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                Tensor perLayerInput = null;
+                if (perLayerInputs != null)
+                    perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
+
+                bool isShared = _kvDonorMap.ContainsKey(l);
+                hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, null);
+                TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
+                perLayerInput?.Dispose();
+            }
+            perLayerInputs?.Dispose();
+
+            // Final norm + LM head + softcap, same as Forward().
+            long lmT0 = Stopwatch.GetTimestamp();
+            Tensor lastNormed = RMSNormOp(hidden, "output_norm.weight");
+            hidden.Dispose();
+            string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
+            Tensor logitsTensor = LinearForward(lastNormed, outputWeight);
+            lastNormed.Dispose();
+            _lmHeadTicks += Stopwatch.GetTimestamp() - lmT0;
+
+            if (_finalLogitSoftcap > 0f)
+                ApplyLogitSoftcap(logitsTensor);
+
+            // Device argmax → [1] int32. Stays on device — this is the handle
+            // we return; the caller defers .GetElementsAsInt() until AFTER
+            // submitting the next step.
+            var deviceToken = new Tensor(_allocator, DType.Int32, 1);
+            if (!MlxFusedOps.TryArgMaxLastAxis(deviceToken, logitsTensor))
+            {
+                // Host fallback. Forces a sync (defeating the pipeline) but
+                // keeps the output correct on backends or shapes the MLX
+                // argmax kernel doesn't cover.
+                unsafe
+                {
+                    float* src = GetFloatPtr(logitsTensor);
+                    int maxIdx = 0;
+                    float maxVal = src[0];
+                    int vocab = (int)logitsTensor.ElementCount();
+                    for (int i = 1; i < vocab; i++)
+                    {
+                        float v = src[i];
+                        if (v > maxVal) { maxVal = v; maxIdx = i; }
+                    }
+                    deviceToken.SetElementsAsInt(new[] { maxIdx });
+                }
+            }
+            logitsTensor.Dispose();
+
+            // Pre-compute the NEXT step's input embedding (+ PLE if applicable)
+            // via device-side get_rows on `deviceToken`. After this returns the
+            // next forward can run without any host int round-trip.
+            var nextHidden = new Tensor(_allocator, DType.Float32, 1, Config.HiddenSize);
+            bool deviceEmbOk = TryComputeNextInputEmbeddingDevice(nextHidden, deviceToken);
+            if (!deviceEmbOk)
+            {
+                // Device path unsupported (no MLX, or non-quantized embedding
+                // table). Sync the token to host and rebuild via the standard
+                // path. This eats the pipeline win for THIS step but keeps
+                // correctness — and is rare in practice for our supported
+                // gemma-4 GGUFs (token_embd is always quantized).
+                int hostTok = deviceToken.GetElementsAsInt(1)[0];
+                nextHidden.Dispose();
+                nextHidden = Embedding(new[] { hostTok });
+                ScaleEmbedding(nextHidden);
+                _pipelineNextInputHidden = nextHidden;
+                _pipelineNextPLE = _pleDim > 0 ? ComputePLE(new[] { hostTok }, nextHidden, seqLen) : null;
+            }
+            else
+            {
+                // Apply the post-lookup scale on device.
+                ScaleEmbedding(nextHidden);
+                _pipelineNextInputHidden = nextHidden;
+                _pipelineNextPLE = _pleDim > 0
+                    ? ComputeNextPLEDevice(deviceToken, nextHidden)
+                    : null;
+
+                // Kick the queued kernels (argmax + embedding + PLE lookups)
+                // so they start executing on Metal NOW. The host sync of
+                // deviceToken in the caller's loop would drain this implicitly,
+                // but an explicit async-eval gives MLX a chance to schedule
+                // and start the work before the host issues the next
+                // SubmitGreedyDecodeStep — that's the pipeline overlap.
+                MlxFusedOps.TryAsyncEvaluate(_pipelineNextInputHidden);
+                if (_pipelineNextPLE != null)
+                    MlxFusedOps.TryAsyncEvaluate(_pipelineNextPLE);
+            }
+
+            _cacheSeqLen += seqLen;
+            _forwardCount++;
+            _forwardSw.Stop();
+            return deviceToken;
+        }
+
+        // Device-side equivalent of Embedding(int[]) for a single [1] int32
+        // device tensor. Reuses MlxQuantizedOps.TryGetRowsQuantizedToFloat32
+        // — same path Embedding(int[]) takes for MLX-quantized token_embd.
+        // Returns false (and leaves outHidden zero-initialized) if the
+        // backend or weight type doesn't support a device get_rows.
+        private bool TryComputeNextInputEmbeddingDevice(Tensor outHidden, Tensor deviceTokenInt)
+        {
+            if (_backend != BackendType.Mlx)
+                return false;
+
+            if (_quantWeights.TryGetValue("token_embd.weight", out var qw))
+            {
+                return MlxQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    outHidden,
+                    qw.EnsureDeviceCacheKey(),
+                    qw.Data,
+                    qw.GgmlType,
+                    qw.Ne0,
+                    qw.Ne1,
+                    qw.RawBytes,
+                    deviceTokenInt);
+            }
+
+            // F32 token_embd via Ops.IndexSelect would also work but isn't
+            // exercised by our supported gemma-4 GGUFs (Q8_0/Q4_K_M/etc all
+            // quantize token_embd). Leave as a future TODO if needed.
+            return false;
+        }
+
+        // Device-side PLE computation for the next decode step. Mirrors
+        // ComputePLE(int[], hidden, seqLen) but takes a [1] int32 device
+        // token tensor for the per_layer_token_embd lookup and uses the
+        // already-scaled hidden tensor for the projection. Returns the
+        // combined [1, _pleDim * numLayers] tensor or null if PLE is
+        // disabled or all paths fall back to host. Note: any failure
+        // here is fine — the caller will fall back to host PLE on the
+        // next call.
+        private Tensor ComputeNextPLEDevice(Tensor deviceTokenInt, Tensor hidden)
+        {
+            int totalPleDim = _pleDim * Config.NumLayers;
+            int seqLen = 1;
+
+            Tensor pleTokenEmb = null;
+            if (_quantWeights.TryGetValue("per_layer_token_embd.weight", out var pleQw))
+            {
+                pleTokenEmb = new Tensor(_allocator, DType.Float32, seqLen, totalPleDim);
+                if (!MlxQuantizedOps.TryGetRowsQuantizedToFloat32(
+                        pleTokenEmb,
+                        pleQw.EnsureDeviceCacheKey(),
+                        pleQw.Data,
+                        pleQw.GgmlType,
+                        pleQw.Ne0,
+                        pleQw.Ne1,
+                        pleQw.RawBytes,
+                        deviceTokenInt))
+                {
+                    pleTokenEmb.Dispose();
+                    pleTokenEmb = null;
+                }
+                else
+                {
+                    float pleScale = MathF.Sqrt(_pleDim);
+                    Ops.Mul(pleTokenEmb, pleTokenEmb, pleScale);
+                }
+            }
+
+            // Projection branch — same shape as ComputePLE.
+            Tensor pleProj = LinearForward(hidden, "per_layer_model_proj.weight");
+            if (pleProj != null)
+            {
+                float projScale = 1f / MathF.Sqrt(Config.HiddenSize);
+                Ops.Mul(pleProj, pleProj, projScale);
+
+                int totalRows = seqLen * Config.NumLayers;
+                using var reshaped = pleProj.View(totalRows, _pleDim);
+                var normWeight = _weights["per_layer_proj_norm.weight"];
+                Ops.RMSNorm(reshaped, reshaped, normWeight, null, Config.Eps);
+            }
+
+            if (pleTokenEmb != null && pleProj != null)
+            {
+                Ops.Add(pleProj, pleProj, pleTokenEmb);
+                float combineScale = 1f / MathF.Sqrt(2f);
+                Ops.Mul(pleProj, pleProj, combineScale);
+                pleTokenEmb.Dispose();
+                return pleProj;
+            }
+            if (pleProj != null) return pleProj;
+            if (pleTokenEmb != null) return pleTokenEmb;
+            return null;
+        }
+
+        public override void ResetPipelinedGreedyState()
+        {
+            _pipelineNextInputHidden?.Dispose();
+            _pipelineNextInputHidden = null;
+            _pipelineNextPLE?.Dispose();
+            _pipelineNextPLE = null;
         }
 
         public override float[] ForwardRefill(int[] tokens)
@@ -1856,6 +2373,9 @@ namespace TensorSharp.Models
 
             string prefix = $"blk.{layer}";
 
+            bool prof = s_DecodeProfileEnabled && seqLen == 1;
+            long pAttnPre = prof ? Stopwatch.GetTimestamp() : 0;
+
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.attn_norm.weight");
 
             var attnOut = Attention(attnNormed, layer, prefix, seqLen, startPos, isShared, exceptPositions);
@@ -1869,10 +2389,12 @@ namespace TensorSharp.Models
             bool _diagSync = seqLen > 1 &&
                 System.Environment.GetEnvironmentVariable("TS_GEMMA4_DIAG") == "1";
             if (_diagSync) _ = attnOut.GetElementsAsFloat(1);
+            if (prof) ProfMark(ref _profAttnSdpaTicks, pAttnPre, attnOut);
 
             // Fold post-attention RMSNorm + residual add into one MLX Metal
             // kernel. This mirrors the GGML fused graph shape and avoids one
             // intermediate tensor / graph node chain per layer.
+            long pAttnOut = prof ? Stopwatch.GetTimestamp() : 0;
             if (TryRmsNormAddInPlaceMlx(hidden, attnOut, $"{prefix}.post_attention_norm.weight"))
             {
                 attnOut.Dispose();
@@ -1886,6 +2408,7 @@ namespace TensorSharp.Models
                 hidden.Dispose();
             }
             if (_diagSync) _ = attnOut.GetElementsAsFloat(1);
+            if (prof) ProfMark(ref _profAttnOutTicks, pAttnOut, attnOut);
 
             Tensor result;
 
@@ -1934,36 +2457,106 @@ namespace TensorSharp.Models
             }
             else
             {
-                var ffnOut = FFNGeluWithOptionalNorm(attnOut, $"{prefix}.ffn_norm.weight",
-                    $"{prefix}.ffn_gate_up.weight", $"{prefix}.ffn_down.weight", seqLen);
-                if (_diagSync) _ = ffnOut.GetElementsAsFloat(1);
-
-                // In-place post-FFN norm: ffnOut is only consumed here
                 string postFfnNormKey = $"{prefix}.post_ffw_norm.weight";
                 if (!_weights.ContainsKey(postFfnNormKey))
                     postFfnNormKey = $"{prefix}.ffn_post_norm.weight";
 
-                if (!TryRmsNormAddInPlaceMlx(attnOut, ffnOut, postFfnNormKey))
+                long pFfn = prof ? Stopwatch.GetTimestamp() : 0;
+
+                // Single-closure FFN: pre-norm + gate_up matmul + GeluMulSplit
+                // + down matmul + post-norm + residual add all in one
+                // mlx_closure_apply via mlx_compile. Implemented to test the
+                // hypothesis that bundling 4 separate MLX ops into one
+                // compiled closure would skip per-op graph-build overhead
+                // and improve decode throughput. **Result: neutral-to-slightly
+                // negative.** On Gemma 4 E4B Q8_0, decode best went from
+                // 52.76 ms/tok (per-op path) to 53.33 ms/tok (fused
+                // closure) — mlx_compile fuses adjacent element-wise ops
+                // but can't fuse matmuls, so the dominant per-op cost
+                // (graph-build for each quantized_matmul kernel) is paid
+                // either way; the closure's own apply-time bookkeeping
+                // ate the small theoretical saving.
+                //
+                // Kept committed (gated off by default) for future
+                // benchmarking on larger models or non-Q8_0 quant paths
+                // where the trade may be different. Set TS_MLX_FUSED_FFN=1
+                // to engage.
+                bool fusedFFNDone = false;
+                if (seqLen == 1
+                    && _backend == BackendType.Mlx
+                    && string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_FFN"), "1", StringComparison.Ordinal)
+                    && TryFusedDenseFFNDecode(attnOut, prefix, postFfnNormKey))
                 {
-                    Ops.RMSNorm(ffnOut, ffnOut, _weights[postFfnNormKey], null, Config.Eps);
-                    Ops.Add(attnOut, attnOut, ffnOut);
+                    // attnOut now holds (residual + post_norm(ffn_out)). It
+                    // is the layer's running residual stream and matches the
+                    // shape of the per-op result below.
+                    fusedFFNDone = true;
                 }
-                ffnOut.Dispose();
+
+                if (!fusedFFNDone)
+                {
+                    var ffnOut = FFNGeluWithOptionalNorm(attnOut, $"{prefix}.ffn_norm.weight",
+                        $"{prefix}.ffn_gate_up.weight", $"{prefix}.ffn_down.weight", seqLen);
+                    if (_diagSync) _ = ffnOut.GetElementsAsFloat(1);
+
+                    if (!TryRmsNormAddInPlaceMlx(attnOut, ffnOut, postFfnNormKey))
+                    {
+                        Ops.RMSNorm(ffnOut, ffnOut, _weights[postFfnNormKey], null, Config.Eps);
+                        Ops.Add(attnOut, attnOut, ffnOut);
+                    }
+                    ffnOut.Dispose();
+                }
                 result = attnOut;
                 if (_diagSync) _ = result.GetElementsAsFloat(1);
+                if (prof) ProfMark(ref _profFfnTicks, pFfn, result);
             }
+
+            long pPleInject = prof ? Stopwatch.GetTimestamp() : 0;
 
             // PLE injection
             if (perLayerInput != null &&
                 (_weights.ContainsKey($"{prefix}.inp_gate.weight") || _quantWeights.ContainsKey($"{prefix}.inp_gate.weight")))
             {
-                using var gate = LinearForward(result, $"{prefix}.inp_gate.weight");
+                Tensor gate = null;
+
+                // Phase 6h: fused Q8 matmul + GeluMul kernel. Saves one MLX
+                // op per layer × 42 layers / token on Gemma 4 E4B Q8_0.
+                if (seqLen == 1
+                    && _backend == BackendType.Mlx
+                    && _quantWeights.TryGetValue($"{prefix}.inp_gate.weight", out var inpGateQw)
+                    && perLayerInput.ElementType == DType.Float32
+                    && perLayerInput.IsContiguous()
+                    && perLayerInput.ElementCount() == inpGateQw.Ne1)
+                {
+                    var fusedGate = new Tensor(_allocator, DType.Float32, 1, (int)inpGateQw.Ne1);
+                    if (MlxQuantizedOps.TryFusedQ8MatmulGeluMul(
+                            fusedGate, result, perLayerInput,
+                            inpGateQw.EnsureDeviceCacheKey(), inpGateQw.Data,
+                            inpGateQw.GgmlType, inpGateQw.Ne0, inpGateQw.Ne1, inpGateQw.RawBytes))
+                    {
+                        gate = fusedGate;
+                    }
+                    else
+                    {
+                        fusedGate.Dispose();
+                    }
+                }
+
+                if (gate == null)
+                {
+                    gate = LinearForward(result, $"{prefix}.inp_gate.weight");
+                    if (gate != null)
+                    {
+                        if (_diagSync) _ = gate.GetElementsAsFloat(1);
+                        Ops.GELUMul(gate, gate, perLayerInput);
+                    }
+                }
+
                 if (gate != null)
                 {
                     if (_diagSync) _ = gate.GetElementsAsFloat(1);
-                    Ops.GELUMul(gate, gate, perLayerInput);
-                    if (_diagSync) _ = gate.GetElementsAsFloat(1);
                     using var pleProj = LinearForward(gate, $"{prefix}.proj.weight");
+                    gate.Dispose();
                     if (pleProj != null)
                     {
                         string postPleNormKey = $"{prefix}.post_norm.weight";
@@ -1975,6 +2568,7 @@ namespace TensorSharp.Models
                     }
                 }
             }
+            if (prof) ProfMark(ref _profPleInjectTicks, pPleInject, result);
 
             float scalar = _layerScalars[layer];
             if (scalar != 1f)
@@ -3008,6 +3602,7 @@ namespace TensorSharp.Models
         private Tensor Attention(Tensor input, int layer, string prefix, int seqLen, int startPos, bool isShared, HashSet<int> exceptPositions = null)
         {
             long t0 = Stopwatch.GetTimestamp();
+            _attnFusedDecodePreprocessApplied = false;
             bool isLocal = IsLocalLayer(layer);
             int hd = HeadDimForLayer(layer);
             int kvHeads = KVHeadsForLayer(layer);
@@ -3053,31 +3648,55 @@ namespace TensorSharp.Models
             {
                 Tensor qkv = LinearForward(input, qkvName);
                 int vDim = (int)qkv.Sizes[1] - qDim - kDim;
-                if (seqLen == 1)
-                {
-                    q = qkv.Narrow(1, 0, qDim);
-                    k = qkv.Narrow(1, qDim, kDim);
-                    v = qkv.Narrow(1, qDim + kDim, vDim);
-                }
-                else
-                {
-                    q = SliceColumnsContiguous(qkv, 0, qDim);
-                    k = SliceColumnsContiguous(qkv, qDim, kDim);
-                    v = SliceColumnsContiguous(qkv, qDim + kDim, vDim);
-                }
-                qkv.Dispose();
 
-                if (seqLen == 1)
+                // Fused QKV preprocess kernel (TryFusedDecodeQkvPreprocess
+                // → TryGemma4QkvPreprocessDecode). Phase 6f rewrote it with
+                // simdgroup reductions but still perf-neutral / slightly
+                // negative on Gemma 4 E4B — the kernel runs only
+                // (NumHeads + 2*NumKVHeads) = 12 threadgroups, under-
+                // saturating the GPU vs the per-op path's ~22 threadgroups
+                // across 5 separate launches. Kept gated off as opt-in for
+                // models with more heads. Set TS_MLX_FUSED_QKV_PREP=1 to
+                // engage.
+                bool fusedDone = false;
+                if (seqLen == 1
+                    && _backend == BackendType.Mlx
+                    && vDim == kDim
+                    && string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_QKV_PREP"), "1", StringComparison.Ordinal)
+                    && TryFusedDecodeQkvPreprocess(qkv, prefix, isLocal, hd, kvHeads, qDim, startPos, out q, out k, out v))
                 {
-                    RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
-                    RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                    qkv.Dispose();
+                    fusedDone = true;
                 }
                 else
                 {
-                    q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
-                    k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+                    if (seqLen == 1)
+                    {
+                        q = qkv.Narrow(1, 0, qDim);
+                        k = qkv.Narrow(1, qDim, kDim);
+                        v = qkv.Narrow(1, qDim + kDim, vDim);
+                    }
+                    else
+                    {
+                        q = SliceColumnsContiguous(qkv, 0, qDim);
+                        k = SliceColumnsContiguous(qkv, qDim, kDim);
+                        v = SliceColumnsContiguous(qkv, qDim + kDim, vDim);
+                    }
+                    qkv.Dispose();
+
+                    if (seqLen == 1)
+                    {
+                        RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
+                        RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                    }
+                    else
+                    {
+                        q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
+                        k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+                    }
+                    ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
                 }
-                ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
+                _attnFusedDecodePreprocessApplied = fusedDone;
             }
             else
             {
@@ -3111,8 +3730,10 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Apply NeoX-style RoPE (skipped for global fast path - already applied)
-            if (!_useGlobalFastPath)
+            // Apply NeoX-style RoPE (skipped for global fast path - already
+            // applied; also skipped for fused MLX decode preprocess, which
+            // bakes RoPE into the same kernel as the Q/K/V norms).
+            if (!_useGlobalFastPath && !_attnFusedDecodePreprocessApplied)
             {
                 float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
                 if (seqLen == 1)
@@ -3145,8 +3766,17 @@ namespace TensorSharp.Models
                     int cachePos = isLocal ? (startPos % _kvCacheSize[layer]) : startPos;
                     CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
                         kvHeads, hd, cachePos);
+                    // Periodically materialize the KV cache to break the
+                    // unbounded slice_update chain that MLX's lazy graph
+                    // builds up one node per decode step. Without this,
+                    // each subsequent attention read has to walk the chain
+                    // back to the original tensor — fine for the first few
+                    // hundred tokens, catastrophic after ~500 (chain depth
+                    // grows linearly in decode step count). Originally this
+                    // fired only for SWA (local) layers because they were
+                    // the chronic-slowdown case; global layers also chain
+                    // and need the same treatment for long generations.
                     if (_backend == BackendType.Mlx
-                        && isLocal
                         && MlxLocalKvMaterializeInterval > 0
                         && ((startPos + 1 + layer) % MlxLocalKvMaterializeInterval) == 0)
                     {
@@ -3734,6 +4364,102 @@ namespace TensorSharp.Models
             Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
                 ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             return data;
+        }
+
+        /// <summary>
+        /// Decode-step fast path: a single mlx_compile closure does the
+        /// dense FFN block (pre-norm + gate_up matmul + GeluMulSplit + down
+        /// matmul + post-norm + residual add) in one
+        /// <c>mlx_closure_apply</c>. Returns false (and the caller falls
+        /// back to the per-op path) when the layer's quant types / shape
+        /// aren't covered. Requires the Q8_0 gate_up/down weight pair the
+        /// dense Gemma 4 decode path uses.
+        /// </summary>
+        private bool TryFusedDenseFFNDecode(Tensor residual, string prefix, string postFfnNormKey)
+        {
+            if (!_quantWeights.TryGetValue($"{prefix}.ffn_gate_up.weight", out var gateUpQw)) return false;
+            if (!_quantWeights.TryGetValue($"{prefix}.ffn_down.weight", out var downQw)) return false;
+            if (!_weights.TryGetValue($"{prefix}.ffn_norm.weight", out var preNormW)) return false;
+            if (!_weights.TryGetValue(postFfnNormKey, out var postNormW)) return false;
+
+            int halfDim = (int)(gateUpQw.Ne1 / 2);
+            return MlxQuantizedOps.TryFusedGemma4DenseFFNDecode(
+                residual,
+                residual,
+                preNormW, Config.Eps,
+                gateUpQw.EnsureDeviceCacheKey(), gateUpQw.Data, gateUpQw.GgmlType, gateUpQw.Ne0, gateUpQw.Ne1, gateUpQw.RawBytes,
+                downQw.EnsureDeviceCacheKey(), downQw.Data, downQw.GgmlType, downQw.Ne0, downQw.Ne1, downQw.RawBytes,
+                postNormW,
+                halfDim);
+        }
+
+        /// <summary>
+        /// Decode-step fast path: one Metal kernel does Q/K/V split +
+        /// RMSNorm + Q/K NeoX RoPE. On success returns
+        /// <c>q</c> [1, NumHeads*headDim] flat,
+        /// <c>k</c> [kvHeads, 1, headDim] head-first (cache-write ready),
+        /// <c>v</c> [kvHeads, 1, headDim] head-first.
+        /// Returns false when the kernel declines (e.g. unsupported headDim,
+        /// missing norm weights) — the caller falls back to the per-op path.
+        /// </summary>
+        private bool TryFusedDecodeQkvPreprocess(
+            Tensor qkv, string prefix, bool isLocal,
+            int headDim, int kvHeads, int qDim, int startPos,
+            out Tensor q, out Tensor k, out Tensor v)
+        {
+            q = null; k = null; v = null;
+
+            // Norm weights must exist and be on the device.
+            if (!_weights.TryGetValue($"{prefix}.attn_q_norm.weight", out var qNormW)) return false;
+            if (!_weights.TryGetValue($"{prefix}.attn_k_norm.weight", out var kNormW)) return false;
+
+            float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
+            int rotHalf = freqs.Length;
+            if (rotHalf <= 0 || rotHalf * 2 > headDim) return false;
+
+            // Build cos/sin tables for the scalar decode position.
+            int tableSize = rotHalf;
+            if (_neoXRopeCos == null || _neoXRopeCos.Length != tableSize)
+            {
+                _neoXRopeCos = new float[tableSize];
+                _neoXRopeSin = new float[tableSize];
+            }
+            bool rebuiltTables = false;
+            if (_neoXRopeCacheSeqLen != 1 || _neoXRopeCacheStartPos != startPos || _neoXRopeCacheFreqs != freqs)
+            {
+                for (int j = 0; j < rotHalf; j++)
+                {
+                    float angle = startPos * freqs[j];
+                    _neoXRopeCos[j] = MathF.Cos(angle);
+                    _neoXRopeSin[j] = MathF.Sin(angle);
+                }
+                _neoXRopeCacheSeqLen = 1;
+                _neoXRopeCacheStartPos = startPos;
+                _neoXRopeCacheFreqs = freqs;
+                rebuiltTables = true;
+            }
+            if (!EnsureNeoXRopeDeviceTables(1, startPos, freqs, rebuiltTables)) return false;
+
+            var qResult = new Tensor(_allocator, DType.Float32, 1, qDim);
+            var kResult = new Tensor(_allocator, DType.Float32, kvHeads, 1, headDim);
+            var vResult = new Tensor(_allocator, DType.Float32, kvHeads, 1, headDim);
+
+            if (!MlxFusedOps.TryGemma4QkvPreprocessDecode(
+                    qResult, kResult, vResult,
+                    qkv, qNormW, kNormW,
+                    _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    Config.NumHeads, kvHeads, headDim, rotHalf, Config.Eps))
+            {
+                qResult.Dispose();
+                kResult.Dispose();
+                vResult.Dispose();
+                return false;
+            }
+
+            q = qResult;
+            k = kResult;
+            v = vResult;
+            return true;
         }
 
         private unsafe void ApplyNeoXRoPEDecode(Tensor data, int numHeads, int headDim, int position, float[] freqs)

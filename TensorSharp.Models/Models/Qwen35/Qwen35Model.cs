@@ -126,21 +126,6 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_EVAL_DECODE_LAYER_BOUNDARIES"), "1", StringComparison.Ordinal);
         private static readonly bool MlxEvalFinalLogits =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_EVAL_FINAL_LOGITS"), "1", StringComparison.Ordinal);
-        private static readonly bool MlxBaselineSyncLayerEval =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BASELINE_ASYNC_LAYER"), "1", StringComparison.Ordinal);
-        // Set to "1" to use the legacy per-expert allocation path (one
-        // host→device upload + one gather + one batchInput tensor per
-        // active expert per layer). Default = use the batched-per-layer
-        // path which amortises those allocations across all experts.
-        private static readonly bool MlxBaselineMoePrefill =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BASELINE_MOE_PREFILL"), "1", StringComparison.Ordinal);
-        // Set to "1" to revert to the legacy decode path that syncs/copies
-        // each expert's down output back to host and accumulates via
-        // VecScaleAdd on CPU. The default keeps the per-expert accumulation
-        // on device and syncs once per MoE layer.
-        private static readonly bool MlxBaselineMoeDecode =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BASELINE_MOE_DECODE"), "1", StringComparison.Ordinal);
-
         // Pipelined greedy decode state. _pipelineNextInputDevice holds the
         // input embedding for the NEXT decode step, computed on-device from
         // the previous step's argmax. When set, SubmitNextGreedyDecodeStep
@@ -168,53 +153,47 @@ namespace TensorSharp.Models
         // Cache keys for the per-layer stacked weight uploads. Use the
         // StackedExpertWeights.Data pointer as the unique identifier.
         //
-        // Opt-in: set TS_MLX_BATCHED_MOE_DECODE=1 to enable. The batched
-        // path issues 1 Metal dispatch per (gate/up/down) instead of K
-        // per-expert dispatches, but in practice MLX's lazy graph already
-        // batches Metal commands efficiently — measured 4-round mean
-        // difference is within run-to-run noise. The implementation is
-        // kept for the (rare) case where the per-dispatch encoder cost
-        // becomes the dominant per-token cost, and as the foundation for
-        // future expert-batching paths (e.g. true `gather_qmm` once an
-        // IQ2_XXS gather variant exists).
-        // Additionally, the batched path uploads the full stacked expert
-        // weights as a SEPARATE MLX array per (layer, kind), roughly
-        // doubling the MLX-tracked weight memory (per-expert arrays are
-        // still kept for the prefill / non-batched code paths). On
-        // memory-constrained machines this can put pressure on the MLX
-        // allocator.
+        // Batched MoE decode: issue 1 Metal dispatch per (gate/up/down)
+        // instead of K per-expert dispatches. Default on; set
+        // TS_MLX_BATCHED_MOE_DECODE=0 to revert to the legacy per-expert
+        // sequence. Uploads the full stacked expert weights as a SEPARATE
+        // MLX array per (layer, kind), roughly doubling MLX-tracked
+        // weight memory (per-expert arrays are still retained for the
+        // prefill path); only set =0 on memory-constrained machines.
         private static readonly bool MlxBatchedMoeDecode =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BATCHED_MOE_DECODE"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_BATCHED_MOE_DECODE"), "0", StringComparison.Ordinal);
 
         // Fused (gate matmul + up matmul + SiLUMul) Metal kernel for the
-        // batched MoE decode path. On by default when the batched MoE
-        // decode is enabled; set TS_MLX_MOE_FUSED_GATE_UP_SILU=0 to fall
-        // back to the legacy 3-dispatch sequence for A/B comparison.
-        // Saves ~2 MLX dispatches per MoE layer per decode token plus the
-        // [K, intermediate] gate/up materialization round-trip.
+        // batched MoE decode path. On by default; set
+        // TS_MLX_MOE_FUSED_GATE_UP_SILU=0 to fall back to the legacy
+        // 3-dispatch sequence for A/B comparison. Saves ~2 MLX dispatches
+        // per MoE layer per decode token plus the [K, intermediate]
+        // gate/up materialization round-trip.
         private static readonly bool MlxMoeFusedGateUpSiluDisabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_MOE_FUSED_GATE_UP_SILU"), "0", StringComparison.Ordinal);
 
-        // TS_MLX_DEVICE_ROUTER=1 (opt-in): compute MoE router top-K +
-        // softmax on the device, skipping the per-MoE-layer host sync on
-        // routerLogits. Eliminates ~60 GetFloatPtr round trips per decode
-        // token (Qwen3.6-35B-A3B has 60 MoE layers).
-        // Requires:
-        //   - greedy router (normTopKProb=true)
-        //   - the batched MoE matmul path is in use
-        //     (TS_MLX_BATCHED_MOE_DECODE=1)
-        //   - no shared-expert gate (the gate scalar is computed from
-        //     host-side VecDot today; switching to device would need
-        //     a few more device ops)
+        // Device-router for MoE decode: compute top-K + softmax on the
+        // device, skipping the per-MoE-layer host sync on routerLogits.
+        // Eliminates ~60 GetFloatPtr round trips per decode token on
+        // Qwen3.6-35B-A3B (60 MoE layers). On by default; set
+        // TS_MLX_DEVICE_ROUTER=0 to disable. Falls back to host routing
+        // automatically when prerequisites are missing (non-greedy
+        // router, no batched MoE decode, or a shared-expert gate
+        // requiring a host-side VecDot).
         private static readonly bool MlxDeviceRouter =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DEVICE_ROUTER"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DEVICE_ROUTER"), "0", StringComparison.Ordinal);
 
         private static int ResolveFusedAttnLayerMinSeqLen()
         {
             string env = Environment.GetEnvironmentVariable("FUSED_ATTN_LAYER_MIN_SEQ_LEN");
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            return 4096;
+            // The fused per-layer attention decode kernel folds 6 small
+            // CPU-side ops into a single Metal graph dispatch. omlx/vllm
+            // both use the equivalent (mx.fast.scaled_dot_product_attention)
+            // unconditionally — the per-call setup cost is amortised even
+            // at small KV lengths once the rest of the model is on-device.
+            return 1;
         }
 
         private static int ResolveMlxFlashAttnDecodeMinSeqLen()
@@ -222,7 +201,10 @@ namespace TensorSharp.Models
             string env = Environment.GetEnvironmentVariable("TS_MLX_FLASH_ATTN_DECODE_MIN_SEQ_LEN");
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            return 2048;
+            // Always prefer the Metal flash-attention kernel for MLX
+            // decode — see omlx/mlx-lm which dispatches
+            // mx.fast.scaled_dot_product_attention for every step.
+            return 1;
         }
 
         private static int ResolveMlxEvalEveryNLayers()
@@ -689,9 +671,10 @@ namespace TensorSharp.Models
                 }
 
                 // Look up the original 3D stacked-along-experts views populated
-                // by ModelBase.LoadWeights. Used by the fused MoE prefill kernel
-                // (TryMoEPrefillFused) to dispatch the entire layer in O(1) GGML
-                // graph submissions instead of O(num_active_experts).
+                // by ModelBase.LoadWeights. Used by the batched MoE decode path
+                // (MlxBatchedMoeDecode) to upload all experts as one MLX array
+                // per (layer, kind) and dispatch a single matmul instead of K
+                // per-expert matmuls.
                 _stackedExpertWeights.TryGetValue(p + "ffn_gate_exps.weight", out _layerStackedGate[l]);
                 _stackedExpertWeights.TryGetValue(p + "ffn_up_exps.weight", out _layerStackedUp[l]);
                 _stackedExpertWeights.TryGetValue(p + "ffn_down_exps.weight", out _layerStackedDown[l]);
@@ -1620,7 +1603,7 @@ namespace TensorSharp.Models
             // of forward will drain the graph (or the sampler's host read does).
             // Last layer keeps a sync eval as a safety net.
             bool isLastLayer = (layer + 1) == Config.NumLayers;
-            bool evaluated = (MlxBaselineSyncLayerEval || isLastLayer)
+            bool evaluated = isLastLayer
                 ? MlxFusedOps.TryEvaluate(hidden)
                 : MlxFusedOps.TryAsyncEvaluate(hidden);
             if (evaluated)
@@ -1675,24 +1658,6 @@ namespace TensorSharp.Models
                 fusedDecodeApplied = true;
             }
 
-            // Prefill fused-layer fast path. Currently disabled because the
-            // fused kernel writes K/V to a Metal buffer that doesn't propagate
-            // back to host memory on Apple Silicon — GGML's metal device
-            // backend leaves props.integrated uninitialised, causing the
-            // unified-memory device to be mis-classified as discrete and the
-            // cacheable buffer path to take DeviceCopy mode. The legacy
-            // FullAttention + FusedPrefillAttention path (used below) is
-            // already competitive with llama.cpp on Qwen3.6 prefill (~100 t/s
-            // warm vs ~600 t/s for llama.cpp) and produces output that is
-            // bit-identical to the reference path. Re-enabling the fused
-            // prefill kernel requires either: (a) windowed-cache approach
-            // similar to GptOssAttentionLayerPrefill, where a small per-call
-            // window tensor is uploaded/downloaded explicitly per head; or
-            // (b) a fix to GGML upstream so Metal's get_props initialises
-            // props.integrated = true on Apple Silicon. Both are tracked as
-            // follow-up work.
-            const bool fusedPrefillApplied = false;
-
             // Fuse:
             //   hidden = hidden + attn_out_proj(attention(rms_norm(hidden)))
             // into the FullAttention call: input norm + QKV is fused inside FullAttention, and
@@ -1701,7 +1666,7 @@ namespace TensorSharp.Models
             // Fused outproj+FFN for attention layers: when the fused attention layer
             // decode is NOT used and the layer is dense FFN (not MoE), fuse the attention
             // output projection + residual + FFN into one GPU dispatch.
-            bool canFuseAttnOutFFN = !fusedDecodeApplied && !fusedPrefillApplied && IsGgmlBackend
+            bool canFuseAttnOutFFN = !fusedDecodeApplied && IsGgmlBackend
                 && !(_isMoeLayer != null && _isMoeLayer[layer])
                 && _attnOutputQW[layer] != null
                 && _postAttnNormW[layer] != null
@@ -1712,7 +1677,7 @@ namespace TensorSharp.Models
             if (canFuseAttnOutFFN)
                 attnOut = FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos,
                     residual: null, skipOutputProj: true);
-            else if (fusedDecodeApplied || fusedPrefillApplied)
+            else if (fusedDecodeApplied)
                 attnOut = null;
             else
                 attnOut = FullAttention(hidden, _attnNormW[layer], layer, seqLen, startPos, residual: hidden);
@@ -3480,74 +3445,6 @@ namespace TensorSharp.Models
             return true;
         }
 
-        /// <summary>
-        /// Fused MoE prefill via the GgmlBasicOps.MoEFFNPrefillSwiGLU kernel.
-        /// Replaces the per-active-expert loop (~num_active_experts * 4
-        /// graph dispatches per layer) with a single graph dispatch that
-        /// performs gate + up + SwiGLU + down + expert weighting + aggregation
-        /// using ggml_mul_mat_id, mirroring llama.cpp's build_moe_ffn.
-        ///
-        /// Returns true on success (output has been written). Returns false
-        /// when the input/output layout isn't supported by the kernel and
-        /// the caller should fall back to the legacy batched-by-expert path.
-        /// </summary>
-        private unsafe bool TryMoEPrefillFused(Tensor input, Tensor output, float* probsPtr, int layer, int seqLen, int hiddenSize)
-        {
-            // Build packed [seqLen, n_used] arrays of routed expert indices and
-            // their normalized weights. The selection / softmax math here is
-            // identical to the existing per-token loop above; we just collect
-            // them into contiguous arrays so the kernel can ggml_backend_tensor_set
-            // them in one shot.
-            int nUsed = _numExpertsUsed;
-            int[] selectedExperts = new int[seqLen * nUsed];
-            float[] routingWeights = new float[seqLen * nUsed];
-            int[] tokTop = new int[nUsed];
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* probsRow = probsPtr + (long)s * _numExperts;
-                SelectTopKInPlace(probsRow, _numExperts, nUsed, tokTop);
-
-                float wSum = 0f;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    selectedExperts[s * nUsed + k] = tokTop[k];
-                    float w = probsRow[tokTop[k]];
-                    routingWeights[s * nUsed + k] = w;
-                    wSum += w;
-                }
-                if (_normTopKProb && wSum > 0f)
-                {
-                    float inv = 1.0f / wSum;
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[s * nUsed + k] *= inv;
-                }
-            }
-
-            var gateW = _layerStackedGate[layer];
-            var upW = _layerStackedUp[layer];
-            var downW = _layerStackedDown[layer];
-
-            try
-            {
-                GgmlBasicOps.MoEFFNPrefillSwiGLU(
-                    input, output,
-                    seqLen, hiddenSize, _expertFfnLength, _numExperts, nUsed,
-                    selectedExperts, routingWeights,
-                    gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, gateW.TotalRawBytes,
-                    upW.Data,   upW.GgmlType,   upW.PerExpertNe0,   upW.PerExpertNe1,   upW.TotalRawBytes,
-                    downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
-                    gateBias: null, upBias: null, downBias: null,
-                    useSwiGLUOAI: false);
-                InvalidateTensorDeviceCache(output);
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                return false;
-            }
-        }
-
         private unsafe bool TryMoEPrefillBatchedMlx(
             Tensor input,
             Tensor output,
@@ -3616,22 +3513,14 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Batch per-layer state. The previous implementation allocated +
-            // uploaded a new rowIndices/routeWeights int/float tensor and
-            // gathered a new batchInput device tensor PER active expert.
-            // With 128 experts × ~8 active per token × 60 layers that's
-            // tens of thousands of small host→device round trips per
-            // prefill. Here we upload routedTokenRows / routedWeights once,
-            // gather all routes into a single [totalRoutes, hidden] tensor,
-            // then narrow-view that buffer per expert. Per-expert work then
-            // reduces to: narrow → matmul (gate/up) → SiLUMul → matmul
-            // (down) → scatter-add with narrow-views of the layer-wide
-            // indices/weights tensors. Each narrow is a free view (shares
-            // storage, just adjusts offset/sizes).
-            if (MlxBaselineMoePrefill)
-                return RunMoEPrefillBatchedMlxLegacy(input, output, sharedDownAll, sharedGateInpVec,
-                    expertOffsets, routedTokenRows, routedWeights, layer, seqLen, hiddenSize);
-
+            // Batched per-layer expert dispatch. Uploads routedTokenRows /
+            // routedWeights once, gathers all routes into a single
+            // [totalRoutes, hidden] tensor, then narrow-views that buffer
+            // per expert. Per-expert work reduces to: narrow → matmul
+            // (gate/up) → SiLUMul → matmul (down) → scatter-add with
+            // narrow-views of the layer-wide indices/weights tensors.
+            // Each narrow is a free view (shares storage, just adjusts
+            // offset/sizes).
             Tensor rowIndicesAll = null;
             Tensor routeWeightsAll = null;
             Tensor batchInputAll = null;
@@ -3711,86 +3600,6 @@ namespace TensorSharp.Models
             }
         }
 
-        // Pre-refactor per-expert path kept for A/B benchmarking. Gated by
-        // TS_MLX_BASELINE_MOE_PREFILL=1. Allocates rowBatch/weightBatch host
-        // arrays + rowIndices/routeWeights device tensors + a fresh
-        // batchInput device tensor + a TryGatherRows call PER active
-        // expert. The new default path amortises all of this across the
-        // layer.
-        private unsafe bool RunMoEPrefillBatchedMlxLegacy(
-            Tensor input,
-            Tensor output,
-            Tensor sharedDownAll,
-            Tensor sharedGateInpVec,
-            int[] expertOffsets,
-            int[] routedTokenRows,
-            float[] routedWeights,
-            int layer,
-            int seqLen,
-            int hiddenSize)
-        {
-            try
-            {
-                for (int e = 0; e < _numExperts; e++)
-                {
-                    int start = expertOffsets[e];
-                    int batchSize = expertOffsets[e + 1] - start;
-                    if (batchSize == 0)
-                        continue;
-
-                    int[] rowBatch = new int[batchSize];
-                    float[] weightBatch = new float[batchSize];
-                    Array.Copy(routedTokenRows, start, rowBatch, 0, batchSize);
-                    Array.Copy(routedWeights, start, weightBatch, 0, batchSize);
-
-                    using var rowIndices = CreateIntTensor(rowBatch, batchSize);
-                    using var routeWeights = CreateFloatTensor(weightBatch, batchSize);
-                    using var batchInput = new Tensor(_allocator, DType.Float32, batchSize, hiddenSize);
-                    if (!MlxFusedOps.TryGatherRows(batchInput, input, rowIndices))
-                        return false;
-
-                    Tensor gate = null;
-                    Tensor up = null;
-                    Tensor down = null;
-                    try
-                    {
-                        gate = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 0);
-                        up = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 1);
-                        if (gate == null || up == null)
-                            return false;
-
-                        Ops.SiLUMul(gate, gate, up);
-
-                        down = ExpertLinearForwardAlloc(gate, layer, e, kind: 2);
-                        if (down == null)
-                            return false;
-
-                        if (!MlxFusedOps.TryScatterAddWeightedRows(output, down, rowIndices, routeWeights))
-                            return false;
-                    }
-                    finally
-                    {
-                        down?.Dispose();
-                        up?.Dispose();
-                        gate?.Dispose();
-                    }
-                }
-
-                if (!TryAddSharedExpertMlx(output, input, sharedDownAll, sharedGateInpVec, seqLen, hiddenSize))
-                    return false;
-
-                return true;
-            }
-            catch (NotSupportedException)
-            {
-                return false;
-            }
-            catch (InvalidOperationException)
-            {
-                return false;
-            }
-        }
-
         private bool TryAddSharedExpertMlx(Tensor output, Tensor input, Tensor sharedDownAll, Tensor sharedGateInpVec, int seqLen, int hiddenSize)
         {
             if (sharedDownAll == null)
@@ -3846,7 +3655,6 @@ namespace TensorSharp.Models
                 && seqLen == 1
                 && routeRowsAreLogits
                 && MlxBatchedMoeDecode
-                && !MlxBaselineMoeDecode
                 && !hasSharedGate
                 && _layerStackedGate != null && _layerStackedGate[layer] != null
                 && _moeGateBuf != null)
@@ -3875,15 +3683,12 @@ namespace TensorSharp.Models
 
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenSize);
             float* outputPtr = null;
-            // MLX decode (seqLen == 1) used to zero output on host then
-            // accumulate expert results via per-expert GetFloatPtr+VecScaleAdd —
-            // each call forced an eval+sync of the entire pending graph
-            // (~8 syncs/layer × 60 MoE layers = ~480 round trips per token).
-            // The on-device path keeps everything queued and syncs once at
-            // the layer boundary instead. Gated for A/B benchmarking.
+            // MLX decode (seqLen == 1) keeps expert accumulation on-device
+            // (one Ops.Fill then per-expert weighted-add via
+            // TryAddScaledInPlace) and syncs once at the layer boundary
+            // instead of forcing a host round-trip per expert.
             bool mlxDecodeOnDevice = _backend == BackendType.Mlx
-                && seqLen == 1
-                && !MlxBaselineMoeDecode;
+                && seqLen == 1;
             if (_backend == BackendType.Mlx && (seqLen > 1 || mlxDecodeOnDevice))
             {
                 Ops.Fill(output, 0f);
@@ -3963,55 +3768,6 @@ namespace TensorSharp.Models
                 && _moeTokenInput.Sizes[1] == hiddenSize)
             {
                 prefillRowBuf = _moeTokenInput;
-            }
-
-            // Prefill fused MoE path (one ggml_cgraph per MoE layer). Collapses
-            // the per-active-expert loop into 3 ggml_mul_mat_id dispatches +
-            // SwiGLU + a small aggregation chain. Mirrors llama.cpp's
-            // build_moe_ffn. Falls back to the legacy batched-by-expert path
-            // when the layer has no stacked weights (e.g. some non-mmap loaders
-            // or models with mismatched expert layouts).
-            // Fused MoE prefill via ggml_mul_mat_id is currently disabled
-            // because empirically it's 2–3× slower than the legacy batched-by-
-            // expert path on Apple Silicon Metal (measured: pp256 18 t/s fused
-            // vs 47 t/s legacy; pp1024 64 t/s fused vs 96 t/s legacy on Qwen3.6
-            // 35B-A3B / IQ2_XXS) AND it leaves Metal's residency set in a
-            // state that slows the immediately-following decode by ~3×. The
-            // batched-by-expert path below already amortises per-expert
-            // dispatch overhead by grouping tokens by expert, which is
-            // sufficient for the steady-state prefill workloads we ship.
-            // Re-enabling the fused kernel would need: (a) a fix for the post-
-            // call decode regression (likely needs the windowed-cache approach
-            // used in GptOssAttentionLayerPrefill so the per-call backend
-            // buffer doesn't hog Metal residency), and (b) a per-(model,
-            // seqLen) crossover threshold validated against actual workloads.
-            if (false && seqLen > 1 && IsGgmlBackend
-                && _layerStackedGate != null && _layerStackedGate[layer] != null
-                && _layerStackedUp != null && _layerStackedUp[layer] != null
-                && _layerStackedDown != null && _layerStackedDown[layer] != null
-                && _expertFfnLength > 0)
-            {
-                if (TryMoEPrefillFused(input, output, routePtr, layer, seqLen, hiddenSize))
-                {
-                    if (sharedDownAll != null)
-                    {
-                        for (int s = 0; s < seqLen; s++)
-                        {
-                            float gateScalar = 1.0f;
-                            if (sharedGateInpPtr != null)
-                            {
-                                float* tokenRow = inputPtr + (long)s * hiddenSize;
-                                int n = Math.Min(sharedGateInpDim, hiddenSize);
-                                gateScalar = SigmoidScalar(VecDot(tokenRow, sharedGateInpPtr, n));
-                            }
-                            float* sharedPtr = GetFloatPtr(sharedDownAll) + (long)s * hiddenSize;
-                            VecScaleAdd(outputPtr + (long)s * hiddenSize, sharedPtr, gateScalar, hiddenSize);
-                        }
-                    }
-                    sharedDownAll?.Dispose();
-                    routerData.Dispose();
-                    return output;
-                }
             }
 
             // Prefill batched-by-expert path: group tokens by expert assignment

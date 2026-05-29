@@ -14,7 +14,7 @@
 | Modalities | Text, image (Omni-class with `mmproj` loaded). Audio is preprocessed for Omni distributions but inference requires a Parakeet `mmproj` that is not shipped with these GGUFs. |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
-| Batched / paged forward | **Opt-in** — set `TS_NEMOTRON_BATCHED=1`. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
+| Batched / paged forward | **Default ON** — set `TS_NEMOTRON_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
 | Output parser | `Qwen3OutputParser` |
 
 ## 1. Origin and intent
@@ -445,11 +445,13 @@ near-peak vector throughput.
 
 ## 11. Batched / paged forward (continuous batching)
 
-Nemotron-H ships an opt-in `IBatchedPagedModel.ForwardBatch`
+Nemotron-H implements `IBatchedPagedModel.ForwardBatch`
 ([`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs))
 that runs through the shared `InferenceEngine` continuous-batching stack
-([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
-Enable it by setting `TS_NEMOTRON_BATCHED=1` (default OFF).
+([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md))
+by default — concurrent requests can only be served truly in parallel
+through the batched path. Set `TS_NEMOTRON_BATCHED=0` to force the
+legacy per-sequence KV-swap fallback for A/B comparison.
 
 Nemotron-H is the most demanding of the batched ports because it
 combines **three different layer types** — Mamba2 SSM, attention-only,
@@ -501,7 +503,8 @@ dispatch plus batched `ssm_in` / `ssm_out` projections. Exposed through
 Vision and audio embeddings inject directly into the batched
 `[numTokens, hidden]` tensor via the same row-wise
 `InjectMultimodalEmbeddings` path the legacy forward uses.
-`SupportsBatchedMultimodal` returns true when the opt-in env var is set.
+`SupportsBatchedMultimodal` returns true while the batched path is
+active (i.e. unless `TS_NEMOTRON_BATCHED=0` is set).
 
 ### Verified correctness and throughput
 

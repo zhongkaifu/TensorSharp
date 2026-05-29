@@ -493,6 +493,14 @@ namespace TensorSharp.MLX
                 return false;
 
             DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            return MlxWorker.Shared.Invoke(() => RunAddmmQuantizedToFloat32(
+                result, input, weight, ggmlType, ne0, ne1, resultStorage, inputStorage, rows));
+        }
+
+        private static bool RunAddmmQuantizedToFloat32(
+            Tensor result, Tensor input, DeviceWeight weight, int ggmlType,
+            long ne0, long ne1, MlxStorage resultStorage, MlxStorage inputStorage, int rows)
+        {
             MlxNative.MlxArray inputView = default;
             MlxNative.MlxArray output = default;
             MlxNative.MlxArray contiguous = default;
@@ -560,6 +568,35 @@ namespace TensorSharp.MLX
                 }
                 else
                 {
+                    // Phase 6c fast path: Q8_0 decode (rows == 1) gets a
+                    // custom simdgroup-optimized kernel that's competitive
+                    // with — sometimes faster than — mlx_quantized_matmul.
+                    // Useful for the LM head, attention output projection,
+                    // PLE matmuls, and any other Q8 matmul that doesn't
+                    // already have a fused norm or add wrapper.
+                    if (rows == 1
+                        && ggmlType == (int)GgmlTensorType.Q8_0
+                        && (int)ne0 % 32 == 0
+                        && weight.Biases.IsValid
+                        && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_Q8_MATMUL"), "0", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            output = MlxNative.Q8Matmul(
+                                inputView, weight.Weight, weight.Scales, weight.Biases,
+                                (int)ne0, (int)ne1, (int)ne0 / 32);
+                            SetDeviceResult(result, output);
+                            output = default;
+                            return true;
+                        }
+                        catch
+                        {
+                            MlxNative.FreeArray(output);
+                            output = default;
+                            // Fall through to MLX's built-in path.
+                        }
+                    }
+
                     output = MlxNative.QuantizedMatmul(
                         inputView,
                         weight.Weight,
@@ -569,9 +606,25 @@ namespace TensorSharp.MLX
                         weight.GroupSize,
                         weight.Bits,
                         weight.Mode);
-                    contiguous = MlxNative.Contiguous(output);
-                    SetDeviceResult(result, contiguous);
-                    contiguous = default;
+                    // mlx_quantized_matmul returns a row-major contiguous
+                    // [rows, outDim] array for the standard 2D matmul case
+                    // used by Forward/Decode. Skip the explicit
+                    // mlx_contiguous call (saves ~84 ops/token on Gemma 4
+                    // decode at ~5 quantized matmuls per layer × 42 layers).
+                    // TS_MLX_QUANT_MATMUL_CONTIG=1 re-enables the defensive
+                    // copy for backends/shapes where the output may be
+                    // strided.
+                    if (string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QUANT_MATMUL_CONTIG"), "1", StringComparison.Ordinal))
+                    {
+                        contiguous = MlxNative.Contiguous(output);
+                        SetDeviceResult(result, contiguous);
+                        contiguous = default;
+                    }
+                    else
+                    {
+                        SetDeviceResult(result, output);
+                        output = default;
+                    }
                 }
                 return true;
             }
@@ -608,38 +661,79 @@ namespace TensorSharp.MLX
             }
 
             DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
-            MlxNative.MlxArray inputView = default;
-            MlxNative.MlxArray normView = default;
-            MlxNative.MlxArray normed = default;
-            MlxNative.MlxArray output = default;
-            MlxNative.MlxArray contiguous = default;
-            try
+            // Batch the whole norm+matmul sub-graph in a single worker call.
+            // Without this wrapper each of the ~5 MLX calls below pays a
+            // ~25 µs queue round-trip; for Qwen3.5 decode (64 layers × this
+            // path twice on hybrid attn+GDN models) that's ~16 ms / token
+            // of pure C#-↔-worker synchronization overhead. With the wrapper
+            // the sub-calls run inline (IsOnWorkerThread short-circuits the
+            // queue), collapsing to a single hand-off.
+            return MlxWorker.Shared.Invoke(() =>
             {
-                inputView = inputStorage.CreateArrayView(input);
-                normView = normStorage.CreateArrayView(normWeight);
-                normed = MlxNative.FastRmsNorm(inputView, normView, eps);
-                output = RunMatmul(normed, weight, ggmlType, rows, (int)ne0, (int)ne1);
-                if (MatmulOutputNeedsContiguous(weight, ggmlType))
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray normView = default;
+                MlxNative.MlxArray normed = default;
+                MlxNative.MlxArray output = default;
+                MlxNative.MlxArray contiguous = default;
+                MlxNative.MlxArray fused = default;
+                try
                 {
-                    contiguous = MlxNative.Contiguous(output);
-                    SetDeviceResult(result, contiguous);
-                    contiguous = default;
+                    inputView = inputStorage.CreateArrayView(input);
+                    normView = normStorage.CreateArrayView(normWeight);
+
+                    // Phase 6 fast path: Q8_0 path (Gemma 4 / Q8_0 GGUFs)
+                    // gets a single custom Metal kernel that does
+                    // RMSNorm(input) + matmul together using simdgroup
+                    // intrinsics. Saves one Metal dispatch per layer ×
+                    // ~84 norm+matmul calls / token (QKV proj + gate_up).
+                    if (rows == 1
+                        && ggmlType == (int)GgmlTensorType.Q8_0
+                        && (int)ne0 % 32 == 0
+                        && weight.Biases.IsValid
+                        && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_Q8_RMSNORM_MATMUL"), "0", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            fused = MlxNative.Q8RmsNormMatmul(
+                                inputView, normView, weight.Weight, weight.Scales, weight.Biases,
+                                eps, (int)ne0, (int)ne1, (int)ne0 / 32);
+                            SetDeviceResult(result, fused);
+                            fused = default;
+                            return true;
+                        }
+                        catch
+                        {
+                            MlxNative.FreeArray(fused);
+                            fused = default;
+                            // Fall through to legacy path.
+                        }
+                    }
+
+                    normed = MlxNative.FastRmsNorm(inputView, normView, eps);
+                    output = RunMatmul(normed, weight, ggmlType, rows, (int)ne0, (int)ne1);
+                    if (MatmulOutputNeedsContiguous(weight, ggmlType))
+                    {
+                        contiguous = MlxNative.Contiguous(output);
+                        SetDeviceResult(result, contiguous);
+                        contiguous = default;
+                    }
+                    else
+                    {
+                        SetDeviceResult(result, output);
+                        output = default;
+                    }
+                    return true;
                 }
-                else
+                finally
                 {
-                    SetDeviceResult(result, output);
-                    output = default;
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(normView);
+                    MlxNative.FreeArray(normed);
+                    MlxNative.FreeArray(output);
+                    MlxNative.FreeArray(contiguous);
+                    MlxNative.FreeArray(fused);
                 }
-                return true;
-            }
-            finally
-            {
-                MlxNative.FreeArray(inputView);
-                MlxNative.FreeArray(normView);
-                MlxNative.FreeArray(normed);
-                MlxNative.FreeArray(output);
-                MlxNative.FreeArray(contiguous);
-            }
+            });
         }
 
         public static bool TryAddmmQuantizedAddToFloat32(
@@ -658,27 +752,355 @@ namespace TensorSharp.MLX
                 return false;
 
             DeviceWeight weight = EnsureWeight(residualStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
-            MlxNative.MlxArray inputView = default;
-            MlxNative.MlxArray residualView = default;
-            MlxNative.MlxArray matmul = default;
-            MlxNative.MlxArray added = default;
-            try
+            // Batch matmul + residual add in a single worker call so the
+            // ~5 internal MLX calls collapse to one queue round-trip.
+            return MlxWorker.Shared.Invoke(() =>
             {
-                inputView = inputStorage.CreateArrayView(input);
-                residualView = residualStorage.CreateArrayView(residual);
-                matmul = RunMatmul(inputView, weight, ggmlType, rows, (int)ne0, (int)ne1);
-                added = MlxNative.Binary(MlxNative.MlxBinaryOp.Add, residualView, matmul);
-                SetDeviceResult(residual, added);
-                added = default;
-                return true;
-            }
-            finally
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray residualView = default;
+                MlxNative.MlxArray matmul = default;
+                MlxNative.MlxArray added = default;
+                MlxNative.MlxArray fused = default;
+                try
+                {
+                    inputView = inputStorage.CreateArrayView(input);
+                    residualView = residualStorage.CreateArrayView(residual);
+
+                    // Phase 6 fast path: Q8_0 (the Gemma 4 / Q8_0 GGUF
+                    // path) gets a single custom Metal kernel that does
+                    // matmul + residual add together. Saves one Metal
+                    // dispatch per layer × 42 layers / token. Falls back
+                    // to the legacy 2-op path on any unsupported shape.
+                    if (rows == 1
+                        && ggmlType == (int)GgmlTensorType.Q8_0
+                        && (int)ne0 % 32 == 0
+                        && weight.Biases.IsValid
+                        && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_Q8_ADDMM_ADD"), "0", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            fused = MlxNative.Q8AddmmAdd(
+                                inputView, weight.Weight, weight.Scales, weight.Biases,
+                                residualView, (int)ne0, (int)ne1, (int)ne0 / 32);
+                            SetDeviceResult(residual, fused);
+                            fused = default;
+                            return true;
+                        }
+                        catch
+                        {
+                            MlxNative.FreeArray(fused);
+                            fused = default;
+                            // Fall through to legacy path.
+                        }
+                    }
+
+                    matmul = RunMatmul(inputView, weight, ggmlType, rows, (int)ne0, (int)ne1);
+                    added = MlxNative.Binary(MlxNative.MlxBinaryOp.Add, residualView, matmul);
+                    SetDeviceResult(residual, added);
+                    added = default;
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(residualView);
+                    MlxNative.FreeArray(matmul);
+                    MlxNative.FreeArray(added);
+                    MlxNative.FreeArray(fused);
+                }
+            });
+        }
+
+        // Lazily-compiled closure for the Gemma 4 dense decode FFN (and any
+        // model that happens to share the same shape: input [1, hidden],
+        // gate_up Q8_0 weight [hidden, 2·intermediate], gelu-mul split,
+        // down Q8_0 weight [intermediate, hidden], residual add). The
+        // closure captures the {eps, mode, groupSize, bits, halfDim} tuple
+        // — see <see cref="FusedFFNCacheKey"/>. A different model with
+        // different intermediate size or quant params would just compile
+        // its own slot. shapeless=true so MLX specializes per shape
+        // internally.
+        private sealed class FusedFFNClosureSlot
+        {
+            public MlxNative.CompiledClosure Closure;
+        }
+        private static readonly Dictionary<FusedFFNCacheKey, FusedFFNClosureSlot> s_FusedFFNClosures = new();
+
+        private readonly struct FusedFFNCacheKey : IEquatable<FusedFFNCacheKey>
+        {
+            public readonly int GgmlType;
+            public readonly int HalfDim;
+            public readonly int GroupSize;
+            public readonly int Bits;
+            public readonly string Mode;
+            public readonly int EpsBits;
+
+            public FusedFFNCacheKey(int ggmlType, int halfDim, int groupSize, int bits, string mode, float eps)
             {
-                MlxNative.FreeArray(inputView);
-                MlxNative.FreeArray(residualView);
-                MlxNative.FreeArray(matmul);
-                MlxNative.FreeArray(added);
+                GgmlType = ggmlType;
+                HalfDim = halfDim;
+                GroupSize = groupSize;
+                Bits = bits;
+                Mode = mode ?? "affine";
+                EpsBits = BitConverter.SingleToInt32Bits(eps);
             }
+
+            public bool Equals(FusedFFNCacheKey other) =>
+                GgmlType == other.GgmlType && HalfDim == other.HalfDim
+                && GroupSize == other.GroupSize && Bits == other.Bits
+                && string.Equals(Mode, other.Mode, StringComparison.Ordinal)
+                && EpsBits == other.EpsBits;
+
+            public override bool Equals(object obj) => obj is FusedFFNCacheKey o && Equals(o);
+            public override int GetHashCode() => HashCode.Combine(GgmlType, HalfDim, GroupSize, Bits, Mode, EpsBits);
+        }
+
+        /// <summary>
+        /// Fused decode-step FFN via <c>mlx_compile</c>. Matches Gemma 4's
+        /// dense MLP block shape:
+        /// <code>
+        ///   normed_pre   = rmsnorm(hidden, ffn_norm_w, eps)
+        ///   gate_up      = normed_pre @ gate_up_w
+        ///   activated    = gelu(gate_up[:, :half]) * gate_up[:, half:]
+        ///   down_out     = activated @ down_w
+        ///   normed_post  = rmsnorm(down_out, post_ffn_norm_w, eps)
+        ///   result       = residual + normed_post
+        /// </code>
+        /// Replaces four separate <c>MlxWorker.Invoke</c> dispatches
+        /// (norm+gate_up matmul + GeluMulSplit + down matmul + post-norm-add)
+        /// with one <c>mlx_closure_apply</c> so MLX pays the per-op
+        /// graph-build cost only once at compile time.
+        ///
+        /// Scoped to Q8_0 weights so the apply-time argument list stays a
+        /// fixed shape (six matmul-component arrays + three norm/IO arrays).
+        /// Returns false for any other quant type so the caller falls back
+        /// to the existing per-op path.
+        /// </summary>
+        public static bool TryFusedGemma4DenseFFNDecode(
+            Tensor residual,
+            Tensor hidden,
+            Tensor preNormWeight, float eps,
+            IntPtr gateUpCacheKey, IntPtr gateUpHostData, int gateUpType, long gateUpNe0, long gateUpNe1, long gateUpBytes,
+            IntPtr downCacheKey, IntPtr downHostData, int downType, long downNe0, long downNe1, long downBytes,
+            Tensor postNormWeight,
+            int halfDim)
+        {
+            if (gateUpType != (int)GgmlTensorType.Q8_0 || downType != (int)GgmlTensorType.Q8_0)
+                return false;
+            if (!CanPreloadQuantizedType(gateUpType) || !CanPreloadQuantizedType(downType))
+                return false;
+            if (halfDim <= 0) return false;
+
+            if (residual == null || hidden == null || preNormWeight == null || postNormWeight == null) return false;
+            if (residual.Storage is not MlxStorage residualStorage) return false;
+            if (hidden.Storage is not MlxStorage hiddenStorage) return false;
+            if (preNormWeight.Storage is not MlxStorage preNormStorage) return false;
+            if (postNormWeight.Storage is not MlxStorage postNormStorage) return false;
+            if (residual.ElementType != DType.Float32 || hidden.ElementType != DType.Float32
+                || preNormWeight.ElementType != DType.Float32 || postNormWeight.ElementType != DType.Float32)
+                return false;
+            if (hidden.DimensionCount != 2 || hidden.Sizes[0] != 1 || hidden.Sizes[1] != gateUpNe0)
+                return false;
+            if (residual.DimensionCount != 2 || residual.Sizes[0] != 1 || residual.Sizes[1] != gateUpNe0)
+                return false;
+            if (preNormWeight.DimensionCount != 1 || preNormWeight.Sizes[0] != gateUpNe0)
+                return false;
+            if (postNormWeight.DimensionCount != 1 || postNormWeight.Sizes[0] != gateUpNe0)
+                return false;
+            if (gateUpNe1 != 2L * halfDim || downNe0 != halfDim || downNe1 != gateUpNe0)
+                return false;
+
+            DeviceWeight gateUpDw = EnsureWeight(residualStorage.DeviceId,
+                gateUpCacheKey, gateUpHostData, gateUpType, gateUpNe0, gateUpNe1, gateUpBytes);
+            DeviceWeight downDw = EnsureWeight(residualStorage.DeviceId,
+                downCacheKey, downHostData, downType, downNe0, downNe1, downBytes);
+
+            var key = new FusedFFNCacheKey(gateUpType, halfDim, gateUpDw.GroupSize, gateUpDw.Bits, gateUpDw.Mode, eps);
+            MlxNative.CompiledClosure closure = EnsureFusedFFNClosure(key);
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray hiddenView = default;
+                MlxNative.MlxArray preNormView = default;
+                MlxNative.MlxArray postNormView = default;
+                MlxNative.MlxArray residualView = default;
+                MlxNative.MlxArray output = default;
+                MlxNative.MlxArray[] outputs = null;
+                try
+                {
+                    hiddenView = hiddenStorage.CreateArrayView(hidden);
+                    preNormView = preNormStorage.CreateArrayView(preNormWeight);
+                    postNormView = postNormStorage.CreateArrayView(postNormWeight);
+                    residualView = residualStorage.CreateArrayView(residual);
+
+                    outputs = MlxNative.ApplyClosure(closure, new[]
+                    {
+                        hiddenView,
+                        preNormView,
+                        gateUpDw.Weight,
+                        gateUpDw.Scales,
+                        gateUpDw.Biases,
+                        downDw.Weight,
+                        downDw.Scales,
+                        downDw.Biases,
+                        postNormView,
+                        residualView,
+                    });
+
+                    if (outputs == null || outputs.Length == 0) return false;
+                    output = outputs[0];
+                    outputs[0] = default;
+                    SetDeviceResult(residual, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(hiddenView);
+                    MlxNative.FreeArray(preNormView);
+                    MlxNative.FreeArray(postNormView);
+                    MlxNative.FreeArray(residualView);
+                    MlxNative.FreeArray(output);
+                    if (outputs != null)
+                    {
+                        for (int i = 0; i < outputs.Length; i++)
+                            MlxNative.FreeArray(outputs[i]);
+                    }
+                }
+            });
+        }
+
+        private static MlxNative.CompiledClosure EnsureFusedFFNClosure(FusedFFNCacheKey key)
+        {
+            lock (s_FusedFFNClosures)
+            {
+                if (s_FusedFFNClosures.TryGetValue(key, out var existing) && existing.Closure != null)
+                    return existing.Closure;
+            }
+
+            // Capture key fields as locals so the closure body uses them as
+            // compile-time constants rather than going through hash lookups.
+            int halfDim = key.HalfDim;
+            int groupSize = key.GroupSize;
+            int bits = key.Bits;
+            string mode = key.Mode;
+            float eps = BitConverter.Int32BitsToSingle(key.EpsBits);
+
+            var closure = MlxNative.NewClosure(inputs =>
+            {
+                // Apply-time arg layout: hidden, pre_norm_w,
+                // gate_up_{weight,scales,biases}, down_{...},
+                // post_norm_w, residual.
+                MlxNative.MlxArray hidden = inputs[0];
+                MlxNative.MlxArray preNormW = inputs[1];
+                MlxNative.MlxArray gateUpW = inputs[2];
+                MlxNative.MlxArray gateUpS = inputs[3];
+                MlxNative.MlxArray gateUpB = inputs[4];
+                MlxNative.MlxArray downW = inputs[5];
+                MlxNative.MlxArray downS = inputs[6];
+                MlxNative.MlxArray downB = inputs[7];
+                MlxNative.MlxArray postNormW = inputs[8];
+                MlxNative.MlxArray residual = inputs[9];
+
+                MlxNative.MlxArray normedPre = default;
+                MlxNative.MlxArray gateUp = default;
+                MlxNative.MlxArray activated = default;
+                MlxNative.MlxArray downOut = default;
+                MlxNative.MlxArray normedPost = default;
+                try
+                {
+                    normedPre = MlxNative.FastRmsNorm(hidden, preNormW, eps);
+                    gateUp = MlxNative.QuantizedMatmul(
+                        normedPre, gateUpW, gateUpS, gateUpB,
+                        transpose: true, groupSize, bits, mode);
+                    activated = MlxNative.GeluMulSplit(gateUp, rows: 1, halfDim: halfDim);
+                    downOut = MlxNative.QuantizedMatmul(
+                        activated, downW, downS, downB,
+                        transpose: true, groupSize, bits, mode);
+                    normedPost = MlxNative.FastRmsNorm(downOut, postNormW, eps);
+                    MlxNative.MlxArray result = MlxNative.Binary(
+                        MlxNative.MlxBinaryOp.Add, residual, normedPost);
+                    return new[] { result };
+                }
+                finally
+                {
+                    MlxNative.FreeArray(normedPre);
+                    MlxNative.FreeArray(gateUp);
+                    MlxNative.FreeArray(activated);
+                    MlxNative.FreeArray(downOut);
+                    MlxNative.FreeArray(normedPost);
+                }
+            }, shapeless: true);
+
+            lock (s_FusedFFNClosures)
+            {
+                if (s_FusedFFNClosures.TryGetValue(key, out var existing) && existing.Closure != null)
+                {
+                    // Someone else compiled the same closure while we were
+                    // tracing. Free ours and use theirs.
+                    MlxNative.FreeCompiledClosure(closure);
+                    return existing.Closure;
+                }
+                s_FusedFFNClosures[key] = new FusedFFNClosureSlot { Closure = closure };
+                return closure;
+            }
+        }
+
+        /// <summary>
+        /// Phase 6h fused decode-step Q8 matmul + GELU-tanh + per-element
+        /// multiply. Used by Gemma 4's PLE inp_gate stage:
+        /// <c>result = gelu(input @ weight) * gate</c>. Replaces a (Q8
+        /// matmul + Ops.GELUMul) pair with one custom Metal dispatch.
+        /// </summary>
+        public static bool TryFusedQ8MatmulGeluMul(
+            Tensor result, Tensor input, Tensor gate,
+            IntPtr cacheKey, IntPtr hostData, int ggmlType,
+            long ne0, long ne1, long rawBytes)
+        {
+            if (ggmlType != (int)GgmlTensorType.Q8_0) return false;
+            if (!CanPreloadQuantizedType(ggmlType)) return false;
+            if (!TryValidateMatmul(result, input, ne0, ne1, out MlxStorage resultStorage, out MlxStorage inputStorage, out int rows))
+                return false;
+            if (rows != 1) return false;
+            if (gate == null || gate.Storage is not MlxStorage gateStorage) return false;
+            if (gate.ElementType != DType.Float32) return false;
+            if (gate.ElementCount() != ne1) return false;
+            if ((int)ne0 % 32 != 0) return false;
+
+            DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            if (!weight.Biases.IsValid) return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray gateView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    inputView = inputStorage.CreateArrayView(input);
+                    gateView = gateStorage.CreateArrayView(gate);
+                    output = MlxNative.Q8MatmulGeluMul(
+                        inputView, weight.Weight, weight.Scales, weight.Biases,
+                        gateView, (int)ne0, (int)ne1, (int)ne0 / 32);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(gateView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         public static bool TryGetRowsQuantizedToFloat32(
@@ -850,13 +1272,19 @@ namespace TensorSharp.MLX
 
         private static bool MatmulOutputNeedsContiguous(DeviceWeight weight, int ggmlType)
         {
-            return ggmlType != (int)GgmlTensorType.IQ4_XS
-                && ggmlType != (int)GgmlTensorType.IQ2_XXS
-                && ggmlType != (int)GgmlTensorType.IQ2_S
-                && ggmlType != (int)GgmlTensorType.IQ3_S
-                && ggmlType != (int)GgmlTensorType.Q6_K
-                && (ggmlType != (int)GgmlTensorType.Q4_K || !string.Equals(weight.Mode, "q4_k", StringComparison.Ordinal))
-                && (ggmlType != (int)GgmlTensorType.Q5_K || !string.Equals(weight.Mode, "q5_k", StringComparison.Ordinal));
+            // mlx_quantized_matmul produces a row-major contiguous output for
+            // the standard 2D matmul case (input is [rows, inDim], weight is
+            // [outDim, inDim] with transpose=true → output [rows, outDim]) —
+            // so the explicit mlx_contiguous call after the matmul is
+            // redundant for ALL types that go through it. The previously-
+            // listed "custom-kernel" types (IQ4_XS, Q4_K with q4_k mode, ...)
+            // were already known to skip it; the generic fallback path now
+            // skips it too unless TS_MLX_QUANT_MATMUL_CONTIG=1 forces the
+            // defensive copy back on (kept for cases where a future MLX
+            // version changes the output layout for some quantization mode).
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_MLX_QUANT_MATMUL_CONTIG"), "1", StringComparison.Ordinal))
+                return true;
+            return false;
         }
 
         private static bool TryValidateGetRows(
@@ -1428,8 +1856,13 @@ namespace TensorSharp.MLX
             MlxNative.MlxArray rawWeight = default;
             try
             {
-                rawWeight = MlxNative.NewArrayFromHost(hostData, new[] { (int)expectedBytes }, DType.UInt8);
-                MlxNative.Eval(rawWeight);
+                // Zero-copy wrap of the GGUF mmap region as an MLX uchar
+                // array. Apple Silicon Metal accepts the host pointer via
+                // MTLBuffer's no-copy path (shared memory mode), so we save
+                // a 14 GB+ malloc+memcpy at model load and avoid carrying a
+                // duplicate of the weights in RAM. Caller must keep the
+                // GGUF mmap alive for the lifetime of the MLX array.
+                rawWeight = MlxNative.NewArrayFromHostNoCopy(hostData, new[] { (int)expectedBytes }, DType.UInt8);
                 var entry = new DeviceWeight
                 {
                     Weight = rawWeight,
@@ -1547,8 +1980,8 @@ namespace TensorSharp.MLX
             MlxNative.MlxArray rawWeight = default;
             try
             {
-                rawWeight = MlxNative.NewArrayFromHost(hostData, new[] { (int)expectedBytes }, DType.UInt8);
-                MlxNative.Eval(rawWeight);
+                // Zero-copy wrap: see CreateRawKWeight for the rationale.
+                rawWeight = MlxNative.NewArrayFromHostNoCopy(hostData, new[] { (int)expectedBytes }, DType.UInt8);
                 var entry = new DeviceWeight
                 {
                     Weight = rawWeight,
@@ -1595,8 +2028,8 @@ namespace TensorSharp.MLX
             MlxNative.MlxArray rawWeight = default;
             try
             {
-                rawWeight = MlxNative.NewArrayFromHost(hostData, new[] { (int)expectedBytes }, DType.UInt8);
-                MlxNative.Eval(rawWeight);
+                // Zero-copy wrap: see CreateRawKWeight for the rationale.
+                rawWeight = MlxNative.NewArrayFromHostNoCopy(hostData, new[] { (int)expectedBytes }, DType.UInt8);
                 var entry = new DeviceWeight
                 {
                     Weight = rawWeight,

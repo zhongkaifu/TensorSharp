@@ -12,6 +12,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace TensorSharp.Runtime
@@ -67,6 +68,8 @@ namespace TensorSharp.Runtime
         private MemoryMappedViewAccessor? _mappedView;
         private unsafe byte* _mappedBase;
         private bool _mappedPointerAcquired;
+        private unsafe byte* _lockedBase;
+        private ulong _lockedLength;
 
         public GgufFile(string path)
         {
@@ -74,6 +77,78 @@ namespace TensorSharp.Runtime
             _stream = File.OpenRead(path);
             Parse();
         }
+
+        /// <summary>
+        /// Pins the GGUF mmap region in physical RAM via mlock(2). This
+        /// prevents the kernel from evicting model-weight pages between
+        /// inference passes (which would otherwise force the next forward
+        /// to page-fault every weight back from SSD/swap). Best-effort:
+        /// silently no-ops on failure (e.g. when the process memlock
+        /// rlimit is too low, or the kernel rejects the wire request).
+        /// Idempotent — safe to call multiple times.
+        /// </summary>
+        public unsafe bool TryLockMappedRegion()
+        {
+            if (_lockedBase != null)
+                return true;
+            EnsureMappedView();
+            if (_mappedBase == null)
+                return false;
+            try
+            {
+                long capacity = _mappedView!.Capacity;
+                if (capacity <= 0)
+                    return false;
+                ulong len = (ulong)capacity;
+
+                // First try a single mlock for the whole region. macOS XNU
+                // sometimes returns EAGAIN when asked to wire many GB at
+                // once even though the global limit allows it — split into
+                // chunks and try again. 256 MB chunks are large enough to
+                // amortise syscall overhead and small enough to avoid the
+                // single-call rejection.
+                int rc = mlock(_mappedBase, (nuint)len);
+                if (rc == 0)
+                {
+                    _lockedBase = _mappedBase;
+                    _lockedLength = len;
+                    return true;
+                }
+                LastLockError = Marshal.GetLastWin32Error();
+
+                const ulong chunk = 256UL * 1024 * 1024;
+                ulong locked = 0;
+                while (locked < len)
+                {
+                    ulong remaining = len - locked;
+                    ulong step = remaining < chunk ? remaining : chunk;
+                    int rcChunk = mlock(_mappedBase + locked, (nuint)step);
+                    if (rcChunk != 0)
+                    {
+                        LastLockError = Marshal.GetLastWin32Error();
+                        if (locked > 0)
+                            _ = munlock(_mappedBase, (nuint)locked);
+                        return false;
+                    }
+                    locked += step;
+                }
+
+                _lockedBase = _mappedBase;
+                _lockedLength = len;
+                LastLockError = 0;
+                return true;
+            }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        public int LastLockError { get; private set; }
+
+        [DllImport("libc", SetLastError = true, EntryPoint = "mlock")]
+        private static extern unsafe int mlock(void* addr, nuint len);
+
+        [DllImport("libc", SetLastError = true, EntryPoint = "munlock")]
+        private static extern unsafe int munlock(void* addr, nuint len);
 
         private void Parse()
         {
@@ -483,6 +558,12 @@ namespace TensorSharp.Runtime
 
         public unsafe void Dispose()
         {
+            if (_lockedBase != null)
+            {
+                try { _ = munlock(_lockedBase, (nuint)_lockedLength); } catch { }
+                _lockedBase = null;
+                _lockedLength = 0;
+            }
             if (_mappedPointerAcquired && _mappedView != null)
             {
                 _mappedView.SafeMemoryMappedViewHandle.ReleasePointer();

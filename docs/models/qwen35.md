@@ -13,7 +13,7 @@
 | Modalities | Text, image |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
-| Batched / paged forward | **Opt-in** — set `TS_QWEN35_BATCHED=1` (auto-enabled by the server's `--continuous-batching` flag). Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
+| Batched / paged forward | **Default ON** — set `TS_QWEN35_BATCHED=0` (or `--no-continuous-batching`) to force the legacy per-sequence KV-swap path for A/B comparison. Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
 | Output parser | `Qwen35OutputParser` (inherits `Qwen3OutputParser`) |
 
 ## 1. Origin and intent
@@ -592,11 +592,14 @@ M-series Macs without any per-token copy.
 
 ## 11. Batched / paged forward (continuous batching)
 
-Qwen 3.5 / 3.6 ships an opt-in `IBatchedPagedModel.ForwardBatch` port
-([`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs)).
-Enable it by setting `TS_QWEN35_BATCHED=1` (auto-enabled by the server's
-`--continuous-batching` flag) — the default is OFF because the legacy
-fused per-layer kernels still win at batch=1 on this architecture.
+Qwen 3.5 / 3.6 implements `IBatchedPagedModel.ForwardBatch`
+([`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs))
+and runs it by default — the batched paged path supports every Qwen3.5
+layer type (attention, GDN recurrent, MoE) and is what continuous-batching
+multi-request workloads need to serve concurrent sequences in parallel.
+Set `TS_QWEN35_BATCHED=0` (or pass `--no-continuous-batching` to the
+server) to force the legacy per-sequence KV-swap fallback for A/B
+comparison or regression isolation.
 
 Qwen 3.5/3.6 is hybrid (FullAttention + GatedDeltaNet recurrent layers),
 so the batched port has to manage **two orthogonal kinds of cache** —
@@ -647,8 +650,9 @@ forward calls the managed reference path through
 
 ### Multimodal in the batched path
 
-`SupportsBatchedMultimodal` returns true when `TS_QWEN35_BATCHED=1` is
-set. `ForwardBatch` builds a global MRoPE position table per batch:
+`SupportsBatchedMultimodal` returns true while the batched path is
+active (i.e. unless `TS_QWEN35_BATCHED=0` is set). `ForwardBatch` builds
+a global MRoPE position table per batch:
 each sequence's MRoPE positions are fetched from the multimodal
 injector, globally offset into the batched hidden tensor, and threaded
 into the per-layer RoPE call. Vision embeddings are injected row-wise

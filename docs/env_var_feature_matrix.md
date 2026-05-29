@@ -24,10 +24,10 @@ real workload.
 
 | Env var | Affects (model) | Affects (backend) | Affects (feature) | Values | Tested |
 |---|---|---|---|---|---|
-| `TS_GPTOSS_BATCHED` | GPT OSS | * | Continuous batching, parallel inference | **`0`**, `1` | yes |
+| `TS_GPTOSS_BATCHED` | GPT OSS | * | Continuous batching, parallel inference (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_QWEN35_BATCHED` | Qwen 3.5 / 3.6 family | * | Continuous batching, parallel inference (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_QWEN35_BATCHED_GDN_NATIVE` | Qwen 3.5 / 3.6 family | * | GatedDeltaNet batched kernel | **`0`**, `1` | yes |
-| `TS_NEMOTRON_BATCHED` | Nemotron-H | * | Continuous batching, parallel inference | **`0`**, `1` | yes |
+| `TS_NEMOTRON_BATCHED` | Nemotron-H | * | Continuous batching, parallel inference (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_GEMMA4_BATCHED` | Gemma 4 | * | Continuous batching (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | * | SSM Mamba2 batched native kernel | **`0`**, `1` | yes |
 | `TS_NEMOTRON_MOE_PREFILL_BATCHED` | Nemotron-H MoE | * | Batched MoE prefill | **`0`**, `1` | yes |
@@ -66,14 +66,21 @@ real workload.
 
 | Env var | Affects (model) | Affects (backend) | Affects (feature) | Values | Tested |
 |---|---|---|---|---|---|
-| `TS_MLX_BATCHED_MOE_DECODE` | Qwen 3.5 / 3.6 MoE | MLX | MoE decode kernel | **`0`**, `1` | yes |
-| `TS_MLX_DEVICE_ROUTER` | Qwen 3.5 / 3.6 MoE | MLX | Router on-device | **`0`**, `1` | yes |
+| `TS_MLX_BATCHED_MOE_DECODE` | Qwen 3.5 / 3.6 MoE | MLX | MoE decode kernel (single batched dispatch per gate/up/down vs. K per-expert dispatches) | `0`, **`1`** | yes |
+| `TS_MLX_MOE_FUSED_GATE_UP_SILU` | Qwen 3.5 / 3.6 MoE | MLX | Fuses MoE gate matmul + up matmul + SiLUMul into one Metal kernel | `0`, **`1`** | yes |
+| `TS_MLX_DEVICE_ROUTER` | Qwen 3.5 / 3.6 MoE | MLX | Router top-K + softmax on-device (skips ~60 host syncs/token on Qwen3.6-35B-A3B) | **`0`**, `1` | yes |
 | `TS_MLX_PIPELINED_DECODE` | * | MLX | Pipelined greedy decode (device-side argmax) | `0`, **`1`** | yes |
 | `TS_MLX_KERNEL_WARMUP` | * | MLX | Force Metal kernel JIT warmup at load | **`0`**, `1` | no (load-time only) |
-| `TS_MLX_MEMORY_LIMIT_MB` | * | MLX | MLX allocator hard cap (MB) | **`<unset>`**, integer | no (HW-dependent) |
+| `TS_MLX_MEMORY_LIMIT_MB` | * | MLX | MLX allocator hard cap (MB) | **`<unset>`** (host-derived), integer | no (HW-dependent) |
+| `TS_MLX_CACHE_LIMIT_MB` | * | MLX | MLX unused-buffer cache cap (MB) | **`<unset>`** (host-derived), integer | no (HW-dependent) |
+| `TS_MLX_WIRED_LIMIT_MB` | * | MLX | Wired-buffer residency cap (MB), set on the MLX side | **`<unset>`** (host-derived), integer | no (HW-dependent) |
 | `TS_MLX_EXPERT_OFFLOAD_MB` | MoE families | MLX | LRU expert offload pool size (MB) | **`<unset>`**, integer | no (HW-dependent) |
 | `TS_MLX_DEVICE_KV_COPY` | * | MLX | On-device KV scatter | `0`, **`1`** | yes |
+| `TS_MLX_FUSED_KV_WRITE` | * | MLX | Single multi-dim `slice_update` write per per-token KV block | `0`, **`1`** | yes |
+| `TS_MLX_MLOCK_GGUF` | * | MLX | `mlock(2)` the GGUF mmap so weights stay resident between forward passes | `0`, **`1`** | no (HW-dependent — needs sufficient `memlock` rlimit) |
+| `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Gemma 4, Qwen 3.5 / 3.6 | MLX | Periodic `mlx_async_eval` cadence to overlap GPU work with host queueing | **`4`** (default), integer (`0` = disabled) | no (perf-tuning) |
 | `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | Qwen 3.5 / 3.6 | MLX | Packed GDN kernels | **`0`**, `1` | yes |
+| `TS_MLX_LOG_MEMORY_POLICY` | * | MLX | One-line memory-policy banners at load | `0`, **`1`** | no (informational) |
 
 ## 6. Feature × prompt-type coverage
 

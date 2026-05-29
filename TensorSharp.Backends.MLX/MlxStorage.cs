@@ -86,6 +86,17 @@ namespace TensorSharp.MLX
             if (ElementCount > int.MaxValue)
                 throw new NotSupportedException("MLX storage arrays larger than Int32.MaxValue elements are not supported yet.");
 
+            // Phase 4 attempted to skip the reshape when the incoming array
+            // was already row-contiguous (and stored the multi-dim array
+            // directly as the storage's deviceArray). That broke
+            // <see cref="UpdateDeviceSlice"/>, which calls 1D
+            // <c>SliceUpdate</c> on <c>deviceArray</c> — mlx errors out
+            // with "Invalid number of indices or strides for array with
+            // dimension 2" when the deviceArray is multi-dim. Keep the
+            // invariant: <c>deviceArray</c> is always stored as 1D flat,
+            // and reshape on entry. The reshape on a row-contiguous array
+            // is internally a metadata-only no-op in MLX, so the cost is
+            // limited to the mlx_reshape C call itself (~5 µs).
             MlxNative.MlxArray flat = MlxNative.Reshape(array, new[] { (int)ElementCount });
             MlxNative.FreeArray(array);
 

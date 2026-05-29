@@ -11,7 +11,7 @@
 | Modalities | Text only |
 | Thinking mode | Yes (Harmony format: `<\|channel>analysis ... <\|channel>final`) |
 | Tool calling | No |
-| Batched / paged forward | **Opt-in** — set `TS_GPTOSS_BATCHED=1`. Per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). See §11. |
+| Batched / paged forward | **Default ON** — set `TS_GPTOSS_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). See §11. |
 | Output parser | `HarmonyOutputParser` (always required) |
 
 ## 1. Origin and intent
@@ -306,9 +306,12 @@ target.
 
 ## 11. Batched / paged forward (continuous batching)
 
-GPT OSS ships an opt-in `IBatchedPagedModel.ForwardBatch`
-([`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs)).
-Enable with `TS_GPTOSS_BATCHED=1` (default OFF). The batched port has to
+GPT OSS implements `IBatchedPagedModel.ForwardBatch`
+([`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs))
+and runs it by default — concurrent requests can only be served truly
+in parallel through the batched path (the per-sequence fallback forwards
+at most one sequence per step). Set `TS_GPTOSS_BATCHED=0` to force the
+legacy per-sequence KV-swap fallback for A/B comparison. The batched port has to
 preserve GPT OSS's three architecture-distinguishing features —
 **attention sinks**, **bias on every projection**, and **per-layer
 alternating SWA** — inside the paged scheduling stack:

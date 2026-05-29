@@ -117,58 +117,61 @@ namespace TensorSharp.MLX
             if (K <= 0 || K >= numExperts) return false;
             if (routeWeights.Sizes[1] != K) return false;
 
-            MlxNative.MlxArray logitsView = default;
-            MlxNative.MlxArray neg = default;
-            MlxNative.MlxArray partIdx = default;
-            MlxNative.MlxArray topIdx2d = default;
-            MlxNative.MlxArray topIdx1d = default;
-            MlxNative.MlxArray topIdx1dInt = default;
-            MlxNative.MlxArray topLogits = default;
-            MlxNative.MlxArray softmaxed = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                logitsView = GetView(routerLogits);
-                // Negate so argpartition's "k smallest" gives top-K largest.
-                neg = MlxNative.Unary(MlxNative.MlxUnaryOp.Neg, logitsView);
-                // [1, numExperts] uint32 — first K positions are top-K largest.
-                partIdx = MlxNative.ArgPartitionAxis(neg, K - 1, axis: 1);
-                // Slice first K → [1, K]
-                topIdx2d = MlxNative.Slice(
-                    partIdx,
-                    starts: new[] { 0, 0 },
-                    stops: new[] { 1, K },
-                    strides: new[] { 1, 1 });
-                // Reshape to [K] for the batched MoE kernel.
-                topIdx1d = MlxNative.Reshape(topIdx2d, new[] { K });
-                // Cast uint32 → int32 (the batched kernel expects int32 indices).
-                topIdx1dInt = MlxNative.Astype(topIdx1d, DType.Int32);
-                // Gather the top-K logits and softmax them (normalized within
-                // the K selected experts — matches the Qwen3.5 _normTopKProb
-                // host-side semantics).
-                topLogits = MlxNative.TakeAxis(logitsView, topIdx1dInt, axis: 1);
-                softmaxed = MlxNative.SoftmaxLastAxis(topLogits);
+                MlxNative.MlxArray logitsView = default;
+                MlxNative.MlxArray neg = default;
+                MlxNative.MlxArray partIdx = default;
+                MlxNative.MlxArray topIdx2d = default;
+                MlxNative.MlxArray topIdx1d = default;
+                MlxNative.MlxArray topIdx1dInt = default;
+                MlxNative.MlxArray topLogits = default;
+                MlxNative.MlxArray softmaxed = default;
+                try
+                {
+                    logitsView = GetView(routerLogits);
+                    // Negate so argpartition's "k smallest" gives top-K largest.
+                    neg = MlxNative.Unary(MlxNative.MlxUnaryOp.Neg, logitsView);
+                    // [1, numExperts] uint32 — first K positions are top-K largest.
+                    partIdx = MlxNative.ArgPartitionAxis(neg, K - 1, axis: 1);
+                    // Slice first K → [1, K]
+                    topIdx2d = MlxNative.Slice(
+                        partIdx,
+                        starts: new[] { 0, 0 },
+                        stops: new[] { 1, K },
+                        strides: new[] { 1, 1 });
+                    // Reshape to [K] for the batched MoE kernel.
+                    topIdx1d = MlxNative.Reshape(topIdx2d, new[] { K });
+                    // Cast uint32 → int32 (the batched kernel expects int32 indices).
+                    topIdx1dInt = MlxNative.Astype(topIdx1d, DType.Int32);
+                    // Gather the top-K logits and softmax them (normalized within
+                    // the K selected experts — matches the Qwen3.5 _normTopKProb
+                    // host-side semantics).
+                    topLogits = MlxNative.TakeAxis(logitsView, topIdx1dInt, axis: 1);
+                    softmaxed = MlxNative.SoftmaxLastAxis(topLogits);
 
-                SetDeviceResult(topIndices, topIdx1dInt);
-                topIdx1dInt = default;
-                SetDeviceResult(routeWeights, softmaxed);
-                softmaxed = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(logitsView);
-                MlxNative.FreeArray(neg);
-                MlxNative.FreeArray(partIdx);
-                MlxNative.FreeArray(topIdx2d);
-                MlxNative.FreeArray(topIdx1d);
-                MlxNative.FreeArray(topIdx1dInt);
-                MlxNative.FreeArray(topLogits);
-                MlxNative.FreeArray(softmaxed);
-            }
+                    SetDeviceResult(topIndices, topIdx1dInt);
+                    topIdx1dInt = default;
+                    SetDeviceResult(routeWeights, softmaxed);
+                    softmaxed = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(logitsView);
+                    MlxNative.FreeArray(neg);
+                    MlxNative.FreeArray(partIdx);
+                    MlxNative.FreeArray(topIdx2d);
+                    MlxNative.FreeArray(topIdx1d);
+                    MlxNative.FreeArray(topIdx1dInt);
+                    MlxNative.FreeArray(topLogits);
+                    MlxNative.FreeArray(softmaxed);
+                }
+            });
         }
 
         // In-place fused output += scalar * src for MLX tensors. Replaces
@@ -187,6 +190,11 @@ namespace TensorSharp.MLX
                 return false;
             if (scalar == 0f) return true;
 
+            return MlxWorker.Shared.Invoke(() => RunAddScaledInPlace(output, src, scalar));
+        }
+
+        private static bool RunAddScaledInPlace(Tensor output, Tensor src, float scalar)
+        {
             MlxNative.MlxArray outView = default;
             MlxNative.MlxArray srcView = default;
             MlxNative.MlxArray scalarArray = default;
@@ -288,31 +296,34 @@ namespace TensorSharp.MLX
                 return false;
             }
 
-            MlxNative.MlxArray srcView = default;
-            MlxNative.MlxArray indicesView = default;
-            MlxNative.MlxArray gathered = default;
-            MlxNative.MlxArray contiguous = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                srcView = GetView(src);
-                indicesView = GetView(indices);
-                gathered = MlxNative.TakeAxis(srcView, indicesView, 0);
-                contiguous = MlxNative.Contiguous(gathered);
-                SetDeviceResult(result, contiguous);
-                contiguous = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(srcView);
-                MlxNative.FreeArray(indicesView);
-                MlxNative.FreeArray(gathered);
-                MlxNative.FreeArray(contiguous);
-            }
+                MlxNative.MlxArray srcView = default;
+                MlxNative.MlxArray indicesView = default;
+                MlxNative.MlxArray gathered = default;
+                MlxNative.MlxArray contiguous = default;
+                try
+                {
+                    srcView = GetView(src);
+                    indicesView = GetView(indices);
+                    gathered = MlxNative.TakeAxis(srcView, indicesView, 0);
+                    contiguous = MlxNative.Contiguous(gathered);
+                    SetDeviceResult(result, contiguous);
+                    contiguous = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(srcView);
+                    MlxNative.FreeArray(indicesView);
+                    MlxNative.FreeArray(gathered);
+                    MlxNative.FreeArray(contiguous);
+                }
+            });
         }
 
         public static bool TryScatterAddWeightedRows(Tensor output, Tensor rows, Tensor indices, Tensor weights)
@@ -341,34 +352,37 @@ namespace TensorSharp.MLX
             if (batchSize <= 0)
                 return true;
 
-            MlxNative.MlxArray outputView = default;
-            MlxNative.MlxArray rowsView = default;
-            MlxNative.MlxArray indicesView = default;
-            MlxNative.MlxArray weightsView = default;
-            MlxNative.MlxArray scattered = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                outputView = GetView(output);
-                rowsView = GetView(rows);
-                indicesView = GetView(indices);
-                weightsView = GetView(weights);
-                scattered = MlxNative.ScatterAddWeightedRows(outputView, rowsView, indicesView, weightsView, seqLen, batchSize, hiddenDim);
-                SetDeviceResult(output, scattered);
-                scattered = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(outputView);
-                MlxNative.FreeArray(rowsView);
-                MlxNative.FreeArray(indicesView);
-                MlxNative.FreeArray(weightsView);
-                MlxNative.FreeArray(scattered);
-            }
+                MlxNative.MlxArray outputView = default;
+                MlxNative.MlxArray rowsView = default;
+                MlxNative.MlxArray indicesView = default;
+                MlxNative.MlxArray weightsView = default;
+                MlxNative.MlxArray scattered = default;
+                try
+                {
+                    outputView = GetView(output);
+                    rowsView = GetView(rows);
+                    indicesView = GetView(indices);
+                    weightsView = GetView(weights);
+                    scattered = MlxNative.ScatterAddWeightedRows(outputView, rowsView, indicesView, weightsView, seqLen, batchSize, hiddenDim);
+                    SetDeviceResult(output, scattered);
+                    scattered = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(outputView);
+                    MlxNative.FreeArray(rowsView);
+                    MlxNative.FreeArray(indicesView);
+                    MlxNative.FreeArray(weightsView);
+                    MlxNative.FreeArray(scattered);
+                }
+            });
         }
 
         /// <summary>
@@ -400,35 +414,38 @@ namespace TensorSharp.MLX
 
             int rows = checked((int)residual.Sizes[0]);
             int hiddenDim = checked((int)residual.Sizes[1]);
-            MlxNative.MlxArray residualView = default;
-            MlxNative.MlxArray inputView = default;
-            MlxNative.MlxArray weightView = default;
-            MlxNative.MlxArray updated = default;
-            MlxNative.MlxArray normed = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                residualView = GetView(residual);
-                inputView = GetView(input);
-                weightView = GetView(normWeight);
-                (updated, normed) = MlxNative.AddRmsNorm(residualView, inputView, weightView, eps, rows, hiddenDim);
-                SetDeviceResult(residual, updated);
-                updated = default;
-                SetDeviceResult(normedOut, normed);
-                normed = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(residualView);
-                MlxNative.FreeArray(inputView);
-                MlxNative.FreeArray(weightView);
-                MlxNative.FreeArray(updated);
-                MlxNative.FreeArray(normed);
-            }
+                MlxNative.MlxArray residualView = default;
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray weightView = default;
+                MlxNative.MlxArray updated = default;
+                MlxNative.MlxArray normed = default;
+                try
+                {
+                    residualView = GetView(residual);
+                    inputView = GetView(input);
+                    weightView = GetView(normWeight);
+                    (updated, normed) = MlxNative.AddRmsNorm(residualView, inputView, weightView, eps, rows, hiddenDim);
+                    SetDeviceResult(residual, updated);
+                    updated = default;
+                    SetDeviceResult(normedOut, normed);
+                    normed = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(residualView);
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(weightView);
+                    MlxNative.FreeArray(updated);
+                    MlxNative.FreeArray(normed);
+                }
+            });
         }
 
         public static bool TryRmsNormAddInPlace(Tensor residual, Tensor input, Tensor normWeight, float eps)
@@ -448,31 +465,34 @@ namespace TensorSharp.MLX
 
             int rows = checked((int)residual.Sizes[0]);
             int hiddenDim = checked((int)residual.Sizes[1]);
-            MlxNative.MlxArray residualView = default;
-            MlxNative.MlxArray inputView = default;
-            MlxNative.MlxArray weightView = default;
-            MlxNative.MlxArray output = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                residualView = GetView(residual);
-                inputView = GetView(input);
-                weightView = GetView(normWeight);
-                output = MlxNative.RmsNormAdd(residualView, inputView, weightView, eps, rows, hiddenDim);
-                SetDeviceResult(residual, output);
-                output = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(residualView);
-                MlxNative.FreeArray(inputView);
-                MlxNative.FreeArray(weightView);
-                MlxNative.FreeArray(output);
-            }
+                MlxNative.MlxArray residualView = default;
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray weightView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    residualView = GetView(residual);
+                    inputView = GetView(input);
+                    weightView = GetView(normWeight);
+                    output = MlxNative.RmsNormAdd(residualView, inputView, weightView, eps, rows, hiddenDim);
+                    SetDeviceResult(residual, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(residualView);
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(weightView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         public static bool TryGeluMulSplit(Tensor result, Tensor gateUp, int halfDim)
@@ -511,6 +531,191 @@ namespace TensorSharp.MLX
             }
         }
 
+        /// <summary>
+        /// Update <c>cache[:, startPos : startPos + seqLen, :] = src</c> in a
+        /// single MLX <c>slice_update</c> dispatch. Replaces the per-head
+        /// <c>Ops.Copy(cacheHead.Narrow(...), srcHead)</c> loop in
+        /// <c>ModelBase.TryCopyHeadFirstToCacheMlx</c>, which costs
+        /// <c>kvHeads × (AsStrided + Contiguous + Reshape + SliceUpdate) = 8+
+        /// MLX ops per KV-cache write per layer</c>. Decode dispatches this
+        /// for K and V on every layer (84 ops/token × 42 layers = ~3.5K
+        /// dispatches saved per token at typical Gemma 4 dims).
+        ///
+        /// <paramref name="cache"/> must be a 3D MLX-backed float tensor
+        /// <c>[heads, cacheLen, headDim]</c> that owns its storage (no
+        /// offset/strided view). <paramref name="src"/> must be a 3D
+        /// MLX-backed float tensor <c>[heads, seqLen, headDim]</c>.
+        /// </summary>
+        public static bool TryWriteKvCacheBlock(Tensor cache, Tensor src, int startPos, int seqLen)
+        {
+            if (cache == null || src == null)
+                return false;
+            if (cache.Storage is not MlxStorage cacheStorage || src.Storage is not MlxStorage)
+                return false;
+            if (cache.ElementType != DType.Float32 && cache.ElementType != DType.Float16)
+                return false;
+            if (src.ElementType != DType.Float32 && src.ElementType != DType.Float16)
+                return false;
+            if (cache.DimensionCount != 3 || src.DimensionCount != 3)
+                return false;
+            if (cache.Sizes[0] != src.Sizes[0] || cache.Sizes[2] != src.Sizes[2])
+                return false;
+            if (src.Sizes[1] != seqLen)
+                return false;
+            if (startPos < 0 || (long)startPos + seqLen > cache.Sizes[1])
+                return false;
+            // Storage must own the whole cache so we can ReplaceDeviceArray
+            // with the slice_update result. Sub-views aren't supported here
+            // (the caller would have to plumb its own bookkeeping for that
+            // case, and KV caches don't use sub-views in practice).
+            if (cache.StorageOffset != 0 || cache.Storage.ElementCount != cache.ElementCount())
+                return false;
+
+            int heads = (int)cache.Sizes[0];
+            int headDim = (int)cache.Sizes[2];
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray cacheView = default;
+                MlxNative.MlxArray srcView = default;
+                MlxNative.MlxArray casted = default;
+                MlxNative.MlxArray updated = default;
+                try
+                {
+                    cacheView = GetView(cache);
+                    srcView = GetView(src);
+                    MlxNative.MlxArray slice = srcView;
+                    if (src.ElementType != cache.ElementType)
+                    {
+                        casted = MlxNative.Astype(srcView, cache.ElementType);
+                        slice = casted;
+                    }
+                    int[] starts = { 0, startPos, 0 };
+                    int[] stops = { heads, startPos + seqLen, headDim };
+                    int[] strides = { 1, 1, 1 };
+                    updated = MlxNative.SliceUpdateMulti(cacheView, slice, starts, stops, strides);
+                    cacheStorage.ReplaceDeviceArray(updated);
+                    updated = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(cacheView);
+                    MlxNative.FreeArray(srcView);
+                    MlxNative.FreeArray(casted);
+                    MlxNative.FreeArray(updated);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Fused Gemma 4 decode-step QKV preprocessing. Reads the
+        /// post-matmul <paramref name="qkv"/> [1, q_dim + k_dim + v_dim],
+        /// then in one Metal kernel:
+        ///   * splits Q / K / V,
+        ///   * applies weighted RMSNorm to each head of Q and K,
+        ///   * applies unweighted RMSNorm to each head of V,
+        ///   * applies NeoX-style RoPE to Q and K (cos/sin already evaluated
+        ///     at the target position).
+        /// Outputs Q flat <c>[1, NumHeads * HeadDim]</c> and K / V head-first
+        /// <c>[NumKVHeads, 1, HeadDim]</c> (the layout the cache slice_update
+        /// expects). Replaces 5 separate MLX dispatches per layer.
+        /// </summary>
+        public static bool TryGemma4QkvPreprocessDecode(
+            Tensor qOut,
+            Tensor kOut,
+            Tensor vOut,
+            Tensor qkv,
+            Tensor qNormWeight,
+            Tensor kNormWeight,
+            Tensor cosTable,
+            Tensor sinTable,
+            int numHeads,
+            int numKVHeads,
+            int headDim,
+            int rotHalf,
+            float eps)
+        {
+            if (qOut == null || kOut == null || vOut == null || qkv == null
+                || qNormWeight == null || kNormWeight == null
+                || cosTable == null || sinTable == null)
+                return false;
+            if (qOut.Storage is not MlxStorage || kOut.Storage is not MlxStorage || vOut.Storage is not MlxStorage)
+                return false;
+            if (qkv.Storage is not MlxStorage || qNormWeight.Storage is not MlxStorage
+                || kNormWeight.Storage is not MlxStorage
+                || cosTable.Storage is not MlxStorage || sinTable.Storage is not MlxStorage)
+                return false;
+            if (qOut.ElementType != DType.Float32 || kOut.ElementType != DType.Float32 || vOut.ElementType != DType.Float32
+                || qkv.ElementType != DType.Float32
+                || qNormWeight.ElementType != DType.Float32 || kNormWeight.ElementType != DType.Float32
+                || cosTable.ElementType != DType.Float32 || sinTable.ElementType != DType.Float32)
+                return false;
+            if (numHeads <= 0 || numKVHeads <= 0 || numHeads % numKVHeads != 0
+                || headDim <= 0 || headDim > 512
+                || (headDim & (headDim - 1)) != 0
+                || rotHalf <= 0 || rotHalf * 2 > headDim)
+                return false;
+            if (qkv.ElementCount() != (long)(numHeads + 2 * numKVHeads) * headDim)
+                return false;
+            if (qNormWeight.ElementCount() != headDim || kNormWeight.ElementCount() != headDim)
+                return false;
+            if (cosTable.ElementCount() != rotHalf || sinTable.ElementCount() != rotHalf)
+                return false;
+            if (qOut.ElementCount() != (long)numHeads * headDim) return false;
+            if (kOut.ElementCount() != (long)numKVHeads * headDim) return false;
+            if (vOut.ElementCount() != (long)numKVHeads * headDim) return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray qkvView = default;
+                MlxNative.MlxArray qNormView = default;
+                MlxNative.MlxArray kNormView = default;
+                MlxNative.MlxArray cosView = default;
+                MlxNative.MlxArray sinView = default;
+                MlxNative.MlxArray q = default;
+                MlxNative.MlxArray k = default;
+                MlxNative.MlxArray v = default;
+                try
+                {
+                    qkvView = GetView(qkv);
+                    qNormView = GetView(qNormWeight);
+                    kNormView = GetView(kNormWeight);
+                    cosView = GetView(cosTable);
+                    sinView = GetView(sinTable);
+
+                    MlxNative.Gemma4QkvPreprocessDecode(
+                        qkvView, qNormView, kNormView, cosView, sinView,
+                        numHeads, numKVHeads, headDim, rotHalf, eps,
+                        out q, out k, out v);
+
+                    SetDeviceResult(qOut, q); q = default;
+                    SetDeviceResult(kOut, k); k = default;
+                    SetDeviceResult(vOut, v); v = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(qkvView);
+                    MlxNative.FreeArray(qNormView);
+                    MlxNative.FreeArray(kNormView);
+                    MlxNative.FreeArray(cosView);
+                    MlxNative.FreeArray(sinView);
+                    MlxNative.FreeArray(q);
+                    MlxNative.FreeArray(k);
+                    MlxNative.FreeArray(v);
+                }
+            });
+        }
+
         public static bool TryFlatToHeadFirst(Tensor result, Tensor input, int numHeads, int seqLen, int headDim, int colOffset = 0)
         {
             if (!CanUseResult(result)
@@ -532,25 +737,28 @@ namespace TensorSharp.MLX
             }
 
             int sourceStride = checked((int)input.Sizes[1]);
-            MlxNative.MlxArray inputView = default;
-            MlxNative.MlxArray output = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                inputView = GetView(input);
-                output = MlxNative.FlatToHeadFirst(inputView, seqLen, numHeads, headDim, sourceStride, colOffset);
-                SetDeviceResult(result, output);
-                output = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(inputView);
-                MlxNative.FreeArray(output);
-            }
+                MlxNative.MlxArray inputView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    inputView = GetView(input);
+                    output = MlxNative.FlatToHeadFirst(inputView, seqLen, numHeads, headDim, sourceStride, colOffset);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(inputView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         public static bool TryNeoXRoPEFlatInPlace(Tensor data, Tensor cosTable, Tensor sinTable,
@@ -607,31 +815,34 @@ namespace TensorSharp.MLX
         private static bool TryNeoXRoPEInPlace(Tensor data, Tensor cosTable, Tensor sinTable,
             int numHeads, int seqLen, int headDim, int rotHalf, bool headFirst)
         {
-            MlxNative.MlxArray dataView = default;
-            MlxNative.MlxArray cosView = default;
-            MlxNative.MlxArray sinView = default;
-            MlxNative.MlxArray output = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                dataView = GetView(data);
-                cosView = GetView(cosTable);
-                sinView = GetView(sinTable);
-                output = MlxNative.NeoXRoPE(dataView, cosView, sinView, numHeads, seqLen, headDim, rotHalf, headFirst);
-                SetDeviceResult(data, output);
-                output = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(dataView);
-                MlxNative.FreeArray(cosView);
-                MlxNative.FreeArray(sinView);
-                MlxNative.FreeArray(output);
-            }
+                MlxNative.MlxArray dataView = default;
+                MlxNative.MlxArray cosView = default;
+                MlxNative.MlxArray sinView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    dataView = GetView(data);
+                    cosView = GetView(cosTable);
+                    sinView = GetView(sinTable);
+                    output = MlxNative.NeoXRoPE(dataView, cosView, sinView, numHeads, seqLen, headDim, rotHalf, headFirst);
+                    SetDeviceResult(data, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(dataView);
+                    MlxNative.FreeArray(cosView);
+                    MlxNative.FreeArray(sinView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         public sealed class AttentionKvCache : IDisposable
@@ -711,59 +922,62 @@ namespace TensorSharp.MLX
                     return false;
                 }
 
-                MlxNative.MlxArray qView = default;
-                MlxNative.MlxArray qCompact = default;
-                MlxNative.MlxArray nextK = default;
-                MlxNative.MlxArray nextV = default;
-                MlxNative.MlxArray attention = default;
-                try
+                return MlxWorker.Shared.Invoke(() =>
                 {
-                    qView = GetView(qHeads);
-                    qCompact = qHeads.IsContiguous() ? qView : MlxNative.Contiguous(qView);
-                    if (qHeads.IsContiguous())
-                        qView = default;
+                    MlxNative.MlxArray qView = default;
+                    MlxNative.MlxArray qCompact = default;
+                    MlxNative.MlxArray nextK = default;
+                    MlxNative.MlxArray nextV = default;
+                    MlxNative.MlxArray attention = default;
+                    try
+                    {
+                        qView = GetView(qHeads);
+                        qCompact = qHeads.IsContiguous() ? qView : MlxNative.Contiguous(qView);
+                        if (qHeads.IsContiguous())
+                            qView = default;
 
-                    if (!TryBuildUpdatedCache(kHeads, vHeads, seqLen, out nextK, out nextV))
+                        if (!TryBuildUpdatedCache(kHeads, vHeads, seqLen, out nextK, out nextV))
+                            return false;
+
+                        int nextLength = length + seqLen;
+                        attention = MlxNative.HeadDim256Attention(
+                            qCompact,
+                            nextK,
+                            nextV,
+                            numHeads,
+                            numKVHeads,
+                            seqLen,
+                            nextLength,
+                            startPos,
+                            causal,
+                            scale);
+                        SetDeviceResult(result, attention);
+                        attention = default;
+
+                        MlxNative.FreeArray(kCache);
+                        MlxNative.FreeArray(vCache);
+                        kCache = nextK;
+                        vCache = nextV;
+                        nextK = default;
+                        nextV = default;
+                        length = nextLength;
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GDN_NATIVE_DEBUG"), "1", StringComparison.Ordinal))
+                            Console.WriteLine($"[MLX] Native Qwen35 GDN disabled for this call: {ex.Message}");
                         return false;
-
-                    int nextLength = length + seqLen;
-                    attention = MlxNative.HeadDim256Attention(
-                        qCompact,
-                        nextK,
-                        nextV,
-                        numHeads,
-                        numKVHeads,
-                        seqLen,
-                        nextLength,
-                        startPos,
-                        causal,
-                        scale);
-                    SetDeviceResult(result, attention);
-                    attention = default;
-
-                    MlxNative.FreeArray(kCache);
-                    MlxNative.FreeArray(vCache);
-                    kCache = nextK;
-                    vCache = nextV;
-                    nextK = default;
-                    nextV = default;
-                    length = nextLength;
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    if (string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GDN_NATIVE_DEBUG"), "1", StringComparison.Ordinal))
-                        Console.WriteLine($"[MLX] Native Qwen35 GDN disabled for this call: {ex.Message}");
-                    return false;
-                }
-                finally
-                {
-                    MlxNative.FreeArray(qView);
-                    MlxNative.FreeArray(qCompact);
-                    MlxNative.FreeArray(nextK);
-                    MlxNative.FreeArray(nextV);
-                    MlxNative.FreeArray(attention);
-                }
+                    }
+                    finally
+                    {
+                        MlxNative.FreeArray(qView);
+                        MlxNative.FreeArray(qCompact);
+                        MlxNative.FreeArray(nextK);
+                        MlxNative.FreeArray(nextV);
+                        MlxNative.FreeArray(attention);
+                    }
+                });
             }
 
             private bool TryBuildUpdatedCache(Tensor kHeads, Tensor vHeads, int seqLen,
@@ -915,6 +1129,19 @@ namespace TensorSharp.MLX
                 if (result.DimensionCount != 2 || result.Sizes[0] != seqLen || result.Sizes[1] != valueDim)
                     return false;
 
+                return MlxWorker.Shared.Invoke(() => RunQwen35PackedInner(
+                    result, packedRaw, convWeight, dtBias, aLog, normWeight,
+                    seqLen, packedDim, qkvDim, keyDim, valueDim,
+                    numKeyHeads, numValueHeads, headKeyDim, headValueDim,
+                    convKernel, eps));
+            }
+
+            private bool RunQwen35PackedInner(
+                Tensor result, Tensor packedRaw, Tensor convWeight, Tensor dtBias, Tensor aLog, Tensor normWeight,
+                int seqLen, int packedDim, int qkvDim, int keyDim, int valueDim,
+                int numKeyHeads, int numValueHeads, int headKeyDim, int headValueDim,
+                int convKernel, float eps)
+            {
                 MlxNative.MlxArray packedView = default;
                 MlxNative.MlxArray convWeightView = default;
                 MlxNative.MlxArray dtBiasView = default;
@@ -1134,6 +1361,21 @@ namespace TensorSharp.MLX
                 if (result.DimensionCount != 2 || result.Sizes[0] != seqLen || result.Sizes[1] != valueDim)
                     return false;
 
+                return MlxWorker.Shared.Invoke(() => RunQwen35Inner(
+                    result, qkvRaw, zRaw, betaRaw, alphaRaw,
+                    convWeight, dtBias, aLog, normWeight,
+                    seqLen, qkvDim, keyDim, valueDim,
+                    numKeyHeads, numValueHeads, headKeyDim, headValueDim,
+                    convKernel, eps));
+            }
+
+            private bool RunQwen35Inner(
+                Tensor result, Tensor qkvRaw, Tensor zRaw, Tensor betaRaw, Tensor alphaRaw,
+                Tensor convWeight, Tensor dtBias, Tensor aLog, Tensor normWeight,
+                int seqLen, int qkvDim, int keyDim, int valueDim,
+                int numKeyHeads, int numValueHeads, int headKeyDim, int headValueDim,
+                int convKernel, float eps)
+            {
                 MlxNative.MlxArray qkvView = default;
                 MlxNative.MlxArray zView = default;
                 MlxNative.MlxArray betaView = default;
@@ -1735,56 +1977,163 @@ namespace TensorSharp.MLX
             if (qFlat.ElementCount() != (long)numHeads * headDim)
                 return false;
 
-            Tensor kLogical = null;
-            Tensor vLogical = null;
-            try
+            // Batch the entire decode-attention sub-graph (narrows + view +
+            // TryRunHeadFirstAttention, which itself issues several MLX
+            // ops) into one worker round-trip. Without this wrapper each
+            // attention layer at decode pays ~15+ queue hand-offs.
+            return MlxWorker.Shared.Invoke(() =>
             {
-                if (circular)
+                Tensor kLogical = null;
+                Tensor vLogical = null;
+                try
                 {
-                    int firstSlot = attendStart % cacheLen;
-                    if (firstSlot < 0)
-                        firstSlot += cacheLen;
-
-                    if (TryCircularDecodeAttention(result, qFlat, kCache, vCache,
-                        numHeads, numKVHeads, headDim, firstSlot, attendLen, cacheLen, scale))
+                    if (circular)
                     {
-                        return true;
-                    }
+                        int firstSlot = attendStart % cacheLen;
+                        if (firstSlot < 0)
+                            firstSlot += cacheLen;
 
-                    if (firstSlot + attendLen <= cacheLen)
-                    {
-                        kLogical = kCache.Narrow(1, firstSlot, attendLen);
-                        vLogical = vCache.Narrow(1, firstSlot, attendLen);
+                        if (TryCircularDecodeAttention(result, qFlat, kCache, vCache,
+                            numHeads, numKVHeads, headDim, firstSlot, attendLen, cacheLen, scale))
+                        {
+                            return true;
+                        }
+
+                        if (firstSlot + attendLen <= cacheLen)
+                        {
+                            kLogical = kCache.Narrow(1, firstSlot, attendLen);
+                            vLogical = vCache.Narrow(1, firstSlot, attendLen);
+                        }
+                        else
+                        {
+                            int tailLen = cacheLen - firstSlot;
+                            int headLen = attendLen - tailLen;
+                            using var kTail = kCache.Narrow(1, firstSlot, tailLen);
+                            using var kHead = kCache.Narrow(1, 0, headLen);
+                            using var vTail = vCache.Narrow(1, firstSlot, tailLen);
+                            using var vHead = vCache.Narrow(1, 0, headLen);
+                            kLogical = Ops.Concat(null, 1, kTail, kHead);
+                            vLogical = Ops.Concat(null, 1, vTail, vHead);
+                        }
                     }
                     else
                     {
-                        int tailLen = cacheLen - firstSlot;
-                        int headLen = attendLen - tailLen;
-                        using var kTail = kCache.Narrow(1, firstSlot, tailLen);
-                        using var kHead = kCache.Narrow(1, 0, headLen);
-                        using var vTail = vCache.Narrow(1, firstSlot, tailLen);
-                        using var vHead = vCache.Narrow(1, 0, headLen);
-                        kLogical = Ops.Concat(null, 1, kTail, kHead);
-                        vLogical = Ops.Concat(null, 1, vTail, vHead);
-                    }
-                }
-                else
-                {
-                    if (attendStart + attendLen > cacheLen)
-                        return false;
-                    kLogical = kCache.Narrow(1, attendStart, attendLen);
-                    vLogical = vCache.Narrow(1, attendStart, attendLen);
-                }
+                        if (attendStart + attendLen > cacheLen)
+                            return false;
 
-                using var qHeads = qFlat.View(numHeads, 1, headDim);
-                return TryRunHeadFirstAttention(result, qHeads, kLogical, vLogical,
-                    numHeads, numKVHeads, 1, attendLen, headDim, string.Empty, scale);
-            }
-            finally
+                        // Phase 6g experiment: custom head_dim=512 kernel
+                        // exists (TryDecodeAttentionHeadDim512) but is gated
+                        // off by default — MLX's built-in fast_sdpa already
+                        // uses simdgroup ops internally and beat the custom
+                        // kernel by ~1 ms / tok on Gemma 4 E4B Q8_0 (42.5
+                        // vs 41.6 ms / tok with it engaged). The custom
+                        // kernel is kept for future experiments. Set
+                        // TS_MLX_FUSED_HEADDIM512_SDPA=1 to engage.
+                        if (headDim == 512 && attendStart == 0
+                            && string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_HEADDIM512_SDPA"), "1", StringComparison.Ordinal))
+                        {
+                            if (TryDecodeAttentionHeadDim512(result, qFlat, kCache, vCache,
+                                numHeads, numKVHeads, headDim, attendLen, cacheLen, scale))
+                            {
+                                return true;
+                            }
+                        }
+
+                        kLogical = kCache.Narrow(1, attendStart, attendLen);
+                        vLogical = vCache.Narrow(1, attendStart, attendLen);
+                    }
+
+                    using var qHeads = qFlat.View(numHeads, 1, headDim);
+                    return TryRunHeadFirstAttention(result, qHeads, kLogical, vLogical,
+                        numHeads, numKVHeads, 1, attendLen, headDim, string.Empty, scale);
+                }
+                finally
+                {
+                    kLogical?.Dispose();
+                    vLogical?.Dispose();
+                }
+            });
+        }
+
+        /// <summary>
+        /// Decode-step attention for Gemma 4 global layers (head_dim = 512,
+        /// non-circular). Calls the custom simdgroup-optimized Metal kernel
+        /// when shapes match; falls through to MLX's built-in SDPA path
+        /// otherwise. Drops in for the existing TryDecodeAttention non-
+        /// circular branch when head_dim == 512.
+        /// </summary>
+        public static bool TryDecodeAttentionHeadDim512(
+            Tensor result,
+            Tensor qFlat,
+            Tensor kCache,
+            Tensor vCache,
+            int numHeads,
+            int numKVHeads,
+            int headDim,
+            int attendLen,
+            int cacheLen,
+            float scale)
+        {
+            if (!CanUseResult(result)
+                || !CanUseAttentionTensor(qFlat)
+                || !CanUseAttentionTensor(kCache)
+                || !CanUseAttentionTensor(vCache)
+                || qFlat.ElementType != DType.Float32
+                || !qFlat.IsContiguous()
+                || !kCache.IsContiguous()
+                || !vCache.IsContiguous()
+                || headDim != 512
+                || attendLen <= 0
+                || attendLen > cacheLen
+                || numHeads <= 0
+                || numKVHeads <= 0
+                || numHeads % numKVHeads != 0
+                || result.DimensionCount != 2
+                || result.Sizes[0] != 1
+                || result.Sizes[1] != (long)numHeads * headDim
+                || qFlat.ElementCount() != (long)numHeads * headDim
+                || kCache.DimensionCount != 3
+                || vCache.DimensionCount != 3
+                || kCache.Sizes[0] != numKVHeads
+                || vCache.Sizes[0] != numKVHeads
+                || kCache.Sizes[1] != cacheLen
+                || vCache.Sizes[1] != cacheLen
+                || kCache.Sizes[2] != headDim
+                || vCache.Sizes[2] != headDim)
             {
-                kLogical?.Dispose();
-                vLogical?.Dispose();
+                return false;
             }
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray qView = default;
+                MlxNative.MlxArray kView = default;
+                MlxNative.MlxArray vView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    qView = GetView(qFlat);
+                    kView = GetView(kCache);
+                    vView = GetView(vCache);
+                    output = MlxNative.DecodeAttentionHeadDim512(
+                        qView, kView, vView,
+                        numHeads, numKVHeads, headDim, cacheLen, attendLen, scale);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(qView);
+                    MlxNative.FreeArray(kView);
+                    MlxNative.FreeArray(vView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         private static bool TryCircularDecodeAttention(
@@ -1831,41 +2180,44 @@ namespace TensorSharp.MLX
                 return false;
             }
 
-            MlxNative.MlxArray qView = default;
-            MlxNative.MlxArray kView = default;
-            MlxNative.MlxArray vView = default;
-            MlxNative.MlxArray output = default;
-            try
+            return MlxWorker.Shared.Invoke(() =>
             {
-                qView = GetView(qFlat);
-                kView = GetView(kCache);
-                vView = GetView(vCache);
-                output = MlxNative.CircularDecodeAttention(
-                    qView,
-                    kView,
-                    vView,
-                    numHeads,
-                    numKVHeads,
-                    headDim,
-                    cacheLen,
-                    firstSlot,
-                    attendLen,
-                    scale);
-                SetDeviceResult(result, output);
-                output = default;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                MlxNative.FreeArray(qView);
-                MlxNative.FreeArray(kView);
-                MlxNative.FreeArray(vView);
-                MlxNative.FreeArray(output);
-            }
+                MlxNative.MlxArray qView = default;
+                MlxNative.MlxArray kView = default;
+                MlxNative.MlxArray vView = default;
+                MlxNative.MlxArray output = default;
+                try
+                {
+                    qView = GetView(qFlat);
+                    kView = GetView(kCache);
+                    vView = GetView(vCache);
+                    output = MlxNative.CircularDecodeAttention(
+                        qView,
+                        kView,
+                        vView,
+                        numHeads,
+                        numKVHeads,
+                        headDim,
+                        cacheLen,
+                        firstSlot,
+                        attendLen,
+                        scale);
+                    SetDeviceResult(result, output);
+                    output = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(qView);
+                    MlxNative.FreeArray(kView);
+                    MlxNative.FreeArray(vView);
+                    MlxNative.FreeArray(output);
+                }
+            });
         }
 
         private static bool TryRunHeadFirstAttention(
@@ -1908,6 +2260,14 @@ namespace TensorSharp.MLX
                 return false;
             }
 
+            return MlxWorker.Shared.Invoke(() => RunHeadFirstAttentionInner(
+                result, qHeads, kHeads, vHeads, numHeads, numKVHeads, seqLen, kvLen, headDim, maskMode, scale));
+        }
+
+        private static bool RunHeadFirstAttentionInner(
+            Tensor result, Tensor qHeads, Tensor kHeads, Tensor vHeads,
+            int numHeads, int numKVHeads, int seqLen, int kvLen, int headDim, string maskMode, float scale)
+        {
             MlxNative.MlxArray qView = default;
             MlxNative.MlxArray kView = default;
             MlxNative.MlxArray vView = default;
@@ -2091,25 +2451,19 @@ namespace TensorSharp.MLX
             if (seqLen <= 0 || kvLen <= 0 || seqLen > kvLen || numKVHeads <= 0 || numHeads % numKVHeads != 0)
                 return false;
 
-            int groupSize = numHeads / numKVHeads;
-            if (seqLen == 1
-                && headDim == 512
-                && seqLen * groupSize <= 32)
-            {
-                return true;
-            }
-
-            if (headDim > MaxFastAttentionHeadDim())
+            // mx.fast.scaled_dot_product_attention dispatches to either the
+            // vector (seqLen<=8) or tiled-matrix (seqLen>8) Metal kernel
+            // depending on shape. Both paths now support head_dim ∈
+            // {64, 80, 96, 128, 256} and (for the vector kernel) 512, with
+            // arbitrary kv length. We mirror omlx and dispatch any head
+            // dim within MLX's documented range; the caller's try/catch
+            // around FastScaledDotProductAttention provides a safe
+            // fallback if MLX rejects a shape at runtime.
+            int maxHeadDim = MaxFastAttentionHeadDim();
+            if (headDim <= 0 || headDim > Math.Max(512, maxHeadDim))
                 return false;
 
-            if (seqLen <= 8
-                && seqLen * groupSize <= 32
-                && (headDim == 64 || headDim == 96 || headDim == 128 || headDim == 256))
-            {
-                return true;
-            }
-
-            return seqLen > 8 && (headDim == 64 || headDim == 80 || headDim == 128);
+            return true;
         }
 
         private static int MaxVectorQueryLen(int groupSize)

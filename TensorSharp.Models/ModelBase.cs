@@ -519,7 +519,15 @@ namespace TensorSharp.Models
             if (isGpuBackend &&
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
             {
-                return Math.Min(requestedContextLength, gpuDefault);
+                // MLX on Apple Silicon shares unified memory with the model
+                // weights, so a smaller initial cache reduces RAM pressure at
+                // load — especially important for 25-32 GB Macs running 14+ GB
+                // models, where every spare gigabyte avoids the macOS memory
+                // compressor activating. The cache grows on demand for longer
+                // sessions; users with persistent long contexts can override
+                // via MAX_CONTEXT to allocate the full window up-front.
+                int effectiveDefault = backend == BackendType.Mlx ? Math.Min(gpuDefault, 2048) : gpuDefault;
+                return Math.Min(requestedContextLength, effectiveDefault);
             }
 
             return requestedContextLength;
@@ -1042,10 +1050,28 @@ namespace TensorSharp.Models
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
 
+                // Repack quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/MXFP4/Q5_K-repack)
+                // were materialised into a fresh MLX-allocator MTLBuffer in
+                // the preload above. The original GGUF/host bytes are now
+                // redundant — releasing them frees the source view and
+                // (when external) lets the OS reclaim those mmap pages.
+                //
+                // Raw-wrap quants (Q4_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S,
+                // IQ4_XS, IQ4_NL, Q5_K-raw) are wrapped zero-copy via
+                // mlx_array_new_data_managed → MTLBuffer-with-bytes-no-copy
+                // pointing at the GGUF mmap. They MUST keep that mmap
+                // alive — calling ReleaseHostData here would (a) lose the
+                // host pointer that MLX is reading from, (b) invoke
+                // madvise(MADV_DONTNEED) on still-active model pages,
+                // forcing the kernel to re-read them from disk on every
+                // forward pass.
                 bool wasMappedView = qw.HasExternalHostView;
-                qw.ReleaseHostData();
-                if (wasMappedView)
-                    mappedHostViews--;
+                if (preloadCopies)
+                {
+                    qw.ReleaseHostData();
+                    if (wasMappedView)
+                        mappedHostViews--;
+                }
             }
 
             // Stacked-experts views are lazily uploaded by the batched-MoE matmul
@@ -1067,6 +1093,34 @@ namespace TensorSharp.Models
             // pointers) need it to remain mapped.
             if (mappedHostViews == 0 && preloadedCount > 0)
                 _gguf?.Dispose();
+            else if (_gguf != null && string.Equals(
+                Environment.GetEnvironmentVariable("TS_MLX_MLOCK_GGUF") ?? "1", "1", StringComparison.Ordinal))
+            {
+                // Pin the GGUF mmap region in physical RAM. Without this,
+                // macOS treats file-backed pages as evictable and the kernel
+                // throws model weights into the page cache between forward
+                // passes — every subsequent layer page-faults them back from
+                // disk and inference collapses to ~0.3 tok/s.
+                //
+                // mlx_set_wired_limit only governs MLX-allocator MTLBuffer
+                // residency, not arbitrary mmap'd pages, so MTLBuffer-backed
+                // zero-copy wrappers (CreateIq4XsRawWeight etc.) need this
+                // explicit mlock too. Opt out via TS_MLX_MLOCK_GGUF=0.
+                bool locked = _gguf.TryLockMappedRegion();
+                if (locked && !string.Equals(
+                    Environment.GetEnvironmentVariable("TS_MLX_LOG_MEMORY_POLICY"), "0", StringComparison.Ordinal))
+                {
+                    Console.WriteLine(
+                        "  GGUF mmap pinned via mlock (model weights stay resident; set TS_MLX_MLOCK_GGUF=0 to disable).");
+                }
+                else if (!locked && !string.Equals(
+                    Environment.GetEnvironmentVariable("TS_MLX_LOG_MEMORY_POLICY"), "0", StringComparison.Ordinal))
+                {
+                    Console.WriteLine(
+                        $"  GGUF mlock failed (errno={_gguf.LastLockError}); inference may swap under memory pressure. " +
+                        "Set TS_MLX_MLOCK_GGUF=0 to suppress this message.");
+                }
+            }
 
             if (preloadedCount > 0 || deferredCount > 0 || zeroCopyExpertCount > 0 || fallbackExpertCount > 0)
             {
@@ -2066,6 +2120,17 @@ namespace TensorSharp.Models
                 return false;
             }
 
+            // Single multi-dim slice_update beats the per-head loop below by
+            // ~8× MLX dispatches per cache write — for decode (kvHeads=2, K+V
+            // per layer × 42 layers) that's ~600 MLX op dispatches/token
+            // collapsed into ~80. Falls back to the per-head loop if the
+            // fused path declines (e.g. dtype mismatch, sub-view storage).
+            // Disable via TS_MLX_FUSED_KV_WRITE=0 to A/B against the per-head
+            // path (helpful when investigating slice_update perf regressions).
+            if (!string.Equals(Environment.GetEnvironmentVariable("TS_MLX_FUSED_KV_WRITE"), "0", StringComparison.Ordinal)
+                && MlxFusedOps.TryWriteKvCacheBlock(cache, src, startPos, seqLen))
+                return true;
+
             int heads = (int)cache.Sizes[0];
             for (int h = 0; h < heads; h++)
             {
@@ -2125,6 +2190,16 @@ namespace TensorSharp.Models
 
         private bool TryCopyHeadFirstRangeToCacheMlx(Tensor cache, Tensor src, int srcOffset, int dstOffset, int length)
         {
+            // Fast path: single multi-dim slice_update for the full
+            // [heads, length, headDim] block when src happens to start at
+            // offset 0. For the wrap-around case we fall back to the per-head
+            // loop with a manually narrowed src.
+            if (srcOffset == 0 && length == src.Sizes[1])
+            {
+                if (MlxFusedOps.TryWriteKvCacheBlock(cache, src, dstOffset, length))
+                    return true;
+            }
+
             int heads = checked((int)cache.Sizes[0]);
             for (int h = 0; h < heads; h++)
             {

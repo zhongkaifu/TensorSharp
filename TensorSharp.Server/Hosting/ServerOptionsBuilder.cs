@@ -358,6 +358,14 @@ namespace TensorSharp.Server.Hosting
                     continue;
                 }
 
+                // Hidden easter-egg flag consumed by the entry point to
+                // enable the animated mascot banner. Recognised here so it
+                // doesn't trip the unknown-arg trap below.
+                if (string.Equals(args[i], "--xzf", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
                 // Paged-KV flags are consumed by ApplyPagedKvCacheCliFlags(args)
                 // in a separate earlier pass. They still appear in args[] when
                 // ParseArgs walks the list, so recognise + skip them here to

@@ -10,6 +10,7 @@
 
 using System;
 using System.Text;
+using System.Threading;
 
 namespace TensorSharp.Runtime
 {
@@ -19,6 +20,9 @@ namespace TensorSharp.Runtime
     /// assistant_logo_2.png at 74x84 half-block pixels) and the bottom section displays the
     /// TensorSharp logo text with a horizontal color gradient. Uses 24-bit ANSI true-color
     /// escape sequences with a graceful fallback for redirected or NO_COLOR terminals.
+    /// When the hidden <c>--xzf</c> easter-egg flag is set, the banner is animated:
+    /// the mascot is revealed row-by-row, the decorative jewel row sweeps through its
+    /// palette, and the logo glyphs ride a moving rainbow gradient before settling.
     /// </summary>
     public static class ConsoleBanner
     {
@@ -117,6 +121,15 @@ namespace TensorSharp.Runtime
             foreach (var line in LogoLines)
                 if (line.Length > logoWidth) logoWidth = line.Length;
 
+            // Animated path is reserved for the --xzf easter egg on terminals
+            // that can handle 24-bit ANSI + cursor positioning. Falls through
+            // to the static path on redirected stdout or NO_COLOR.
+            if (color && showSarah)
+            {
+                PrintAnimated(logoWidth);
+                return;
+            }
+
             var sb = new StringBuilder(65536);
             sb.AppendLine();
 
@@ -127,6 +140,102 @@ namespace TensorSharp.Runtime
 
             sb.AppendLine();
             Console.Write(sb.ToString());
+        }
+
+        /// <summary>
+        /// Renders the full banner as a short animation when the operator
+        /// passes the hidden <c>--xzf</c> flag. Three phases: (1) the mascot
+        /// is revealed row-by-row with a small per-row delay, (2) the
+        /// decorative jewel row cycles through its palette by rotating the
+        /// symbol indices, (3) the logo glyphs ride a rainbow gradient that
+        /// sweeps right-to-left and then settles on the final colors. Writes
+        /// the final frame in-place, so when the animation ends the visible
+        /// banner is identical to the static version.
+        /// </summary>
+        private static void PrintAnimated(int logoWidth)
+        {
+            const string Reset = "\x1b[0m";
+            const string ClearEol = "\x1b[0K";
+
+            Console.WriteLine();
+
+            // Phase 1: typewriter-style row-by-row reveal of Sarah.
+            int sarahPad = Math.Max(0, (logoWidth - SarahDisplayWidth) / 2);
+            string sarahIndent = sarahPad > 0 ? new string(' ', sarahPad) : "";
+            foreach (var line in Sarah)
+            {
+                Console.Write(sarahIndent);
+                Console.WriteLine(line);
+                Thread.Sleep(15);
+            }
+            Console.WriteLine();
+
+            // Phase 2: rotate the jewel palette in place. After the first
+            // frame each subsequent frame moves the cursor up one line and
+            // back to column 0, then rewrites the row.
+            int cubeSpacing = logoWidth / (Cubes.Length + 1);
+            const int cubeFrames = 9;
+            for (int frame = 0; frame < cubeFrames; frame++)
+            {
+                if (frame > 0) Console.Write("\x1b[1A\r");
+                var sb = new StringBuilder(256);
+                sb.Append("  ");
+                int cursor = 0;
+                for (int i = 0; i < Cubes.Length; i++)
+                {
+                    int target = cubeSpacing * (i + 1);
+                    if (target > cursor) { sb.Append(new string(' ', target - cursor)); cursor = target; }
+                    var c = Cubes[(i + frame) % Cubes.Length];
+                    sb.Append($"\x1b[38;2;{c.R};{c.G};{c.B}m{c.Symbol}{Reset}");
+                    cursor++;
+                }
+                sb.Append(ClearEol);
+                Console.WriteLine(sb.ToString());
+                Thread.Sleep(70);
+            }
+
+            // Phase 3: animated rainbow sweep through the logo glyphs. Each
+            // frame shifts the gradient horizontally; the final frame uses
+            // phase 0, which matches the static BuildColor render exactly so
+            // the post-animation state is indistinguishable from the
+            // no-animation banner.
+            const int logoFrames = 10;
+            for (int frame = 0; frame < logoFrames; frame++)
+            {
+                if (frame > 0) Console.Write($"\x1b[{LogoLines.Length}A\r");
+                float phase = frame < logoFrames - 1 ? (float)frame / (logoFrames - 1) : 0f;
+                var sb = new StringBuilder(8192);
+                for (int row = 0; row < LogoLines.Length; row++)
+                {
+                    string line = LogoLines[row];
+                    float brightness = 1.0f - row * 0.04f;
+                    sb.Append("  ");
+                    for (int col = 0; col < line.Length; col++)
+                    {
+                        char ch = line[col];
+                        if (ch == ' ') { sb.Append(' '); continue; }
+                        float t = ((float)col / Math.Max(1, line.Length - 1) + phase) % 1.0f;
+                        var (r, g, b) = Lerp(t);
+                        r = Clamp((int)(r * brightness));
+                        g = Clamp((int)(g * brightness));
+                        b = Clamp((int)(b * brightness));
+                        sb.Append($"\x1b[38;2;{r};{g};{b}m{ch}");
+                    }
+                    sb.Append(Reset);
+                    sb.Append(ClearEol);
+                    sb.Append('\n');
+                }
+                Console.Write(sb.ToString());
+                Thread.Sleep(60);
+            }
+
+            // Tagline and URL settle in below the logo, no animation.
+            Console.WriteLine();
+            var trailer = new StringBuilder();
+            CenterColored(trailer, Tagline, logoWidth, 6, 182, 212);
+            CenterColored(trailer, Url, logoWidth, 100, 116, 139);
+            Console.Write(trailer.ToString());
+            Console.WriteLine();
         }
 
         private static void BuildColor(StringBuilder sb, int logoWidth, bool showSarah)

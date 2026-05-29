@@ -35,6 +35,7 @@
 // dispatch on layer_types[i]).
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
@@ -127,6 +128,18 @@ namespace TensorSharp.Models
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
+
+            bool diagDispatch = _backend == BackendType.Mlx
+                && Environment.GetEnvironmentVariable("TS_DIAG_DISPATCH") == "1";
+            long dispatchBefore = diagDispatch ? TensorSharp.MLX.MlxWorker.DispatchCount : 0;
+            long queueBefore = diagDispatch ? TensorSharp.MLX.MlxWorker.QueueCount : 0;
+            long fwdStart = diagDispatch ? Stopwatch.GetTimestamp() : 0;
+            // Note: diagDispatch is for development only — the
+            // MlxWorker.DispatchCount / QueueCount counters use
+            // Interlocked.Increment on every Invoke/Dispatch even when
+            // the env-var is unset, which adds ~1-2 ns per call. For
+            // 14k calls/token that's 30 microseconds — fine for
+            // measurement, but consider compiling them out for prod.
 
             if (!IsBatchedPathEnabled())
             {
@@ -384,11 +397,36 @@ namespace TensorSharp.Models
                     }
                     else
                     {
-                        ManagedPagedAttention.Forward(
-                            qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
-                            numTokens, numHeads, numKVHeads, headDim, _q35PagedBlockSize,
-                            queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
-                            attentionScale, causal: true, slidingWindow: 0);
+                        // TensorPagedAttention is GPU-backed and ~10×
+                        // faster than ManagedPagedAttention for long
+                        // contexts, but pays a per-layer gather + host
+                        // tensor-create + readback overhead that wins
+                        // only once seq_len × heads × headDim crosses
+                        // the ~16K-element mark. Below that threshold
+                        // (typical chat-style decode at 32–256 tokens
+                        // on Qwen3.5's 16 attention layers) the
+                        // CPU-side scalar attention is actually faster.
+                        // Toggle via TS_QWEN35_MLX_TENSOR_PAGED_ATTN=1.
+                        bool useTensorPath = string.Equals(
+                            Environment.GetEnvironmentVariable("TS_QWEN35_MLX_TENSOR_PAGED_ATTN"),
+                            "1", StringComparison.Ordinal);
+                        if (useTensorPath)
+                        {
+                            TensorPagedAttention.Forward(
+                                _allocator, isGgmlBackend: false,
+                                qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
+                                numTokens, numHeads, numKVHeads, headDim, _q35PagedBlockSize,
+                                queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
+                                attentionScale, causal: true);
+                        }
+                        else
+                        {
+                            ManagedPagedAttention.Forward(
+                                qFlat, _q35PagedK[layer], _q35PagedV[layer], attnFlat,
+                                numTokens, numHeads, numKVHeads, headDim, _q35PagedBlockSize,
+                                queryStartLoc, seqLens, positions, ctx.BlockTables, numSeqs,
+                                attentionScale, causal: true, slidingWindow: 0);
+                        }
                     }
 
                     Tensor attnOut = CreateFloatTensor(attnFlat, numTokens, qDim);
@@ -451,6 +489,19 @@ namespace TensorSharp.Models
                 Buffer.BlockCopy(allLogits, s * Config.VocabSize * sizeof(float),
                                  slice, 0, Config.VocabSize * sizeof(float));
                 perSeq[s] = slice;
+            }
+
+            if (diagDispatch)
+            {
+                long totalDelta = TensorSharp.MLX.MlxWorker.DispatchCount - dispatchBefore;
+                long queueDelta = TensorSharp.MLX.MlxWorker.QueueCount - queueBefore;
+                long elapsedMs = (Stopwatch.GetTimestamp() - fwdStart) * 1000 / Stopwatch.Frequency;
+                try
+                {
+                    System.IO.File.AppendAllText("/tmp/ts_dispatch_diag.txt",
+                        $"[batch] seqs={numSeqs} tokens={numTokens} total_calls={totalDelta} queue_calls={queueDelta} inline={totalDelta - queueDelta} ms={elapsedMs}\n");
+                }
+                catch { }
             }
             return perSeq;
         }
