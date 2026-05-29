@@ -1155,6 +1155,7 @@ namespace TensorSharp.Models
         private bool CopyGdnStateOut(int layer, Span<byte> destination, out int written)
         {
             written = 0;
+            SyncCudaGdnConvStateToHost(layer);
             float[] conv = _convState[layer];
             int convBytes = conv.Length * sizeof(float);
             Tensor delta = _deltaStateTensor[layer];
@@ -1192,6 +1193,7 @@ namespace TensorSharp.Models
 
             source[..convBytes].CopyTo(MemoryMarshal.AsBytes(conv.AsSpan()));
             _convStateWriteIdx[layer] = BitConverter.ToInt32(source.Slice(convBytes, sizeof(int)));
+            SyncCudaGdnConvStateFromHost(layer);
 
             delta.Storage.EnsureHostReadable();
             IntPtr deltaBase = delta.Storage.PtrAtElement(0);

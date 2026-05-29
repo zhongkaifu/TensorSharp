@@ -352,6 +352,16 @@ __device__ __forceinline__ float silu(float x)
     return x / (1.0f + expf(-x));
 }
 
+__device__ __forceinline__ float sigmoid_f32(float x)
+{
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float softplus_f32(float x)
+{
+    return x > 0.0f ? x + log1pf(expf(-x)) : log1pf(expf(x));
+}
+
 __device__ __forceinline__ float gelu(float x)
 {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
@@ -532,6 +542,248 @@ extern "C" __global__ void ts_swiglu_oai_split_f32(const float* gate_up, float* 
     float y = fminf(fmaxf(row_ptr[col + half_dim], -limit), limit);
     float sig = 1.0f / (1.0f + expf(-alpha * x));
     output[idx] = x * sig * (y + 1.0f);
+}
+
+__device__ __forceinline__ float qwen35_gdn_conv_channel(
+    const float* packed,
+    const float* conv_state,
+    const float* conv_w,
+    int s,
+    int ch,
+    int seq_len,
+    int packed_dim,
+    int qkv_dim,
+    int conv_kernel,
+    int conv_write_idx)
+{
+    int conv_dim = conv_kernel - 1;
+    float acc = 0.0f;
+
+    for (int ki = 0; ki < conv_kernel; ki++)
+    {
+        int logical = s + ki;
+        float x;
+        if (logical < conv_dim)
+        {
+            int slot = (conv_write_idx + logical) % conv_dim;
+            x = conv_state[(size_t)slot * qkv_dim + ch];
+        }
+        else
+        {
+            int input_s = logical - conv_dim;
+            input_s = input_s < seq_len ? input_s : seq_len - 1;
+            x = packed[(size_t)input_s * packed_dim + ch];
+        }
+        acc += x * conv_w[(size_t)ch * conv_kernel + ki];
+    }
+
+    return silu(acc);
+}
+
+extern "C" __global__ void ts_qwen35_gdn_packed_f32(
+    const float* packed,
+    float* conv_state,
+    float* ssm_state,
+    const float* conv_w,
+    const float* dt_bias,
+    const float* a_log,
+    const float* ssm_norm,
+    float* output,
+    int seq_len,
+    int packed_dim,
+    int qkv_dim,
+    int qk_dim,
+    int v_dim,
+    int num_k_heads,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    int conv_kernel,
+    int conv_write_idx,
+    float eps)
+{
+    int h = blockIdx.x;
+    if (h >= num_v_heads)
+        return;
+
+    extern __shared__ float scratch[];
+    float* q = scratch;
+    float* k = q + head_k_dim;
+    float* core = k + head_k_dim;
+
+    __shared__ float q_scale;
+    __shared__ float k_scale;
+    __shared__ float gate_h;
+    __shared__ float beta_h;
+    __shared__ float delta_h;
+    __shared__ float rms_inv;
+
+    int tid = threadIdx.x;
+    int src_h = h % num_k_heads;
+    int q_offset = src_h * head_k_dim;
+    int k_offset = qk_dim + src_h * head_k_dim;
+    int v_offset = 2 * qk_dim + h * head_v_dim;
+    int z_offset = qkv_dim + h * head_v_dim;
+    int beta_offset = qkv_dim + v_dim + h;
+    int alpha_offset = qkv_dim + v_dim + num_v_heads + h;
+    int state_per_head = head_v_dim * head_k_dim;
+    float* state_head = ssm_state + (size_t)h * state_per_head;
+    float q_head_scale = rsqrtf((float)head_v_dim);
+
+    for (int s = 0; s < seq_len; s++)
+    {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (int d = tid; d < head_k_dim; d += blockDim.x)
+        {
+            float qv = qwen35_gdn_conv_channel(
+                packed, conv_state, conv_w, s, q_offset + d,
+                seq_len, packed_dim, qkv_dim, conv_kernel, conv_write_idx);
+            float kv = qwen35_gdn_conv_channel(
+                packed, conv_state, conv_w, s, k_offset + d,
+                seq_len, packed_dim, qkv_dim, conv_kernel, conv_write_idx);
+            q[d] = qv;
+            k[d] = kv;
+            q_sum += qv * qv;
+            k_sum += kv * kv;
+        }
+
+        q_sum = block_reduce_sum(q_sum);
+        k_sum = block_reduce_sum(k_sum);
+        if (tid == 0)
+        {
+            q_scale = rsqrtf(q_sum + eps) * q_head_scale;
+            k_scale = rsqrtf(k_sum + eps);
+            const float* packed_row = packed + (size_t)s * packed_dim;
+            gate_h = softplus_f32(packed_row[alpha_offset] + dt_bias[h]) * a_log[h];
+            beta_h = sigmoid_f32(packed_row[beta_offset]);
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_k_dim; d += blockDim.x)
+        {
+            q[d] *= q_scale;
+            k[d] *= k_scale;
+        }
+        __syncthreads();
+
+        float state_scale = expf(gate_h);
+        for (int i = tid; i < state_per_head; i += blockDim.x)
+            state_head[i] *= state_scale;
+        __syncthreads();
+
+        for (int row = 0; row < head_v_dim; row++)
+        {
+            float* state_row = state_head + row * head_k_dim;
+            float kv_mem = 0.0f;
+            for (int d = tid; d < head_k_dim; d += blockDim.x)
+                kv_mem += state_row[d] * k[d];
+            kv_mem = block_reduce_sum(kv_mem);
+
+            if (tid == 0)
+            {
+                float v = qwen35_gdn_conv_channel(
+                    packed, conv_state, conv_w, s, v_offset + row,
+                    seq_len, packed_dim, qkv_dim, conv_kernel, conv_write_idx);
+                delta_h = (v - kv_mem) * beta_h;
+            }
+            __syncthreads();
+
+            for (int d = tid; d < head_k_dim; d += blockDim.x)
+                state_row[d] += k[d] * delta_h;
+            __syncthreads();
+
+            float core_v = 0.0f;
+            for (int d = tid; d < head_k_dim; d += blockDim.x)
+                core_v += state_row[d] * q[d];
+            core_v = block_reduce_sum(core_v);
+            if (tid == 0)
+                core[row] = core_v;
+            __syncthreads();
+        }
+
+        float sum_sq = 0.0f;
+        for (int row = tid; row < head_v_dim; row += blockDim.x)
+            sum_sq += core[row] * core[row];
+        sum_sq = block_reduce_sum(sum_sq);
+        if (tid == 0)
+            rms_inv = rsqrtf(sum_sq / (float)head_v_dim + eps);
+        __syncthreads();
+
+        float* out_row = output + (size_t)s * v_dim + h * head_v_dim;
+        const float* packed_row = packed + (size_t)s * packed_dim;
+        for (int row = tid; row < head_v_dim; row += blockDim.x)
+        {
+            float z = packed_row[z_offset + row];
+            out_row[row] = core[row] * rms_inv * ssm_norm[row] * silu(z);
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void ts_qwen35_gdn_update_conv_state_f32(
+    const float* packed,
+    float* conv_state,
+    int seq_len,
+    int packed_dim,
+    int qkv_dim,
+    int conv_dim,
+    int conv_write_idx)
+{
+    int tail = seq_len < conv_dim ? seq_len : conv_dim;
+    int total = tail * qkv_dim;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total)
+        return;
+
+    int t = i / qkv_dim;
+    int ch = i - t * qkv_dim;
+    int s = seq_len - tail + t;
+    int slot = (conv_write_idx + s) % conv_dim;
+    conv_state[(size_t)slot * qkv_dim + ch] = packed[(size_t)s * packed_dim + ch];
+}
+
+extern "C" __global__ void ts_qwen35_gdn_pack_inputs_f32(
+    const float* qkv,
+    const float* z,
+    const float* beta,
+    const float* alpha,
+    float* packed,
+    int seq_len,
+    int qkv_dim,
+    int z_dim,
+    int num_v_heads,
+    int packed_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * packed_dim;
+    if (i >= total)
+        return;
+
+    int s = i / packed_dim;
+    int col = i - s * packed_dim;
+    if (col < qkv_dim)
+    {
+        packed[i] = qkv[(size_t)s * qkv_dim + col];
+        return;
+    }
+
+    col -= qkv_dim;
+    if (col < z_dim)
+    {
+        packed[i] = z[(size_t)s * z_dim + col];
+        return;
+    }
+
+    col -= z_dim;
+    if (col < num_v_heads)
+    {
+        packed[i] = beta[(size_t)s * num_v_heads + col];
+        return;
+    }
+
+    col -= num_v_heads;
+    packed[i] = alpha[(size_t)s * num_v_heads + col];
 }
 
 extern "C" __global__ void ts_rmsnorm_f32(

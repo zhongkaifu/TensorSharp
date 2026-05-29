@@ -22,6 +22,9 @@ namespace TensorSharp.Cuda
         private readonly IntPtr siluMulSplitF32;
         private readonly IntPtr geluMulSplitF32;
         private readonly IntPtr swigluOaiSplitF32;
+        private readonly IntPtr qwen35GdnPackedF32;
+        private readonly IntPtr qwen35GdnUpdateConvStateF32;
+        private readonly IntPtr qwen35GdnPackInputsF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr softmaxF32;
         private readonly IntPtr attentionSoftmaxSinksF32;
@@ -73,6 +76,9 @@ namespace TensorSharp.Cuda
             siluMulSplitF32 = module.GetFunction("ts_silu_mul_split_f32");
             geluMulSplitF32 = module.GetFunction("ts_gelu_mul_split_f32");
             swigluOaiSplitF32 = module.GetFunction("ts_swiglu_oai_split_f32");
+            qwen35GdnPackedF32 = module.GetFunction("ts_qwen35_gdn_packed_f32");
+            qwen35GdnUpdateConvStateF32 = module.GetFunction("ts_qwen35_gdn_update_conv_state_f32");
+            qwen35GdnPackInputsF32 = module.GetFunction("ts_qwen35_gdn_pack_inputs_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             attentionSoftmaxSinksF32 = module.GetFunction("ts_attention_softmax_sinks_f32");
@@ -266,6 +272,106 @@ namespace TensorSharp.Cuda
             int count = checked(rows * halfDim);
             void** args = stackalloc void*[] { &gateUpArg, &outputArg, &rowsArg, &halfDimArg, &alphaArg, &limitArg };
             Launch(swigluOaiSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQwen35GatedDeltaNetPackedF32(
+            IntPtr packed,
+            IntPtr convState,
+            IntPtr ssmState,
+            IntPtr convWeight,
+            IntPtr dtBias,
+            IntPtr aLog,
+            IntPtr ssmNorm,
+            IntPtr output,
+            int seqLen,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            int numKHeads,
+            int numVHeads,
+            int headKDim,
+            int headVDim,
+            int convKernel,
+            int convWriteIdx,
+            float eps,
+            IntPtr stream)
+        {
+            IntPtr packedArg = packed;
+            IntPtr convStateArg = convState;
+            IntPtr ssmStateArg = ssmState;
+            IntPtr convWeightArg = convWeight;
+            IntPtr dtBiasArg = dtBias;
+            IntPtr aLogArg = aLog;
+            IntPtr ssmNormArg = ssmNorm;
+            IntPtr outputArg = output;
+            int seqLenArg = seqLen;
+            int packedDimArg = packedDim;
+            int qkvDimArg = qkvDim;
+            int qkDimArg = qkDim;
+            int vDimArg = vDim;
+            int numKHeadsArg = numKHeads;
+            int numVHeadsArg = numVHeads;
+            int headKDimArg = headKDim;
+            int headVDimArg = headVDim;
+            int convKernelArg = convKernel;
+            int convWriteIdxArg = convWriteIdx;
+            float epsArg = eps;
+            void** args = stackalloc void*[]
+            {
+                &packedArg, &convStateArg, &ssmStateArg, &convWeightArg, &dtBiasArg,
+                &aLogArg, &ssmNormArg, &outputArg, &seqLenArg, &packedDimArg,
+                &qkvDimArg, &qkDimArg, &vDimArg, &numKHeadsArg, &numVHeadsArg,
+                &headKDimArg, &headVDimArg, &convKernelArg, &convWriteIdxArg, &epsArg
+            };
+            uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
+            Launch(qwen35GdnPackedF32, (uint)numVHeads, 1, 1, BlockSize, 1, 1, sharedBytes, stream, args);
+
+            int convDim = convKernel - 1;
+            if (convDim <= 0)
+                return;
+
+            int tail = Math.Min(seqLen, convDim);
+            int updateCount = checked(tail * qkvDim);
+            int convDimArg = convDim;
+            void** updateArgs = stackalloc void*[]
+            {
+                &packedArg, &convStateArg, &seqLenArg, &packedDimArg, &qkvDimArg,
+                &convDimArg, &convWriteIdxArg
+            };
+            Launch(qwen35GdnUpdateConvStateF32, Grid(updateCount), 1, 1, BlockSize, 1, 1, 0, stream, updateArgs);
+        }
+
+        public void LaunchQwen35GatedDeltaNetPackInputsF32(
+            IntPtr qkv,
+            IntPtr z,
+            IntPtr beta,
+            IntPtr alpha,
+            IntPtr packed,
+            int seqLen,
+            int qkvDim,
+            int zDim,
+            int numVHeads,
+            int packedDim,
+            IntPtr stream)
+        {
+            IntPtr qkvArg = qkv;
+            IntPtr zArg = z;
+            IntPtr betaArg = beta;
+            IntPtr alphaArg = alpha;
+            IntPtr packedArg = packed;
+            int seqLenArg = seqLen;
+            int qkvDimArg = qkvDim;
+            int zDimArg = zDim;
+            int numVHeadsArg = numVHeads;
+            int packedDimArg = packedDim;
+            int count = checked(seqLen * packedDim);
+            void** args = stackalloc void*[]
+            {
+                &qkvArg, &zArg, &betaArg, &alphaArg, &packedArg,
+                &seqLenArg, &qkvDimArg, &zDimArg, &numVHeadsArg, &packedDimArg
+            };
+            Launch(qwen35GdnPackInputsF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)

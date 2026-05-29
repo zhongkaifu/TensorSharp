@@ -39,6 +39,7 @@ using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
 
@@ -82,6 +83,16 @@ namespace TensorSharp.Models
         private static readonly bool GdnVerifyChunkedEnv =
             string.Equals(Environment.GetEnvironmentVariable("GDN_VERIFY_CHUNKED"), "1",
                 StringComparison.Ordinal);
+
+        // Direct CUDA runs the packed Qwen3.5/Qwen3.6 GDN recurrence on device
+        // instead of downloading the packed projection, conv state, and SSM state
+        // for the managed per-token loop. Set TS_CUDA_QWEN35_GDN_NATIVE=0 to
+        // force the legacy path for A/B benchmarking.
+        private static readonly bool CudaGdnNativeEnabledEnv =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QWEN35_GDN_NATIVE"), "0",
+                StringComparison.Ordinal) &&
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QWEN35_GDN_NATIVE"), "false",
+                StringComparison.OrdinalIgnoreCase);
 
         // Tolerance above which the verification mode logs a warning. A few
         // ULPs of drift are normal because the chunked GGML path executes the
@@ -150,6 +161,7 @@ namespace TensorSharp.Models
         // O(convDim*qkvDim) Array.Copy per token in the recurrent step.
         private float[][] _convState;  // [layer][convChannels * (convKernelSize-1)]
         private int[] _convStateWriteIdx;
+        private Tensor[] _cudaGdnConvStateTensor; // [layer]: Tensor[convDim, qkvDim] for direct CUDA
         private Tensor[] _deltaStateTensor; // [layer]: Tensor[numVHeads, headVDim, headKDim]
         private MlxFusedOps.GatedDeltaNetCache[] _mlxGdnCache;
 
@@ -209,7 +221,9 @@ namespace TensorSharp.Models
         private bool _gdnDisableChunkedPrefill = GdnChunkedPrefillDisabledEnv;
         private long _gdnChunkedTicks;       // Total time spent in the chunked path
         private long _gdnPerTokenTicks;      // Total time spent in the per-token path (prefill only)
+        private long _gdnCudaNativeTicks;    // Total time spent in the direct CUDA native GDN path
         private int _gdnChunkedCalls;        // Number of times the chunked path has been used
+        private int _gdnCudaNativeCalls;     // Number of times direct CUDA native GDN has been used
         private long _gdnChunkedCpuPrepTicks; // Time spent in CPU prep (Conv1D + memcpy + SiLU)
         private long _gdnChunkedKernelTicks; // Time spent in the GGML kernel call (incl. sync + download)
 
@@ -369,6 +383,11 @@ namespace TensorSharp.Models
             int convDim = _convKernel - 1;
             _convState[l] = new float[convDim * qkvDim];
             _convStateWriteIdx[l] = 0;
+            if (_cudaGdnConvStateTensor != null && convDim > 0)
+            {
+                _cudaGdnConvStateTensor[l] = new Tensor(_allocator, DType.Float32, convDim, qkvDim);
+                Ops.Fill(_cudaGdnConvStateTensor[l], 0);
+            }
             _deltaStateTensor[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
             Ops.Fill(_deltaStateTensor[l], 0);
             if (_mlxGdnCache != null)
@@ -383,6 +402,9 @@ namespace TensorSharp.Models
         {
             _convState = new float[numLayers][];
             _convStateWriteIdx = new int[numLayers];
+            _cudaGdnConvStateTensor = _backend == BackendType.Cuda
+                ? new Tensor[numLayers]
+                : null;
             _deltaStateTensor = new Tensor[numLayers];
             _mlxGdnCache = _backend == BackendType.Mlx
                 ? new MlxFusedOps.GatedDeltaNetCache[numLayers]
@@ -396,8 +418,29 @@ namespace TensorSharp.Models
         {
             Array.Clear(_convState[l]);
             _convStateWriteIdx[l] = 0;
+            if (_cudaGdnConvStateTensor?[l] != null)
+                Ops.Fill(_cudaGdnConvStateTensor[l], 0);
             Ops.Fill(_deltaStateTensor[l], 0);
             _mlxGdnCache?[l]?.Reset();
+        }
+
+        private void SyncCudaGdnConvStateToHost(int layer)
+        {
+            Tensor conv = _cudaGdnConvStateTensor?[layer];
+            if (conv == null || _convState?[layer] == null)
+                return;
+
+            float[] values = conv.GetElementsAsFloat((int)conv.ElementCount());
+            Array.Copy(values, _convState[layer], values.Length);
+        }
+
+        private void SyncCudaGdnConvStateFromHost(int layer)
+        {
+            Tensor conv = _cudaGdnConvStateTensor?[layer];
+            if (conv == null || _convState?[layer] == null)
+                return;
+
+            conv.SetElementsAsFloat(_convState[layer]);
         }
 
         /// <summary>
@@ -438,6 +481,8 @@ namespace TensorSharp.Models
         /// </summary>
         private void DisposeGdnState()
         {
+            if (_cudaGdnConvStateTensor != null)
+                foreach (var t in _cudaGdnConvStateTensor) t?.Dispose();
             if (_deltaStateTensor != null)
                 foreach (var t in _deltaStateTensor) t?.Dispose();
             if (_mlxGdnCache != null)
@@ -478,8 +523,9 @@ namespace TensorSharp.Models
             double msPerTick = 1000.0 / Stopwatch.Frequency;
             double chunkedMs = _gdnChunkedTicks * msPerTick;
             double perTokenMs = _gdnPerTokenTicks * msPerTick;
+            double cudaNativeMs = _gdnCudaNativeTicks * msPerTick;
 
-            if (_gdnChunkedCalls == 0 && _gdnPerTokenCalls == 0)
+            if (_gdnChunkedCalls == 0 && _gdnPerTokenCalls == 0 && _gdnCudaNativeCalls == 0)
                 return;
 
             double cpuPrepMs = _gdnChunkedCpuPrepTicks * msPerTick;
@@ -493,6 +539,8 @@ namespace TensorSharp.Models
                 Console.WriteLine($"      cpu prep:     {cpuPrepMs:F0} ms total, {cpuPrepMs / _gdnChunkedCalls:F2} ms/call");
                 Console.WriteLine($"      ggml kernel:  {kernelMs:F0} ms total, {kernelMs / _gdnChunkedCalls:F2} ms/call");
             }
+            Console.WriteLine($"    cuda native:    {_gdnCudaNativeCalls} calls, {cudaNativeMs:F0} ms total" +
+                (_gdnCudaNativeCalls > 0 ? $", {cudaNativeMs / _gdnCudaNativeCalls:F2} ms/call" : ""));
             Console.WriteLine($"    per-token path: {_gdnPerTokenCalls} prefill calls, {perTokenMs:F0} ms total" +
                 (_gdnPerTokenCalls > 0 ? $", {perTokenMs / _gdnPerTokenCalls:F2} ms/call" : ""));
             if (_gdnDisableChunkedPrefill)
@@ -517,7 +565,9 @@ namespace TensorSharp.Models
         {
             _gdnChunkedTicks = 0;
             _gdnPerTokenTicks = 0;
+            _gdnCudaNativeTicks = 0;
             _gdnChunkedCalls = 0;
+            _gdnCudaNativeCalls = 0;
             _gdnChunkedCpuPrepTicks = 0;
             _gdnChunkedKernelTicks = 0;
             _gdnPerTokenCalls = 0;
@@ -772,6 +822,7 @@ namespace TensorSharp.Models
             Tensor gated = null;
             float* gatedBase = null;
             bool ranMlxNativeGdn = false;
+            bool ranCudaNativeGdn = false;
 
             if (packedInput != null)
             {
@@ -811,6 +862,10 @@ namespace TensorSharp.Models
                 }
 
                 if (!ranMlxNativeGdn)
+                    ranCudaNativeGdn = TryRunCudaNativeGdnPacked(
+                        packedInput, layer, seqLen, packedDim, qkvDim, qkDim, vDim, out gated);
+
+                if (!ranMlxNativeGdn && !ranCudaNativeGdn)
                     packedPtr = GetFloatPtr(packedInput);
             }
             else
@@ -859,7 +914,33 @@ namespace TensorSharp.Models
                     }
                 }
 
-                if (!ranMlxNativeGdn)
+                if (!ranMlxNativeGdn && CudaGdnNativeEnabledEnv && _backend == BackendType.Cuda)
+                {
+                    bool reuseDecodePacked = seqLen == 1 && _gdnDecodePackedBuf != null;
+                    Tensor cudaPacked = reuseDecodePacked
+                        ? _gdnDecodePackedBuf
+                        : new Tensor(_allocator, DType.Float32, seqLen, packedDim);
+                    bool packedOk = CudaFusedOps.TryQwen35GatedDeltaNetPackInputs(
+                        cudaPacked,
+                        qkvRaw,
+                        zRaw,
+                        betaRaw,
+                        alphaRaw,
+                        seqLen,
+                        qkvDim,
+                        zDim,
+                        _numVHeads,
+                        packedDim);
+                    if (packedOk)
+                    {
+                        ranCudaNativeGdn = TryRunCudaNativeGdnPacked(
+                            cudaPacked, layer, seqLen, packedDim, qkvDim, qkDim, vDim, out gated);
+                    }
+                    if (!reuseDecodePacked)
+                        cudaPacked.Dispose();
+                }
+
+                if (!ranMlxNativeGdn && !ranCudaNativeGdn)
                 {
                     qkvBase = GetFloatPtr(qkvRaw);
                     zBase = GetFloatPtr(zRaw);
@@ -868,7 +949,7 @@ namespace TensorSharp.Models
                 }
             }
 
-            if (!ranMlxNativeGdn)
+            if (!ranMlxNativeGdn && !ranCudaNativeGdn)
             {
                 // Pre-resolved layer constants (cached at construction; no dictionary lookup here).
                 float* dtBiasPtr = GetFloatPtr(_ssmDtBiasW[layer]);
@@ -1000,6 +1081,69 @@ namespace TensorSharp.Models
             if (profilePrefill) _prefillRecOutputTicks += Stopwatch.GetTimestamp() - stageStart;
             _attnTicks += Stopwatch.GetTimestamp() - t0;
             return fusedAdd ? null : output;
+        }
+
+        private bool TryRunCudaNativeGdnPacked(
+            Tensor packedInput,
+            int layer,
+            int seqLen,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            out Tensor gated)
+        {
+            gated = null;
+            if (!CudaGdnNativeEnabledEnv
+                || _backend != BackendType.Cuda
+                || packedInput == null
+                || _cudaGdnConvStateTensor?[layer] == null
+                || _ssmConv1dW[layer] == null
+                || _ssmDtBiasW[layer] == null
+                || _ssmAW[layer] == null
+                || _ssmNormW[layer] == null)
+            {
+                return false;
+            }
+
+            gated = seqLen == 1 ? _gdnGatedOutT : new Tensor(_allocator, DType.Float32, seqLen, _ssmDInner);
+            long tCuda = Stopwatch.GetTimestamp();
+            bool ok = CudaFusedOps.TryQwen35GatedDeltaNetPacked(
+                gated,
+                packedInput,
+                _cudaGdnConvStateTensor[layer],
+                _deltaStateTensor[layer],
+                _ssmConv1dW[layer],
+                _ssmDtBiasW[layer],
+                _ssmAW[layer],
+                _ssmNormW[layer],
+                seqLen,
+                packedDim,
+                qkvDim,
+                qkDim,
+                vDim,
+                _numKHeads,
+                _numVHeads,
+                _headKDim,
+                _headVDim,
+                _convKernel,
+                _convStateWriteIdx[layer],
+                Config.Eps);
+
+            if (!ok)
+            {
+                if (seqLen > 1)
+                    gated.Dispose();
+                gated = null;
+                return false;
+            }
+
+            int convDim = _convKernel - 1;
+            if (convDim > 0)
+                _convStateWriteIdx[layer] = (_convStateWriteIdx[layer] + seqLen) % convDim;
+            _gdnCudaNativeTicks += Stopwatch.GetTimestamp() - tCuda;
+            _gdnCudaNativeCalls++;
+            return true;
         }
 
         /// <summary>

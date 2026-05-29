@@ -194,5 +194,75 @@ namespace TensorSharp.Cuda
         {
             return CudaKernelOps.TrySwiGluOaiSplit(result, gateUp, halfDim, alpha, limit);
         }
+
+        public static bool TryQwen35GatedDeltaNetPacked(
+            Tensor result,
+            Tensor packed,
+            Tensor convState,
+            Tensor ssmState,
+            Tensor convWeight,
+            Tensor dtBias,
+            Tensor aLog,
+            Tensor ssmNorm,
+            int seqLen,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            int numKHeads,
+            int numVHeads,
+            int headKDim,
+            int headVDim,
+            int convKernel,
+            int convWriteIdx,
+            float eps)
+        {
+            return CudaKernelOps.TryQwen35GatedDeltaNetPacked(
+                result,
+                packed,
+                convState,
+                ssmState,
+                convWeight,
+                dtBias,
+                aLog,
+                ssmNorm,
+                seqLen,
+                packedDim,
+                qkvDim,
+                qkDim,
+                vDim,
+                numKHeads,
+                numVHeads,
+                headKDim,
+                headVDim,
+                convKernel,
+                convWriteIdx,
+                eps);
+        }
+
+        public static bool TryQwen35GatedDeltaNetPackInputs(
+            Tensor packed,
+            Tensor qkv,
+            Tensor z,
+            Tensor beta,
+            Tensor alpha,
+            int seqLen,
+            int qkvDim,
+            int zDim,
+            int numVHeads,
+            int packedDim)
+        {
+            return CudaKernelOps.TryQwen35GatedDeltaNetPackInputs(
+                packed,
+                qkv,
+                z,
+                beta,
+                alpha,
+                seqLen,
+                qkvDim,
+                zDim,
+                numVHeads,
+                packedDim);
+        }
     }
 }

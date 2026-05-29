@@ -75,21 +75,130 @@ namespace TensorSharp.Cuda
 
         public static bool TryCopy(Tensor result, Tensor src)
         {
-            if (!TryGetContiguous(result, out CudaStorage resultStorage, out _, out long resultCount) ||
-                !TryGetContiguous(src, out CudaStorage srcStorage, out _, out long srcCount))
+            if (result == null || src == null ||
+                result.Storage is not CudaStorage resultStorage ||
+                src.Storage is not CudaStorage srcStorage ||
+                result.ElementType != src.ElementType ||
+                result.ElementCount() != src.ElementCount() ||
+                !SameShape(result, src))
             {
                 return false;
             }
 
-            if (result.ElementType != src.ElementType || resultCount != srcCount)
+            long elementCount = result.ElementCount();
+            if (elementCount == 0)
+                return true;
+
+            if (result.IsContiguous() && src.IsContiguous())
+            {
+                srcStorage.EnsureDeviceCurrent();
+                long byteCount = checked(result.ElementType.ByteLengthFor(elementCount));
+                long resultByteOffset = ElementOffsetToBytes(result.StorageOffset, result.ElementType);
+                long srcByteOffset = ElementOffsetToBytes(src.StorageOffset, src.ElementType);
+                resultStorage.CopyDeviceFrom(srcStorage, resultByteOffset, srcByteOffset, byteCount);
+                return true;
+            }
+
+            return TryCopyStridedBytes(result, src, resultStorage, srcStorage);
+        }
+
+        private static bool TryCopyStridedBytes(Tensor result, Tensor src, CudaStorage resultStorage, CudaStorage srcStorage)
+        {
+            if (ReferenceEquals(resultStorage, srcStorage) && !SameStorageView(result, src))
                 return false;
 
-            srcStorage.EnsureDeviceCurrent();
-            long byteCount = checked(resultCount * result.ElementType.Size());
-            long resultByteOffset = checked(result.StorageOffset * result.ElementType.Size());
-            long srcByteOffset = checked(src.StorageOffset * src.ElementType.Size());
-            resultStorage.CopyDeviceFrom(srcStorage, resultByteOffset, srcByteOffset, byteCount);
+            int dimCount = result.DimensionCount;
+            ReadOnlySpan<long> resultSizes = result.Sizes;
+            ReadOnlySpan<long> resultStrides = result.Strides;
+            ReadOnlySpan<long> srcStrides = src.Strides;
+
+            long innerElems = 1;
+            int outerDims = dimCount;
+            for (int d = dimCount - 1; d >= 0; d--)
+            {
+                long size = resultSizes[d];
+                if (size == 1)
+                {
+                    outerDims = d;
+                    continue;
+                }
+
+                if (resultStrides[d] != innerElems || srcStrides[d] != innerElems)
+                    break;
+
+                innerElems = checked(innerElems * size);
+                outerDims = d;
+            }
+
+            if (outerDims == dimCount)
+                return false;
+
+            DType dtype = result.ElementType;
+            if (dtype == DType.Q8_0 && (innerElems % 32) != 0)
+                return false;
+
+            long innerBytes = checked(dtype.ByteLengthFor(innerElems));
+            long[] counter = outerDims > 0 ? new long[outerDims] : Array.Empty<long>();
+
+            while (true)
+            {
+                long resultElemOffset = result.StorageOffset;
+                long srcElemOffset = src.StorageOffset;
+                for (int d = 0; d < outerDims; d++)
+                {
+                    resultElemOffset = checked(resultElemOffset + counter[d] * resultStrides[d]);
+                    srcElemOffset = checked(srcElemOffset + counter[d] * srcStrides[d]);
+                }
+
+                long resultByteOffset = ElementOffsetToBytes(resultElemOffset, dtype);
+                long srcByteOffset = ElementOffsetToBytes(srcElemOffset, dtype);
+                resultStorage.CopyDeviceFrom(srcStorage, resultByteOffset, srcByteOffset, innerBytes);
+
+                int dim = outerDims - 1;
+                while (dim >= 0)
+                {
+                    counter[dim]++;
+                    if (counter[dim] < resultSizes[dim])
+                        break;
+                    counter[dim] = 0;
+                    dim--;
+                }
+
+                if (dim < 0)
+                    break;
+            }
+
             return true;
+        }
+
+        private static bool SameStorageView(Tensor result, Tensor src)
+        {
+            if (result.StorageOffset != src.StorageOffset ||
+                result.DimensionCount != src.DimensionCount)
+            {
+                return false;
+            }
+
+            for (int d = 0; d < result.DimensionCount; d++)
+            {
+                if (result.Sizes[d] != src.Sizes[d] || result.Strides[d] != src.Strides[d])
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static long ElementOffsetToBytes(long elementOffset, DType dtype)
+        {
+            if (dtype == DType.Q8_0)
+            {
+                if ((elementOffset % 32) != 0)
+                    throw new InvalidOperationException(
+                        $"Q8_0 byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
+                return checked((elementOffset / 32) * 34);
+            }
+
+            return checked(elementOffset * dtype.Size());
         }
 
         public static bool TryUnary(Tensor result, Tensor src, CudaUnaryOp op)
@@ -1543,6 +1652,190 @@ namespace TensorSharp.Cuda
                 addToResult ? 1 : 0,
                 allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryQwen35GatedDeltaNetPacked(
+            Tensor result,
+            Tensor packed,
+            Tensor convState,
+            Tensor ssmState,
+            Tensor convWeight,
+            Tensor dtBias,
+            Tensor aLog,
+            Tensor ssmNorm,
+            int seqLen,
+            int packedDim,
+            int qkvDim,
+            int qkDim,
+            int vDim,
+            int numKHeads,
+            int numVHeads,
+            int headKDim,
+            int headVDim,
+            int convKernel,
+            int convWriteIdx,
+            float eps)
+        {
+            int convDim = convKernel - 1;
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(packed, out CudaStorage packedStorage, out IntPtr packedPtr, out int packedCount) ||
+                !TryGetContiguousFloat(convState, out CudaStorage convStateStorage, out IntPtr convStatePtr, out int convStateCount) ||
+                !TryGetContiguousFloat(ssmState, out CudaStorage ssmStateStorage, out IntPtr ssmStatePtr, out int ssmStateCount) ||
+                !TryGetContiguousFloat(convWeight, out CudaStorage convWeightStorage, out IntPtr convWeightPtr, out int convWeightCount) ||
+                !TryGetContiguousFloat(dtBias, out CudaStorage dtBiasStorage, out IntPtr dtBiasPtr, out int dtBiasCount) ||
+                !TryGetContiguousFloat(aLog, out CudaStorage aLogStorage, out IntPtr aLogPtr, out int aLogCount) ||
+                !TryGetContiguousFloat(ssmNorm, out CudaStorage ssmNormStorage, out IntPtr ssmNormPtr, out int ssmNormCount) ||
+                seqLen <= 0 ||
+                packedDim <= 0 ||
+                qkvDim <= 0 ||
+                qkDim <= 0 ||
+                vDim <= 0 ||
+                numKHeads <= 0 ||
+                numVHeads <= 0 ||
+                headKDim <= 0 ||
+                headVDim <= 0 ||
+                convKernel <= 0 ||
+                convDim <= 0 ||
+                convWriteIdx < 0 ||
+                convWriteIdx >= convDim ||
+                eps <= 0.0f ||
+                qkDim != checked(numKHeads * headKDim) ||
+                vDim != checked(numVHeads * headVDim) ||
+                qkvDim != checked(2 * qkDim + vDim) ||
+                packedDim < checked(qkvDim + vDim + 2 * numVHeads) ||
+                result.DimensionCount != 2 ||
+                packed.DimensionCount != 2 ||
+                result.Sizes[0] != seqLen ||
+                result.Sizes[1] != vDim ||
+                packed.Sizes[0] != seqLen ||
+                packed.Sizes[1] != packedDim ||
+                resultCount != checked(seqLen * vDim) ||
+                packedCount != checked(seqLen * packedDim) ||
+                convStateCount != checked(convDim * qkvDim) ||
+                ssmStateCount != checked(numVHeads * headVDim * headKDim) ||
+                convWeightCount != checked(qkvDim * convKernel) ||
+                dtBiasCount < numVHeads ||
+                aLogCount < numVHeads ||
+                ssmNormCount < headVDim)
+            {
+                return false;
+            }
+
+            int updateTail = Math.Min(seqLen, convDim);
+            if (updateTail > 0)
+                _ = checked(updateTail * qkvDim);
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            packedStorage.EnsureDeviceCurrent();
+            convStateStorage.EnsureDeviceCurrent();
+            ssmStateStorage.EnsureDeviceCurrent();
+            convWeightStorage.EnsureDeviceCurrent();
+            dtBiasStorage.EnsureDeviceCurrent();
+            aLogStorage.EnsureDeviceCurrent();
+            ssmNormStorage.EnsureDeviceCurrent();
+
+            allocator.Context.MakeCurrent();
+            kernels.LaunchQwen35GatedDeltaNetPackedF32(
+                packedPtr,
+                convStatePtr,
+                ssmStatePtr,
+                convWeightPtr,
+                dtBiasPtr,
+                aLogPtr,
+                ssmNormPtr,
+                resultPtr,
+                seqLen,
+                packedDim,
+                qkvDim,
+                qkDim,
+                vDim,
+                numKHeads,
+                numVHeads,
+                headKDim,
+                headVDim,
+                convKernel,
+                convWriteIdx,
+                eps,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            convStateStorage.MarkDeviceModified();
+            ssmStateStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryQwen35GatedDeltaNetPackInputs(
+            Tensor packed,
+            Tensor qkv,
+            Tensor z,
+            Tensor beta,
+            Tensor alpha,
+            int seqLen,
+            int qkvDim,
+            int zDim,
+            int numVHeads,
+            int packedDim)
+        {
+            if (!TryGetContiguousFloat(packed, out CudaStorage packedStorage, out IntPtr packedPtr, out int packedCount) ||
+                !TryGetContiguousFloat(qkv, out CudaStorage qkvStorage, out IntPtr qkvPtr, out int qkvCount) ||
+                !TryGetContiguousFloat(z, out CudaStorage zStorage, out IntPtr zPtr, out int zCount) ||
+                !TryGetContiguousFloat(beta, out CudaStorage betaStorage, out IntPtr betaPtr, out int betaCount) ||
+                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
+                seqLen <= 0 ||
+                qkvDim <= 0 ||
+                zDim <= 0 ||
+                numVHeads <= 0 ||
+                packedDim != checked(qkvDim + zDim + 2 * numVHeads) ||
+                packed.DimensionCount != 2 ||
+                qkv.DimensionCount != 2 ||
+                z.DimensionCount != 2 ||
+                beta.DimensionCount != 2 ||
+                alpha.DimensionCount != 2 ||
+                packed.Sizes[0] != seqLen ||
+                packed.Sizes[1] != packedDim ||
+                qkv.Sizes[0] != seqLen ||
+                qkv.Sizes[1] != qkvDim ||
+                z.Sizes[0] != seqLen ||
+                z.Sizes[1] != zDim ||
+                beta.Sizes[0] != seqLen ||
+                beta.Sizes[1] != numVHeads ||
+                alpha.Sizes[0] != seqLen ||
+                alpha.Sizes[1] != numVHeads ||
+                packedCount != checked(seqLen * packedDim) ||
+                qkvCount != checked(seqLen * qkvDim) ||
+                zCount != checked(seqLen * zDim) ||
+                betaCount != checked(seqLen * numVHeads) ||
+                alphaCount != checked(seqLen * numVHeads))
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = packedStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            qkvStorage.EnsureDeviceCurrent();
+            zStorage.EnsureDeviceCurrent();
+            betaStorage.EnsureDeviceCurrent();
+            alphaStorage.EnsureDeviceCurrent();
+
+            allocator.Context.MakeCurrent();
+            kernels.LaunchQwen35GatedDeltaNetPackInputsF32(
+                qkvPtr,
+                zPtr,
+                betaPtr,
+                alphaPtr,
+                packedPtr,
+                seqLen,
+                qkvDim,
+                zDim,
+                numVHeads,
+                packedDim,
+                allocator.Stream.Handle);
+            packedStorage.MarkDeviceModified();
             return true;
         }
 
