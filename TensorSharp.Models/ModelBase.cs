@@ -519,14 +519,18 @@ namespace TensorSharp.Models
             if (isGpuBackend &&
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
             {
-                // MLX on Apple Silicon shares unified memory with the model
-                // weights, so a smaller initial cache reduces RAM pressure at
-                // load — especially important for 25-32 GB Macs running 14+ GB
-                // models, where every spare gigabyte avoids the macOS memory
-                // compressor activating. The cache grows on demand for longer
-                // sessions; users with persistent long contexts can override
-                // via MAX_CONTEXT to allocate the full window up-front.
-                int effectiveDefault = backend == BackendType.Mlx ? Math.Min(gpuDefault, 2048) : gpuDefault;
+                // Direct GPU backends benefit from a smaller initial KV allocation so
+                // huge advertised contexts (for example 262k) do not reserve the entire
+                // GPU budget before the dynamic CPU/KV cache compressor activates.
+                // The cache grows on demand for longer sessions; users with persistent
+                // long contexts can override via MAX_CONTEXT to allocate the full window
+                // up-front.
+                int effectiveDefault = backend switch
+                {
+                    BackendType.Mlx => Math.Min(gpuDefault, 2048),
+                    BackendType.Cuda => Math.Min(gpuDefault, 2048),
+                    _ => gpuDefault,
+                };
                 return Math.Min(requestedContextLength, effectiveDefault);
             }
 
@@ -695,7 +699,7 @@ namespace TensorSharp.Models
             if (info.Type == GgmlTensorType.F32)
                 return false;
 
-            if (backend == BackendType.Cuda && !CudaQuantizedOps.SupportsQuantizedType((int)info.Type))
+            if (backend == BackendType.Cuda && !CanStoreDirectCudaCompressedWeight(info.Type))
                 return false;
 
             if (backend == BackendType.Cpu && !ManagedQuantizedOps.SupportsCpuQuantizedStorage(info.Type))
@@ -708,6 +712,40 @@ namespace TensorSharp.Models
                 return true;
 
             return info.Shape.Length == 3 && info.Name.Contains("_exps.");
+        }
+
+        private static bool CanStoreDirectCudaCompressedWeight(GgmlTensorType type)
+        {
+            return type switch
+            {
+                GgmlTensorType.F16 or
+                GgmlTensorType.BF16 or
+                GgmlTensorType.Q4_0 or
+                GgmlTensorType.Q4_1 or
+                GgmlTensorType.Q5_0 or
+                GgmlTensorType.Q5_1 or
+                GgmlTensorType.Q8_0 or
+                GgmlTensorType.Q8_1 or
+                GgmlTensorType.Q2_K or
+                GgmlTensorType.Q3_K or
+                GgmlTensorType.Q4_K or
+                GgmlTensorType.Q5_K or
+                GgmlTensorType.Q6_K or
+                GgmlTensorType.Q8_K or
+                GgmlTensorType.IQ2_XXS or
+                GgmlTensorType.IQ2_XS or
+                GgmlTensorType.IQ3_XXS or
+                GgmlTensorType.IQ1_S or
+                GgmlTensorType.IQ4_NL or
+                GgmlTensorType.IQ3_S or
+                GgmlTensorType.IQ2_S or
+                GgmlTensorType.IQ4_XS or
+                GgmlTensorType.IQ1_M or
+                GgmlTensorType.TQ1_0 or
+                GgmlTensorType.TQ2_0 or
+                GgmlTensorType.MXFP4 => true,
+                _ => false,
+            };
         }
 
         /// <summary>
@@ -1286,8 +1324,8 @@ namespace TensorSharp.Models
 
         protected bool TryCreateFusedQuantizedWeight(out QuantizedWeight fused, params QuantizedWeight[] weights)
         {
-            if (_backend == BackendType.Mlx)
-                return QuantizedWeight.TryCreateConcatenatedView(out fused, weights);
+            if (CanUseFileMappedQuantizedWeights && QuantizedWeight.TryCreateConcatenatedView(out fused, weights))
+                return true;
 
             fused = QuantizedWeight.ConcatOrCreateCopy(weights);
             return true;
@@ -1562,7 +1600,7 @@ namespace TensorSharp.Models
             }
 
             if (!weight.HasHostData)
-                throw new InvalidOperationException($"Quantized embedding weight type {(GgmlTensorType)weight.GgmlType} is not available on the MLX device and its host copy has been released.");
+                throw new InvalidOperationException($"Quantized embedding weight type {(GgmlTensorType)weight.GgmlType} is not available on the selected device and its host copy has been released.");
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
@@ -1622,7 +1660,7 @@ namespace TensorSharp.Models
             }
 
             if (!weight.HasHostData)
-                throw new InvalidOperationException($"Quantized linear weight type {(GgmlTensorType)weight.GgmlType} is not available on the MLX device and its host copy has been released.");
+                throw new InvalidOperationException($"Quantized linear weight type {(GgmlTensorType)weight.GgmlType} is not available on the selected device and its host copy has been released.");
 
             long rowBytes = NativeDequant.RowSize(weight.GgmlType, weight.Ne0);
             float* inputPtr = GetFloatPtr(input);

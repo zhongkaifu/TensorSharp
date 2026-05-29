@@ -54,13 +54,15 @@ public class ModelContextLengthTests
         {
             Environment.SetEnvironmentVariable("MAX_CONTEXT", null);
 
-            Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
-            Assert.Equal(4096, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 4096));
-            Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
+            Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
+            Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 4096));
+            Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
+            Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.GgmlCuda, 262144));
             Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cpu, 262144));
 
             Environment.SetEnvironmentVariable("MAX_CONTEXT", "262144");
             Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
+            Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
         }
         finally
         {

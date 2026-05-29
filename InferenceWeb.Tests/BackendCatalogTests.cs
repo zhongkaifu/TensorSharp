@@ -158,6 +158,39 @@ public class BackendCatalogTests
         Assert.True(shouldStoreQuantized);
     }
 
+    [Theory]
+    [InlineData(GgmlTensorType.IQ2_XXS)]
+    [InlineData(GgmlTensorType.IQ2_S)]
+    [InlineData(GgmlTensorType.MXFP4)]
+    public void ShouldStoreWeightQuantized_DirectCudaKeepsHostFallbackWeightsCompressed(GgmlTensorType type)
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.ffn_gate_exps.weight",
+            Type = type,
+            Shape = new ulong[] { 256, 512, 8 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Cuda, info);
+
+        Assert.True(shouldStoreQuantized);
+    }
+
+    [Fact]
+    public void ShouldStoreWeightQuantized_DirectCudaDoesNotKeepIntegerWeightsCompressed()
+    {
+        var info = new GgufTensorInfo
+        {
+            Name = "blk.0.some_index.weight",
+            Type = GgmlTensorType.I32,
+            Shape = new ulong[] { 128, 256 }
+        };
+
+        bool shouldStoreQuantized = ModelBase.ShouldStoreWeightQuantized(BackendType.Cuda, info);
+
+        Assert.False(shouldStoreQuantized);
+    }
+
     [Fact]
     public void ShouldStoreWeightQuantized_MlxKeepsSupportedWeightsCompressed()
     {

@@ -31,6 +31,27 @@ namespace TensorSharp.Cuda
                 scale);
         }
 
+        public static bool TryAttentionSoftmaxWithSinks(
+            Tensor scores,
+            Tensor sinks,
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStart,
+            int windowSize,
+            float scale)
+        {
+            return CudaKernelOps.TryAttentionSoftmaxWithSinks(
+                scores,
+                sinks,
+                numHeads,
+                seqLen,
+                kvLen,
+                maskStart,
+                windowSize,
+                scale);
+        }
+
         public static bool TrySliceColumns(Tensor result, Tensor src, int colOffset, int width)
         {
             return CudaKernelOps.TrySliceColumns(result, src, colOffset, width);
@@ -63,6 +84,75 @@ namespace TensorSharp.Cuda
                 cacheSize,
                 circular,
                 scale);
+        }
+
+        public static bool TryGqaDecodeAttentionWithSinks(
+            Tensor result,
+            Tensor query,
+            Tensor keyCache,
+            Tensor valueCache,
+            Tensor sinks,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            bool circular,
+            float scale)
+        {
+            return CudaKernelOps.TryGqaDecodeAttentionWithSinks(
+                result,
+                query,
+                keyCache,
+                valueCache,
+                sinks,
+                numQHeads,
+                numKVHeads,
+                headDim,
+                attendStart,
+                attendLen,
+                cacheSize,
+                circular,
+                scale);
+        }
+
+        public static bool TryGqaPrefillAttentionWithSinks(
+            Tensor result,
+            Tensor query,
+            Tensor keyCache,
+            Tensor valueCache,
+            Tensor sinks,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            int cacheSize,
+            int maskStart,
+            int windowSize,
+            float scale)
+        {
+            return CudaKernelOps.TryGqaPrefillAttentionWithSinks(
+                result,
+                query,
+                keyCache,
+                valueCache,
+                sinks,
+                numQHeads,
+                numKVHeads,
+                headDim,
+                seqLen,
+                kvLen,
+                cacheSize,
+                maskStart,
+                windowSize,
+                scale);
+        }
+
+        public static bool TryAddBiasRows(Tensor tensor, Tensor bias)
+        {
+            return CudaKernelOps.TryAddBiasRows(tensor, bias);
         }
 
         public static bool TryFlatToHeadFirst(Tensor result, Tensor src, int numHeads, int seqLen, int headDim)
@@ -98,6 +188,11 @@ namespace TensorSharp.Cuda
         public static bool TryGELUMulSplit(Tensor result, Tensor gateUp, int halfDim)
         {
             return CudaKernelOps.TryGELUMulSplit(result, gateUp, halfDim);
+        }
+
+        public static bool TrySwiGluOaiSplit(Tensor result, Tensor gateUp, int halfDim, float alpha, float limit)
+        {
+            return CudaKernelOps.TrySwiGluOaiSplit(result, gateUp, halfDim, alpha, limit);
         }
     }
 }

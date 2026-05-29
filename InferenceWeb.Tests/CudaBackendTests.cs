@@ -484,6 +484,172 @@ public class CudaBackendTests
         }
     }
 
+    [Theory]
+    [InlineData((int)GgmlTensorType.Q4_K)]
+    [InlineData((int)GgmlTensorType.Q5_K)]
+    [InlineData((int)GgmlTensorType.Q6_K)]
+    public void CudaQuantizedMatmul_KQuantsMatchDequantizedReferenceAfterHostRelease(int ggmlType)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int rows = 3;
+        const int inDim = 256;
+        const int outDim = 5;
+        byte[] weights = CreateKQuantRows(ggmlType, outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.013f) + MathF.Cos((r + 2) * (c + 3) * 0.007f) * 0.25f;
+
+        float[] expected = DequantizedMatmulK(weights, outDim, inDim, input, GetKQuantDequantizer(ggmlType));
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x764000 + ggmlType);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, inputTensor, cacheKey, IntPtr.Zero, ggmlType, inDim, outDim, weights.Length));
+                AssertClose(expected, output.GetElementsAsFloat(rows * outDim), 5e-2f);
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Theory]
+    [InlineData((int)GgmlTensorType.Q4_K)]
+    [InlineData((int)GgmlTensorType.Q5_K)]
+    [InlineData((int)GgmlTensorType.Q6_K)]
+    public void CudaQuantizedRows_KQuantsMatchDequantizedReferenceAfterHostRelease(int ggmlType)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 256;
+        const int outDim = 5;
+        int[] rows = { 4, 1, 3 };
+        byte[] weights = CreateKQuantRows(ggmlType, outDim, inDim);
+        float[] expected = new float[rows.Length * inDim];
+        DequantizeKRow dequantize = GetKQuantDequantizer(ggmlType);
+        for (int i = 0; i < rows.Length; i++)
+            dequantize(weights, rows[i], inDim, expected, i * inDim);
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x765000 + ggmlType);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+
+            try
+            {
+                using var indices = Tensor.FromArray(allocator, rows);
+                using var output = new Tensor(allocator, DType.Float32, rows.Length, inDim);
+                Assert.True(CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    output,
+                    cacheKey,
+                    IntPtr.Zero,
+                    ggmlType,
+                    inDim,
+                    outDim,
+                    weights.Length,
+                    indices));
+
+                AssertClose(expected, output.GetElementsAsFloat(rows.Length * inDim), 5e-2f);
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void CudaQuantizedMatmulAndRows_IQ2XXSMatchQ8ActivationReferenceAfterHostRelease()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int rows = 3;
+        const int inDim = 512;
+        const int outDim = 5;
+        byte[] weights = CreateIq2XxsRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((r + 3) * (c + 1) * 0.009f);
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x766000 + (int)GgmlTensorType.IQ2_XXS);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, (int)GgmlTensorType.IQ2_XXS, inDim, outDim, weights.Length);
+
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output,
+                    inputTensor,
+                    cacheKey,
+                    IntPtr.Zero,
+                    (int)GgmlTensorType.IQ2_XXS,
+                    inDim,
+                    outDim,
+                    weights.Length));
+
+                float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.IQ2_XXS, outDim, inDim, QuantizeDequantizeQ8_1(input));
+                AssertClose(expected, output.GetElementsAsFloat(rows * outDim), 5e-3f);
+
+                int[] selected = { 4, 1, 3 };
+                using var indices = Tensor.FromArray(allocator, selected);
+                using var rowOutput = new Tensor(allocator, DType.Float32, selected.Length, inDim);
+                Assert.True(CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    rowOutput,
+                    cacheKey,
+                    IntPtr.Zero,
+                    (int)GgmlTensorType.IQ2_XXS,
+                    inDim,
+                    outDim,
+                    weights.Length,
+                    indices));
+
+                float[] expectedRows = DequantizeNativeRows(weights, GgmlTensorType.IQ2_XXS, inDim, selected);
+                AssertClose(expectedRows, rowOutput.GetElementsAsFloat(selected.Length * inDim), 5e-3f);
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
     [Fact]
     public void CudaScaledDotProductAttention_WithMaskMatchesReference()
     {
@@ -646,6 +812,83 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaGqaPrefillAttentionWithSinks_ReadsStridedKvCache()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int seqLen = 3;
+        const int kvLen = 5;
+        const int cacheSize = 7;
+        const int headDim = 5;
+        const int maskStart = kvLen - seqLen;
+        const int windowSize = 4;
+        const float scale = 0.73f;
+
+        float[,,] q = new float[numQHeads, seqLen, headDim];
+        float[,,] k = new float[numKVHeads, kvLen, headDim];
+        float[,,] v = new float[numKVHeads, kvLen, headDim];
+
+        for (int h = 0; h < numQHeads; h++)
+            for (int t = 0; t < seqLen; t++)
+                for (int d = 0; d < headDim; d++)
+                    q[h, t, d] = MathF.Sin((h + 1) * (t + 2) * (d + 3) * 0.037f);
+
+        for (int h = 0; h < numKVHeads; h++)
+        {
+            for (int t = 0; t < kvLen; t++)
+            {
+                for (int d = 0; d < headDim; d++)
+                {
+                    k[h, t, d] = MathF.Cos((h + 2) * (t + 1) * (d + 1) * 0.041f);
+                    v[h, t, d] = MathF.Sin((h + 3) * (t + 2) * (d + 1) * 0.029f) * 0.5f;
+                }
+            }
+        }
+
+        float[] sinkValues = { 0.15f, -0.2f, 0.35f, -0.05f };
+
+        using var allocator = new CudaAllocator();
+        using var qTensor = Tensor.FromArray(allocator, q);
+        using var kActive = Tensor.FromArray(allocator, k);
+        using var vActive = Tensor.FromArray(allocator, v);
+        using var sinks = Tensor.FromArray(allocator, sinkValues);
+
+        using var kCacheF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        using var vCacheF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        Ops.Fill(kCacheF32, -9f);
+        Ops.Fill(vCacheF32, -9f);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kCacheF32, kActive, 0, kvLen, cacheSize, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vCacheF32, vActive, 0, kvLen, cacheSize, circular: false));
+
+        float[] expected = GqaPrefillAttentionReference(
+            q, k, v, numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize, scale, sinkValues);
+
+        using var actualF32 = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaPrefillAttentionWithSinks(
+            actualF32, qTensor, kCacheF32, vCacheF32, sinks,
+            numQHeads, numKVHeads, headDim,
+            seqLen, kvLen, cacheSize,
+            maskStart, windowSize, scale));
+        AssertClose(expected, actualF32.GetElementsAsFloat(seqLen * numQHeads * headDim), 1e-5f);
+
+        using var kCacheF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        using var vCacheF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kCacheF16, kActive, 0, kvLen, cacheSize, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vCacheF16, vActive, 0, kvLen, cacheSize, circular: false));
+
+        using var actualF16 = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaPrefillAttentionWithSinks(
+            actualF16, qTensor, kCacheF16, vCacheF16, sinks,
+            numQHeads, numKVHeads, headDim,
+            seqLen, kvLen, cacheSize,
+            maskStart, windowSize, scale));
+        AssertClose(expected, actualF16.GetElementsAsFloat(seqLen * numQHeads * headDim), 2e-3f);
+    }
+
+    [Fact]
     public void CudaFusedLayoutOps_MatchReference()
     {
         if (!CudaBackend.IsAvailable())
@@ -744,6 +987,98 @@ public class CudaBackendTests
             vF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
             numQHeads, numKVHeads, headDim, attendStart, attendLen, cacheSize, circular: true);
         AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
+    }
+
+    [Fact]
+    public void CudaGqaDecodeAttentionWithSinks_ReadsFloat16KvCache()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int headDim = 3;
+        const int cacheSize = 6;
+        const int attendStart = 1;
+        const int attendLen = 5;
+        const float scale = 0.73f;
+
+        using var allocator = new CudaAllocator();
+        using var q = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        using var kF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        using var vF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        FillSinusoidal(q, 0.07f);
+        FillSinusoidal(kF32, 0.11f);
+        FillSinusoidal(vF32, -0.13f);
+
+        using var kF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        using var vF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kF16, kF32, 0, cacheSize, cacheSize, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vF16, vF32, 0, cacheSize, cacheSize, circular: false));
+
+        float[] sinkValues = { 0.15f, -0.2f, 0.35f, -0.05f };
+        using var sinks = Tensor.FromArray(allocator, sinkValues);
+        using var actual = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaDecodeAttentionWithSinks(
+            actual, q, kF16, vF16, sinks, numQHeads, numKVHeads, headDim,
+            attendStart, attendLen, cacheSize, circular: false, scale));
+
+        float[] expected = GqaDecodeAttentionReference(
+            q.GetElementsAsFloat(numQHeads * headDim),
+            kF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            vF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            numQHeads, numKVHeads, headDim, attendStart, attendLen, cacheSize,
+            circular: false, scale, sinkValues);
+        AssertClose(expected, actual.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
+    }
+
+    [Fact]
+    public void CudaGqaDecodeAttentionWithSinks_PartitionedMatchesReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numQHeads = 4;
+        const int numKVHeads = 2;
+        const int headDim = 16;
+        const int cacheSize = 2350;
+        const int attendStart = 29;
+        const int attendLen = 2305;
+        const float scale = 0.21f;
+
+        using var allocator = new CudaAllocator();
+        using var q = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        using var kF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        using var vF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+        FillSinusoidal(q, 0.07f);
+        FillSinusoidal(kF32, 0.011f);
+        FillSinusoidal(vF32, -0.013f);
+
+        float[] sinkValues = { 0.08f, -0.17f, 0.29f, -0.04f };
+        using var sinks = Tensor.FromArray(allocator, sinkValues);
+        float[] expected = GqaDecodeAttentionReference(
+            q.GetElementsAsFloat(numQHeads * headDim),
+            kF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            vF32.GetElementsAsFloat(numKVHeads * cacheSize * headDim),
+            numQHeads, numKVHeads, headDim, attendStart, attendLen, cacheSize,
+            circular: false, scale, sinkValues);
+
+        using var actualF32 = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaDecodeAttentionWithSinks(
+            actualF32, q, kF32, vF32, sinks, numQHeads, numKVHeads, headDim,
+            attendStart, attendLen, cacheSize, circular: false, scale));
+        AssertClose(expected, actualF32.GetElementsAsFloat(numQHeads * headDim), 1e-5f);
+
+        using var kF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        using var vF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(kF16, kF32, 0, cacheSize, cacheSize, circular: false));
+        Assert.True(CudaFusedOps.TryCopyHeadFirstToCache(vF16, vF32, 0, cacheSize, cacheSize, circular: false));
+
+        using var actualF16 = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+        Assert.True(CudaFusedOps.TryGqaDecodeAttentionWithSinks(
+            actualF16, q, kF16, vF16, sinks, numQHeads, numKVHeads, headDim,
+            attendStart, attendLen, cacheSize, circular: false, scale));
+        AssertClose(expected, actualF16.GetElementsAsFloat(numQHeads * headDim), 2e-3f);
     }
 
     [Fact]
@@ -846,6 +1181,82 @@ public class CudaBackendTests
         AssertClose(expectedRope, data.GetElementsAsFloat(16), 1e-5f);
     }
 
+    [Fact]
+    public void CudaFusedBiasAndOaiSwiGlu_MatchReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var matrix = Tensor.FromArray(allocator, new float[,]
+        {
+            { 1f, -2f, 3f, 4f, -5f },
+            { -0.5f, 0.75f, -1.25f, 2.5f, 3.5f },
+        });
+        using var bias = Tensor.FromArray(allocator, new[] { 0.5f, -1f, 1.5f, -2f, 2.5f });
+        Assert.True(CudaFusedOps.TryAddBiasRows(matrix, bias));
+        AssertClose(new[]
+        {
+            1.5f, -3f, 4.5f, 2f, -2.5f,
+            0f, -0.25f, 0.25f, 0.5f, 6f,
+        }, matrix.GetElementsAsFloat(10), 1e-6f);
+
+        const float alpha = 1.702f;
+        const float limit = 2.0f;
+        float[] gateUpValues = { -3f, 0.5f, 3f, 1f, -4f, 0.25f, 1.25f, -0.75f, 0.1f, 2f, 3f, -5f };
+        using var gateUp = Tensor.FromArray(allocator, new float[,]
+        {
+            { gateUpValues[0], gateUpValues[1], gateUpValues[2], gateUpValues[3], gateUpValues[4], gateUpValues[5] },
+            { gateUpValues[6], gateUpValues[7], gateUpValues[8], gateUpValues[9], gateUpValues[10], gateUpValues[11] },
+        });
+        using var activated = new Tensor(allocator, DType.Float32, 2, 3);
+        Assert.True(CudaFusedOps.TrySwiGluOaiSplit(activated, gateUp, 3, alpha, limit));
+
+        float[] expected = new float[6];
+        for (int row = 0; row < 2; row++)
+        {
+            for (int col = 0; col < 3; col++)
+            {
+                float x = MathF.Min(gateUpValues[row * 6 + col], limit);
+                float y = MathF.Min(MathF.Max(gateUpValues[row * 6 + 3 + col], -limit), limit);
+                float sig = 1.0f / (1.0f + MathF.Exp(-alpha * x));
+                expected[row * 3 + col] = x * sig * (y + 1.0f);
+            }
+        }
+
+        AssertClose(expected, activated.GetElementsAsFloat(6), 1e-5f);
+    }
+
+    [Fact]
+    public void CudaAttentionSoftmaxWithSinksAndWindow_MatchesReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int heads = 2;
+        const int seqLen = 3;
+        const int kvLen = 6;
+        const int maskStart = 3;
+        const int windowSize = 3;
+        const float scale = 0.5f;
+
+        float[,,] scores = new float[heads, seqLen, kvLen];
+        for (int h = 0; h < heads; h++)
+            for (int q = 0; q < seqLen; q++)
+                for (int k = 0; k < kvLen; k++)
+                    scores[h, q, k] = MathF.Sin((h + 1) * (q + 2) * (k + 3) * 0.11f);
+
+        float[] sinksHost = { 0.25f, -0.35f };
+        using var allocator = new CudaAllocator();
+        using var scoreTensor = Tensor.FromArray(allocator, scores);
+        using var sinks = Tensor.FromArray(allocator, sinksHost);
+        Assert.True(CudaFusedOps.TryAttentionSoftmaxWithSinks(
+            scoreTensor, sinks, heads, seqLen, kvLen, maskStart, windowSize, scale));
+
+        float[] expected = AttentionSoftmaxWithSinksReference(scores, sinksHost, heads, seqLen, kvLen, maskStart, windowSize, scale);
+        AssertClose(expected, scoreTensor.GetElementsAsFloat(heads * seqLen * kvLen), 1e-6f);
+    }
+
     private static float[] SoftmaxRow(params float[] values)
     {
         float max = values.Max();
@@ -919,6 +1330,158 @@ public class CudaBackendTests
         return data;
     }
 
+    private static byte[] CreateKQuantRows(int ggmlType, int rows, int cols)
+    {
+        return ggmlType switch
+        {
+            (int)GgmlTensorType.Q4_K => CreateQ4KRows(rows, cols),
+            (int)GgmlTensorType.Q5_K => CreateQ5KRows(rows, cols),
+            (int)GgmlTensorType.Q6_K => CreateQ6KRows(rows, cols),
+            _ => throw new ArgumentOutOfRangeException(nameof(ggmlType)),
+        };
+    }
+
+    private static DequantizeKRow GetKQuantDequantizer(int ggmlType)
+    {
+        return ggmlType switch
+        {
+            (int)GgmlTensorType.Q4_K => DequantizeQ4KRow,
+            (int)GgmlTensorType.Q5_K => DequantizeQ5KRow,
+            (int)GgmlTensorType.Q6_K => DequantizeQ6KRow,
+            _ => throw new ArgumentOutOfRangeException(nameof(ggmlType)),
+        };
+    }
+
+    private static byte[] CreateQ4KRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 144;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.03125f + r * 0.015625f);
+                WriteHalf(raw, offset + 2, 0.015625f + r * 0.0078125f);
+                for (int i = 0; i < 12; i++)
+                    raw[offset + 4 + i] = (byte)((r * 17 + b * 13 + i * 7 + 19) & 0xFF);
+                for (int i = 0; i < 128; i++)
+                    raw[offset + 16 + i] = (byte)((r * 23 + b * 11 + i * 5 + 3) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
+    private static byte[] CreateQ5KRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 176;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.0234375f + r * 0.0078125f);
+                WriteHalf(raw, offset + 2, 0.01171875f + r * 0.00390625f);
+                for (int i = 0; i < 12; i++)
+                    raw[offset + 4 + i] = (byte)((r * 19 + b * 7 + i * 9 + 5) & 0xFF);
+                for (int i = 0; i < 32; i++)
+                    raw[offset + 16 + i] = (byte)((r * 29 + b * 3 + i * 17 + 1) & 0xFF);
+                for (int i = 0; i < 128; i++)
+                    raw[offset + 48 + i] = (byte)((r * 31 + b * 5 + i * 3 + 7) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
+    private static byte[] CreateQ6KRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 210;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                int qlOffsetBase = offset;
+                int qhOffsetBase = offset + 128;
+                int scalesOffset = offset + 192;
+                for (int sub = 0; sub < 16; sub++)
+                {
+                    int scale = ((r * 3 + b * 5 + sub * 2) % 9) - 4;
+                    if (scale == 0)
+                        scale = 3;
+                    raw[scalesOffset + sub] = unchecked((byte)(sbyte)scale);
+                    for (int i = 0; i < 16; i++)
+                    {
+                        int signed = ((r * 17 + b * 13 + sub * 11 + i * 7) % 63) - 31;
+                        WriteQ6Value(raw, qlOffsetBase, qhOffsetBase, sub, i, signed + 32);
+                    }
+                }
+
+                WriteHalf(raw, offset + 208, 0.015625f + r * 0.00390625f);
+            }
+        }
+
+        return raw;
+    }
+
+    private static byte[] CreateIq2XxsRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 66;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.0078125f + r * 0.001953125f + b * 0.0009765625f);
+                for (int i = 0; i < 64; i++)
+                    raw[offset + 2 + i] = (byte)((r * 29 + b * 17 + i * 11 + 7) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
+    private static void WriteQ6Value(byte[] raw, int qlBase, int qhBase, int sub, int index, int unsignedValue)
+    {
+        int half = sub / 8;
+        int sh = sub % 8;
+        int qlOffset = qlBase + half * 64 + (sh % 4) * 16 + index;
+        bool isUpper = sh >= 4;
+        int qhOffset = qhBase + half * 32 + (sh % 2) * 16 + index;
+        int qhShift = (sh / 2) * 2;
+        int lo4 = unsignedValue & 0x0F;
+        int hi2 = (unsignedValue >> 4) & 0x03;
+        if (isUpper)
+            raw[qlOffset] = (byte)((raw[qlOffset] & 0x0F) | (lo4 << 4));
+        else
+            raw[qlOffset] = (byte)((raw[qlOffset] & 0xF0) | lo4);
+        raw[qhOffset] = (byte)((raw[qhOffset] & ~(0x03 << qhShift)) | (hi2 << qhShift));
+    }
+
+    private static void WriteHalf(byte[] data, int offset, float value)
+    {
+        ushort bits = BitConverter.HalfToUInt16Bits((System.Half)value);
+        data[offset] = (byte)(bits & 0xFF);
+        data[offset + 1] = (byte)(bits >> 8);
+    }
+
     private static float[] DequantizedMatmulQ80(byte[] weights, int outDim, int inDim, float[,] input, int rows)
     {
         int blocks = inDim / 32;
@@ -970,6 +1533,202 @@ public class CudaBackendTests
             }
         }
         return expected;
+    }
+
+    private delegate void DequantizeKRow(byte[] weights, int row, int inDim, float[] destination, int destinationOffset);
+
+    private static float[] DequantizedMatmulK(byte[] weights, int outDim, int inDim, float[,] input, DequantizeKRow dequantize)
+    {
+        int rows = input.GetLength(0);
+        float[] expected = new float[rows * outDim];
+        float[] dequantizedRow = new float[inDim];
+        for (int o = 0; o < outDim; o++)
+        {
+            dequantize(weights, o, inDim, dequantizedRow, 0);
+            for (int r = 0; r < rows; r++)
+            {
+                float sum = 0;
+                for (int c = 0; c < inDim; c++)
+                    sum += input[r, c] * dequantizedRow[c];
+                expected[r * outDim + o] = sum;
+            }
+        }
+
+        return expected;
+    }
+
+    private static float[] DequantizedMatmulNative(byte[] weights, GgmlTensorType type, int outDim, int inDim, float[,] input)
+    {
+        int rows = input.GetLength(0);
+        float[] expected = new float[rows * outDim];
+        float[] dequantizedRow = new float[inDim];
+        long rowBytes = NativeDequant.RowSize((int)type, inDim);
+        for (int o = 0; o < outDim; o++)
+        {
+            NativeDequant.DequantizeToFloat32((int)type, weights, (int)(o * rowBytes), dequantizedRow, 0, inDim);
+            for (int r = 0; r < rows; r++)
+            {
+                float sum = 0;
+                for (int c = 0; c < inDim; c++)
+                    sum += input[r, c] * dequantizedRow[c];
+                expected[r * outDim + o] = sum;
+            }
+        }
+
+        return expected;
+    }
+
+    private static float[,] QuantizeDequantizeQ8_1(float[,] input)
+    {
+        int rows = input.GetLength(0);
+        int cols = input.GetLength(1);
+        Assert.Equal(0, cols % 32);
+        float[,] result = new float[rows, cols];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int block = 0; block < cols; block += 32)
+            {
+                float amax = 0;
+                for (int i = 0; i < 32; i++)
+                    amax = MathF.Max(amax, MathF.Abs(input[r, block + i]));
+
+                float d = amax > 0 ? amax / 127.0f : 0;
+                float id = d > 0 ? 1.0f / d : 0;
+                for (int i = 0; i < 32; i++)
+                {
+                    int q = (int)MathF.Round(input[r, block + i] * id, MidpointRounding.ToEven);
+                    q = Math.Max(-127, Math.Min(127, q));
+                    result[r, block + i] = d * q;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static float[] DequantizeNativeRows(byte[] weights, GgmlTensorType type, int inDim, int[] rows)
+    {
+        float[] expected = new float[rows.Length * inDim];
+        long rowBytes = NativeDequant.RowSize((int)type, inDim);
+        for (int i = 0; i < rows.Length; i++)
+            NativeDequant.DequantizeToFloat32((int)type, weights, (int)(rows[i] * rowBytes), expected, i * inDim, inDim);
+        return expected;
+    }
+
+    private static void DequantizeQ4KRow(byte[] weights, int row, int inDim, float[] destination, int destinationOffset)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 144;
+        int blocksPerRow = inDim / blockSize;
+        for (int b = 0; b < blocksPerRow; b++)
+        {
+            int offset = (row * blocksPerRow + b) * blockBytes;
+            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset] | (weights[offset + 1] << 8)));
+            float min = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset + 2] | (weights[offset + 3] << 8)));
+            int scalesOffset = offset + 4;
+            int qOffset = offset + 16;
+            int group = 0;
+            for (int j = 0; j < blockSize; j += 64)
+            {
+                GetScaleMinK4(group, weights, scalesOffset, out byte sc1, out byte m1q);
+                GetScaleMinK4(group + 1, weights, scalesOffset, out byte sc2, out byte m2q);
+                float d1 = d * sc1;
+                float d2 = d * sc2;
+                float m1 = min * m1q;
+                float m2 = min * m2q;
+                for (int l = 0; l < 32; l++)
+                    destination[destinationOffset + b * blockSize + j + l] = d1 * (weights[qOffset + l] & 0x0F) - m1;
+                for (int l = 0; l < 32; l++)
+                    destination[destinationOffset + b * blockSize + j + l + 32] = d2 * (weights[qOffset + l] >> 4) - m2;
+                qOffset += 32;
+                group += 2;
+            }
+        }
+    }
+
+    private static void DequantizeQ5KRow(byte[] weights, int row, int inDim, float[] destination, int destinationOffset)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 176;
+        int blocksPerRow = inDim / blockSize;
+        for (int b = 0; b < blocksPerRow; b++)
+        {
+            int offset = (row * blocksPerRow + b) * blockBytes;
+            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset] | (weights[offset + 1] << 8)));
+            float min = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset + 2] | (weights[offset + 3] << 8)));
+            int scalesOffset = offset + 4;
+            int qhOffset = offset + 16;
+            int qlOffset = offset + 48;
+            byte u1 = 1;
+            byte u2 = 2;
+            int group = 0;
+            for (int j = 0; j < blockSize; j += 64)
+            {
+                GetScaleMinK4(group, weights, scalesOffset, out byte sc1, out byte m1q);
+                GetScaleMinK4(group + 1, weights, scalesOffset, out byte sc2, out byte m2q);
+                float d1 = d * sc1;
+                float d2 = d * sc2;
+                float m1 = min * m1q;
+                float m2 = min * m2q;
+                for (int l = 0; l < 32; l++)
+                {
+                    int lo = (weights[qlOffset + l] & 0x0F) + ((weights[qhOffset + l] & u1) != 0 ? 16 : 0);
+                    int hi = (weights[qlOffset + l] >> 4) + ((weights[qhOffset + l] & u2) != 0 ? 16 : 0);
+                    destination[destinationOffset + b * blockSize + j + l] = d1 * lo - m1;
+                    destination[destinationOffset + b * blockSize + j + l + 32] = d2 * hi - m2;
+                }
+
+                qlOffset += 32;
+                group += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+    }
+
+    private static void DequantizeQ6KRow(byte[] weights, int row, int inDim, float[] destination, int destinationOffset)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 210;
+        int blocksPerRow = inDim / blockSize;
+        for (int b = 0; b < blocksPerRow; b++)
+        {
+            int offset = (row * blocksPerRow + b) * blockBytes;
+            int qlBase = offset;
+            int qhBase = offset + 128;
+            int scalesBase = offset + 192;
+            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(weights[offset + 208] | (weights[offset + 209] << 8)));
+            for (int sub = 0; sub < 16; sub++)
+            {
+                int half = sub / 8;
+                int sh = sub % 8;
+                int qlOffset = qlBase + half * 64 + (sh % 4) * 16;
+                bool isUpper = sh >= 4;
+                int qhOffset = qhBase + half * 32 + (sh % 2) * 16;
+                int qhShift = (sh / 2) * 2;
+                float scale = d * unchecked((sbyte)weights[scalesBase + sub]);
+                for (int i = 0; i < 16; i++)
+                {
+                    int lo4 = isUpper ? (weights[qlOffset + i] >> 4) & 0x0F : weights[qlOffset + i] & 0x0F;
+                    int hi2 = (weights[qhOffset + i] >> qhShift) & 0x03;
+                    int q6 = (lo4 | (hi2 << 4)) - 32;
+                    destination[destinationOffset + b * blockSize + sub * 16 + i] = scale * q6;
+                }
+            }
+        }
+    }
+
+    private static void GetScaleMinK4(int index, byte[] packed, int offset, out byte scale, out byte min)
+    {
+        if (index < 4)
+        {
+            scale = (byte)(packed[offset + index] & 63);
+            min = (byte)(packed[offset + index + 4] & 63);
+            return;
+        }
+
+        scale = (byte)((packed[offset + index + 4] & 0x0F) | ((packed[offset + index - 4] >> 6) << 4));
+        min = (byte)((packed[offset + index + 4] >> 4) | ((packed[offset + index] >> 6) << 4));
     }
 
     private static float[] ScaledDotProductAttentionReference(float[,,,] q, float[,,,] k, float[,,,] v, float[,,,] mask, float scale)
@@ -1030,7 +1789,9 @@ public class CudaBackendTests
         int kvLen,
         int headDim,
         int maskStart,
-        int windowSize)
+        int windowSize,
+        float scale = 1.0f,
+        float[] sinks = null)
     {
         int groupSize = numQHeads / numKVHeads;
         float[] result = new float[seqLen * numQHeads * headDim];
@@ -1043,7 +1804,7 @@ public class CudaBackendTests
                 int visible = maskStart + tq;
                 int minVisible = windowSize > 0 ? Math.Max(0, visible - windowSize + 1) : 0;
                 float[] scores = new float[kvLen];
-                float max = float.NegativeInfinity;
+                float max = sinks != null ? sinks[h] : float.NegativeInfinity;
                 for (int tk = 0; tk < kvLen; tk++)
                 {
                     if (tk > visible || tk < minVisible)
@@ -1055,11 +1816,11 @@ public class CudaBackendTests
                     float dot = 0;
                     for (int d = 0; d < headDim; d++)
                         dot += q[h, tq, d] * k[kvHead, tk, d];
-                    scores[tk] = dot;
-                    max = MathF.Max(max, dot);
+                    scores[tk] = dot * scale;
+                    max = MathF.Max(max, scores[tk]);
                 }
 
-                float sum = 0;
+                float sum = sinks != null ? MathF.Exp(sinks[h] - max) : 0;
                 for (int tk = minVisible; tk <= visible; tk++)
                 {
                     scores[tk] = MathF.Exp(scores[tk] - max);
@@ -1089,7 +1850,9 @@ public class CudaBackendTests
         int attendStart,
         int attendLen,
         int cacheSize,
-        bool circular)
+        bool circular,
+        float scale = 1.0f,
+        float[] sinks = null)
     {
         int groupSize = numQHeads / numKVHeads;
         float[] result = new float[numQHeads * headDim];
@@ -1098,7 +1861,7 @@ public class CudaBackendTests
         {
             int kvHead = h / groupSize;
             float[] scores = new float[attendLen];
-            float max = float.NegativeInfinity;
+            float max = sinks != null ? sinks[h] : float.NegativeInfinity;
             for (int t = 0; t < attendLen; t++)
             {
                 int logical = attendStart + t;
@@ -1106,11 +1869,11 @@ public class CudaBackendTests
                 float dot = 0;
                 for (int d = 0; d < headDim; d++)
                     dot += q[h * headDim + d] * k[(kvHead * cacheSize + cachePos) * headDim + d];
-                scores[t] = dot;
-                max = MathF.Max(max, dot);
+                scores[t] = dot * scale;
+                max = MathF.Max(max, scores[t]);
             }
 
-            float sum = 0;
+            float sum = sinks != null ? MathF.Exp(sinks[h] - max) : 0;
             for (int t = 0; t < attendLen; t++)
             {
                 scores[t] = MathF.Exp(scores[t] - max);
@@ -1127,6 +1890,54 @@ public class CudaBackendTests
                     acc += scores[t] / sum * v[(kvHead * cacheSize + cachePos) * headDim + d];
                 }
                 result[h * headDim + d] = acc;
+            }
+        }
+
+        return result;
+    }
+
+    private static float[] AttentionSoftmaxWithSinksReference(
+        float[,,] scores,
+        float[] sinks,
+        int heads,
+        int seqLen,
+        int kvLen,
+        int maskStart,
+        int windowSize,
+        float scale)
+    {
+        float[] result = new float[heads * seqLen * kvLen];
+        for (int h = 0; h < heads; h++)
+        {
+            for (int q = 0; q < seqLen; q++)
+            {
+                int visible = maskStart + q;
+                int minVisible = windowSize > 0 ? Math.Max(0, visible - windowSize + 1) : 0;
+                float max = sinks != null ? sinks[h] : float.NegativeInfinity;
+                for (int k = 0; k < kvLen; k++)
+                {
+                    if (k <= visible && k >= minVisible)
+                        max = MathF.Max(max, scores[h, q, k] * scale);
+                }
+
+                float sum = sinks != null ? MathF.Exp(sinks[h] - max) : 0;
+                for (int k = 0; k < kvLen; k++)
+                {
+                    int offset = (h * seqLen + q) * kvLen + k;
+                    if (k <= visible && k >= minVisible)
+                    {
+                        float p = MathF.Exp(scores[h, q, k] * scale - max);
+                        result[offset] = p;
+                        sum += p;
+                    }
+                    else
+                    {
+                        result[offset] = 0;
+                    }
+                }
+
+                for (int k = 0; k < kvLen; k++)
+                    result[(h * seqLen + q) * kvLen + k] /= sum;
             }
         }
 

@@ -18,15 +18,25 @@ namespace TensorSharp.Cuda
         private readonly IntPtr addMulScalarF32;
         private readonly IntPtr mulMulAddF32;
         private readonly IntPtr binaryActivationF32;
+        private readonly IntPtr addBiasRowsF32;
         private readonly IntPtr siluMulSplitF32;
         private readonly IntPtr geluMulSplitF32;
+        private readonly IntPtr swigluOaiSplitF32;
         private readonly IntPtr rmsNormF32;
         private readonly IntPtr softmaxF32;
+        private readonly IntPtr attentionSoftmaxSinksF32;
         private readonly IntPtr scaledDotProductAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF16;
+        private readonly IntPtr gqaPrefillAttentionSinksF32;
+        private readonly IntPtr gqaPrefillAttentionSinksF16;
         private readonly IntPtr gqaDecodeAttentionF32;
         private readonly IntPtr gqaDecodeAttentionF16;
+        private readonly IntPtr gqaDecodeAttentionSinksF32;
+        private readonly IntPtr gqaDecodeAttentionSinksF16;
+        private readonly IntPtr gqaDecodeAttentionPartitionF32;
+        private readonly IntPtr gqaDecodeAttentionPartitionF16;
+        private readonly IntPtr gqaDecodeAttentionPartitionReduceF32;
         private readonly IntPtr sliceColumnsF32;
         private readonly IntPtr flatToHeadFirstF32;
         private readonly IntPtr splitQkvHeadFirstF32;
@@ -41,6 +51,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
         private readonly IntPtr quantMatmulF32;
+        private readonly IntPtr quantMatmulIq2XxsQ81F32;
         private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ80SingleF32;
         private readonly IntPtr quantMatmulQ80F32;
@@ -58,15 +69,25 @@ namespace TensorSharp.Cuda
             addMulScalarF32 = module.GetFunction("ts_addmul_scalar_f32");
             mulMulAddF32 = module.GetFunction("ts_mulmuladd_f32");
             binaryActivationF32 = module.GetFunction("ts_binary_activation_f32");
+            addBiasRowsF32 = module.GetFunction("ts_add_bias_rows_f32");
             siluMulSplitF32 = module.GetFunction("ts_silu_mul_split_f32");
             geluMulSplitF32 = module.GetFunction("ts_gelu_mul_split_f32");
+            swigluOaiSplitF32 = module.GetFunction("ts_swiglu_oai_split_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
+            attentionSoftmaxSinksF32 = module.GetFunction("ts_attention_softmax_sinks_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
+            gqaPrefillAttentionSinksF32 = module.GetFunction("ts_gqa_prefill_attention_sinks_f32");
+            gqaPrefillAttentionSinksF16 = module.GetFunction("ts_gqa_prefill_attention_sinks_f16");
             gqaDecodeAttentionF32 = module.GetFunction("ts_gqa_decode_attention_f32");
             gqaDecodeAttentionF16 = module.GetFunction("ts_gqa_decode_attention_f16");
+            gqaDecodeAttentionSinksF32 = module.GetFunction("ts_gqa_decode_attention_sinks_f32");
+            gqaDecodeAttentionSinksF16 = module.GetFunction("ts_gqa_decode_attention_sinks_f16");
+            gqaDecodeAttentionPartitionF32 = module.GetFunction("ts_gqa_decode_attention_partition_f32");
+            gqaDecodeAttentionPartitionF16 = module.GetFunction("ts_gqa_decode_attention_partition_f16");
+            gqaDecodeAttentionPartitionReduceF32 = module.GetFunction("ts_gqa_decode_attention_partition_reduce_f32");
             sliceColumnsF32 = module.GetFunction("ts_slice_columns_f32");
             flatToHeadFirstF32 = module.GetFunction("ts_flat_to_head_first_f32");
             splitQkvHeadFirstF32 = module.GetFunction("ts_split_qkv_head_first_f32");
@@ -81,6 +102,7 @@ namespace TensorSharp.Cuda
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
+            quantMatmulIq2XxsQ81F32 = module.GetFunction("ts_quant_matmul_iq2_xxs_q8_1_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
@@ -199,6 +221,18 @@ namespace TensorSharp.Cuda
             Launch(binaryActivationF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchAddBiasRowsF32(IntPtr tensor, IntPtr bias, int rows, int cols, int biasCols, IntPtr stream)
+        {
+            IntPtr tensorArg = tensor;
+            IntPtr biasArg = bias;
+            int rowsArg = rows;
+            int colsArg = cols;
+            int biasColsArg = biasCols;
+            int count = checked(rows * cols);
+            void** args = stackalloc void*[] { &tensorArg, &biasArg, &rowsArg, &colsArg, &biasColsArg };
+            Launch(addBiasRowsF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchSiLUMulSplitF32(IntPtr gateUp, IntPtr output, int rows, int halfDim, IntPtr stream)
         {
             IntPtr gateUpArg = gateUp;
@@ -219,6 +253,19 @@ namespace TensorSharp.Cuda
             int count = checked(rows * halfDim);
             void** args = stackalloc void*[] { &gateUpArg, &outputArg, &rowsArg, &halfDimArg };
             Launch(geluMulSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchSwiGluOaiSplitF32(IntPtr gateUp, IntPtr output, int rows, int halfDim, float alpha, float limit, IntPtr stream)
+        {
+            IntPtr gateUpArg = gateUp;
+            IntPtr outputArg = output;
+            int rowsArg = rows;
+            int halfDimArg = halfDim;
+            float alphaArg = alpha;
+            float limitArg = limit;
+            int count = checked(rows * halfDim);
+            void** args = stackalloc void*[] { &gateUpArg, &outputArg, &rowsArg, &halfDimArg, &alphaArg, &limitArg };
+            Launch(swigluOaiSplitF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)
@@ -242,6 +289,35 @@ namespace TensorSharp.Cuda
             int colsArg = cols;
             void** args = stackalloc void*[] { &inputArg, &outputArg, &rowsArg, &colsArg };
             Launch(softmaxF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchAttentionSoftmaxSinksF32(
+            IntPtr scores,
+            IntPtr sinks,
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int hasSinks,
+            IntPtr stream)
+        {
+            IntPtr scoresArg = scores;
+            IntPtr sinksArg = sinks;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &scoresArg, &sinksArg, &numHeadsArg, &seqLenArg, &kvLenArg,
+                &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg
+            };
+            Launch(attentionSoftmaxSinksF32, (uint)(numHeads * seqLen), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchScaledDotProductAttentionF32(
@@ -351,6 +427,90 @@ namespace TensorSharp.Cuda
             Launch(gqaPrefillAttentionF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
 
+        public void LaunchGqaPrefillAttentionSinksF32(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int cacheSize,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int hasSinks,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int cacheSizeArg = cacheSize;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
+                &numQHeadsArg, &numKVHeadsArg, &seqLenArg, &kvLenArg, &cacheSizeArg,
+                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg
+            };
+            Launch(gqaPrefillAttentionSinksF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaPrefillAttentionSinksF16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int cacheSize,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int hasSinks,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int cacheSizeArg = cacheSize;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
+                &numQHeadsArg, &numKVHeadsArg, &seqLenArg, &kvLenArg, &cacheSizeArg,
+                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg
+            };
+            Launch(gqaPrefillAttentionSinksF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
         public void LaunchGqaDecodeAttentionF32(
             IntPtr query,
             IntPtr keyCache,
@@ -419,6 +579,193 @@ namespace TensorSharp.Cuda
                 &headDimArg, &attendStartArg, &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg
             };
             Launch(gqaDecodeAttentionF16, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionSinksF32(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            int hasSinks,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
+                &numQHeadsArg, &numKVHeadsArg, &headDimArg, &attendStartArg,
+                &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg, &hasSinksArg
+            };
+            Launch(gqaDecodeAttentionSinksF32, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionSinksF16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            int hasSinks,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
+                &numQHeadsArg, &numKVHeadsArg, &headDimArg, &attendStartArg,
+                &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg, &hasSinksArg
+            };
+            Launch(gqaDecodeAttentionSinksF16, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(attendLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionPartitionF32(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr partial,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            int hasSinks,
+            int numPartitions,
+            int partitionSize,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr partialArg = partial;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            int numPartitionsArg = numPartitions;
+            int partitionSizeArg = partitionSize;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &partialArg,
+                &numQHeadsArg, &numKVHeadsArg, &headDimArg, &attendStartArg,
+                &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg, &hasSinksArg,
+                &numPartitionsArg, &partitionSizeArg
+            };
+            Launch(gqaDecodeAttentionPartitionF32, (uint)numQHeads, (uint)numPartitions, 1, BlockSize, 1, 1, (uint)(partitionSize * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionPartitionF16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinks,
+            IntPtr partial,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            int circular,
+            float scale,
+            int hasSinks,
+            int numPartitions,
+            int partitionSize,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinks;
+            IntPtr partialArg = partial;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int headDimArg = headDim;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            int circularArg = circular;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            int numPartitionsArg = numPartitions;
+            int partitionSizeArg = partitionSize;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &partialArg,
+                &numQHeadsArg, &numKVHeadsArg, &headDimArg, &attendStartArg,
+                &attendLenArg, &cacheSizeArg, &circularArg, &scaleArg, &hasSinksArg,
+                &numPartitionsArg, &partitionSizeArg
+            };
+            Launch(gqaDecodeAttentionPartitionF16, (uint)numQHeads, (uint)numPartitions, 1, BlockSize, 1, 1, (uint)(partitionSize * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionPartitionReduceF32(
+            IntPtr partial,
+            IntPtr output,
+            int numQHeads,
+            int headDim,
+            int numPartitions,
+            IntPtr stream)
+        {
+            IntPtr partialArg = partial;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int headDimArg = headDim;
+            int numPartitionsArg = numPartitions;
+            void** args = stackalloc void*[] { &partialArg, &outputArg, &numQHeadsArg, &headDimArg, &numPartitionsArg };
+            Launch(gqaDecodeAttentionPartitionReduceF32, (uint)numQHeads, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchSliceColumnsF32(
@@ -732,6 +1079,20 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
             Launch(quantMatmulF32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQuantMatmulIq2XxsQ81F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + 3) / 4);
+            uint sharedBytes = checked((uint)((inDim / 32) * 36));
+            Launch(quantMatmulIq2XxsQ81F32, gridX, (uint)rows, 1, BlockSize, 1, 1, sharedBytes, stream, args);
         }
 
         public void LaunchQuantMatmulQ40F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)

@@ -14,6 +14,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
 
@@ -1007,12 +1008,9 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    using (var qView = qkvFused.Narrow(1, 0, _qDim))
-                        qTensor = Ops.NewContiguous(qView);
-                    using (var kView = qkvFused.Narrow(1, _qDim, _kDim))
-                        kTensor = Ops.NewContiguous(kView);
-                    using (var vView = qkvFused.Narrow(1, _qDim + _kDim, _kDim))
-                        vTensor = Ops.NewContiguous(vView);
+                    qTensor = SliceColumnsContiguous(qkvFused, 0, _qDim);
+                    kTensor = SliceColumnsContiguous(qkvFused, _qDim, _kDim);
+                    vTensor = SliceColumnsContiguous(qkvFused, _qDim + _kDim, _kDim);
                     qkvFused.Dispose();
                 }
             }
@@ -1048,6 +1046,18 @@ namespace TensorSharp.Models
                 // the host SIMD CPU path is faster. Threshold tunable via
                 // TS_MLX_SINKS_ATTN_MIN_KV_LEN (default 2048).
                 bool attnOk = false;
+                if (_backend == BackendType.Cuda)
+                {
+                    Tensor sinksCuda = sinks != null ? GetOrCreateSinksMlxTensor(layer, sinks, numHeads) : null;
+                    int attendStart = isSWA ? Math.Max(0, totalSeqLen - _slidingWindow) : 0;
+                    int attendLen = totalSeqLen - attendStart;
+                    attnOk = CudaFusedOps.TryGqaDecodeAttentionWithSinks(
+                        attnResult, qTensor,
+                        _kvCacheK[layer], _kvCacheV[layer], sinksCuda,
+                        numHeads, numKVHeads, headDim,
+                        attendStart, attendLen, _kvCacheCapacity,
+                        circular: false, scale);
+                }
                 if (_backend == BackendType.Mlx
                     && sinks != null
                     && totalSeqLen >= MlxSinksAttnMinKvLen)
@@ -1090,6 +1100,36 @@ namespace TensorSharp.Models
             kHeads.Dispose();
             vHeads.Dispose();
 
+            if (_backend == BackendType.Cuda)
+            {
+                var fusedAttention = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                Tensor sinksCuda = sinks != null ? GetOrCreateSinksMlxTensor(layer, sinks, numHeads) : null;
+                if (CudaFusedOps.TryGqaPrefillAttentionWithSinks(
+                    fusedAttention,
+                    qHeads,
+                    _kvCacheK[layer],
+                    _kvCacheV[layer],
+                    sinksCuda,
+                    numHeads,
+                    numKVHeads,
+                    headDim,
+                    seqLen,
+                    totalSeqLen,
+                    _kvCacheCapacity,
+                    startPos,
+                    isSWA ? _slidingWindow : 0,
+                    scale))
+                {
+                    qHeads.Dispose();
+                    _attnTicks += Stopwatch.GetTimestamp() - t0;
+
+                    Tensor fusedOutput = LinearForwardWithBias(fusedAttention, wn[3], wn[4]);
+                    fusedAttention.Dispose();
+                    return fusedOutput;
+                }
+                fusedAttention.Dispose();
+            }
+
             int groupSize = numHeads / numKVHeads;
             Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
             Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
@@ -1120,6 +1160,18 @@ namespace TensorSharp.Models
                     slidingWindow: isSWA ? _slidingWindow : 0,
                     scale: 1.0f);
             }
+            else if (_backend == BackendType.Cuda &&
+                     CudaFusedOps.TryAttentionSoftmaxWithSinks(
+                         scores,
+                         sinks != null ? GetOrCreateSinksMlxTensor(layer, sinks, numHeads) : null,
+                         numHeads,
+                         seqLen,
+                         totalSeqLen,
+                         startPos,
+                         isSWA ? _slidingWindow : 0,
+                         1.0f))
+            {
+            }
             else
             {
                 Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
@@ -1141,6 +1193,17 @@ namespace TensorSharp.Models
             Tensor output = LinearForwardWithBias(flatOutput, wn[3], wn[4]);
             flatOutput.Dispose();
             return output;
+        }
+
+        private Tensor SliceColumnsContiguous(Tensor src, int colOffset, int width)
+        {
+            var result = new Tensor(_allocator, DType.Float32, src.Sizes[0], width);
+            if (CudaFusedOps.TrySliceColumns(result, src, colOffset, width))
+                return result;
+            result.Dispose();
+
+            using var view = src.Narrow(1, colOffset, width);
+            return Ops.NewContiguous(view);
         }
 
         private unsafe void ApplySWAMask(Tensor scores, int numHeads, int seqLen, int totalSeqLen, int startPos)
@@ -1395,7 +1458,7 @@ namespace TensorSharp.Models
                     return;
             }
 
-            float* outputPtr = GetFloatPtr(output);
+            float* outputPtr = _backend == BackendType.Cuda ? null : GetFloatPtr(output);
 
             for (int e = 0; e < _numExpertsUsed; e++)
             {
@@ -1404,8 +1467,13 @@ namespace TensorSharp.Models
                 string[] en = _expertNames[layer][expertIdx];
 
                 Tensor expertOut = ExpertFFN(hiddenState, en[0], en[1], en[2], en[3], 1);
-                float* expertPtr = GetFloatPtr(expertOut);
-                VecScaleAdd(outputPtr, expertPtr, weight, hiddenDim);
+                if (_backend == BackendType.Cuda)
+                    Ops.AddMulV(output, output, expertOut, weight);
+                else
+                {
+                    float* expertPtr = GetFloatPtr(expertOut);
+                    VecScaleAdd(outputPtr, expertPtr, weight, hiddenDim);
+                }
                 expertOut.Dispose();
             }
         }
@@ -1644,6 +1712,19 @@ namespace TensorSharp.Models
             Tensor gateUp = LinearForwardWithBias(input, gateUpWeightName, gateUpBiasName);
             int halfDim = (int)(gateUp.Sizes[1] / 2);
 
+            if (_backend == BackendType.Cuda)
+            {
+                var activatedCuda = new Tensor(_allocator, DType.Float32, seqLen, halfDim);
+                if (CudaFusedOps.TrySwiGluOaiSplit(activatedCuda, gateUp, halfDim, SiluAlpha, SiluLimit))
+                {
+                    gateUp.Dispose();
+                    Tensor downCuda = LinearForwardWithBias(activatedCuda, downWeightName, downBiasName);
+                    activatedCuda.Dispose();
+                    return downCuda;
+                }
+                activatedCuda.Dispose();
+            }
+
             float* guPtr = GetFloatPtr(gateUp);
 
             for (int s = 0; s < seqLen; s++)
@@ -1753,6 +1834,9 @@ namespace TensorSharp.Models
 
             if (_weights.TryGetValue(biasName, out var bias))
             {
+                if (_backend == BackendType.Cuda && CudaFusedOps.TryAddBiasRows(result, bias))
+                    return result;
+
                 int seqLen = (int)result.Sizes[0];
                 int outDim = (int)result.Sizes[1];
                 float* rPtr = GetFloatPtr(result);
@@ -1775,6 +1859,12 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
+            if (_layerSinksMlx != null)
+                foreach (var t in _layerSinksMlx) t?.Dispose();
+            if (_sinksHandles != null)
+                foreach (var handle in _sinksHandles)
+                    if (handle.IsAllocated)
+                        handle.Free();
             base.Dispose();
         }
     }

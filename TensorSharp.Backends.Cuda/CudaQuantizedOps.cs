@@ -38,7 +38,8 @@ namespace TensorSharp.Cuda
                 ggmlType == 9 ||     // Q8_1
                 ggmlType == 12 ||    // Q4_K
                 ggmlType == 13 ||    // Q5_K
-                ggmlType == 14;      // Q6_K
+                ggmlType == 14 ||    // Q6_K
+                ggmlType == 16;      // IQ2_XXS
         }
 
         public static void PreloadQuantizedWeight(
@@ -146,6 +147,17 @@ namespace TensorSharp.Cuda
             else if (ggmlType == 8)
             {
                 kernels.LaunchQuantMatmulQ80F32(
+                    weight.DevicePtr,
+                    inputPtr,
+                    resultPtr,
+                    inDim,
+                    outDim,
+                    rows,
+                    allocator.Stream.Handle);
+            }
+            else if (ggmlType == 16 && (inDim & 255) == 0 && ((inDim / 32) * 36) <= 48 * 1024)
+            {
+                kernels.LaunchQuantMatmulIq2XxsQ81F32(
                     weight.DevicePtr,
                     inputPtr,
                     resultPtr,

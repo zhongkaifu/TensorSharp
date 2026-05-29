@@ -3,6 +3,9 @@
 #include <math.h>
 #include <stdint.h>
 
+#define GGML_COMMON_IMPL_CUDA
+#include "../../../ExternalProjects/ggml/src/ggml-common.h"
+
 #define GGML_Q4_0 2
 #define GGML_Q4_1 3
 #define GGML_Q5_0 6
@@ -12,10 +15,47 @@
 #define GGML_Q4_K 12
 #define GGML_Q5_K 13
 #define GGML_Q6_K 14
+#define GGML_IQ2_XXS 16
+#define TS_QK8_1 32
+
+struct ts_block_q8_1
+{
+    half d;
+    half s;
+    int8_t qs[TS_QK8_1];
+};
+
+struct ts_block_iq2_xxs
+{
+    half d;
+    uint16_t qs[32];
+};
 
 __device__ __forceinline__ unsigned int read_u32_unaligned(const uint8_t* p)
 {
     return (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+__device__ __forceinline__ int get_int_b2(const void* x, int i32)
+{
+    const uint16_t* x16 = reinterpret_cast<const uint16_t*>(x);
+    return (int)x16[2 * i32] | ((int)x16[2 * i32 + 1] << 16);
+}
+
+__device__ __forceinline__ int get_int_b4(const void* x, int i32)
+{
+    return reinterpret_cast<const int*>(x)[i32];
+}
+
+__device__ __forceinline__ int dp4a_i8(int a, int b, int c)
+{
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
+    return c + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
+#endif
 }
 
 __device__ __forceinline__ int qrow_bytes(int type, int cols)
@@ -31,6 +71,7 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_Q4_K: return (cols / 256) * 144;
         case GGML_Q5_K: return (cols / 256) * 176;
         case GGML_Q6_K: return (cols / 256) * 210;
+        case GGML_IQ2_XXS: return (cols / 256) * 66;
         default: return 0;
     }
 }
@@ -113,6 +154,27 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         return d * (float)qs[col & 31];
     }
 
+    if (type == GGML_IQ2_XXS)
+    {
+        const uint8_t* block = row + (col / 256) * 66;
+        int t = col & 255;
+        int ib32 = t / 32;
+        int l = (t & 31) / 8;
+        int j = t & 7;
+
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+        const uint8_t grid_index = qs[ib32 * 8 + l];
+        uint32_t signscale = read_u32_unaligned(qs + ib32 * 8 + 4);
+        float db = d * (0.5f + (float)(signscale >> 28)) * 0.25f;
+
+        uint32_t sign7 = (signscale >> (7 * l)) & 0x7F;
+        uint32_t sign8 = sign7 | ((__popc(sign7) & 1) << 7);
+        uint64_t grid = iq2xxs_grid[grid_index];
+        int v = (int)((grid >> (8 * j)) & 0xFF);
+        return (sign8 & (1u << j)) ? -db * (float)v : db * (float)v;
+    }
+
     if (type == GGML_Q4_K)
     {
         const uint8_t* block = row + (col / 256) * 144;
@@ -144,14 +206,12 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         const uint8_t* qs = block + 48;
         int sub = t / 32;
         int pos = t & 31;
+        int pair = sub / 2;
         int sc = get_scale_min_k4(scales, sub);
         int m = get_min_k4(scales, sub);
-        const uint8_t* sub_qs = qs + sub * 16;
-        const uint8_t* sub_qh = qh + sub * 4;
-        int j = pos / 2;
-        uint8_t packed = sub_qs[j];
-        int bit = (sub_qh[j / 4] >> ((j & 3) * 2 + (pos & 1))) & 1;
-        int v = ((pos & 1) ? (packed >> 4) : (packed & 0x0F)) | (bit << 4);
+        uint8_t packed = qs[pair * 32 + pos];
+        int bit = (qh[pos] >> sub) & 1;
+        int v = ((sub & 1) ? (packed >> 4) : (packed & 0x0F)) | (bit << 4);
         return d * (float)sc * (float)v - dmin * (float)m;
     }
 
@@ -184,6 +244,61 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
     }
 
     return 0.0f;
+}
+
+__device__ __forceinline__ void quantize_q8_1_block(const float* x, ts_block_q8_1* dst)
+{
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < TS_QK8_1; i++)
+        amax = fmaxf(amax, fabsf(x[i]));
+
+    float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < TS_QK8_1; i++)
+    {
+        int q = (int)rintf(x[i] * id);
+        q = max(-127, min(127, q));
+        dst->qs[i] = (int8_t)q;
+        sum += q;
+    }
+
+    dst->d = __float2half_rn(d);
+    dst->s = __float2half_rn(d * (float)sum);
+}
+
+__device__ __forceinline__ float dot_iq2_xxs_q8_1(const uint8_t* iq_block, const ts_block_q8_1* q8_blocks, int group)
+{
+    const ts_block_iq2_xxs* bq2 = reinterpret_cast<const ts_block_iq2_xxs*>(iq_block);
+    int iqs = group * 2;
+    int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(&q2);
+    uint32_t aux32 = (uint32_t)get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2)
+    {
+        const int* grid_pos = reinterpret_cast<const int*>(iq2xxs_grid + aux8[k0 / 2]);
+        int signs_packed = ksigns_iq2xs[(aux32 >> (7 * k0 / 2)) & 0x7F];
+
+        int signs0 = __vcmpne4(((signs_packed & 0x03) << 7) | ((signs_packed & 0x0C) << 21), 0x00000000);
+        int grid0 = __vsub4(grid_pos[0] ^ signs0, signs0);
+        int u0 = get_int_b4(q8_blocks[group].qs, k0 + 0);
+        sumi = dp4a_i8(grid0, u0, sumi);
+
+        int signs1 = __vcmpne4(((signs_packed & 0x30) << 3) | ((signs_packed & 0xC0) << 17), 0x00000000);
+        int grid1 = __vsub4(grid_pos[1] ^ signs1, signs1);
+        int u1 = get_int_b4(q8_blocks[group].qs, k0 + 1);
+        sumi = dp4a_i8(grid1, u1, sumi);
+    }
+
+    int ls = aux32 >> 28;
+    sumi = (ls * sumi + sumi / 2) / 4;
+    float d = __half2float(bq2->d) * __half2float(q8_blocks[group].d);
+    return d * (float)sumi;
 }
 
 __device__ __forceinline__ float block_reduce_sum(float v)
@@ -361,6 +476,18 @@ extern "C" __global__ void ts_binary_activation_f32(const float* a, const float*
         output[i] = x * (1.0f / (1.0f + expf(-y)));
 }
 
+extern "C" __global__ void ts_add_bias_rows_f32(float* tensor, const float* bias, int rows, int cols, int bias_cols)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = rows * cols;
+    if (i >= count)
+        return;
+
+    int col = i - (i / cols) * cols;
+    if (col < bias_cols)
+        tensor[i] += bias[col];
+}
+
 extern "C" __global__ void ts_silu_mul_split_f32(const float* gate_up, float* output, int rows, int half_dim)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -389,6 +516,22 @@ extern "C" __global__ void ts_gelu_mul_split_f32(const float* gate_up, float* ou
     float gate = row_ptr[col];
     float up = row_ptr[col + half_dim];
     output[idx] = gelu(gate) * up;
+}
+
+extern "C" __global__ void ts_swiglu_oai_split_f32(const float* gate_up, float* output, int rows, int half_dim, float alpha, float limit)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * half_dim;
+    if (idx >= total)
+        return;
+
+    int row = idx / half_dim;
+    int col = idx - row * half_dim;
+    const float* row_ptr = gate_up + (size_t)row * half_dim * 2;
+    float x = fminf(row_ptr[col], limit);
+    float y = fminf(fmaxf(row_ptr[col + half_dim], -limit), limit);
+    float sig = 1.0f / (1.0f + expf(-alpha * x));
+    output[idx] = x * sig * (y + 1.0f);
 }
 
 extern "C" __global__ void ts_rmsnorm_f32(
@@ -464,6 +607,64 @@ extern "C" __global__ void ts_softmax_f32(const float* input, float* output, int
 
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         y[i] *= inv_sum;
+}
+
+extern "C" __global__ void ts_attention_softmax_sinks_f32(
+    float* scores,
+    const float* sinks,
+    int num_heads,
+    int seq_len,
+    int kv_len,
+    int mask_start,
+    int window_size,
+    float scale,
+    int has_sinks)
+{
+    int row = blockIdx.x;
+    int total_rows = num_heads * seq_len;
+    if (row >= total_rows)
+        return;
+
+    int head = row / seq_len;
+    int q = row - head * seq_len;
+    int visible = mask_start + q;
+    int min_visible = 0;
+    if (window_size > 0)
+        min_visible = max(0, visible - window_size + 1);
+
+    float* row_ptr = scores + (size_t)row * kv_len;
+    float max_v = has_sinks ? sinks[head] : -FLT_MAX;
+    for (int k = threadIdx.x; k < kv_len; k += blockDim.x)
+    {
+        bool allowed = k <= visible && k >= min_visible;
+        float v = allowed ? row_ptr[k] * scale : -FLT_MAX;
+        row_ptr[k] = v;
+        max_v = fmaxf(max_v, v);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && has_sinks) ? expf(sinks[head] - shared_max) : 0.0f;
+    for (int k = threadIdx.x; k < kv_len; k += blockDim.x)
+    {
+        float v = row_ptr[k];
+        float p = v == -FLT_MAX ? 0.0f : expf(v - shared_max);
+        row_ptr[k] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    for (int k = threadIdx.x; k < kv_len; k += blockDim.x)
+        row_ptr[k] *= inv_sum;
 }
 
 extern "C" __global__ void ts_scaled_dot_product_attention_f32(
@@ -564,24 +765,20 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     int min_visible = 0;
     if (window_size > 0)
         min_visible = max(0, visible - window_size + 1);
+    int max_visible = min(visible, kv_len - 1);
 
     const float* q = query + ((size_t)q_head * seq_len + q_pos) * head_dim;
     extern __shared__ float scores[];
 
     float max_v = -FLT_MAX;
-    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        bool allowed = k_pos <= visible && k_pos >= min_visible;
-        float score = -FLT_MAX;
-        if (allowed)
-        {
-            const float* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += q[d] * k[d];
-            score = dot * scale;
-            max_v = fmaxf(max_v, score);
-        }
+        const float* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * k[d];
+        float score = dot * scale;
+        max_v = fmaxf(max_v, score);
         scores[k_pos] = score;
     }
 
@@ -592,10 +789,9 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     __syncthreads();
 
     float sum = 0.0f;
-    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        float score = scores[k_pos];
-        float p = score == -FLT_MAX ? 0.0f : expf(score - shared_max);
+        float p = expf(scores[k_pos] - shared_max);
         scores[k_pos] = p;
         sum += p;
     }
@@ -610,14 +806,173 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
     {
         float acc = 0.0f;
-        for (int k_pos = 0; k_pos < kv_len; k_pos++)
+        for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
         {
             float p = scores[k_pos];
-            if (p != 0.0f)
-            {
-                const float* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
-                acc += p * inv_sum * v[d];
-            }
+            const float* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+            acc += p * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_sinks_f32(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale,
+    int has_sinks)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    const float* q = query + (size_t)q_head * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        int logical_pos = attend_start + t;
+        int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+        if (cache_pos < 0)
+            cache_pos += cache_size;
+
+        const float* k = key_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * k[d];
+
+        float score = dot * scale;
+        scores[t] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && has_sinks) ? expf(sinks[q_head] - shared_max) : 0.0f;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        float p = expf(scores[t] - shared_max);
+        scores[t] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (size_t)q_head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int t = 0; t < attend_len; t++)
+        {
+            int logical_pos = attend_start + t;
+            int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+            if (cache_pos < 0)
+                cache_pos += cache_size;
+
+            const float* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+            acc += scores[t] * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_sinks_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale,
+    int has_sinks)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    const float* q = query + (size_t)q_head * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        int logical_pos = attend_start + t;
+        int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+        if (cache_pos < 0)
+            cache_pos += cache_size;
+
+        const half* k = key_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * __half2float(k[d]);
+
+        float score = dot * scale;
+        scores[t] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && has_sinks) ? expf(sinks[q_head] - shared_max) : 0.0f;
+    for (int t = threadIdx.x; t < attend_len; t += blockDim.x)
+    {
+        float p = expf(scores[t] - shared_max);
+        scores[t] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (size_t)q_head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int t = 0; t < attend_len; t++)
+        {
+            int logical_pos = attend_start + t;
+            int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+            if (cache_pos < 0)
+                cache_pos += cache_size;
+
+            const half* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+            acc += scores[t] * inv_sum * __half2float(v[d]);
         }
         out[d] = acc;
     }
@@ -648,24 +1003,20 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     int min_visible = 0;
     if (window_size > 0)
         min_visible = max(0, visible - window_size + 1);
+    int max_visible = min(visible, kv_len - 1);
 
     const float* q = query + ((size_t)q_head * seq_len + q_pos) * head_dim;
     extern __shared__ float scores[];
 
     float max_v = -FLT_MAX;
-    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        bool allowed = k_pos <= visible && k_pos >= min_visible;
-        float score = -FLT_MAX;
-        if (allowed)
-        {
-            const half* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += q[d] * __half2float(k[d]);
-            score = dot * scale;
-            max_v = fmaxf(max_v, score);
-        }
+        const half* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * __half2float(k[d]);
+        float score = dot * scale;
+        max_v = fmaxf(max_v, score);
         scores[k_pos] = score;
     }
 
@@ -676,10 +1027,9 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     __syncthreads();
 
     float sum = 0.0f;
-    for (int k_pos = threadIdx.x; k_pos < kv_len; k_pos += blockDim.x)
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        float score = scores[k_pos];
-        float p = score == -FLT_MAX ? 0.0f : expf(score - shared_max);
+        float p = expf(scores[k_pos] - shared_max);
         scores[k_pos] = p;
         sum += p;
     }
@@ -694,14 +1044,169 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
     {
         float acc = 0.0f;
-        for (int k_pos = 0; k_pos < kv_len; k_pos++)
+        for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
         {
             float p = scores[k_pos];
-            if (p != 0.0f)
-            {
-                const half* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
-                acc += p * inv_sum * __half2float(v[d]);
-            }
+            const half* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+            acc += p * inv_sum * __half2float(v[d]);
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_sinks_f32(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int cache_size,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int has_sinks)
+{
+    int q_head = blockIdx.x;
+    int q_pos = blockIdx.y;
+    if (q_head >= num_q_heads || q_pos >= seq_len)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    int visible = mask_start + q_pos;
+    int min_visible = 0;
+    if (window_size > 0)
+        min_visible = max(0, visible - window_size + 1);
+    int max_visible = min(visible, kv_len - 1);
+
+    const float* q = query + ((size_t)q_head * seq_len + q_pos) * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    {
+        const float* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * k[d];
+        float score = dot * scale;
+        max_v = fmaxf(max_v, score);
+        scores[k_pos] = score;
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && has_sinks) ? expf(sinks[q_head] - shared_max) : 0.0f;
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    {
+        float p = expf(scores[k_pos] - shared_max);
+        scores[k_pos] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + ((size_t)q_pos * num_q_heads + q_head) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
+        {
+            float p = scores[k_pos];
+            const float* v = value_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            acc += p * inv_sum * v[d];
+        }
+        out[d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_sinks_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int cache_size,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int has_sinks)
+{
+    int q_head = blockIdx.x;
+    int q_pos = blockIdx.y;
+    if (q_head >= num_q_heads || q_pos >= seq_len)
+        return;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    int visible = mask_start + q_pos;
+    int min_visible = 0;
+    if (window_size > 0)
+        min_visible = max(0, visible - window_size + 1);
+    int max_visible = min(visible, kv_len - 1);
+
+    const float* q = query + ((size_t)q_head * seq_len + q_pos) * head_dim;
+    extern __shared__ float scores[];
+
+    float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    {
+        const half* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * __half2float(k[d]);
+        float score = dot * scale;
+        max_v = fmaxf(max_v, score);
+        scores[k_pos] = score;
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && has_sinks) ? expf(sinks[q_head] - shared_max) : 0.0f;
+    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    {
+        float p = expf(scores[k_pos] - shared_max);
+        scores[k_pos] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + ((size_t)q_pos * num_q_heads + q_head) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
+        {
+            float p = scores[k_pos];
+            const half* v = value_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            acc += p * inv_sum * __half2float(v[d]);
         }
         out[d] = acc;
     }
@@ -862,6 +1367,225 @@ extern "C" __global__ void ts_gqa_decode_attention_f16(
             acc += scores[t] * inv_sum * __half2float(v[d]);
         }
         out[d] = acc;
+    }
+}
+
+template <typename cache_t>
+__device__ __forceinline__ float ts_cache_to_float(cache_t v)
+{
+    return (float)v;
+}
+
+template <>
+__device__ __forceinline__ float ts_cache_to_float<half>(half v)
+{
+    return __half2float(v);
+}
+
+template <typename cache_t>
+__device__ __forceinline__ void ts_gqa_decode_attention_partition_impl(
+    const float* query,
+    const cache_t* key_cache,
+    const cache_t* value_cache,
+    const float* sinks,
+    float* partial,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale,
+    int has_sinks,
+    int num_partitions,
+    int partition_size,
+    float* scores)
+{
+    int q_head = blockIdx.x;
+    int partition = blockIdx.y;
+    if (q_head >= num_q_heads || partition >= num_partitions)
+        return;
+
+    int part_start = partition * partition_size;
+    int part_len = attend_len - part_start;
+    if (part_len > partition_size)
+        part_len = partition_size;
+    if (part_len < 0)
+        part_len = 0;
+
+    int group_size = num_q_heads / num_kv_heads;
+    int kv_head = q_head / group_size;
+    const float* q = query + (size_t)q_head * head_dim;
+    int include_sink = has_sinks && partition == 0;
+
+    float max_v = include_sink ? sinks[q_head] : -FLT_MAX;
+    for (int i = threadIdx.x; i < part_len; i += blockDim.x)
+    {
+        int logical_pos = attend_start + part_start + i;
+        int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+        if (cache_pos < 0)
+            cache_pos += cache_size;
+
+        const cache_t* k = key_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[d] * ts_cache_to_float<cache_t>(k[d]);
+
+        float score = dot * scale;
+        scores[i] = score;
+        max_v = fmaxf(max_v, score);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = (threadIdx.x == 0 && include_sink) ? expf(sinks[q_head] - shared_max) : 0.0f;
+    for (int i = threadIdx.x; i < part_len; i += blockDim.x)
+    {
+        float p = expf(scores[i] - shared_max);
+        scores[i] = p;
+        sum += p;
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float shared_sum;
+    if (threadIdx.x == 0)
+        shared_sum = sum;
+    __syncthreads();
+
+    float* partial_row = partial + ((size_t)q_head * num_partitions + partition) * (head_dim + 2);
+    if (threadIdx.x == 0)
+    {
+        partial_row[0] = shared_max;
+        partial_row[1] = shared_sum;
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int i = 0; i < part_len; i++)
+        {
+            int logical_pos = attend_start + part_start + i;
+            int cache_pos = circular ? (logical_pos % cache_size) : logical_pos;
+            if (cache_pos < 0)
+                cache_pos += cache_size;
+
+            const cache_t* v = value_cache + ((size_t)kv_head * cache_size + cache_pos) * head_dim;
+            acc += scores[i] * ts_cache_to_float<cache_t>(v[d]);
+        }
+        partial_row[2 + d] = acc;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_partition_f32(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    const float* sinks,
+    float* partial,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale,
+    int has_sinks,
+    int num_partitions,
+    int partition_size)
+{
+    extern __shared__ float scores[];
+    ts_gqa_decode_attention_partition_impl<float>(
+        query, key_cache, value_cache, sinks, partial,
+        num_q_heads, num_kv_heads, head_dim,
+        attend_start, attend_len, cache_size, circular, scale,
+        has_sinks, num_partitions, partition_size, scores);
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_partition_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    const float* sinks,
+    float* partial,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    int circular,
+    float scale,
+    int has_sinks,
+    int num_partitions,
+    int partition_size)
+{
+    extern __shared__ float scores[];
+    ts_gqa_decode_attention_partition_impl<half>(
+        query, key_cache, value_cache, sinks, partial,
+        num_q_heads, num_kv_heads, head_dim,
+        attend_start, attend_len, cache_size, circular, scale,
+        has_sinks, num_partitions, partition_size, scores);
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_partition_reduce_f32(
+    const float* partial,
+    float* output,
+    int num_q_heads,
+    int head_dim,
+    int num_partitions)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= num_q_heads)
+        return;
+
+    int stride = head_dim + 2;
+    const float* partial_head = partial + (size_t)q_head * num_partitions * stride;
+
+    float max_v = -FLT_MAX;
+    for (int p = threadIdx.x; p < num_partitions; p += blockDim.x)
+    {
+        const float* row = partial_head + (size_t)p * stride;
+        if (row[1] > 0.0f)
+            max_v = fmaxf(max_v, row[0]);
+    }
+
+    max_v = block_reduce_max(max_v);
+    __shared__ float shared_max;
+    if (threadIdx.x == 0)
+        shared_max = max_v;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int p = threadIdx.x; p < num_partitions; p += blockDim.x)
+    {
+        const float* row = partial_head + (size_t)p * stride;
+        if (row[1] > 0.0f)
+            sum += expf(row[0] - shared_max) * row[1];
+    }
+
+    sum = block_reduce_sum(sum);
+    __shared__ float inv_sum;
+    if (threadIdx.x == 0)
+        inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    __syncthreads();
+
+    float* out = output + (size_t)q_head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int p = 0; p < num_partitions; p++)
+        {
+            const float* row = partial_head + (size_t)p * stride;
+            if (row[1] > 0.0f)
+                acc += expf(row[0] - shared_max) * row[2 + d];
+        }
+        out[d] = acc * inv_sum;
     }
 }
 
@@ -1304,6 +2028,78 @@ extern "C" __global__ void ts_quant_matmul_f32(
             acc2 += qvalue_at(w_row2, type, k) * x;
         if (w_row3 != 0)
             acc3 += qvalue_at(w_row3, type, k) * x;
+    }
+
+    acc0 = block_reduce_sum(acc0);
+    if (threadIdx.x == 0)
+        output[(size_t)row * out_dim + out_col0] = acc0;
+    __syncthreads();
+
+    acc1 = block_reduce_sum(acc1);
+    if (threadIdx.x == 0 && w_row1 != 0)
+        output[(size_t)row * out_dim + out_col0 + 1] = acc1;
+    __syncthreads();
+
+    acc2 = block_reduce_sum(acc2);
+    if (threadIdx.x == 0 && w_row2 != 0)
+        output[(size_t)row * out_dim + out_col0 + 2] = acc2;
+    __syncthreads();
+
+    acc3 = block_reduce_sum(acc3);
+    if (threadIdx.x == 0 && w_row3 != 0)
+        output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+}
+
+extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    const int cols_per_block = 4;
+    int out_col0 = blockIdx.x * cols_per_block;
+    int row = blockIdx.y;
+    if (out_col0 >= out_dim || row >= rows || (in_dim & 255) != 0)
+        return;
+
+    int iq_blocks = in_dim / 256;
+    int q8_blocks = in_dim / TS_QK8_1;
+    int row_bytes = iq_blocks * (int)sizeof(ts_block_iq2_xxs);
+    const float* x_row = input + (size_t)row * in_dim;
+
+    extern __shared__ __align__(16) unsigned char shared_q8_bytes[];
+    ts_block_q8_1* xq = reinterpret_cast<ts_block_q8_1*>(shared_q8_bytes);
+
+    for (int qb = threadIdx.x; qb < q8_blocks; qb += blockDim.x)
+        quantize_q8_1_block(x_row + (size_t)qb * TS_QK8_1, xq + qb);
+    __syncthreads();
+
+    const uint8_t* w_row0 = weights + (size_t)(out_col0 + 0) * row_bytes;
+    const uint8_t* w_row1 = out_col0 + 1 < out_dim ? weights + (size_t)(out_col0 + 1) * row_bytes : 0;
+    const uint8_t* w_row2 = out_col0 + 2 < out_dim ? weights + (size_t)(out_col0 + 2) * row_bytes : 0;
+    const uint8_t* w_row3 = out_col0 + 3 < out_dim ? weights + (size_t)(out_col0 + 3) * row_bytes : 0;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    int dot_groups = iq_blocks * 8;
+    for (int g = threadIdx.x; g < dot_groups; g += blockDim.x)
+    {
+        int ib = g >> 3;
+        int group = g & 7;
+        const ts_block_q8_1* q8_block = xq + ib * 8;
+        int block_offset = ib * (int)sizeof(ts_block_iq2_xxs);
+
+        acc0 += dot_iq2_xxs_q8_1(w_row0 + block_offset, q8_block, group);
+        if (w_row1 != 0)
+            acc1 += dot_iq2_xxs_q8_1(w_row1 + block_offset, q8_block, group);
+        if (w_row2 != 0)
+            acc2 += dot_iq2_xxs_q8_1(w_row2 + block_offset, q8_block, group);
+        if (w_row3 != 0)
+            acc3 += dot_iq2_xxs_q8_1(w_row3 + block_offset, q8_block, group);
     }
 
     acc0 = block_reduce_sum(acc0);

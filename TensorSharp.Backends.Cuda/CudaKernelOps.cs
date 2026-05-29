@@ -46,6 +46,10 @@ namespace TensorSharp.Cuda
 
     internal static class CudaKernelOps
     {
+        private const int DecodeAttentionPartitionSize = 512;
+        private const int DecodeAttentionPartitionThreshold = 2048;
+        private const int DecodeAttentionSingleBlockMaxTokens = 8192;
+
         public static bool TryFill(Tensor result, float value)
         {
             if (!TryGetContiguous(result, out CudaStorage storage, out IntPtr ptr, out long longCount) ||
@@ -127,6 +131,28 @@ namespace TensorSharp.Cuda
             allocator.Context.MakeCurrent();
             kernels.LaunchBinaryActivationF32(lhsPtr, rhsPtr, resultPtr, count, (int)op, allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryAddBiasRows(Tensor tensor, Tensor bias)
+        {
+            if (!TryGetContiguousRows(tensor, out CudaStorage tensorStorage, out IntPtr tensorPtr, out int rows, out int cols) ||
+                !TryGetContiguousFloat(bias, out CudaStorage biasStorage, out IntPtr biasPtr, out int biasCount) ||
+                biasCount <= 0 ||
+                biasCount > cols)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = tensorStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            tensorStorage.EnsureDeviceCurrent();
+            biasStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchAddBiasRowsF32(tensorPtr, biasPtr, rows, cols, biasCount, allocator.Stream.Handle);
+            tensorStorage.MarkDeviceModified();
             return true;
         }
 
@@ -313,6 +339,39 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TrySwiGluOaiSplit(Tensor result, Tensor gateUp, int halfDim, float alpha, float limit)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int count) ||
+                !TryGetContiguousFloat(gateUp, out CudaStorage gateUpStorage, out IntPtr gateUpPtr, out _) ||
+                result.DimensionCount != 2 ||
+                gateUp.DimensionCount != 2 ||
+                halfDim <= 0 ||
+                result.Sizes[0] != gateUp.Sizes[0] ||
+                result.Sizes[1] != halfDim ||
+                gateUp.Sizes[1] < halfDim * 2 ||
+                count != result.Sizes[0] * halfDim)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            gateUpStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchSwiGluOaiSplitF32(
+                gateUpPtr,
+                resultPtr,
+                checked((int)result.Sizes[0]),
+                halfDim,
+                alpha,
+                limit,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryRMSNorm(Tensor result, Tensor src, Tensor alpha, Tensor beta, float eps)
         {
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
@@ -364,6 +423,68 @@ namespace TensorSharp.Cuda
             allocator.Context.MakeCurrent();
             kernels.LaunchSoftmaxF32(srcPtr, resultPtr, rows, cols, allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryAttentionSoftmaxWithSinks(
+            Tensor scores,
+            Tensor sinks,
+            int numHeads,
+            int seqLen,
+            int kvLen,
+            int maskStart,
+            int windowSize,
+            float scale)
+        {
+            if (!TryGetContiguousFloat(scores, out CudaStorage scoreStorage, out IntPtr scorePtr, out int scoreCount) ||
+                scores.DimensionCount != 3 ||
+                numHeads <= 0 ||
+                seqLen <= 0 ||
+                kvLen <= 0 ||
+                kvLen > 8192 ||
+                maskStart < 0 ||
+                windowSize < 0 ||
+                scores.Sizes[0] != numHeads ||
+                scores.Sizes[1] != seqLen ||
+                scores.Sizes[2] != kvLen ||
+                scoreCount != numHeads * seqLen * kvLen)
+            {
+                return false;
+            }
+
+            IntPtr sinksPtr = IntPtr.Zero;
+            CudaStorage sinksStorage = null;
+            int hasSinks = 0;
+            if (sinks != null)
+            {
+                if (!TryGetContiguousFloat(sinks, out sinksStorage, out sinksPtr, out int sinkCount) ||
+                    sinkCount < numHeads)
+                {
+                    return false;
+                }
+
+                hasSinks = 1;
+            }
+
+            CudaAllocator allocator = scoreStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            scoreStorage.EnsureDeviceCurrent();
+            sinksStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchAttentionSoftmaxSinksF32(
+                scorePtr,
+                sinksPtr,
+                numHeads,
+                seqLen,
+                kvLen,
+                maskStart,
+                windowSize,
+                scale,
+                hasSinks,
+                allocator.Stream.Handle);
+            scoreStorage.MarkDeviceModified();
             return true;
         }
 
@@ -441,6 +562,145 @@ namespace TensorSharp.Cuda
                 scale,
                 hasMask,
                 allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryGqaDecodeAttentionWithSinks(
+            Tensor result,
+            Tensor query,
+            Tensor keyCache,
+            Tensor valueCache,
+            Tensor sinks,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            bool circular,
+            float scale)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out int queryCount) ||
+                !TryGetContiguousFloatOrHalf(keyCache, out CudaStorage keyStorage, out IntPtr keyPtr, out _, out bool keyIsHalf) ||
+                !TryGetContiguousFloatOrHalf(valueCache, out CudaStorage valueStorage, out IntPtr valuePtr, out _, out bool valueIsHalf) ||
+                query.DimensionCount != 2 ||
+                result.DimensionCount != 2 ||
+                keyCache.DimensionCount != 3 ||
+                valueCache.DimensionCount != 3 ||
+                numQHeads <= 0 ||
+                numKVHeads <= 0 ||
+                headDim <= 0 ||
+                attendStart < 0 ||
+                attendLen <= 0 ||
+                cacheSize <= 0 ||
+                numQHeads % numKVHeads != 0 ||
+                query.Sizes[0] != 1 ||
+                query.Sizes[1] != numQHeads * headDim ||
+                result.Sizes[0] != 1 ||
+                result.Sizes[1] != numQHeads * headDim ||
+                keyCache.Sizes[0] != numKVHeads ||
+                keyCache.Sizes[1] != cacheSize ||
+                keyCache.Sizes[2] != headDim ||
+                valueCache.Sizes[0] != numKVHeads ||
+                valueCache.Sizes[1] != cacheSize ||
+                valueCache.Sizes[2] != headDim ||
+                queryCount != numQHeads * headDim ||
+                resultCount != queryCount ||
+                (!circular && attendStart + attendLen > cacheSize) ||
+                keyIsHalf != valueIsHalf)
+            {
+                return false;
+            }
+
+            IntPtr sinksPtr = IntPtr.Zero;
+            CudaStorage sinksStorage = null;
+            int hasSinks = 0;
+            if (sinks != null)
+            {
+                if (!TryGetContiguousFloat(sinks, out sinksStorage, out sinksPtr, out int sinkCount) ||
+                    sinkCount < numQHeads)
+                {
+                    return false;
+                }
+
+                hasSinks = 1;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            sinksStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            if (TryLaunchPartitionedGqaDecodeAttention(
+                    kernels,
+                    allocator,
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular,
+                    scale,
+                    hasSinks,
+                    keyIsHalf))
+            {
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+
+            if (attendLen > DecodeAttentionSingleBlockMaxTokens)
+                return false;
+
+            if (keyIsHalf)
+            {
+                kernels.LaunchGqaDecodeAttentionSinksF16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    hasSinks,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGqaDecodeAttentionSinksF32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    hasSinks,
+                    allocator.Stream.Handle);
+            }
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -538,6 +798,128 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryGqaPrefillAttentionWithSinks(
+            Tensor result,
+            Tensor query,
+            Tensor keyCache,
+            Tensor valueCache,
+            Tensor sinks,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            int cacheSize,
+            int maskStart,
+            int windowSize,
+            float scale)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out int queryCount) ||
+                !TryGetContiguousFloatOrHalf(keyCache, out CudaStorage keyStorage, out IntPtr keyPtr, out _, out bool keyIsHalf) ||
+                !TryGetContiguousFloatOrHalf(valueCache, out CudaStorage valueStorage, out IntPtr valuePtr, out _, out bool valueIsHalf) ||
+                query.DimensionCount != 3 ||
+                keyCache.DimensionCount != 3 ||
+                valueCache.DimensionCount != 3 ||
+                result.DimensionCount != 2 ||
+                numQHeads <= 0 ||
+                numKVHeads <= 0 ||
+                headDim <= 0 ||
+                seqLen <= 0 ||
+                kvLen <= 0 ||
+                kvLen > 8192 ||
+                cacheSize <= 0 ||
+                maskStart < 0 ||
+                maskStart >= kvLen ||
+                windowSize < 0 ||
+                numQHeads % numKVHeads != 0 ||
+                query.Sizes[0] != numQHeads ||
+                query.Sizes[1] != seqLen ||
+                query.Sizes[2] != headDim ||
+                keyCache.Sizes[0] != numKVHeads ||
+                keyCache.Sizes[1] != cacheSize ||
+                keyCache.Sizes[2] != headDim ||
+                valueCache.Sizes[0] != numKVHeads ||
+                valueCache.Sizes[1] != cacheSize ||
+                valueCache.Sizes[2] != headDim ||
+                kvLen > cacheSize ||
+                result.Sizes[0] != seqLen ||
+                result.Sizes[1] != numQHeads * headDim ||
+                queryCount != numQHeads * seqLen * headDim ||
+                resultCount != seqLen * numQHeads * headDim ||
+                keyIsHalf != valueIsHalf)
+            {
+                return false;
+            }
+
+            IntPtr sinksPtr = IntPtr.Zero;
+            CudaStorage sinksStorage = null;
+            int hasSinks = 0;
+            if (sinks != null)
+            {
+                if (!TryGetContiguousFloat(sinks, out sinksStorage, out sinksPtr, out int sinkCount) ||
+                    sinkCount < numQHeads)
+                {
+                    return false;
+                }
+
+                hasSinks = 1;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            queryStorage.EnsureDeviceCurrent();
+            keyStorage.EnsureDeviceCurrent();
+            valueStorage.EnsureDeviceCurrent();
+            sinksStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            if (keyIsHalf)
+            {
+                kernels.LaunchGqaPrefillAttentionSinksF16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    cacheSize,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    hasSinks,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGqaPrefillAttentionSinksF32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    cacheSize,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    hasSinks,
+                    allocator.Stream.Handle);
+            }
+
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryGqaDecodeAttention(
             Tensor result,
             Tensor query,
@@ -565,7 +947,6 @@ namespace TensorSharp.Cuda
                 headDim <= 0 ||
                 attendStart < 0 ||
                 attendLen <= 0 ||
-                attendLen > 8192 ||
                 cacheSize <= 0 ||
                 numQHeads % numKVHeads != 0 ||
                 query.Sizes[0] != 1 ||
@@ -594,6 +975,32 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
+            if (TryLaunchPartitionedGqaDecodeAttention(
+                    kernels,
+                    allocator,
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    IntPtr.Zero,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular,
+                    scale,
+                    hasSinks: 0,
+                    keyIsHalf))
+            {
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+
+            if (attendLen > DecodeAttentionSingleBlockMaxTokens)
+                return false;
+
             if (keyIsHalf)
             {
                 kernels.LaunchGqaDecodeAttentionF16(
@@ -629,6 +1036,86 @@ namespace TensorSharp.Cuda
                     allocator.Stream.Handle);
             }
             resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        private static bool TryLaunchPartitionedGqaDecodeAttention(
+            CudaKernels kernels,
+            CudaAllocator allocator,
+            IntPtr queryPtr,
+            IntPtr keyPtr,
+            IntPtr valuePtr,
+            IntPtr sinksPtr,
+            IntPtr resultPtr,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            bool circular,
+            float scale,
+            int hasSinks,
+            bool keyIsHalf)
+        {
+            if (attendLen <= DecodeAttentionPartitionThreshold)
+                return false;
+
+            int numPartitions = (attendLen + DecodeAttentionPartitionSize - 1) / DecodeAttentionPartitionSize;
+            using var partial = new Tensor(allocator, DType.Float32, numQHeads, numPartitions, headDim + 2);
+            if (!TryGetContiguousFloat(partial, out _, out IntPtr partialPtr, out _))
+                return false;
+
+            if (keyIsHalf)
+            {
+                kernels.LaunchGqaDecodeAttentionPartitionF16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    partialPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    hasSinks,
+                    numPartitions,
+                    DecodeAttentionPartitionSize,
+                    allocator.Stream.Handle);
+            }
+            else
+            {
+                kernels.LaunchGqaDecodeAttentionPartitionF32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    partialPtr,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    circular ? 1 : 0,
+                    scale,
+                    hasSinks,
+                    numPartitions,
+                    DecodeAttentionPartitionSize,
+                    allocator.Stream.Handle);
+            }
+
+            kernels.LaunchGqaDecodeAttentionPartitionReduceF32(
+                partialPtr,
+                resultPtr,
+                numQHeads,
+                headDim,
+                numPartitions,
+                allocator.Stream.Handle);
             return true;
         }
 
