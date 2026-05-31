@@ -4,5 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
+# Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
+bash "${SCRIPT_DIR}/../eng/fetch-ggml.sh"
+
 cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD_DIR}" --config Release --target GgmlOps

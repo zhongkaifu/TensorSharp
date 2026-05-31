@@ -65,9 +65,19 @@
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
   </Target>
 
+  <!-- The CUDA kernels include ExternalProjects/ggml/src/ggml-common.h, which is
+       cloned from ggml-org/ggml at build time. Only fetch when nvcc is present, so a
+       CUDA-less C# build does not require network access. -->
+  <Target Name="EnsureGgmlSources" DependsOnTargets="ResolveCudaPtxBuildSettings" Condition="'$(_NvccExitCode)' == '0'">
+    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
+          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.ps1&quot;" />
+    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
+          Command="bash &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.sh&quot;" />
+  </Target>
+
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
-          DependsOnTargets="ResolveCudaPtxBuildSettings"
+          DependsOnTargets="ResolveCudaPtxBuildSettings;EnsureGgmlSources"
           Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
           Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"

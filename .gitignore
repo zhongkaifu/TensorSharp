@@ -25,6 +25,10 @@ artifacts/
 TensorSharp.GGML.Native/build/
 TensorSharp.GGML.Native/build-windows/
 
+# ggml sources are cloned at build time from https://github.com/ggml-org/ggml
+# (see eng/fetch-ggml.sh / eng/fetch-ggml.ps1), not committed.
+ExternalProjects/ggml/
+
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
 

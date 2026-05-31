@@ -184,6 +184,9 @@ BUILD_PARALLEL_ARGS=(--parallel "${BUILD_PARALLEL_LEVEL}")
 
 echo "Configuring TensorSharp.GGML.Native (CUDA=${ENABLE_CUDA}, CUDA_ARCHITECTURES=${CUDA_ARCH_SUMMARY}, TESTS=${BUILD_TESTS}, PARALLEL=${BUILD_PARALLEL_LEVEL})"
 
+# Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
+bash "${SCRIPT_DIR}/../eng/fetch-ggml.sh"
+
 CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA="${ENABLE_CUDA}"

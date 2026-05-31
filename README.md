@@ -178,7 +178,7 @@ TensorSharp/
 │   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
 ├── benchmarks/                  # Reproducible benchmark harnesses
 │   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
-└── ExternalProjects/            # Third-party dependencies (ggml)
+└── ExternalProjects/            # ggml/ is cloned from github.com/ggml-org/ggml at build time (not committed)
 ```
 
 ## NuGet Packages
@@ -209,6 +209,7 @@ The verifier runs `dotnet pack` for the public packages above and fails if an in
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- **`git` and network access:** the GGML/CUDA native builds clone the ggml sources from [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) into `ExternalProjects/ggml/` on first build (see `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`). The clone tracks ggml's default branch (`master`); pin a different ref with `TENSORSHARP_GGML_GIT_REF`, or set `TENSORSHARP_GGML_NO_UPDATE=1` to skip the network update once cloned (offline rebuilds)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
 - **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS

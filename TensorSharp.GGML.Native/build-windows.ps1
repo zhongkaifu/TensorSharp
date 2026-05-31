@@ -253,6 +253,10 @@ if ($EnableCuda -eq "ON" -and -not [string]::IsNullOrWhiteSpace($CudaArchitectur
     $CMakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures"
 }
 
+# Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-ggml.ps1")
+if ($LASTEXITCODE -ne 0) { throw "fetch-ggml.ps1 failed with exit code $LASTEXITCODE" }
+
 cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @CMakeArgs @ExtraCMakeArgs
 
 $BuildArgs = @("--build", $BuildDir, "--config", "Release", "--parallel", "$BuildParallelLevel")

@@ -178,7 +178,7 @@ TensorSharp/
 │   └── inference_benchmark_matrix.md  # 跨引擎吞吐矩阵（TensorSharp vs llama.cpp vs Ollama）
 ├── benchmarks/                  # 可重现的基准脚本
 │   └── inference_matrix/        # 驱动脚本、modelfiles、prompts、每格原始 JSON 结果
-└── ExternalProjects/            # 第三方依赖（ggml）
+└── ExternalProjects/            # ggml/ 在构建时从 github.com/ggml-org/ggml 克隆（不纳入版本控制）
 ```
 
 ## NuGet 包分层
@@ -209,6 +209,7 @@ pwsh ./eng/verify-packages.ps1
 ## 前置要求
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具；若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`
 - **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
 - **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本

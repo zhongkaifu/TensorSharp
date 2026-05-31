@@ -26,10 +26,14 @@ endif()
 
 find_package(Threads REQUIRED)
 
-set(GGML_VERSION "0.0.0" CACHE STRING "" FORCE)
-set(GGML_VERSION_MAJOR 0 CACHE STRING "" FORCE)
 set(GGML_SCHED_MAX_COPIES 4 CACHE STRING "" FORCE)
-add_compile_definitions(GGML_VERSION=\"0.0.0\" GGML_COMMIT=\"unknown\")
+
+# Upstream ggml-org/ggml derives GGML_VERSION/GGML_COMMIT in its root CMakeLists and
+# injects them onto its own targets, so we no longer set them here.
+
+# Do not build ggml's bundled tests/examples when consumed as a subdirectory.
+set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
@@ -74,7 +78,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_COMPRESSION_MODE "speed" CACHE STRING "" FORCE)
 endif()
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src" ggml-build)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml" ggml-build)
 
 add_library(GgmlOps SHARED
     ggml_ops_core.cpp

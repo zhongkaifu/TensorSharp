@@ -529,7 +529,11 @@ namespace tsg
             return false;
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        return props.type == GGML_BACKEND_DEVICE_TYPE_GPU && !props.integrated;
+        // Upstream ggml's ggml_backend_dev_props has no `integrated` field (that was an
+        // ollama-fork extension). On the backends we use the field was effectively always
+        // 0 anyway -- the Metal backend reports type=GPU and never set it -- so the
+        // discrete-GPU test reduces to "is this a GPU device".
+        return props.type == GGML_BACKEND_DEVICE_TYPE_GPU;
     }
 
     bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size)
