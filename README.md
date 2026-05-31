@@ -68,7 +68,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | [gemma3.md](docs/models/gemma3.md) |
 | Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | [qwen3.md](docs/models/qwen3.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes | [qwen35.md](docs/models/qwen35.md) |
-| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | No | [gptoss.md](docs/models/gptoss.md) |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | [gptoss.md](docs/models/gptoss.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | [mistral3.md](docs/models/mistral3.md) |
 
@@ -862,6 +862,7 @@ Each architecture uses its own wire format for tool calls:
 
 - **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H:** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4:** `<|tool_call>call:function_name{args}<tool_call|>`
+- **GPT OSS (Harmony):** tools are declared as a TypeScript namespace in the developer message, and calls are emitted on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
 
 The output parser (`OutputParser.cs`) automatically extracts tool calls from the model's raw output regardless of architecture.
 

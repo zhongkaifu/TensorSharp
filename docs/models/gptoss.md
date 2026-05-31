@@ -10,7 +10,7 @@
 | Example models | gpt-oss-20b |
 | Modalities | Text only |
 | Thinking mode | Yes (Harmony format: `<\|channel>analysis ... <\|channel>final`) |
-| Tool calling | No |
+| Tool calling | Yes (Harmony `commentary` channel — `to=functions.NAME`) |
 | Batched / paged forward | **Default ON** — set `TS_GPTOSS_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). See §11. |
 | Output parser | `HarmonyOutputParser` (always required) |
 
@@ -367,11 +367,34 @@ alternating SWA** — inside the paged scheduling stack:
 - The output parser strips the `<|channel>analysis ...` block (or surfaces
   it as `<think>` content for the API) and exposes the `<|channel>final`
   payload as the assistant message.
-- Tool calling is **not supported** — the Harmony format reserves a tool
-  channel but the open-weights gpt-oss-20b release does not invoke it
-  reliably; the API accepts `tools` but does not surface tool calls.
-- Chat template uses the GPT-4o pre-tokenizer and a Harmony-aware Jinja2
-  template loaded from the GGUF.
+- **Tool calling is supported** via the Harmony `commentary` channel. When
+  the request includes `tools`:
+  - The system message gains the line *"Calls to these tools must go to the
+    commentary channel: 'functions'."* and the developer message gains a
+    `# Tools` block declaring each tool as a TypeScript namespace
+    (`namespace functions { type NAME = (_: { ... }) => any; }`).
+  - The model emits a call as
+    `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`.
+    `HarmonyOutputParser` parses the channel + `to=functions.NAME` recipient
+    and decodes the JSON arguments into a `ToolCall` (max one call per turn,
+    matching the reference implementations).
+  - Tool results are fed back as
+    `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>`.
+  - **Stop tokens:** a tool call terminates with `<|call|>` (id 200012),
+    which the gpt-oss GGUF does *not* list as an eos (only `<|return|>`,
+    id 200002, is). `ModelBase` adds `<|call|>` to the stop set for the
+    `gptoss`/`gpt-oss` architectures so generation halts after the call and
+    it can be parsed.
+  - Round-trip validated against gpt-oss-20b in
+    [`HarmonyToolCallIntegrationTests`](../../InferenceWeb.Tests/HarmonyToolCallIntegrationTests.cs);
+    format/parse coverage in
+    [`HarmonyToolCallTests`](../../InferenceWeb.Tests/HarmonyToolCallTests.cs).
+- Chat template uses the GPT-4o pre-tokenizer. Rendering is handled by the
+  hardcoded `ChatTemplate.RenderHarmony` (the GGUF's embedded Harmony Jinja
+  relies on recursive macros / `namespace()` / `strftime_now` that the
+  lightweight Jinja2 engine does not fully support, especially on the tool
+  path), so gpt-oss is routed to the hardcoded renderer like `mistral3` and
+  `nemotron_h`.
 
 ## 13. Optimization opportunities
 

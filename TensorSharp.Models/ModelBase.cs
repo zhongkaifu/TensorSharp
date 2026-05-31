@@ -667,6 +667,18 @@ namespace TensorSharp.Models
             if (extraEos != null)
                 eosIds.AddRange(extraEos);
 
+            // gpt-oss / Harmony terminates a tool call with <|call|> rather than
+            // the configured eos (<|return|>). The GGUF only lists <|return|> as
+            // eos, so without this the model would not stop after emitting a tool
+            // call and the call could never be parsed. Add <|call|> as a stop token.
+            string arch = _gguf.GetString("general.architecture", "");
+            if (arch == "gptoss" || arch == "gpt-oss")
+            {
+                int callId = Array.IndexOf(vocabTokens, "<|call|>");
+                if (callId >= 0 && !eosIds.Contains(callId))
+                    eosIds.Add(callId);
+            }
+
             string tokenizerModel = _gguf.GetString("tokenizer.ggml.model", "gpt2");
 
             if (tokenizerModel == "llama" || tokenizerModel == "t5" || tokenizerModel == "gemma4")

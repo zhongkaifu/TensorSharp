@@ -9,7 +9,7 @@ These examples cover the current thinking/tool-call surface for the CLI and the 
 | Gemma 4 | Yes | Yes | Uses Gemma channel/tool-call tags |
 | Qwen 3 | Yes | Yes | Uses `<think>` and JSON-style `<tool_call>` tags |
 | Qwen 3.5 / 3.6 family | Yes | Yes | Covers `qwen35`, `qwen35moe`, and `qwen3next` GGUFs |
-| GPT OSS | Yes | No | Harmony parser separates analysis/final channels |
+| GPT OSS | Yes | Yes | Harmony parser separates analysis/final channels; tool calls go on the commentary channel |
 | Nemotron-H | Yes | Yes | Uses Qwen-style thinking/tool-call tags |
 | Gemma 3 / Mistral 3 | No | No | Multimodal-capable, but not thinking/tool-call capable in TensorSharp |
 
@@ -342,7 +342,7 @@ else:
 | Gemma 4 | `<\|channel>thought\n...<channel\|>` | `<\|tool_call>call:NAME{args}<tool_call\|>` |
 | Qwen 3 | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 | Qwen 3.5 / 3.6 family | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
-| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final` (Harmony) | not supported |
+| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final` (Harmony) | `<\|channel\|>commentary to=functions.NAME <\|constrain\|>json<\|message\|>{args}<\|call\|>` |
 | Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 
 ## How It Works
@@ -365,5 +365,5 @@ When `tools` are provided:
 2. **Qwen3**: Tool definitions are injected as JSON in the system message. The model outputs calls as `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
 3. **Qwen3.5 / 3.6-family GGUFs**: Tool definitions use `<tools>...</tools>` format. The model outputs calls as `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`.
 4. **Nemotron-H**: Uses the same `<tool_call>{"name":"...","arguments":{...}}</tool_call>` wire format as Qwen3.
-5. **GPT OSS**: tool-calling is not currently supported.
+5. **GPT OSS**: Tools are declared in the developer message as a TypeScript namespace (`namespace functions { type NAME = (_: { ... }) => any; }`). The model emits calls on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`, which stops generation on the `<|call|>` token. Tool results are returned as `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>`.
 

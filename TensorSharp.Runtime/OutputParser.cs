@@ -593,25 +593,42 @@ namespace TensorSharp.Runtime
 
         private HState _state;
         private readonly StringBuilder _buffer = new();
+        private readonly StringBuilder _toolArgs = new();
         private bool _thinkingEnabled;
         private string? _currentChannel;
+        private string? _currentRecipient;
+        private int _callIndex;
 
         private const string MsgStartTag = "<|start|>";
         private const string MsgEndTag = "<|end|>";
+        private const string CallTag = "<|call|>";
+        private const string ReturnTag = "<|return|>";
         private const string HeaderEndTag = "<|message|>";
         private const string ChannelTag = "<|channel|>";
+        private const string FunctionPrefix = "functions.";
+
+        // Tags that terminate a content message during generation.
+        private static readonly string[] EndTags = { MsgEndTag, CallTag, ReturnTag };
+        // Tags whose partial suffixes must be held back while streaming content.
+        private static readonly string[] HoldTags = { MsgEndTag, CallTag, ReturnTag, MsgStartTag };
 
         public bool HasThinkingSupport => true;
-        public bool HasToolSupport => false;
+        public bool HasToolSupport => true;
         public bool AlwaysRequired => true;
 
         public void Init(bool enableThinking, List<ToolFunction> tools)
         {
             _buffer.Clear();
+            _toolArgs.Clear();
             _thinkingEnabled = enableThinking;
             _state = HState.LookingForStart;
             _currentChannel = null;
+            _currentRecipient = null;
+            _callIndex = 0;
 
+            // The prompt's generation marker is "<|start|>assistant", so the
+            // model's first emitted token is "<|channel|>". Prime the buffer so
+            // the parser is already past the start tag.
             _buffer.Append("<|start|>assistant");
         }
 
@@ -621,6 +638,7 @@ namespace TensorSharp.Runtime
             var result = new ParsedOutput();
             var contentSb = new StringBuilder();
             var thinkingSb = new StringBuilder();
+            var toolCalls = new List<ToolCall>();
 
             bool keepParsing = true;
             while (keepParsing)
@@ -661,17 +679,7 @@ namespace TensorSharp.Runtime
                             _buffer.Clear();
                             _buffer.Append(after);
 
-                            int chIdx = header.IndexOf(ChannelTag, StringComparison.Ordinal);
-                            if (chIdx >= 0)
-                            {
-                                string channelPart = header.Substring(chIdx + ChannelTag.Length);
-                                int spaceIdx = channelPart.IndexOfAny(new[] { ' ', '\t', '\n', '\r' });
-                                _currentChannel = spaceIdx >= 0 ? channelPart.Substring(0, spaceIdx) : channelPart;
-                            }
-                            else
-                            {
-                                _currentChannel = "final";
-                            }
+                            ParseHeader(header);
 
                             _state = HState.ParsingContent;
                             keepParsing = after.Length > 0;
@@ -688,21 +696,22 @@ namespace TensorSharp.Runtime
                         break;
 
                     case HState.ParsingContent:
-                        int endIdx = buf.IndexOf(MsgEndTag, StringComparison.Ordinal);
+                        int endIdx = FindEarliestEndTag(buf, out int tagLen);
                         if (endIdx >= 0)
                         {
                             string content = buf.Substring(0, endIdx);
-                            string after = buf.Substring(endIdx + MsgEndTag.Length);
+                            string after = buf.Substring(endIdx + tagLen);
                             _buffer.Clear();
                             _buffer.Append(after);
 
                             EmitContent(content, contentSb, thinkingSb);
+                            FinalizeMessage(toolCalls);
                             _state = HState.LookingForStart;
                             keepParsing = after.Length > 0;
                         }
                         else if (!done)
                         {
-                            int hold = HoldBack(buf, MsgEndTag, MsgStartTag);
+                            int hold = HoldBack(buf, HoldTags);
                             if (hold > 0)
                             {
                                 string emit = buf.Substring(0, buf.Length - hold);
@@ -719,6 +728,7 @@ namespace TensorSharp.Runtime
                         else
                         {
                             if (buf.Length > 0) EmitContent(buf, contentSb, thinkingSb);
+                            FinalizeMessage(toolCalls);
                             _buffer.Clear();
                         }
                         break;
@@ -727,15 +737,112 @@ namespace TensorSharp.Runtime
 
             result.Content = contentSb.ToString();
             result.Thinking = thinkingSb.ToString();
+            if (toolCalls.Count > 0)
+                result.ToolCalls = toolCalls;
             return result;
+        }
+
+        /// <summary>
+        /// Parse a message header (the text between &lt;|start|&gt; and &lt;|message|&gt;)
+        /// to extract the channel and, for tool calls, the "to=functions.NAME" recipient.
+        /// Handles both header orderings (recipient before or after the channel tag).
+        /// </summary>
+        private void ParseHeader(string header)
+        {
+            int chIdx = header.IndexOf(ChannelTag, StringComparison.Ordinal);
+            if (chIdx >= 0)
+            {
+                string channelPart = header.Substring(chIdx + ChannelTag.Length);
+                int spaceIdx = channelPart.IndexOfAny(new[] { ' ', '\t', '\n', '\r' });
+                _currentChannel = spaceIdx >= 0 ? channelPart.Substring(0, spaceIdx) : channelPart;
+            }
+            else
+            {
+                _currentChannel = "final";
+            }
+
+            _currentRecipient = null;
+            int toIdx = header.IndexOf("to=", StringComparison.Ordinal);
+            if (toIdx >= 0)
+            {
+                string rest = header.Substring(toIdx + 3);
+                int end = 0;
+                while (end < rest.Length && !char.IsWhiteSpace(rest[end]) && rest[end] != '<')
+                    end++;
+                if (end > 0)
+                    _currentRecipient = rest.Substring(0, end);
+            }
         }
 
         private void EmitContent(string content, StringBuilder contentSb, StringBuilder thinkingSb)
         {
-            if (_currentChannel == "analysis")
+            if (content.Length == 0) return;
+            if (IsToolCall())
+                _toolArgs.Append(content);
+            else if (_currentChannel == "analysis")
                 thinkingSb.Append(content);
             else
                 contentSb.Append(content);
+        }
+
+        /// <summary>Finalize the current message: emit a tool call if it targeted functions.*.</summary>
+        private void FinalizeMessage(List<ToolCall> toolCalls)
+        {
+            if (IsToolCall())
+            {
+                var tc = BuildToolCall();
+                if (tc != null)
+                    toolCalls.Add(tc);
+            }
+            _toolArgs.Clear();
+            _currentRecipient = null;
+        }
+
+        private bool IsToolCall() =>
+            _currentRecipient != null && _currentRecipient.StartsWith(FunctionPrefix, StringComparison.Ordinal);
+
+        private ToolCall? BuildToolCall()
+        {
+            string name = _currentRecipient!.Substring(FunctionPrefix.Length);
+            if (string.IsNullOrEmpty(name)) return null;
+
+            var args = new Dictionary<string, object>();
+            string raw = _toolArgs.ToString().Trim();
+            if (raw.Length > 0)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var prop in doc.RootElement.EnumerateObject())
+                            args[prop.Name] = Qwen3OutputParser.JsonElementToObject(prop.Value);
+                    }
+                }
+                catch
+                {
+                    // Malformed JSON: surface the call with no parsed arguments
+                    // rather than dropping it entirely.
+                }
+            }
+            return new ToolCall { Name = name, Arguments = args, Index = _callIndex++ };
+        }
+
+        /// <summary>Find the earliest message-terminating tag in the buffer.</summary>
+        private static int FindEarliestEndTag(string buf, out int tagLen)
+        {
+            int best = -1;
+            tagLen = 0;
+            foreach (var tag in EndTags)
+            {
+                int idx = buf.IndexOf(tag, StringComparison.Ordinal);
+                if (idx >= 0 && (best < 0 || idx < best))
+                {
+                    best = idx;
+                    tagLen = tag.Length;
+                }
+            }
+            return best;
         }
 
         private static int HoldBack(string buf, params string[] tags)

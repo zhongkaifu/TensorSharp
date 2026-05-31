@@ -10,7 +10,7 @@
 | 示例模型 | gpt-oss-20b |
 | 模态 | 仅文本 |
 | 思维链模式 | 是（Harmony 格式：`<\|channel>analysis ... <\|channel>final`） |
-| 工具调用 | 否 |
+| 工具调用 | 是（Harmony `commentary` channel —— `to=functions.NAME`） |
 | 批处理 / 分页前向 | **默认启用** —— 设置 `TS_GPTOSS_BATCHED=0` 可强制走旧的按序列 KV-swap 路径用于 A/B 对比。每层分页 K/V，注意力 sinks 通过原生 `TSGgml_PagedAttentionForwardWithSinks`（或托管 C# 回退 `TS_GPTOSS_PAGED_ATTN_MANAGED=1`）。详见 §11。 |
 | 输出解析器 | `HarmonyOutputParser`（始终启用） |
 
@@ -275,8 +275,13 @@ GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
   - `<|channel>analysis ...` 思维链推理。
   - `<|channel>final ...` 用户可见的回答。
 - 输出解析器剥掉 `<|channel>analysis ...` 块（或在 API 中作为 `<think>` 内容暴露），把 `<|channel>final` 部分作为 assistant 消息暴露。
-- **不支持工具调用** —— Harmony 格式预留了 tool channel，但开放权重的 gpt-oss-20b 不能稳定触发；API 接受 `tools` 但不会暴露 tool call。
-- 聊天模板使用 GPT-4o pre-tokenizer 与 GGUF 中加载的 Harmony-aware Jinja2 模板。
+- **支持工具调用**（通过 Harmony `commentary` channel）。当请求包含 `tools` 时：
+  - system 消息追加 “Calls to these tools must go to the commentary channel: 'functions'.”，developer 消息追加 `# Tools` 块，把每个工具声明为 TypeScript namespace（`namespace functions { type NAME = (_: { ... }) => any; }`）。
+  - 模型以 `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>` 形式输出调用；`HarmonyOutputParser` 解析 channel 与 `to=functions.NAME` recipient，并把 JSON 参数解析为 `ToolCall`（每轮最多一个调用，与参考实现一致）。
+  - 工具结果以 `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>` 形式回传。
+  - **停止 token：** 工具调用以 `<|call|>`（id 200012）结束，而 gpt-oss GGUF 只把 `<|return|>`（id 200002）列为 eos。`ModelBase` 为 `gptoss`/`gpt-oss` 架构把 `<|call|>` 加入停止集合，使生成在调用后停下来以便解析。
+  - 已用 gpt-oss-20b 在 [`HarmonyToolCallIntegrationTests`](../../InferenceWeb.Tests/HarmonyToolCallIntegrationTests.cs) 做端到端往返验证；格式/解析覆盖见 [`HarmonyToolCallTests`](../../InferenceWeb.Tests/HarmonyToolCallTests.cs)。
+- 聊天模板使用 GPT-4o pre-tokenizer。渲染由硬编码的 `ChatTemplate.RenderHarmony` 处理（GGUF 内置的 Harmony Jinja 依赖递归宏 / `namespace()` / `strftime_now` 等轻量 Jinja2 引擎无法完全支持的特性，尤其在工具路径上），因此 gpt-oss 与 `mistral3`、`nemotron_h` 一样走硬编码渲染器。
 
 ## 13. 优化机会
 

@@ -9,7 +9,7 @@
 | Gemma 4 | 支持 | 支持 | 使用 Gemma channel/tool-call 标签 |
 | Qwen 3 | 支持 | 支持 | 使用 `<think>` 与 JSON 风格 `<tool_call>` 标签 |
 | Qwen 3.5 / 3.6 family | 支持 | 支持 | 覆盖 `qwen35`、`qwen35moe`、`qwen3next` GGUF |
-| GPT OSS | 支持 | 不支持 | Harmony 解析器会拆分 analysis/final channel |
+| GPT OSS | 支持 | 支持 | Harmony 解析器会拆分 analysis/final channel；工具调用走 commentary channel |
 | Nemotron-H | 支持 | 支持 | 使用 Qwen 风格思维链/工具调用标签 |
 | Gemma 3 / Mistral 3 | 不支持 | 不支持 | 在 TensorSharp 中支持多模态，但不支持思维链/工具调用 |
 
@@ -342,7 +342,7 @@ else:
 | Gemma 4 | `<\|channel>thought\n...<channel\|>` | `<\|tool_call>call:NAME{args}<tool_call\|>` |
 | Qwen 3 | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 | Qwen 3.5 / 3.6 family | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
-| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final`（Harmony 格式） | 暂不支持 |
+| GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final`（Harmony 格式） | `<\|channel\|>commentary to=functions.NAME <\|constrain\|>json<\|message\|>{args}<\|call\|>` |
 | Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
 
 ## 工作原理
@@ -365,4 +365,4 @@ else:
 2. **Qwen3**：工具定义以 JSON 形式注入到 system message。模型输出调用为 `<tool_call>{"name":"...","arguments":{...}}</tool_call>`。
 3. **Qwen3.5 / 3.6-family GGUF**：工具定义使用 `<tools>...</tools>` 格式。模型输出调用为 `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`。
 4. **Nemotron-H**：与 Qwen3 共用相同的 `<tool_call>{"name":"...","arguments":{...}}</tool_call>` 线协议。
-5. **GPT OSS**：当前未支持工具调用。
+5. **GPT OSS**：工具以 TypeScript namespace 形式声明在 developer 消息中（`namespace functions { type NAME = (_: { ... }) => any; }`）。模型在 commentary channel 输出调用：`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`，并在 `<|call|>` 停止 token 处结束生成。工具结果以 `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>` 回传。

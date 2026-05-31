@@ -527,6 +527,14 @@ namespace TensorSharp.Runtime
             if (architecture == "nemotron_h" || architecture == "nemotron_h_moe" || architecture == "nemotron_h_omni")
                 return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
 
+            // gpt-oss / Harmony: the embedded template relies on advanced Jinja
+            // features (recursive macros, namespace(), strftime_now, list slicing)
+            // that the lightweight engine does not fully support — especially on the
+            // tool-rendering path. Use the purpose-built hardcoded renderer instead so
+            // tool declarations and tool-call framing are always correct.
+            if (architecture == "gptoss" || architecture == "gpt-oss")
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+
             if (!string.IsNullOrWhiteSpace(template))
             {
                 try
@@ -566,7 +574,7 @@ namespace TensorSharp.Runtime
                 return RenderGemma4(messages, addGenerationPrompt, tools, enableThinking);
 
             if (architecture == "gptoss" || architecture == "gpt-oss")
-                return RenderHarmony(messages, addGenerationPrompt);
+                return RenderHarmony(messages, addGenerationPrompt, tools, enableThinking);
 
             if (architecture == "qwen35" || architecture == "qwen35moe" || architecture == "qwen3next" ||
                 architecture == "qwen3vl" || architecture == "qwen3vlmoe")
@@ -785,9 +793,11 @@ namespace TensorSharp.Runtime
         /// user/assistant messages with &lt;|start|&gt;role&lt;|message|&gt;content&lt;|end|&gt; framing,
         /// and a generation prompt of just &lt;|start|&gt;assistant (model generates channel tags).
         /// </summary>
-        public static string RenderHarmony(List<ChatMessage> messages, bool addGenerationPrompt = true)
+        public static string RenderHarmony(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
+            bool hasTools = tools != null && tools.Count > 0;
 
             int startIdx = 0;
             string? developerContent = null;
@@ -797,28 +807,82 @@ namespace TensorSharp.Runtime
                 startIdx = 1;
             }
 
+            // System message.
             sb.Append("<|start|>system<|message|>");
             sb.Append("You are ChatGPT, a large language model trained by OpenAI.\n");
             sb.Append("Knowledge cutoff: 2024-06\n");
             sb.Append($"Current date: {DateTime.Now:yyyy-MM-dd}\n\n");
             sb.Append("Reasoning: medium\n\n");
             sb.Append("# Valid channels: analysis, commentary, final. Channel must be included for every message.");
+            if (hasTools)
+                sb.Append("\nCalls to these tools must go to the commentary channel: 'functions'.");
             sb.Append("<|end|>");
 
-            if (!string.IsNullOrEmpty(developerContent))
+            // Developer message carries the instructions and the tool namespace.
+            if (!string.IsNullOrEmpty(developerContent) || hasTools)
             {
                 sb.Append("<|start|>developer<|message|>");
-                sb.Append("# Instructions\n\n");
-                sb.Append(developerContent);
+                if (!string.IsNullOrEmpty(developerContent))
+                {
+                    sb.Append("# Instructions\n\n");
+                    sb.Append(developerContent);
+                    sb.Append("\n\n");
+                }
+                if (hasTools)
+                {
+                    sb.Append("# Tools\n\n");
+                    RenderHarmonyToolNamespace(sb, "functions", tools!);
+                }
                 sb.Append("<|end|>");
             }
 
+            // The name of the most recent assistant tool call; tool-result
+            // messages are attributed to it (Harmony has no per-message tool id).
+            string? lastToolName = null;
             for (int i = startIdx; i < messages.Count; i++)
             {
                 var msg = messages[i];
                 if (msg.Role == "assistant")
                 {
-                    sb.Append("<|start|>assistant<|channel|>final<|message|>");
+                    if (msg.ToolCalls != null && msg.ToolCalls.Count > 0)
+                    {
+                        // Replay the reasoning that produced the call when available
+                        // (Harmony keeps analysis for the active tool-call turn).
+                        if (!string.IsNullOrEmpty(msg.Thinking))
+                        {
+                            sb.Append("<|start|>assistant<|channel|>analysis<|message|>");
+                            sb.Append(msg.Thinking);
+                            sb.Append("<|end|>");
+                        }
+                        foreach (var tc in msg.ToolCalls)
+                        {
+                            sb.Append("<|start|>assistant<|channel|>commentary to=functions.");
+                            sb.Append(tc.Name);
+                            sb.Append(" <|constrain|>json<|message|>");
+                            sb.Append(SerializeToolArguments(tc.Arguments));
+                            sb.Append("<|call|>");
+                            lastToolName = tc.Name;
+                        }
+                        if (!string.IsNullOrEmpty(msg.Content))
+                        {
+                            sb.Append("<|start|>assistant<|channel|>final<|message|>");
+                            sb.Append(msg.Content);
+                            sb.Append("<|end|>");
+                        }
+                    }
+                    else
+                    {
+                        sb.Append("<|start|>assistant<|channel|>final<|message|>");
+                        sb.Append(msg.Content ?? "");
+                        sb.Append("<|end|>");
+                        lastToolName = null;
+                    }
+                }
+                else if (msg.Role == "tool")
+                {
+                    sb.Append("<|start|>functions.");
+                    sb.Append(lastToolName ?? "");
+                    sb.Append(" to=assistant<|channel|>commentary<|message|>");
                     sb.Append(msg.Content ?? "");
                     sb.Append("<|end|>");
                 }
@@ -836,6 +900,79 @@ namespace TensorSharp.Runtime
                 sb.Append("<|start|>assistant");
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Render the Harmony tool namespace, e.g.
+        /// <code>## functions\n\nnamespace functions {\n\n// desc\ntype name = (_: {\nparam: string,\n}) => any;\n\n} // namespace functions</code>
+        /// Matches the official gpt-oss chat template's TypeScript-style declarations.
+        /// </summary>
+        private static void RenderHarmonyToolNamespace(StringBuilder sb, string ns, List<ToolFunction> tools)
+        {
+            sb.Append("## ").Append(ns).Append("\n\n");
+            sb.Append("namespace ").Append(ns).Append(" {\n\n");
+            foreach (var tool in tools)
+            {
+                if (!string.IsNullOrEmpty(tool.Description))
+                    sb.Append("// ").Append(tool.Description).Append('\n');
+                sb.Append("type ").Append(tool.Name).Append(" = ");
+                if (tool.Parameters != null && tool.Parameters.Count > 0)
+                {
+                    sb.Append("(_: {\n");
+                    foreach (var kv in tool.Parameters)
+                    {
+                        var p = kv.Value;
+                        if (!string.IsNullOrEmpty(p.Description))
+                            sb.Append("// ").Append(p.Description).Append('\n');
+                        sb.Append(kv.Key);
+                        bool required = tool.Required != null && tool.Required.Contains(kv.Key);
+                        if (!required)
+                            sb.Append('?');
+                        sb.Append(": ");
+                        sb.Append(RenderHarmonyTsType(p));
+                        sb.Append(",\n");
+                    }
+                    sb.Append("}) => any;\n\n");
+                }
+                else
+                {
+                    sb.Append("() => any;\n\n");
+                }
+            }
+            sb.Append("} // namespace ").Append(ns);
+        }
+
+        /// <summary>Map a tool parameter to its Harmony TypeScript type.</summary>
+        private static string RenderHarmonyTsType(ToolParameter p)
+        {
+            string type = (p.Type ?? "").ToLowerInvariant();
+            switch (type)
+            {
+                case "string":
+                    if (p.Enum != null && p.Enum.Count > 0)
+                        return "\"" + string.Join("\" | \"", p.Enum) + "\"";
+                    return "string";
+                case "number":
+                case "integer":
+                    return "number";
+                case "boolean":
+                    return "boolean";
+                case "array":
+                    // ToolParameter does not carry item types; fall back to any[].
+                    return "any[]";
+                case "object":
+                    return "object";
+                default:
+                    return "any";
+            }
+        }
+
+        /// <summary>Serialize tool-call arguments to compact JSON for the Harmony commentary message.</summary>
+        private static string SerializeToolArguments(Dictionary<string, object>? arguments)
+        {
+            if (arguments == null || arguments.Count == 0)
+                return "{}";
+            return JsonSerializer.Serialize(arguments);
         }
 
         /// <summary>

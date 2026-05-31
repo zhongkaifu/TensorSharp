@@ -68,7 +68,7 @@
 | Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 | [gemma3_zh-cn.md](docs/models/gemma3_zh-cn.md) |
 | Qwen 3 | `qwen3` | Qwen3-4B | 仅文本 | 支持 | 支持 | [qwen3_zh-cn.md](docs/models/qwen3_zh-cn.md) |
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE） | 图像 | 支持 | 支持 | [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md) |
-| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 不支持 | [gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md) |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 支持 | [gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni（图像） | 图像（Omni） | 支持 | 支持 | [nemotron_zh-cn.md](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | [mistral3_zh-cn.md](docs/models/mistral3_zh-cn.md) |
 
@@ -856,6 +856,7 @@ curl http://localhost:5000/api/queue/status
 
 - **Qwen 3 / Qwen 3.5/3.6-family / Nemotron-H：** `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
 - **Gemma 4：** `<|tool_call>call:function_name{args}<tool_call|>`
+- **GPT OSS（Harmony）：** 工具以 TypeScript namespace 形式声明在 developer 消息中，调用通过 commentary channel 输出：`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`
 
 输出解析器（`OutputParser.cs`）会自动从模型原始输出中提取工具调用，与架构无关。
 

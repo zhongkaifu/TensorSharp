@@ -281,7 +281,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### 聊天 + 工具调用
 
-工具按 Ollama tool API 的形式定义。服务端会根据当前架构识别工具调用的线协议（如 Qwen / Nemotron-H 使用 `<tool_call>...</tool_call>`，Gemma 4 使用 `<|tool_call>...<tool_call|>`），并解析为结构化的 `tool_calls`：
+工具按 Ollama tool API 的形式定义。服务端会根据当前架构识别工具调用的线协议（如 Qwen / Nemotron-H 使用 `<tool_call>...</tool_call>`，Gemma 4 使用 `<|tool_call>...<tool_call|>`，GPT OSS 使用 Harmony commentary channel `<|channel|>commentary to=functions.NAME ...<|call|>`），并解析为结构化的 `tool_calls`：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \

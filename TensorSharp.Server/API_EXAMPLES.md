@@ -282,7 +282,7 @@ The response carries the chain-of-thought separately in `message.thinking`:
 
 ### Chat with Tool Calling
 
-Define tools in the same shape as Ollama's tool API. The server detects the architecture's wire format (e.g. `<tool_call>...</tool_call>` for Qwen / Nemotron-H, `<|tool_call>...<tool_call|>` for Gemma 4) and parses them into structured `tool_calls`:
+Define tools in the same shape as Ollama's tool API. The server detects the architecture's wire format (e.g. `<tool_call>...</tool_call>` for Qwen / Nemotron-H, `<|tool_call>...<tool_call|>` for Gemma 4, and the Harmony `commentary` channel `<|channel|>commentary to=functions.NAME ...<|call|>` for GPT OSS) and parses them into structured `tool_calls`:
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
