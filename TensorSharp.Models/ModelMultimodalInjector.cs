@@ -20,8 +20,8 @@ namespace TensorSharp.Models
         private readonly Dictionary<string, CachedEmbedding> _visionCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CachedEmbedding> _audioCache = new(StringComparer.OrdinalIgnoreCase);
 
-        // Per-request buckets. "" is the default bucket used by the legacy
-        // single-threaded path (SessionKvCacheManager, InteractiveSession);
+        // Per-request buckets. "" is the default bucket used by direct
+        // single-threaded callers (for example InteractiveSession);
         // engine-path callers pass a unique requestId so concurrent requests
         // don't clobber each other's prepared embeddings. Mutations are guarded
         // by _bucketLock because the engine's per-seq Forward (driven by the

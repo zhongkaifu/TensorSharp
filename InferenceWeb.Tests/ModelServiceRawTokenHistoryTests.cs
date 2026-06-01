@@ -13,9 +13,9 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// Tests for the ModelService-level conversation tracking that keeps raw output tokens
 /// associated with assistant messages across HTTP requests, enabling the next turn's
-/// prompt render to splice raw tokens in for cached KV state.
+/// prompt render to preserve the exact tokenized conversation prefix.
 /// </summary>
-public class ModelServiceKVCacheTests
+public class ModelServiceRawTokenHistoryTests
 {
     [Fact]
     public void ResolvePrefillChunkSize_CudaLongPrompt_UsesSafeChunkSize()
@@ -82,13 +82,13 @@ public class ModelServiceKVCacheTests
     }
 
     /// <summary>
-    /// Reproduces the Qwen 3.5 / 3.6 WebUI cache-reset bug:
+    /// Reproduces the Qwen 3.5 / 3.6 WebUI raw-token history bug:
     /// the streaming output parser strips &lt;think&gt;...&lt;/think&gt; framing from the
     /// assistant text before the WebUI accumulates it, so on the next chat request the
     /// WebUI sends back an assistant message whose Content is a STRIPPED subset of what
     /// our tracked history stored. The augmenter MUST still recognise this as the same
     /// turn and splice the cached raw output tokens, otherwise every multi-turn chat with
-    /// a thinking model degenerates to a full prompt re-prefill.
+    /// a thinking model changes the rendered token prefix.
     /// </summary>
     [Fact]
     public void AugmentWithCachedRawTokens_WebUIParsedContentMismatch_StillSplicesRawTokens()

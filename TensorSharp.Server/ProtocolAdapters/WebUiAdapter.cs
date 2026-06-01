@@ -110,8 +110,9 @@ namespace TensorSharp.Server.ProtocolAdapters
                 return Results.NotFound(new { ok = false, error = $"Session '{id}' not found." });
             }
 
-            // Fire through the inference queue so we don't race with an in-flight request
-            // that is still using this session's tensors.
+            // Keep the legacy queue handshake for the API contract. The queue is a
+            // no-op now; in-flight KV state is owned by the engine, while disposing
+            // the session only clears tracked chat history.
             using var ticket = _queue.Enqueue(ctx.RequestAborted);
             await ticket.WaitUntilReadyAsync();
             _svc.DisposeSession(removed);

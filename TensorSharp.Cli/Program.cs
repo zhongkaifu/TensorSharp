@@ -95,9 +95,8 @@ namespace TensorSharp.Cli
             int pagedKvBenchTrials = 3;
             // Cross-session paged KV cache knobs. Each flag is plumbed through to
             // the matching env var so any code that calls
-            // PagedKvCacheConfig.FromEnvironment() picks it up - that's the same
-            // path the benchmark and (in TensorSharp.Server) the SessionKvCacheManager
-            // both use, so a single set of flags configures everything consistently.
+            // PagedKvCacheConfig.FromEnvironment() picks it up. The CLI
+            // benchmark still exercises the standalone PagedKvCacheManager.
             bool? pagedKvEnableOverride = null;
             int? pagedKvBlockSizeOverride = null;
             long? pagedKvRamMbOverride = null;
@@ -2847,4 +2846,3 @@ namespace TensorSharp.Cli
         }
     }
 }
-

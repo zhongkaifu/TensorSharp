@@ -141,7 +141,7 @@ to sample from.
 **Refactored** (existing files re-written to drive the engine):
 
 - `Server/ChatGenerationPipeline.cs` — was a per-token sample/forward loop
-  bound to `SessionKvCacheManager`; now submits the rendered prompt to the
+  bound to server-owned session KV state; now submits the rendered prompt to the
   engine and streams tokens from the returned `InferenceRequestHandle`.
 - `Server/ModelService.cs` — constructs and owns the `InferenceEngineHost`;
   resets the engine on model reload so the block pool is rebuilt for the
@@ -160,14 +160,15 @@ to sample from.
   All required models (Gemma 4, Qwen 3 / 3.5, Mistral 3, Gemma 3, GPT-OSS,
   Nemotron) already implement them.
 
-**Vestigial — pending follow-on deletion**:
+**Deleted / isolated legacy server state**:
 
-- `Server/SessionKvCacheManager.cs` is still constructed by `ModelService`
-  because some legacy public APIs (`ActiveSession`, `KVCache` property,
-  `ResetSession`, `DisposeSession`, etc.) are exercised by tests and by
-  parts of `SessionManager`. The actual KV-cache lifecycle has moved into
-  the engine; the manager now just owns chat-history bookkeeping. Once
-  callers are migrated off these legacy APIs the file can be deleted.
+- `Server/SessionKvCacheManager.cs` has been removed. Server sessions no
+  longer own token/logit KV bookkeeping, no session is activated into the
+  model, and `ModelService.ResetSession` / `DisposeSession` only affect
+  tracked chat history. Compatibility properties such as `ActiveSession` and
+  `KVCache` remain as inert shims so older callers compile, but they are never
+  used by inference. All live KV ownership now flows through
+  `Runtime/Scheduling`.
 
 ## Test Coverage
 

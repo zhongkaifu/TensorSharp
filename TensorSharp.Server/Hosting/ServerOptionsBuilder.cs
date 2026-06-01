@@ -113,8 +113,7 @@ namespace TensorSharp.Server.Hosting
         /// <c>--no-continuous-batching</c> forces the per-seq path for every
         /// model.
         ///
-        /// Must run before <see cref="SessionKvCacheManager"/> /
-        /// <see cref="InferenceEngine"/> are constructed because both
+        /// Must run before <see cref="InferenceEngine"/> is constructed because
         /// <c>BatchExecutor</c> and Qwen3.5's <c>SupportsBatchedMultimodal</c>
         /// read the env vars at runtime on each step.
         /// </summary>
@@ -164,8 +163,9 @@ namespace TensorSharp.Server.Hosting
         /// Translate <c>--paged-kv*</c> CLI flags into the env vars consumed by
         /// <see cref="PagedKvCacheConfig.FromEnvironment"/>. Returns true when at
         /// least one flag was applied so the caller can emit a startup-log line.
-        /// Must run before <see cref="SessionKvCacheManager"/> is constructed -
-        /// the manager reads the env vars at field-initializer time.
+        /// These flags are retained for CLI compatibility with older server
+        /// builds; the continuous-batching engine reads its scheduler knobs
+        /// from <c>TS_SCHED_*</c>.
         /// </summary>
         public static bool ApplyPagedKvCacheCliFlags(string[] args)
         {

@@ -20,10 +20,7 @@ namespace TensorSharp.Server
     public class ModelService : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
-        // Session registry retained for adapters and tests that track per-
-        // user conversation state. KV cache management has moved to the
-        // engine; this layer now only owns chat-history bookkeeping.
-        private readonly SessionKvCacheManager _sessions;
+        private readonly ChatSession _intrinsicSession;
         private readonly InferenceEngineHost _engineHost;
         private readonly ChatGenerationPipeline _generation;
 
@@ -41,7 +38,7 @@ namespace TensorSharp.Server
             var telemetry = new InferenceTelemetry(logger);
 
             _lifecycle = new ModelLifecycleService(logger);
-            _sessions = new SessionKvCacheManager(_lifecycle, logger);
+            _intrinsicSession = new ChatSession("__svc_intrinsic__");
             _engineHost = new InferenceEngineHost(_lifecycle, logger);
             _generation = new ChatGenerationPipeline(_lifecycle, _engineHost, kvCacheRenderer, telemetry, logger);
         }
@@ -61,22 +58,24 @@ namespace TensorSharp.Server
         public ModelBase Model => _lifecycle.Model;
 
         /// <summary>
-        /// The session whose tokens are currently held in the model's KV tensors, or
-        /// null if no session has been activated yet since the last model load / reset.
+        /// Legacy compatibility shim. The engine owns KV state, so no server
+        /// session is ever active in the model.
         /// </summary>
-        public ChatSession ActiveSession => _sessions.ActiveSession;
+        public ChatSession ActiveSession => null;
 
         /// <summary>
-        /// Inspection-only view of the active session's KV cache bookkeeping (for tests
-        /// and diagnostics). Returns an empty cache when no session is active.
+        /// Legacy compatibility shim. Server-side session KV bookkeeping was
+        /// removed; callers receive an isolated empty cache that is never used
+        /// by inference.
         /// </summary>
-        public KVCache KVCache => _sessions.KVCache;
+        public KVCache KVCache => new();
 
         /// <summary>
-        /// Snapshot of the messages whose tokens are reflected in the current (active)
-        /// session's KV state. Returned as a read-only view.
+        /// Snapshot of the intrinsic compatibility session's tracked history.
+        /// Session-aware requests use the explicit <see cref="ChatSession"/>
+        /// instance passed to the generation methods.
         /// </summary>
-        public IReadOnlyList<ChatMessage> TrackedHistory => _sessions.TrackedHistory;
+        public IReadOnlyList<ChatMessage> TrackedHistory => _intrinsicSession.TrackedHistory.AsReadOnly();
 
         public bool IsModelAlreadyLoaded(string modelName)
         {
@@ -93,46 +92,40 @@ namespace TensorSharp.Server
             // Tear down the per-model engine BEFORE the model is unloaded so
             // the engine's worker thread doesn't race the model disposal.
             _engineHost.Reset();
-            _sessions.ClearForModelReload();
+            _intrinsicSession.TrackedHistory.Clear();
             _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
         }
 
         /// <summary>
-        /// Clear the active session's conversation cache and reset the model's K/V
-        /// tensors. Callers that hold a specific session should prefer
-        /// <see cref="ResetSession"/>.
+        /// Legacy compatibility shim for older callers. There is no
+        /// service-owned KV cache to invalidate; this clears only the intrinsic
+        /// tracked history used by non-session-aware overloads.
         /// </summary>
         public void InvalidateKVCache()
         {
-            _sessions.InvalidateKVCache();
+            _intrinsicSession.TrackedHistory.Clear();
         }
 
         /// <summary>
-        /// Reset the given session's conversation cache. If the session is currently
-        /// active in the model, the model's K/V tensors are also reset.
+        /// Reset the given session's tracked conversation history. Engine-owned
+        /// KV blocks are request-scoped and are not reset through this API.
         /// </summary>
         public void ResetSession(ChatSession session)
         {
-            _sessions.ResetSession(session);
+            if (session == null)
+                return;
+            session.TrackedHistory.Clear();
+            session.LastUsedAt = DateTime.UtcNow;
         }
 
         /// <summary>
-        /// Dispose the given session and release any KV state it held. When the
-        /// session was active in the model, the model's K/V tensors are reset so
-        /// no data leaks to whichever session is activated next.
+        /// Dispose the given session and release its tracked history. The
+        /// inference engine releases KV blocks independently of session
+        /// disposal.
         /// </summary>
         public void DisposeSession(ChatSession session)
         {
-            _sessions.DisposeSession(session);
-        }
-
-        /// <summary>
-        /// Make <paramref name="session"/> the active session. Switching sessions resets
-        /// the model's K/V tensors so no cached data leaks across sessions.
-        /// </summary>
-        internal void ActivateSession(ChatSession session)
-        {
-            _sessions.ActivateSession(session);
+            session?.Dispose();
         }
 
         /// <summary>
@@ -146,12 +139,12 @@ namespace TensorSharp.Server
             List<ToolFunction> tools = null,
             bool enableThinking = false)
         {
-            return ChatStreamAsync(_sessions.IntrinsicSession, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
+            return ChatStreamAsync(_intrinsicSession, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
         }
 
         /// <summary>
         /// Stream chat inference tokens using the given <paramref name="session"/>'s
-        /// KV cache and tracked history. Must be called within the InferenceQueue.
+        /// tracked history. Must be called within the InferenceQueue.
         /// </summary>
         public IAsyncEnumerable<string> ChatStreamAsync(
             ChatSession session,
@@ -177,7 +170,7 @@ namespace TensorSharp.Server
                 List<ToolFunction> tools = null,
                 bool enableThinking = false)
         {
-            return ChatStreamWithMetricsAsync(_sessions.IntrinsicSession, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
+            return ChatStreamWithMetricsAsync(_intrinsicSession, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
         }
 
         /// <summary>
@@ -199,7 +192,7 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Stream generate tokens. Must be called within the InferenceQueue to prevent concurrent access.
-        /// Always resets the session's KV cache - intended for one-shot completions.
+        /// Intended for one-shot completions and does not update session history.
         /// </summary>
         public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
             GenerateStreamAsync(
@@ -209,12 +202,12 @@ namespace TensorSharp.Server
                 CancellationToken cancellationToken,
                 SamplingConfig samplingConfig = null)
         {
-            return GenerateStreamAsync(_sessions.IntrinsicSession, prompt, imagePaths, maxTokens, cancellationToken, samplingConfig);
+            return GenerateStreamAsync(_intrinsicSession, prompt, imagePaths, maxTokens, cancellationToken, samplingConfig);
         }
 
         /// <summary>
-        /// Session-aware streaming generate. The session's KV cache is reset before the
-        /// prefill, so the yielded done tuple always reports <c>kvCacheReusedTokens == 0</c>.
+        /// Session-aware streaming generate. Generate requests are treated as
+        /// one-shot prompts and do not update tracked chat history.
         /// </summary>
         public IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>
             GenerateStreamAsync(
@@ -229,17 +222,17 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
-        /// Instance-friendly shim that augments against the active session's tracked
-        /// history. Prefer the static overload that takes an explicit tracked history
-        /// for deterministic testing.
+        /// Instance-friendly shim that augments against the intrinsic compatibility
+        /// session's tracked history. Prefer the static overload that takes an
+        /// explicit tracked history for deterministic testing.
         /// </summary>
         internal List<ChatMessage> AugmentWithCachedRawTokens(List<ChatMessage> incoming)
         {
-            return AugmentWithCachedRawTokens(incoming, (_sessions.ActiveSession ?? _sessions.IntrinsicSession).TrackedHistory);
+            return AugmentWithCachedRawTokens(incoming, _intrinsicSession.TrackedHistory);
         }
 
         internal static int ResolvePrefillChunkSize(BackendType backend, int tokenCount)
-            => SessionKvCacheManager.ResolvePrefillChunkSize(backend, tokenCount);
+            => PrefillChunking.ResolveChunkSize(backend, tokenCount);
 
         internal static List<ChatMessage> AugmentWithCachedRawTokens(
             List<ChatMessage> incoming,
@@ -291,7 +284,7 @@ namespace TensorSharp.Server
         {
             _engineHost.Dispose();
             _lifecycle.Dispose();
-            _sessions.Dispose();
+            _intrinsicSession.Dispose();
         }
 
         private static bool IsMmProjFile(string fileName)

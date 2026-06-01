@@ -87,8 +87,8 @@ public class SessionManagerTests
     [Fact]
     public void TryRemove_DefaultSessionIdReturnsNullAndKeepsSession()
     {
-        // The default session must survive for the lifetime of the server since the
-        // Ollama / OpenAI endpoints rely on it for cache reuse.
+        // The default session must survive for the lifetime of the server since
+        // the Ollama / OpenAI endpoints rely on it for tracked-history reuse.
         var mgr = new SessionManager();
         var before = mgr.DefaultSession;
 
@@ -106,28 +106,25 @@ public class SessionManagerTests
         var a = mgr.CreateSession();
         var b = mgr.CreateSession();
 
-        a.KVCache.RecordAppend(new[] { 10, 20, 30 }, new float[] { 1.0f });
         a.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "A's secret" });
 
         // Session B must not see any of A's state.
-        Assert.True(b.KVCache.IsEmpty);
         Assert.Empty(b.TrackedHistory);
-        Assert.Equal(3, a.KVCache.Count);
+        Assert.Single(a.TrackedHistory);
     }
 
     [Fact]
     public void TryRemove_SessionIsNotAutoDisposed()
     {
-        // TryRemove only unregisters; disposal is the caller's responsibility so that
-        // ModelService can reset the model's K/V tensors before the bookkeeping is
-        // torn down. The returned session should still be usable for inspection.
+        // TryRemove only unregisters; disposal is the caller's responsibility.
+        // The returned session should still be usable for inspection.
         var mgr = new SessionManager();
         var created = mgr.CreateSession();
-        created.KVCache.RecordAppend(7, new float[] { 0.1f });
+        created.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "keep" });
 
         var removed = mgr.TryRemove(created.Id);
 
         Assert.False(removed!.IsDisposed);
-        Assert.Equal(1, removed.KVCache.Count);
+        Assert.Single(removed.TrackedHistory);
     }
 }

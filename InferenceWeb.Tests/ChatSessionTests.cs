@@ -11,9 +11,8 @@
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Unit tests for <see cref="ChatSession"/>: ensures each session owns an isolated
-/// <see cref="KVCache"/> and tracked-history buffer, and that disposing the session
-/// fully clears that state.
+/// Unit tests for <see cref="ChatSession"/>: ensures each session owns an
+/// isolated tracked-history buffer, and that disposing the session clears it.
 /// </summary>
 public class ChatSessionTests
 {
@@ -26,8 +25,6 @@ public class ChatSessionTests
         Assert.False(string.IsNullOrEmpty(a.Id));
         Assert.False(string.IsNullOrEmpty(b.Id));
         Assert.NotEqual(a.Id, b.Id);
-        Assert.True(a.KVCache.IsEmpty);
-        Assert.True(b.KVCache.IsEmpty);
         Assert.Empty(a.TrackedHistory);
         Assert.Empty(b.TrackedHistory);
         Assert.False(a.IsDisposed);
@@ -36,30 +33,25 @@ public class ChatSessionTests
     [Fact]
     public void SessionsHaveIndependentState()
     {
-        // Mutating one session's cache / history must not leak into another.
+        // Mutating one session's history must not leak into another.
         var a = new ChatSession();
         var b = new ChatSession();
 
-        a.KVCache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.1f });
         a.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hello-a" });
 
-        Assert.Equal(3, a.KVCache.Count);
         Assert.Single(a.TrackedHistory);
-        Assert.True(b.KVCache.IsEmpty);
         Assert.Empty(b.TrackedHistory);
     }
 
     [Fact]
-    public void Dispose_ClearsTokensAndHistory()
+    public void Dispose_ClearsHistory()
     {
         var session = new ChatSession();
-        session.KVCache.RecordAppend(new[] { 42, 43 }, new float[] { 0.5f });
         session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hi" });
 
         session.Dispose();
 
         Assert.True(session.IsDisposed);
-        Assert.True(session.KVCache.IsEmpty);
         Assert.Empty(session.TrackedHistory);
     }
 

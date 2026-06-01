@@ -148,11 +148,10 @@ TensorSharp/
 │   ├── ModelService.cs          # Facade that keeps the public server inference API stable; owns the InferenceEngineHost
 │   ├── ModelLifecycleService.cs # Model load/dispose and backend selection (CPU / CUDA / MLX / GGML CPU/Metal/CUDA)
 │   ├── InferenceEngineHost.cs   # DI-registered per-model InferenceEngine singleton (continuous batching entry point)
-│   ├── SessionKvCacheManager.cs # Active session switching, KV reuse/truncate/reset, prefill chunking (legacy per-seq path)
 │   ├── ChatGenerationPipeline.cs # Prompt rendering, submits to InferenceEngine, streams tokens, stop handling
 │   ├── InferenceTelemetry.cs    # Prompt/eval timing, TTFT, tokens/sec, full input/output logs
 │   ├── ChatHistoryPreparer.cs   # History normalization, raw-token splice helpers, multimodal order helpers
-│   ├── ChatSession.cs           # Per-conversation KV cache + tracked history
+│   ├── ChatSession.cs           # Per-conversation tracked history + raw assistant tokens
 │   ├── SessionManager.cs        # Thread-safe session registry (default + per-tab sessions)
 │   ├── InferenceQueue.cs        # Backward-compatible queue-status surface (engine itself handles concurrency)
 │   ├── BackendCatalog.cs        # Discovery of available compute backends (CPU / CUDA / MLX / GGML*)
@@ -518,14 +517,14 @@ cd TensorSharp.Server/bin
 Open `http://localhost:5000` in your browser. The web interface supports:
 
 - Multi-turn chat conversations
-- Per-tab chat sessions: each browser tab owns its own KV cache; clicking "New Chat" disposes the current session server-side so its cache is released
+- Per-tab chat sessions: each browser tab owns its own tracked conversation history; KV blocks are owned by the inference engine
 - A single hosted GGUF selected explicitly with `--model`
 - An explicit hosted multimodal projector via `--mmproj` when needed
 - Image, video, and audio uploads for multimodal inference (up to 500 MB)
 - Thinking/reasoning mode toggle
 - Tool calling with function definitions
 - Streaming token generation via Server-Sent Events
-- Request queue with real-time position feedback
+- Backward-compatible queue-status events (the engine itself handles concurrency)
 - Message editing and deletion with regeneration from any point in the conversation
 - Free scrolling: scroll up to read earlier replies while new tokens stream in; the chat auto-scrolls again as soon as the user scrolls back to the bottom
 
@@ -549,12 +548,12 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
-| `--paged-kv` / `--no-paged-kv` | Force enable or disable the vLLM-style paged KV cache for the active session. When enabled the KV blocks live in a global block pool with prefix-cache sharing. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
-| `--paged-kv-block-size <N>` | Tokens per paged KV block (default: `256`). Smaller blocks share more aggressively but pay more bookkeeping. |
-| `--paged-kv-ram-mb <N>` | Soft cap for the paged-block RAM working set in megabytes. Blocks beyond the cap spill to SSD when `--paged-kv-ssd-dir` is set. |
-| `--paged-kv-ssd-dir <dir>` | Directory used as the SSD cold tier for paged blocks. Optional but recommended for very large multi-session workloads. |
-| `--paged-kv-ssd-mb <N>` | Maximum SSD usage in megabytes for the cold tier. |
-| `--paged-kv-quant-bits <0\|4\|8>` | Optional KV block quantization (TurboQuantKvCodec). `0` (default) keeps blocks in their native dtype; `4` / `8` halve / quarter the per-block bandwidth at small numerical cost. Recurrent-state models silently fall back to passthrough. |
+| `--paged-kv` / `--no-paged-kv` | Legacy compatibility flags for the removed per-session paged-KV manager. Current server KV state is engine-owned; use continuous-batching / `TS_SCHED_*` knobs for the engine. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
+| `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size. The current server engine uses `TS_SCHED_BLOCK_SIZE`. |
+| `--paged-kv-ram-mb <N>` | Legacy standalone paged-KV RAM-tier cap. |
+| `--paged-kv-ssd-dir <dir>` | Legacy standalone paged-KV SSD cold-tier directory. |
+| `--paged-kv-ssd-mb <N>` | Legacy standalone paged-KV SSD cap. |
+| `--paged-kv-quant-bits <0\|4\|8>` | Legacy standalone paged-KV block quantization (TurboQuantKvCodec). |
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
 `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
@@ -588,12 +587,12 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 
 | Variable | Description |
 |---|---|
-| `TS_KV_PAGED_CACHE` | `1` / `0` to force-enable / disable the paged KV cache for the active session. The CLI shortcuts are `--paged-kv` / `--no-paged-kv`. |
-| `TS_KV_BLOCK_SIZE` | Tokens per paged KV block (default: `256`). |
-| `TS_KV_CACHE_MAX_RAM_MB` | Soft cap for the paged-block RAM working set in megabytes. |
-| `TS_KV_CACHE_SSD_DIR` | Directory used as the SSD cold tier for paged blocks. |
-| `TS_KV_CACHE_MAX_SSD_MB` | Maximum SSD usage in megabytes for the cold tier. |
-| `TS_KV_PAGED_QUANT_BITS` | KV block quantization bits (`0` = passthrough, `4`, or `8`). |
+| `TS_KV_PAGED_CACHE` | Legacy compatibility switch for the standalone `PagedKvCacheManager`; current `TensorSharp.Server` request KV state is engine-owned. The CLI shortcuts are `--paged-kv` / `--no-paged-kv`. |
+| `TS_KV_BLOCK_SIZE` | Legacy standalone paged-KV block size. The engine uses `TS_SCHED_BLOCK_SIZE`. |
+| `TS_KV_CACHE_MAX_RAM_MB` | Legacy standalone paged-KV RAM-tier cap. |
+| `TS_KV_CACHE_SSD_DIR` | Legacy standalone paged-KV SSD cold-tier directory. |
+| `TS_KV_CACHE_MAX_SSD_MB` | Legacy standalone paged-KV SSD cap. |
+| `TS_KV_PAGED_QUANT_BITS` | Legacy standalone paged-KV block quantization bits (`0` = passthrough, `4`, or `8`). |
 | `TS_SCHED_DISABLE_BATCHED` | `1` forces the per-sequence KV-swap fallback even when a model implements `IBatchedPagedModel`. The CLI shortcut is `--no-continuous-batching`. |
 | `TS_SCHED_MAX_BATCHED_TOKENS` | Scheduler per-step token budget (default: `4096`). |
 | `TS_SCHED_MAX_RUNNING_SEQS` | Maximum in-flight sequences (default: `16`). |
@@ -637,9 +636,9 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
 | Continuous-batching engine (`InferenceEngine` + scheduler) | ON in `TensorSharp.Server` | `TS_SCHED_DISABLE_BATCHED=1` to force per-seq fallback | `--no-continuous-batching` / `--continuous-batching` |
-| Paged KV cache for the active session | ON | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
-| Paged KV SSD spillover (cold tier) | OFF | `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`, `--paged-kv-ssd-dir`, `--paged-kv-ssd-mb` |
-| Paged KV block quantization (TurboQuantKvCodec) | OFF (`0` = passthrough) | `TS_KV_PAGED_QUANT_BITS` (`0` / `4` / `8`) | `--paged-kv-quant-bits` |
+| Legacy per-session paged-KV manager | removed from Server request path | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` retained for compatibility / standalone tests | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
+| Legacy paged-KV SSD spillover (standalone manager) | OFF | `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`, `--paged-kv-ssd-dir`, `--paged-kv-ssd-mb` |
+| Legacy paged-KV block quantization (standalone manager) | OFF (`0` = passthrough) | `TS_KV_PAGED_QUANT_BITS` (`0` / `4` / `8`) | `--paged-kv-quant-bits` |
 | Block-hash prefix sharing across requests | ON | `TS_SCHED_PREFIX_CACHE=0` to disable | — |
 | Scheduler tunables (per-step token budget, max in-flight seqs, prefill chunk, block pool size, decode quantum) | engine defaults | `TS_SCHED_MAX_BATCHED_TOKENS`, `TS_SCHED_MAX_RUNNING_SEQS`, `TS_SCHED_PREFILL_CHUNK`, `TS_SCHED_NUM_BLOCKS`, `TS_SCHED_BLOCK_SIZE`, `TS_SCHED_DECODE_QUANTUM` | — |
 
@@ -943,7 +942,7 @@ the fused path engages.
 - **Optimized pure C# CPU path**: managed GEMM fast paths and contiguous float32 kernels accelerate decode, softmax, RMSNorm, RoPE, fused activations, and other hot paths while keeping quantized GGUF weights compressed during CPU loading.
 - **Circular KV cache**: sliding-window attention layers use a fixed-size circular buffer, bounding memory usage regardless of sequence length.
 - **KV-cache prefix reuse**: multi-turn conversations reuse the longest matching token prefix across turns. Truncation is automatically backed off by the sliding-window size for SWA models so the suffix can rebuild the SWA context.
-- **Paged KV cache & block-hash prefix sharing**: the continuous-batching engine partitions KV into fixed-size blocks, content-hashes each full block, and shares them across concurrent and sequential requests. Combined with a per-tier (RAM → SSD) `PagedKvBlockStore`, this gives vLLM-style memory efficiency without giving up the legacy per-session contiguous path.
+- **Paged KV cache & block-hash prefix sharing**: the continuous-batching engine partitions KV into fixed-size blocks, content-hashes each full block, and shares them across concurrent and sequential requests. Models that have not implemented `IBatchedPagedModel` still use the engine's isolated per-sequence KV-swap fallback.
 - **Native paged-attention kernel**: `TSGgml_PagedAttentionForward` (and the `WithSinks` variant for GPT OSS) does a C++ gather of K/V from the paged buffer, builds a small GGML graph per sequence, and dispatches `ggml_flash_attn_ext` — the same fused Metal/CUDA flash-attention kernel the legacy single-sequence path uses. On Ministral-3-14B long-context (4×~800 tokens) it is **~21 % faster than the legacy per-sequence GGML path**.
 - **Batched / paged forward passes**: Mistral 3, Gemma 4, GPT OSS, Qwen 3.5/3.6 (incl. GatedDeltaNet recurrent state pool), and Nemotron-H (incl. Mamba2 recurrent state pool + native batched Mamba2 kernel) pack N sequences into a single `ForwardBatch` call with one batched linear-projection matmul per layer, paged K/V scatter via `slotMapping`, and per-sequence attention via the native kernel. Gemma 4 batched path reaches **1.5×** legacy throughput at batch=8 short prompts and **1.6×** at 4×800-token prompts; Nemotron-H Mamba2 batched reaches **3.95×** at batch=3 on Apple M4 Pro. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **Kernel warmup**: both CLI and Server run a tiny forward pass at startup to pre-compile GPU kernels (Metal pipeline states, CUDA JIT) and warm the memory pool, avoiding cold-start latency on the first real inference request.
@@ -989,7 +988,7 @@ For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the 
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history and KV cache plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

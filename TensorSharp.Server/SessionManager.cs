@@ -23,9 +23,8 @@ namespace TensorSharp.Server
     /// single built-in "default" session that survives the lifetime of the server.
     ///
     /// The manager is intentionally a thin wrapper around a concurrent dictionary so
-    /// that session lookup is lock-free on the inference hot path. Session disposal
-    /// always goes through <see cref="ModelService.DisposeSession"/> so that the
-    /// model's KV tensors are also reset when the session being removed was active.
+    /// that session lookup is lock-free on the inference hot path. Sessions track
+    /// conversation history only; the inference engine owns all KV blocks.
     /// </summary>
     public sealed class SessionManager
     {
@@ -49,8 +48,8 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Shared session used by stateless API clients (Ollama / OpenAI compatible
-        /// endpoints). Never removed from the registry so multi-turn cache reuse
-        /// continues to work across requests for those clients.
+        /// endpoints). Never removed from the registry so raw assistant-token
+        /// history remains available across requests for those clients.
         /// </summary>
         public ChatSession DefaultSession => _sessions[DefaultSessionId];
 
@@ -94,10 +93,9 @@ namespace TensorSharp.Server
 
         /// <summary>
         /// Remove the session from the registry and return it (without disposing it
-        /// yet). The caller is expected to coordinate with <see cref="ModelService"/>
-        /// so the model's KV tensors are reset when the active session is being
-        /// removed, then call <see cref="ChatSession.Dispose"/> on the returned
-        /// instance.
+        /// yet). The caller is expected to call <see cref="ModelService.DisposeSession"/>
+        /// on the returned instance so the public session-lifecycle surface stays
+        /// centralized.
         ///
         /// The default session cannot be removed; this method returns null for it.
         /// </summary>

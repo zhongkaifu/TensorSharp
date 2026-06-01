@@ -180,6 +180,43 @@ public class BatchedExecutorTests
         }
     }
 
+    [Fact]
+    public async Task InferenceEngine_ExecutorStepException_CompletesErroredRequestAndContinuesWaiting()
+    {
+        var model = new ThrowingBatchedStubModel("fp-step-error", badRequestId: "bad", peakToken: 7);
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 256,
+            MaxNumRunningSequences = 1,
+            MaxPrefillChunkSize = 64,
+            NumBlocks = 4,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+        };
+        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+
+        var badSeq = new SequenceState("bad", Enumerable.Range(1, 4).ToList(),
+            maxNewTokens: 2, BlockSize, SamplingConfig.Default);
+        var goodSeq = new SequenceState("good", Enumerable.Range(1, 4).ToList(),
+            maxNewTokens: 2, BlockSize, SamplingConfig.Default);
+
+        var bad = engine.SubmitRequest(badSeq);
+        var good = engine.SubmitRequest(goodSeq);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => bad.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("bad", ex.Message);
+
+        var goodCompletion = await good.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, goodCompletion.Status);
+        Assert.Equal(0, badSeq.BlockTable.NumBlocks);
+        Assert.Equal(SequenceStatus.FinishedError, badSeq.Status);
+        Assert.Contains("bad", model.ReleasedRequestIds);
+        Assert.Contains("good", model.ReleasedRequestIds);
+        Assert.Equal(cfg.NumBlocks, engine.PoolStats.freeBlocks);
+    }
+
     // ----- helpers -----
 
     private static SchedulerConfig SmallConfig() => new()
@@ -298,6 +335,61 @@ public class BatchedExecutorTests
                 result[i] = logits;
             }
             return result;
+        }
+    }
+
+    private sealed class ThrowingBatchedStubModel : IModelArchitecture, IBatchedPagedModel
+    {
+        private readonly string _fp;
+        private readonly string _badRequestId;
+        private readonly int _peak;
+
+        public ThrowingBatchedStubModel(string fp, string badRequestId, int peakToken)
+        {
+            _fp = fp;
+            _badRequestId = badRequestId;
+            _peak = peakToken;
+            Tokenizer = new StubTokenizer(VocabSize);
+        }
+
+        public List<string> ReleasedRequestIds { get; } = new();
+
+        public ModelConfig Config { get; } = new ModelConfig { VocabSize = VocabSize };
+        public ITokenizer Tokenizer { get; }
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => true;
+        public bool SupportsKVStateSnapshot => true;
+        public string KVStateFingerprint => _fp;
+        public long ComputeKVBlockByteSize(int n) => 2L * NumLayers * NumKVHeads * n * HeadDim * sizeof(float);
+        public float[] Forward(int[] tokens) => new float[VocabSize];
+        public void ResetKVCache() { }
+        public void TruncateKVCache(int n) { }
+        public bool TryExtractKVBlock(int s, int n, Span<byte> dst) => true;
+        public bool TryInjectKVBlock(int s, int n, ReadOnlySpan<byte> src) => true;
+        public void Dispose() { }
+
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
+        {
+            for (int i = 0; i < ctx.Sequences.Count; i++)
+            {
+                if (ctx.Sequences[i].RequestId == _badRequestId)
+                    throw new InvalidOperationException($"boom for {_badRequestId}");
+            }
+
+            var result = new float[ctx.Sequences.Count][];
+            for (int i = 0; i < result.Length; i++)
+            {
+                var logits = new float[VocabSize];
+                logits[_peak] = 10f;
+                result[i] = logits;
+            }
+            return result;
+        }
+
+        public void OnSequenceReleased(string requestId)
+        {
+            ReleasedRequestIds.Add(requestId);
         }
     }
 

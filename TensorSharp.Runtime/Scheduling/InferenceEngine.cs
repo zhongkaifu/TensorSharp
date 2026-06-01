@@ -23,10 +23,9 @@ namespace TensorSharp.Runtime.Scheduling
     /// requests via <see cref="SubmitRequest"/> and consume per-token output
     /// via the returned <see cref="InferenceRequestHandle"/>.
     ///
-    /// Replaces the old <c>InferenceQueue</c> + <c>SessionKvCacheManager</c>:
-    /// the engine is the single coordination point for everything that needs
-    /// the model's KV state, and request lifecycle is per-request not per-
-    /// session.
+    /// Replaces the old FIFO queue plus per-session KV manager: the engine is
+    /// the single coordination point for everything that needs the model's KV
+    /// state, and request lifecycle is per-request rather than per-session.
     /// </summary>
     public sealed class InferenceEngine : IDisposable
     {
@@ -140,21 +139,30 @@ namespace TensorSharp.Runtime.Scheduling
 
                 // Run one scheduler step.
                 sw.Restart();
-                SchedulerOutput output;
+                SchedulerOutput output = null;
                 List<SequenceStepResult> results;
                 try
                 {
                     output = _scheduler.Schedule();
                     if (output.IsEmpty && _scheduler.RunningCount == 0)
                         continue;
+                }
+                catch (Exception ex)
+                {
+                    FailStepSequences(ex, output, "scheduler");
+                    continue;
+                }
 
+                try
+                {
                     results = _executor.ExecuteStep(output);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Engine worker step failed");
+                    FailStepSequences(ex, output, "executor");
                     continue;
                 }
+
                 Interlocked.Increment(ref _totalStepsRun);
                 Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
 
@@ -174,15 +182,129 @@ namespace TensorSharp.Runtime.Scheduling
         private void NotifyReleasedSequences(SchedulerOutput output)
         {
             if (_model is not Runtime.Scheduling.IBatchedPagedModel batched) return;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             if (output.FinishedRequestIds != null)
             {
                 foreach (var id in output.FinishedRequestIds)
-                    batched.OnSequenceReleased(id);
+                    NotifyReleasedSequence(batched, id, seen);
             }
             if (output.PreemptedRequestIds != null)
             {
                 foreach (var id in output.PreemptedRequestIds)
-                    batched.OnSequenceReleased(id);
+                    NotifyReleasedSequence(batched, id, seen);
+            }
+        }
+
+        private void FailStepSequences(Exception ex, SchedulerOutput output, string phase)
+        {
+            var affected = GetAffectedSequences(output);
+            if (affected.Count == 0)
+            {
+                _logger.LogError(ex, "Engine {Phase} step failed with no affected requests", phase);
+                if (output != null)
+                    NotifyReleasedSequences(output);
+                return;
+            }
+
+            _logger.LogError(
+                ex,
+                "Engine {Phase} step failed; failing {Count} affected request(s)",
+                phase,
+                affected.Count);
+
+            var released = new HashSet<string>(StringComparer.Ordinal);
+            if (output?.PreemptedRequestIds != null)
+            {
+                foreach (var id in output.PreemptedRequestIds)
+                {
+                    if (!string.IsNullOrEmpty(id))
+                        released.Add(id);
+                }
+            }
+
+            foreach (var seq in affected)
+            {
+                if (seq == null) continue;
+
+                try
+                {
+                    if (_scheduler.NotifyError(seq, ex, output))
+                        released.Add(seq.RequestId);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogError(
+                        cleanupEx,
+                        "Failed to release scheduler state for errored sequence {RequestId}",
+                        seq.RequestId);
+                    released.Add(seq.RequestId);
+                }
+
+                if (_handles.TryRemove(seq.RequestId, out var handle))
+                {
+                    handle.CompleteWithError(ex);
+                    Interlocked.Increment(ref _totalCompleted);
+                    released.Add(seq.RequestId);
+                }
+            }
+
+            if (output?.FinishedRequestIds != null)
+            {
+                foreach (var id in output.FinishedRequestIds)
+                {
+                    if (!string.IsNullOrEmpty(id))
+                        released.Add(id);
+                }
+            }
+
+            NotifyReleasedSequences(released);
+        }
+
+        private List<SequenceState> GetAffectedSequences(SchedulerOutput output)
+        {
+            var affected = new List<SequenceState>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            if (output?.ScheduledWork != null)
+            {
+                foreach (var work in output.ScheduledWork)
+                {
+                    var seq = work?.Sequence;
+                    if (seq == null) continue;
+                    if (seen.Add(seq.RequestId))
+                        affected.Add(seq);
+                }
+            }
+
+            if (affected.Count > 0)
+                return affected;
+
+            return _scheduler.GetInFlightSequencesSnapshot();
+        }
+
+        private void NotifyReleasedSequences(IEnumerable<string> requestIds)
+        {
+            if (_model is not Runtime.Scheduling.IBatchedPagedModel batched) return;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var id in requestIds)
+                NotifyReleasedSequence(batched, id, seen);
+        }
+
+        private void NotifyReleasedSequence(
+            Runtime.Scheduling.IBatchedPagedModel batched,
+            string requestId,
+            HashSet<string> seen)
+        {
+            if (string.IsNullOrEmpty(requestId)) return;
+            if (seen != null && !seen.Add(requestId)) return;
+
+            try
+            {
+                batched.OnSequenceReleased(requestId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Model release hook failed for sequence {RequestId}", requestId);
             }
         }
 
@@ -219,7 +341,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.Error != null)
                 {
-                    _scheduler.NotifyStop(seq, SequenceStatus.FinishedError, "error", output);
+                    _scheduler.NotifyError(seq, r.Error, output);
                     handle?.CompleteWithError(r.Error);
                     _handles.TryRemove(seq.RequestId, out _);
                     Interlocked.Increment(ref _totalCompleted);

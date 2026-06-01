@@ -148,11 +148,10 @@ TensorSharp/
 │   ├── ModelService.cs          # 保持服务端推理公共 API 稳定的门面，持有 InferenceEngineHost
 │   ├── ModelLifecycleService.cs # 模型加载/释放与后端选择（CPU / CUDA / MLX / GGML CPU/Metal/CUDA）
 │   ├── InferenceEngineHost.cs   # DI 注册的单模型 InferenceEngine 单例（连续批处理入口）
-│   ├── SessionKvCacheManager.cs # 活跃会话切换、KV 复用/截断/重置、prefill 分块（旧的单序列路径）
 │   ├── ChatGenerationPipeline.cs # Prompt 渲染，将请求提交到 InferenceEngine，流式返回 token，处理 stop
 │   ├── InferenceTelemetry.cs    # Prompt/eval 计时、TTFT、tokens/sec、完整输入/输出日志
 │   ├── ChatHistoryPreparer.cs   # 历史归一化、raw token 拼接、多模态顺序辅助
-│   ├── ChatSession.cs           # 单会话 KV 缓存与历史跟踪
+│   ├── ChatSession.cs           # 单会话历史跟踪与 assistant raw token
 │   ├── SessionManager.cs        # 线程安全的会话注册（默认会话 + 每个 UI Tab 的会话）
 │   ├── InferenceQueue.cs        # 向后兼容的队列状态接口（并发由引擎本身处理）
 │   ├── BackendCatalog.cs        # 可用计算后端的发现（CPU / CUDA / MLX / GGML*）
@@ -980,7 +979,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史与 KV 缓存联动、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
@@ -1006,4 +1005,3 @@ Zhongkai Fu
 ## 许可证
 
 详见 [LICENSE](LICENSE)。
-

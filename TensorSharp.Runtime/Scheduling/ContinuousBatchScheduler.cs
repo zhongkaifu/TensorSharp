@@ -54,6 +54,29 @@ namespace TensorSharp.Runtime.Scheduling
         public BlockPool Pool => _pool;
         public SchedulerConfig Config => _cfg;
 
+        /// <summary>Snapshot all requests currently owned by the scheduler.
+        /// Used by the engine's failure path when scheduling itself throws and
+        /// no per-step <see cref="SchedulerOutput"/> is available.</summary>
+        public List<SequenceState> GetInFlightSequencesSnapshot()
+        {
+            var result = new List<SequenceState>(_runningOrder.Count + _waiting.Count);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var seq in _runningOrder)
+            {
+                if (seq == null || seq.Status.IsFinished()) continue;
+                if (seen.Add(seq.RequestId)) result.Add(seq);
+            }
+
+            foreach (var seq in _waiting)
+            {
+                if (seq == null || seq.Status.IsFinished()) continue;
+                if (seen.Add(seq.RequestId)) result.Add(seq);
+            }
+
+            return result;
+        }
+
         /// <summary>Submit a sequence. It enters the waiting queue; the next
         /// <see cref="Schedule"/> call will try to admit it.</summary>
         public void Submit(SequenceState seq)
@@ -73,15 +96,11 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (_waitingIndex.TryGetValue(requestId, out var node))
             {
-                _waiting.Remove(node);
-                _waitingIndex.Remove(requestId);
-                node.Value.Status = SequenceStatus.FinishedAborted;
-                return true;
+                return FinishSequence(node.Value, SequenceStatus.FinishedAborted, "aborted", cacheBlocks: false);
             }
             if (_running.TryGetValue(requestId, out var seq))
             {
-                FinishSequence(seq, SequenceStatus.FinishedAborted, "aborted");
-                return true;
+                return FinishSequence(seq, SequenceStatus.FinishedAborted, "aborted", cacheBlocks: true);
             }
             return false;
         }
@@ -196,26 +215,55 @@ namespace TensorSharp.Runtime.Scheduling
         public void NotifyStop(SequenceState seq, SequenceStatus finalStatus, string reason, SchedulerOutput output)
         {
             if (seq == null) return;
-            FinishSequence(seq, finalStatus, reason);
-            output.FinishedRequestIds.Add(seq.RequestId);
+            if (FinishSequence(seq, finalStatus, reason, cacheBlocks: true))
+                output.FinishedRequestIds.Add(seq.RequestId);
+        }
+
+        /// <summary>Mark a sequence as errored and release any scheduler-owned
+        /// blocks. Error paths deliberately skip prefix-cache registration
+        /// because the model state for the failed step may be partial.</summary>
+        public bool NotifyError(SequenceState seq, Exception error, SchedulerOutput output = null)
+        {
+            if (seq == null) return false;
+            bool finished = FinishSequence(seq, SequenceStatus.FinishedError, "error", cacheBlocks: false, error: error);
+            if (finished && output != null)
+                output.FinishedRequestIds.Add(seq.RequestId);
+            return finished;
         }
 
         /// <summary>Free a finished sequence's blocks and remove from running.</summary>
-        private void FinishSequence(SequenceState seq, SequenceStatus finalStatus, string reason)
+        private bool FinishSequence(
+            SequenceState seq,
+            SequenceStatus finalStatus,
+            string reason,
+            bool cacheBlocks,
+            Exception error = null)
         {
-            if (seq.Status.IsFinished()) return;
+            if (seq == null || seq.Status.IsFinished()) return false;
 
             // Cache the final partial trailing block into the prefix cache
             // (if there are any full blocks) before freeing.
-            CacheFullBlocksForSequence(seq);
+            if (cacheBlocks)
+                CacheFullBlocksForSequence(seq);
 
             var freed = seq.BlockTable.Clear();
             if (freed.Count > 0) _pool.Free(freed);
 
             seq.Status = finalStatus;
             seq.FinishReason = reason;
+            seq.Error = error;
+            seq.LastLogits = null;
+
+            if (_waitingIndex.TryGetValue(seq.RequestId, out var waitingNode))
+            {
+                _waiting.Remove(waitingNode);
+                _waitingIndex.Remove(seq.RequestId);
+            }
+
             if (_running.Remove(seq.RequestId))
                 _runningOrder.Remove(seq);
+
+            return true;
         }
 
         /// <summary>Make sure the sequence has block table capacity for

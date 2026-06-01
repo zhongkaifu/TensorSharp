@@ -36,9 +36,8 @@ string baseDirectory = AppContext.BaseDirectory;
 ServerHostingOptions hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);
 LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
 string configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(args);
-// Translate --paged-kv* flags into env vars before any singleton that reads
-// PagedKvCacheConfig.FromEnvironment() is constructed (notably the
-// SessionKvCacheManager built lazily inside ModelService).
+// Translate --paged-kv* flags into env vars before startup logging reads
+// PagedKvCacheConfig.FromEnvironment().
 bool pagedKvFlagsApplied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(args);
 // Translate --continuous-batching / --no-continuous-batching into env vars
 // that gate BatchExecutor (TS_SCHED_DISABLE_BATCHED) and Qwen3.5 ForwardBatch

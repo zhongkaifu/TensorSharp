@@ -11,24 +11,20 @@
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Unit tests for <see cref="ModelService"/> session-lifecycle operations. These do
-/// not load a real model (they exercise only the cache bookkeeping), so they are
-/// safe to run on any machine. The expensive K/V tensor reset is a no-op when no
-/// model is loaded.
+/// Unit tests for <see cref="ModelService"/> session-lifecycle operations. These
+/// do not load a real model; server sessions now only own tracked history.
 /// </summary>
 public class ModelServiceSessionTests
 {
     [Fact]
-    public void ResetSession_ClearsCacheAndHistoryForTheGivenSession()
+    public void ResetSession_ClearsHistoryForTheGivenSession()
     {
         var svc = new ModelService();
         var session = new ChatSession();
-        session.KVCache.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
         session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hi" });
 
         svc.ResetSession(session);
 
-        Assert.True(session.KVCache.IsEmpty);
         Assert.Empty(session.TrackedHistory);
         Assert.False(session.IsDisposed);
     }
@@ -40,16 +36,12 @@ public class ModelServiceSessionTests
         var sessA = new ChatSession();
         var sessB = new ChatSession();
 
-        sessA.KVCache.RecordAppend(new[] { 1, 2 }, new float[] { 0.1f });
         sessA.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "a" });
-        sessB.KVCache.RecordAppend(new[] { 9, 8 }, new float[] { 0.2f });
         sessB.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "b" });
 
         svc.ResetSession(sessA);
 
-        Assert.True(sessA.KVCache.IsEmpty);
         Assert.Empty(sessA.TrackedHistory);
-        Assert.Equal(2, sessB.KVCache.Count);
         Assert.Single(sessB.TrackedHistory);
     }
 
@@ -65,13 +57,11 @@ public class ModelServiceSessionTests
     {
         var svc = new ModelService();
         var session = new ChatSession();
-        session.KVCache.RecordAppend(new[] { 10, 20 }, new float[] { 0.3f });
         session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "x" });
 
         svc.DisposeSession(session);
 
         Assert.True(session.IsDisposed);
-        Assert.True(session.KVCache.IsEmpty);
         Assert.Empty(session.TrackedHistory);
     }
 
@@ -83,13 +73,11 @@ public class ModelServiceSessionTests
         var sessA = new ChatSession();
         var sessB = new ChatSession();
 
-        sessB.KVCache.RecordAppend(new[] { 77 }, new float[] { 0.9f });
         sessB.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "keep" });
 
         svc.DisposeSession(sessA);
 
         Assert.False(sessB.IsDisposed);
-        Assert.Equal(1, sessB.KVCache.Count);
         Assert.Single(sessB.TrackedHistory);
     }
 
@@ -118,6 +106,16 @@ public class ModelServiceSessionTests
         var svc = new ModelService();
         svc.InvalidateKVCache();
         Assert.False(svc.IsLoaded);
+    }
+
+    [Fact]
+    public void KVCache_ReturnsIsolatedCompatibilityShim()
+    {
+        var svc = new ModelService();
+        var legacyView = svc.KVCache;
+        legacyView.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
+
+        Assert.True(svc.KVCache.IsEmpty);
     }
 
     [Fact]

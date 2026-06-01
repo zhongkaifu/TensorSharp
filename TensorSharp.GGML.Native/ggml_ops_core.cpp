@@ -14,6 +14,8 @@
 #include <unistd.h>
 #endif
 
+#include <cstdio>
+
 // ============================================================================
 // ggml_pool implementation
 // ============================================================================
@@ -113,6 +115,38 @@ namespace tsg
     std::atomic<bool> g_async_compute_enabled{false};
     std::atomic<bool> g_pending_gpu_work{false};
 
+    static bool is_truthy_env(const char* value)
+    {
+        return value != nullptr &&
+            (std::strcmp(value, "1") == 0 ||
+             std::strcmp(value, "true") == 0 ||
+             std::strcmp(value, "TRUE") == 0 ||
+             std::strcmp(value, "True") == 0 ||
+             std::strcmp(value, "yes") == 0 ||
+             std::strcmp(value, "YES") == 0 ||
+             std::strcmp(value, "on") == 0 ||
+             std::strcmp(value, "ON") == 0);
+    }
+
+    static bool ggml_debug_logging_enabled()
+    {
+        return is_truthy_env(std::getenv("TENSORSHARP_GGML_DEBUG"));
+    }
+
+    static void filtered_ggml_log(enum ggml_log_level level, const char* text, void* user_data)
+    {
+        (void) user_data;
+        if (level == GGML_LOG_LEVEL_DEBUG && !ggml_debug_logging_enabled())
+            return;
+        std::fputs(text, stderr);
+        std::fflush(stderr);
+    }
+
+    static void configure_ggml_logging()
+    {
+        ggml_log_set(filtered_ggml_log, nullptr);
+    }
+
     // --- Error helpers ---
 
     void set_last_error(const std::string& message)
@@ -177,6 +211,7 @@ namespace tsg
     void initialize_backend()
     {
         clear_last_error();
+        configure_ggml_logging();
         g_backend = create_backend_instance(g_backend_type);
         if (g_backend == nullptr)
             return;

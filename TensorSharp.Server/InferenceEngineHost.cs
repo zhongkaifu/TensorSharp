@@ -26,10 +26,9 @@ namespace TensorSharp.Server
     /// requests run concurrently (with iteration-level fairness), and the
     /// paged KV pool / continuous-batching scheduler / per-block prefix cache
     /// all live behind this single entry point. Adapters that haven't yet
-    /// been migrated to the engine continue to gate themselves via
-    /// <see cref="InferenceQueue"/>; the queue still serializes those callers
-    /// but its tickets are granted immediately so the engine remains
-    /// responsible for the only real concurrency boundary.
+    /// dropped queue-status chunks still take <see cref="InferenceQueue"/>
+    /// tickets, but those tickets grant immediately so the engine remains the
+    /// only real concurrency boundary.
     /// </summary>
     public sealed class InferenceEngineHost : IDisposable
     {
