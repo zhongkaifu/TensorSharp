@@ -14,10 +14,10 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 
 | Surface | Coverage |
 |---|---|
-| Web UI SSE | Session-scoped streaming, queue progress, done event metrics, abort handling |
+| Web UI SSE | Session-scoped streaming, compatibility queue/status shape, done event metrics, abort handling |
 | Ollama compatibility | Chat streaming/non-streaming, multi-turn history, thinking, tool-call request plumbing |
 | OpenAI compatibility | Chat Completions streaming/non-streaming, tool calls, structured outputs, validation errors |
-| Operational behavior | FIFO queue, concurrent requests, mixed API handoff, architecture-aware skips |
+| Operational behavior | Continuous-batching request admission, concurrent requests, mixed API handoff, architecture-aware skips |
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ python3 test_multiturn.py
 - Ollama chat multi-turn behavior in streaming and non-streaming modes
 - OpenAI Chat Completions streaming and non-streaming behavior
 - OpenAI structured outputs with both `response_format: {"type":"json_object"}` and `response_format.json_schema`
-- Queue status endpoint shape
+- Compatibility queue/status endpoint shape
 - Error handling for missing required fields
 - Structured-output validation errors and documented request conflicts
 
@@ -63,10 +63,10 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 ### Bash-only operational checks
 
 - System-prompt persistence in the Web UI flow
-- Concurrent requests and FIFO queue behavior
+- Concurrent request admission through the continuous-batching engine
 - Long-conversation stress test
 - Mixed Ollama/OpenAI handoff
-- Abort mid-generation and queue release
+- Abort mid-generation and compatibility status remains idle
 - Ollama tool-call request plumbing
 
 ### Python-specific compatibility checks
@@ -78,6 +78,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 
 - The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server currently emulates here.
 - Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` or `think` are expected to return HTTP `400`.
+- GPT OSS Harmony tool parsing is covered by in-process tests; these server integration scripts currently leave GPT OSS tool-call checks skipped.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
 
 ## Usage

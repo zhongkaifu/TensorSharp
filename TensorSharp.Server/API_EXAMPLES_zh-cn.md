@@ -17,8 +17,8 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 |---|---|
 | 承载模型 | 单个 GGUF 文件，通过 `--model` 选择；请求中的 `model` 必须是该文件名或 basename |
 | 投影器 | 可选单个投影器，通过 `--mmproj` 选择；供多模态模型使用 |
-| 后端 | `cpu`、`cuda`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`；`/api/models` 会返回当前主机可用项 |
-| 并发 | FIFO 队列；等待期间通过队列位置事件/chunk 提示客户端 |
+| 后端 | `cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`；`/api/models` 会返回当前主机可用项 |
+| 并发 | 连续批处理引擎接纳并发请求；队列位置 chunk 仅为旧客户端兼容字段，当前通常不会发送 |
 | 会话 | Web UI 使用每个浏览器 tab 独立会话；Ollama/OpenAI 兼容端点共享默认会话 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`json_schema` 不能与 `think` 或 `tools` 同时使用 |
 
@@ -50,6 +50,7 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 |---|---|
 | `cpu` | 纯 C# CPU 后端 |
 | `cuda` | Direct CUDA 后端，使用 CUDA Driver API、cuBLAS、PTX 内核与 CPU 回退 |
+| `mlx` | Apple Silicon 的 MLX Metal 后端 |
 | `ggml_cpu` | 原生 GGML CPU 后端 |
 | `ggml_metal` | macOS 的 GGML Metal 后端 |
 | `ggml_cuda` | NVIDIA GPU 的 GGML CUDA 后端 |
@@ -574,7 +575,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 ### 工具型接口
 
 ```bash
-# 推理队列快照（busy 标志、待处理请求数、累计处理数）
+# 队列 / 状态兼容快照（busy 标志、待处理请求数、累计处理数）
 curl http://localhost:5000/api/queue/status
 
 # 服务版本
@@ -635,7 +636,7 @@ curl -N -X POST http://localhost:5000/api/chat \
 
 | 事件字段 | 触发时机 | 含义 |
 |---|---|---|
-| `queue_position`、`queue_pending` | 排队期间每秒一次 | 当前请求排在队列中的位置 |
+| `queue_position`、`queue_pending` | 仅为旧客户端兼容；当前 no-op 队列通常不会发送 | 旧客户端兼容字段 |
 | `token` | 每个生成的 token（启用 `think` / `tools` 时为解析后的内容片段） | 流式正文 |
 | `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
 | `tool_calls` | 模型输出工具调用 | `{name, arguments}` 数组 |

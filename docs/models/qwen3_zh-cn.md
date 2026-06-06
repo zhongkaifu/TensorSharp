@@ -243,7 +243,7 @@ Qwen 3.5/3.6、Nemotron-H 后续都在它的基础上扩展。它通过
 ### 已验证的正确性
 
 针对真实 base-Qwen3 GGUF 的 logit 级正确性尚未在此 tree 中验证（本地只有
-Qwen 3.6 / GatedDeltaNet GGUF）。opt-in 的
+Qwen 3.6 / GatedDeltaNet GGUF）。按模型文件门控的
 [`Qwen3BatchedForwardTests`](../../InferenceWeb.Tests/Qwen3BatchedForwardTests.cs)
 在把 base Qwen3 GGUF 放进 `TS_TEST_MODEL_DIR` 后会自我验证。
 `EngineParallelInferenceTests` 在已有的 Qwen GGUF 上验证了引擎侧路径。

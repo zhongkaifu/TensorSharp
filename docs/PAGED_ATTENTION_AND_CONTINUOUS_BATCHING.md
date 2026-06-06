@@ -344,53 +344,44 @@ so the kernel-side support is in. The remaining work is in the model:
    either `FFN` or `MoEForward`. Both ops already operate over a
    batched `[numTokens, hidden]` axis.
 
-The current scaffold throws `NotSupportedException` for each of the
-above; the BatchExecutor catches and falls through. Replacing each
-throw with the corresponding feature implementation is the path to a
-production Gemma 4 batched port.
+The production Gemma 4 port now implements these pieces in
+`Gemma4Model.BatchedForward.cs`. `TS_GEMMA4_BATCHED=0` remains the
+debugging switch for forcing the older per-sequence KV-swap path.
 
-### What it would take to port Qwen 3.6 / Nemotron 3 fully
+### Hybrid recurrent ports
 
-Both architectures have a recurrent component (GatedDeltaNet for
-Qwen 3.5/3.6, Mamba2 for Nemotron 3) that maintains a per-sequence
-running state evolving across the entire input. Paging assumes KV is
-the only cache; recurrent state is orthogonal.
+Qwen 3.5/3.6 and Nemotron-H each have a recurrent component
+(GatedDeltaNet for Qwen 3.5/3.6, Mamba2 for Nemotron-H) that maintains a
+per-sequence running state evolving across the entire input. Paging
+assumes KV is the only cache; recurrent state is orthogonal.
 
-A full port would require designing a **per-sequence recurrent-state
-pool**:
+The current ports use a **per-sequence recurrent-state pool** alongside
+the attention `BlockPool`:
 
 - A `RecurrentStatePool` analogous to `BlockPool`, holding `convState +
   ssmState` per layer per sequence (~10–20 KB per sequence for the
   recurrent-only state).
 - Allocated on the first recurrent-layer touch for a sequence.
 - Persisted across forward calls inside the engine.
-- Freed on sequence retirement (engine already calls
-  `_pool.Free(seq.BlockTable.Blocks)` — would also call
-  `_recurrentPool.Free(seq.Id)`).
-- The model's `ForwardBatch` would interleave paged-KV layer dispatch
+- Freed on sequence retirement alongside the attention block table.
+- The model's `ForwardBatch` interleaves paged-KV layer dispatch
   (for FullAttention layers) with recurrent-pool fetch/update (for
   GDN/Mamba layers).
-- Block-boundary capture (currently used by the per-seq path's
-  `IModelArchitecture.RequiresPerBlockCapture`) needs an equivalent
-  for the recurrent state — the running state at position N must be
-  captured at every block boundary during prefill so a later
-  `TryInjectKVBlock`-equivalent can resume.
+- Native sub-kernels are available behind per-model toggles where they
+  are still being measured (`TS_QWEN35_BATCHED_GDN_NATIVE=1` and
+  `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`).
 
-Estimated effort: 2–3 weeks per architecture. The substrate (engine,
-scheduler, paged pool, native kernel) is the same; the work is the
-recurrent-pool abstraction and the per-architecture state-shape +
-state-update kernel work.
-
-### Porting status — required models
+### Porting status — current models
 
 | Model | Status | Notes |
 |---|---|---|
-| **Mistral 3** (Ministral-3-14B) | ✅ Full port, validated on real GGUF, **21% faster than legacy** on long context | The reference implementation. |
-| **Gemma 4** (E4B) | ✅ Full port, **default path** (set `TS_GEMMA4_BATCHED=0` to force the per-seq KV-swap fallback for debugging). All 42 layers (SWA + GQA + PLE + KV-donor sharing at L24+) match legacy within FP noise on the per-layer checksum trace. Two bring-up bugs fixed: (1) missing `ggml_cont` on Q after the permute in `TSGgml_PagedAttentionForward` (`ggml_flash_attn_ext` silently produced wrong output when Q was a non-contiguous view on Metal); (2) `EnsurePagedBuffers` destructively rebuilt the K/V arrays when growing, wiping any K/V already written for previously-scheduled sequences — manifested as the FIRST sequence in a multi-sequence batch generating a degenerate single-token loop on its first decode after subsequent sequences joined. Bug #2 affected Mistral 3 and Qwen 3 too; all three EnsurePagedBuffers helpers now copy old contents on grow. See [`Gemma4BatchedForwardTests.cs`](../InferenceWeb.Tests/Gemma4BatchedForwardTests.cs) for the apples-to-apples logit-cosine check (cosine ≥ 0.99 with the legacy unfused path) and [`EngineParallelInferenceTests.Gemma4_ThreeLongGenerationsParallel`](../InferenceWeb.Tests/EngineParallelInferenceTests.cs) for the multi-sequence parallel test. | See [`Gemma4Model.BatchedForward.cs`](../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs). |
-| **Qwen 3.6** (Qwen 3.5 / GatedDeltaNet) | ✅ Ported with per-slot recurrent-state pool (Phase 5c). **Default path** (set `TS_QWEN35_BATCHED=0` or pass `--no-continuous-batching` to force the per-seq KV-swap fallback for debugging). 100% greedy-match against legacy on small prompts; ~1.83× tps at n=3 on Qwen 3.6-27B (Apple M4 Pro, Metal). Native batched GDN op exists (Phase 7 in [`ggml_ops_gated_delta_net.cpp`](../TensorSharp.GGML.Native/ggml_ops_gated_delta_net.cpp)) but is gated behind `TS_QWEN35_BATCHED_GDN_NATIVE=1` pending perf verification. | See [`Qwen35Model.BatchedForward.cs`](../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs). |
-| **GptOss** (gpt-oss-20b) | ✅ Ported. **Default path** (set `TS_GPTOSS_BATCHED=0` to force the per-seq KV-swap fallback for debugging). Per-layer paged K/V; batched Q/K/V with bias; NeoX+YaRN RoPE per token; per-layer SWA (alternating); per-head attention sinks via the new native kernel [`TSGgml_PagedAttentionForwardWithSinks`](../TensorSharp.GGML.Native/ggml_ops_paged_attention.cpp) (Phase 9 — `ggml_flash_attn_ext` + `ggml_flash_attn_ext_add_sinks` under the hood, falls back to managed-C# [`ManagedPagedAttention.ForwardWithSinks`](../TensorSharp.Runtime/Paged/ManagedPagedAttention.cs) on non-GGML backends or when `TS_GPTOSS_PAGED_ATTN_MANAGED=1`); MoE FFN batched through existing `MoEForward` token-parallel path. **100% greedy match** vs legacy (12/12 tokens), preserved through both Phase 8 (managed) and Phase 9 (native sinks). Perf remains **flat** (~0.93–1.05× across n=1,3,5) — the native sinks kernel didn't move the needle because the bottleneck is the *per-layer* and *per-seq* ggml graph construction cost: the legacy path runs one fused per-layer kernel ([`TryFusedAttnLayerPrefill`](../TensorSharp.GGML.Native/ggml_ops_*.cpp): RMSNorm + fused QKV + RoPE + KV-append + sinks-aware softmax + attn + output proj + residual in one cgraph), whereas the batched path issues ~5 separate graphs per layer (norm, QKV, RoPE, paged-attn, output, residual). Closing this last gap needs a *fused-per-layer* batched kernel like the existing GptOss legacy one, but operating on paged K/V — substantial follow-up work. See [`GptOssModel.BatchedForward.cs`](../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs), [`GptOssBatchedCorrectnessTests.cs`](../InferenceWeb.Tests/GptOssBatchedCorrectnessTests.cs), [`GptOssBatchedPerfBench.cs`](../InferenceWeb.Tests/GptOssBatchedPerfBench.cs). |  |
-| **Nemotron 3 (with native Mamba2 batched kernel)** | ✅ Phase 9. Set `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` (in addition to `TS_NEMOTRON_BATCHED=1`) to route the Mamba2 recurrent step through a new native C++ kernel ([`TSGgml_NemotronMamba2BatchedStepF32`](../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp), NEON SIMD + GCD per-head parallelism — mirrors my Qwen 3.5 Phase 7 GDN kernel structure). Replaces N C# `Mamba2Block` calls with one native dispatch + batched `ssm_in` / `ssm_out` projections. **100% prefix match** vs the C# Mamba2 path on greedy sampling (12/12 tokens). Perf vs legacy: **3.95× tps at n=3, 2.93× at n=5, 0.75× at n=1** on NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ2_XXS, Apple M4 Pro, Metal (n=1 loses because batched scaffolding outweighs benefit for single-seq). **Also fixed a latent bug**: `s_nemoBatchedOptIn` was `static readonly` and captured the env var at class-load time, so tests setting `TS_NEMOTRON_BATCHED=1` at runtime never actually toggled the path — both legacy and "batched" test runs were silently falling through to per-seq. Changed to method getter (mirrors Qwen 3.5's pattern). Prior Phase 3-8 "100% match" results were validating per-seq vs per-seq; this is the first run where the batched ForwardBatch math is genuinely exercised, and it produces token-for-token identical first-prefix output. |  |
-| **Nemotron 3** | ✅ Ported with per-slot Mamba2 conv + SSM state pool. **Default path** (set `TS_NEMOTRON_BATCHED=0` to force the per-seq KV-swap fallback for debugging). Attention layers use paged-attention (Mistral 3 pattern, no RoPE). FFN dense layers run token-parallel ReLU². FFN MoE layers run through the existing `MoEForward` token-parallel router + per-token expert dispatch (Phase 7). Mamba2 layers run per-seq state-swap on the existing single-seq native kernel (analog of Qwen 3.5 Phase 5c reference-swap). Multimodal vision + audio embeddings inject directly into the batched `[numTokens, hidden]` tensor via the same row-wise `InjectMultimodalEmbeddings` the legacy path uses (Phase 8, follows the Mistral 3 stance that upstream serializes multimodal). `SupportsBatchedMultimodal` returns true while the batched path is active (i.e. unless `TS_NEMOTRON_BATCHED=0` is set). **100% greedy match** vs legacy across 3 short text prompts (12/12 tokens); **3.43× tps at n=3**, **1.94× at n=1**, **1.67× at n=5** on NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ2_XXS, Apple M4 Pro, Metal. Multimodal-prompt correctness is structurally validated (text-only stays 100% after removing the multimodal pre-flight rejection) but lacks a local audio/image fixture in `InferenceWeb.Tests/` for end-to-end verification. See [`NemotronBatchedCorrectnessTests.cs`](../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs) and [`NemotronBatchedPerfBench.cs`](../InferenceWeb.Tests/NemotronBatchedPerfBench.cs). | See [`NemotronModel.BatchedForward.cs`](../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs). |
+| **Mistral 3** (Ministral-3-14B) | ✅ Full port, default path | Reference implementation; validated on real GGUF; native paged attention is ~21% faster than the legacy per-seq path on long context. |
+| **Gemma 4** (E4B) | ✅ Full port, default path | Handles SWA + global attention, PLE, dual head dims, and KV-donor sharing. Set `TS_GEMMA4_BATCHED=0` to force the per-seq KV-swap fallback for debugging or batch=1 A/B tests. |
+| **Qwen 3** | ✅ Reference port, default path | First `ForwardBatch` implementation. Base-Qwen3 logit validation is model-gated through `Qwen3BatchedForwardTests` when a real base-Qwen3 GGUF is present. |
+| **Qwen 3.5 / 3.6 family** | ✅ Full port, default path | Per-slot recurrent-state pool for GatedDeltaNet; set `TS_QWEN35_BATCHED=0` or pass `--no-continuous-batching` to fall back. Optional native GDN kernel: `TS_QWEN35_BATCHED_GDN_NATIVE=1`. |
+| **GPT OSS** (gpt-oss-20b) | ✅ Full port, default path | Attention sinks use native paged attention with managed fallback (`TS_GPTOSS_PAGED_ATTN_MANAGED=1`). Greedy correctness matches legacy; throughput is mostly flat until a fused per-layer batched GPT OSS kernel lands. Set `TS_GPTOSS_BATCHED=0` to fall back. |
+| **Nemotron-H / Nemotron 3 Nano Omni** | ✅ Full port, default path | Per-slot Mamba2 conv + SSM state pool, text greedy match vs legacy, multimodal path structurally covered. Optional native Mamba2 batched step: `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`; set `TS_NEMOTRON_BATCHED=0` to fall back. |
+| **Gemma 3** | Per-sequence fallback | Does not implement `IBatchedPagedModel.ForwardBatch`; it still runs inside the engine using isolated per-seq KV-swap. |
 
 ### Refactoring a model for true batched compute
 
@@ -413,7 +404,10 @@ rewriting the forward pass to be batch-aware:
 
 ### Reference implementations
 
-Two production models now implement `IBatchedPagedModel.ForwardBatch`.
+The sections below describe the original Qwen 3 and Mistral 3 reference
+ports. The same contract is now also implemented by Gemma 4, GPT OSS,
+Qwen 3.5/3.6-family, and Nemotron-H, while Gemma 3 stays on the
+per-sequence fallback.
 
 #### [`Qwen3Model.BatchedForward.cs`](../TensorSharp.Models/Models/Qwen3/Qwen3Model.BatchedForward.cs)
 
@@ -435,7 +429,7 @@ The standard Qwen3 architecture (per-head Q/K RMSNorm, GPT-NeoX RoPE):
 
 End-to-end logit-level correctness against a real base-Qwen3 GGUF is
 not yet verified in this tree (only Qwen 3.6 / GatedDeltaNet GGUFs are
-available locally). The opt-in
+available locally). The
 [Qwen3BatchedForwardTests](../InferenceWeb.Tests/Qwen3BatchedForwardTests.cs)
 self-validate as soon as a base Qwen3 GGUF is dropped into
 `TS_TEST_MODEL_DIR`.
@@ -565,12 +559,12 @@ Take-aways:
   tokens / seq) run hits **1.61×**, very close to the Mistral 3 result
   on the same hardware (1.21×; Gemma's extra SWA + KV-donor parallelism
   is what closes the gap).
-- **Single-sequence is a net loss.** With nothing to amortise across,
-  the paged graph build + gather pays for itself on every step and the
-  legacy single-seq fused-decode kernel wins by ~3×. The runtime keeps
-  the legacy path for batch=1 by leaving `TS_GEMMA4_BATCHED` unset;
-  the batched path is the right choice for the multi-request server
-  workload it was built for.
+- **Single-sequence can be a net loss.** With nothing to amortise
+  across, the paged graph build + gather pays for itself on every step
+  and the legacy single-seq fused-decode kernel can win by ~3×. The
+  server default remains the batched path for multi-request workloads;
+  set `TS_GEMMA4_BATCHED=0` when you specifically want a batch=1 A/B
+  comparison.
 - **Output-token counts differ** between paths in the same workload
   (e.g. 41 vs 120 on short-parallel) because logit cosine is 0.99,
   not 1.0 — the per-Metal-launch FP reductions aren't bit-deterministic
@@ -578,36 +572,20 @@ Take-aways:
   some prompts. The fair throughput metric is **tokens / wall-second**,
   which is what the table reports.
 
-### Other models — Qwen 3.6 / Nemotron 3
+### Hybrid recurrent models
 
-Qwen 3.6 / 3.5 use GatedDeltaNet recurrent blocks whose running state
-is not paged. Nemotron 3 includes Mamba layers with the same recurrent
-constraint. Adapting those architectures to `IBatchedPagedModel` is
-the next milestone; the Qwen3 implementation is the template for the
-attention-only portion.
-
-This work is the natural next phase. The current architecture (scheduler,
-executor, block pool, kernel, engine, host, Qwen3 reference) is the
-substrate it plugs into.
+Qwen 3.5 / 3.6 and Nemotron-H now implement `ForwardBatch` with a
+separate recurrent-state pool alongside the paged attention block pool.
+Attention layers use paged K/V and recurrent layers index per-sequence
+state slots, so prefix-sharing attention blocks no longer collide with
+GatedDeltaNet or Mamba2 state.
 
 ### Adapter migration
 
-Adapters (WebUI / Ollama / OpenAI) still emit queue-position chunks via
-the no-op `InferenceQueue`. With continuous batching the concept is
-meaningless; the adapters can drop the position chunks entirely once a
-follow-up pass cleans them up. The engine itself already handles all
-concurrency.
-
-### Multimodal concurrency
-
-`ModelMultimodalInjector` stores pending vision / audio embeddings on the
-**model**, not the sequence. Two multimodal requests therefore can't
-prepare in parallel without stepping on each other; the rewritten
-`ChatGenerationPipeline` serialises prompt preparation behind a lock for
-multimodal turns and lets text-only turns prepare in parallel. A clean
-fix is to move the prepared-embedding list into `SequenceState` and have
-the executor install it on the model right before `Forward` /
-`ForwardBatch`.
+Adapters (WebUI / Ollama / OpenAI) still carry queue/status
+compatibility fields and `/api/queue/status`, but `InferenceQueue` is now
+a no-op shim. The engine itself handles all concurrency; queue-position
+chunks are legacy compatibility only and are normally not emitted.
 
 ### Multimodal concurrency
 
@@ -617,7 +595,7 @@ prepare in parallel without stepping on each other. The integration tests
 work around this with a per-`EngineContext` lock around
 `ProcessPromptTokens`. A clean fix is to move the prepared-embedding list
 into `SequenceState` and have the executor install it on the model right
-before `Forward`. This is a small refactor inside
+before `Forward` / `ForwardBatch`. This is a small refactor inside
 `ModelMultimodalInjector`.
 
 ### Decode quantum tuning

@@ -17,8 +17,8 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 |---|---|
 | Hosted models | One GGUF file, selected with `--model`; requests must name that hosted file or its basename |
 | Projectors | Optional single projector, selected with `--mmproj`; used for multimodal-capable models |
-| Backends | `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`; `/api/models` reports which are available on the host |
-| Concurrency | FIFO queue with queue-position events/chunks while a request waits |
+| Backends | `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`; `/api/models` reports which are available on the host |
+| Concurrency | Continuous-batching engine admits concurrent requests; queue-position chunks are legacy compatibility only and normally absent |
 | Sessions | Web UI uses per-tab sessions; Ollama/OpenAI compatibility endpoints share the default session |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `json_schema` cannot be combined with `think` or `tools` |
 
@@ -50,6 +50,7 @@ Backend quick reference:
 |---|---|
 | `cpu` | Pure C# CPU backend |
 | `cuda` | Direct CUDA backend using CUDA Driver API, cuBLAS, PTX kernels, and CPU fallbacks |
+| `mlx` | MLX Metal backend for Apple Silicon |
 | `ggml_cpu` | Native GGML CPU backend |
 | `ggml_metal` | GGML Metal backend for macOS |
 | `ggml_cuda` | GGML CUDA backend for NVIDIA GPUs |
@@ -576,7 +577,7 @@ Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_
 ### Utilities
 
 ```bash
-# Inference queue snapshot (busy flag, pending requests, total processed)
+# Compatibility queue/status snapshot (busy flag, pending requests, total processed)
 curl http://localhost:5000/api/queue/status
 
 # Server version
@@ -640,7 +641,7 @@ Event shapes:
 
 | Event field(s) | When | Meaning |
 |---|---|---|
-| `queue_position`, `queue_pending` | once per second while the request is queued | how many requests are ahead of this one |
+| `queue_position`, `queue_pending` | legacy compatibility only; normally not emitted by the current no-op queue | compatibility fields for older clients |
 | `token` | each generated token (or parsed content chunk when `think`/`tools` are active) | streaming content |
 | `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
 | `tool_calls` | when the model emits a tool call | array of `{name, arguments}` |
@@ -840,4 +841,3 @@ while IFS= read -r line; do
   echo -e "\n"
 done < test_requests.jsonl
 ```
-

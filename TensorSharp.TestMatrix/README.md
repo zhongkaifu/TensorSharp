@@ -17,7 +17,7 @@ affect — keep them in sync when you add a new flag.
 | **Models** | Auto-discovered GGUFs in `/Users/ZhongkaiFu/work/model` (configurable); explicit overrides also supported |
 | **Backends** | `cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `cuda`, `mlx` (host-availability filtered) |
 | **Features / prompt types** | Synthetic prefill (512, 2048), synthetic decode (128), short text, long text, uploaded text, multi-turn chat, function/tool calling, thinking mode, image, audio, video |
-| **Env-var sweeps** | 17 curated high-impact flags (continuous batching, KV-cache codec, prefill chunk, multimodal, MLX) — see the [matrix doc](../docs/env_var_feature_matrix.md) |
+| **Env-var sweeps** | 22 curated high-impact flags (continuous batching, KV-cache codec, prefill chunk, multimodal, MLX) — see the [matrix doc](../docs/env_var_feature_matrix.md) |
 
 ## Building
 

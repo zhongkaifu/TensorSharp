@@ -2,9 +2,9 @@
 
 A curated reference of the high-impact environment variables that change
 TensorSharp inference behavior, and the features / models / backends they
-affect. This matrix is the source of truth for
-[`TensorSharp.TestMatrix`](../TensorSharp.TestMatrix/README.md), which exercises
-each (env var × feature) cell in CI and tracks regressions over time.
+affect. This matrix is the companion reference for
+[`TensorSharp.TestMatrix`](../TensorSharp.TestMatrix/README.md); the
+`Tested` column shows which runtime knobs are currently swept by that runner.
 
 The matrix is intentionally **curated**, not exhaustive — there are ~90 `TS_*`
 debug knobs in the codebase, but most are diagnostic-only (`DUMP_LAYERS`,
@@ -30,7 +30,7 @@ real workload.
 | `TS_NEMOTRON_BATCHED` | Nemotron-H | * | Continuous batching, parallel inference (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_GEMMA4_BATCHED` | Gemma 4 | * | Continuous batching (default ON, set `0` to opt out) | `0`, **`1`** | yes |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | * | SSM Mamba2 batched native kernel | **`0`**, `1` | yes |
-| `TS_NEMOTRON_MOE_PREFILL_BATCHED` | Nemotron-H MoE | * | Batched MoE prefill | **`0`**, `1` | yes |
+| `TS_NEMOTRON_MOE_PREFILL_BATCHED` | Nemotron-H MoE | * | Batched MoE prefill (default ON, set `0` to disable) | `0`, **`1`** | no |
 | `TS_BATCHED_N1_FAST_PATH` | * | * | N=1 fast path through the batched scheduler | **`0`**, `1` | yes |
 | `TS_SCHED_DISABLE_BATCHED` | * | * | Falls through to per-seq KV swap when set | **`0`**, `1` | yes |
 
@@ -39,8 +39,8 @@ real workload.
 | Env var | Affects (model) | Affects (backend) | Affects (feature) | Values | Tested |
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | * | * | All prefill / decode / multimodal | **`f32`**, `f16`, `q8_0` | yes |
-| `TS_KV_PAGED_QUANT_BITS` | * | * | Paged KV cache codec (TurboQuant) | **`0`** (off), `4`, `8` | yes |
-| `TS_KV_CACHE_SSD_DIR` | * | * | SSD-backed paged KV tier for very large working sets | **`<unset>`**, path | no (env only) |
+| `TS_KV_PAGED_QUANT_BITS` | * | * | Standalone `PagedKvCacheManager` / CLI `--bench-kvcache` codec (TurboQuant); compatibility flag, not the current Server request-KV path | **`0`** (off), `4`, `8` | yes |
+| `TS_KV_CACHE_SSD_DIR` | * | * | Standalone `PagedKvCacheManager` SSD tier; compatibility flag, not the current Server request-KV path | **`<unset>`**, path | no (env only) |
 | `MAX_CONTEXT` | * | * | Hard cap on context length | **`<unset>`** (model default), integer | yes |
 
 ## 3. Prefill / decode tuning
@@ -68,7 +68,7 @@ real workload.
 | Env var | Affects (model) | Affects (backend) | Affects (feature) | Values | Tested |
 |---|---|---|---|---|---|
 | `TS_MLX_BATCHED_MOE_DECODE` | Qwen 3.5 / 3.6 MoE | MLX | MoE decode kernel (single batched dispatch per gate/up/down vs. K per-expert dispatches) | `0`, **`1`** | yes |
-| `TS_MLX_MOE_FUSED_GATE_UP_SILU` | Qwen 3.5 / 3.6 MoE | MLX | Fuses MoE gate matmul + up matmul + SiLUMul into one Metal kernel | `0`, **`1`** | yes |
+| `TS_MLX_MOE_FUSED_GATE_UP_SILU` | Qwen 3.5 / 3.6 MoE | MLX | Fuses MoE gate matmul + up matmul + SiLUMul into one Metal kernel | `0`, **`1`** | no |
 | `TS_MLX_DEVICE_ROUTER` | Qwen 3.5 / 3.6 MoE | MLX | Router top-K + softmax on-device (skips ~60 host syncs/token on Qwen3.6-35B-A3B) | **`0`**, `1` | yes |
 | `TS_MLX_PIPELINED_DECODE` | * | MLX | Pipelined greedy decode (device-side argmax) | `0`, **`1`** | yes |
 | `TS_MLX_KERNEL_WARMUP` | * | MLX | Force Metal kernel JIT warmup at load | **`0`**, `1` | no (load-time only) |
@@ -77,7 +77,7 @@ real workload.
 | `TS_MLX_WIRED_LIMIT_MB` | * | MLX | Wired-buffer residency cap (MB), set on the MLX side | **`<unset>`** (host-derived), integer | no (HW-dependent) |
 | `TS_MLX_EXPERT_OFFLOAD_MB` | MoE families | MLX | LRU expert offload pool size (MB) | **`<unset>`**, integer | no (HW-dependent) |
 | `TS_MLX_DEVICE_KV_COPY` | * | MLX | On-device KV scatter | `0`, **`1`** | yes |
-| `TS_MLX_FUSED_KV_WRITE` | * | MLX | Single multi-dim `slice_update` write per per-token KV block | `0`, **`1`** | yes |
+| `TS_MLX_FUSED_KV_WRITE` | * | MLX | Single multi-dim `slice_update` write per per-token KV block | `0`, **`1`** | no |
 | `TS_MLX_MLOCK_GGUF` | * | MLX | `mlock(2)` the GGUF mmap so weights stay resident between forward passes | `0`, **`1`** | no (HW-dependent — needs sufficient `memlock` rlimit) |
 | `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Gemma 4, Qwen 3.5 / 3.6 | MLX | Periodic `mlx_async_eval` cadence to overlap GPU work with host queueing | **`4`** (default), integer (`0` = disabled) | no (perf-tuning) |
 | `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | Qwen 3.5 / 3.6 | MLX | Packed GDN kernels | **`0`**, `1` | yes |

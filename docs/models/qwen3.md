@@ -305,7 +305,7 @@ Implementation:
 
 End-to-end logit-level correctness against a real base-Qwen3 GGUF is not
 yet verified in this tree (only Qwen 3.6 / GatedDeltaNet GGUFs are
-available locally). The opt-in
+available locally). The model-gated
 [`Qwen3BatchedForwardTests`](../../InferenceWeb.Tests/Qwen3BatchedForwardTests.cs)
 self-validate as soon as a base Qwen3 GGUF is dropped into
 `TS_TEST_MODEL_DIR`. `EngineParallelInferenceTests` exercise the engine

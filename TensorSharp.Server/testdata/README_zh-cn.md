@@ -14,10 +14,10 @@
 
 | 接口 | 覆盖内容 |
 |---|---|
-| Web UI SSE | 会话级流式输出、队列进度、done 事件指标、中断处理 |
+| Web UI SSE | 会话级流式输出、队列 / 状态兼容字段结构、done 事件指标、中断处理 |
 | Ollama 兼容 | 聊天流式/非流式、多轮历史、思维链、工具调用请求链路 |
 | OpenAI 兼容 | Chat Completions 流式/非流式、工具调用、结构化输出、校验错误 |
-| 运维行为 | FIFO 队列、并发请求、混合 API 切换、按架构自动跳过 |
+| 运维行为 | 连续批处理请求接纳、并发请求、混合 API 切换、按架构自动跳过 |
 
 ## 快速开始
 
@@ -47,7 +47,7 @@ python3 test_multiturn.py
 - Ollama 聊天的多轮行为（流式与非流式）
 - OpenAI Chat Completions 的流式与非流式响应
 - OpenAI 结构化输出：同时支持 `response_format: {"type":"json_object"}` 与 `response_format.json_schema`
-- 队列状态接口的字段结构
+- 队列 / 状态兼容接口的字段结构
 - 必填字段缺失时的错误处理
 - 结构化输出校验错误及文档化的请求冲突情况
 
@@ -63,10 +63,10 @@ python3 test_multiturn.py
 ### 仅 Bash 的运维侧检查
 
 - Web UI 流程中的 system prompt 持久化
-- 并发请求与 FIFO 队列行为
+- 通过连续批处理引擎接纳并发请求
 - 长对话压力测试
 - Ollama / OpenAI 接口混用
-- 生成中途中断与队列释放
+- 生成中途中断后兼容状态保持空闲
 - Ollama 工具调用请求路径
 
 ### 仅 Python 的兼容性检查
@@ -78,6 +78,7 @@ python3 test_multiturn.py
 
 - 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server 当前模拟的兼容范围内。
 - 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 或 `think` 同时使用时预期返回 HTTP `400`。
+- GPT OSS 的 Harmony 工具调用解析由进程内测试覆盖；这些服务端集成脚本当前仍会跳过 GPT OSS 的工具调用检查。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
 
 ## 使用方法

@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `cuda`, `ggml_cuda`, `ggml_cpu`, or `cpu` to match your machine.
+These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `mlx`, `cuda`, `ggml_cuda`, `ggml_cpu`, or `cpu` to match your machine.
 
 | Architecture | Thinking | Tool calls | Notes |
 |---|---|---|---|
@@ -366,4 +366,3 @@ When `tools` are provided:
 3. **Qwen3.5 / 3.6-family GGUFs**: Tool definitions use `<tools>...</tools>` format. The model outputs calls as `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`.
 4. **Nemotron-H**: Uses the same `<tool_call>{"name":"...","arguments":{...}}</tool_call>` wire format as Qwen3.
 5. **GPT OSS**: Tools are declared in the developer message as a TypeScript namespace (`namespace functions { type NAME = (_: { ... }) => any; }`). The model emits calls on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`, which stops generation on the `<|call|>` token. Tool results are returned as `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>`.
-
