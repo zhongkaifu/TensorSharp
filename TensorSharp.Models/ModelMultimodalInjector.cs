@@ -330,7 +330,15 @@ namespace TensorSharp.Models
             int audioStartId = _model.Tokenizer.LookupToken("<|audio>");
             int audioEndId = _model.Tokenizer.LookupToken("<audio|>");
 
-            var imageProcessor = model.VisionEncoder != null ? new Gemma4ImageProcessor() : null;
+            // The gemma4uv unified embedder declares its own image_mean / image_std
+            // (mean=0, std=1 -> [0,1]); the gemma4v SigLIP path keeps the legacy
+            // [-1,1] normalization.
+            var imageProcessor = model.VisionEncoder != null
+                ? (model.VisionEncoder.IsUnified
+                    ? new Gemma4ImageProcessor(imageMean: model.VisionEncoder.ImageMean,
+                        imageStd: model.VisionEncoder.ImageStd)
+                    : new Gemma4ImageProcessor())
+                : null;
             int searchFrom = 0;
 
             foreach (var message in history)
@@ -604,12 +612,6 @@ namespace TensorSharp.Models
             if (imageStartId < 0) imageStartId = 19;
             if (imageEndId < 0) imageEndId = 20;
 
-            // Audio tokens are emitted by the chat template per-message but we can only
-            // run the encoder if the mmproj actually shipped Parakeet weights. Detect
-            // upfront and skip silently otherwise (the CLI logs a warning).
-            int audioTokenId = _model.Tokenizer.LookupToken("<so_embedding>");
-            if (audioTokenId < 0) audioTokenId = 27;
-
             int searchFrom = 0;
             foreach (var message in history)
             {
@@ -710,6 +712,17 @@ namespace TensorSharp.Models
             return GetOrCreateCachedEmbedding(_audioCache, audioPath, fullPath =>
             {
                 float[] samples = Gemma4AudioPreprocessor.DecodeAudioFile(fullPath);
+
+                // Gemma 4 "unified" models (projector_type "gemma4ua", e.g.
+                // gemma-4-12b) are encoder-free: the raw waveform is chunked into
+                // 640-sample frames and projected directly, with no mel
+                // spectrogram or conformer encoder.
+                if (model.AudioEncoder.IsEncoderFree)
+                {
+                    Tensor rawEmbeddings = model.AudioEncoder.EncodeRawWaveform(samples);
+                    return CreateCachedEmbedding(fullPath, rawEmbeddings);
+                }
+
                 if (samples.Length % 128 != 0)
                 {
                     int padded = samples.Length + (128 - samples.Length % 128);

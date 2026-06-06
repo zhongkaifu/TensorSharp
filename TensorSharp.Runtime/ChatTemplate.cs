@@ -541,14 +541,32 @@ namespace TensorSharp.Runtime
                 {
                     var preprocessed = InjectMultimodalTokens(messages, architecture);
                     var jinja = new Jinja2Template(template);
-                    var context = BuildJinja2Context(preprocessed, addGenerationPrompt, architecture, tools, enableThinking);
+                    var context = BuildJinja2Context(preprocessed, addGenerationPrompt, tools, enableThinking);
                     string result = jinja.Render(context).TrimEnd();
                     if (result.Length > 0)
                     {
-                        if (architecture == "gemma4" && addGenerationPrompt && !enableThinking)
-                            result = EnsureGemma4ThinkingBlock(result);
-                        Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
-                        return result;
+                        // Defensive correctness guard: a lightweight Jinja engine that
+                        // cannot fully evaluate a feature the template relies on can
+                        // SILENTLY render an empty body for a message — most insidiously
+                        // when the template captures a message into a block-form
+                        // {% set captured %}...{% endset %} (as the Gemma 4 template does
+                        // for every message's content). When that capture mis-renders, the
+                        // user's question is dropped from the prompt entirely and the model
+                        // generates text unrelated to the prompt. Detect that here and fall
+                        // back to the hardcoded template, which always emits message content.
+                        if (!RenderedContainsLastUserText(result, messages))
+                        {
+                            Console.Error.WriteLine(
+                                $"[ChatTemplate] Jinja2 rendering for '{architecture}' dropped the last user message; " +
+                                "falling back to hardcoded template.");
+                        }
+                        else
+                        {
+                            if (architecture == "gemma4" && addGenerationPrompt && !enableThinking)
+                                result = EnsureGemma4ThinkingBlock(result);
+                            Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
+                            return result;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -561,6 +579,43 @@ namespace TensorSharp.Runtime
 
             Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
             return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+        }
+
+        /// <summary>
+        /// Verify the rendered prompt still contains the most recent user message's
+        /// text. Every supported chat template emits a user message's content
+        /// verbatim (at most trimmed), so a missing substring means the renderer
+        /// dropped the user's question — see the call site for why that matters.
+        /// Returns true (i.e. "looks fine") when there is no user text to verify
+        /// (e.g. an image-only turn).
+        /// </summary>
+        private static bool RenderedContainsLastUserText(string rendered, List<ChatMessage> messages)
+        {
+            if (messages == null)
+                return true;
+
+            string? lastUserText = null;
+            for (int i = messages.Count - 1; i >= 0; i--)
+            {
+                if (messages[i] != null && messages[i].Role == "user")
+                {
+                    lastUserText = messages[i].Content;
+                    break;
+                }
+            }
+
+            string needle = NormalizeNewlines(lastUserText).Trim();
+            if (needle.Length == 0)
+                return true;
+
+            return NormalizeNewlines(rendered).Contains(needle, StringComparison.Ordinal);
+        }
+
+        private static string NormalizeNewlines(string? s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return string.Empty;
+            return s.Replace("\r\n", "\n").Replace('\r', '\n');
         }
 
         private static string RenderHardcoded(List<ChatMessage> messages,
@@ -601,7 +656,7 @@ namespace TensorSharp.Runtime
         }
 
         private static Dictionary<string, object> BuildJinja2Context(
-            List<ChatMessage> messages, bool addGenerationPrompt, string? architecture,
+            List<ChatMessage> messages, bool addGenerationPrompt,
             List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var msgList = new List<object>();
@@ -631,7 +686,7 @@ namespace TensorSharp.Runtime
                 msgList.Add(dict);
             }
 
-            string bosToken = (architecture == "gemma4") ? "<bos>" : "";
+            string bosToken = "";
 
             var ctx = new Dictionary<string, object>
             {
@@ -978,16 +1033,19 @@ namespace TensorSharp.Runtime
         /// <summary>
         /// Render Gemma4 chat template.
         /// Uses &lt;|turn&gt;/&lt;turn|&gt; markers. Images use &lt;|image&gt;.
-        /// Matches the HF Jinja2 template: BOS is explicit, and when thinking is
-        /// disabled the generation prompt includes an empty thinking block
-        /// (&lt;|channel&gt;thought\n&lt;channel|&gt;) so the model skips thinking.
+        /// When thinking is disabled the generation prompt includes an empty
+        /// thinking block (&lt;|channel&gt;thought\n&lt;channel|&gt;) so the model
+        /// skips thinking.
+        ///
+        /// BOS is NOT emitted here: the tokenizer prepends it (add_bos_token=true,
+        /// encode addSpecial=true), exactly like <see cref="RenderGemma3"/> and the
+        /// GGUF Jinja2 path (which renders an empty bos_token). Emitting a literal
+        /// &lt;bos&gt; here too would double the BOS token in the prompt.
         /// </summary>
         public static string RenderGemma4(List<ChatMessage> messages, bool addGenerationPrompt = true,
             List<ToolFunction>? tools = null, bool enableThinking = false)
         {
             var sb = new StringBuilder();
-
-            sb.Append("<bos>");
 
             bool hasTools = tools != null && tools.Count > 0;
             bool hasSystem = messages.Count > 0 && (messages[0].Role == "system" || messages[0].Role == "developer");

@@ -26,6 +26,12 @@
     <CudaNvccOptimizationFlags Condition="'$(CudaNvccOptimizationFlags)' == ''">-O3 --extra-device-vectorization</CudaNvccOptimizationFlags>
     <CudaEnableFastMath Condition="'$(CudaEnableFastMath)' == ''">false</CudaEnableFastMath>
     <CudaFastMathFlag Condition="'$(CudaEnableFastMath)' == 'true' Or '$(CudaEnableFastMath)' == 'True'">--use_fast_math</CudaFastMathFlag>
+    <GgmlSourceDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', 'ExternalProjects', 'ggml'))</GgmlSourceDir>
+    <GgmlCommonHeader>$([MSBuild]::NormalizePath('$(GgmlSourceDir)', 'src', 'ggml-common.h'))</GgmlCommonHeader>
+    <GgmlFetchUpdate Condition="'$(GgmlFetchUpdate)' == '' And '$(TENSORSHARP_GGML_UPDATE)' != ''">$(TENSORSHARP_GGML_UPDATE)</GgmlFetchUpdate>
+    <GgmlFetchUpdate Condition="'$(GgmlFetchUpdate)' == ''">false</GgmlFetchUpdate>
+    <GgmlFetchUpdateEnabled Condition="'$(GgmlFetchUpdate)' == '1' Or '$(GgmlFetchUpdate)' == 'ON' Or '$(GgmlFetchUpdate)' == 'on' Or '$(GgmlFetchUpdate)' == 'On' Or '$(GgmlFetchUpdate)' == 'TRUE' Or '$(GgmlFetchUpdate)' == 'true' Or '$(GgmlFetchUpdate)' == 'True' Or '$(GgmlFetchUpdate)' == 'YES' Or '$(GgmlFetchUpdate)' == 'yes' Or '$(GgmlFetchUpdate)' == 'Yes'">true</GgmlFetchUpdateEnabled>
+    <GgmlFetchUpdateEnabled Condition="'$(GgmlFetchUpdateEnabled)' == ''">false</GgmlFetchUpdateEnabled>
   </PropertyGroup>
 
   <ItemGroup>
@@ -65,20 +71,25 @@
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
   </Target>
 
-  <!-- The CUDA kernels include ExternalProjects/ggml/src/ggml-common.h, which is
-       cloned from ggml-org/ggml at build time. Only fetch when nvcc is present, so a
-       CUDA-less C# build does not require network access. -->
+  <!-- The CUDA kernels include ExternalProjects/ggml/src/ggml-common.h. Fetch it
+       only on first use or when explicitly requested, so normal builds do not
+       spend time in git or fail because an existing checkout cannot be updated. -->
   <Target Name="EnsureGgmlSources" DependsOnTargets="ResolveCudaPtxBuildSettings" Condition="'$(_NvccExitCode)' == '0'">
-    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
+    <Message Condition="Exists('$(GgmlCommonHeader)') And '$(GgmlFetchUpdateEnabled)' != 'true'"
+             Importance="low"
+             Text="TensorSharp CUDA build: using existing ggml sources at $(GgmlSourceDir)" />
+    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' == 'true' And ('$(GgmlFetchUpdateEnabled)' == 'true' Or !Exists('$(GgmlCommonHeader)'))"
           Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.ps1&quot;" />
-    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
+    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' != 'true' And ('$(GgmlFetchUpdateEnabled)' == 'true' Or !Exists('$(GgmlCommonHeader)'))"
           Command="bash &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.sh&quot;" />
+    <Error Condition="!Exists('$(GgmlCommonHeader)')"
+           Text="TensorSharp CUDA build requires ggml sources at $(GgmlSourceDir). Run eng/fetch-ggml.sh or eng/fetch-ggml.ps1, or set TENSORSHARP_GGML_GIT_URL/TENSORSHARP_GGML_GIT_REF and rebuild." />
   </Target>
 
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
           DependsOnTargets="ResolveCudaPtxBuildSettings;EnsureGgmlSources"
-          Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
+          Inputs="@(CudaKernel);$(GgmlCommonHeader);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
           Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="WARNING: TensorSharp CUDA kernels were not compiled because nvcc was not found. The CUDA backend will keep CPU fallbacks for PTX-backed ops." />

@@ -45,10 +45,23 @@ namespace TensorSharp.Cli
                 args.Length, loggingOptions.MinimumLevel, loggingOptions.Directory,
                 loggingOptions.FileEnabled, loggingOptions.ConsoleEnabled);
 
+            // The ggml-metal device singleton asserts its residency set is empty
+            // when its C++ static destructor runs at process exit; any GGML
+            // backend buffer that outlives the run (e.g. the reusable prefill
+            // compute buffer) must be freed first. Mirror the server's shutdown
+            // wiring so the CLI exits cleanly on the GGML/Metal backend.
+            AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
+            {
+                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
+                catch { /* native lib may be absent for non-GGML backends */ }
+            };
+
             try
             {
                 MainCore(args);
                 _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed");
+                try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
+                catch { /* native lib may be absent for non-GGML backends */ }
             }
             catch (Exception ex)
             {
@@ -1440,13 +1453,6 @@ namespace TensorSharp.Cli
                  model.Config.Architecture == "nemotron_h" ||
                  model.Config.Architecture == "nemotron_h_moe"))
             {
-                int audioTokenId = model.Tokenizer.LookupToken("<so_embedding>");
-                int audioStartId = model.Tokenizer.LookupToken("<so_start>");
-                int audioEndId = model.Tokenizer.LookupToken("<so_end>");
-                if (audioTokenId < 0) audioTokenId = 27;
-                if (audioStartId < 0) audioStartId = 28;
-                if (audioEndId < 0) audioEndId = 29;
-
                 try
                 {
                     float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(audioPaths[0]);
@@ -1843,37 +1849,6 @@ namespace TensorSharp.Cli
             return sb.ToString();
         }
 
-        
-
-        static unsafe TensorSharp.Tensor ConcatenateEmbeddings(List<TensorSharp.Tensor> embeddings,
-            int totalTokens, int embDim)
-        {
-            var allocator = embeddings[0].Allocator;
-            var result = new TensorSharp.Tensor(allocator, DType.Float32, totalTokens, embDim);
-
-            float* dstPtr = GetTensorPtr(result);
-            int offset = 0;
-            foreach (var emb in embeddings)
-            {
-                int tokens = (int)emb.Sizes[0];
-                float* srcPtr = GetTensorPtr(emb);
-                long bytes = (long)tokens * embDim * sizeof(float);
-                Buffer.MemoryCopy(srcPtr, dstPtr + offset * embDim, bytes, bytes);
-                offset += tokens;
-                emb.Dispose();
-            }
-            return result;
-        }
-
-        static unsafe float* GetTensorPtr(TensorSharp.Tensor t)
-        {
-            if (t.Storage is TensorSharp.GGML.GgmlStorage gs)
-                return (float*)gs.PtrAtElement(t.StorageOffset);
-            if (t.Storage is CpuStorage cs)
-                return (float*)cs.PtrAtElement(t.StorageOffset);
-            throw new NotSupportedException();
-        }
-
         static void LogTopLogits(float[] logits, ModelBase model, string label)
         {
             if (!_log.IsEnabled(LogLevel.Debug))
@@ -1892,7 +1867,7 @@ namespace TensorSharp.Cli
             _log.LogInformation(LogEventIds.CliBenchmark, "Running verification tests");
 
             TestTokenizer(model);
-            TestChatTemplate(model);
+            TestChatTemplate();
             TestInferenceWithOllamaComparison(model, maxTokens, outputFile);
         }
 
@@ -1987,7 +1962,6 @@ namespace TensorSharp.Cli
                     pending.Dispose();
                     if (run == 0)
                         firstRunDecodeTokens[decodeTokens - 1] = lastTok;
-                    next = lastTok;
                     model.ResetPipelinedGreedyState();
                 }
                 else
@@ -2167,7 +2141,7 @@ namespace TensorSharp.Cli
             var samplerCfg = sampling ?? SamplingConfig.Greedy;
 
             (double[] cached, int[] promptTokensCached) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: true);
-            (double[] noCache, int[] promptTokensNoCache) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: false);
+            (double[] noCache, int[] _) = RunBenchmarkPass(model, arch, userTurns, turnLimit, maxTokens, samplerCfg, enableThinking, useCache: false);
 
             for (int i = 0; i < turnLimit; i++)
             {
@@ -2328,7 +2302,6 @@ namespace TensorSharp.Cli
             model.ResetKVCache();
 
             long warmRss = WorkingSetBytes();
-            long warmManagedAlloc = GC.GetTotalAllocatedBytes(precise: true);
 
             // ===== Baseline: paged cache disabled =====
             var baselineMs = new double[trials];
@@ -2564,7 +2537,7 @@ namespace TensorSharp.Cli
             }
         }
 
-        static void TestChatTemplate(ModelBase model)
+        static void TestChatTemplate()
         {
             _log.LogInformation(LogEventIds.CliBenchmark, "chat template test starting");
 

@@ -58,7 +58,8 @@ real workload.
 
 | Env var | Affects (model) | Affects (backend) | Affects (feature) | Values | Tested |
 |---|---|---|---|---|---|
-| `VIDEO_MAX_FRAMES` | Gemma 4 | * | Video prompts | **`8`**, integer | yes |
+| `VIDEO_SAMPLE_FPS` | Gemma 4 | * | Video prompts | **`1`**, positive number | yes |
+| `VIDEO_MAX_FRAMES` | Gemma 4 | * | Video prompts | **`<unset>`** (no cap), integer | yes |
 | `TS_NEMOTRON_IMAGE_MAX_TILES` | Nemotron-H Omni | * | Image prompts | **`<unset>`**, integer | yes |
 | `TS_NEMOTRON_MULTIMODAL_WARMUP` | Nemotron-H Omni | * | First-call vision warmup | `0`, **`1`** | no |
 

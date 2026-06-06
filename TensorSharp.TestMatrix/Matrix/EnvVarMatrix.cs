@@ -151,11 +151,19 @@ public static class EnvVarMatrix
 
         // Multimodal
         new(
+            Name: "VIDEO_SAMPLE_FPS",
+            Category: "Multimodal",
+            Values: new[] { "1", "2" },
+            DefaultValue: "1",
+            Notes: "Frames sampled per second of video (time-based extraction).",
+            AppliesTo: (m, b, f) => f.Kind == FeatureKind.Video),
+
+        new(
             Name: "VIDEO_MAX_FRAMES",
             Category: "Multimodal",
-            Values: new[] { "4", "8", "16" },
-            DefaultValue: "8",
-            Notes: "Max sampled frames per video prompt.",
+            Values: new[] { "8", "16" },
+            DefaultValue: "<unset> (no cap)",
+            Notes: "Optional upper bound on sampled frames per video; unset/0 = no cap (pure time-based).",
             AppliesTo: (m, b, f) => f.Kind == FeatureKind.Video),
 
         new(

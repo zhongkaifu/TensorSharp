@@ -475,23 +475,12 @@ public sealed class CliRunner
             System.Text.RegularExpressions.RegexOptions.Compiled
             | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
-    private static bool LooksLikeLogLine(string line)
-    {
-        // Microsoft.Extensions.Logging's SimpleConsoleFormatter writes one of:
-        //   info: TensorSharp.Cli[…]
-        //   warn: TensorSharp.Cli[…]
-        //   <HH:mm:ss> info: TensorSharp.Cli[…]   (when IncludeScopes/SingleLine + timestamp)
-        // …plus indented continuation lines (start with whitespace).
-        if (line.Length > 0 && char.IsWhiteSpace(line[0])) return true;
-        return LogLinePrefixRegex.IsMatch(line);
-    }
-
     private static void ScrubInheritedTsEnv(ProcessStartInfo psi)
     {
-        // Wipe TS_*, GDN_*, KV_*, MAX_CONTEXT, VIDEO_MAX_FRAMES, FUSED_*,
-        // QWEN35_* from inherited env so the matrix has a clean slate.
+        // Wipe TS_*, GDN_*, KV_*, MAX_CONTEXT, VIDEO_MAX_FRAMES, VIDEO_SAMPLE_FPS,
+        // FUSED_*, QWEN35_* from inherited env so the matrix has a clean slate.
         var prefixes = new[] { "TS_", "GDN_", "QWEN35_", "FUSED_" };
-        var keys = new[] { "KV_CACHE_DTYPE", "MAX_CONTEXT", "MAX_TOKENS", "VIDEO_MAX_FRAMES" };
+        var keys = new[] { "KV_CACHE_DTYPE", "MAX_CONTEXT", "MAX_TOKENS", "VIDEO_MAX_FRAMES", "VIDEO_SAMPLE_FPS" };
         var toClear = new List<string>();
         foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
         {

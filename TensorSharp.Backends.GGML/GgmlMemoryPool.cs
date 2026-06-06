@@ -26,7 +26,6 @@ namespace TensorSharp.GGML
         private const int GgmlHostPtrAlignment = 32;
         private const int BlockSize = 32 * 1024 * 1024; // 32 MB per block
         private const int DefaultInitialBlockCount = 4;
-        private const int DefaultMaxPooledBlocks = 64;
         private const int CudaInitialBlockCount = 0;
         private const int CudaMaxPooledBlocks = 8;
         private const long CudaMaxRetainedBlockSize = 8L * 1024 * 1024;

@@ -987,7 +987,7 @@ namespace TensorSharp.Cli
             {
                 _generationCts = new CancellationTokenSource();
                 _isGenerating = true;
-                Stream(userText, renderHistory, _generationCts.Token);
+                Stream(renderHistory, _generationCts.Token);
             }
             catch (OperationCanceledException)
             {
@@ -1059,7 +1059,7 @@ namespace TensorSharp.Cli
             return sb.ToString();
         }
 
-        private void Stream(string userText, List<ChatMessage> renderHistory, CancellationToken cancellationToken)
+        private void Stream(List<ChatMessage> renderHistory, CancellationToken cancellationToken)
         {
             string arch = _model.Config.Architecture;
 

@@ -26,9 +26,6 @@ namespace TensorSharp.Models
         public const int NewlineNewlineToken = 108;
         public const int PadToken = 0;
 
-        private const float ImageMean = 0.5f;
-        private const float ImageStd = 0.5f;
-
         public Gemma3ImageProcessor(int tokensPerImage = 256, int imageSize = 896, int patchSize = 14)
         {
             TokensPerImage = tokensPerImage;
@@ -463,30 +460,57 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Pack RGBA pixels into channel-first float format [R..., G..., B...] normalized with mean/std.
-        /// Matches Ollama's pack(): channel-first with (pixel/255 - mean) / std.
+        /// Resize (bilinear, composite over white) and normalize to channel-first
+        /// [C, H, W] using explicit per-channel mean/std: (pixel/255 - mean) / std.
+        /// Used by models whose mmproj declares its own image_mean / image_std
+        /// (e.g. the Gemma 4 unified vision embedder with mean=0, std=1 -> [0,1]).
         /// </summary>
-        private float[] PackChannelFirst(byte[] rgba, int width, int height)
+        internal static float[] ResizeRgbaToChannelFirstNormalized(
+            byte[] rgba, int srcW, int srcH, int dstW, int dstH, float[] mean, float[] std)
         {
-            int pixels = width * height;
+            int pixels = dstW * dstH;
             float[] result = new float[3 * pixels];
+            double xRatio = (double)srcW / dstW;
+            double yRatio = (double)srcH / dstH;
 
-            for (int y = 0; y < height; y++)
+            Parallel.For(0, dstH, dy =>
             {
-                for (int x = 0; x < width; x++)
-                {
-                    int pixIdx = y * width + x;
-                    float r = (rgba[pixIdx * 4] / 255f - ImageMean) / ImageStd;
-                    float g = (rgba[pixIdx * 4 + 1] / 255f - ImageMean) / ImageStd;
-                    float b = (rgba[pixIdx * 4 + 2] / 255f - ImageMean) / ImageStd;
+                double srcY = (dy + 0.5) * yRatio - 0.5;
+                int y0 = Math.Max(0, (int)srcY);
+                int y1 = Math.Min(srcH - 1, y0 + 1);
+                double fy = srcY - y0;
 
-                    result[pixIdx] = r;
-                    result[pixels + pixIdx] = g;
-                    result[2 * pixels + pixIdx] = b;
+                for (int dx = 0; dx < dstW; dx++)
+                {
+                    double srcX = (dx + 0.5) * xRatio - 0.5;
+                    int x0 = Math.Max(0, (int)srcX);
+                    int x1 = Math.Min(srcW - 1, x0 + 1);
+                    double fx = srcX - x0;
+
+                    int dstIdx = dy * dstW + dx;
+                    for (int c = 0; c < 3; c++)
+                    {
+                        float v00 = CompositeChannel01(rgba, (y0 * srcW + x0) * 4, c);
+                        float v01 = CompositeChannel01(rgba, (y0 * srcW + x1) * 4, c);
+                        float v10 = CompositeChannel01(rgba, (y1 * srcW + x0) * 4, c);
+                        float v11 = CompositeChannel01(rgba, (y1 * srcW + x1) * 4, c);
+
+                        double v = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) +
+                                   v10 * (1 - fx) * fy + v11 * fx * fy;
+                        result[c * pixels + dstIdx] = (float)((v - mean[c]) / std[c]);
+                    }
                 }
-            }
+            });
 
             return result;
+        }
+
+        // Composite an RGBA channel over a white background and rescale to [0, 1].
+        private static float CompositeChannel01(byte[] rgba, int pixelBase, int channel)
+        {
+            float alpha = rgba[pixelBase + 3] / 255f;
+            float composited = rgba[pixelBase + channel] * alpha + 255f * (1f - alpha);
+            return composited / 255f;
         }
     }
 }

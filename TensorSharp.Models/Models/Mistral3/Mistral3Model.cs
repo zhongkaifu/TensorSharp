@@ -465,7 +465,7 @@ namespace TensorSharp.Models
             {
                 foreach (var (embeddings, position) in _pendingVisionEmbeddingsList)
                 {
-                    InjectVisionEmbeddings(hidden, embeddings, position);
+                    InjectVisionEmbeddings(hidden, embeddings, position, startPos);
                     embeddings.Dispose();
                 }
                 _pendingVisionEmbeddingsList.Clear();
@@ -514,7 +514,7 @@ namespace TensorSharp.Models
             return _logitsBuffer;
         }
 
-        private unsafe void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos)
+        private unsafe void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos, int startPos)
         {
             int numVisionTokens = (int)visionEmbeddings.Sizes[0];
             int dim = Config.HiddenSize;
@@ -528,7 +528,10 @@ namespace TensorSharp.Models
                 Buffer.MemoryCopy(src, dst, dim * sizeof(float), dim * sizeof(float));
             }
 
-            Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
+            // insertPos is the offset within the current prefill chunk; startPos
+            // (the cached sequence length) makes the absolute position explicit so
+            // the log reads monotonically across chunked multimodal prefill.
+            Console.WriteLine($"Injected {numVisionTokens} vision tokens at chunk-offset {insertPos} (absolute position {startPos + insertPos})");
         }
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos)

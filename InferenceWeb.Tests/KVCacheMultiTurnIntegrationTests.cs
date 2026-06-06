@@ -182,7 +182,6 @@ public class KVCacheMultiTurnIntegrationTests
     private static List<(int promptTokens, int forwardedTokens)> RunConversation(
         RecordingFakeModel model,
         SimpleTokenizer tokenizer,
-        SimpleRenderer renderer,
         KVCachePromptRenderer kvRenderer,
         KVCache kvCache,
         IList<string> userTurns,
@@ -270,7 +269,7 @@ public class KVCacheMultiTurnIntegrationTests
         var raw1 = new List<int> { 1001, 1002, 1003 };
         var raw2 = new List<int> { 2001, 2002 };
 
-        var stats = RunConversation(model, tokenizer, renderer, kvRenderer, kvCache,
+        var stats = RunConversation(model, tokenizer, kvRenderer, kvCache,
             new[] { "Hi", "More" },
             new[] { raw1, raw2 });
 
@@ -306,7 +305,7 @@ public class KVCacheMultiTurnIntegrationTests
         // produce. This is the key scenario.
         var rawWithThinking = new List<int> { 7001, 7002, 7003, 7004, 7005 };
 
-        var stats = RunConversation(model, tokenizer, renderer, kvRenderer, kvCache,
+        var stats = RunConversation(model, tokenizer, kvRenderer, kvCache,
             new[] { "Q1", "Q2" },
             new[] { rawWithThinking, new List<int> { 8001 } });
 
@@ -345,7 +344,7 @@ public class KVCacheMultiTurnIntegrationTests
 
         var raw = new List<int> { 1001, 1002 };
 
-        var stats = RunConversation(model, tokenizer, renderer, kvRenderer, kvCache,
+        var stats = RunConversation(model, tokenizer, kvRenderer, kvCache,
             new[] { "Q1", "Q2" },
             new[] { raw, new List<int> { 2001 } });
 
@@ -371,11 +370,9 @@ public class KVCacheMultiTurnIntegrationTests
         var model = new RecordingFakeModel { SupportsTruncation = false };
 
         // Turn 1: user "Q1"
-        RunConversation(model, tokenizer, renderer, kvRenderer, kvCache,
+        RunConversation(model, tokenizer, kvRenderer, kvCache,
             new[] { "Q1" },
             new[] { new List<int> { 1001 } });
-
-        int opsAfterTurn1 = model.Operations.Count;
 
         // Turn 2: completely different opening user message -> no usable common prefix.
         var history = new List<ChatMessage>
@@ -545,7 +542,7 @@ public class KVCacheMultiTurnIntegrationTests
         for (int i = 0; i < 200; i++)
             bigRaw.Add(10000 + i);
 
-        var stats = RunConversation(model, tokenizer, renderer, kvRenderer, kvCache,
+        var stats = RunConversation(model, tokenizer, kvRenderer, kvCache,
             new[] { "First user turn that establishes context", "Q" },
             new[] { bigRaw, new List<int> { 9001 } });
 

@@ -948,6 +948,8 @@ namespace TensorSharp.Models
 
             long preloadedBytes = 0;
             int preloadedCount = 0;
+            long retainedHostBytes = 0;
+            int retainedHostCount = 0;
             int mappedHostViews = 0;
 
             foreach (QuantizedWeight qw in _quantWeights.Values)
@@ -969,13 +971,18 @@ namespace TensorSharp.Models
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
 
-                if (!ShouldRetainCudaHostQuantWeight(weightName))
+                if (!ShouldRetainCudaHostQuantWeight(weightName, qw))
                 {
                     bool wasMappedView = qw.HasExternalHostView;
                     qw.ReleaseHostData();
 
                     if (wasMappedView)
                         mappedHostViews--;
+                }
+                else
+                {
+                    retainedHostBytes += qw.RawBytes;
+                    retainedHostCount++;
                 }
             }
 
@@ -984,7 +991,12 @@ namespace TensorSharp.Models
             _cudaQuantWeightsPrepared = true;
 
             if (preloadedCount > 0)
-                Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+            {
+                string retained = retainedHostCount > 0
+                    ? $"; retained {retainedHostBytes / 1024 / 1024} MB across {retainedHostCount} host fallback tensors"
+                    : "; host copies released";
+                Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors{retained}");
+            }
         }
 
         private void PrepareMlxQuantizedWeightsForInference()
@@ -1308,10 +1320,18 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors (host copies released)");
         }
 
-        private static bool ShouldRetainCudaHostQuantWeight(string weightName)
+        private static bool ShouldRetainCudaHostQuantWeight(string weightName, QuantizedWeight weight)
         {
-            return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
-                string.Equals(weightName, "per_layer_token_embd.weight", StringComparison.Ordinal);
+            if (!string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) &&
+                !string.Equals(weightName, "per_layer_token_embd.weight", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            // Keep a host fallback only for embedding quant types that GGML CUDA
+            // cannot select with ggml_get_rows. Supported types stay fully
+            // device-resident after the load-time preload.
+            return !CanUseGgmlCudaQuantizedGetRows(weight.GgmlType);
         }
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
@@ -1322,6 +1342,11 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda)
                 return true;
 
+            return CanUseGgmlCudaQuantizedGetRows(ggmlType);
+        }
+
+        private static bool CanUseGgmlCudaQuantizedGetRows(int ggmlType)
+        {
             return ((GgmlTensorType)ggmlType) switch
             {
                 GgmlTensorType.Q4_0 => true,
@@ -3133,6 +3158,22 @@ namespace TensorSharp.Models
         /// opt in by overriding alongside the four members below.
         /// </summary>
         public virtual bool SupportsKVStateSnapshot => false;
+
+        /// <summary>
+        /// Whether a K/V snapshot taken by one sequence can be re-injected into another
+        /// sequence's fresh cache (cross-request prefix reuse + executor ownership swap).
+        /// Defaults to <see cref="SupportsKVStateSnapshot"/>; models whose snapshot
+        /// restore does not faithfully reproduce a fresh prefill (e.g. sliding-window /
+        /// circular caches) override this to false to force a correct re-prefill.
+        /// </summary>
+        public virtual bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot;
+
+        /// <summary>
+        /// Maximum leading-prompt-token count whose K/V snapshot can be faithfully
+        /// restored into another sequence. Defaults to unbounded; sliding-window models
+        /// (e.g. Gemma 4) override this with their window size.
+        /// </summary>
+        public virtual int MaxReusablePrefixTokens => int.MaxValue;
 
         /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count,

@@ -20,9 +20,6 @@ namespace TensorSharp.Models
         public int ShortestEdge { get; }
         public int LongestEdge { get; }
 
-        private const float ImageMean = 0.5f;
-        private const float ImageStd = 0.5f;
-
         public Qwen35ImageProcessor(int patchSize = 14, int mergeSize = 2,
             int shortestEdge = 64 * 1024, int longestEdge = 2 * 1024 * 1024)
         {
@@ -96,29 +93,6 @@ namespace TensorSharp.Models
             float[] pixels = Gemma3ImageProcessor.ResizeRgbaToChannelFirstNormalized(
                 rgba, origWidth, origHeight, resizedW, resizedH);
             return (pixels, resizedH, resizedW);
-        }
-
-        private static float[] PackChannelFirst(byte[] rgba, int width, int height)
-        {
-            int numPixels = width * height;
-            float[] result = new float[3 * numPixels];
-
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int pixIdx = y * width + x;
-                    float r = (rgba[pixIdx * 4] / 255f - ImageMean) / ImageStd;
-                    float g = (rgba[pixIdx * 4 + 1] / 255f - ImageMean) / ImageStd;
-                    float b = (rgba[pixIdx * 4 + 2] / 255f - ImageMean) / ImageStd;
-
-                    result[pixIdx] = r;
-                    result[numPixels + pixIdx] = g;
-                    result[2 * numPixels + pixIdx] = b;
-                }
-            }
-
-            return result;
         }
     }
 }

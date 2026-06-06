@@ -26,26 +26,50 @@
     <GgmlNativeBuildScript Condition="$([MSBuild]::IsOSPlatform('Linux'))">build-linux.sh</GgmlNativeBuildScript>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Windows')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
-    <GgmlNativeForceBuild Condition="$([MSBuild]::IsOSPlatform('Windows')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">true</GgmlNativeForceBuild>
-    <GgmlNativeForceBuild Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">true</GgmlNativeForceBuild>
+    <GgmlNativeIncrementalBinary>$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)</GgmlNativeIncrementalBinary>
+    <GgmlNativeIncrementalBinary Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)</GgmlNativeIncrementalBinary>
+    <GgmlNativeBuildStampDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(BaseIntermediateOutputPath)', 'ggml_native'))</GgmlNativeBuildStampDir>
+    <GgmlNativeBuildSettingsKey>$(GgmlNativeBuildArgs)_$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)_$(TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES)_$(TENSORSHARP_GGML_NATIVE_BUILD_TESTS)</GgmlNativeBuildSettingsKey>
+    <GgmlNativeBuildSettingsKey Condition="'$(GgmlNativeBuildSettingsKey)' == '___'">default</GgmlNativeBuildSettingsKey>
+    <GgmlNativeBuildSettingsKey>$(GgmlNativeBuildSettingsKey.Replace(' ', '_').Replace('-', '').Replace(';', '_'))</GgmlNativeBuildSettingsKey>
+    <GgmlNativeBuildStamp>$(GgmlNativeBuildStampDir)/$(GgmlNativeBuildSettingsKey).stamp</GgmlNativeBuildStamp>
   </PropertyGroup>
+  <ItemGroup>
+    <GgmlNativeBuildInput Include="$(MSBuildProjectFullPath)" />
+    <GgmlNativeBuildInput Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/CMakeLists.txt" />
+    <GgmlNativeBuildInput Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.c;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.cc;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.cpp;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.cu;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.h;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/*.hpp" />
+    <GgmlNativeBuildInput Include="$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-linux.sh;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-macos.sh;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-windows.ps1" />
+    <GgmlNativeBuildInput Include="$(MSBuildProjectDirectory)/../eng/fetch-ggml.sh;$(MSBuildProjectDirectory)/../eng/fetch-ggml.ps1" />
+    <GgmlNativeBuildInput Include="$(MSBuildProjectDirectory)/../ExternalProjects/ggml/CMakeLists.txt;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/src/**/*.c;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/src/**/*.cc;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/src/**/*.cpp;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/src/**/*.cu;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/src/**/*.h;$(MSBuildProjectDirectory)/../ExternalProjects/ggml/include/**/*.h" Condition="Exists('$(MSBuildProjectDirectory)/../ExternalProjects/ggml')" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.Data.DataSetExtensions" Version="4.5.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
   </ItemGroup>
-  <Target Name="BuildGgmlNativeWindows" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''">
+  <Target Name="BuildGgmlNativeWindows"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Inputs="@(GgmlNativeBuildInput)"
+          Outputs="$(GgmlNativeBuildStamp)">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+    <MakeDir Directories="$(GgmlNativeBuildStampDir)" />
+    <WriteLinesToFile File="$(GgmlNativeBuildStamp)" Lines="args=$(GgmlNativeBuildArgs);cuda_arch=$(TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES);tests=$(TENSORSHARP_GGML_NATIVE_BUILD_TESTS)" Overwrite="true" />
   </Target>
-  <Target Name="BuildGgmlNativeUnix" BeforeTargets="BeforeBuild" Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''">
+  <Target Name="BuildGgmlNativeUnix"
+          Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Inputs="@(GgmlNativeBuildInput)"
+          Outputs="$(GgmlNativeBuildStamp)">
     <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+    <MakeDir Directories="$(GgmlNativeBuildStampDir)" />
+    <WriteLinesToFile File="$(GgmlNativeBuildStamp)" Lines="args=$(GgmlNativeBuildArgs);cuda_arch=$(TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES);tests=$(TENSORSHARP_GGML_NATIVE_BUILD_TESTS)" Overwrite="true" />
   </Target>
-  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">
+  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" DependsOnTargets="BuildGgmlNativeWindows;BuildGgmlNativeUnix" Condition="'$(GgmlNativeBinaryName)' != ''">
     <ItemGroup>
       <GgmlNativeBinary Include="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')" />
       <GgmlNativeBinary Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')" />
     </ItemGroup>
+    <Error Condition="'@(GgmlNativeBinary)' == ''" Text="TensorSharp GGML native build did not produce $(GgmlNativeBinaryName) under $(GgmlNativeBuildDir)." />
     <Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

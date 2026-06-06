@@ -38,6 +38,7 @@
         "MAX_CONTEXT",
         "TS_PREFILL_CHUNK",
         "TS_GGML_ASYNC_COMPUTE",
+        "VIDEO_SAMPLE_FPS",
         "VIDEO_MAX_FRAMES",
         "TS_NEMOTRON_IMAGE_MAX_TILES",
         "TS_MLX_BATCHED_MOE_DECODE",

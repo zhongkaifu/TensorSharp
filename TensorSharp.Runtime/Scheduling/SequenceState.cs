@@ -27,7 +27,8 @@ namespace TensorSharp.Runtime.Scheduling
             int maxNewTokens,
             int blockSize,
             SamplingConfig samplingConfig,
-            object userTag = null)
+            object userTag = null,
+            string mediaFingerprint = null)
         {
             if (promptTokens == null) throw new ArgumentNullException(nameof(promptTokens));
             if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
@@ -43,6 +44,7 @@ namespace TensorSharp.Runtime.Scheduling
             Status = SequenceStatus.Waiting;
             SubmittedAt = DateTime.UtcNow;
             UserTag = userTag;
+            MediaFingerprint = string.IsNullOrEmpty(mediaFingerprint) ? null : mediaFingerprint;
         }
 
         /// <summary>Monotonic submission sequence number. Used as FCFS tiebreaker
@@ -58,6 +60,16 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Sticky reference the caller can use to associate a session,
         /// HTTP request, or telemetry context with this sequence.</summary>
         public object UserTag { get; }
+
+        /// <summary>
+        /// Stable identifier of the multimodal content (images/audio/video) baked
+        /// into this prompt's embeddings, or <c>null</c> for text-only prompts.
+        /// Mixed into the prefix-cache block hashes so two prompts that share
+        /// identical placeholder token IDs but carry <em>different</em> media never
+        /// adopt each other's K/V blocks (which would otherwise surface a stale
+        /// image/audio). Identical media still shares the cache.
+        /// </summary>
+        public string MediaFingerprint { get; }
 
         public SequenceStatus Status { get; internal set; }
         public DateTime SubmittedAt { get; }
@@ -97,6 +109,15 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>How many tokens were restored from prefix cache (block hash
         /// hits) at admission time. Diagnostic only.</summary>
         public int PrefixCacheReusedTokens { get; internal set; }
+
+        /// <summary>True when this sequence reuses the model's LIVE KV cache
+        /// directly (its prompt extends exactly the tokens still resident in the
+        /// model's cache from the previous request on the same session), instead of
+        /// adopting K/V blocks from the prefix-cache pool. The executor keeps the
+        /// live cache as-is rather than reset+inject, which is the only correct way
+        /// to reuse a prefix longer than a sliding-window model's window (the pooled
+        /// snapshot can't faithfully reconstruct the wrapped circular cache).</summary>
+        public bool UsesLiveCacheContinuation { get; internal set; }
 
         /// <summary>True once this sequence's K/V state has been written into
         /// the model's paged storage (via <c>ForwardBatch</c> or an explicit
@@ -140,6 +161,25 @@ namespace TensorSharp.Runtime.Scheduling
         {
             NumComputedTokens = 0;
             LastLogits = null;
+            // A preempted sequence re-prefills on re-admission; any prior live-cache
+            // continuation claim is stale (its blocks were freed and the model's live
+            // cache has since moved on), so drop it and let admission re-decide.
+            UsesLiveCacheContinuation = false;
+        }
+
+        /// <summary>Abandon a planned live-cache continuation (see
+        /// <see cref="UsesLiveCacheContinuation"/>) when the model's live cache is
+        /// no longer usable at execution time. Drops the reused-prefix claim so the
+        /// sequence re-prefills from position 0, but KEEPS the already-allocated
+        /// blocks (their token counter is reset) so block-table accounting stays
+        /// consistent through the re-prefill.</summary>
+        internal void ClearLiveCacheContinuation()
+        {
+            UsesLiveCacheContinuation = false;
+            NumComputedTokens = 0;
+            PrefixCacheReusedTokens = 0;
+            LastLogits = null;
+            BlockTable.ResetTokensKeepingBlocks();
         }
 
         public void AppendOutputToken(int token)

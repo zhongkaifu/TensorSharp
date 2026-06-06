@@ -36,6 +36,23 @@ namespace TensorSharp.Models
         private readonly int _nMerge;
         private readonly float _ropeTheta;
 
+        // "gemma4uv" (Gemma 4 unified vision embedder, e.g. Gemma-4-12B) uses a
+        // completely different, block-less vision path: a single large-patch
+        // conv (patch_size * n_merge) followed by three pytorch LayerNorms,
+        // learned 2D positional embeddings, an unweighted RMSNorm and a linear
+        // projection. The classic "gemma4v" path (SigLIP transformer with
+        // v.blk.N.* blocks, e.g. Gemma-4-E4B) keeps the original encode flow.
+        private readonly bool _isUnified;
+        private readonly string _projectorType;
+        // image_mean / image_std read from the mmproj. The unified embedder is
+        // trained on raw [0,1] pixels (mean=0, std=1); the SigLIP path keeps the
+        // legacy [-1,1] preprocessing for backward compatibility.
+        private readonly float[] _imageMean;
+        private readonly float[] _imageStd;
+
+        // pytorch nn.LayerNorm default epsilon used by the unified embedder.
+        private const float UnifiedLayerNormEps = 1e-5f;
+
         private struct ClampParams
         {
             public float InMin, InMax, OutMin, OutMax;
@@ -57,6 +74,16 @@ namespace TensorSharp.Models
         }
 
         public int ProjectionDim => _projectionDim;
+
+        /// <summary>True when this mmproj is a Gemma 4 "unified" vision embedder
+        /// (projector_type "gemma4uv"), which uses the block-less encode path.</summary>
+        public bool IsUnified => _isUnified;
+
+        /// <summary>Per-channel image mean read from the mmproj (or null).</summary>
+        public float[] ImageMean => _imageMean;
+
+        /// <summary>Per-channel image std read from the mmproj (or null).</summary>
+        public float[] ImageStd => _imageStd;
 
         /// <summary>Attach the model that owns this encoder so the per-block
         /// loop in <see cref="Encode"/> can yield the GPU compute lock between
@@ -80,9 +107,15 @@ namespace TensorSharp.Models
             if (_nMerge == 0) _nMerge = 3;
             _ropeTheta = 100f;
 
-            Console.WriteLine($"Vision encoder: hidden={_hiddenSize}, intermediate={_intermediateSize}, " +
-                $"heads={_numHeads}, blocks={_blockCount}, projDim={_projectionDim}, " +
-                $"patch={_patchSize}, nMerge={_nMerge}");
+            _projectorType = gguf.GetString("clip.vision.projector_type", "gemma4v") ?? "gemma4v";
+            _isUnified = string.Equals(_projectorType, "gemma4uv", StringComparison.Ordinal);
+            _imageMean = gguf.GetFloatArray("clip.vision.image_mean");
+            _imageStd = gguf.GetFloatArray("clip.vision.image_std");
+
+            Console.WriteLine($"Vision encoder: type={_projectorType}, hidden={_hiddenSize}, " +
+                $"intermediate={_intermediateSize}, heads={_numHeads}, blocks={_blockCount}, " +
+                $"projDim={_projectionDim}, patch={_patchSize}, nMerge={_nMerge}" +
+                (_isUnified ? $", unifiedPatch={_patchSize * _nMerge}" : string.Empty));
 
             LoadWeights(gguf);
             gguf.Dispose();
@@ -146,6 +179,9 @@ namespace TensorSharp.Models
 
         public unsafe Tensor Encode(float[] pixelValues, int imgWidth, int imgHeight)
         {
+            if (_isUnified)
+                return EncodeUnified(pixelValues, imgWidth, imgHeight);
+
             int patchesX = imgWidth / _patchSize;
             int patchesY = imgHeight / _patchSize;
             int numPatches = patchesX * patchesY;
@@ -175,6 +211,122 @@ namespace TensorSharp.Models
             hidden.Dispose();
 
             return projected;
+        }
+
+        /// <summary>
+        /// Encode path for the Gemma 4 "unified" vision embedder (projector_type
+        /// "gemma4uv", used by Gemma-4-12B). Mirrors llama.cpp's
+        /// clip_graph_gemma4uv::build():
+        ///   im2col(patch = patch_size * n_merge) -> LayerNorm(patch_norm_1)
+        ///   -> patch_embd matmul + bias -> LayerNorm(patch_norm_2)
+        ///   -> + 2D learned position embeddings -> LayerNorm(patch_norm_3 / pos_norm)
+        ///   -> unweighted RMSNorm -> linear projection to the text embedding dim.
+        /// There are no transformer blocks (clip.vision.block_count == 0).
+        /// </summary>
+        private unsafe Tensor EncodeUnified(float[] pixelValues, int imgWidth, int imgHeight)
+        {
+            // The unified variant folds the n_merge "token merging" directly into
+            // a larger conv patch, so the effective patch is patch_size * n_merge
+            // (e.g. 16 * 3 = 48) and there is no separate pooling step.
+            int P = _patchSize * _nMerge;
+            const int C = 3;
+            int patchDim = P * P * C;          // e.g. 48 * 48 * 3 = 6912
+            int patchesX = imgWidth / P;
+            int patchesY = imgHeight / P;
+            int numPatches = patchesX * patchesY;
+
+            // 1. im2col: each patch becomes a flat row ordered [c][ky][kx] to match
+            //    the converted v.patch_embd.weight layout (same ordering as the
+            //    SigLIP PatchEmbed above).
+            var cols = new Tensor(_allocator, DType.Float32, numPatches, patchDim);
+            float* colsPtr = GetFloatPtr(cols);
+            for (int py = 0; py < patchesY; py++)
+            {
+                for (int px = 0; px < patchesX; px++)
+                {
+                    int patchIdx = py * patchesX + px;
+                    float* row = colsPtr + (long)patchIdx * patchDim;
+                    for (int c = 0; c < C; c++)
+                    {
+                        for (int ky = 0; ky < P; ky++)
+                        {
+                            int imgY = py * P + ky;
+                            for (int kx = 0; kx < P; kx++)
+                            {
+                                int imgX = px * P + kx;
+                                row[c * P * P + ky * P + kx] =
+                                    pixelValues[c * imgHeight * imgWidth + imgY * imgWidth + imgX];
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. patch_norm_1: pytorch LayerNorm over the patch vector.
+            Ops.LayerNorm(cols, cols, _weights["v.patch_norm.1.weight"],
+                _weights["v.patch_norm.1.bias"], UnifiedLayerNormEps);
+
+            // 3. patch embedding (linear) + bias -> [numPatches, hiddenSize].
+            var hidden = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+            Ops.Addmm(hidden, 0, hidden, 1f, cols, GetOrCreateTransposedWeight("v.patch_embd.weight"));
+            cols.Dispose();
+            AddBiasInPlace(hidden, _weights["v.patch_embd.bias"], numPatches, _hiddenSize);
+
+            // 4. patch_norm_2: LayerNorm over the embedding dim.
+            Ops.LayerNorm(hidden, hidden, _weights["v.patch_norm.2.weight"],
+                _weights["v.patch_norm.2.bias"], UnifiedLayerNormEps);
+
+            // 5. add learned 2D (x, y) position embeddings.
+            AddUnifiedPositionEmbedding(hidden, patchesX, numPatches);
+
+            // 6. patch_norm_3 (pos_norm): LayerNorm over the embedding dim.
+            Ops.LayerNorm(hidden, hidden, _weights["v.patch_norm.3.weight"],
+                _weights["v.patch_norm.3.bias"], UnifiedLayerNormEps);
+
+            // 7. embedding_pre_projection_norm: unweighted RMSNorm (eps = hparams.eps).
+            ApplyUnweightedRMSNorm(hidden, numPatches, _hiddenSize);
+
+            // 8. project to the text embedding dimension.
+            var projected = LinearProjection(hidden, "mm.input_projection.weight");
+            hidden.Dispose();
+
+            return projected;
+        }
+
+        private unsafe void AddBiasInPlace(Tensor t, Tensor bias, int rows, int cols)
+        {
+            float* p = GetFloatPtr(t);
+            float* b = GetFloatPtr(bias);
+            for (int r = 0; r < rows; r++)
+            {
+                float* row = p + (long)r * cols;
+                for (int d = 0; d < cols; d++)
+                    row[d] += b[d];
+            }
+        }
+
+        private unsafe void AddUnifiedPositionEmbedding(Tensor hidden, int patchesX, int numPatches)
+        {
+            // v.position_embd.weight is stored as two stacked lookup tables
+            // (x then y), each [maxPos, hiddenSize]; pos_x = patch % cols,
+            // pos_y = patch / cols.
+            var posEmbd = _weights["v.position_embd.weight"];
+            int maxPos = (int)posEmbd.Sizes[1];
+            float* posPtr = GetFloatPtr(posEmbd);
+            float* xTable = posPtr;
+            float* yTable = posPtr + (long)maxPos * _hiddenSize;
+            float* dstPtr = GetFloatPtr(hidden);
+
+            for (int p = 0; p < numPatches; p++)
+            {
+                int x = p % patchesX;
+                int y = p / patchesX;
+                float* dstRow = dstPtr + (long)p * _hiddenSize;
+                float* xRow = xTable + (long)x * _hiddenSize;
+                float* yRow = yTable + (long)y * _hiddenSize;
+                for (int d = 0; d < _hiddenSize; d++)
+                    dstRow[d] += xRow[d] + yRow[d];
+            }
         }
 
         private unsafe Tensor PatchEmbed(float[] pixelValues, int imgW, int imgH, int patchesX, int patchesY)

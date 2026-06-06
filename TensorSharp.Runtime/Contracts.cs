@@ -51,6 +51,30 @@ namespace TensorSharp.Runtime
         bool SupportsKVStateSnapshot => false;
 
         /// <summary>
+        /// Whether K/V state captured by one sequence can be safely re-injected into a
+        /// DIFFERENT sequence's freshly-reset cache. This drives two reuse paths:
+        /// cross-request prefix-cache adoption and the executor's ownership swap.
+        /// It is distinct from <see cref="SupportsKVStateSnapshot"/> (which only gates
+        /// whether the paged engine can run at all): a model may snapshot fine for its
+        /// own continuous decode yet be unable to faithfully restore a snapshot into a
+        /// fresh cache. Gemma 4's sliding-window / circular cache is exactly that case —
+        /// the byte-level restore does not reproduce a fresh prefill, so reusing it
+        /// produces corrupted output. Such models return false to force a correct
+        /// re-prefill. Defaults to <see cref="SupportsKVStateSnapshot"/>.
+        /// </summary>
+        bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot;
+
+        /// <summary>
+        /// Maximum number of leading prompt tokens whose K/V snapshot can be faithfully
+        /// re-injected into a different (or re-admitted) sequence. Full-attention models
+        /// can reuse an unbounded prefix. Sliding-window / circular-cache models (Gemma 4)
+        /// can only reliably restore the last window's worth of positions, so they cap
+        /// this at the window size; the engine reuses up to the cap and re-prefills the
+        /// rest. Defaults to unbounded.
+        /// </summary>
+        int MaxReusablePrefixTokens => int.MaxValue;
+
+        /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count, head
         /// counts, head dim, KV dtype) tuple. Snapshots are only safe to restore into
         /// a model whose fingerprint matches the one in effect when they were captured.

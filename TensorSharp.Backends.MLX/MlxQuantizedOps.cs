@@ -494,12 +494,12 @@ namespace TensorSharp.MLX
 
             DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             return MlxWorker.Shared.Invoke(() => RunAddmmQuantizedToFloat32(
-                result, input, weight, ggmlType, ne0, ne1, resultStorage, inputStorage, rows));
+                result, input, weight, ggmlType, ne0, ne1, inputStorage, rows));
         }
 
         private static bool RunAddmmQuantizedToFloat32(
             Tensor result, Tensor input, DeviceWeight weight, int ggmlType,
-            long ne0, long ne1, MlxStorage resultStorage, MlxStorage inputStorage, int rows)
+            long ne0, long ne1, MlxStorage inputStorage, int rows)
         {
             MlxNative.MlxArray inputView = default;
             MlxNative.MlxArray output = default;
@@ -711,7 +711,7 @@ namespace TensorSharp.MLX
 
                     normed = MlxNative.FastRmsNorm(inputView, normView, eps);
                     output = RunMatmul(normed, weight, ggmlType, rows, (int)ne0, (int)ne1);
-                    if (MatmulOutputNeedsContiguous(weight, ggmlType))
+                    if (MatmulOutputNeedsContiguous())
                     {
                         contiguous = MlxNative.Contiguous(output);
                         SetDeviceResult(result, contiguous);
@@ -1270,7 +1270,7 @@ namespace TensorSharp.MLX
                 weight.Mode);
         }
 
-        private static bool MatmulOutputNeedsContiguous(DeviceWeight weight, int ggmlType)
+        private static bool MatmulOutputNeedsContiguous()
         {
             // mlx_quantized_matmul produces a row-major contiguous output for
             // the standard 2D matmul case (input is [rows, inDim], weight is

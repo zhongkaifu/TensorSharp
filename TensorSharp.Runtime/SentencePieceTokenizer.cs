@@ -25,7 +25,6 @@ namespace TensorSharp.Runtime
         private const string SpaceReplacement = "▁";
 
         private readonly string[] _vocab;
-        private readonly int[] _tokenTypes;
         private readonly float[] _scores;
         private readonly Dictionary<string, int> _vocabLookup;
         private readonly int _bosTokenId;
@@ -43,7 +42,6 @@ namespace TensorSharp.Runtime
             int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos)
         {
             _vocab = vocab;
-            _tokenTypes = tokenTypes;
             _scores = scores;
             _bosTokenId = bosTokenId;
             _eosTokenIds = eosTokenIds;

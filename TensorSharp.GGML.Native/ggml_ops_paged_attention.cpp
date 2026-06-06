@@ -624,11 +624,19 @@ namespace
         ggml_cgraph* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, result);
 
-        // Try zero-copy bind for Q. The host pointer comes from a tensor
-        // storage allocated by GgmlAllocator on Metal; that memory is
-        // already a host-mapped MTLBuffer, so ggml_backend_dev_buffer_from_host_ptr
-        // returns a thin wrapper. Falls through to upload if the device
-        // refuses host-ptr buffers (e.g., on CUDA without UVA).
+        // Try zero-copy bind for Q/OUT on Metal only. The host pointer comes
+        // from storage allocated by GgmlAllocator; on Metal that memory can be
+        // wrapped as a host-mapped MTLBuffer, so
+        // ggml_backend_dev_buffer_from_host_ptr returns a thin wrapper.
+        //
+        // CUDA's host-pointer buffer support is not the same contract as
+        // Metal unified memory here: the rest of TensorSharp's GGML/CUDA ops
+        // use device-local cached copies plus explicit upload/download for
+        // activations. If this paged-attention path binds Q/OUT as host-ptr
+        // buffers on CUDA, it can read stale activation bytes or leave output
+        // outside the device-copy cache, which corrupts Gemma 4 batched
+        // attention. Non-Metal backends deliberately fall through to the
+        // explicit upload/download path below.
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
 
         // Zero-copy bind for Q and OUT. We can't use try_get_host_ptr_buffer
@@ -656,6 +664,7 @@ namespace
 
         auto get_or_make_host_ptr_buffer = [&](void* host_ptr, std::size_t bytes) -> ggml_backend_buffer_t {
             if (host_ptr == nullptr || bytes == 0 || dev == nullptr) return nullptr;
+            if (g_backend_type != BACKEND_TYPE_METAL) return nullptr;
             const std::size_t alignment = get_host_ptr_alignment(g_backend, dev);
             if (!is_pointer_aligned(host_ptr, alignment)) return nullptr;
             ggml_backend_dev_props props;

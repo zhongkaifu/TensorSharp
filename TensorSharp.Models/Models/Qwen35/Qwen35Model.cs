@@ -331,7 +331,6 @@ namespace TensorSharp.Models
             !string.Equals(Environment.GetEnvironmentVariable("QWEN35_DISABLE_FUSED_FFN"), "1", StringComparison.Ordinal);
         private long _decodeAttnBlockTicks;
         private long _decodeRecBlockTicks;
-        private long _decodeFinalLmHeadTicks;
         private long _decodeForwardCount;
         private long _prefillEmbedTicks;
         private long _prefillAttnBlockTicks;

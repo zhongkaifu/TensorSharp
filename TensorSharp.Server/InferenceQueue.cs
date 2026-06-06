@@ -39,7 +39,7 @@ namespace TensorSharp.Server
             // We still hand out a ticket so callers can dispose it for
             // backwards-compatible counting.
             Interlocked.Increment(ref _totalProcessed);
-            return new QueueTicket(this, ct, requestId);
+            return new QueueTicket(ct, requestId);
         }
 
         public QueueStatus GetStatus()
@@ -73,7 +73,6 @@ namespace TensorSharp.Server
     /// </summary>
     public class QueueTicket : IDisposable
     {
-        private readonly InferenceQueue _queue;
         private readonly CancellationTokenRegistration _ctReg;
         private bool _disposed;
 
@@ -83,9 +82,8 @@ namespace TensorSharp.Server
         public bool IsCancelled => false;
         internal System.Collections.Generic.LinkedListNode<QueueTicket> Node { get; set; }
 
-        internal QueueTicket(InferenceQueue queue, CancellationToken ct, string requestId)
+        internal QueueTicket(CancellationToken ct, string requestId)
         {
-            _queue = queue;
             RequestId = requestId;
             _ctReg = ct.Register(() => { });
         }

@@ -73,7 +73,7 @@ public static class ModelDiscovery
                 {
                     continue;
                 }
-                string? mmproj = FindMmproj(modelDir, name, guess.Family);
+                string? mmproj = FindMmproj(modelDir, guess.Family);
                 byId[id] = new ModelSpec(
                     Id: id,
                     Family: guess.Family,
@@ -109,7 +109,7 @@ public static class ModelDiscovery
         return fileName.Contains("mmproj", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? FindMmproj(string modelDir, string ggufFileName, string family)
+    private static string? FindMmproj(string modelDir, string family)
     {
         // Prefer a same-family mmproj. Family substrings are tested in priority order.
         string[] needles = family.ToLowerInvariant() switch

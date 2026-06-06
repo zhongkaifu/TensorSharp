@@ -1,5 +1,13 @@
 <Project>
   <PropertyGroup>
+    <TensorSharpHostIntermediateName Condition="'$(TensorSharpHostIntermediateName)' == '' And $([MSBuild]::IsOSPlatform('Windows'))">windows</TensorSharpHostIntermediateName>
+    <TensorSharpHostIntermediateName Condition="'$(TensorSharpHostIntermediateName)' == '' And $([MSBuild]::IsOSPlatform('Linux'))">linux</TensorSharpHostIntermediateName>
+    <TensorSharpHostIntermediateName Condition="'$(TensorSharpHostIntermediateName)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">osx</TensorSharpHostIntermediateName>
+    <TensorSharpHostIntermediateName Condition="'$(TensorSharpHostIntermediateName)' == ''">host</TensorSharpHostIntermediateName>
+    <TensorSharpUseHostIntermediateOutput Condition="'$(TensorSharpUseHostIntermediateOutput)' == ''">true</TensorSharpUseHostIntermediateOutput>
+    <BaseIntermediateOutputPath Condition="'$(TensorSharpUseHostIntermediateOutput)' == 'true' And '$(BaseIntermediateOutputPath)' == ''">obj\$(TensorSharpHostIntermediateName)\</BaseIntermediateOutputPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;obj/**</DefaultItemExcludes>
+
     <TensorSharpVersion>2.8.6</TensorSharpVersion>
     <TensorSharpPackageTags>tensorsharp;tensor;llm;gguf;inference</TensorSharpPackageTags>
 

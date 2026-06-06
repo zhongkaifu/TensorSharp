@@ -46,14 +46,6 @@ namespace TensorSharp.Cpu.LinearAlgebra
         ///</param>
         public void Run(string SRNAME, int INFO)
         {
-
-            #region Strings
-
-            SRNAME = SRNAME.Substring(0, 6);
-
-            #endregion
-
-
             #region Prolog
 
             // *

@@ -658,7 +658,7 @@ namespace TensorSharp.Runtime
             string path, int depth, List<string> errors, out JsonNode? normalized)
         {
             normalized = null;
-            bool arrayLike = schema.TryGetProperty("items", out var itemsEl)
+            bool arrayLike = schema.TryGetProperty("items", out _)
                 || (schema.TryGetProperty("type", out var typeEl) &&
                     ((typeEl.ValueKind == JsonValueKind.String && typeEl.GetString() == "array") ||
                      (typeEl.ValueKind == JsonValueKind.Array && ArrayContainsType(typeEl, "array"))));
@@ -671,7 +671,7 @@ namespace TensorSharp.Runtime
                 return false;
             }
 
-            if (!schema.TryGetProperty("items", out itemsEl))
+            if (!schema.TryGetProperty("items", out var itemsEl))
             {
                 normalized = JsonNode.Parse(value.GetRawText());
                 return true;
@@ -914,7 +914,6 @@ namespace TensorSharp.Runtime
 
         private static bool TryExtractJsonObject(string rawOutput, [NotNullWhen(true)] out string? json, [NotNullWhen(false)] out string? error)
         {
-            json = null;
             error = null;
 
             string trimmed = rawOutput.Trim();
