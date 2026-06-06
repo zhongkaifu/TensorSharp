@@ -15,10 +15,29 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
-$GgmlDir = Join-Path $RepoRoot "ExternalProjects/ggml"
+$ExternalProjectsDir = Join-Path $RepoRoot "ExternalProjects"
+$GgmlDir = Join-Path $ExternalProjectsDir "ggml"
 
 $GitUrl = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_URL)) { "https://github.com/ggml-org/ggml.git" } else { $env:TENSORSHARP_GGML_GIT_URL }
 $GitRef = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_REF)) { "master" } else { $env:TENSORSHARP_GGML_GIT_REF }
+
+New-Item -ItemType Directory -Force -Path $ExternalProjectsDir | Out-Null
+$Sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $HashBytes = $Sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($RepoRoot.ToLowerInvariant()))
+}
+finally {
+    $Sha256.Dispose()
+}
+$HashText = -join ($HashBytes[0..7] | ForEach-Object { $_.ToString("x2") })
+$FetchMutex = [System.Threading.Mutex]::new($false, "TensorSharpGgmlFetch_$HashText")
+$HasFetchMutex = $false
+
+try {
+    $HasFetchMutex = $FetchMutex.WaitOne([TimeSpan]::FromMinutes(10))
+    if (-not $HasFetchMutex) {
+        throw "Timed out waiting for ggml fetch lock."
+    }
 
 function Test-Truthy([string] $Value) {
     return $Value -match '^(1|ON|on|On|TRUE|true|True|YES|yes|Yes)$'
@@ -66,3 +85,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 $sha = (git -C $GgmlDir rev-parse --short HEAD).Trim()
 Write-Host "ggml: cloned at $sha"
+}
+finally {
+    if ($HasFetchMutex) {
+        $FetchMutex.ReleaseMutex()
+    }
+    $FetchMutex.Dispose()
+}

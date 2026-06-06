@@ -16,11 +16,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+EXTERNAL_PROJECTS_DIR="${REPO_ROOT}/ExternalProjects"
 GGML_DIR="${REPO_ROOT}/ExternalProjects/ggml"
+LOCK_FILE="${EXTERNAL_PROJECTS_DIR}/.ggml-fetch.lock"
 
 GIT_URL="${TENSORSHARP_GGML_GIT_URL:-https://github.com/ggml-org/ggml.git}"
 GIT_REF="${TENSORSHARP_GGML_GIT_REF:-master}"
 NO_UPDATE_RAW="${TENSORSHARP_GGML_NO_UPDATE:-}"
+
+mkdir -p "${EXTERNAL_PROJECTS_DIR}"
+
+# Solution builds can invoke this from multiple projects at once.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${LOCK_FILE}"
+    flock 9
+else
+    LOCK_DIR="${LOCK_FILE}.d"
+    until mkdir "${LOCK_DIR}" 2>/dev/null; do
+        sleep 1
+    done
+    trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+fi
 
 is_truthy() {
     case "${1:-}" in
