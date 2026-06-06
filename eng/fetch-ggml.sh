@@ -26,6 +26,13 @@ GIT_REF="${TENSORSHARP_GGML_GIT_REF:-master}"
 UPDATE_RAW="${TENSORSHARP_GGML_UPDATE:-}"
 NO_UPDATE_RAW="${TENSORSHARP_GGML_NO_UPDATE:-}"
 
+git_ggml() {
+    # Repositories under /mnt/c can trip Git's ownership guard when Windows and
+    # WSL touch the same checkout. Keep the trust scoped to this invocation and
+    # keep generated dependency sources stable across Windows/WSL builds.
+    git -c "safe.directory=${GGML_DIR}" -c core.autocrlf=false -c core.eol=lf "$@"
+}
+
 is_truthy() {
     case "${1:-}" in
         1|ON|on|On|TRUE|true|True|YES|yes|Yes) return 0 ;;
@@ -49,10 +56,10 @@ if [[ -d "${GGML_DIR}/.git" ]]; then
     else
         echo "ggml: existing checkout is missing src/ggml-common.h; fetching ${GIT_REF} (${GIT_URL})"
     fi
-    git -C "${GGML_DIR}" remote set-url origin "${GIT_URL}" 2>/dev/null || true
-    if git -C "${GGML_DIR}" fetch --depth 1 origin "${GIT_REF}" 2>/dev/null; then
-        if git -C "${GGML_DIR}" reset --hard FETCH_HEAD; then
-            git -C "${GGML_DIR}" rev-parse --short HEAD | sed 's/^/ggml: now at /'
+    git_ggml -C "${GGML_DIR}" remote set-url origin "${GIT_URL}" 2>/dev/null || true
+    if git_ggml -C "${GGML_DIR}" fetch --depth 1 origin "${GIT_REF}"; then
+        if git_ggml -C "${GGML_DIR}" reset --hard FETCH_HEAD; then
+            git_ggml -C "${GGML_DIR}" rev-parse --short HEAD | sed 's/^/ggml: now at /'
         elif [[ -f "${GGML_REQUIRED_HEADER}" ]]; then
             echo "ggml: WARNING - fetched ${GIT_REF}, but could not reset checkout; using existing sources" >&2
         else
@@ -82,15 +89,26 @@ if [[ -e "${GGML_DIR}" ]]; then
 fi
 
 echo "ggml: cloning ${GIT_URL} (${GIT_REF}) into ${GGML_DIR}"
-if git clone --depth 1 --branch "${GIT_REF}" "${GIT_URL}" "${GGML_DIR}" 2>/dev/null; then
+clone_error=""
+if clone_error="$(git_ggml clone --depth 1 --branch "${GIT_REF}" "${GIT_URL}" "${GGML_DIR}" 2>&1)"; then
     :
 else
     # --branch only accepts a branch or tag; fall back to fetching an explicit
     # commit ref shallowly.
     rm -rf "${GGML_DIR}"
-    git init -q "${GGML_DIR}"
-    git -C "${GGML_DIR}" remote add origin "${GIT_URL}"
-    git -C "${GGML_DIR}" fetch --depth 1 origin "${GIT_REF}"
-    git -C "${GGML_DIR}" checkout -q FETCH_HEAD
+    git_ggml init -q "${GGML_DIR}"
+    git_ggml -C "${GGML_DIR}" remote add origin "${GIT_URL}"
+    if ! git_ggml -C "${GGML_DIR}" fetch --depth 1 origin "${GIT_REF}"; then
+        echo "ggml: ERROR - could not clone ${GIT_REF} from ${GIT_URL}" >&2
+        if [[ -n "${clone_error}" ]]; then
+            echo "${clone_error}" >&2
+        fi
+        exit 128
+    fi
+    git_ggml -C "${GGML_DIR}" checkout -q FETCH_HEAD
 fi
-git -C "${GGML_DIR}" rev-parse --short HEAD | sed 's/^/ggml: cloned at /'
+if [[ ! -f "${GGML_REQUIRED_HEADER}" ]]; then
+    echo "ggml: ERROR - fetched ${GIT_REF}, but ${GGML_REQUIRED_HEADER} is missing" >&2
+    exit 128
+fi
+git_ggml -C "${GGML_DIR}" rev-parse --short HEAD | sed 's/^/ggml: cloned at /'

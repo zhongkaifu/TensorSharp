@@ -145,11 +145,11 @@ while (($# > 0)); do
 done
 
 ENABLE_CUDA="$(normalize_bool "${ENABLE_CUDA}")"
-if [[ -z "${ENABLE_CUDA}" ]]; then
-    ENABLE_CUDA="$(read_cached_cuda_setting)"
-fi
 if [[ -z "${ENABLE_CUDA}" ]] && has_cuda_toolkit; then
     ENABLE_CUDA="ON"
+fi
+if [[ -z "${ENABLE_CUDA}" ]]; then
+    ENABLE_CUDA="$(read_cached_cuda_setting)"
 fi
 if [[ -z "${ENABLE_CUDA}" ]]; then
     ENABLE_CUDA="OFF"

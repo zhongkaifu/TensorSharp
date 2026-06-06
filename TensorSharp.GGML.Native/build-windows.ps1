@@ -190,10 +190,12 @@ for ($i = 0; $i -lt $RemainingArgs.Length; $i++) {
 
 $EnableCuda = Normalize-Bool $EnableCuda
 if ([string]::IsNullOrWhiteSpace($EnableCuda)) {
-    $EnableCuda = Read-CachedCudaSetting
-}
-if ([string]::IsNullOrWhiteSpace($EnableCuda) -and (Test-CudaToolkit)) {
-    $EnableCuda = "ON"
+    if (Test-CudaToolkit) {
+        $EnableCuda = "ON"
+    }
+    else {
+        $EnableCuda = Read-CachedCudaSetting
+    }
 }
 if ([string]::IsNullOrWhiteSpace($EnableCuda)) {
     $EnableCuda = "OFF"

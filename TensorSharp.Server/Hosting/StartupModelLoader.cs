@@ -45,7 +45,7 @@ namespace TensorSharp.Server.Hosting
                 return;
             }
 
-            if (!BackendSelector.TryResolveSupportedBackend(options, configuredBackendInput, out string startupBackend, out string startupBackendError))
+            if (!TryResolveStartupBackend(options, out string startupBackend, out string startupBackendError))
                 throw new InvalidOperationException(startupBackendError);
 
             if (!File.Exists(options.StartupModelPath))
@@ -71,6 +71,13 @@ namespace TensorSharp.Server.Hosting
                 logger.LogInformation(LogEventIds.HostConfiguration,
                     "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
             }
+        }
+
+        internal static bool TryResolveStartupBackend(ServerHostingOptions options, out string resolvedBackend, out string error)
+        {
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
+            return BackendSelector.TryResolveSupportedBackend(options, null, out resolvedBackend, out error);
         }
     }
 }

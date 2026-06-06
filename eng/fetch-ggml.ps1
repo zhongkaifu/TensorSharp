@@ -23,6 +23,13 @@ $GgmlRequiredHeader = Join-Path $GgmlDir "src\ggml-common.h"
 $GitUrl = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_URL)) { "https://github.com/ggml-org/ggml.git" } else { $env:TENSORSHARP_GGML_GIT_URL }
 $GitRef = if ([string]::IsNullOrWhiteSpace($env:TENSORSHARP_GGML_GIT_REF)) { "master" } else { $env:TENSORSHARP_GGML_GIT_REF }
 
+function Invoke-GgmlGit {
+    # Repositories under /mnt/c can trip Git's ownership guard when Windows and
+    # WSL touch the same checkout. Keep the trust scoped to this invocation and
+    # keep generated dependency sources stable across Windows/WSL builds.
+    & git -c "safe.directory=$GgmlDir" -c core.autocrlf=false -c core.eol=lf @args
+}
+
 function Test-Truthy([string] $Value) {
     return $Value -match '^(1|ON|on|On|TRUE|true|True|YES|yes|Yes)$'
 }
@@ -45,10 +52,10 @@ if (Test-Path (Join-Path $GgmlDir ".git")) {
         Write-Host "ggml: existing checkout is missing src/ggml-common.h; fetching $GitRef ($GitUrl)"
     }
 
-    git -C $GgmlDir remote set-url origin $GitUrl 2>$null
-    git -C $GgmlDir fetch --depth 1 origin $GitRef 2>$null
+    Invoke-GgmlGit -C $GgmlDir remote set-url origin $GitUrl 2>$null
+    Invoke-GgmlGit -C $GgmlDir fetch --depth 1 origin $GitRef
     if ($LASTEXITCODE -eq 0) {
-        git -C $GgmlDir reset --hard FETCH_HEAD
+        Invoke-GgmlGit -C $GgmlDir reset --hard FETCH_HEAD
         if ($LASTEXITCODE -ne 0) {
             if (Test-Path $GgmlRequiredHeader) {
                 Write-Warning "ggml: fetched $GitRef, but could not reset checkout; using existing sources"
@@ -57,7 +64,7 @@ if (Test-Path (Join-Path $GgmlDir ".git")) {
 
             throw "git reset failed and no usable ggml sources exist at $GgmlDir"
         }
-        $sha = (git -C $GgmlDir rev-parse --short HEAD).Trim()
+        $sha = (Invoke-GgmlGit -C $GgmlDir rev-parse --short HEAD).Trim()
         Write-Host "ggml: now at $sha"
     }
     else {
@@ -82,18 +89,26 @@ if (Test-Path $GgmlDir) {
 }
 
 Write-Host "ggml: cloning $GitUrl ($GitRef) into $GgmlDir"
-git clone --depth 1 --branch $GitRef $GitUrl $GgmlDir 2>$null
+$cloneOutput = Invoke-GgmlGit clone --depth 1 --branch $GitRef $GitUrl $GgmlDir 2>&1
 if ($LASTEXITCODE -ne 0) {
     # --branch only accepts a branch or tag; fall back to fetching an explicit
     # commit ref shallowly.
     if (Test-Path $GgmlDir) { Remove-Item -Recurse -Force $GgmlDir }
-    git init -q $GgmlDir
+    Invoke-GgmlGit init -q $GgmlDir
     if ($LASTEXITCODE -ne 0) { throw "git init failed" }
-    git -C $GgmlDir remote add origin $GitUrl
-    git -C $GgmlDir fetch --depth 1 origin $GitRef
-    if ($LASTEXITCODE -ne 0) { throw "git fetch '$GitRef' failed" }
-    git -C $GgmlDir checkout -q FETCH_HEAD
+    Invoke-GgmlGit -C $GgmlDir remote add origin $GitUrl
+    Invoke-GgmlGit -C $GgmlDir fetch --depth 1 origin $GitRef
+    if ($LASTEXITCODE -ne 0) {
+        if ($cloneOutput) {
+            $cloneOutput | ForEach-Object { Write-Error $_ }
+        }
+        throw "git fetch '$GitRef' failed"
+    }
+    Invoke-GgmlGit -C $GgmlDir checkout -q FETCH_HEAD
     if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
 }
-$sha = (git -C $GgmlDir rev-parse --short HEAD).Trim()
+if (-not (Test-Path $GgmlRequiredHeader)) {
+    throw "fetched $GitRef, but $GgmlRequiredHeader is missing"
+}
+$sha = (Invoke-GgmlGit -C $GgmlDir rev-parse --short HEAD).Trim()
 Write-Host "ggml: cloned at $sha"
