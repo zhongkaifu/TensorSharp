@@ -239,7 +239,6 @@ public class BatchedExecutorTests
     {
         private readonly string _fp;
         private readonly int _peak;
-        private byte[] _state = Array.Empty<byte>();
         private int _cacheSeqLen;
 
         public int NumBatchCalls { get; private set; }

@@ -501,7 +501,7 @@ namespace TensorSharp.Models
 
         private Tensor LinearForward(Tensor input, string weightName, string biasName, int outDim)
         {
-            if (!_weights.TryGetValue(weightName, out var weight))
+            if (!_weights.TryGetValue(weightName, out _))
                 return null;
 
             int seqLen = (int)input.Sizes[0];

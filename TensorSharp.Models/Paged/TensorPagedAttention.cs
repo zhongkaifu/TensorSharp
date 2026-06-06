@@ -89,11 +89,11 @@ namespace TensorSharp.Models.Paged
                 using var vTensorFlat = MakeTensor(allocator, vFlat, 0, vFlat.Length, seqLen, kvDim);
 
                 // Reshape Q to head-first: [numHeads, numQ, headDim].
-                Tensor qHeads = ReshapeToHeadFirst(allocator, qTensorFlat, numHeads, numQ, headDim);
+                Tensor qHeads = ReshapeToHeadFirst(qTensorFlat, numHeads, numQ, headDim);
 
                 // Reshape K, V to head-first: [numKvHeads, seqLen, headDim].
-                Tensor kHeads = ReshapeToHeadFirst(allocator, kTensorFlat, numKvHeads, seqLen, headDim);
-                Tensor vHeads = ReshapeToHeadFirst(allocator, vTensorFlat, numKvHeads, seqLen, headDim);
+                Tensor kHeads = ReshapeToHeadFirst(kTensorFlat, numKvHeads, seqLen, headDim);
+                Tensor vHeads = ReshapeToHeadFirst(vTensorFlat, numKvHeads, seqLen, headDim);
 
                 // Expand KV heads for grouped-query attention (a no-op when
                 // numHeads == numKvHeads).
@@ -207,7 +207,7 @@ namespace TensorSharp.Models.Paged
         /// <summary>Reshape a [length, numHeads * headDim] flat tensor to a
         /// [numHeads, length, headDim] head-first tensor via View + Transpose
         /// + Contiguous.</summary>
-        private static Tensor ReshapeToHeadFirst(IAllocator allocator, Tensor flat, int numHeads, int length, int headDim)
+        private static Tensor ReshapeToHeadFirst(Tensor flat, int numHeads, int length, int headDim)
         {
             using var view = flat.View(length, numHeads, headDim);
             using var transposed = view.Transpose(0, 1);

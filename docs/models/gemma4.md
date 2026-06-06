@@ -252,9 +252,10 @@ Identical to Gemma 3: `tanh(logits / cap) * cap` when
 
 `Gemma4VisionEncoder` is a SigLIP-style ViT with 2D position embeddings,
 GELU-Tanh MLP, and a final linear projector to the LM hidden dim. Video frames
-are extracted from MP4 inputs (default up to 8 frames at 1 fps via OpenCV /
-SkiaSharp) and each frame is encoded independently; the resulting embeddings
-are concatenated and injected at successive `<|image>` markers.
+are extracted from MP4 inputs using time-based sampling (one frame per second by
+default via OpenCV, configurable with `VIDEO_SAMPLE_FPS`; `VIDEO_MAX_FRAMES` adds
+an optional upper bound) and each frame is encoded independently; the resulting
+embeddings are concatenated and injected at successive `<|image>` markers.
 
 ### 4.10 Audio pipeline
 

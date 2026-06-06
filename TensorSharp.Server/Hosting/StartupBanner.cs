@@ -55,10 +55,11 @@ namespace TensorSharp.Server.Hosting
             }
 
             logger.LogInformation(LogEventIds.HostConfiguration,
-                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultWebMaxTokens={DefaultWebMaxTokens} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
+                "Server configuration: hostedModel={HostedModel} hostedMmProj={HostedMmProj} defaultWebMaxTokens={DefaultWebMaxTokens} videoSampleFps={VideoSampleFps} videoMaxFrames={VideoMaxFrames} listen={ListenAddress}",
                 options.StartupModelPath ?? "(none)",
                 options.StartupMmProjPath ?? "(none)",
                 options.DefaultWebMaxTokens,
+                MediaHelper.GetConfiguredVideoSampleFps().ToString("0.###", CultureInfo.InvariantCulture),
                 MediaHelper.GetConfiguredMaxVideoFrames(),
                 listenAddress);
 

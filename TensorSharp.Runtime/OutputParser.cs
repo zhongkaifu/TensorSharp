@@ -594,7 +594,6 @@ namespace TensorSharp.Runtime
         private HState _state;
         private readonly StringBuilder _buffer = new();
         private readonly StringBuilder _toolArgs = new();
-        private bool _thinkingEnabled;
         private string? _currentChannel;
         private string? _currentRecipient;
         private int _callIndex;
@@ -620,7 +619,6 @@ namespace TensorSharp.Runtime
         {
             _buffer.Clear();
             _toolArgs.Clear();
-            _thinkingEnabled = enableThinking;
             _state = HState.LookingForStart;
             _currentChannel = null;
             _currentRecipient = null;

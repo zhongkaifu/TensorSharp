@@ -43,6 +43,19 @@ namespace TensorSharp.Runtime.Scheduling
         // starve other scheduled sequences on the serial per-seq path.
         private int _ownerForwardedTokens;
 
+        // ---- Live-cache continuation tracking (see ComputeLiveContinuationLcp) ----
+        // The exact sequence whose tokens [0, _liveCacheLen) are currently resident
+        // in the model's live KV cache, and whether that state is still trustworthy.
+        // Set after every per-sequence forward; invalidated whenever the model's KV
+        // cache is reset / rebuilt for a different sequence (or the batched path
+        // takes over). Lets a same-session follow-up turn whose prompt extends this
+        // sequence skip re-prefill entirely by continuing from the live cache —
+        // critical for sliding-window models where the pooled snapshot can only
+        // reuse one window.
+        private SequenceState _liveCacheSeq;
+        private int _liveCacheLen;
+        private bool _liveCacheValid;
+
         // Re-used scratch buffer for inject/extract. Sized to one full block.
         private byte[] _scratch;
 
@@ -321,18 +334,6 @@ namespace TensorSharp.Runtime.Scheduling
             return !string.IsNullOrEmpty(raw) && raw != "0" && raw.ToLowerInvariant() != "false";
         }
 
-        private bool HasAnyPendingMultimodal(SchedulerOutput output)
-        {
-            var injector = _model.MultimodalInjector;
-            if (injector == null) return false;
-            foreach (var work in output.ScheduledWork)
-            {
-                if (injector.HasPendingEmbeddings(work.Sequence.RequestId))
-                    return true;
-            }
-            return false;
-        }
-
         private (List<ScheduledSequenceWork> multimodal, List<ScheduledSequenceWork> text) SplitMultimodalWork(SchedulerOutput output)
         {
             var multimodal = new List<ScheduledSequenceWork>();
@@ -357,6 +358,10 @@ namespace TensorSharp.Runtime.Scheduling
 
         private List<SequenceStepResult> ExecuteStepBatched(IBatchedPagedModel batched, SchedulerOutput output)
         {
+            // The batched paged path manages K/V in paged storage (slot mapping),
+            // not the single live linear cache the continuation fast-path tracks.
+            // Drop any live-cache claim so a follow-up can't continue from stale state.
+            _liveCacheValid = false;
             int numSeqs = output.ScheduledWork.Count;
             var ctx = new BatchedForwardContext
             {
@@ -380,7 +385,6 @@ namespace TensorSharp.Runtime.Scheduling
                 var work = output.ScheduledWork[s];
                 var seq = work.Sequence;
 
-                int sampledFirst = -1;
                 int[] inputTokens;
                 if (work.IsPrefill)
                 {
@@ -388,7 +392,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 else
                 {
-                    sampledFirst = SampleFromLogits(seq);
+                    int sampledFirst = SampleFromLogits(seq);
                     seq.AppendOutputToken(sampledFirst);
                     inputTokens = new[] { sampledFirst };
                 }
@@ -512,7 +516,13 @@ namespace TensorSharp.Runtime.Scheduling
             var picked = output.ScheduledWork[0];
             if (_currentOwner != null && output.ScheduledWork.Count > 0)
             {
-                bool canSwap = _model.SupportsKVStateSnapshot;
+                // Rotating ownership to another sequence requires extracting the
+                // current owner's state and injecting the newcomer's — a cross-
+                // sequence snapshot round-trip. Models whose restore is not faithful
+                // (Gemma 4 SWA) report SupportsCrossSequenceKvReuse=false, so we never
+                // swap; concurrent sequences serialize on the owner instead of
+                // producing corrupted output.
+                bool canSwap = _model.SupportsKVStateSnapshot && _model.SupportsCrossSequenceKvReuse;
                 int quantum = Math.Max(1, _scheduler.Config.DecodeQuantumTokens);
                 bool quantumExceeded = canSwap && _ownerForwardedTokens >= quantum;
 
@@ -609,6 +619,14 @@ namespace TensorSharp.Runtime.Scheduling
                     _ownerTokensInModel += inputTokens.Length;
                     _ownerForwardedTokens += inputTokens.Length;
 
+                    // Record what the model's live KV cache now holds so a same-session
+                    // follow-up turn can continue from it without re-prefilling. Valid
+                    // until the cache is reset for a different sequence (EnsureOwnership)
+                    // or the batched path takes over.
+                    _liveCacheSeq = seq;
+                    _liveCacheLen = seq.NumComputedTokens;
+                    _liveCacheValid = true;
+
                     // Capture any newly-completed full blocks into the prefix cache.
                     int capturedFullBlocks = CaptureNewlyFullBlocks(seq);
 
@@ -645,6 +663,77 @@ namespace TensorSharp.Runtime.Scheduling
             return results;
         }
 
+        /// <summary>
+        /// Longest prompt prefix of <paramref name="seq"/> that can be served by
+        /// continuing the model's LIVE KV cache (rather than the pooled snapshot),
+        /// or 0 when live continuation doesn't apply. Returns a positive length only
+        /// when ALL of:
+        ///   - the model caps pooled prefix reuse (sliding-window / circular cache);
+        ///   - a valid live cache from a prior sequence is resident;
+        ///   - that prior sequence's entire token run is an exact prefix of this
+        ///     prompt (the linear "continue the conversation" case);
+        ///   - the reusable length exceeds what the pooled path could give (the cap);
+        ///   - at least one new suffix token remains to forward.
+        /// Invoked by the scheduler at admission. Thread-safety: the engine runs the
+        /// scheduler and executor on the same worker thread, so the live-cache fields
+        /// are not concurrently mutated here.
+        /// </summary>
+        public int ComputeLiveContinuationLcp(SequenceState seq)
+        {
+            if (seq == null || !_liveCacheValid || _liveCacheSeq == null || _liveCacheLen <= 0)
+                return 0;
+            if (!_model.SupportsKVStateSnapshot || !_model.SupportsCrossSequenceKvReuse)
+                return 0;
+
+            // Only worth it for capped models: an uncapped model already reuses the
+            // full prefix through the pool (which also caches blocks for concurrent
+            // sequences), so live continuation would add cost without benefit.
+            int cap = _model.MaxReusablePrefixTokens;
+            if (cap == int.MaxValue)
+                return 0;
+
+            int liveLen = Math.Min(_liveCacheLen, _liveCacheSeq.NumTotalTokens);
+            if (liveLen <= cap)
+                return 0; // pooled reuse already covers this prefix correctly
+            if (seq.PromptTokens.Count <= liveLen)
+                return 0; // no new suffix to forward (or prompt shorter than cache)
+
+            // Require the entire live sequence to be an exact prefix of the new
+            // prompt. This is the common multi-turn append ("请继续") case and avoids
+            // truncating the circular cache (which would reintroduce the wrap issue).
+            for (int i = 0; i < liveLen; i++)
+            {
+                if (seq.PromptTokens[i] != _liveCacheSeq.TokenAt(i))
+                    return 0;
+            }
+            return liveLen;
+        }
+
+        /// <summary>Set <paramref name="seq"/> up to continue from the model's live
+        /// KV cache for its first <paramref name="lcp"/> tokens: reserve blocks so
+        /// block-table accounting matches, mark the reused prefix as computed, and
+        /// flag the sequence so <see cref="EnsureOwnership"/> keeps the live cache
+        /// instead of reset+inject. Returns false (caller falls back to the pooled
+        /// path) if blocks can't be reserved. Invoked by the scheduler at admission.</summary>
+        public bool TryAdoptLiveCache(SequenceState seq, int lcp)
+        {
+            if (seq == null || lcp <= 0) return false;
+            if (seq.BlockTable.NumBlocks != 0) return false;
+
+            int neededBlocks = (lcp + _blockSize - 1) / _blockSize;
+            var blocks = _pool.AllocateNew(neededBlocks);
+            if (blocks == null)
+                return false; // pool pressure -> let the caller use the capped pool path
+
+            for (int i = 0; i < blocks.Length; i++)
+                seq.BlockTable.AppendBlock(blocks[i]);
+
+            seq.SetComputedTokensForPrefixAdoption(lcp);
+            seq.PrefixCacheReusedTokens = lcp;
+            seq.UsesLiveCacheContinuation = true;
+            return true;
+        }
+
         /// <summary>Ensure the model's K/V state belongs to <paramref name="seq"/>.
         /// If a different sequence is the current owner, extract its state into
         /// its blocks, reset the model, and inject this sequence's state from
@@ -658,6 +747,35 @@ namespace TensorSharp.Runtime.Scheduling
                 return;
             }
 
+            // Live-cache continuation: the new sequence's prompt extends exactly the
+            // tokens still resident in the model's live KV cache (planned by the
+            // scheduler via TryAdoptLiveCache). Keep the cache as-is and continue
+            // from the reused prefix - no reset, no pooled inject. This is the only
+            // way to reuse a prefix longer than a sliding-window model's window
+            // without the lossy circular-cache snapshot reconstruction.
+            if (seq.UsesLiveCacheContinuation)
+            {
+                if (_currentOwner == null
+                    && _liveCacheValid
+                    && seq.NumComputedTokens > 0
+                    && _liveCacheLen == seq.NumComputedTokens)
+                {
+                    _currentOwner = seq;
+                    _ownerTokensInModel = seq.NumComputedTokens;
+                    _ownerForwardedTokens = 0;
+                    return;
+                }
+
+                // The live cache was invalidated between scheduling and execution
+                // (e.g. a concurrent sequence took ownership). Drop the reused-prefix
+                // claim and re-prefill from scratch via the normal path below; the
+                // sequence keeps its reserved blocks so accounting stays consistent.
+                _logger.LogDebug(
+                    "Live-cache continuation for {RequestId} no longer valid; re-prefilling.",
+                    seq.RequestId);
+                seq.ClearLiveCacheContinuation();
+            }
+
             // Swap out the previous owner.
             if (_currentOwner != null)
             {
@@ -669,12 +787,23 @@ namespace TensorSharp.Runtime.Scheduling
                 // lost. (This path forces re-prefill on the next admission.)
             }
 
-            // Swap in the new owner.
+            // Swap in the new owner. Resetting the model cache discards whatever
+            // live state was resident, so any pending live-cache continuation that
+            // referenced it is now stale.
             _model.ResetKVCache();
+            _liveCacheValid = false;
             _ownerTokensInModel = 0;
             if (seq.NumComputedTokens > 0)
             {
-                if (!_model.SupportsKVStateSnapshot)
+                // Injecting a snapshot taken by another sequence is only valid when the
+                // model can snapshot, can restore across sequences, AND the restored
+                // prefix fits within what it can faithfully reconstruct. Gemma 4's
+                // circular SWA cache only restores the last window's worth of positions,
+                // so a snapshot longer than MaxReusablePrefixTokens (or any reuse for a
+                // model that opts out entirely) is discarded and re-prefilled cleanly.
+                if (!_model.SupportsKVStateSnapshot
+                    || !_model.SupportsCrossSequenceKvReuse
+                    || seq.NumComputedTokens > _model.MaxReusablePrefixTokens)
                 {
                     // The model can't accept injected state. We have to discard
                     // the seq's "computed" claim and rerun. Mark it for re-prefill.
@@ -837,6 +966,9 @@ namespace TensorSharp.Runtime.Scheduling
             _currentOwner = null;
             _ownerTokensInModel = 0;
             _ownerForwardedTokens = 0;
+            _liveCacheSeq = null;
+            _liveCacheLen = 0;
+            _liveCacheValid = false;
             _model.ResetKVCache();
         }
     }

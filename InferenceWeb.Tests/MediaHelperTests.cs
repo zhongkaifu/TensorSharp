@@ -33,7 +33,7 @@ public class MediaHelperTests
     }
 
     [Fact]
-    public void GetConfiguredMaxVideoFramesFallsBackToDefaultWhenUnset()
+    public void GetConfiguredMaxVideoFramesReturnsNoCapWhenUnset()
     {
         lock (EnvLock)
         {
@@ -42,7 +42,9 @@ public class MediaHelperTests
             {
                 Environment.SetEnvironmentVariable("VIDEO_MAX_FRAMES", null);
 
-                Assert.Equal(MediaHelper.DefaultVideoMaxFrames, MediaHelper.GetConfiguredMaxVideoFrames());
+                // 0 == no cap: extraction stays purely time-based by default.
+                Assert.Equal(0, MediaHelper.DefaultVideoMaxFrames);
+                Assert.Equal(0, MediaHelper.GetConfiguredMaxVideoFrames());
             }
             finally
             {
@@ -66,6 +68,66 @@ public class MediaHelperTests
             finally
             {
                 Environment.SetEnvironmentVariable("VIDEO_MAX_FRAMES", oldValue);
+            }
+        }
+    }
+
+    [Fact]
+    public void GetConfiguredVideoSampleFpsFallsBackToOneFpsWhenUnset()
+    {
+        lock (EnvLock)
+        {
+            string? oldValue = Environment.GetEnvironmentVariable("VIDEO_SAMPLE_FPS");
+            try
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", null);
+
+                Assert.Equal(1.0, MediaHelper.DefaultVideoSampleFps);
+                Assert.Equal(1.0, MediaHelper.GetConfiguredVideoSampleFps());
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", oldValue);
+            }
+        }
+    }
+
+    [Fact]
+    public void GetConfiguredVideoSampleFpsUsesPositiveEnvironmentOverride()
+    {
+        lock (EnvLock)
+        {
+            string? oldValue = Environment.GetEnvironmentVariable("VIDEO_SAMPLE_FPS");
+            try
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", "2.5");
+
+                Assert.Equal(2.5, MediaHelper.GetConfiguredVideoSampleFps());
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", oldValue);
+            }
+        }
+    }
+
+    [Fact]
+    public void GetConfiguredVideoSampleFpsIgnoresNonPositiveOrInvalidValues()
+    {
+        lock (EnvLock)
+        {
+            string? oldValue = Environment.GetEnvironmentVariable("VIDEO_SAMPLE_FPS");
+            try
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", "0");
+                Assert.Equal(1.0, MediaHelper.GetConfiguredVideoSampleFps());
+
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", "not-a-number");
+                Assert.Equal(1.0, MediaHelper.GetConfiguredVideoSampleFps());
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("VIDEO_SAMPLE_FPS", oldValue);
             }
         }
     }

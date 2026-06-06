@@ -40,11 +40,11 @@ namespace TensorSharp.Cpu.LinearAlgebra
         ///</param>
         public bool Run(string CA, string CB)
         {
-            bool lsame = false;
+            bool lsame;
 
             #region Variables
 
-            int INTA = 0; int INTB = 0; int ZCODE = 0;
+            int INTA; int INTB; int ZCODE;
 
             #endregion
 

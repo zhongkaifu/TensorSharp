@@ -46,6 +46,43 @@ public class ImageProcessorTests
     }
 
     [Fact]
+    public void Gemma4ImageProcessorPreservesAspectRatioAndDoesNotUpscale()
+    {
+        // Regression test for the gemma4uv image-preprocessing bug.
+        //
+        // A 750x500 photo has 375k pixels, already inside the [40,280]-token budget
+        // (92160..645120 px at patch16*merge3). The reference (llama.cpp
+        // calc_size_preserved_ratio + PAD_CEIL) therefore keeps the aspect-aligned
+        // native size 768x480 (16x10 = 160 patches) and letter-boxes with black.
+        // The old SmartResize always rescaled to the *max* pixel budget, producing a
+        // stretched, upscaled 960x624 (260 patches) image -> the model then reported a
+        // "very wide", "blurry" picture and hallucinated cut/sliced apples.
+        string path = WriteSyntheticPng(750, 500);
+        try
+        {
+            var processor = new Gemma4ImageProcessor(
+                patchSize: 16, nMerge: 3, minTokens: 40, maxTokens: 280,
+                imageMean: new[] { 0f, 0f, 0f }, imageStd: new[] { 1f, 1f, 1f });
+            var (pixels, width, height) = processor.ProcessImage(path);
+
+            Assert.Equal(768, width);   // not the old upscaled 960
+            Assert.Equal(480, height);  // not the old upscaled 624
+            Assert.Equal(3 * width * height, pixels.Length);
+
+            // Content (red) is centred (720x480, offsetX=24); the 24px left/right
+            // borders are black letter-box padding -> normalized 0 (mean=0, std=1).
+            int rowMid = (height / 2) * width;
+            Assert.InRange(pixels[rowMid + 0], -0.01f, 0.01f);             // left pad -> black
+            Assert.True(pixels[rowMid + width / 2] > 0.9f);                // centre -> red (~1)
+            Assert.InRange(pixels[rowMid + (width - 1)], -0.01f, 0.01f);   // right pad -> black
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Qwen35ImageProcessorComputeImageTokenCountSupportsJpeg()
     {
         string path = WriteEmbeddedJpeg();

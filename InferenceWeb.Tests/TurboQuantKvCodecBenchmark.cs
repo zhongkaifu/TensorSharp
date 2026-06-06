@@ -125,7 +125,7 @@ public class TurboQuantKvCodecBenchmark
         var model = new BenchFakeArchitecture("bench-fp", seed: 17, floatsPerToken);
         var tokens = new int[totalTokens];
         for (int i = 0; i < totalTokens; i++) tokens[i] = i + 1;
-        model.Fill(tokens, totalTokens);
+        model.Fill(totalTokens);
 
         var pagedConfig = new PagedKvCacheConfig
         {
@@ -350,7 +350,7 @@ public class TurboQuantKvCodecBenchmark
             return true;
         }
 
-        public void Fill(int[] tokens, int upToTokens)
+        public void Fill(int upToTokens)
         {
             int floatCount = upToTokens * _floatsPerToken;
             _floats = new float[floatCount];

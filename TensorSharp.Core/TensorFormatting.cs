@@ -241,7 +241,7 @@ namespace TensorSharp
 
             int nColumnPerLine = (int)Math.Floor((80 - indent.Length) / (double)(sz + 1));
             long firstColumn = 0;
-            long lastColumn = -1;
+            long lastColumn;
             while (firstColumn < tensor.Sizes[1])
             {
                 if (firstColumn + nColumnPerLine - 2 < tensor.Sizes[1])
@@ -296,11 +296,6 @@ namespace TensorSharp
 
         private static void FormatTensor(StringBuilder builder, Tensor tensor)
         {
-            Tuple<string, double, int> storageFormat = GetStorageFormat(tensor.Storage, tensor);
-            string format = storageFormat.Item1;
-            double scale = storageFormat.Item2;
-            int sz = storageFormat.Item3;
-
             int startingLength = builder.Length;
             long[] counter = Enumerable.Repeat((long)0, tensor.DimensionCount - 2).ToArray();
             bool finished = false;

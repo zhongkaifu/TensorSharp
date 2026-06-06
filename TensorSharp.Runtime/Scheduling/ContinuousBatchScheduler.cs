@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling
@@ -27,8 +26,26 @@ namespace TensorSharp.Runtime.Scheduling
     {
         private readonly SchedulerConfig _cfg;
         private readonly BlockPool _pool;
-        private readonly ILogger _logger;
         private readonly string _fingerprint;
+
+        // When false, cross-sequence K/V reuse is unsafe for this model (e.g. Gemma 4's
+        // sliding-window cache restores incorrectly into a fresh sequence). We then
+        // neither adopt cached prefix blocks nor register blocks for others to adopt,
+        // so every sequence re-prefills and gets correct logits.
+        private readonly bool _crossSeqKvReuse;
+
+        // Upper bound on how many leading prompt tokens may be adopted from the prefix
+        // cache. Sliding-window models cap this at their window size because the
+        // circular-cache snapshot can only be faithfully restored within one window.
+        private readonly int _maxReusablePrefixTokens;
+
+        // Live-cache continuation hooks (wired by the engine to the executor). The
+        // first computes how many leading prompt tokens can be served by continuing
+        // the model's live KV cache (beyond the pooled-snapshot cap); the second
+        // sets the sequence up to do so. Lets same-session follow-up turns reuse the
+        // whole conversation prefix on sliding-window models. Null when unwired.
+        private Func<SequenceState, int> _liveContinuationLcp;
+        private Func<SequenceState, int, bool> _liveContinuationAdopt;
 
         private readonly LinkedList<SequenceState> _waiting = new();
         private readonly Dictionary<string, LinkedListNode<SequenceState>> _waitingIndex = new();
@@ -41,12 +58,30 @@ namespace TensorSharp.Runtime.Scheduling
             SchedulerConfig cfg,
             BlockPool pool,
             string modelFingerprint,
-            ILogger logger = null)
+            ILogger logger = null,
+            bool supportsCrossSequenceKvReuse = true,
+            int maxReusablePrefixTokens = int.MaxValue)
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
-            _logger = logger ?? NullLogger.Instance;
             _fingerprint = modelFingerprint ?? string.Empty;
+            _crossSeqKvReuse = supportsCrossSequenceKvReuse;
+            _maxReusablePrefixTokens = maxReusablePrefixTokens <= 0 ? int.MaxValue : maxReusablePrefixTokens;
+        }
+
+        /// <summary>Whether cross-sequence prefix-cache reuse is enabled for this
+        /// model. False for models (e.g. Gemma 4 SWA) whose K/V snapshot cannot be
+        /// faithfully restored into a different sequence.</summary>
+        private bool PrefixCachingActive => _cfg.EnablePrefixCaching && _crossSeqKvReuse;
+
+        /// <summary>Wire the live-cache continuation hooks (see the fields). Called
+        /// once by the engine after the executor is constructed.</summary>
+        public void AttachLiveCacheContinuation(
+            Func<SequenceState, int> computeLcp,
+            Func<SequenceState, int, bool> adopt)
+        {
+            _liveContinuationLcp = computeLcp;
+            _liveContinuationAdopt = adopt;
         }
 
         public int WaitingCount => _waiting.Count;
@@ -160,9 +195,28 @@ namespace TensorSharp.Runtime.Scheduling
                 // Try prefix cache lookup before allocating blocks (only for
                 // brand-new sequences; preempted ones already had their blocks
                 // freed and need a fresh re-prefill, no shortcut).
-                if (seq.BlockTable.NumBlocks == 0 && _cfg.EnablePrefixCaching)
+                bool plannedLiveContinuation = false;
+                if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
                 {
-                    AdoptPrefixBlocksCapped(seq);
+                    // Live-cache continuation: when this is the SOLE sequence about to
+                    // run (nothing else running or already scheduled this step), the
+                    // model's live KV cache from the previous turn is still intact and
+                    // its prompt may extend it. Continuing from that live cache reuses
+                    // the whole conversation prefix - past the pooled-snapshot window
+                    // cap - with no corruption. Gated to the sole-sequence case so no
+                    // concurrent sequence can clobber the live cache before we run.
+                    if (_running.Count == 0
+                        && output.ScheduledWork.Count == 0
+                        && _liveContinuationLcp != null
+                        && _liveContinuationAdopt != null)
+                    {
+                        int lcp = _liveContinuationLcp(seq);
+                        if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
+                            plannedLiveContinuation = true;
+                    }
+
+                    if (!plannedLiveContinuation)
+                        AdoptPrefixBlocksCapped(seq);
                 }
 
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
@@ -194,6 +248,13 @@ namespace TensorSharp.Runtime.Scheduling
                 bool isPrefill = want > 1 || promptUncomputed > 0;
                 output.ScheduledWork.Add(new ScheduledSequenceWork(seq, want, true, isPrefill));
                 tokenBudget -= want;
+
+                // A live-cache continuation depends on the model's live cache staying
+                // intact until this sequence runs. Don't admit any other sequence this
+                // step (it could take ownership first and reset the cache); the others
+                // wait one step.
+                if (plannedLiveContinuation)
+                    break;
             }
 
             return output;
@@ -344,8 +405,13 @@ namespace TensorSharp.Runtime.Scheduling
             if (seq.BlockTable.NumBlocks > 0) return;
             if (seq.PromptTokens.Count < _cfg.BlockSize) return;
 
-            var hashes = KvBlockHasher.ComputeBlockHashes(seq.PromptTokens, _cfg.BlockSize, _fingerprint);
+            var hashes = KvBlockHasher.ComputeBlockHashes(seq.PromptTokens, _cfg.BlockSize, EffectiveFingerprint(seq));
             int maxAdoptableTokens = Math.Max(0, seq.PromptTokens.Count - 1);
+            // Cap reuse at the model's reliably-restorable prefix length (sliding
+            // window for circular caches). Adopting beyond this would inject a wrapped
+            // snapshot that the model can't faithfully reconstruct -> corrupt output.
+            if (_maxReusablePrefixTokens != int.MaxValue)
+                maxAdoptableTokens = Math.Min(maxAdoptableTokens, _maxReusablePrefixTokens);
             int maxAdoptableBlocks = maxAdoptableTokens / _cfg.BlockSize;
 
             int adopted = 0;
@@ -371,7 +437,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// add them to the block hash index.</summary>
         public void OnBlocksCommitted(SequenceState seq, int previousTokens)
         {
-            if (!_cfg.EnablePrefixCaching) return;
+            if (!PrefixCachingActive) return;
             int prevFull = previousTokens / _cfg.BlockSize;
             int curFull = seq.NumComputedTokens / _cfg.BlockSize;
             if (curFull <= prevFull) return;
@@ -389,7 +455,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         private void CacheFullBlocksForSequence(SequenceState seq)
         {
-            if (!_cfg.EnablePrefixCaching) return;
+            if (!PrefixCachingActive) return;
             int curFull = seq.NumComputedTokens / _cfg.BlockSize;
             if (curFull == 0) return;
             int allTokensCovered = curFull * _cfg.BlockSize;
@@ -422,7 +488,23 @@ namespace TensorSharp.Runtime.Scheduling
             var list = new List<int>(tokens);
             for (int i = 0; i < tokens; i++)
                 list.Add(seq.TokenAt(i));
-            return KvBlockHasher.ComputeBlockHashes(list, _cfg.BlockSize, _fingerprint);
+            return KvBlockHasher.ComputeBlockHashes(list, _cfg.BlockSize, EffectiveFingerprint(seq));
+        }
+
+        /// <summary>
+        /// The model fingerprint, additionally salted with the sequence's media
+        /// fingerprint when the prompt carries images/audio/video. This keeps the
+        /// prefix-cache block hashes content-aware: identical media reuses cached
+        /// K/V, but different media (sharing the same placeholder token IDs) can
+        /// never adopt a stale neighbour's blocks. Text-only sequences fall back to
+        /// the bare model fingerprint, so their hashes are unchanged.
+        /// </summary>
+        private string EffectiveFingerprint(SequenceState seq)
+        {
+            string media = seq?.MediaFingerprint;
+            if (string.IsNullOrEmpty(media))
+                return _fingerprint;
+            return string.Concat(_fingerprint, "mm:", media);
         }
     }
 }

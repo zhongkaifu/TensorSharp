@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
@@ -18,8 +19,43 @@ namespace TensorSharp.Models
 {
     public static class MediaHelper
     {
-        public const int DefaultVideoMaxFrames = 4;
+        /// <summary>
+        /// Frames sampled per second of video when no explicit rate is supplied.
+        /// Overridable via the <c>VIDEO_SAMPLE_FPS</c> environment variable.
+        /// </summary>
+        public const double DefaultVideoSampleFps = 1.0;
 
+        /// <summary>
+        /// Default upper bound on the number of extracted frames. <c>0</c> means
+        /// "no cap": extraction is purely time-based at the sampling fps. Set the
+        /// <c>VIDEO_MAX_FRAMES</c> environment variable to a positive value to
+        /// bound long videos.
+        /// </summary>
+        public const int DefaultVideoMaxFrames = 0;
+
+        /// <summary>
+        /// Resolves the sampling rate (frames per second of video) from the
+        /// <c>VIDEO_SAMPLE_FPS</c> environment variable, falling back to
+        /// <see cref="DefaultVideoSampleFps"/> when unset or invalid.
+        /// </summary>
+        public static double GetConfiguredVideoSampleFps(double fallback = DefaultVideoSampleFps)
+        {
+            string raw = Environment.GetEnvironmentVariable("VIDEO_SAMPLE_FPS");
+            if (!string.IsNullOrWhiteSpace(raw) &&
+                double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed) &&
+                parsed > 0)
+            {
+                return parsed;
+            }
+
+            return fallback > 0 ? fallback : DefaultVideoSampleFps;
+        }
+
+        /// <summary>
+        /// Resolves the optional upper bound on extracted frames from the
+        /// <c>VIDEO_MAX_FRAMES</c> environment variable. Returns <c>0</c> (no cap)
+        /// when unset or invalid so that extraction stays purely time-based.
+        /// </summary>
         public static int GetConfiguredMaxVideoFrames(int fallback = DefaultVideoMaxFrames)
         {
             string raw = Environment.GetEnvironmentVariable("VIDEO_MAX_FRAMES");
@@ -30,13 +66,32 @@ namespace TensorSharp.Models
                 return parsed;
             }
 
-            return fallback > 0 ? fallback : DefaultVideoMaxFrames;
+            return fallback > 0 ? fallback : 0;
         }
 
-        public static List<string> ExtractVideoFrames(string videoPath, int maxFrames = 0, double fps = 1.0)
+        /// <summary>
+        /// Extracts frames from a video using time-based sampling: one frame every
+        /// <c>1 / fps</c> seconds (default 1 fps), so the frame count scales with the
+        /// clip's duration. When <paramref name="maxFrames"/> resolves to a positive
+        /// value (via the <c>VIDEO_MAX_FRAMES</c> env var or an explicit argument) it
+        /// acts as an upper bound, evenly down-selecting; otherwise every sampled
+        /// frame is kept.
+        /// </summary>
+        /// <param name="videoPath">Path to the source video file.</param>
+        /// <param name="maxFrames">
+        /// Optional cap on the number of frames. <c>&lt;= 0</c> resolves from
+        /// <c>VIDEO_MAX_FRAMES</c> (default: no cap).
+        /// </param>
+        /// <param name="fps">
+        /// Sampling rate in frames per second of video. <c>&lt;= 0</c> resolves from
+        /// <c>VIDEO_SAMPLE_FPS</c> (default: 1 fps).
+        /// </param>
+        public static List<string> ExtractVideoFrames(string videoPath, int maxFrames = 0, double fps = 0.0)
         {
             if (maxFrames <= 0)
                 maxFrames = GetConfiguredMaxVideoFrames();
+            if (fps <= 0)
+                fps = GetConfiguredVideoSampleFps();
 
             string tempDir = Path.Combine(Path.GetTempPath(), $"frames_{Guid.NewGuid():N}");
             Directory.CreateDirectory(tempDir);
@@ -50,12 +105,27 @@ namespace TensorSharp.Models
             if (videoFps <= 0 || totalFrames <= 0)
                 throw new Exception($"Invalid video: fps={videoFps}, frames={totalFrames}");
 
+            // Time-based candidate sampling: pick one frame every (videoFps / fps)
+            // source frames, i.e. one frame per (1 / fps) seconds of wall-clock time.
             int frameInterval = Math.Max(1, (int)Math.Round(videoFps / fps));
             var candidateFrames = new List<int>();
             for (int frameIdx = 0; frameIdx < totalFrames; frameIdx += frameInterval)
                 candidateFrames.Add(frameIdx);
 
-            var selectedPositions = SelectEvenlySpacedIndices(candidateFrames.Count, maxFrames);
+            // Keep every time-sampled frame by default. VIDEO_MAX_FRAMES (when > 0)
+            // is an optional upper bound that evenly down-selects to protect against
+            // runaway frame counts / context blow-up on very long clips.
+            List<int> selectedPositions;
+            if (maxFrames > 0 && candidateFrames.Count > maxFrames)
+            {
+                selectedPositions = SelectEvenlySpacedIndices(candidateFrames.Count, maxFrames);
+            }
+            else
+            {
+                selectedPositions = new List<int>(candidateFrames.Count);
+                for (int i = 0; i < candidateFrames.Count; i++)
+                    selectedPositions.Add(i);
+            }
 
             var frames = new List<string>();
             using var mat = new Mat();

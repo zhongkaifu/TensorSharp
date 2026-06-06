@@ -50,6 +50,13 @@ namespace TensorSharp.Runtime
         private sealed class TextNode : Node { public string Text = string.Empty; }
         private sealed class OutputNode : Node { public string Expr = string.Empty; }
         private sealed class SetNode : Node { public string VarName = string.Empty; public string ValueExpr = string.Empty; }
+        private sealed class SetBlockNode : Node
+        {
+            // {% set var %}...{% endset %} : captures the rendered body into 'var'.
+            public string VarName = string.Empty;
+            public string? FilterExpr; // optional trailing filters, e.g. "trim" in {% set x | trim %}
+            public List<Node> Body = new();
+        }
         private sealed class ForNode : Node
         {
             public string VarName = string.Empty;
@@ -220,11 +227,20 @@ namespace TensorSharp.Runtime
                 }
                 else if (body.StartsWith("set "))
                 {
-                    var setNode = ParseSet(body);
-                    nodes.Add(setNode);
-                    pos++;
+                    if (IsBlockSet(body))
+                    {
+                        pos++;
+                        var blockNode = ParseSetBlock(body, segs, ref pos);
+                        nodes.Add(blockNode);
+                    }
+                    else
+                    {
+                        var setNode = ParseSet(body);
+                        nodes.Add(setNode);
+                        pos++;
+                    }
                 }
-                else if (body == "endif" || body == "endfor" || body == "endmacro" ||
+                else if (body == "endif" || body == "endfor" || body == "endmacro" || body == "endset" ||
                          body.StartsWith("elif ") || body == "elif" || body == "else")
                 {
                     return nodes;
@@ -242,7 +258,8 @@ namespace TensorSharp.Runtime
         {
             return body == tag || (tag == "endif" && (body == "elif" || body.StartsWith("elif ") || body == "else"))
                 || (tag == "endfor" && body == "endfor")
-                || (tag == "endmacro" && body == "endmacro");
+                || (tag == "endmacro" && body == "endmacro")
+                || (tag == "endset" && body == "endset");
         }
 
         private static ForNode ParseFor(string header, List<Seg> segs, ref int pos)
@@ -362,6 +379,44 @@ namespace TensorSharp.Runtime
             };
         }
 
+        /// <summary>
+        /// Distinguish the block form "{% set var %}...{% endset %}" (captures rendered
+        /// body into a variable) from the inline form "{% set var = expr %}". The inline
+        /// form has a single '=' assignment operator right after the (dotted) target name.
+        /// </summary>
+        private static bool IsBlockSet(string body)
+        {
+            string rest = body.Substring(4); // strip "set "
+            int i = 0;
+            while (i < rest.Length && (char.IsLetterOrDigit(rest[i]) || rest[i] == '_' || rest[i] == '.'))
+                i++;
+            while (i < rest.Length && char.IsWhiteSpace(rest[i]))
+                i++;
+            // Inline assignment: a single '=' that is not part of '==', '<=', '>=', '!='.
+            bool inlineAssign = i < rest.Length && rest[i] == '=' &&
+                                (i + 1 >= rest.Length || rest[i + 1] != '=');
+            return !inlineAssign;
+        }
+
+        private static SetBlockNode ParseSetBlock(string header, List<Seg> segs, ref int pos)
+        {
+            // "set <target>" optionally followed by "| filter | filter2"
+            string target = header.Substring(4).Trim();
+            string varName = target;
+            string? filterExpr = null;
+            int pipe = target.IndexOf('|');
+            if (pipe >= 0)
+            {
+                varName = target.Substring(0, pipe).Trim();
+                filterExpr = target.Substring(pipe + 1).Trim();
+            }
+
+            var body = ParseNodes(segs, ref pos, "endset");
+            if (pos < segs.Count && segs[pos].Body == "endset") pos++;
+
+            return new SetBlockNode { VarName = varName, FilterExpr = filterExpr, Body = body };
+        }
+
         #endregion
 
         #region Renderer
@@ -422,18 +477,24 @@ namespace TensorSharp.Runtime
                     case SetNode sn:
                     {
                         object? setVal = EvalExpr(sn.ValueExpr, ctx);
-                        int dotIdx = sn.VarName.IndexOf('.');
-                        if (dotIdx > 0)
+                        AssignVar(sn.VarName, setVal, ctx);
+                        break;
+                    }
+                    case SetBlockNode sbn:
+                    {
+                        var inner = new StringBuilder();
+                        RenderNodes(sbn.Body, ctx, inner);
+                        object? captured = inner.ToString();
+                        if (!string.IsNullOrEmpty(sbn.FilterExpr))
                         {
-                            string nsName = sn.VarName.Substring(0, dotIdx);
-                            string attrName = sn.VarName.Substring(dotIdx + 1);
-                            if (ctx.Get(nsName) is IDictionary<string, object> nsDict)
-                                nsDict[attrName] = setVal!;
+                            // Reuse the expression evaluator's filter-chain handling by
+                            // binding the captured text to a synthetic variable.
+                            ctx.Push();
+                            ctx.Set("__setblock_capture__", captured!);
+                            captured = EvalPrimary("__setblock_capture__ | " + sbn.FilterExpr, ctx);
+                            ctx.Pop();
                         }
-                        else
-                        {
-                            ctx.Set(sn.VarName, setVal!);
-                        }
+                        AssignVar(sbn.VarName, captured, ctx);
                         break;
                     }
                     case ForNode fn:
@@ -446,6 +507,22 @@ namespace TensorSharp.Runtime
                         ctx.Set(mn.Name, mn);
                         break;
                 }
+            }
+        }
+
+        private static void AssignVar(string varName, object? value, Context ctx)
+        {
+            int dotIdx = varName.IndexOf('.');
+            if (dotIdx > 0)
+            {
+                string nsName = varName.Substring(0, dotIdx);
+                string attrName = varName.Substring(dotIdx + 1);
+                if (ctx.Get(nsName) is IDictionary<string, object> nsDict)
+                    nsDict[attrName] = value!;
+            }
+            else
+            {
+                ctx.Set(varName, value!);
             }
         }
 
@@ -810,13 +887,28 @@ namespace TensorSharp.Runtime
             if (expr.StartsWith("raise_exception("))
                 return null;
 
-            // range(n) function
+            // range(stop) / range(start, stop) / range(start, stop, step) function
             if (expr.StartsWith("range(") && expr.EndsWith(")"))
             {
                 string inner = expr.Substring(6, expr.Length - 7).Trim();
-                int n = (int)ToNumber(EvalExpr(inner, ctx));
+                var rangeArgs = SplitArgs(inner);
+                int start = 0, stop = 0, step = 1;
+                if (rangeArgs.Count == 1)
+                {
+                    stop = (int)ToNumber(EvalExpr(rangeArgs[0], ctx));
+                }
+                else if (rangeArgs.Count >= 2)
+                {
+                    start = (int)ToNumber(EvalExpr(rangeArgs[0], ctx));
+                    stop = (int)ToNumber(EvalExpr(rangeArgs[1], ctx));
+                    if (rangeArgs.Count >= 3)
+                        step = (int)ToNumber(EvalExpr(rangeArgs[2], ctx));
+                }
                 var list = new List<object>();
-                for (int j = 0; j < n; j++) list.Add(j);
+                if (step > 0)
+                    for (int j = start; j < stop; j += step) list.Add(j);
+                else if (step < 0)
+                    for (int j = start; j > stop; j += step) list.Add(j);
                 return list;
             }
 
@@ -1290,7 +1382,20 @@ namespace TensorSharp.Runtime
                 }
                 case "safe":
                     return val;
-                case "selectattr" or "map" or "reject" or "rejectattr":
+                case "map":
+                {
+                    // map('filter_name') applies a named filter to each element.
+                    if (val is IList<object> mapList && !string.IsNullOrEmpty(filterArgs))
+                    {
+                        string mapFilter = filterArgs.Trim().Trim('\'', '"');
+                        var mapped = new List<object>();
+                        foreach (var item in mapList)
+                            mapped.Add(ApplyFilter(item, mapFilter, ctx)!);
+                        return mapped;
+                    }
+                    return val;
+                }
+                case "selectattr" or "reject" or "rejectattr":
                     return val;
                 default:
                     return val;

@@ -117,8 +117,6 @@ namespace TensorSharp.Server.Hosting
             string backend,
             out string error)
         {
-            error = null;
-
             if (!TryResolveHostedModelRequest(requestedModel, hostedModelPath, out string resolvedModelPath, out error))
                 return false;
 

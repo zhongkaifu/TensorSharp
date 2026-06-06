@@ -159,13 +159,22 @@ namespace TensorSharp.Server
             int promptTokenCount = inputTokens.Count;
             var cfg = samplingConfig ?? SamplingConfig.Default;
 
+            // Fingerprint the media (images/audio/video) folded into this prompt.
+            // The image/placeholder token IDs are identical across requests, so the
+            // prefix-cache block hashes must be salted with the actual media content
+            // — otherwise a later request with the *same* template but a *different*
+            // image would adopt the previous image's K/V blocks and describe a stale
+            // image. Null for text-only prompts (no change to their cache behavior).
+            string mediaFingerprint = BuildMediaFingerprint(renderHistory);
+
             var seq = new SequenceState(
                 requestId: requestId,
                 promptTokens: inputTokens,
                 maxNewTokens: maxTokens,
                 blockSize: engine.PoolStats.blockSize,
                 samplingConfig: cfg,
-                userTag: session);
+                userTag: session,
+                mediaFingerprint: mediaFingerprint);
 
             promptSw.Stop();
             long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
@@ -362,6 +371,41 @@ namespace TensorSharp.Server
                 if (m.AudioPaths != null && m.AudioPaths.Count > 0) return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Build a stable fingerprint of every image/audio attachment in the
+        /// prompt, in prompt order. Uploads are stored under content-addressed
+        /// filenames, so the path identifies the content: identical media yields
+        /// the same fingerprint (prefix cache reused), different media yields a
+        /// different one (prefix cache correctly bypassed). Returns null when the
+        /// prompt has no media, leaving text-only cache behavior unchanged.
+        /// </summary>
+        private static string BuildMediaFingerprint(List<ChatMessage> history)
+        {
+            if (history == null) return null;
+            StringBuilder sb = null;
+            foreach (var m in history)
+            {
+                if (m == null) continue;
+                if (m.ImagePaths != null)
+                {
+                    foreach (var p in m.ImagePaths)
+                    {
+                        if (string.IsNullOrEmpty(p)) continue;
+                        (sb ??= new StringBuilder()).Append(m.IsVideo ? "vid:" : "img:").Append(p).Append('\n');
+                    }
+                }
+                if (m.AudioPaths != null)
+                {
+                    foreach (var p in m.AudioPaths)
+                    {
+                        if (string.IsNullOrEmpty(p)) continue;
+                        (sb ??= new StringBuilder()).Append("aud:").Append(p).Append('\n');
+                    }
+                }
+            }
+            return sb?.ToString();
         }
 
         /// <summary>

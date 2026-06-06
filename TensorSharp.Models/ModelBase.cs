@@ -3135,6 +3135,22 @@ namespace TensorSharp.Models
         public virtual bool SupportsKVStateSnapshot => false;
 
         /// <summary>
+        /// Whether a K/V snapshot taken by one sequence can be re-injected into another
+        /// sequence's fresh cache (cross-request prefix reuse + executor ownership swap).
+        /// Defaults to <see cref="SupportsKVStateSnapshot"/>; models whose snapshot
+        /// restore does not faithfully reproduce a fresh prefill (e.g. sliding-window /
+        /// circular caches) override this to false to force a correct re-prefill.
+        /// </summary>
+        public virtual bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot;
+
+        /// <summary>
+        /// Maximum leading-prompt-token count whose K/V snapshot can be faithfully
+        /// restored into another sequence. Defaults to unbounded; sliding-window models
+        /// (e.g. Gemma 4) override this with their window size.
+        /// </summary>
+        public virtual int MaxReusablePrefixTokens => int.MaxValue;
+
+        /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count,
         /// head counts, head dim, KV dtype) tuple. The paged cache stores blocks
         /// keyed by SHA-256 chain over this fingerprint, so changing it

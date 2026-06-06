@@ -114,7 +114,7 @@ namespace TensorSharp.Models
             var hidden = PatchEmbed(pixelValues, patchesPerSide);
             if (debug) DumpTensor(hidden, "After PatchEmbed", numPatches);
 
-            AddPositionEmbedding(hidden, numPatches);
+            AddPositionEmbedding(hidden);
             if (debug) DumpTensor(hidden, "After PosEmbed", numPatches);
 
             for (int i = 0; i < _blockCount; i++)
@@ -193,7 +193,7 @@ namespace TensorSharp.Models
             return result;
         }
 
-        private void AddPositionEmbedding(Tensor hidden, int numPatches)
+        private void AddPositionEmbedding(Tensor hidden)
         {
             var posEmbd = _weights["v.position_embd.weight"];
             Ops.Add(hidden, hidden, posEmbd);

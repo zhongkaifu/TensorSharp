@@ -161,7 +161,8 @@ namespace TensorSharp.Server
         private static ChatMessage NormalizeMessageForInference(ChatMessage msg, string arch, ILogger logger)
         {
             int maxVideoFrames = MediaHelper.GetConfiguredMaxVideoFrames();
-            if (arch != "gemma4" || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
+            // maxVideoFrames <= 0 means "no cap" (pure time-based extraction); leave history untouched.
+            if (arch != "gemma4" || maxVideoFrames <= 0 || !msg.IsVideo || msg.ImagePaths == null || msg.ImagePaths.Count <= maxVideoFrames)
                 return msg;
 
             var sampled = MediaHelper.SelectEvenlySpacedIndices(msg.ImagePaths.Count, maxVideoFrames)

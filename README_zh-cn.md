@@ -566,7 +566,8 @@ cd TensorSharp.Server/bin
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 当 `--max-tokens` 与请求级上限均未指定时使用的默认生成长度（默认：`20000`） |
 | `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
-| `VIDEO_MAX_FRAMES` | 视频提示词中均匀抽取的视频帧上限（默认：`4`） |
+| `VIDEO_SAMPLE_FPS` | 视频提示词每秒抽取的帧数；基于时间的抽帧（默认：`1`） |
+| `VIDEO_MAX_FRAMES` | 抽取视频帧数量的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制） |
 | `PORT` / `ASPNETCORE_URLS` | 标准 ASP.NET Core 监听配置（默认端口：`5000`） |
 | `TENSORSHARP_TEMPERATURE` | `--temperature` 与请求体均未指定时的默认采样温度 |
 | `TENSORSHARP_TOP_K` | `--top-k` 与请求体均未指定时的默认 Top-K |
@@ -692,7 +693,7 @@ cd TensorSharp.Server/bin
 |---|---|---|
 | ASP.NET Core 监听 | `http://0.0.0.0:5000` | `PORT`、`ASPNETCORE_URLS` |
 | 没有分词器时的纯文本上传字符上限 | 8000 字符 | `MAX_TEXT_FILE_CHARS` |
-| 视频帧抽取数量 | 4 帧 | `VIDEO_MAX_FRAMES` |
+| 视频帧抽取 | 1 fps（基于时间，不限制） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
 
 #### 日志（服务端 + CLI）
 
@@ -867,7 +868,7 @@ curl http://localhost:5000/api/queue/status
 Gemma 4 模型支持图像、视频和音频输入。将多模态投影器（`gemma-4-mmproj-F16.gguf`）放在与模型文件相同目录即可自动加载。
 
 - **图像：** PNG、JPEG、HEIC/HEIF
-- **视频：** MP4（使用 OpenCV 以 1 fps 抽取最多 8 帧）
+- **视频：** MP4（使用 OpenCV 以 1 fps 基于时间抽帧；可通过 `VIDEO_SAMPLE_FPS` / `VIDEO_MAX_FRAMES` 调整）
 - **音频：** WAV（16kHz 单声道）、MP3、OGG Vorbis
 
 ### Gemma 3

@@ -568,14 +568,28 @@ namespace tsg
         // ollama-fork extension). On the backends we use the field was effectively always
         // 0 anyway -- the Metal backend reports type=GPU and never set it -- so the
         // discrete-GPU test reduces to "is this a GPU device".
+        //
+        // NOTE: This governs the binding policy for *read-write* tensors
+        // (activations, KV cache). For those, even on unified-memory Metal we
+        // keep the device-local + explicit upload/download path because the
+        // zero-copy host-ptr path for read-write tensors is not exercised on
+        // Metal (it relies on a lazy-sync model that the per-op activation
+        // bindings here don't fully honour). Large *read-only weights* are
+        // handled separately and ARE wrapped zero-copy on Metal -- see the
+        // unified-memory weight branch in try_get_cacheable_tensor_buffer,
+        // which is where the model-weight memory duplication is avoided.
         return props.type == GGML_BACKEND_DEVICE_TYPE_GPU;
     }
 
-    bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size)
+    // Capability-only test: can this host pointer be wrapped as a device-visible
+    // buffer at all (backend supports buffer_from_host_ptr and the pointer meets
+    // the buffer-type alignment)? Unlike can_use_host_ptr_buffer this does NOT
+    // consult prefers_device_local_cache, so it returns true on unified-memory
+    // Metal. Used by the read-only-weight zero-copy path; read-write activation
+    // bindings continue to gate on can_use_host_ptr_buffer.
+    bool host_ptr_buffer_capable(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size)
     {
         if (dev == nullptr || ptr == nullptr || size == 0)
-            return false;
-        if (prefers_device_local_cache(dev))
             return false;
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
@@ -583,6 +597,13 @@ namespace tsg
             return false;
         const std::size_t alignment = get_host_ptr_alignment(backend, dev);
         return is_pointer_aligned(ptr, alignment);
+    }
+
+    bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size)
+    {
+        if (prefers_device_local_cache(dev))
+            return false;
+        return host_ptr_buffer_capable(backend, dev, ptr, size);
     }
 
     // Hint to the OS that the given file-backed mmap region is no longer
@@ -718,10 +739,14 @@ namespace tsg
     bool try_get_host_ptr_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,
         void* data, std::size_t bytes, bool cacheable,
-        ggml_backend_buffer_t& out_buffer)
+        ggml_backend_buffer_t& out_buffer,
+        bool allow_unified_weight)
     {
         out_buffer = nullptr;
-        if (!can_use_host_ptr_buffer(backend, dev, data, bytes))
+        const bool capable = allow_unified_weight
+            ? host_ptr_buffer_capable(backend, dev, data, bytes)
+            : can_use_host_ptr_buffer(backend, dev, data, bytes);
+        if (!capable)
             return false;
 
         if (cacheable)
@@ -781,7 +806,24 @@ namespace tsg
         if (backend == nullptr || dev == nullptr || tensor == nullptr || data == nullptr || bytes == 0)
             return false;
 
-        const bool use_device_copy = prefers_device_local_cache(dev);
+        // Read-only model weights on a unified-memory backend (Metal on Apple
+        // Silicon) are wrapped zero-copy around their host/mmap pointer rather
+        // than copied into a device-local buffer. This is THE fix for model
+        // weight memory blow-up: a 12 GB Q8_0 model otherwise pays ~12 GB of
+        // dirty anonymous device copies ON TOP of the 12 GB GGUF mmap (~24 GB,
+        // swapping on a 24 GB box). The weight bytes are read-only and the
+        // GGUF mmap stays alive for the model's lifetime, so the wrap is safe.
+        //
+        // Restricted to USAGE_WEIGHTS: small read-write tensors (KV cache,
+        // activations) are bound with USAGE_COMPUTE and keep the device-local
+        // copy path, whose explicit upload/download is what the Metal kernels
+        // here rely on for correctness.
+        const bool unified_weight =
+            usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            g_backend_type == BACKEND_TYPE_METAL &&
+            host_ptr_buffer_capable(backend, dev, data, bytes);
+
+        const bool use_device_copy = prefers_device_local_cache(dev) && !unified_weight;
 
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
@@ -846,10 +888,113 @@ namespace tsg
             return true;
         }
 
-        if (!try_get_host_ptr_buffer(backend, dev, data, bytes, true, out_buffer))
+        if (!try_get_host_ptr_buffer(backend, dev, data, bytes, true, out_buffer, unified_weight))
             return false;
 
         out_addr = data;
+        return true;
+    }
+
+    // --- Reusable compute buffer for per-graph intermediate tensors ---
+    //
+    // Per-layer Gemma4 prefill builds a fresh ggml graph each layer and used to
+    // allocate a fresh Metal backend buffer for its intermediate activations on
+    // every call. That allocation (ggml_backend_alloc_ctx_tensors -> Metal
+    // newBufferWithLength of ~100-150 MB for a 512-token chunk) costs ~20 ms and
+    // ran 42x per chunk, dominating prefill wall time. The buffer's contents are
+    // fully overwritten by each graph_compute (every intermediate is produced
+    // before it is consumed), and the per-layer host_read_barrier drains the
+    // previous layer's GPU work before the next graph runs, so a single buffer
+    // can be safely reused (re-packed via ggml_tallocr) across calls.
+    static std::mutex g_reuse_compute_mutex;
+    static ggml_backend_buffer_t g_reuse_compute_buf = nullptr;
+    static std::size_t g_reuse_compute_size = 0;
+    static ggml_backend_t g_reuse_compute_backend = nullptr;
+
+    void free_reuse_compute_buffer()
+    {
+        std::lock_guard<std::mutex> lock(g_reuse_compute_mutex);
+        if (g_reuse_compute_buf != nullptr)
+        {
+            ggml_backend_buffer_free(g_reuse_compute_buf);
+            g_reuse_compute_buf = nullptr;
+        }
+        g_reuse_compute_size = 0;
+        g_reuse_compute_backend = nullptr;
+    }
+
+    bool alloc_ctx_tensors_reuse(ggml_context* ctx)
+    {
+        // Escape hatch for A/B testing / regression isolation.
+        static const bool s_disabled = []() {
+            const char* e = std::getenv("TS_GGML_REUSE_COMPUTE_BUF");
+            return e != nullptr && e[0] == '0';
+        }();
+        if (s_disabled)
+            return false;
+
+        if (g_backend == nullptr || ctx == nullptr)
+            return false;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+        if (buft == nullptr)
+            return false;
+
+        const std::size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+        if (needed == 0)
+            return true; // every tensor already has a buffer (all inputs pre-bound)
+
+        const std::size_t max_size = ggml_backend_buft_get_max_size(buft);
+        if (needed > max_size)
+            return false; // would require splitting across buffers; caller falls back
+
+        std::lock_guard<std::mutex> lock(g_reuse_compute_mutex);
+
+        // A backend swap (model reload) invalidates the cached buffer. The old
+        // backend already freed its buffers on teardown, so just drop the stale
+        // handle rather than freeing through the dead backend.
+        if (g_reuse_compute_backend != g_backend)
+        {
+            g_reuse_compute_buf = nullptr;
+            g_reuse_compute_size = 0;
+            g_reuse_compute_backend = g_backend;
+        }
+
+        if (g_reuse_compute_buf == nullptr || g_reuse_compute_size < needed)
+        {
+            if (g_reuse_compute_buf != nullptr)
+                ggml_backend_buffer_free(g_reuse_compute_buf);
+            g_reuse_compute_buf = ggml_backend_buft_alloc_buffer(buft, needed);
+            if (g_reuse_compute_buf == nullptr)
+            {
+                g_reuse_compute_size = 0;
+                return false;
+            }
+            g_reuse_compute_size = needed;
+            ggml_backend_buffer_set_usage(g_reuse_compute_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+
+        // Re-pack this graph's unallocated tensors into the cached buffer. Mirrors
+        // ggml-alloc.c's alloc_tensor_range exactly (the size query above used the
+        // identical iteration, so everything fits a single buffer here).
+        ggml_tallocr tallocr = ggml_tallocr_new(g_reuse_compute_buf);
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t))
+        {
+            ggml_status status = GGML_STATUS_SUCCESS;
+            if (t->data == nullptr)
+            {
+                if (t->view_src == nullptr)
+                    status = ggml_tallocr_alloc(&tallocr, t);
+                else if (t->buffer == nullptr)
+                    status = ggml_backend_view_init(t);
+            }
+            else if (t->view_src != nullptr && t->buffer == nullptr)
+            {
+                status = ggml_backend_view_init(t);
+            }
+            if (status != GGML_STATUS_SUCCESS)
+                return false;
+        }
         return true;
     }
 
@@ -1434,6 +1579,10 @@ TSG_EXPORT void TSGgml_Shutdown()
         g_offloadable_resident_bytes = 0;
         g_offloadable_budget = 0;
     }
+
+    // Release the reusable per-graph compute buffer before the backend it was
+    // allocated from is torn down.
+    free_reuse_compute_buffer();
 
     if (g_backend != nullptr)
     {

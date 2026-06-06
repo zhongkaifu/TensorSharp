@@ -98,6 +98,17 @@ namespace TensorSharp.Runtime.Paged
             return freed;
         }
 
+        /// <summary>Reset the committed-token counter to zero while KEEPING the
+        /// allocated physical blocks. Used by the live-cache-continuation fallback:
+        /// when the model's live KV cache turns out to be unusable at execution time
+        /// the sequence must re-prefill from position 0, but the blocks already
+        /// reserved for it (sized for the would-be reused prefix) stay so the
+        /// re-prefill can write into them without reallocating.</summary>
+        public void ResetTokensKeepingBlocks()
+        {
+            _numTokens = 0;
+        }
+
         /// <summary>Drop ALL blocks. Returned to the caller for freeing.</summary>
         public List<KvBlock> Clear()
         {

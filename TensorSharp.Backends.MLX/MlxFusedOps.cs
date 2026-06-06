@@ -936,7 +936,7 @@ namespace TensorSharp.MLX
                         if (qHeads.IsContiguous())
                             qView = default;
 
-                        if (!TryBuildUpdatedCache(kHeads, vHeads, seqLen, out nextK, out nextV))
+                        if (!TryBuildUpdatedCache(kHeads, vHeads, out nextK, out nextV))
                             return false;
 
                         int nextLength = length + seqLen;
@@ -980,7 +980,7 @@ namespace TensorSharp.MLX
                 });
             }
 
-            private bool TryBuildUpdatedCache(Tensor kHeads, Tensor vHeads, int seqLen,
+            private bool TryBuildUpdatedCache(Tensor kHeads, Tensor vHeads,
                 out MlxNative.MlxArray nextK, out MlxNative.MlxArray nextV)
             {
                 nextK = default;

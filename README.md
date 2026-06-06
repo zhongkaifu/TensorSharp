@@ -567,7 +567,8 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
-| `VIDEO_MAX_FRAMES` | Maximum evenly spaced video frames extracted for video prompts (default: `4`) |
+| `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
+| `VIDEO_MAX_FRAMES` | Optional upper bound on extracted video frames (evenly down-sampled); unset/`0` means no cap (default: no cap) |
 | `PORT` / `ASPNETCORE_URLS` | Standard ASP.NET Core listener configuration (default port: `5000`) |
 | `TENSORSHARP_TEMPERATURE` | Default sampling temperature when neither `--temperature` nor the request body sets one |
 | `TENSORSHARP_TOP_K` | Default top-K when neither `--top-k` nor the request body sets one |
@@ -693,7 +694,7 @@ These fill in fields the request body omits; per-request JSON always wins, CLI f
 |---|---|---|
 | ASP.NET Core listener | `http://0.0.0.0:5000` | `PORT`, `ASPNETCORE_URLS` |
 | Plain-text upload character cap (when no tokenizer available) | 8000 chars | `MAX_TEXT_FILE_CHARS` |
-| Video-frame extraction count | 4 frames | `VIDEO_MAX_FRAMES` |
+| Video-frame extraction | 1 fps (time-based, no cap) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
 
 #### Logging (server + CLI)
 
@@ -873,7 +874,7 @@ The output parser (`OutputParser.cs`) automatically extracts tool calls from the
 Gemma 4 models support image, video, and audio inputs. Place the multimodal projector (`gemma-4-mmproj-F16.gguf`) in the same directory as the model file for automatic loading.
 
 - **Images:** PNG, JPEG, HEIC/HEIF
-- **Video:** MP4 (extracts up to 8 frames at 1 fps using OpenCV)
+- **Video:** MP4 (time-based extraction at 1 fps using OpenCV; tune with `VIDEO_SAMPLE_FPS` / `VIDEO_MAX_FRAMES`)
 - **Audio:** WAV (16kHz mono), MP3, OGG Vorbis
 
 ### Gemma 3

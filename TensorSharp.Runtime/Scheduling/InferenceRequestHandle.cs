@@ -26,7 +26,6 @@ namespace TensorSharp.Runtime.Scheduling
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
         private readonly TaskCompletionSource<InferenceCompletion> _completionTcs =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly InferenceEngine _engine;
         private readonly CancellationTokenRegistration _ctReg;
         private int _publishedTokens;
 
@@ -39,7 +38,6 @@ namespace TensorSharp.Runtime.Scheduling
         internal InferenceRequestHandle(SequenceState seq, InferenceEngine engine, CancellationToken ct)
         {
             Sequence = seq;
-            _engine = engine;
             _ctReg = ct.Register(() => engine.Abort(seq.RequestId));
         }
 

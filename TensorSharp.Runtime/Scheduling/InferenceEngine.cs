@@ -30,7 +30,6 @@ namespace TensorSharp.Runtime.Scheduling
     public sealed class InferenceEngine : IDisposable
     {
         private readonly IModelArchitecture _model;
-        private readonly SchedulerConfig _cfg;
         private readonly ILogger _logger;
         private readonly BlockPool _pool;
         private readonly ContinuousBatchScheduler _scheduler;
@@ -50,13 +49,20 @@ namespace TensorSharp.Runtime.Scheduling
         public InferenceEngine(IModelArchitecture model, SchedulerConfig cfg, ILogger logger = null)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
-            _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            ArgumentNullException.ThrowIfNull(cfg);
             _logger = logger ?? NullLogger.Instance;
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
             _pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, blockBytes);
-            _scheduler = new ContinuousBatchScheduler(cfg, _pool, model.KVStateFingerprint ?? string.Empty, logger);
+            _scheduler = new ContinuousBatchScheduler(cfg, _pool, model.KVStateFingerprint ?? string.Empty, logger,
+                supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
+                maxReusablePrefixTokens: model.MaxReusablePrefixTokens);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
+            // Let the scheduler plan same-session live-cache continuations through the
+            // executor (which owns the model's live KV-cache state).
+            _scheduler.AttachLiveCacheContinuation(
+                _executor.ComputeLiveContinuationLcp,
+                _executor.TryAdoptLiveCache);
 
             _worker = new Thread(WorkerLoop)
             {

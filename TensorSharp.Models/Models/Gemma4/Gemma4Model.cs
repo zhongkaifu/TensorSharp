@@ -682,6 +682,26 @@ namespace TensorSharp.Models
         public override bool SupportsKVStateSnapshot
             => _kvCacheK != null && _kvCacheV != null;
 
+        // Gemma 4 CAN reuse a K/V snapshot across sequences, but the POOLED snapshot
+        // path only up to one sliding window. Its local-attention layers (40 of 48)
+        // live in a circular cache that physically retains just the last
+        // _slidingWindow positions; the global layers keep everything. Re-injecting a
+        // pooled snapshot longer than the window forces the local layers to
+        // reconstruct wrapped state that no longer exists, which corrupts output
+        // (verified: the model loses the conversation and replies as if the context
+        // were random text). Within the window the pooled snapshot is correct.
+        //
+        // MaxReusablePrefixTokens caps the POOLED path at the window. Reuse BEYOND the
+        // window is still achieved - correctly - via live-cache continuation
+        // (BatchExecutor.ComputeLiveContinuationLcp), which keeps the model's actual
+        // live cache between same-session turns instead of reconstructing it.
+        public override bool SupportsCrossSequenceKvReuse => true;
+
+        public override int MaxReusablePrefixTokens =>
+            Config != null && Config.UsesCircularKvCache && _slidingWindow > 0
+                ? _slidingWindow
+                : int.MaxValue;
+
         public override string KVStateFingerprint =>
             $"gemma4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|gKV={_numGlobalKVHeads}|gD={_globalHeadDim}|lD={_localHeadDim}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
 
@@ -864,7 +884,7 @@ namespace TensorSharp.Models
         private static readonly bool s_DecodeProfileEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DECODE_PROFILE"), "1", StringComparison.Ordinal);
         private long _profEmbedTicks, _profPleTicks, _profLayerTicks, _profFinalNormTicks, _profLmHeadTicks, _profSoftcapTicks, _profLogitsCopyTicks;
-        private long _profAttnPreTicks, _profAttnSdpaTicks, _profAttnOutTicks, _profFfnTicks, _profPleInjectTicks;
+        private long _profAttnSdpaTicks, _profAttnOutTicks, _profFfnTicks, _profPleInjectTicks;
         private int _profDecodeCalls;
 
         private void ProfMark(ref long counter, long since, Tensor syncTensor)
@@ -888,7 +908,6 @@ namespace TensorSharp.Models
             Console.WriteLine($"  embed       : {_profEmbedTicks * inv:F3} ms/tok");
             Console.WriteLine($"  PLE compute : {_profPleTicks * inv:F3} ms/tok");
             Console.WriteLine($"  per-layer   : {_profLayerTicks * inv:F3} ms/tok");
-            Console.WriteLine($"    attn pre  : {_profAttnPreTicks * inv:F3} ms/tok  (norm+qkv+split+norms+RoPE+cache)");
             Console.WriteLine($"    attn SDPA : {_profAttnSdpaTicks * inv:F3} ms/tok");
             Console.WriteLine($"    attn out  : {_profAttnOutTicks * inv:F3} ms/tok  (output proj + post-attn-norm+add)");
             Console.WriteLine($"    FFN       : {_profFfnTicks * inv:F3} ms/tok  (gate_up+gelu+down + post-ffn-norm+add)");
@@ -947,7 +966,7 @@ namespace TensorSharp.Models
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
                         exceptPositions.Add(startPos + pos + i);
-                    InjectVisionEmbeddings(hidden, emb, pos);
+                    InjectVisionEmbeddings(hidden, emb, pos, startPos);
                     emb.Dispose();
                 }
                 _pendingVisionEmbeddingsList.Clear();
@@ -961,7 +980,7 @@ namespace TensorSharp.Models
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
                         exceptPositions.Add(startPos + pos + i);
-                    InjectVisionEmbeddings(hidden, emb, pos);
+                    InjectVisionEmbeddings(hidden, emb, pos, startPos);
                     emb.Dispose();
                 }
                 _pendingAudioEmbeddingsList.Clear();
@@ -1489,7 +1508,7 @@ namespace TensorSharp.Models
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
                         exceptPositions.Add(startPos + pos + i);
-                    InjectVisionEmbeddings(hidden, emb, pos);
+                    InjectVisionEmbeddings(hidden, emb, pos, startPos);
                     emb.Dispose();
                 }
                 _pendingVisionEmbeddingsList.Clear();
@@ -1503,7 +1522,7 @@ namespace TensorSharp.Models
                     int numTokens = (int)emb.Sizes[0];
                     for (int i = 0; i < numTokens; i++)
                         exceptPositions.Add(startPos + pos + i);
-                    InjectVisionEmbeddings(hidden, emb, pos);
+                    InjectVisionEmbeddings(hidden, emb, pos, startPos);
                     emb.Dispose();
                 }
                 _pendingAudioEmbeddingsList.Clear();
@@ -1619,7 +1638,7 @@ namespace TensorSharp.Models
             Ops.Mul(logits, logits, cap);
         }
 
-        private void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos)
+        private void InjectVisionEmbeddings(Tensor hidden, Tensor visionEmbeddings, int insertPos, int startPos)
         {
             int numVisionTokens = (int)visionEmbeddings.Sizes[0];
             using var target = hidden.Narrow(0, insertPos, numVisionTokens);
@@ -1634,7 +1653,10 @@ namespace TensorSharp.Models
                 deviceEmbeddings.SetElementsAsFloat(hostEmbeddings);
                 Ops.Copy(target, deviceEmbeddings);
             }
-            Console.WriteLine($"Injected {numVisionTokens} vision tokens at position {insertPos}");
+            // insertPos is the offset within the current prefill chunk; startPos
+            // (the cached sequence length) makes the absolute position explicit so
+            // the log reads monotonically across chunked multimodal prefill.
+            Console.WriteLine($"Injected {numVisionTokens} vision tokens at chunk-offset {insertPos} (absolute position {startPos + insertPos})");
         }
 
         private bool CanUseFusedLayerGraph(int seqLen, HashSet<int> exceptPositions, bool enabled)
@@ -1725,6 +1747,23 @@ namespace TensorSharp.Models
             {
                 _canUseFusedFullModelDecode = true;
             }
+
+            // The async / lazy-sync hazard above is NOT specific to MoE. Every
+            // Gemma 4 variant's seqLen>1 prefill mixes CPU writes with device
+            // kernels: the global-attention fast path
+            // (SplitQKVToHeadFirst + ApplyNeoXRoPEHeadFirst) and the flat
+            // ApplyNeoXRoPEPrefill populate Q/K/V on the CPU via Parallel.For,
+            // and the following RMSNorm / attention op reads them on the GPU.
+            // Under Metal async compute there is no host-write barrier, so that
+            // GPU op can run against a stale device buffer and silently drop the
+            // prompt's contribution to the residual stream — the model then emits
+            // coherent but off-topic text (e.g. defining a word lifted from the
+            // prompt instead of answering it). This bites dense, non-KV-shared
+            // builds such as gemma-4-12b-it whose global layers take the CPU-write
+            // fast path. Decode runs as a single fused graph, so forcing the
+            // per-op synchronize falls almost entirely on one-time prefill.
+            if (GgmlBasicOps.GetAsyncCompute())
+                GgmlBasicOps.SetAsyncCompute(false);
 
             int n = Config.NumLayers;
 
@@ -1994,6 +2033,33 @@ namespace TensorSharp.Models
 
             bool isLocal = IsLocalLayer(layer);
             bool isShared = _kvDonorMap.ContainsKey(layer);
+
+            // Correctness guard: the fused per-layer prefill kernel
+            // (TSGgml_Gemma4LayerPrefill) miscomputes sliding-window attention for
+            // SWA (local) layers once the sequence reaches past the window — query
+            // positions p >= slidingWindow must have their early keys masked out,
+            // and the fused kernel's windowed path corrupts the hidden state, so
+            // the model emits garbage for any prompt longer than the window.
+            //
+            // The corruption cannot be contained by falling back only for the SWA
+            // layers or only for the chunk that crosses the window. Prefill is
+            // processed chunk-by-chunk and the fused vs. per-op paths are not
+            // interchangeable mid-sequence: fused chunks leave K/V on the device
+            // (and write the circular SWA cache differently than the per-op path),
+            // so mixing fused and per-op work within a prefill corrupts the later
+            // (windowed) chunks. Empirically the corruption appears for any prompt
+            // longer than the sliding window and worsens with length.
+            //
+            // Keep multi-token prefill (seqLen > 1) entirely on the per-op path
+            // (TransformerBlock -> FusedPrefillAttention, which masks the window
+            // correctly and is verified correct at every length). Single-token
+            // decode (seqLen == 1) is unaffected — it is served by the fused
+            // full-model decode kernel (NativeGemma4ModelDecode) over the circular
+            // cache, never this per-layer prefill path — so generation speed is
+            // unchanged; only multi-token prefill loses the per-layer graph fusion.
+            if (seqLen > 1)
+                return false;
+
             int donorLayer = isShared ? _kvDonorMap[layer] : layer;
             var (ropeBase, ropeDims) = RopeForLayer(layer);
 
@@ -3169,13 +3235,10 @@ namespace TensorSharp.Models
                 string vName = $"{prefix}.attn_v.weight";
                 string qkvName = $"{prefix}.attn_qkv.weight";
 
-                bool hasV = _quantWeights.ContainsKey(vName) || _weights.ContainsKey(vName);
-
                 if (_quantWeights.TryGetValue(qName, out var qw) &&
                     _quantWeights.TryGetValue(kName, out var kw))
                 {
-                    QuantizedWeight vw = null;
-                    bool hasQuantV = _quantWeights.TryGetValue(vName, out vw);
+                    bool hasQuantV = _quantWeights.TryGetValue(vName, out QuantizedWeight vw);
 
                     if (qw.GgmlType == kw.GgmlType && qw.Ne0 == kw.Ne0 &&
                         (!hasQuantV || (vw.GgmlType == kw.GgmlType && vw.Ne0 == kw.Ne0)))
@@ -3197,8 +3260,7 @@ namespace TensorSharp.Models
                 else if (_weights.TryGetValue(qName, out var qf) &&
                          _weights.TryGetValue(kName, out var kf))
                 {
-                    Tensor vf = null;
-                    bool hasF32V = _weights.TryGetValue(vName, out vf);
+                    bool hasF32V = _weights.TryGetValue(vName, out Tensor vf);
 
                     int qDim = (int)qf.Sizes[0], kDim = (int)kf.Sizes[0];
                     int vDim = hasF32V ? (int)vf.Sizes[0] : kDim;
@@ -3332,7 +3394,6 @@ namespace TensorSharp.Models
                     _layerPerExpertScale[l] = scales;
                 }
 
-                bool hasGateUp = _layerStackedGate[l] != null && (_layerStackedUp[l] != null || fusedGateUpLayers > 0);
                 // Re-evaluate per layer: gate must exist; either up exists, or the
                 // gate is the pre-fused gate_up (ne1 = 2 * n_ff).
                 bool gateIsFused = _layerStackedGate[l] != null
@@ -3623,7 +3684,6 @@ namespace TensorSharp.Models
             if (_useGlobalFastPath)
             {
                 Tensor qkv = LinearForward(input, qkvName);
-                int vDim = (int)qkv.Sizes[1] - qDim - kDim;
 
                 _globalQHeads = SplitQKVToHeadFirst(qkv, 0, Config.NumHeads, seqLen, hd);
                 _globalKHeads = SplitQKVToHeadFirst(qkv, qDim, kvHeads, seqLen, hd);

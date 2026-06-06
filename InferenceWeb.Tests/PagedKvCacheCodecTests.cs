@@ -34,7 +34,7 @@ public class PagedKvCacheCodecTests
         var manager = NewEnabledManager("fp-int4", bits: 4);
         var model = new FloatFakeArchitecture("fp-int4", seed: 1);
         var tokens = Enumerable.Range(1, BlockSize * 3).ToArray();
-        model.InjectFullState(tokens, tokens.Length);
+        model.InjectFullState(tokens.Length);
 
         manager.Capture(model, tokens, tokens.Length);
         var stats = manager.GetStats();
@@ -54,7 +54,7 @@ public class PagedKvCacheCodecTests
         var manager = NewEnabledManager("fp-int4-rt", bits: 4);
         var model = new FloatFakeArchitecture("fp-int4-rt", seed: 7);
         var tokens = Enumerable.Range(1, BlockSize * 3).ToArray();
-        model.InjectFullState(tokens, tokens.Length);
+        model.InjectFullState(tokens.Length);
         manager.Capture(model, tokens, tokens.Length);
 
         var modelB = new FloatFakeArchitecture("fp-int4-rt", seed: 7);
@@ -76,7 +76,7 @@ public class PagedKvCacheCodecTests
         var manager = NewEnabledManager("fp-int8-rt", bits: 8);
         var model = new FloatFakeArchitecture("fp-int8-rt", seed: 11);
         var tokens = Enumerable.Range(1, BlockSize * 3).ToArray();
-        model.InjectFullState(tokens, tokens.Length);
+        model.InjectFullState(tokens.Length);
         manager.Capture(model, tokens, tokens.Length);
 
         var modelB = new FloatFakeArchitecture("fp-int8-rt", seed: 11);
@@ -104,7 +104,7 @@ public class PagedKvCacheCodecTests
         var manager = new PagedKvCacheManager(config, "fp-raw", NullLogger.Instance, codec: null);
         var model = new FloatFakeArchitecture("fp-raw", seed: 13);
         var tokens = Enumerable.Range(1, BlockSize * 2).ToArray();
-        model.InjectFullState(tokens, tokens.Length);
+        model.InjectFullState(tokens.Length);
         manager.Capture(model, tokens, tokens.Length);
 
         var modelB = new FloatFakeArchitecture("fp-raw", seed: 13);
@@ -201,7 +201,7 @@ public class PagedKvCacheCodecTests
         // Test helper: deterministically fill the KV buffer with realistic
         // values derived from the seed and the token index so different
         // instances with the same seed see identical floats.
-        internal void InjectFullState(int[] tokens, int upToTokens)
+        internal void InjectFullState(int upToTokens)
         {
             int floatCount = upToTokens * FloatsPerToken;
             _floats = new float[floatCount];

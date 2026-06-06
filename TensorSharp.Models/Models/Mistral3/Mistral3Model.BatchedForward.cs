@@ -94,9 +94,13 @@ namespace TensorSharp.Models
             // requests must be prepared serially upstream.
             if (_pendingVisionEmbeddingsList.Count > 0)
             {
+                // Multimodal requests are prepared serially upstream, so the batch
+                // holds a single sequence; its already-computed token count is the
+                // chunk's absolute base used to report the absolute injection position.
+                int visionStartPos = numSeqs > 0 ? ctx.Sequences[0].NumComputedTokens : 0;
                 foreach (var (embeddings, position) in _pendingVisionEmbeddingsList)
                 {
-                    InjectVisionEmbeddings(hiddenStates, embeddings, position);
+                    InjectVisionEmbeddings(hiddenStates, embeddings, position, visionStartPos);
                     embeddings.Dispose();
                 }
                 _pendingVisionEmbeddingsList.Clear();

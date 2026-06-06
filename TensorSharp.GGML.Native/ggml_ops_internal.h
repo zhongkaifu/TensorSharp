@@ -32,6 +32,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -476,6 +477,21 @@ namespace tsg
     bool can_initialize_backend(int backend_type);
     bool backend_supports_op(ggml_tensor* op);
 
+    // Allocate the unallocated (compute/intermediate) tensors of `ctx` into a
+    // persistent, reusable backend buffer instead of freshly allocating a new
+    // backend buffer on every call. Mirrors ggml_backend_alloc_ctx_tensors but
+    // keeps the underlying buffer cached (grown on demand) across calls, which
+    // avoids the ~20 ms/call Metal buffer allocation that dominates per-layer
+    // prefill. Returns true on success. The caller must NOT free the buffer;
+    // it is owned by the cache and released in TSGgml_Shutdown. Safe only when
+    // the previous graph that used the buffer has been synchronized before the
+    // next graph_compute (the per-layer prefill host_read_barrier guarantees
+    // this). Returns false (caller should fall back to the stock allocator) if
+    // the required size exceeds a single backend buffer's maximum.
+    bool alloc_ctx_tensors_reuse(ggml_context* ctx);
+    // Free the cached reuse buffer (called from TSGgml_Shutdown).
+    void free_reuse_compute_buffer();
+
     // --- Size / layout queries ---
 
     std::size_t required_raw_bytes(const TensorView2DDesc& desc);
@@ -514,12 +530,18 @@ namespace tsg
     std::size_t get_host_ptr_alignment(ggml_backend_t backend, ggml_backend_dev_t dev);
     bool prefers_device_local_cache(ggml_backend_dev_t dev);
     bool can_use_host_ptr_buffer(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size);
+    bool host_ptr_buffer_capable(ggml_backend_t backend, ggml_backend_dev_t dev, const void* ptr, std::size_t size);
     void invalidate_cached_buffer(void* data);
 
+    // allow_unified_weight: when true the prefers_device_local_cache gate is
+    // bypassed and only raw capability (host_ptr_buffer_capable) is required.
+    // Set by the read-only-weight path on unified-memory Metal so weights are
+    // wrapped zero-copy instead of duplicated into a device-local copy.
     bool try_get_host_ptr_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,
         void* data, std::size_t bytes, bool cacheable,
-        ggml_backend_buffer_t& out_buffer);
+        ggml_backend_buffer_t& out_buffer,
+        bool allow_unified_weight = false);
 
     bool try_get_cacheable_tensor_buffer(
         ggml_backend_t backend, ggml_backend_dev_t dev,

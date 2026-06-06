@@ -1474,8 +1474,6 @@ namespace TensorSharp.Cpu
             {
                 bool nta = transA == BlasOp.NonTranspose;
                 bool ntb = transB == BlasOp.NonTranspose;
-                byte transa = (byte)transA;
-                byte transb = (byte)transB;
                 int m = (int)a.Sizes[nta ? 1 : 2];
                 int k = (int)b.Sizes[ntb ? 1 : 2];
                 int n = (int)b.Sizes[ntb ? 2 : 1];
@@ -1496,8 +1494,8 @@ namespace TensorSharp.Cpu
                         float* bPtrSingle = (float*)CpuNativeHelpers.GetBufferStart(b);
                         float* cPtrSingle = (float*)CpuNativeHelpers.GetBufferStart(c);
 
-                        transa = (byte)ConvertBlasOp(transA);
-                        transb = (byte)ConvertBlasOp(transB);
+                        byte transa = (byte)ConvertBlasOp(transA);
+                        byte transb = (byte)ConvertBlasOp(transB);
                         cblas_sgemm_batch_strided(Order.Column, transa, transb, m, n, k, alpha, aPtrSingle, lda, stra, bPtrSingle, ldb, strb, beta, cPtrSingle, ldc, strc, batchSize);
                     }
                     catch (Exception err)

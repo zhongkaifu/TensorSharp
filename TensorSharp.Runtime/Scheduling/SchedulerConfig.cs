@@ -72,7 +72,7 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 1024),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
-                EnablePrefixCaching = ReadInt("TS_SCHED_PREFIX_CACHE", 1) != 0,
+                EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
             };
             return cfg;
@@ -83,6 +83,19 @@ namespace TensorSharp.Runtime.Scheduling
             string raw = System.Environment.GetEnvironmentVariable(name);
             if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out int v) && v > 0)
                 return v;
+            return fallback;
+        }
+
+        // Boolean flag reader that accepts "0"/"1" (and "true"/"false"). Unlike
+        // ReadInt, this honours an explicit "0" so a flag can actually be disabled.
+        private static bool ReadBool(string name, bool fallback)
+        {
+            string raw = System.Environment.GetEnvironmentVariable(name);
+            if (string.IsNullOrEmpty(raw)) return fallback;
+            raw = raw.Trim();
+            if (raw == "1") return true;
+            if (raw == "0") return false;
+            if (bool.TryParse(raw, out bool b)) return b;
             return fallback;
         }
     }

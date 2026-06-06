@@ -1082,14 +1082,6 @@ namespace TensorSharp.MLX
             }
         }
 
-        private static bool CanUseNativeUnary(Tensor result, Tensor src)
-        {
-            return result != null &&
-                src != null &&
-                CanUseNativeWriteTarget(result) &&
-                AreFloat32(src);
-        }
-
         private static bool CanUseNativeCopy(Tensor result, Tensor src)
         {
             return result != null &&

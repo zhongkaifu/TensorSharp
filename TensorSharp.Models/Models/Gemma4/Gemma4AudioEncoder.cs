@@ -54,12 +54,25 @@ namespace TensorSharp.Models
         private Tensor _onesForNorm;
         private readonly float[] _causalMask;
 
+        private readonly string _projectorType;
+        private readonly bool _isEncoderFree;
+
         public int ProjectionDim => _projectionDim;
+
+        /// <summary>True when this mmproj uses the Gemma 4 "unified" multimodal
+        /// embedder (projector_type "gemma4ua"). These models have no conformer
+        /// audio encoder: the raw 16 kHz waveform is chunked into 640-sample
+        /// frames, RMS-normalized, and projected directly into text-embedding
+        /// space. Used by e.g. gemma-4-12b. See <see cref="EncodeRawWaveform"/>.</summary>
+        public bool IsEncoderFree => _isEncoderFree;
 
         public Gemma4AudioEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
             var gguf = new GgufFile(mmProjPath);
+
+            _projectorType = gguf.GetString("clip.audio.projector_type", "gemma4a") ?? "gemma4a";
+            _isEncoderFree = string.Equals(_projectorType, "gemma4ua", StringComparison.Ordinal);
 
             _hiddenSize = (int)gguf.GetUint32("clip.audio.embedding_length",
                 (uint)gguf.GetUint32("gemma4.audio.embedding_length", 1024));
@@ -87,6 +100,8 @@ namespace TensorSharp.Models
             _useOllamaNames = _weights.ContainsKey("a.blk.0.ln1.weight");
             _causalMask = BuildCausalValidMask();
             Console.WriteLine($"  GGUF naming: {(_useOllamaNames ? "Ollama" : "mmproj/Unsloth")}");
+            Console.WriteLine($"  projector_type: {_projectorType}" +
+                (_isEncoderFree ? " (encoder-free / raw-waveform)" : " (conformer)"));
         }
 
         private void LoadWeights(GgufFile gguf)
@@ -288,6 +303,52 @@ namespace TensorSharp.Models
             return hiddenTensor;
         }
 
+        /// <summary>
+        /// Encoder-free audio embedding path for Gemma 4 "unified" models
+        /// (projector_type "gemma4ua", e.g. gemma-4-12b). Mirrors llama.cpp's
+        /// clip_graph_gemma4ua: the raw 16 kHz mono waveform is chunked into
+        /// fixed 640-sample frames (40 ms/token, last frame zero-padded), each
+        /// frame is RMS-normalized over its 640 samples (unweighted, eps=1e-6),
+        /// and projected straight into text-embedding space via
+        /// mm.a.input_projection.weight [640 -> textHidden]. There is no
+        /// conformer, mel spectrogram, bias or output clamping.
+        /// </summary>
+        public unsafe Tensor EncodeRawWaveform(float[] samples)
+        {
+            const string projName = "mm.a.input_projection.weight";
+            if (!_weights.TryGetValue(projName, out var projWeight))
+                throw new InvalidOperationException(
+                    $"Gemma4 unified audio encoder requires '{projName}' in the mmproj file.");
+
+            int outDim = (int)projWeight.Sizes[0];    // text hidden size (e.g. 3840)
+            int frameSize = (int)projWeight.Sizes[1]; // raw samples per token (640)
+
+            int nTokens = (samples.Length + frameSize - 1) / frameSize;
+            if (nTokens <= 0)
+                throw new InvalidOperationException("Audio waveform produced zero frames.");
+
+            Console.Write($"Audio encoder (gemma4ua): frames={nTokens} x {frameSize} -> [{nTokens},{outDim}]...");
+
+            // Pack samples into [nTokens, frameSize] row-major, zero-padding the
+            // trailing frame. Row t holds samples[t*frameSize .. t*frameSize+frameSize).
+            float[] framed = new float[(long)nTokens * frameSize];
+            int copyCount = Math.Min(samples.Length, framed.Length);
+            Array.Copy(samples, framed, copyCount);
+
+            var input = new Tensor(_allocator, DType.Float32, nTokens, frameSize);
+            input.SetElementsAsFloat(framed);
+
+            // embedding_pre_projection_norm: unweighted RMSNorm over frameSize.
+            ApplyUnweightedRMSNorm(input, nTokens, frameSize);
+
+            var output = new Tensor(_allocator, DType.Float32, nTokens, outDim);
+            Ops.Addmm(output, 0, output, 1f, input, GetOrCreateTransposedWeight(projName));
+            input.Dispose();
+
+            Console.WriteLine(" done");
+            return output;
+        }
+
         private int GetConvOutChannels(string prefix)
         {
             var w = _weights[$"{prefix}.weight"];
@@ -419,7 +480,6 @@ namespace TensorSharp.Models
 
             var upOut = AudioClippableLinearForward(normed, $"{prefix}.{upName}", seqLen);
             normed.Dispose();
-            int upDim = (int)upOut.Sizes[1];
 
             // SiLU
             ApplySiLU(upOut);
@@ -816,7 +876,6 @@ namespace TensorSharp.Models
 
         private void ApplyPerDimScale(Tensor q, Tensor perDimScale, int seqLen)
         {
-            int dim = (int)q.Sizes[1];
             using var reshaped = q.View(seqLen * _numHeads, _headDim);
             Ops.Mul(reshaped, reshaped, perDimScale);
         }

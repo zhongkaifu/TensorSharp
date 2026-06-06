@@ -1825,12 +1825,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
         }
 
-        // Allocate backend buffer
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (buffer.value == nullptr)
+        // Allocate backend buffer. Reuse a persistent compute buffer across
+        // decode steps instead of allocating a fresh one every token (llama.cpp
+        // amortizes this via a persistent graph allocator; we mirror that). The
+        // host_read_barrier below drains the prior step's GPU work before this
+        // graph runs, so reusing the buffer is race-free.
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(ctx))
         {
-            set_last_error("Failed to allocate backend buffer for Gemma4 model decode.");
-            return 0;
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr)
+            {
+                set_last_error("Failed to allocate backend buffer for Gemma4 model decode.");
+                return 0;
+            }
         }
 
         // Drain pending async work before CPU memcpys from C# tensor buffers.
@@ -2660,10 +2668,19 @@ TSG_EXPORT int TSGgml_Gemma4LayerPrefill(
             bind(ple_post_norm_w, plePostNormW, hiddenSize * sizeof(float), true);
         }
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (buffer.value == nullptr) {
-            set_last_error("Failed to allocate buffer for Gemma4 layer prefill.");
-            return 0;
+        // Reuse a persistent compute buffer across layers instead of allocating
+        // a fresh ~100-150 MB Metal buffer every call (was ~20 ms/layer, the
+        // single largest prefill overhead). Falls back to the stock per-call
+        // allocator if the reuse path can't service this graph. The per-layer
+        // host_read_barrier below drains the prior layer's GPU work before this
+        // graph runs, so reusing the buffer is race-free.
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(ctx)) {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) {
+                set_last_error("Failed to allocate buffer for Gemma4 layer prefill.");
+                return 0;
+            }
         }
 
         // Drain pending async work so the upcoming CPU memcpys (inside
