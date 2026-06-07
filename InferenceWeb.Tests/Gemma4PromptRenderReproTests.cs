@@ -16,6 +16,15 @@
 //      also prepends BOS (add_bos_token=true), producing a double BOS. Fixed by
 //      letting the tokenizer own the BOS, matching every other renderer.
 //
+//   3. The MIRROR of (2): some GGUF builds (e.g. gemma-4-31B-it-UD-IQ2_M) set
+//      add_bos_token=false and rely on the template's "{{ bos_token }}" to emit
+//      the BOS. TensorSharp renders bos_token empty AND the tokenizer won't add
+//      one, so the prompt ends up with ZERO BOS. A Gemma model with a missing BOS
+//      produces a coherent opening that then collapses into repeating a single
+//      token ("...是一个一个一个..."). ModelBase.ResolveAddBosToken now detects a
+//      template-declared BOS and lets the tokenizer own it (exactly one BOS). The
+//      Generate_* tests assert the output does not degenerate into repetition.
+//
 // The unit tests need no model and run everywhere. The end-to-end tests load the
 // real 12B GGUF when TS_GEMMA4_12B (or ~/work/model/gemma-4-12b-it-Q8_0.gguf)
 // is present, otherwise they skip.
@@ -116,8 +125,12 @@ public class Gemma4PromptRenderReproTests
         var scores = gguf.GetFloatArray("tokenizer.ggml.scores")!;
         int bosId = (int)gguf.GetUint32("tokenizer.ggml.bos_token_id");
         int eosId = (int)gguf.GetUint32("tokenizer.ggml.eos_token_id");
-        bool addBos = gguf.GetBool("tokenizer.ggml.add_bos_token", false);
+        bool addBosMeta = gguf.GetBool("tokenizer.ggml.add_bos_token", false);
         string chatTemplate = gguf.GetString("tokenizer.chat_template") ?? "";
+        // Mirror production BOS resolution: a template with a leading {{ bos_token }}
+        // requires a BOS even when add_bos_token=false (TensorSharp renders bos_token
+        // empty, so the tokenizer must own it). See ModelBase.ResolveAddBosToken.
+        bool addBos = ModelBase.ResolveAddBosToken(addBosMeta, bosId, chatTemplate);
         var tokenizer = new SentencePieceTokenizer(vocab, tokenTypes, scores, bosId,
             new[] { eosId }, addBos, false);
 
@@ -168,6 +181,16 @@ public class Gemma4PromptRenderReproTests
             bool relevant = text.Contains("最终幻想") || text.Contains("Final Fantasy") ||
                             text.Contains("FF7") || text.Contains("FF");
             Assert.True(relevant, $"output is unrelated to the prompt: {text}");
+
+            // Degeneration guard: a missing BOS (or other compute bug) makes the model
+            // emit a coherent opening and then collapse into repeating a single token
+            // ("...是一个一个一个一个..."). The prefix still contains "最终幻想", so the
+            // relevance check alone does NOT catch it. Require that the generated tokens
+            // are reasonably diverse - genuine prose keeps most tokens distinct, whereas
+            // a repetition collapse drives the distinct-token ratio toward zero.
+            int distinctTokens = outToks.Distinct().Count();
+            Assert.True(distinctTokens >= outToks.Count / 2,
+                $"output degenerated into repetition ({distinctTokens} distinct of {outToks.Count} tokens): {text}");
         }
         finally
         {

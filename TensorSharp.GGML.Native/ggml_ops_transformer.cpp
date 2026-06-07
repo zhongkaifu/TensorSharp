@@ -1408,7 +1408,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     void** ple_gate_arr, int* ple_gate_type_arr, std::int64_t* ple_gate_ne0_arr, std::int64_t* ple_gate_ne1_arr, std::int64_t* ple_gate_bytes_arr,
     void** ple_proj_arr, int* ple_proj_type_arr, std::int64_t* ple_proj_ne0_arr, std::int64_t* ple_proj_ne1_arr, std::int64_t* ple_proj_bytes_arr,
     void** ple_post_norm_arr,
-    int kv_cache_type)
+    int kv_cache_type,
+    // Separate K/V projection weights for mixed-quantization models (e.g.
+    // UD-IQ2_M) where attn_q/attn_k/attn_v carry DIFFERENT ggml types and so
+    // cannot be fused into a single attn_qkv tensor. When k_arr[l] != nullptr
+    // the layer runs three separate Q/K/V matmuls and qkv_arr[l] then holds
+    // the Q weight (with qkv_*_arr[l] describing Q). When k_arr == nullptr or
+    // k_arr[l] == nullptr the layer uses the fused attn_qkv weight as before,
+    // so existing fully-fused callers are unaffected.
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr)
 {
     try
     {
@@ -1478,6 +1487,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         struct LayerTensors {
             ggml_tensor* attn_norm_w;
             ggml_tensor* qkv_w;
+            ggml_tensor* k_w;   // separate K weight (mixed-quant); null when fused
+            ggml_tensor* v_w;   // separate V weight (mixed-quant); null when fused
             ggml_tensor* q_norm_w;
             ggml_tensor* k_norm_w;
             ggml_tensor* o_w;
@@ -1504,6 +1515,19 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
             lt.attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
             lt.qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type_arr[l]), qkv_ne0_arr[l], qkv_ne1_arr[l]);
+            // Mixed-quant layers carry separate K/V weights (qkv_w then holds Q
+            // only). Shared layers never run their own K/V projection.
+            const bool separate_qkv = (!info.isShared && k_arr != nullptr && k_arr[l] != nullptr);
+            if (separate_qkv)
+            {
+                lt.k_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(k_type_arr[l]), k_ne0_arr[l], k_ne1_arr[l]);
+                lt.v_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(v_type_arr[l]), v_ne0_arr[l], v_ne1_arr[l]);
+            }
+            else
+            {
+                lt.k_w = nullptr;
+                lt.v_w = nullptr;
+            }
             lt.q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
             lt.k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
             lt.o_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type_arr[l]), o_ne0_arr[l], o_ne1_arr[l]);
@@ -1576,14 +1600,29 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
             if (!info.isShared)
             {
-                // 2. Fused QKV projection
-                ggml_tensor* qkv_flat = ggml_reshape_1d(ctx,
-                    ggml_mul_mat(ctx, lt.qkv_w, normed_2d), info.qDim + 2 * info.kDim);
-                ggml_tensor* q_raw = ggml_view_1d(ctx, qkv_flat, info.qDim, 0);
-                ggml_tensor* k_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
-                    static_cast<std::size_t>(info.qDim) * sizeof(float));
-                ggml_tensor* v_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
-                    static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float));
+                // 2. QKV projection. Mixed-quant layers (lt.k_w != nullptr) run
+                // three separate matmuls because Q/K/V carry different ggml
+                // types and cannot share one fused weight; otherwise a single
+                // fused attn_qkv matmul is sliced into Q/K/V.
+                ggml_tensor* q_raw;
+                ggml_tensor* k_raw;
+                ggml_tensor* v_raw;
+                if (lt.k_w != nullptr)
+                {
+                    q_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.qkv_w, normed_2d), info.qDim);
+                    k_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.k_w, normed_2d), info.kDim);
+                    v_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, lt.v_w, normed_2d), info.kDim);
+                }
+                else
+                {
+                    ggml_tensor* qkv_flat = ggml_reshape_1d(ctx,
+                        ggml_mul_mat(ctx, lt.qkv_w, normed_2d), info.qDim + 2 * info.kDim);
+                    q_raw = ggml_view_1d(ctx, qkv_flat, info.qDim, 0);
+                    k_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
+                        static_cast<std::size_t>(info.qDim) * sizeof(float));
+                    v_raw = ggml_view_1d(ctx, qkv_flat, info.kDim,
+                        static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float));
+                }
 
                 // Per-head Q/K norm
                 ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_raw, info.hd, num_heads);
@@ -1797,6 +1836,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             auto& info = li[l];
 
             bind_or_mark(lt.qkv_w, qkv_arr[l], static_cast<std::size_t>(qkv_bytes_arr[l]), true);
+            if (lt.k_w != nullptr)
+            {
+                bind_or_mark(lt.k_w, k_arr[l], static_cast<std::size_t>(k_bytes_arr[l]), true);
+                bind_or_mark(lt.v_w, v_arr[l], static_cast<std::size_t>(v_bytes_arr[l]), true);
+            }
             bind_or_mark(lt.o_w, o_arr[l], static_cast<std::size_t>(o_bytes_arr[l]), true);
             bind_or_mark(lt.gu_w, gu_arr[l], static_cast<std::size_t>(gu_bytes_arr[l]), true);
             bind_or_mark(lt.down_w, down_arr[l], static_cast<std::size_t>(down_bytes_arr[l]), true);
@@ -1883,6 +1927,462 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     catch (...)
     {
         set_last_error("Unknown error in Gemma4 model decode.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused single-layer MoE decode (seqLen == 1): runs an ENTIRE Gemma 4 MoE
+// transformer block as one GGML graph on the device, eliminating the ~18-20
+// per-op C#→GGML dispatches the legacy TransformerBlock issues per MoE layer
+// (each of which allocates+frees a Metal buffer and synchronises). Handles:
+//   attn_norm → QKV (fused or separate/mixed-quant) → QK/V-norm → RoPE →
+//   KV-cache write (circular for SWA) → flash_attn → O-proj →
+//   post_attn_norm → residual1
+//   ┌ dense shared FFN: ffn_norm → gate_up → gelu*up → down → post_ffw_norm_1
+//   └ MoE: in-graph router (rms_norm·1/√H·gate_inp_scale → mul_mat → softmax →
+//          top_k → gather+renorm → ×down_exps_scale) → mul_mat_id experts
+//          (geglu) → weighted sum → post_ffw_norm_2 → add into dense output
+//   result = residual1 + post_ffw_norm(mlp); ×layer_output_scale
+// The in-graph router mirrors Gemma4Model.MoERoute + TryMoEForwardResidual
+// exactly so the device path is numerically equivalent to the per-op path.
+// ============================================================================
+
+// Descriptor passed by pointer from C#. Layout MUST match
+// Gemma4MoELayerDecodeDesc in GgmlNative.cs. 8-byte fields (pointers + int64)
+// are grouped first, then 4-byte (int32 + float), so natural alignment is
+// identical on both sides with no implicit padding surprises.
+struct TSGgmlGemma4MoELayerDesc
+{
+    // --- pointers (host memory) ---
+    void* hidden;            // [hidden_size] F32, in/out (residual stream)
+    void* attn_norm_w;       // [hidden_size] F32
+    void* qkv_w;             // fused QKV, or Q-only when separate_qkv
+    void* k_w;               // separate K weight (null unless separate_qkv)
+    void* v_w;               // separate V weight (null unless separate_qkv)
+    void* q_norm_w;          // [head_dim] F32
+    void* k_norm_w;          // [head_dim] F32 (null for shared layers)
+    void* o_w;               // attn_output weight
+    void* post_attn_norm_w;  // [hidden_size] F32
+    void* k_cache;           // [kv_heads, cache_size, head_dim] (donor's for shared)
+    void* v_cache;
+    void* freq_factors;      // [freq_factors_len] F32 (null for local/no-scaling)
+    void* ffn_norm_w;        // [hidden_size] F32
+    void* gu_w;              // dense fused gate_up weight [hidden, 2*ff_dense]
+    void* down_w;            // dense down weight [ff_dense, hidden]
+    void* post_ffw_norm_1_w; // [hidden_size] F32
+    void* gate_inp_w;        // router [hidden, num_experts] F32
+    void* gate_inp_scale;    // [hidden] F32 (null if absent)
+    void* pre_ffw_norm_2_w;  // [hidden_size] F32 (expert input norm)
+    void* gate_up_exps;      // stacked experts [hidden, 2*ff_moe, num_experts]
+    void* down_exps;         // stacked experts [ff_moe, hidden, num_experts]
+    void* down_exps_scale;   // [num_experts] F32 (null if absent)
+    void* post_ffw_norm_2_w; // [hidden_size] F32
+    void* post_ffw_norm_w;   // [hidden_size] F32
+
+    // --- int64 weight shapes ---
+    std::int64_t qkv_ne0, qkv_ne1, qkv_bytes;
+    std::int64_t k_ne0, k_ne1, k_bytes;
+    std::int64_t v_ne0, v_ne1, v_bytes;
+    std::int64_t o_ne0, o_ne1, o_bytes;
+    std::int64_t gu_ne0, gu_ne1, gu_bytes;
+    std::int64_t down_ne0, down_ne1, down_bytes;
+    std::int64_t gue_ne0, gue_ne1, gue_bytes; // per-expert ne0/ne1 + TOTAL bytes
+    std::int64_t de_ne0, de_ne1, de_bytes;
+
+    // --- int32 scalars / shapes ---
+    std::int32_t struct_bytes;       // sizeof sanity check
+    std::int32_t hidden_size;
+    std::int32_t num_heads;
+    std::int32_t num_kv_heads;
+    std::int32_t head_dim;
+    std::int32_t cache_size;
+    std::int32_t is_local;
+    std::int32_t is_shared;
+    std::int32_t sliding_window;
+    std::int32_t position;
+    std::int32_t rope_n_dims;
+    std::int32_t kv_cache_type;
+    std::int32_t num_experts;
+    std::int32_t num_experts_used;
+    std::int32_t freq_factors_len;
+    std::int32_t qkv_type;
+    std::int32_t k_type;
+    std::int32_t v_type;
+    std::int32_t o_type;
+    std::int32_t gu_type;
+    std::int32_t down_type;
+    std::int32_t gue_type;
+    std::int32_t de_type;
+    std::int32_t separate_qkv;
+
+    // --- float scalars ---
+    float eps;
+    float rope_base;
+    float inv_sqrt_hidden;     // 1/sqrt(hidden_size) for the router
+    float layer_output_scale;
+};
+
+TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+        if (d == nullptr)
+        {
+            set_last_error("Gemma4 MoE layer decode: null descriptor.");
+            return 0;
+        }
+        if (d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlGemma4MoELayerDesc)))
+        {
+            set_last_error("Gemma4 MoE layer decode: descriptor size mismatch (C#/native struct layout drift).");
+            return 0;
+        }
+
+        const int H = d->hidden_size;
+        const int position = d->position;
+        const int totalSeqLen = position + 1;
+        const int hd = d->head_dim;
+        const int nH = d->num_heads;
+        const int kvH = d->num_kv_heads;
+        const int qDim = nH * hd;
+        const int kDim = kvH * hd;
+        const int cacheSize = d->cache_size;
+        const bool isLocal = d->is_local != 0;
+        const bool isShared = d->is_shared != 0;
+        const bool separate_qkv = d->separate_qkv != 0;
+        const int kvType = d->kv_cache_type;
+        const float eps = d->eps;
+        const int nExp = d->num_experts;
+        const int nUsed = d->num_experts_used;
+        const int attendLen = isLocal ? std::min(totalSeqLen, d->sliding_window) : totalSeqLen;
+        const std::int64_t ffDense = d->gu_ne1 / 2;
+        const std::int64_t ffMoe = d->gue_ne1 / 2;
+
+        const std::size_t ctx_size = 16 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Gemma4 MoE layer decode: failed to acquire ggml context.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        // --- input / weight tensors ---
+        ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* freq_factors_t = (d->freq_factors != nullptr && d->freq_factors_len > 0)
+            ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d->freq_factors_len) : nullptr;
+
+        ggml_tensor* attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->qkv_type), d->qkv_ne0, d->qkv_ne1);
+        ggml_tensor* k_w = separate_qkv ? ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->k_type), d->k_ne0, d->k_ne1) : nullptr;
+        ggml_tensor* v_w = separate_qkv ? ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->v_type), d->v_ne0, d->v_ne1) : nullptr;
+        ggml_tensor* q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_tensor* k_norm_w = isShared ? nullptr : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        ggml_tensor* o_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->o_type), d->o_ne0, d->o_ne1);
+        ggml_tensor* post_attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* k_cached_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kvType), hd, cacheSize, kvH);
+        ggml_tensor* v_cached_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kvType), hd, cacheSize, kvH);
+
+        ggml_tensor* ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->gu_type), d->gu_ne0, d->gu_ne1);
+        ggml_tensor* down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d->down_type), d->down_ne0, d->down_ne1);
+        ggml_tensor* post_ffw_norm_1_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+
+        ggml_tensor* gate_inp_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, nExp);
+        ggml_tensor* gate_inp_scale_t = (d->gate_inp_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
+        ggml_tensor* pre_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* gate_up_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->gue_type), d->gue_ne0, d->gue_ne1, nExp);
+        ggml_tensor* down_exps_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(d->de_type), d->de_ne0, d->de_ne1, nExp);
+        ggml_tensor* down_exps_scale_t = (d->down_exps_scale != nullptr) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nExp) : nullptr;
+        ggml_tensor* post_ffw_norm_2_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* post_ffw_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+
+        // ===================== Attention =====================
+        ggml_tensor* hidden = hidden_t;
+        ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), attn_norm_w);
+        ggml_tensor* normed_2d = ggml_reshape_2d(ctx, normed, H, 1);
+
+        ggml_tensor* q_rope;
+        ggml_tensor* k_full = nullptr;
+        ggml_tensor* v_full = nullptr;
+        ggml_tensor* k_cpy = nullptr;
+        ggml_tensor* v_cpy = nullptr;
+        ggml_tensor* attn_mask = nullptr;
+        std::vector<ggml_fp16_t> attn_mask_data;
+
+        const int rope_dims = d->rope_n_dims;
+        ggml_tensor* rope_ff = isLocal ? nullptr : freq_factors_t;
+
+        if (!isShared)
+        {
+            ggml_tensor* q_raw;
+            ggml_tensor* k_raw;
+            ggml_tensor* v_raw;
+            if (separate_qkv)
+            {
+                q_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, qkv_w, normed_2d), qDim);
+                k_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, k_w, normed_2d), kDim);
+                v_raw = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, v_w, normed_2d), kDim);
+            }
+            else
+            {
+                ggml_tensor* qkv_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, qkv_w, normed_2d), qDim + 2 * kDim);
+                q_raw = ggml_view_1d(ctx, qkv_flat, qDim, 0);
+                k_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim) * sizeof(float));
+                v_raw = ggml_view_1d(ctx, qkv_flat, kDim, static_cast<std::size_t>(qDim + kDim) * sizeof(float));
+            }
+
+            ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_raw, hd, nH);
+            ggml_tensor* k_2d = ggml_reshape_2d(ctx, k_raw, hd, kvH);
+            ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), q_norm_w);
+            ggml_tensor* k_normed = ggml_mul(ctx, ggml_rms_norm(ctx, k_2d, eps), k_norm_w);
+            ggml_tensor* v_2d = ggml_reshape_2d(ctx, v_raw, hd, kvH);
+            ggml_tensor* v_normed = ggml_rms_norm(ctx, v_2d, eps);
+
+            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, hd, nH, 1);
+            ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_normed, hd, kvH, 1);
+            q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff, rope_dims, 2, 0, d->rope_base, 1.0f, 0, 1, 0, 0);
+            ggml_tensor* k_rope_t = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff, rope_dims, 2, 0, d->rope_base, 1.0f, 0, 1, 0, 0);
+
+            ggml_tensor* k_rope_perm = ggml_permute(ctx, k_rope_t, 0, 2, 1, 3);
+            ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_normed, hd, kvH, 1);
+            ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+            ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
+            ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+
+            const int cachePos = isLocal ? (position % cacheSize) : position;
+            const int activeStart = isLocal ? ((totalSeqLen - attendLen) % cacheSize) : 0;
+            const int attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
+            const std::size_t kv_byte_offset = static_cast<std::size_t>(cachePos) * k_cached_t->nb[1];
+            ggml_tensor* k_dst = ggml_view_3d(ctx, k_cached_t, hd, 1, kvH, k_cached_t->nb[1], k_cached_t->nb[2], kv_byte_offset);
+            ggml_tensor* v_dst = ggml_view_3d(ctx, v_cached_t, hd, 1, kvH, v_cached_t->nb[1], v_cached_t->nb[2], kv_byte_offset);
+            k_cpy = ggml_cpy(ctx, k_write, k_dst);
+            v_cpy = ggml_cpy(ctx, v_write, v_dst);
+            if (flash_attn_requires_masked_padding(hd))
+            {
+                attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+                fill_flash_attn_mask(attn_mask_data, attnKvLen, attendLen);
+            }
+            k_full = view_kv_cache_window(ctx, k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+            v_full = view_kv_cache_window(ctx, v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+        }
+        else
+        {
+            ggml_tensor* q_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, qkv_w, normed_2d), qDim);
+            ggml_tensor* q_2d = ggml_reshape_2d(ctx, q_flat, hd, nH);
+            ggml_tensor* q_normed = ggml_mul(ctx, ggml_rms_norm(ctx, q_2d, eps), q_norm_w);
+            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_normed, hd, nH, 1);
+            q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff, rope_dims, 2, 0, d->rope_base, 1.0f, 0, 1, 0, 0);
+
+            const int activeStart = isLocal ? ((totalSeqLen - attendLen) % cacheSize) : 0;
+            const int attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
+            if (flash_attn_requires_masked_padding(hd))
+            {
+                attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+                fill_flash_attn_mask(attn_mask_data, attnKvLen, attendLen);
+            }
+            k_full = view_kv_cache_window(ctx, k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+            v_full = view_kv_cache_window(ctx, v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+        }
+
+        if (k_full == nullptr || v_full == nullptr)
+        {
+            set_last_error("Gemma4 MoE layer decode: failed to build KV cache views.");
+            return 0;
+        }
+
+        ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
+        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, attn_mask, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
+        ggml_tensor* o_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, o_w, attn_flat), H);
+        ggml_tensor* post_attn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, o_flat, eps), post_attn_norm_w);
+        ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn_normed);
+
+        // ===================== Dense shared FFN =====================
+        ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), ffn_norm_w);
+        ggml_tensor* ffn_normed_2d = ggml_reshape_2d(ctx, ffn_normed, H, 1);
+        ggml_tensor* gu_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, gu_w, ffn_normed_2d), 2 * ffDense);
+        ggml_tensor* dense_gate = ggml_view_1d(ctx, gu_flat, ffDense, 0);
+        ggml_tensor* dense_up = ggml_view_1d(ctx, gu_flat, ffDense, static_cast<std::size_t>(ffDense) * sizeof(float));
+        ggml_tensor* dense_h = ggml_mul(ctx, ggml_gelu(ctx, dense_gate), dense_up);
+        ggml_tensor* dense_h_2d = ggml_reshape_2d(ctx, dense_h, ffDense, 1);
+        ggml_tensor* dense_down = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, down_w, dense_h_2d), H);
+        ggml_tensor* mlp = ggml_mul(ctx, ggml_rms_norm(ctx, dense_down, eps), post_ffw_norm_1_w);
+
+        // ===================== MoE router (in-graph) =====================
+        ggml_tensor* route_n = ggml_rms_norm(ctx, ggml_reshape_2d(ctx, residual1, H, 1), eps);
+        route_n = ggml_scale(ctx, route_n, d->inv_sqrt_hidden);
+        if (gate_inp_scale_t != nullptr)
+            route_n = ggml_mul(ctx, route_n, gate_inp_scale_t);
+        ggml_tensor* logits = ggml_mul_mat(ctx, gate_inp_w, route_n);          // [nExp, 1]
+        ggml_tensor* probs = ggml_soft_max(ctx, logits);                       // softmax over nExp
+        ggml_tensor* sel = ggml_top_k(ctx, probs, nUsed);                      // [nUsed, 1] i32
+        ggml_tensor* probs_r = ggml_reshape_3d(ctx, probs, 1, nExp, 1);
+        ggml_tensor* w = ggml_get_rows(ctx, probs_r, sel);                     // [1, nUsed, 1]
+        ggml_tensor* w_2d = ggml_reshape_2d(ctx, w, nUsed, 1);
+        ggml_tensor* w_sum = ggml_sum_rows(ctx, w_2d);                         // [1, 1]
+        w_2d = ggml_div(ctx, w_2d, w_sum);                                     // renormalised over selected
+        if (down_exps_scale_t != nullptr)
+        {
+            ggml_tensor* scale_r = ggml_reshape_3d(ctx, down_exps_scale_t, 1, nExp, 1);
+            ggml_tensor* sel_scale = ggml_get_rows(ctx, scale_r, sel);         // [1, nUsed, 1]
+            w_2d = ggml_mul(ctx, w_2d, ggml_reshape_2d(ctx, sel_scale, nUsed, 1));
+        }
+        ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, 1);
+
+        // ===================== MoE experts =====================
+        ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, residual1, H, 1), eps), pre_ffw_norm_2_w);
+        ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, 1);
+        ggml_tensor* gate_up = ggml_mul_mat_id(ctx, gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, 1]
+        ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+        ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);               // [ffMoe, nUsed, 1]
+        ggml_tensor* moe_down = ggml_mul_mat_id(ctx, down_exps_t, moe_act, sel);       // [H, nUsed, 1]
+        ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                     // broadcast [H, nUsed, 1]
+
+        // aggregate over the nUsed dim → [H, 1]
+        ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], 0);
+        for (int u = 1; u < nUsed; ++u)
+        {
+            ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, 1, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+            moe_out = ggml_add(ctx, moe_out, view_u);
+        }
+        ggml_tensor* moe_out_1d = ggml_reshape_1d(ctx, moe_out, H);
+        ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out_1d, eps), post_ffw_norm_2_w);
+        mlp = ggml_add(ctx, mlp, moe_normed);
+
+        // ===================== Final residual + layer scale =====================
+        ggml_tensor* mlp_normed = ggml_mul(ctx, ggml_rms_norm(ctx, mlp, eps), post_ffw_norm_w);
+        ggml_tensor* result = ggml_add(ctx, residual1, mlp_normed);
+        if (std::fabs(d->layer_output_scale - 1.0f) > 1e-9f)
+            result = ggml_scale(ctx, result, d->layer_output_scale);
+
+        ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* out_cpy = ggml_cpy(ctx, result, hidden_out);
+        ggml_set_output(out_cpy);
+
+        // --- build graph (KV writes first to order them before reads) ---
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, 2048, false);
+        if (k_cpy != nullptr) ggml_build_forward_expand(graph, k_cpy);
+        if (v_cpy != nullptr) ggml_build_forward_expand(graph, v_cpy);
+        ggml_build_forward_expand(graph, out_cpy);
+
+        // --- bind tensors ---
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (t == nullptr || data == nullptr) return;
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                void* addr = nullptr;
+                bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                {
+                    if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
+                    {
+                        if (needs_upload) upload_list.push_back({t, data, bytes});
+                        return;
+                    }
+                    invalidate_cached_buffer(data);
+                }
+            }
+            if (bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cacheable, buf))
+                {
+                    if (!cacheable) ephemeral_bufs.emplace_back(buf);
+                    if (ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS)
+                        return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        bind_or_mark(qkv_w, d->qkv_w, static_cast<std::size_t>(d->qkv_bytes), true);
+        if (separate_qkv)
+        {
+            bind_or_mark(k_w, d->k_w, static_cast<std::size_t>(d->k_bytes), true);
+            bind_or_mark(v_w, d->v_w, static_cast<std::size_t>(d->v_bytes), true);
+        }
+        bind_or_mark(o_w, d->o_w, static_cast<std::size_t>(d->o_bytes), true);
+        bind_or_mark(gu_w, d->gu_w, static_cast<std::size_t>(d->gu_bytes), true);
+        bind_or_mark(down_w, d->down_w, static_cast<std::size_t>(d->down_bytes), true);
+        bind_or_mark(gate_up_exps_t, d->gate_up_exps, static_cast<std::size_t>(d->gue_bytes), true);
+        bind_or_mark(down_exps_t, d->down_exps, static_cast<std::size_t>(d->de_bytes), true);
+        bind_or_mark(gate_inp_w, d->gate_inp_w, static_cast<std::size_t>(H) * nExp * sizeof(float), true);
+
+        bind_or_mark(attn_norm_w, d->attn_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(post_attn_norm_w, d->post_attn_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(ffn_norm_w, d->ffn_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(post_ffw_norm_1_w, d->post_ffw_norm_1_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(pre_ffw_norm_2_w, d->pre_ffw_norm_2_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(post_ffw_norm_2_w, d->post_ffw_norm_2_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(post_ffw_norm_w, d->post_ffw_norm_w, static_cast<std::size_t>(H) * sizeof(float), true);
+        bind_or_mark(q_norm_w, d->q_norm_w, static_cast<std::size_t>(hd) * sizeof(float), true);
+        if (!isShared)
+            bind_or_mark(k_norm_w, d->k_norm_w, static_cast<std::size_t>(hd) * sizeof(float), true);
+        if (gate_inp_scale_t != nullptr)
+            bind_or_mark(gate_inp_scale_t, d->gate_inp_scale, static_cast<std::size_t>(H) * sizeof(float), true);
+        if (down_exps_scale_t != nullptr)
+            bind_or_mark(down_exps_scale_t, d->down_exps_scale, static_cast<std::size_t>(nExp) * sizeof(float), true);
+
+        bind_or_mark(k_cached_t, d->k_cache, kv_cache_bytes(kvH, cacheSize, hd, kvType), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        bind_or_mark(v_cached_t, d->v_cache, kv_cache_bytes(kvH, cacheSize, hd, kvType), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        if (attn_mask != nullptr && !attn_mask_data.empty())
+            bind_or_mark(attn_mask, attn_mask_data.data(), attn_mask_data.size() * sizeof(ggml_fp16_t), false);
+
+        // Allocate intermediates (reuse persistent compute buffer across tokens).
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(ctx))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr)
+            {
+                set_last_error("Gemma4 MoE layer decode: failed to allocate backend buffer.");
+                return 0;
+            }
+        }
+
+        host_read_barrier();
+
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        ggml_backend_tensor_set(hidden_t, d->hidden, 0, static_cast<std::size_t>(H) * sizeof(float));
+        std::int32_t pos_val = position;
+        ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+        if (freq_factors_t != nullptr)
+            ggml_backend_tensor_set(freq_factors_t, d->freq_factors, 0, static_cast<std::size_t>(d->freq_factors_len) * sizeof(float));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("Gemma4 MoE layer decode: graph execution failed.");
+            return 0;
+        }
+
+        finalize_compute_with_download(hidden_out, d->hidden, static_cast<std::size_t>(H) * sizeof(float));
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Gemma4 MoE layer decode.");
         return 0;
     }
 }

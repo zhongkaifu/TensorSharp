@@ -1351,6 +1351,19 @@ namespace TensorSharp.GGML
                 blockSize, scale, slidingWindow, sinksData);
         }
 
+        /// <summary>
+        /// Runs one entire Gemma 4 MoE transformer block (attention + dense
+        /// shared FFN + in-graph-routed experts + all norms/residuals) as a
+        /// single fused GGML graph on the device for decode (seqLen == 1).
+        /// Replaces ~18-20 per-op dispatches per MoE layer, each of which would
+        /// otherwise allocate/free a Metal buffer and synchronise. Throws on
+        /// failure (caller falls back to the per-op TransformerBlock path).
+        /// </summary>
+        public static void Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs args)
+        {
+            GgmlNative.Gemma4MoELayerDecode(in args);
+        }
+
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
             IntPtr attnNormW,
@@ -1859,7 +1872,9 @@ namespace TensorSharp.GGML
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            int kvCacheType = 0)
+            int kvCacheType = 0,
+            IntPtr[] kArr = null, int[] kTypeArr = null, long[] kNe0Arr = null, long[] kNe1Arr = null, long[] kBytesArr = null,
+            IntPtr[] vArr = null, int[] vTypeArr = null, long[] vNe0Arr = null, long[] vNe1Arr = null, long[] vBytesArr = null)
         {
             GgmlNative.Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -1881,7 +1896,9 @@ namespace TensorSharp.GGML
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr, kvCacheType);
+                plePostNormArr, kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr);
         }
 
         [RegisterOpStorageType("addmmbatch", typeof(GgmlStorage))]

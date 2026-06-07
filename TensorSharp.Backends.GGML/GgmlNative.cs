@@ -132,6 +132,83 @@ internal readonly struct GgmlQuantizedWeight
     }
 }
 
+// Descriptor for the fused single-layer Gemma 4 MoE decode kernel
+// (TSGgml_Gemma4MoELayerDecode). Field order/types MUST match the native
+// TSGgmlGemma4MoELayerDesc struct EXACTLY: all 8-byte fields (pointers then
+// int64) first, then 4-byte fields (int32 then float). StructBytes is a
+// sizeof() sanity check the native side validates before use.
+[StructLayout(LayoutKind.Sequential)]
+public struct Gemma4MoELayerDecodeArgs
+{
+    // pointers (24)
+    public IntPtr Hidden;
+    public IntPtr AttnNormW;
+    public IntPtr QkvW;
+    public IntPtr KW;
+    public IntPtr VW;
+    public IntPtr QNormW;
+    public IntPtr KNormW;
+    public IntPtr OW;
+    public IntPtr PostAttnNormW;
+    public IntPtr KCache;
+    public IntPtr VCache;
+    public IntPtr FreqFactors;
+    public IntPtr FfnNormW;
+    public IntPtr GuW;
+    public IntPtr DownW;
+    public IntPtr PostFfwNorm1W;
+    public IntPtr GateInpW;
+    public IntPtr GateInpScale;
+    public IntPtr PreFfwNorm2W;
+    public IntPtr GateUpExps;
+    public IntPtr DownExps;
+    public IntPtr DownExpsScale;
+    public IntPtr PostFfwNorm2W;
+    public IntPtr PostFfwNormW;
+
+    // int64 weight shapes (24)
+    public long QkvNe0, QkvNe1, QkvBytes;
+    public long KNe0, KNe1, KBytes;
+    public long VNe0, VNe1, VBytes;
+    public long ONe0, ONe1, OBytes;
+    public long GuNe0, GuNe1, GuBytes;
+    public long DownNe0, DownNe1, DownBytes;
+    public long GueNe0, GueNe1, GueBytes;
+    public long DeNe0, DeNe1, DeBytes;
+
+    // int32 scalars / shapes (24)
+    public int StructBytes;
+    public int HiddenSize;
+    public int NumHeads;
+    public int NumKvHeads;
+    public int HeadDim;
+    public int CacheSize;
+    public int IsLocal;
+    public int IsShared;
+    public int SlidingWindow;
+    public int Position;
+    public int RopeNDims;
+    public int KvCacheType;
+    public int NumExperts;
+    public int NumExpertsUsed;
+    public int FreqFactorsLen;
+    public int QkvType;
+    public int KType;
+    public int VType;
+    public int OType;
+    public int GuType;
+    public int DownType;
+    public int GueType;
+    public int DeType;
+    public int SeparateQkv;
+
+    // float scalars (4)
+    public float Eps;
+    public float RopeBase;
+    public float InvSqrtHidden;
+    public float LayerOutputScale;
+}
+
 internal enum GgmlUnaryOp
 {
     Neg = 1,
@@ -952,7 +1029,17 @@ internal enum GgmlIndexReductionOp
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            int kvCacheType);
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs desc);
+
+        public static void Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs desc)
+        {
+            CheckResult(TSGgml_Gemma4MoELayerDecode(in desc), nameof(TSGgml_Gemma4MoELayerDecode));
+        }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
@@ -2161,7 +2248,9 @@ internal enum GgmlIndexReductionOp
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            int kvCacheType = 0)
+            int kvCacheType = 0,
+            IntPtr[] kArr = null, int[] kTypeArr = null, long[] kNe0Arr = null, long[] kNe1Arr = null, long[] kBytesArr = null,
+            IntPtr[] vArr = null, int[] vTypeArr = null, long[] vNe0Arr = null, long[] vNe1Arr = null, long[] vBytesArr = null)
         {
             CheckResult(TSGgml_Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -2183,7 +2272,9 @@ internal enum GgmlIndexReductionOp
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr, kvCacheType), "gemma4_model_decode");
+                plePostNormArr, kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr), "gemma4_model_decode");
         }
 
         public static void GatedDeltaNetChunked(

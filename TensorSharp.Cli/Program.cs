@@ -474,7 +474,11 @@ namespace TensorSharp.Cli
             }
 
             string rawText;
-            if (inputFile != null && File.Exists(inputFile))
+            // When the user supplies their own prompt via --input, honour it for
+            // every modality (text, image, video, audio). Only fall back to a
+            // modality-specific default prompt when no input file was given.
+            bool hasUserInput = inputFile != null && File.Exists(inputFile);
+            if (hasUserInput)
             {
                 rawText = File.ReadAllText(inputFile).TrimEnd();
                 _log.LogInformation(LogEventIds.HostConfiguration,
@@ -503,7 +507,8 @@ namespace TensorSharp.Cli
                 imagePaths = MediaHelper.ExtractVideoFrames(videoPath);
                 _log.LogInformation(LogEventIds.VideoFrameDownsample,
                     "Extracted {FrameCount} frames from video", imagePaths.Count);
-                rawText = "What is happening in this video? Please describe it.";
+                if (!hasUserInput)
+                    rawText = "What is happening in this video? Please describe it.";
             }
             else if (imagePath != null)
             {
@@ -513,7 +518,8 @@ namespace TensorSharp.Cli
                     return;
                 }
                 imagePaths = new List<string> { imagePath };
-                rawText = "What is in this image? Please describe it.";
+                if (!hasUserInput)
+                    rawText = "What is in this image? Please describe it.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Image input: {ImagePath} ({Bytes})",
                     imagePath, LoggingExtensions.FormatBytes(new FileInfo(imagePath).Length));
@@ -527,7 +533,8 @@ namespace TensorSharp.Cli
                     return;
                 }
                 audioPaths = new List<string> { audioPath };
-                rawText = "Listen to this audio and describe what you hear.";
+                if (!hasUserInput)
+                    rawText = "Listen to this audio and describe what you hear.";
                 _log.LogInformation(LogEventIds.UploadReceived,
                     "Audio input: {AudioPath} ({Bytes})",
                     audioPath, LoggingExtensions.FormatBytes(new FileInfo(audioPath).Length));
@@ -1133,7 +1140,15 @@ namespace TensorSharp.Cli
 
                     if (model is Gemma4Model g4 && g4.VisionEncoder != null)
                     {
-                        var proc = new Gemma4ImageProcessor();
+                        // The gemma4uv unified embedder declares its own
+                        // image_mean / image_std (mean=0, std=1 -> [0,1]); the
+                        // gemma4v SigLIP path keeps the legacy [-1,1] map. Match
+                        // the server's ModelMultimodalInjector here so the CLI
+                        // preprocesses identically.
+                        var proc = g4.VisionEncoder.IsUnified
+                            ? new Gemma4ImageProcessor(imageMean: g4.VisionEncoder.ImageMean,
+                                imageStd: g4.VisionEncoder.ImageStd)
+                            : new Gemma4ImageProcessor();
                         var allVisionEmbeddings = new List<TensorSharp.Tensor>();
 
                         foreach (var imgP in imagePaths)

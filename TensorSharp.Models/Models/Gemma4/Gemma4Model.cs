@@ -140,6 +140,12 @@ namespace TensorSharp.Models
         // MoE Gemma 4 model. Kept as a separate flag so a future MoE-aware
         // model-wide kernel can flip this on independently.
         private bool _canUseFusedFullModelDecode;
+        // Gates the fused single-graph MoE-layer decode kernel
+        // (TSGgml_Gemma4MoELayerDecode). Disable via TS_GGML_MOE_FUSED_DECODE=0
+        // for A/B comparison against the per-op TransformerBlock path. Flipped
+        // off at runtime if the kernel ever throws (graceful degradation).
+        private bool _moeFusedDecodeEnabled =
+            Environment.GetEnvironmentVariable("TS_GGML_MOE_FUSED_DECODE") != "0";
         private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
@@ -1062,6 +1068,21 @@ namespace TensorSharp.Models
                         }
                     }
 
+                    // Fused single-graph MoE layer decode (attention + dense FFN
+                    // + in-graph-routed experts) on GGML. Collapses ~18-20 per-op
+                    // dispatches per MoE layer (each allocating/freeing a Metal
+                    // buffer and synchronising) into one GPU graph, which is the
+                    // dominant decode cost for MoE Gemma 4 (e.g. 26B-A4B). Only
+                    // for the plain decode shape (no PLE / vision injection).
+                    if (seqLen == 1 && HasMoE(l) && perLayerInput == null
+                        && exceptPositions == null && _moeFusedDecodeEnabled
+                        && TryFusedMoELayerDecode(hidden, l, startPos))
+                    {
+                        _fusedHits++;
+                        if (_g4DumpDiag) System.Console.WriteLine($"[g4-legacy ] after-layer-{l}: {DiagChecksum(hidden, $"L{l}")}");
+                        continue;
+                    }
+
                     _nonFusedHits++;
                     hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
                     TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
@@ -1678,6 +1699,11 @@ namespace TensorSharp.Models
             public int[] HeadDim, KvHeads, CacheSize, IsLocal, KvSource, RopeNDims;
             public float[] RopeBase, LayerScalar;
             public int[] QkvType; public long[] QkvNe0, QkvNe1, QkvBytes;
+            // Separate K/V projection weights for mixed-quant layers (null
+            // pointer entry => layer uses the fused Qkv weight instead).
+            public IntPtr[] K, V;
+            public int[] KType; public long[] KNe0, KNe1, KBytes;
+            public int[] VType; public long[] VNe0, VNe1, VBytes;
             public int[] OType; public long[] ONe0, ONe1, OBytes;
             public int[] GuType; public long[] GuNe0, GuNe1, GuBytes;
             public int[] DownType; public long[] DownNe0, DownNe1, DownBytes;
@@ -1767,21 +1793,48 @@ namespace TensorSharp.Models
 
             int n = Config.NumLayers;
 
-            // Verify all *non-MoE* layers have the needed quantized QKV weight
-            // for the per-layer fused kernel. MoE layers are dispatched via
-            // the C# TransformerBlock so they don't need the precomputed
-            // arrays — the loop below leaves their Qkv slot at IntPtr.Zero
-            // and the per-layer call site bails on HasMoE(l) before touching
-            // it. If a single dense layer is missing its quantized weight
-            // (e.g. an unfortunate F32 fallback), disable per-layer fused
-            // dispatch entirely to keep the dispatch decision simple.
+            // Verify all *non-MoE* layers expose the quantized attention
+            // projection weights the fused kernel needs. MoE layers are
+            // dispatched via the C# TransformerBlock so they don't need the
+            // precomputed arrays — the loop below leaves their Qkv slot at
+            // IntPtr.Zero and the per-layer call site bails on HasMoE(l)
+            // before touching it.
+            //
+            // Two valid shapes per non-shared layer:
+            //   * fused  : attn_qkv.weight  (Q/K/V share one ggml type)
+            //   * separate: attn_q + attn_k + attn_v.weight  (mixed-quant
+            //     models such as UD-IQ2_M where Q/K/V carry different types
+            //     and cannot be fused — the kernel runs three matmuls)
+            // Shared (KV-donor-following) layers only project Q. If a dense
+            // layer is missing even the separate set, disable fused dispatch
+            // entirely to keep the dispatch decision simple.
+            // Tracks whether EVERY non-shared dense layer carries a fused
+            // attn_qkv weight. The per-layer fused kernel
+            // (TSGgml_Gemma4LayerPrefill) only understands a fused QKV weight,
+            // so it stays gated on this. The full-model decode kernel handles
+            // separate Q/K/V, so it relaxes to "fused OR separate" below.
+            bool allLayersFusedQkv = true;
             for (int l = 0; l < n; l++)
             {
                 if (HasMoE(l)) continue;
                 string prefix = $"blk.{l}";
                 bool isShared = _kvDonorMap.ContainsKey(l);
-                string qkvKey = isShared ? $"{prefix}.attn_q.weight" : $"{prefix}.attn_qkv.weight";
-                if (!_quantWeights.ContainsKey(qkvKey))
+                bool ok;
+                if (isShared)
+                {
+                    ok = _quantWeights.ContainsKey($"{prefix}.attn_q.weight");
+                }
+                else
+                {
+                    bool fused = _quantWeights.ContainsKey($"{prefix}.attn_qkv.weight");
+                    bool separate = _quantWeights.ContainsKey($"{prefix}.attn_q.weight")
+                        && _quantWeights.ContainsKey($"{prefix}.attn_k.weight")
+                        && _quantWeights.ContainsKey($"{prefix}.attn_v.weight");
+                    ok = fused || separate;
+                    if (!fused)
+                        allLayersFusedQkv = false;
+                }
+                if (!ok)
                 {
                     _canUseFusedDecode = false;
                     _canUseFusedFullModelDecode = false;
@@ -1798,6 +1851,8 @@ namespace TensorSharp.Models
             a.KvSource = new int[n]; a.RopeNDims = new int[n];
             a.RopeBase = new float[n]; a.LayerScalar = new float[n];
             a.QkvType = new int[n]; a.QkvNe0 = new long[n]; a.QkvNe1 = new long[n]; a.QkvBytes = new long[n];
+            a.K = new IntPtr[n]; a.KType = new int[n]; a.KNe0 = new long[n]; a.KNe1 = new long[n]; a.KBytes = new long[n];
+            a.V = new IntPtr[n]; a.VType = new int[n]; a.VNe0 = new long[n]; a.VNe1 = new long[n]; a.VBytes = new long[n];
             a.OType = new int[n]; a.ONe0 = new long[n]; a.ONe1 = new long[n]; a.OBytes = new long[n];
             a.GuType = new int[n]; a.GuNe0 = new long[n]; a.GuNe1 = new long[n]; a.GuBytes = new long[n];
             a.DownType = new int[n]; a.DownNe0 = new long[n]; a.DownNe1 = new long[n]; a.DownBytes = new long[n];
@@ -1868,6 +1923,32 @@ namespace TensorSharp.Models
                         a.QkvNe0[l] = qkvW.Ne0;
                         a.QkvNe1[l] = qkvW.Ne1;
                         a.QkvBytes[l] = qkvW.RawBytes;
+                    }
+                    else if (_quantWeights.TryGetValue($"{prefix}.attn_q.weight", out var qW)
+                        && _quantWeights.TryGetValue($"{prefix}.attn_k.weight", out var kW)
+                        && _quantWeights.TryGetValue($"{prefix}.attn_v.weight", out var vW))
+                    {
+                        // Mixed-quant layer: Q/K/V carry different ggml types,
+                        // so the kernel runs three separate matmuls. Qkv slot
+                        // holds Q; K/V go in their own arrays (a non-null K
+                        // pointer is the native kernel's "separate" signal).
+                        a.Qkv[l] = qW.CacheKey;
+                        a.QkvType[l] = qW.GgmlType;
+                        a.QkvNe0[l] = qW.Ne0;
+                        a.QkvNe1[l] = qW.Ne1;
+                        a.QkvBytes[l] = qW.RawBytes;
+
+                        a.K[l] = kW.CacheKey;
+                        a.KType[l] = kW.GgmlType;
+                        a.KNe0[l] = kW.Ne0;
+                        a.KNe1[l] = kW.Ne1;
+                        a.KBytes[l] = kW.RawBytes;
+
+                        a.V[l] = vW.CacheKey;
+                        a.VType[l] = vW.GgmlType;
+                        a.VNe0[l] = vW.Ne0;
+                        a.VNe1[l] = vW.Ne1;
+                        a.VBytes[l] = vW.RawBytes;
                     }
                 }
 
@@ -1950,9 +2031,15 @@ namespace TensorSharp.Models
             }
 
             _decodeArrays = a;
-            _canUseFusedDecode = true;
+            // The per-layer fused kernel only supports fused QKV; mixed-quant
+            // (separate Q/K/V) models rely solely on the full-model decode
+            // kernel, which handles them. Keeping this false for mixed-quant
+            // preserves the existing MoE / chunked-prefill fallbacks.
+            _canUseFusedDecode = allLayersFusedQkv;
             Console.WriteLine(_canUseFusedFullModelDecode
-                ? "  Gemma4 fused model decode enabled"
+                ? (allLayersFusedQkv
+                    ? "  Gemma4 fused model decode enabled"
+                    : "  Gemma4 fused model decode enabled (separate Q/K/V for mixed-quant layers)")
                 : "  Gemma4 fused dense-layer graph enabled (MoE layers use hybrid path)");
         }
 
@@ -1994,7 +2081,156 @@ namespace TensorSharp.Models
                 a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
                 a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
                 a.PlePostNorm,
-                _kvCacheDtype.GgmlType());
+                _kvCacheDtype.GgmlType(),
+                a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+        }
+
+        /// <summary>
+        /// Decode (seqLen == 1) one entire Gemma 4 MoE transformer block as a
+        /// single fused GGML graph: attention (norm → QKV → QK/V-norm → RoPE →
+        /// KV-cache write → flash attention → O-proj → post-attn-norm → residual)
+        /// + dense shared FFN + in-graph-routed experts + post norms/residual.
+        ///
+        /// Replaces the ~18-20 per-op dispatches that the C# TransformerBlock
+        /// issues per MoE layer — each of which allocates+frees a Metal buffer
+        /// and forces a queue synchronise — with ONE device graph. This is the
+        /// dominant decode bottleneck for MoE Gemma 4 (attention runs on the CPU
+        /// in the per-op path and grows with KV length). Returns false (caller
+        /// falls back to TransformerBlock) when any required weight is missing or
+        /// the layout is unsupported.
+        ///
+        /// The in-graph router mirrors <see cref="MoERoute"/> + the per-expert
+        /// scale fold in <see cref="TryMoEForwardResidual"/> exactly, so output
+        /// is numerically equivalent to the per-op path.
+        /// </summary>
+        private unsafe bool TryFusedMoELayerDecode(Tensor hidden, int layer, int startPos)
+        {
+            if (!IsGgmlBackend || _decodeArrays == null) return false;
+            // Requires the stacked (fused-gate_up) expert weights; the separate
+            // gate/up expert layout isn't handled by this kernel.
+            if (_layerStackedGate == null || _layerStackedGate[layer] == null
+                || _layerStackedDown == null || _layerStackedDown[layer] == null)
+                return false;
+            if (_layerStackedUp != null && _layerStackedUp[layer] != null) return false;
+
+            // Block-quantized KV cache is written via ggml_cpy(F32->cacheType)
+            // by the kernel; only F32/F16 caches are wired here.
+            if (_kvCacheDtype.IsBlockQuantized()) return false;
+
+            var a = _decodeArrays;
+            // Attention weights must be present in the precomputed arrays.
+            if (a.Qkv[layer] == IntPtr.Zero || a.O[layer] == IntPtr.Zero
+                || a.Gu[layer] == IntPtr.Zero || a.Down[layer] == IntPtr.Zero)
+                return false;
+
+            string prefix = $"blk.{layer}";
+
+            if (!_weights.TryGetValue($"{prefix}.ffn_gate_inp.weight", out var routerW))
+                return false;
+            string preNorm2Key = _weights.ContainsKey($"{prefix}.pre_ffw_norm_2.weight")
+                ? $"{prefix}.pre_ffw_norm_2.weight" : $"{prefix}.ffn_pre_norm_2.weight";
+            if (!_weights.TryGetValue(preNorm2Key, out var preNorm2W)) return false;
+            string postNorm1Key = _weights.ContainsKey($"{prefix}.post_ffw_norm_1.weight")
+                ? $"{prefix}.post_ffw_norm_1.weight" : $"{prefix}.ffn_post_norm_1.weight";
+            if (!_weights.TryGetValue(postNorm1Key, out var postNorm1W)) return false;
+            string postNorm2Key = _weights.ContainsKey($"{prefix}.post_ffw_norm_2.weight")
+                ? $"{prefix}.post_ffw_norm_2.weight" : $"{prefix}.ffn_post_norm_2.weight";
+            if (!_weights.TryGetValue(postNorm2Key, out var postNorm2W)) return false;
+
+            bool isLocal = IsLocalLayer(layer);
+            bool isShared = _kvDonorMap.ContainsKey(layer);
+            int H = Config.HiddenSize;
+
+            // Proportional RoPE freq factors apply to global layers only.
+            IntPtr freqPtr = IntPtr.Zero;
+            int freqLen = 0;
+            if (!isLocal && _weights.TryGetValue("rope_freqs.weight", out var freqTensor))
+            {
+                freqPtr = (IntPtr)GetFloatPtr(freqTensor);
+                freqLen = (int)freqTensor.ElementCount();
+            }
+
+            // Optional routing-input per-dim scale and per-expert post-down scale.
+            IntPtr gateInpScalePtr = IntPtr.Zero;
+            if (_weights.TryGetValue($"{prefix}.ffn_gate_inp.scale", out var giScale))
+                gateInpScalePtr = (IntPtr)GetFloatPtr(giScale);
+            IntPtr downScalePtr = IntPtr.Zero;
+            string downScaleKey = _weights.ContainsKey($"{prefix}.ffn_down_exps.scale")
+                ? $"{prefix}.ffn_down_exps.scale" : $"{prefix}.ffn_gate_inp.per_expert_scale";
+            if (_weights.TryGetValue(downScaleKey, out var downScaleT))
+                downScalePtr = (IntPtr)GetFloatPtr(downScaleT);
+
+            var gateW = _layerStackedGate[layer];
+            var downW = _layerStackedDown[layer];
+
+            var args = new Gemma4MoELayerDecodeArgs
+            {
+                Hidden = (IntPtr)GetFloatPtr(hidden),
+                AttnNormW = a.AttnNorm[layer],
+                QkvW = a.Qkv[layer], QkvType = a.QkvType[layer], QkvNe0 = a.QkvNe0[layer], QkvNe1 = a.QkvNe1[layer], QkvBytes = a.QkvBytes[layer],
+                KW = a.K[layer], KType = a.KType[layer], KNe0 = a.KNe0[layer], KNe1 = a.KNe1[layer], KBytes = a.KBytes[layer],
+                VW = a.V[layer], VType = a.VType[layer], VNe0 = a.VNe0[layer], VNe1 = a.VNe1[layer], VBytes = a.VBytes[layer],
+                QNormW = a.QNorm[layer],
+                KNormW = isShared ? IntPtr.Zero : a.KNorm[layer],
+                OW = a.O[layer], OType = a.OType[layer], ONe0 = a.ONe0[layer], ONe1 = a.ONe1[layer], OBytes = a.OBytes[layer],
+                PostAttnNormW = a.PostAttnNorm[layer],
+                KCache = a.KCache[layer], VCache = a.VCache[layer],
+                FreqFactors = freqPtr, FreqFactorsLen = freqLen,
+                FfnNormW = a.FfnNorm[layer],
+                GuW = a.Gu[layer], GuType = a.GuType[layer], GuNe0 = a.GuNe0[layer], GuNe1 = a.GuNe1[layer], GuBytes = a.GuBytes[layer],
+                DownW = a.Down[layer], DownType = a.DownType[layer], DownNe0 = a.DownNe0[layer], DownNe1 = a.DownNe1[layer], DownBytes = a.DownBytes[layer],
+                PostFfwNorm1W = (IntPtr)GetFloatPtr(postNorm1W),
+                GateInpW = (IntPtr)GetFloatPtr(routerW),
+                GateInpScale = gateInpScalePtr,
+                PreFfwNorm2W = (IntPtr)GetFloatPtr(preNorm2W),
+                GateUpExps = gateW.Data, GueType = gateW.GgmlType, GueNe0 = gateW.PerExpertNe0, GueNe1 = gateW.PerExpertNe1, GueBytes = gateW.TotalRawBytes,
+                DownExps = downW.Data, DeType = downW.GgmlType, DeNe0 = downW.PerExpertNe0, DeNe1 = downW.PerExpertNe1, DeBytes = downW.TotalRawBytes,
+                DownExpsScale = downScalePtr,
+                PostFfwNorm2W = (IntPtr)GetFloatPtr(postNorm2W),
+                PostFfwNormW = a.PostFfnNorm[layer],
+
+                StructBytes = Marshal.SizeOf<Gemma4MoELayerDecodeArgs>(),
+                HiddenSize = H,
+                NumHeads = Config.NumHeads,
+                NumKvHeads = a.KvHeads[layer],
+                HeadDim = a.HeadDim[layer],
+                CacheSize = a.CacheSize[layer],
+                IsLocal = a.IsLocal[layer],
+                IsShared = isShared ? 1 : 0,
+                SlidingWindow = _slidingWindow,
+                Position = startPos,
+                RopeNDims = a.RopeNDims[layer],
+                KvCacheType = _kvCacheDtype.GgmlType(),
+                NumExperts = _numExperts,
+                NumExpertsUsed = _numExpertsUsed,
+                SeparateQkv = a.K[layer] != IntPtr.Zero ? 1 : 0,
+
+                Eps = Config.Eps,
+                RopeBase = a.RopeBase[layer],
+                InvSqrtHidden = 1f / MathF.Sqrt(H),
+                LayerOutputScale = a.LayerScalar[layer],
+            };
+
+            try
+            {
+                GgmlBasicOps.Gemma4MoELayerDecode(in args);
+            }
+            catch (Exception ex)
+            {
+                // Disable for the rest of this model's lifetime and fall back to
+                // the per-op path so a kernel issue degrades to (slow) correctness
+                // rather than failing generation.
+                System.Console.WriteLine($"[gemma4] fused MoE layer decode disabled after error: {ex.Message}");
+                _moeFusedDecodeEnabled = false;
+                return false;
+            }
+            // The kernel writes K/V into the device-local cached buffer (bound
+            // with USAGE_COMPUTE), so the host copy is now stale — mark dirty so
+            // any later host read of the cache syncs first (mirrors the fused
+            // full-model decode path).
+            _kvCacheHostDirty = true;
+            return true;
         }
 
         /// <summary>
@@ -3988,7 +4224,12 @@ namespace TensorSharp.Models
                 // Block-wise windowed attention for SWA layers with very large
                 // sequences (e.g., when chunking is disabled for multimodal).
                 // Avoids O(n²) score tensor that can exhaust memory.
-                bool useWindowedAttn = isLocal && kvIsSeqHeads && seqLen > _slidingWindow * 4;
+                // Disabled when multimodal soft tokens are present: that path
+                // applies a plain causal+window mask and cannot honour the
+                // bidirectional image span, so fall back to the full O(n²)
+                // ApplyCausalMask path which does.
+                bool useWindowedAttn = isLocal && kvIsSeqHeads && seqLen > _slidingWindow * 4
+                    && exceptPositions == null;
 
                 // Fused prefill attention: run Q*K^T → mask → softmax → *V as a
                 // a fused backend kernel where available, eliminating several dispatches
@@ -4067,8 +4308,16 @@ namespace TensorSharp.Models
                     kExpanded.Dispose();
 
                     int windowSize = isLocal ? _slidingWindow : 0;
-                    HashSet<int> maskExcept = isLocal ? null : exceptPositions;
-                    ApplyCausalMask(scores, seqLen, kvLen, windowSize, maskExcept);
+                    // Bidirectional (non-causal) attention over multimodal
+                    // soft-token spans must apply on EVERY layer - including
+                    // the local/SWA layers (Gemma 4 is ~5:1 SWA:global, so
+                    // restricting the exception to global layers left the
+                    // image tokens causally masked on ~83% of layers and
+                    // badly degraded image understanding). llama.cpp encodes
+                    // the image batch with set_causal_attn(false) on all
+                    // layers; the soft-token span fits inside the 1024 SWA
+                    // window so the window bound never clips it.
+                    ApplyCausalMask(scores, seqLen, kvLen, windowSize, exceptPositions);
                     Ops.Softmax(scores, scores);
 
                     var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
@@ -5164,6 +5413,17 @@ namespace TensorSharp.Models
 
             if (exceptPositions != null && exceptPositions.Count > 0)
             {
+                // Combined causal + sliding-window + bidirectional-image mask.
+                // A query at absolute position qa attends to key kv when:
+                //   * kv is within the (optional) sliding window lower bound, AND
+                //   * kv <= qa (causal)  OR  both qa and kv are multimodal
+                //     soft tokens (bidirectional within the image/audio span).
+                // This matches llama.cpp's set_causal_attn(false) image batch:
+                // soft tokens see each other in both directions on every layer,
+                // but never attend forward to ordinary (text) tokens, and text
+                // tokens never attend forward to the image. Window + bidi are
+                // handled together here so the separate window pass below is
+                // skipped (early return).
                 float* sPtr = GetFloatPtr(scores);
                 int numHeads = (int)scores.Sizes[0];
                 int rowStride = queryLen * totalKVLen;
@@ -5175,15 +5435,22 @@ namespace TensorSharp.Models
                     {
                         int queryAbsPos = startPos + q;
                         bool queryIsExcept = exceptPositions.Contains(queryAbsPos);
+                        int lowerBound = windowSize > 0 ? queryAbsPos - windowSize + 1 : 0;
                         float* row = headScores + q * totalKVLen;
-                        for (int kv = queryAbsPos + 1; kv < totalKVLen; kv++)
+                        for (int kv = 0; kv < totalKVLen; kv++)
                         {
-                            if (!queryIsExcept && !exceptPositions.Contains(kv))
+                            bool allowed;
+                            if (kv <= queryAbsPos)
+                                allowed = windowSize <= 0 || kv >= lowerBound;
+                            else
+                                allowed = queryIsExcept && exceptPositions.Contains(kv);
+                            if (!allowed)
                                 row[kv] = float.NegativeInfinity;
                         }
                     }
                 }
                 InvalidateTensorDeviceCache(scores);
+                return;
             }
             else
             {

@@ -651,6 +651,33 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Decide whether the tokenizer should prepend a BOS token when encoding a
+        /// prompt with <c>addSpecial=true</c>.
+        ///
+        /// Normally this mirrors the GGUF's <c>tokenizer.ggml.add_bos_token</c> flag.
+        /// However, some GGUF conversions (notably several Gemma 4 builds, e.g.
+        /// gemma-4-31B IQ2_M) set <c>add_bos_token=false</c> and instead rely on the
+        /// chat template's leading <c>{{ bos_token }}</c> to emit the
+        /// beginning-of-sequence marker. TensorSharp always renders <c>bos_token</c> as
+        /// an empty string (and its hardcoded chat renderers deliberately omit a literal
+        /// BOS to avoid a double BOS when the tokenizer owns it), so for such models the
+        /// rendered prompt would otherwise carry NO BOS at all. A Gemma-family model
+        /// with a missing BOS degenerates into repetition / off-topic output. When the
+        /// template declares a leading BOS but the tokenizer is configured not to add
+        /// one, let the tokenizer own it so the prompt still begins with exactly one BOS
+        /// (the empty-rendered <c>bos_token</c> guarantees we never double it).
+        /// </summary>
+        public static bool ResolveAddBosToken(bool addBosFromMetadata, int bosTokenId, string? chatTemplate)
+        {
+            if (addBosFromMetadata)
+                return true;
+            if (bosTokenId < 0)
+                return false;
+            return !string.IsNullOrEmpty(chatTemplate)
+                && chatTemplate.Contains("bos_token", StringComparison.Ordinal);
+        }
+
         protected void ParseTokenizer()
         {
             var vocabTokens = _gguf.GetStringArray("tokenizer.ggml.tokens");
@@ -659,8 +686,16 @@ namespace TensorSharp.Models
             var tokenTypes = _gguf.GetInt32Array("tokenizer.ggml.token_type");
             int bosId = (int)_gguf.GetUint32("tokenizer.ggml.bos_token_id");
             int eosId = (int)_gguf.GetUint32("tokenizer.ggml.eos_token_id");
-            bool addBos = _gguf.GetBool("tokenizer.ggml.add_bos_token", false);
+            bool addBosMetadata = _gguf.GetBool("tokenizer.ggml.add_bos_token", false);
             bool addEos = _gguf.GetBool("tokenizer.ggml.add_eos_token", false);
+
+            bool addBos = ResolveAddBosToken(addBosMetadata, bosId, _gguf.GetString("tokenizer.chat_template"));
+            if (addBos && !addBosMetadata)
+            {
+                Console.WriteLine(
+                    "  Tokenizer: add_bos_token=false but chat template emits bos_token; " +
+                    "enabling BOS so the prompt starts with exactly one BOS.");
+            }
 
             var eosIds = new List<int> { eosId };
             var extraEos = _gguf.GetInt32Array("tokenizer.ggml.eos_token_ids");
