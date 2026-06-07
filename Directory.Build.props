@@ -3,6 +3,14 @@
     <TensorSharpVersion>2.8.6</TensorSharpVersion>
     <TensorSharpPackageTags>tensorsharp;tensor;llm;gguf;inference</TensorSharpPackageTags>
 
+    <TensorSharpHostObjFolder Condition="$([MSBuild]::IsOSPlatform('Windows'))">obj/windows/</TensorSharpHostObjFolder>
+    <TensorSharpHostObjFolder Condition="$([MSBuild]::IsOSPlatform('Linux'))">obj/linux/</TensorSharpHostObjFolder>
+    <TensorSharpHostObjFolder Condition="$([MSBuild]::IsOSPlatform('OSX'))">obj/macos/</TensorSharpHostObjFolder>
+    <TensorSharpHostObjFolder Condition="'$(TensorSharpHostObjFolder)' == ''">obj/other/</TensorSharpHostObjFolder>
+    <BaseIntermediateOutputPath Condition="'$(BaseIntermediateOutputPath)' == '' Or '$(BaseIntermediateOutputPath)' == 'obj\' Or '$(BaseIntermediateOutputPath)' == 'obj/'">$(TensorSharpHostObjFolder)</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath Condition="'$(MSBuildProjectExtensionsPath)' == '' Or '$(MSBuildProjectExtensionsPath)' == 'obj\' Or '$(MSBuildProjectExtensionsPath)' == 'obj/'">$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj/**;obj\**</DefaultItemExcludes>
+
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

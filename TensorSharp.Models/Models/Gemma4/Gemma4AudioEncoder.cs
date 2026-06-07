@@ -78,7 +78,13 @@ namespace TensorSharp.Models
                 (uint)gguf.GetUint32("gemma4.audio.embedding_length", 1024));
             _numHeads = (int)gguf.GetUint32("clip.audio.attention.head_count",
                 (uint)gguf.GetUint32("gemma4.audio.attention.head_count", 8));
-            _headDim = _hiddenSize / _numHeads;
+            // Encoder-free "gemma4ua" mmproj files (e.g. gemma-4-12b) have no
+            // conformer, so head_count / block_count / feed_forward_length are
+            // written as 0. These models go through EncodeRawWaveform and never
+            // touch the conformer attention path, so _headDim is unused — guard
+            // the division to avoid a DivideByZeroException at load time.
+            // Conformer mmproj files always report head_count > 0.
+            _headDim = _numHeads > 0 ? _hiddenSize / _numHeads : 0;
             _ffnSize = (int)gguf.GetUint32("clip.audio.feed_forward_length",
                 (uint)gguf.GetUint32("gemma4.audio.feed_forward_length", 4096));
             _numLayers = (int)gguf.GetUint32("clip.audio.block_count",

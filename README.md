@@ -19,6 +19,8 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | [Per-model architecture cards](docs/models/README.md) | Read end-to-end documentation of one architecture (origin, forward graph, components, parameters, and how TensorSharp implements / optimizes prefill and decode) |
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | Understand the vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
 | [Inference benchmark matrix](docs/inference_benchmark_matrix.md) | Compare TensorSharp against llama.cpp and Ollama across text / multimodal workloads, with KV-cache dtype sweeps |
+| [Environment variable feature matrix](docs/env_var_feature_matrix.md) | See which high-impact runtime flags affect which models, backends, and prompt types |
+| [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |
 | [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Copy complete curl and Python examples for the server surface |
 | [Server integration tests](TensorSharp.Server/testdata/README.md) | Exercise the public API contract against a running server |
 
@@ -33,6 +35,7 @@ A C# inference engine for running large language models (LLMs) locally using GGU
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes |
+| Test/eval harness | `TensorSharp.TestMatrix` sweeps supported hosts across model, backend, feature, and env-var cells, then compares against per-host baselines |
 
 ## Features
 
@@ -169,11 +172,13 @@ TensorSharp/
 │   ├── testdata/                # Integration test suites (bash + Python)
 │   └── API_EXAMPLES.md          # Detailed API documentation
 ├── TensorSharp.Cli/             # CLI application (one-shot generation, interactive REPL, batch JSONL, benchmarks)
+├── TensorSharp.TestMatrix/      # Test / benchmark matrix runner, default prompts, env-var sweeps, and per-host baselines
 ├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, paged scheduler, batched-model correctness, web/server helpers
 ├── AdvUtils/                    # Utility library (logger)
 ├── docs/                        # Developer reference
 │   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # Paged KV cache, prefix sharing, scheduler, per-model batched-forward status
+│   ├── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
 │   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
 ├── benchmarks/                  # Reproducible benchmark harnesses
 │   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
@@ -610,15 +615,15 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_NEMOTRON_BATCHED` | Set to `0` to force Nemotron-H onto the legacy per-sequence KV-swap path (default: batched/paged). |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Use the native Mamba2 batched step kernel inside Nemotron-H batched path. |
 | `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
-| `TS_MLX_PIPELINED_DECODE` | Set to `1` to enable pipelined greedy decode on the MLX backend (CLI only). |
+| `TS_MLX_PIPELINED_DECODE` | `1` (default) enables pipelined greedy decode on the MLX backend when the request is greedy, has no stop sequences, and the model supports device-side argmax / next-embedding lookup. Set to `0` to disable. CLI only. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |
 | `TS_MLX_FUSED_KV_WRITE` | `1` (default) uses a single multi-dim `slice_update` to write the per-token KV block. Set to `0` to revert to the per-head loop (A/B testing / regression isolation). |
 | `TS_MLX_BATCHED_MOE_DECODE` | `1` (default) collapses K per-expert decode dispatches to one batched dispatch per (gate/up/down) kind for Qwen 3.5/3.6 MoE. Set to `0` on memory-constrained machines (saves ~weight-doubling overhead from the stacked weight slabs). |
 | `TS_MLX_MOE_FUSED_GATE_UP_SILU` | `1` (default) fuses gate matmul + up matmul + SiLUMul into one Metal kernel for batched MoE decode. Set to `0` to A/B against the legacy 3-dispatch path. |
-| `TS_MLX_DEVICE_ROUTER` | `1` (opt-in) keeps MoE router top-K + softmax on device to skip ~60 host syncs/token on Qwen 3.6-35B-A3B. Requires greedy router + batched MoE matmul. |
+| `TS_MLX_DEVICE_ROUTER` | `1` (default) keeps MoE router top-K + softmax on device to skip ~60 host syncs/token on Qwen 3.6-35B-A3B. Set to `0` to disable; the code also falls back automatically when prerequisites are missing. |
 | `TS_MLX_LOG_MEMORY_POLICY` | `1` (default) prints once-per-load MLX memory-policy lines (wired limit, GGUF mlock status, allocator caps). Set to `0` to silence. |
 | `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | Override the MLX allocator hard cap / unused-buffer cache cap / wired-buffer residency cap (megabytes). Defaults are derived from the host's unified-memory capacity. |
-| `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Default `4` (sweep on E4B Q8_0 shows ~7% decode win vs. disabled). Set to `0` to disable. |
+| `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Gemma 4 defaults to every 4 layers via `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS`; Qwen 3 / Qwen 3.5 / Nemotron-H default to every 16 layers via `TS_MLX_EVAL_EVERY_N_LAYERS`. Set to `0` to disable where supported. |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
 
 Sampling parameter precedence (highest wins):
@@ -661,13 +666,13 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 |---|---|---|---|
 | Default compute backend | `ggml_metal` (macOS), `ggml_cpu` (Windows/Linux) | `BACKEND` | `--backend` |
 | MLX backend library lookup | probe app dir | `TENSORSHARP_MLX_LIBRARY` (full path to `libmlxc`), `TENSORSHARP_MLX_LIBRARY_DIR` (directory) | — |
-| MLX pipelined greedy decode (CLI only) | OFF | `TS_MLX_PIPELINED_DECODE=1` | — |
+| MLX pipelined greedy decode (CLI only) | ON when eligible | `TS_MLX_PIPELINED_DECODE=0` disables | — |
 | MLX `mlock(2)` of GGUF mmap so weights stay resident | ON | `TS_MLX_MLOCK_GGUF=0` to disable | — |
 | MLX fused multi-dim KV write (single `slice_update` per cache block) | ON | `TS_MLX_FUSED_KV_WRITE=0` to revert to per-head loop | — |
 | MLX batched MoE decode (Qwen 3.5/3.6 MoE) | ON | `TS_MLX_BATCHED_MOE_DECODE=0` for legacy per-expert path | — |
 | MLX fused MoE gate+up+SiLUMul Metal kernel | ON | `TS_MLX_MOE_FUSED_GATE_UP_SILU=0` for legacy 3-dispatch | — |
-| MLX on-device MoE router top-K + softmax | OFF | `TS_MLX_DEVICE_ROUTER=1` | — |
-| MLX Gemma 4 layer-boundary `async_eval` cadence | every 4 layers | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N` (`0` = disabled) | — |
+| MLX on-device MoE router top-K + softmax | ON when prerequisites are met | `TS_MLX_DEVICE_ROUTER=0` disables | — |
+| MLX layer-boundary `async_eval` cadence | Gemma 4: every 4 layers; Qwen / Nemotron: every 16 layers | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N` or `TS_MLX_EVAL_EVERY_N_LAYERS=N` (`0` = disabled where supported) | — |
 | MLX allocator caps (memory / cache / wired buffer) | host-derived | `TS_MLX_MEMORY_LIMIT_MB`, `TS_MLX_CACHE_LIMIT_MB`, `TS_MLX_WIRED_LIMIT_MB` | — |
 | MLX one-line memory-policy banners at load | ON | `TS_MLX_LOG_MEMORY_POLICY=0` to silence | — |
 
@@ -983,7 +988,7 @@ The memory reduction comes primarily from no longer copying the GGUF file into a
 
 ### Cross-engine inference matrix
 
-For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic prefill / image / audio / video tasks and KV-cache dtype sweeps for `f32`, `f16`, and `q8_0`), see [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). The driver scripts are in `benchmarks/inference_matrix/scripts/` and the per-cell raw JSON outputs live under `benchmarks/inference_matrix/results/`.
+For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic prefill / image / audio / video tasks and KV-cache dtype sweeps for `f32`, `f16`, and `q8_0`), see [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). The driver scripts are in `benchmarks/inference_matrix/scripts/`; per-cell raw JSON outputs are generated under `benchmarks/inference_matrix/results/` when you run the matrix.
 
 ## Testing
 
@@ -997,7 +1002,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 
 ### Server integration tests
 
-Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue behavior, concurrent requests, and abort support. Architecture-specific features (thinking, tool calling) are auto-detected and skipped when the active model does not support them.
+Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features (thinking, tool calling) are auto-detected and skipped when the active model does not support them.
 
 ```bash
 # Start TensorSharp.Server, then run:
@@ -1007,6 +1012,17 @@ bash TensorSharp.Server/testdata/test_multiturn.sh
 ```
 
 See [TensorSharp.Server/testdata/README.md](TensorSharp.Server/testdata/README.md) for the full test matrix.
+
+### Inference matrix runner
+
+`TensorSharp.TestMatrix` is the broader CLI-driven harness for long-running model/backend coverage. It discovers GGUF files, filters unavailable backends and unsupported prompt types, runs baseline plus env-var sweep cells, writes one JSON result per cell, emits an aggregate Markdown report, and compares results with per-host baselines when requested.
+
+```bash
+dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
+dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run
+```
+
+See [TensorSharp.TestMatrix/README.md](TensorSharp.TestMatrix/README.md) and [docs/env_var_feature_matrix.md](docs/env_var_feature_matrix.md) for the current runner contract.
 
 ## Author
 

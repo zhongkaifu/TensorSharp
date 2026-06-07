@@ -1,5 +1,7 @@
 # TensorSharp.TestMatrix
 
+[English](README.md) | [中文](README_zh-cn.md)
+
 A test and benchmark matrix runner for TensorSharp inference. It sweeps the
 cartesian product of **(model × backend × feature × env-var)** by invoking
 `TensorSharp.Cli` as a subprocess, parses per-run metrics from its structured
@@ -17,7 +19,7 @@ affect — keep them in sync when you add a new flag.
 | **Models** | Auto-discovered GGUFs in `/Users/ZhongkaiFu/work/model` (configurable); explicit overrides also supported |
 | **Backends** | `cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `cuda`, `mlx` (host-availability filtered) |
 | **Features / prompt types** | Synthetic prefill (512, 2048), synthetic decode (128), short text, long text, uploaded text, multi-turn chat, function/tool calling, thinking mode, image, audio, video |
-| **Env-var sweeps** | 17 curated high-impact flags (continuous batching, KV-cache codec, prefill chunk, multimodal, MLX) — see the [matrix doc](../docs/env_var_feature_matrix.md) |
+| **Env-var sweeps** | Baseline cells plus the curated high-impact flags selected by `default_env_vars` in [`Defaults/matrix-config.json`](Defaults/matrix-config.json). The registered superset lives in `EnvVarMatrix.All`; see the [matrix doc](../docs/env_var_feature_matrix.md). |
 
 ## Building
 
@@ -38,6 +40,10 @@ Default run (everything the host supports, all curated env-var sweeps):
 dotnet run --project TensorSharp.TestMatrix -c Release
 ```
 
+Each applicable cell also gets a baseline run with no forced env var. Sweep
+cases pass exactly one env var/value pair to the subprocess after inherited
+`TS_*`/related variables are scrubbed.
+
 Curated subset — useful for an interactive dev cycle:
 
 ```bash
@@ -54,6 +60,12 @@ Dry-run (print every case id it would execute):
 
 ```bash
 dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run
+```
+
+Disable env-var sweeps and run only baseline cells:
+
+```bash
+dotnet run --project TensorSharp.TestMatrix -c Release -- --env-vars none
 ```
 
 Resume an interrupted run without re-executing cells already on disk:
@@ -178,7 +190,7 @@ host-class layout, and update workflow.
 |---|---|
 | A new backend | [`Matrix/Backend.cs`](Matrix/Backend.cs) — add a `BackendInfo`, register in `BackendCatalog.All` |
 | A new prompt type / feature | [`Matrix/FeatureCatalog.cs`](Matrix/FeatureCatalog.cs) + [`Runners/CliRunner.cs`](Runners/CliRunner.cs) `BuildArgs` switch; drop any new prompt under `Inputs/prompts/` |
-| A new env-var sweep | [`Matrix/EnvVarMatrix.cs`](Matrix/EnvVarMatrix.cs) — add an `EnvVarSpec` with an `AppliesTo` predicate; add a row to [`docs/env_var_feature_matrix.md`](../docs/env_var_feature_matrix.md) |
+| A new env-var sweep | [`Matrix/EnvVarMatrix.cs`](Matrix/EnvVarMatrix.cs) — add an `EnvVarSpec` with an `AppliesTo` predicate; add it to [`Defaults/matrix-config.json`](Defaults/matrix-config.json) if it should run by default; add a row to [`docs/env_var_feature_matrix.md`](../docs/env_var_feature_matrix.md) and its Chinese version |
 | A model the auto-discovery misses | Add a `ModelConfig` entry under `models[]` in `matrix-config.json` |
 
 ## CI

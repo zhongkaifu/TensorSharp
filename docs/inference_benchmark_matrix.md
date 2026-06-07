@@ -1,10 +1,17 @@
 # TensorSharp inference benchmark matrix
 
+[English](inference_benchmark_matrix.md) | [中文](inference_benchmark_matrix_zh-cn.md)
+
 Comparison of **TensorSharp**, **llama.cpp** and **Ollama** running the **same** GGUF files on the **same** machine, across text, prefill, decode and multimodal (image / audio / video) workloads.
 
 TensorSharp is represented by four variants: three on the **GGML Metal** backend with three KV-cache dtypes (F32, F16, Q8_0) to measure the impact of KV-cache precision, and one on the **MLX** backend (mlx-c / Apple Metal, F32 KV) to compare against the GGML Metal path.
 
 All engines were pointed at the same on-disk `.gguf` file. For Ollama this required registering a custom Modelfile (`ts-gemma4-e4b-q8`) so that no quantisation differences would skew the comparison.
+
+This is a captured benchmark snapshot, not an automatically regenerated report
+for the current working tree. Re-run the scripts in
+`benchmarks/inference_matrix/scripts/` to refresh the numbers for a new commit,
+backend version, or machine.
 
 ## TL;DR
 
@@ -24,7 +31,7 @@ And prefill throughput on the synthetic 2048-token prompt (`pp2048`):
 
 | Engine | Version / build |
 |--------|-----------------|
-| TensorSharp | git `90c14f4` (this repo), .NET 10.0.103, ggml_metal and mlx backends |
+| TensorSharp | captured at git `90c14f4`, .NET 10.0.103, ggml_metal and mlx backends |
 | llama.cpp   | brew package, version: 8990 (660b1b4bd) (Metal + BLAS) |
 | Ollama      | 0.23.4 |
 
@@ -174,4 +181,4 @@ python3 scripts/build_report.py
 
 Driver: `benchmarks/inference_matrix/scripts/run_bench.py`  
 Report generator: `benchmarks/inference_matrix/scripts/build_report.py`  
-Per-cell raw JSON: `benchmarks/inference_matrix/results/<engine>__<model>__<task>.json`
+Per-cell raw JSON is generated at run time under `benchmarks/inference_matrix/results/<engine>__<model>__<task>.json`.

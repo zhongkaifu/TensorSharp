@@ -1,0 +1,121 @@
+# 环境变量 x 功能矩阵
+
+[English](env_var_feature_matrix.md) | [中文](env_var_feature_matrix_zh-cn.md)
+
+本文是 [`TensorSharp.TestMatrix`](../TensorSharp.TestMatrix/README_zh-cn.md)
+使用的运行时开关参考。它只覆盖会真实影响推理正确性、吞吐、内存占用或模型路由
+的高影响环境变量。
+
+代码侧的事实来源是
+[`TensorSharp.TestMatrix/Matrix/EnvVarMatrix.cs`](../TensorSharp.TestMatrix/Matrix/EnvVarMatrix.cs)。
+默认 sweep 列表配置在
+[`TensorSharp.TestMatrix/Defaults/matrix-config.json`](../TensorSharp.TestMatrix/Defaults/matrix-config.json)。
+
+## TestMatrix 如何使用本文
+
+- 每个适用的 `(model, backend, feature)` cell 都会先运行一个**baseline**：
+  不强制设置任何 sweep 变量。
+- 对每个被选中的环境变量，运行器会为每个列出的值创建一个 case，并只把该变量
+  传给 `TensorSharp.Cli` 子进程。
+- 每个子进程启动前，会清理继承来的 `TS_*`、`GDN_*`、`QWEN35_*`、
+  `FUSED_*`、`KV_CACHE_DTYPE`、`MAX_CONTEXT`、`MAX_TOKENS`、
+  `VIDEO_MAX_FRAMES`、`VIDEO_SAMPLE_FPS`，确保矩阵值是权威输入。
+- `--env-vars none` 会关闭 sweep case。如果配置文件中的 `default_env_vars`
+  为空，且 CLI 没有覆盖它，运行器会使用全部已注册的 `EnvVarMatrix.All` 项。
+
+下表中的“运行时 baseline”表示变量未设置时的行为。“默认 sweep”表示当前默认
+配置是否会扫描该变量，而不是所有已注册变量。
+
+## 连续批处理 / 批处理前向
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `TS_GPTOSS_BATCHED` | GPT OSS | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
+| `TS_QWEN35_BATCHED` | Qwen 3.5 / 3.6 family、`qwen3next` | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
+| `TS_QWEN35_BATCHED_GDN_NATIVE` | Qwen 3.5 / 3.6 family、`qwen3next` | 原生批处理 GatedDeltaNet 内核 | 关闭 | `0`, `1` | 否 |
+| `TS_NEMOTRON_BATCHED` | Nemotron-H | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
+| `TS_GEMMA4_BATCHED` | Gemma 4 | 批处理分页前向 vs 按序列回退 | 启用 | `0`, `1` | 是 |
+| `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | 原生批处理 Mamba2 step | 关闭 | `0`, `1` | 否 |
+| `TS_BATCHED_N1_FAST_PATH` | 全部 | 让符合条件的 N=1 步骤也走批处理调度器 | 关闭 | `0`, `1` | 是 |
+| `TS_SCHED_DISABLE_BATCHED` | 全部 | 全局按序列 KV-swap 回退 | 关闭 | `0`, `1` | 是 |
+
+## KV Cache / 上下文
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `KV_CACHE_DTYPE` | 全部 | KV cache 元素类型 | `f32` | `f32`, `f16`, `q8_0` | 是 |
+| `TS_KV_PAGED_QUANT_BITS` | 全部 | TurboQuant 分页 KV 块编解码器 | 关闭（`0`） | `0`, `4`, `8` | 是 |
+| `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限 | 模型默认值 | `4096`, `8192`, `16384` | 是 |
+
+## Prefill / Decode 调优
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `TS_PREFILL_CHUNK` | GPT OSS、Qwen 3.5 / 3.6 family 的长上下文功能 | 分块 prefill 大小 | 架构默认值 | `256`, `512`, `1024` | 是 |
+| `GDN_DISABLE_CHUNKED_PREFILL` | `qwen3next` | 关闭 GDN 分块 prefill | 关闭 | `0`, `1` | 否 |
+| `TS_GGML_ASYNC_COMPUTE` | GGML 后端 | 异步 compute 提交 | 关闭 | `0`, `1` | 是 |
+
+## 多模态
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `VIDEO_SAMPLE_FPS` | 视频功能 | 按时间抽帧的每秒帧数 | `1` | `1`, `2` | 是 |
+| `VIDEO_MAX_FRAMES` | 视频功能 | 抽取视频帧上限 | 不限制 | `8`, `16` | 是 |
+| `TS_NEMOTRON_IMAGE_MAX_TILES` | Nemotron-H 图像功能 | 最大图像 tile 数 | 架构默认值 | `4`, `8`, `12` | 是 |
+
+## MLX 专属
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `TS_MLX_BATCHED_MOE_DECODE` | MLX 上的 Qwen 3.5 / 3.6 MoE | 每种 gate/up/down 一次批处理 dispatch，而不是按 expert dispatch | 启用 | `0`, `1` | 是 |
+| `TS_MLX_DEVICE_ROUTER` | MLX 上的 Qwen 3.5 / 3.6 MoE | 满足前置条件时在 device 上执行 top-K + softmax router | 启用，且会自动回退 | `0`, `1` | 是 |
+| `TS_MLX_PIPELINED_DECODE` | MLX decode 功能 | 模型支持时使用 device-side argmax 的流水化贪心 decode | 满足条件时启用 | `0`, `1` | 是 |
+| `TS_MLX_DEVICE_KV_COPY` | MLX | Device 侧 KV scatter | 启用 | `0`, `1` | 否 |
+| `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | MLX 上的 Qwen 3.5 / 3.6 family | Packed GDN kernel | 关闭 | `0`, `1` | 是 |
+
+## 功能覆盖
+
+功能目录位于
+[`TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs`](../TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs)。
+当前功能集合如下：
+
+| 功能 | 驱动方式 | 能力门控 |
+|---|---|---|
+| `pp512` | `--benchmark --bench-prefill 512 --bench-decode 0` | 所有模型 |
+| `pp2048` | `--benchmark --bench-prefill 2048 --bench-decode 0` | 所有模型 |
+| `tg128` | `--benchmark --bench-prefill 32 --bench-decode 128` | 所有模型 |
+| `short_text` | `--input prompts/short_text.txt --max-tokens 64` | 所有模型 |
+| `long_text` | `--input prompts/long_text.txt --max-tokens 64` | 所有模型 |
+| `uploaded_text` | `--input prompts/upload_text.txt --max-tokens 64` | 所有模型 |
+| `multi_turn` | `--multi-turn-jsonl multi_turn/three_turn.jsonl` | 所有模型 |
+| `tools` | `--tools tools/weather_tools.json` | 矩阵能力标记为支持工具调用的模型 |
+| `thinking` | `--think` | 矩阵能力标记为支持思维链的模型 |
+| `image` | `--image media/apple.png --mmproj ...` | 图像模型且有 mmproj |
+| `audio` | `--audio media/sample.mp3 --mmproj ...` | 音频模型且有 mmproj |
+| `video` | `--video media/sample.mp4 --mmproj ...` | 视频模型且有 mmproj |
+
+默认语义检查刻意保持较弱，用于捕获灾难性回归。相关功能会检查 `blue`、
+`paged`、`08:01:12`、`alex` + `teal`、`get_current_weather` + `tokyo`、
+`10:38` 与 `apple`。音频与视频没有默认期望子串，因为样例媒体由运行环境提供。
+
+## 过滤规则
+
+运行前会过滤组合爆炸：
+
+1. 后端可用性：CUDA 后端在 macOS 跳过；MLX 需要 Apple Silicon；GGML Metal 需要 macOS。
+2. 模型能力：当发现或配置的模型不支持图像 / 音频 / 视频 / 工具 / 思维链时，对应功能跳过。
+3. 投影器可用性：多模态功能需要 mmproj 路径。
+4. 环境变量适用性：每个 `EnvVarSpec.AppliesTo` 决定该变量是否对当前 `(model, backend, feature)` cell 有意义。
+
+## 更新矩阵
+
+新增高影响环境变量时：
+
+1. 在 [`TensorSharp.TestMatrix/Matrix/EnvVarMatrix.cs`](../TensorSharp.TestMatrix/Matrix/EnvVarMatrix.cs) 注册一个 `EnvVarSpec`。
+2. 如果它应进入默认 sweep，把它加入
+   [`Defaults/matrix-config.json`](../TensorSharp.TestMatrix/Defaults/matrix-config.json)
+   的 `default_env_vars`。
+3. 更新本文和英文版本中的对应行。
+4. 如果该变量改变功能适用性，同步更新
+   [`FeatureCatalog.cs`](../TensorSharp.TestMatrix/Matrix/FeatureCatalog.cs)
+   或模型发现的能力推断。

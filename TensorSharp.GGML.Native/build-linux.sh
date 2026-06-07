@@ -89,6 +89,11 @@ detect_default_build_parallel_level() {
         cpu_count="$(nproc)"
     fi
 
+    # Use all CPUs, bounded only by RAM. nvcc is memory-hungry, so allow ~3 GB per
+    # parallel job (matches llama.cpp/ggml's own heuristic). The previous hard cap
+    # of 4 jobs throttled the CUDA compile to a fraction of available cores even on
+    # large machines with plenty of RAM; the memory bound below already prevents
+    # OOM. Override with TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL when needed.
     local jobs="${cpu_count}"
     if [[ -r /proc/meminfo ]]; then
         local mem_kb
@@ -102,10 +107,6 @@ detect_default_build_parallel_level() {
                 jobs="${memory_limited_jobs}"
             fi
         fi
-    fi
-
-    if (( jobs > 4 )); then
-        jobs=4
     fi
 
     echo "${jobs}"

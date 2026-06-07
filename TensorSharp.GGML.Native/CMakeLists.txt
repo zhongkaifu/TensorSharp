@@ -56,7 +56,17 @@ set(GGML_ZENDNN OFF CACHE BOOL "" FORCE)
 set(GGML_HEXAGON OFF CACHE BOOL "" FORCE)
 set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+
+# Turn on ggml's ccache integration only when ccache/sccache is actually on PATH.
+# A cached clean rebuild of the CUDA backend drops from minutes to seconds, and
+# gating on availability avoids ggml's "ccache not found" warning on machines that
+# do not have it. Install ccache (e.g. `apt install ccache`) to opt in.
+find_program(TSG_CCACHE_PROGRAM NAMES ccache sccache)
+if (TSG_CCACHE_PROGRAM)
+    set(GGML_CCACHE ON CACHE BOOL "" FORCE)
+else()
+    set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+endif()
 
 if (APPLE)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
@@ -74,6 +84,11 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_NO_VMM OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_DEBUG OFF CACHE BOOL "" FORCE)
+    # NCCL is only used for multi-GPU collective communication and defaults to ON
+    # upstream, which makes the build emit "Warning: NCCL not found ..." on the
+    # common single-GPU / no-NCCL setup. TensorSharp does not depend on NCCL, so
+    # disable the probe to keep the build quiet (multi-GPU still works without it).
+    set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_PEER_MAX_BATCH_SIZE 128 CACHE STRING "" FORCE)
     set(GGML_CUDA_COMPRESSION_MODE "speed" CACHE STRING "" FORCE)
 endif()

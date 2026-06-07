@@ -85,6 +85,11 @@ function Detect-LocalCudaArchitectures {
 }
 
 function Detect-DefaultBuildParallelLevel {
+    # Use all CPUs, bounded only by RAM. nvcc is memory-hungry, so allow ~3 GB per
+    # parallel job (matches llama.cpp/ggml's own heuristic). The previous hard cap
+    # of 4 jobs throttled the CUDA compile to a fraction of available cores even on
+    # large machines with plenty of RAM; the memory bound below already prevents
+    # OOM. Override with TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL when needed.
     $jobs = [Math]::Max(1, [Environment]::ProcessorCount)
 
     try {
@@ -96,10 +101,6 @@ function Detect-DefaultBuildParallelLevel {
     }
     catch {
         # Keep the CPU-based default if CIM is unavailable.
-    }
-
-    if ($jobs -gt 4) {
-        $jobs = 4
     }
 
     return $jobs

@@ -1,4 +1,6 @@
-﻿# Model Architecture Cards
+# Model Architecture Cards
+
+[English](model_cards.md) | [中文](model_cards_zh-cn.md)
 
 > This file has been split. Each model now has a dedicated card under
 > [`docs/models/`](models/README.md), and there is a per-model 中文 version

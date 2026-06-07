@@ -17,8 +17,10 @@
 | [计算后端](#计算后端) | 在纯 C# CPU、Direct CUDA/cuBLAS、MLX Metal、GGML CPU、GGML Metal、GGML CUDA 之间选择 |
 | [HTTP API](#http-api) | 使用 Ollama 兼容、OpenAI 兼容或 Web UI SSE 端点 |
 | [按模型架构卡片](docs/models/README_zh-cn.md) | 阅读单个架构的端到端文档（来源、前向计算图、组件、参数，以及 TensorSharp 如何实现并优化 prefill 与 decode） |
-| [分页注意力 & 连续批处理](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | 了解 vLLM 风格的分页 KV 缓存、前缀共享与迭代级调度器 |
-| [推理基准矩阵](docs/inference_benchmark_matrix.md) | 在文本 / 多模态负载与 KV cache dtype 上对比 TensorSharp、llama.cpp 与 Ollama |
+| [分页注意力 & 连续批处理](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md) | 了解 vLLM 风格的分页 KV 缓存、前缀共享与迭代级调度器 |
+| [推理基准矩阵](docs/inference_benchmark_matrix_zh-cn.md) | 在文本 / 多模态负载与 KV cache dtype 上对比 TensorSharp、llama.cpp 与 Ollama |
+| [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 查看高影响运行时开关会影响哪些模型、后端与提示类型 |
+| [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |
 | [服务端 API 示例](TensorSharp.Server/API_EXAMPLES_zh-cn.md) | 复制完整的 curl 与 Python 示例 |
 | [服务端集成测试](TensorSharp.Server/testdata/README_zh-cn.md) | 针对运行中的服务验证公开 API 契约 |
 
@@ -33,6 +35,7 @@
 | 连续批处理 | vLLM 风格的分页 KV 缓存、跨请求基于内容哈希的前缀共享、迭代级调度器（默认启用，可通过 `--no-continuous-batching` 关闭） |
 | 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不再扫描目录 |
 | 可观测性 | 结构化每轮日志、队列状态，以及 Web UI / Ollama / OpenAI 响应中的 KV 缓存复用指标 |
+| 测试 / 评测 | `TensorSharp.TestMatrix` 可按模型、后端、功能与环境变量组合做矩阵扫描，并与每类主机的基线做回归对比 |
 
 ## 功能特性
 
@@ -43,7 +46,7 @@
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
-- **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)。
+- **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 全部默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。每个模型都提供 `TS_<FAMILY>_BATCHED=0` 兜底开关（如 `TS_GEMMA4_BATCHED=0`、`TS_QWEN35_BATCHED=0`、`TS_GPTOSS_BATCHED=0`、`TS_NEMOTRON_BATCHED=0`），可强制回到按序列 KV-swap 路径用于 A/B 对比或回归排查。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -169,11 +172,13 @@ TensorSharp/
 │   ├── testdata/                # 集成测试套件（bash + Python）
 │   └── API_EXAMPLES.md          # 详细 API 文档
 ├── TensorSharp.Cli/             # CLI 应用（单次生成、交互式 REPL、JSONL 批处理、基准）
+├── TensorSharp.TestMatrix/      # 测试 / 基准矩阵运行器、默认提示、环境变量扫描与主机基线
 ├── InferenceWeb.Tests/          # xUnit 单元测试，覆盖算子、KV 缓存、分页调度器、批处理模型正确性以及 Web/服务辅助逻辑
 ├── AdvUtils/                    # 工具库（日志）
 ├── docs/                        # 开发者参考文档
 │   ├── models/                  # 按模型架构卡片（每个模型一份 .md，中英双语）
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # 分页 KV 缓存、前缀共享、调度器、按模型批处理状态
+│   ├── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
 │   └── inference_benchmark_matrix.md  # 跨引擎吞吐矩阵（TensorSharp vs llama.cpp vs Ollama）
 ├── benchmarks/                  # 可重现的基准脚本
 │   └── inference_matrix/        # 驱动脚本、modelfiles、prompts、每格原始 JSON 结果
@@ -390,7 +395,7 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
-| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16` 或 `q8_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；详见 [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md)。 |
+| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16` 或 `q8_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；详见 [`docs/inference_benchmark_matrix_zh-cn.md`](docs/inference_benchmark_matrix_zh-cn.md)。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
@@ -516,14 +521,14 @@ cd TensorSharp.Server/bin
 在浏览器中打开 `http://localhost:5000`。Web 界面支持：
 
 - 多轮聊天
-- 每个浏览器 Tab 独立的会话：每个 Tab 拥有自己的 KV 缓存；点击「New Chat」会在服务端释放当前会话及其缓存
+- 每个浏览器 Tab 独立的会话：每个 Tab 拥有自己的对话历史；KV block 由推理引擎统一管理
 - 通过 `--model` 显式托管单个 GGUF 模型
 - 在需要时通过 `--mmproj` 显式托管多模态投影器
 - 上传图像、视频和音频进行多模态推理（最大 500 MB）
 - 思维链/推理模式切换
 - 带函数定义的工具调用
 - 通过 Server-Sent Events 进行流式 token 生成
-- 带实时排队位置反馈的请求队列
+- 向后兼容的队列状态事件（实际并发由推理引擎处理）
 - 消息编辑和删除，支持从对话中任意位置重新生成
 - 自由滚动：在生成过程中可向上滚动查看历史消息；只要重新滚回底部，新内容会继续自动跟随
 
@@ -547,12 +552,12 @@ cd TensorSharp.Server/bin
 | `--seed <N>` | 当请求未提供时使用的默认随机种子（`-1` = 非确定性） |
 | `--stop <string>` | 默认停止序列（可重复指定）。请求体里的 `stop`/`stop_sequences` 会**完全替换**默认列表，而不是与之合并。 |
 | `--continuous-batching` / `--no-continuous-batching` | 启用（默认）或关闭迭代级分页批处理。启用时服务会在批内动态加入 / 抢占序列，并在实现了 `IBatchedPagedModel` 的模型上将多个序列打包到一次前向中执行。`--no-continuous-batching` 会让所有模型回退到按序列 KV 交换。别名：`--paged-batching` / `--no-paged-batching`。 |
-| `--paged-kv` / `--no-paged-kv` | 为当前会话强制启用或关闭 vLLM 风格的分页 KV 缓存。启用时 KV 块位于全局块池中并支持跨请求前缀共享。别名：`--paged-kv-cache` / `--no-paged-kv-cache`。 |
-| `--paged-kv-block-size <N>` | 分页 KV 块中每块的 token 数（默认：`256`）。块越小，前缀共享越激进，但管理开销也更高。 |
-| `--paged-kv-ram-mb <N>` | 分页块 RAM 工作集的软上限（MB）。超出上限的块会在配置了 `--paged-kv-ssd-dir` 时溢出到 SSD。 |
-| `--paged-kv-ssd-dir <dir>` | 分页块的 SSD 冷层目录。可选，但对多会话大型工作集推荐。 |
-| `--paged-kv-ssd-mb <N>` | 冷层 SSD 用量上限（MB）。 |
-| `--paged-kv-quant-bits <0\|4\|8>` | 可选的 KV 块量化（TurboQuantKvCodec）。`0`（默认）保持原始 dtype；`4` / `8` 会显著降低每块带宽（数值精度略有损失）。带递归状态的模型会静默回退到 passthrough。 |
+| `--paged-kv` / `--no-paged-kv` | 已移除的按会话分页 KV 管理器的兼容参数。当前服务端 KV 状态由引擎持有；请使用连续批处理 / `TS_SCHED_*` 开关调节引擎。别名：`--paged-kv-cache` / `--no-paged-kv-cache`。 |
+| `--paged-kv-block-size <N>` | 旧的独立分页 KV 块大小。当前引擎使用 `TS_SCHED_BLOCK_SIZE`。 |
+| `--paged-kv-ram-mb <N>` | 旧的独立分页 KV RAM 层上限。 |
+| `--paged-kv-ssd-dir <dir>` | 旧的独立分页 KV SSD 冷层目录。 |
+| `--paged-kv-ssd-mb <N>` | 旧的独立分页 KV SSD 上限。 |
+| `--paged-kv-quant-bits <0\|4\|8>` | 旧的独立分页 KV 块量化（TurboQuantKvCodec）。 |
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`presence_penalty`、`frequency_penalty`、`seed`、
@@ -587,12 +592,12 @@ cd TensorSharp.Server/bin
 
 | 变量 | 说明 |
 |---|---|
-| `TS_KV_PAGED_CACHE` | `1` / `0` 强制为当前会话启用 / 关闭分页 KV 缓存。对应的 CLI 快捷方式是 `--paged-kv` / `--no-paged-kv`。 |
-| `TS_KV_BLOCK_SIZE` | 分页 KV 每块的 token 数（默认：`256`）。 |
-| `TS_KV_CACHE_MAX_RAM_MB` | 分页块 RAM 工作集的软上限（MB）。 |
-| `TS_KV_CACHE_SSD_DIR` | 分页块 SSD 冷层使用的目录。 |
-| `TS_KV_CACHE_MAX_SSD_MB` | 冷层 SSD 用量上限（MB）。 |
-| `TS_KV_PAGED_QUANT_BITS` | KV 块量化位数（`0` = 透传，`4`，或 `8`）。 |
+| `TS_KV_PAGED_CACHE` | 旧的独立 `PagedKvCacheManager` 兼容开关；当前 `TensorSharp.Server` 的请求 KV 状态由引擎持有。CLI 快捷方式是 `--paged-kv` / `--no-paged-kv`。 |
+| `TS_KV_BLOCK_SIZE` | 旧的独立分页 KV 块大小。当前引擎使用 `TS_SCHED_BLOCK_SIZE`。 |
+| `TS_KV_CACHE_MAX_RAM_MB` | 旧的独立分页 KV RAM 层上限。 |
+| `TS_KV_CACHE_SSD_DIR` | 旧的独立分页 KV SSD 冷层目录。 |
+| `TS_KV_CACHE_MAX_SSD_MB` | 旧的独立分页 KV SSD 上限。 |
+| `TS_KV_PAGED_QUANT_BITS` | 旧的独立分页 KV 块量化位数（`0` = 透传，`4`，或 `8`）。 |
 | `TS_SCHED_DISABLE_BATCHED` | `1` 会即使模型实现了 `IBatchedPagedModel`，也强制回退到按序列 KV 交换。CLI 快捷方式是 `--no-continuous-batching`。 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` | 调度器每步 token 预算（默认：`4096`）。 |
 | `TS_SCHED_MAX_RUNNING_SEQS` | 同时在执行的最大序列数（默认：`16`）。 |
@@ -609,15 +614,15 @@ cd TensorSharp.Server/bin
 | `TS_NEMOTRON_BATCHED` | 设为 `0` 强制 Nemotron-H 走旧的按序列 KV-swap 路径（默认走批处理 / 分页）。 |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | 在 Nemotron-H 批处理路径中使用原生 Mamba2 批处理步骤内核。 |
 | `TS_PAGED_ATTN_KERNEL` | `Mistral3Model.BatchedForward` 选择的分页注意力派发内核：`native`（默认）、`tensor`（基于 C# Tensor）或 `managed`（纯 C# 标量）。 |
-| `TS_MLX_PIPELINED_DECODE` | 设为 `1` 启用 MLX 后端上的流水化贪心 decode（仅 CLI）。 |
+| `TS_MLX_PIPELINED_DECODE` | 默认 `1`，当请求为贪心采样、没有 stop 序列且模型支持 device-side argmax / 下一 token embedding 查找时，在 MLX 后端启用流水化贪心 decode。设为 `0` 可关闭。仅 CLI。 |
 | `TS_MLX_MLOCK_GGUF` | 默认 `1`，通过 `mlock(2)` 把 GGUF mmap 区域钉在物理内存，避免前向之间被换出。设为 `0` 关闭（适用于进程 `memlock` rlimit 太低、或希望让 OS 自行管理分页的情况）。仅 MLX 后端。 |
 | `TS_MLX_FUSED_KV_WRITE` | 默认 `1`，使用单次多维 `slice_update` 写入每个 token 的 KV block。设为 `0` 回退到按 head 的循环（A/B 测试 / 隔离回归用）。 |
 | `TS_MLX_BATCHED_MOE_DECODE` | 默认 `1`，将 Qwen 3.5/3.6 MoE 解码时每专家的 K 次 dispatch 合并为每种（gate / up / down）一次批处理 dispatch。在显存紧张的机器上可设为 `0` 关闭（可节省堆叠权重 slab 带来的近一倍权重显存占用）。 |
 | `TS_MLX_MOE_FUSED_GATE_UP_SILU` | 默认 `1`，把批处理 MoE 解码的 gate matmul + up matmul + SiLUMul 融合到一个 Metal kernel。设为 `0` 用于和旧的 3-dispatch 路径做 A/B 对比。 |
-| `TS_MLX_DEVICE_ROUTER` | 默认关闭，设为 `1` 让 MoE router 的 top-K + softmax 留在 device 上，避免每个 MoE 层一次主机同步（在 Qwen3.6-35B-A3B 上约能节省每 token ~60 次同步）。要求 router 为贪心 + 启用了批处理 MoE matmul。 |
+| `TS_MLX_DEVICE_ROUTER` | 默认 `1`，让 MoE router 的 top-K + softmax 留在 device 上，避免每个 MoE 层一次主机同步（在 Qwen3.6-35B-A3B 上约能节省每 token ~60 次同步）。设为 `0` 可关闭；不满足前置条件时会自动回退到 host routing。 |
 | `TS_MLX_LOG_MEMORY_POLICY` | 默认 `1`，加载时打印一行 MLX 内存策略信息（wired limit、GGUF mlock 状态、分配器上限等）。设为 `0` 静默。 |
 | `TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB` | 覆盖 MLX 分配器硬上限 / 空闲缓冲池上限 / wired 缓冲上限（兆字节）。默认值会根据宿主机统一内存大小派生。 |
-| `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。默认 `4`（在 E4B Q8_0 上 sweep 显示比关闭快约 7%）。设为 `0` 关闭。 |
+| `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。Gemma 4 通过 `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` 默认每 4 层一次；Qwen 3 / Qwen 3.5 / Nemotron-H 通过 `TS_MLX_EVAL_EVERY_N_LAYERS` 默认每 16 层一次。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
 
 采样参数的优先级（从高到低）：
@@ -636,9 +641,9 @@ cd TensorSharp.Server/bin
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
 | 连续批处理引擎（`InferenceEngine` + 调度器） | 在 `TensorSharp.Server` 中默认启用 | `TS_SCHED_DISABLE_BATCHED=1` 强制按序列回退 | `--no-continuous-batching` / `--continuous-batching` |
-| 当前会话的分页 KV 缓存 | 启用 | `TS_KV_PAGED_CACHE`（`0` / `1`）、`TS_KV_BLOCK_SIZE` | `--paged-kv` / `--no-paged-kv`、`--paged-kv-block-size N` |
-| 分页 KV SSD 冷层溢出 | 关闭 | `TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`、`--paged-kv-ssd-dir`、`--paged-kv-ssd-mb` |
-| 分页 KV 块量化（TurboQuantKvCodec） | 关闭（`0` = 透传） | `TS_KV_PAGED_QUANT_BITS`（`0` / `4` / `8`） | `--paged-kv-quant-bits` |
+| 旧的按会话分页 KV 管理器 | 已从服务端请求路径移除 | `TS_KV_PAGED_CACHE`（`0` / `1`）、`TS_KV_BLOCK_SIZE` 仅为兼容 / 独立测试保留 | `--paged-kv` / `--no-paged-kv`、`--paged-kv-block-size N` |
+| 旧的分页 KV SSD 冷层溢出 | 关闭 | `TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`、`--paged-kv-ssd-dir`、`--paged-kv-ssd-mb` |
+| 旧的分页 KV 块量化（TurboQuantKvCodec） | 关闭（`0` = 透传） | `TS_KV_PAGED_QUANT_BITS`（`0` / `4` / `8`） | `--paged-kv-quant-bits` |
 | 跨请求的块级哈希前缀共享 | 启用 | `TS_SCHED_PREFIX_CACHE=0` 关闭 | — |
 | 调度器调优（每步 token 预算、最大同时序列数、prefill 分块、块池大小、decode quantum） | 引擎默认 | `TS_SCHED_MAX_BATCHED_TOKENS`、`TS_SCHED_MAX_RUNNING_SEQS`、`TS_SCHED_PREFILL_CHUNK`、`TS_SCHED_NUM_BLOCKS`、`TS_SCHED_BLOCK_SIZE`、`TS_SCHED_DECODE_QUANTUM` | — |
 
@@ -660,13 +665,13 @@ cd TensorSharp.Server/bin
 |---|---|---|---|
 | 默认计算后端 | `ggml_metal`（macOS）、`ggml_cpu`（Windows/Linux） | `BACKEND` | `--backend` |
 | MLX 后端库查找 | 优先探测应用目录 | `TENSORSHARP_MLX_LIBRARY`（`libmlxc` 完整路径）、`TENSORSHARP_MLX_LIBRARY_DIR`（目录） | — |
-| MLX 流水化贪心 decode（仅 CLI） | 关闭 | `TS_MLX_PIPELINED_DECODE=1` | — |
+| MLX 流水化贪心 decode（仅 CLI） | 满足条件时启用 | `TS_MLX_PIPELINED_DECODE=0` 关闭 | — |
 | 使用 `mlock(2)` 钉住 GGUF mmap，使权重常驻 | 启用 | `TS_MLX_MLOCK_GGUF=0` 关闭 | — |
 | MLX 融合多维 KV 写入（每个 cache block 单次 `slice_update`） | 启用 | `TS_MLX_FUSED_KV_WRITE=0` 回退到按 head 循环 | — |
 | MLX 批处理 MoE 解码（Qwen 3.5/3.6 MoE） | 启用 | `TS_MLX_BATCHED_MOE_DECODE=0` 走旧的按专家路径 | — |
 | MLX MoE gate+up+SiLUMul 融合 Metal kernel | 启用 | `TS_MLX_MOE_FUSED_GATE_UP_SILU=0` 走旧的 3-dispatch | — |
-| MLX 设备端 MoE router top-K + softmax | 关闭 | `TS_MLX_DEVICE_ROUTER=1` | — |
-| MLX Gemma 4 解码层边界 `async_eval` 间隔 | 每 4 层 | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N`（`0` = 关闭） | — |
+| MLX 设备端 MoE router top-K + softmax | 满足条件时启用 | `TS_MLX_DEVICE_ROUTER=0` 关闭 | — |
+| MLX 解码层边界 `async_eval` 间隔 | Gemma 4：每 4 层；Qwen / Nemotron：每 16 层 | `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS=N` 或 `TS_MLX_EVAL_EVERY_N_LAYERS=N`（支持处 `0` = 关闭） | — |
 | MLX 分配器上限（内存 / 缓存 / wired buffer） | 按宿主机派生 | `TS_MLX_MEMORY_LIMIT_MB`、`TS_MLX_CACHE_LIMIT_MB`、`TS_MLX_WIRED_LIMIT_MB` | — |
 | 加载时打印一行 MLX 内存策略信息 | 启用 | `TS_MLX_LOG_MEMORY_POLICY=0` 静默 | — |
 
@@ -934,9 +939,9 @@ TensorSharp 采用分层系统结构：
 - **优化后的纯 C# CPU 路径**：托管 GEMM 快速路径和连续 Float32 内核加速了 decode、softmax、RMSNorm、RoPE、融合激活等热点路径，同时在 CPU 加载时保持量化 GGUF 权重压缩状态。
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
 - **KV 缓存前缀复用**：多轮对话会复用各轮之间最长的匹配 token 前缀。对 SWA 模型，截断会自动按滑动窗口大小回退，使后缀部分可以重建 SWA 上下文。
-- **分页 KV 缓存 & 块哈希前缀共享**：连续批处理引擎把 KV 切分成固定大小的块，对每个写满的块做内容哈希，并在并发 / 历史请求间共享。配合按层级（RAM → SSD）的 `PagedKvBlockStore`，可获得 vLLM 风格的内存效率，同时保留旧的按会话连续路径。
+- **分页 KV 缓存 & 块哈希前缀共享**：连续批处理引擎把 KV 切分成固定大小的块，对每个写满的块做内容哈希，并在并发 / 历史请求间共享。尚未实现 `IBatchedPagedModel` 的模型仍会走同一引擎内隔离的按序列 KV-swap 回退路径。
 - **原生分页注意力内核**：`TSGgml_PagedAttentionForward`（及面向 GPT OSS 的 `WithSinks` 变体）在 C++ 中按序列从分页缓冲区聚合 K/V，按序列构建小型 GGML 图，并派发 `ggml_flash_attn_ext`——也就是旧的单序列路径所使用的同一融合 Metal/CUDA flash 注意力内核。在 Ministral-3-14B 长上下文（4×~800 tokens）上比旧的按序列 GGML 路径**快 ~21%**。
-- **批处理 / 分页前向**：Mistral 3、Gemma 4、GPT OSS、Qwen 3.5/3.6（含 GatedDeltaNet 递归状态池）、Nemotron-H（含 Mamba2 递归状态池 + 原生批处理 Mamba2 内核）把 N 个序列打包到一次 `ForwardBatch` 调用中，每层执行一次批处理线性投影 matmul，通过 `slotMapping` 写入分页 K/V，并通过原生内核做按序列注意力。Gemma 4 批处理路径在 batch=8 短 prompt 下达到 **1.5×** 旧吞吐，在 4×800-token prompt 下达到 **1.6×**；Nemotron-H Mamba2 批处理在 Apple M4 Pro 上 batch=3 时达到 **3.95×**。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)。
+- **批处理 / 分页前向**：Mistral 3、Gemma 4、GPT OSS、Qwen 3.5/3.6（含 GatedDeltaNet 递归状态池）、Nemotron-H（含 Mamba2 递归状态池 + 原生批处理 Mamba2 内核）把 N 个序列打包到一次 `ForwardBatch` 调用中，每层执行一次批处理线性投影 matmul，通过 `slotMapping` 写入分页 K/V，并通过原生内核做按序列注意力。Gemma 4 批处理路径在 batch=8 短 prompt 下达到 **1.5×** 旧吞吐，在 4×800-token prompt 下达到 **1.6×**；Nemotron-H Mamba2 批处理在 Apple M4 Pro 上 batch=3 时达到 **3.95×**。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **内核预热**：CLI 和 Server 在启动时运行一次微型前向传播，以预编译 GPU 内核（Metal pipeline state、CUDA JIT）并预热内存池，避免首次推理请求的冷启动延迟。
 - **Prefill 缓存**（Gemma 4、Qwen 3.5/3.6-family）：逐 forward 传播的 SWA 掩码缓存（Gemma 4）、跨全局层的 NeoX RoPE cos/sin 查找表缓存（Gemma 4）、以及跨层的 RoPE 位置张量缓存（Gemma 4、Qwen 3.5/3.6-family），消除了 prefill 期间的冗余重复计算。
 - **原地 QK RMSNorm**（Qwen 3.5/3.6-family）：逐头 QK 归一化通过 `View` 原地执行，避免了每层每个 Q/K 的一次张量分配与拷贝。
@@ -947,8 +952,8 @@ TensorSharp 采用分层系统结构：
 - **最佳匹配内存池**：GGML 主机分配器使用 best-fit 而非 first-fit 在已池化块中检索可重用空间，避免把大块草稿内存交给小型中间张量请求，从而把工作集严格控制在合理范围内。
 - **有界池保留量**：集成 GPU / CPU 内存池现在将单个保留块上限设为 64 MB，整池上限设为 32 块。结合 mmap 后的权重，可在快速复用短生命中间张量的同时限制峰值常驻内存。
 - **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管分配。F32 权重与 norm 仍按需加载；量化权重在受支持的后端上通过 mmap 方式绑定。
-- **可选 SSD 溢出的分页 KV 块池**：分页 KV 块由每个引擎自带的 `BlockPool` 管理，并支持 LRU 淘汰；`PagedKvBlockStore` 通过 `TS_KV_CACHE_MAX_RAM_MB` 控制 RAM 占用，超出上限的冷块会溢出到 SSD 冷层（`TS_KV_CACHE_SSD_DIR`，上限由 `TS_KV_CACHE_MAX_SSD_MB` 控制）。块内容哈希会保存在全局索引中，跨会话与请求的前缀复用都无需重算 K/V。
-- **KV 块编解码器**：可通过 `--paged-kv-quant-bits` 启用 `TurboQuantKvCodec`（Q4 或 Q8）对块原地压缩，以微小精度成本换取每块带宽与内存占用减半 / 减为四分之一。带递归状态的模型会自动回退到 passthrough。
+- **可选 SSD 溢出的分页 KV 块池**：`PagedKvBlockStore` 保留了 RAM / SSD 分层块存储能力（`TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB`），主要服务独立分页 KV 组件与后续扩展；服务端请求路径的活跃块由每个引擎的 `BlockPool` 统一管理。
+- **KV 块编解码器**：`TurboQuantKvCodec`（Q4 或 Q8）可压缩分页块，以微小精度成本换取每块带宽与内存占用减半 / 减为四分之一。带递归状态的模型会自动回退到 passthrough。
 
 ## 性能数据
 
@@ -974,7 +979,7 @@ TensorSharp 采用分层系统结构：
 
 ### 跨引擎推理矩阵
 
-在相同磁盘 GGUF 文件上对 TensorSharp、llama.cpp 与 Ollama 做苹果对苹果的对比（当前覆盖 Gemma 4 E4B Q8_0，包含文本 / 合成 prefill / 图像 / 音频 / 视频任务，并对 `f32`、`f16`、`q8_0` 三种 KV cache dtype 做扫描），见 [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md)。驱动脚本位于 `benchmarks/inference_matrix/scripts/`，每格原始 JSON 结果位于 `benchmarks/inference_matrix/results/`。
+在相同磁盘 GGUF 文件上对 TensorSharp、llama.cpp 与 Ollama 做苹果对苹果的对比（当前覆盖 Gemma 4 E4B Q8_0，包含文本 / 合成 prefill / 图像 / 音频 / 视频任务，并对 `f32`、`f16`、`q8_0` 三种 KV cache dtype 做扫描），见 [`docs/inference_benchmark_matrix_zh-cn.md`](docs/inference_benchmark_matrix_zh-cn.md)。驱动脚本位于 `benchmarks/inference_matrix/scripts/`；运行矩阵后，每格原始 JSON 会生成到 `benchmarks/inference_matrix/results/`。
 
 ## 测试
 
@@ -988,7 +993,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 
 ### 服务端集成测试
 
-TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、结构化输出、队列行为、并发请求和中断支持。架构特定能力（思维链、工具调用）会自动检测，当前模型不支持时会自动跳过。
+TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、结构化输出、队列状态兼容、并发请求和中断支持。架构特定能力（思维链、工具调用）会自动检测，当前模型不支持时会自动跳过。
 
 ```bash
 # 先启动 TensorSharp.Server，然后运行：
@@ -998,6 +1003,17 @@ bash TensorSharp.Server/testdata/test_multiturn.sh
 ```
 
 完整测试矩阵见 [TensorSharp.Server/testdata/README.md](TensorSharp.Server/testdata/README.md)。
+
+### 推理矩阵运行器
+
+`TensorSharp.TestMatrix` 是更大的 CLI 驱动覆盖工具，用于长时间模型 / 后端验证。它会发现 GGUF 文件，过滤不可用后端与不受支持的提示类型，运行 baseline 与环境变量 sweep，用每个 cell 一个 JSON 的形式保存结果，生成汇总 Markdown 报告，并可按需与每类主机的基线做回归对比。
+
+```bash
+dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
+dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run
+```
+
+当前运行器契约见 [TensorSharp.TestMatrix/README_zh-cn.md](TensorSharp.TestMatrix/README_zh-cn.md) 与 [docs/env_var_feature_matrix_zh-cn.md](docs/env_var_feature_matrix_zh-cn.md)。
 
 ## 作者
 

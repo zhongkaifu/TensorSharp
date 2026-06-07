@@ -14,10 +14,10 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 
 | Surface | Coverage |
 |---|---|
-| Web UI SSE | Session-scoped streaming, queue progress, done event metrics, abort handling |
+| Web UI SSE | Session-scoped streaming, queue-status compatibility events, done event metrics, abort handling |
 | Ollama compatibility | Chat streaming/non-streaming, multi-turn history, thinking, tool-call request plumbing |
 | OpenAI compatibility | Chat Completions streaming/non-streaming, tool calls, structured outputs, validation errors |
-| Operational behavior | FIFO queue, concurrent requests, mixed API handoff, architecture-aware skips |
+| Operational behavior | Continuous-batching concurrency, queue-status compatibility, mixed API handoff, architecture-aware skips |
 
 ## Quick Start
 
@@ -63,10 +63,11 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 ### Bash-only operational checks
 
 - System-prompt persistence in the Web UI flow
-- Concurrent requests and FIFO queue behavior
+- Concurrent requests through the continuous-batching engine
+- Queue-status compatibility fields
 - Long-conversation stress test
 - Mixed Ollama/OpenAI handoff
-- Abort mid-generation and queue release
+- Abort mid-generation and request cleanup
 - Ollama tool-call request plumbing
 
 ### Python-specific compatibility checks

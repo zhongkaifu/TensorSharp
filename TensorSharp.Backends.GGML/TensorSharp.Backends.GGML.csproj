@@ -16,8 +16,9 @@
     <CodeAnalysisRuleSet>MinimumRecommendedRules.ruleset</CodeAnalysisRuleSet>
   </PropertyGroup>
   <PropertyGroup>
-    <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
-    <GgmlNativeBuildDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+    <GgmlNativeSourceDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native</GgmlNativeSourceDir>
+    <GgmlNativeBuildDir>$(GgmlNativeSourceDir)/build</GgmlNativeBuildDir>
+    <GgmlNativeBuildDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(GgmlNativeSourceDir)/build-windows</GgmlNativeBuildDir>
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
     <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
@@ -26,8 +27,27 @@
     <GgmlNativeBuildScript Condition="$([MSBuild]::IsOSPlatform('Linux'))">build-linux.sh</GgmlNativeBuildScript>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Windows')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
-    <GgmlNativeForceBuild Condition="$([MSBuild]::IsOSPlatform('Windows')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">true</GgmlNativeForceBuild>
-    <GgmlNativeForceBuild Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">true</GgmlNativeForceBuild>
+    <!-- The native build (CMake + ggml, optionally a full CUDA backend) is
+         expensive — minutes even when nothing changed, because the build targets
+         below previously ran build-*.{ps1,sh} on every C# build. Make it
+         incremental at the MSBuild level: BuildGgmlNative{Windows,Unix} declare
+         Inputs/Outputs so MSBuild skips them entirely when no native source changed
+         and the requested config is unchanged (see _PrepareGgmlNativeIncremental).
+
+         The Output is a stamp the target freshens after a successful native build,
+         rather than the produced library: CMake runs its own incremental compile
+         and may legitimately leave the library's timestamp untouched on a no-op
+         rebuild, so keying off the library would make this target re-run forever.
+         A changed native source or a changed config is newer than the stamp and
+         re-runs the target, after which CMake rebuilds only what actually changed.
+
+         The two stamps live under $(IntermediateOutputPath) (obj/, gitignored).
+         That path is finalised by the SDK targets imported at the end of the
+         project, so it is referenced directly in the target attributes below
+         (expanded at execution time) rather than captured into a property here,
+         where it would still be empty. -->
+    <GgmlNativeConfigStampName>ggml-native.config</GgmlNativeConfigStampName>
+    <GgmlNativeBuildStampName>ggml-native.stamp</GgmlNativeBuildStampName>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Data.DataSetExtensions" Version="4.5.0" />
@@ -35,11 +55,57 @@
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
   </ItemGroup>
-  <Target Name="BuildGgmlNativeWindows" BeforeTargets="BeforeBuild" Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+  <!-- Native sources whose change should trigger a native rebuild. The globs are
+       single-level so they do not descend into the build*/ output dirs, the tests/
+       subdir, or the upstream ggml checkout (ExternalProjects/ggml). Changing the
+       pinned ggml ref is a deliberate action; clean the build dir to pick it up. -->
+  <ItemGroup>
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cpp" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.h" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.hpp" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cu" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cuh" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/CMakeLists.txt" />
+    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)" Condition="'$(GgmlNativeBuildScript)' != ''" />
+    <GgmlNativeSource Include="$(MSBuildProjectFullPath)" />
+  </ItemGroup>
+  <!-- Records the native build config (currently the CUDA on/off selection). The
+       stamp is only rewritten when the config actually changes, so an unchanged
+       config does not bump its timestamp and therefore does not invalidate the
+       incremental check. A changed config bumps it past the binary, forcing a
+       rebuild — this is what makes toggling CUDA on/off rebuild a binary whose
+       sources are otherwise unchanged. -->
+  <Target Name="_PrepareGgmlNativeIncremental" Condition="'$(GgmlNativeBuildScript)' != ''">
+    <PropertyGroup>
+      <_GgmlNativeConfigKey>cuda=$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)</_GgmlNativeConfigKey>
+      <_GgmlNativeConfigStamp>$(IntermediateOutputPath)$(GgmlNativeConfigStampName)</_GgmlNativeConfigStamp>
+    </PropertyGroup>
+    <ReadLinesFromFile File="$(_GgmlNativeConfigStamp)" Condition="Exists('$(_GgmlNativeConfigStamp)')">
+      <Output TaskParameter="Lines" PropertyName="_GgmlNativeConfigPrev" />
+    </ReadLinesFromFile>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(_GgmlNativeConfigStamp)" Lines="$(_GgmlNativeConfigKey)" Overwrite="true"
+                      Condition="'$(_GgmlNativeConfigPrev)' != '$(_GgmlNativeConfigKey)'" />
   </Target>
-  <Target Name="BuildGgmlNativeUnix" BeforeTargets="BeforeBuild" Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''">
-    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+  <Target Name="BuildGgmlNativeWindows" BeforeTargets="BeforeBuild"
+          DependsOnTargets="_PrepareGgmlNativeIncremental"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Inputs="@(GgmlNativeSource);$(IntermediateOutputPath)$(GgmlNativeConfigStampName)"
+          Outputs="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)">
+    <Message Importance="high" Text="Building GGML native library (incremental); CMake recompiles only changed sources." />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Touch Files="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)" AlwaysCreate="true" />
+  </Target>
+  <Target Name="BuildGgmlNativeUnix" BeforeTargets="BeforeBuild"
+          DependsOnTargets="_PrepareGgmlNativeIncremental"
+          Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Inputs="@(GgmlNativeSource);$(IntermediateOutputPath)$(GgmlNativeConfigStampName)"
+          Outputs="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)">
+    <Message Importance="high" Text="Building GGML native library (incremental); CMake recompiles only changed sources." />
+    <Exec Command="bash &quot;$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)&quot; $(GgmlNativeBuildArgs)" />
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Touch Files="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)" AlwaysCreate="true" />
   </Target>
   <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">
     <ItemGroup>
