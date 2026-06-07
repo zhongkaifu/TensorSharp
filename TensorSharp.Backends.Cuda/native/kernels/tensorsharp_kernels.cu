@@ -3,8 +3,9 @@
 #include <math.h>
 #include <stdint.h>
 
-#define GGML_COMMON_IMPL_CUDA
-#include "../../../ExternalProjects/ggml/src/ggml-common.h"
+// IQ2_XXS dequant lookup tables, vendored from ggml-org/ggml so the CUDA backend
+// builds without the upstream ggml checkout (see tensorsharp_iq2xxs_tables.cuh).
+#include "tensorsharp_iq2xxs_tables.cuh"
 
 #define GGML_Q4_0 2
 #define GGML_Q4_1 3

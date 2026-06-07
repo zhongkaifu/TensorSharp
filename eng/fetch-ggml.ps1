@@ -50,8 +50,14 @@ if (Test-Path (Join-Path $GgmlDir ".git")) {
     }
 
     Write-Host "ggml: updating existing checkout to $GitRef ($GitUrl)"
-    git -C $GgmlDir remote set-url origin $GitUrl 2>$null
-    git -C $GgmlDir fetch --depth 1 origin $GitRef 2>$null
+    # Do not redirect git's stderr (no `2>$null`): git writes normal progress and
+    # summaries ("From github.com/...") to stderr, and under
+    # $ErrorActionPreference='Stop' redirecting a native command's stderr turns that
+    # output into a terminating NativeCommandError even on success (Windows
+    # PowerShell 5.1). Letting it pass through keeps the $LASTEXITCODE checks below
+    # working for both the success and offline (non-zero exit) paths.
+    git -C $GgmlDir remote set-url origin $GitUrl
+    git -C $GgmlDir fetch --depth 1 origin $GitRef
     if ($LASTEXITCODE -eq 0) {
         git -C $GgmlDir reset --hard FETCH_HEAD
         if ($LASTEXITCODE -ne 0) { throw "git reset failed" }
@@ -70,7 +76,9 @@ if (Test-Path $GgmlDir) {
 }
 
 Write-Host "ggml: cloning $GitUrl ($GitRef) into $GgmlDir"
-git clone --depth 1 --branch $GitRef $GitUrl $GgmlDir 2>$null
+# No `2>$null` here either: git clone reports progress on stderr, which would
+# otherwise become a terminating error under $ErrorActionPreference='Stop'.
+git clone --depth 1 --branch $GitRef $GitUrl $GgmlDir
 if ($LASTEXITCODE -ne 0) {
     # --branch only accepts a branch or tag; fall back to fetching an explicit
     # commit ref shallowly.

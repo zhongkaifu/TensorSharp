@@ -32,6 +32,9 @@
     <CudaKernel Include="$(CudaKernelDir)/*.cu">
       <FastMathFlag></FastMathFlag>
     </CudaKernel>
+    <!-- Headers the kernels #include (e.g. the vendored IQ2_XXS tables). Tracked as
+         build inputs so editing them re-triggers the PTX compile below. -->
+    <CudaKernelHeader Include="$(CudaKernelDir)/*.cuh" />
     <Content Include="$(PtxOutputDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(PtxOutputDir)')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -65,20 +68,14 @@
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="TensorSharp CUDA build: PTX target is $(_ResolvedCudaArch)" />
   </Target>
 
-  <!-- The CUDA kernels include ExternalProjects/ggml/src/ggml-common.h, which is
-       cloned from ggml-org/ggml at build time. Only fetch when nvcc is present, so a
-       CUDA-less C# build does not require network access. -->
-  <Target Name="EnsureGgmlSources" DependsOnTargets="ResolveCudaPtxBuildSettings" Condition="'$(_NvccExitCode)' == '0'">
-    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
-          Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.ps1&quot;" />
-    <Exec Condition="'$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
-          Command="bash &quot;$(MSBuildProjectDirectory)/../eng/fetch-ggml.sh&quot;" />
-  </Target>
-
+  <!-- The CUDA kernels are self-contained: the only data they needed from ggml
+       (the IQ2_XXS dequant lookup tables) is vendored in
+       native/kernels/tensorsharp_iq2xxs_tables.cuh, so this backend builds without
+       the upstream ggml checkout (ExternalProjects/ggml) or any ggml fetch step. -->
   <Target Name="CompileCudaPtx"
           BeforeTargets="BeforeBuild"
-          DependsOnTargets="ResolveCudaPtxBuildSettings;EnsureGgmlSources"
-          Inputs="@(CudaKernel);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
+          DependsOnTargets="ResolveCudaPtxBuildSettings"
+          Inputs="@(CudaKernel);@(CudaKernelHeader);$(MSBuildProjectFullPath);$(CudaArchResolverPs1);$(CudaArchResolverSh)"
           Outputs="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx');$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp">
     <Message Condition="'$(_NvccExitCode)' != '0'" Importance="high"
              Text="WARNING: TensorSharp CUDA kernels were not compiled because nvcc was not found. The CUDA backend will keep CPU fallbacks for PTX-backed ops." />
