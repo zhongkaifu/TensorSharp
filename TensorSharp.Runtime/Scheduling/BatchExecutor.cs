@@ -142,6 +142,35 @@ namespace TensorSharp.Runtime.Scheduling
                     ? (new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>(output.ScheduledWork))
                     : SplitMultimodalWork(output);
 
+                // Per-sequence fused decode: for models that expose a fast fused
+                // single-graph Forward backed by per-request KV caches, serve
+                // concurrent (N>=2) sequences by running each through its own
+                // fused Forward rather than the op-by-op batched paged path. The
+                // batched path issues ~20 Metal-queue-draining dispatches per
+                // layer, starving the GPU (~30% utilisation) so that aggregate
+                // throughput at N=2 collapses below the single-stream rate; the
+                // fused per-sequence path keeps the GPU saturated (one fused
+                // decode graph per token per sequence).
+                //
+                // Multimodal sequences are handled by this path too: because
+                // each request owns an isolated KV cache (no cross-sequence
+                // byte-level swap), the per-seq Forward injects this request's
+                // bucketed vision/audio embeddings into its own cache without
+                // colliding with concurrent text sequences — the very isolation
+                // the legacy multimodal/text split worked around on the swap
+                // path. Routing everything through the fused path also avoids a
+                // KV-storage split (fused sequences keep K/V in their linear
+                // per-request cache, never the paged buffers the batched path
+                // reads), which is what corrupted concurrent image+text output.
+                if (batchedEnabled
+                    && _model is IBatchedPagedModel fusedModel
+                    && fusedModel.SupportsPerSequenceFusedForward
+                    && IsPerSeqFusedEnabled()
+                    && ShouldUsePerSeqFused(fusedModel, output))
+                {
+                    return ExecuteStepPerSequenceFused(fusedModel, output);
+                }
+
                 if (batchedEnabled && _model is IBatchedPagedModel batched && textWork.Count > 0 && multimodalWork.Count > 0)
                 {
                     // Mixed batch (only reachable when the model declines batched
@@ -475,11 +504,154 @@ namespace TensorSharp.Runtime.Scheduling
             return results;
         }
 
+        private static bool IsPerSeqFusedEnabled()
+        {
+            // Default ON. Set TS_PER_SEQ_FUSED=0 to force concurrent requests
+            // back onto the op-by-op batched paged path (A/B / debugging).
+            string raw = Environment.GetEnvironmentVariable("TS_PER_SEQ_FUSED");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool ShouldUsePerSeqFused(IBatchedPagedModel fused, SchedulerOutput output)
+        {
+            int count = output.ScheduledWork.Count;
+            if (count == 0) return false;
+            if (count >= 2) return true;
+            // Single scheduled sequence: keep it on the fused path only if it
+            // already owns a per-request fused cache. Such a sequence cannot
+            // drop back to the single-stream/batched path because its tail K/V
+            // lives only in its per-request linear cache (not reconstructable
+            // from paged storage). A never-fused single sequence falls through
+            // to the existing N==1 fast path (which keeps prefix-cache reuse
+            // and live-cache continuation).
+            return fused.HasFusedSequenceCache(output.ScheduledWork[0].Sequence.RequestId);
+        }
+
+        /// <summary>Run every scheduled sequence through the model's fused
+        /// single-graph <see cref="IModelArchitecture.Forward"/> with its own
+        /// per-request KV cache (bound via
+        /// <see cref="IBatchedPagedModel.BindSequenceCache"/>). This is the
+        /// high-throughput path for N&gt;=2 concurrency: each sequence's forward
+        /// is one fused GPU graph (e.g. NativeGemma4ModelDecode), keeping the
+        /// device saturated, instead of the op-by-op batched paged path whose
+        /// per-op Metal-queue drains leave the GPU idle.
+        ///
+        /// No cross-sequence KV swap happens (each request owns its cache), so
+        /// sliding-window models stay correct. Prefix-cache REUSE is honoured
+        /// by injecting the reused prefix into a freshly-created cache once;
+        /// the path does not itself CAPTURE blocks back into the shared pool
+        /// (a concurrent request never writes the shared block storage), so it
+        /// can't corrupt blocks shared via copy-on-write.</summary>
+        private List<SequenceStepResult> ExecuteStepPerSequenceFused(IBatchedPagedModel fused, SchedulerOutput output)
+        {
+            int n = output.ScheduledWork.Count;
+            var results = new List<SequenceStepResult>(n);
+            if (n == 0) return results;
+
+            // Transition from the single-stream (N==1) path: if a prior owner's
+            // K/V is still live in the model's primary cache, hand it to that
+            // request's per-request holder (zero-copy) so its history is
+            // preserved and the primary is freed for future N==1 use.
+            if (_currentOwner != null)
+            {
+                if (_currentOwner.Status == SequenceStatus.Running)
+                    fused.AdoptPrimaryCacheToFused(_currentOwner.RequestId);
+                _currentOwner = null;
+                _ownerTokensInModel = 0;
+                _ownerForwardedTokens = 0;
+            }
+            // The per-request caches make the single shared live-cache tracking
+            // meaningless; drop any claim so a later same-session N==1 turn
+            // re-establishes it cleanly from the primary cache.
+            _liveCacheValid = false;
+
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                int prevComputed = seq.NumComputedTokens;
+                try
+                {
+                    bool freshCache = fused.BindSequenceCache(seq.RequestId);
+
+                    // Prefix-cache reuse: a freshly-created cache whose sequence
+                    // was admitted with already-computed (reused) tokens needs
+                    // that prefix injected from the shared paged blocks before
+                    // its first forward. (Injection READS the shared blocks into
+                    // this request's own cache; it never writes them.)
+                    if (freshCache && seq.NumComputedTokens > 0)
+                        InjectAllBlocks(seq, seq.NumComputedTokens);
+
+                    int sampledToken = -1;
+                    int[] inputTokens;
+                    if (work.IsPrefill)
+                    {
+                        inputTokens = BuildPrefillChunk(seq, work);
+                    }
+                    else
+                    {
+                        sampledToken = SampleFromLogits(seq);
+                        seq.AppendOutputToken(sampledToken);
+                        inputTokens = new[] { sampledToken };
+                    }
+
+                    // Multimodal prefill chunks queue their overlapping
+                    // embeddings so Forward injects them at the right positions
+                    // (bucketed per RequestId).
+                    if (_model.MultimodalInjector != null && work.IsPrefill)
+                    {
+                        _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(
+                            prevComputed, inputTokens.Length, seq.RequestId);
+                    }
+
+                    var swForward = Stopwatch.StartNew();
+                    float[] logits = _model.Forward(inputTokens);
+                    swForward.Stop();
+
+                    // Every sequence's forward overwrites the model's shared
+                    // logits buffer, so each must be cloned before the next
+                    // sequence's forward in this same step.
+                    seq.LastLogits = (float[])logits.Clone();
+
+                    seq.AdvanceComputedTokens(inputTokens.Length);
+
+                    if (!seq.FirstTokenAt.HasValue && sampledToken >= 0)
+                        seq.FirstTokenAt = DateTime.UtcNow;
+
+                    results.Add(new SequenceStepResult
+                    {
+                        Sequence = seq,
+                        TokensForwarded = inputTokens.Length,
+                        SampledToken = sampledToken,
+                        IsPrefill = work.IsPrefill,
+                        FullBlocksCaptured = 0,
+                        ForwardElapsedTicks = swForward.ElapsedTicks,
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Fused per-seq step failed for sequence {RequestId}", seq.RequestId);
+                    results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+                    seq.Error = ex;
+                }
+            }
+            return results;
+        }
+
         private List<SequenceStepResult> ExecuteStepPerSequence(SchedulerOutput output)
         {
             var results = new List<SequenceStepResult>(1);
             if (output.ScheduledWork.Count == 0)
                 return results;
+
+            // If a per-sequence-fused episode preceded this single-stream step,
+            // the model's active KV cache may be a per-request holder. Reinstate
+            // the primary cache before the in-place reset/inject logic below so
+            // we never clobber a (possibly still-running) concurrent request's
+            // cache. No-op when the primary cache is already active or the model
+            // doesn't use per-request caches.
+            if (_model is IBatchedPagedModel pf && pf.SupportsPerSequenceFusedForward)
+                pf.RestorePrimaryCache();
 
             // The byte-level KV-state extract/inject in EnsureOwnership does
             // not correctly snapshot models with circular / sliding-window
@@ -1044,8 +1216,55 @@ namespace TensorSharp.Runtime.Scheduling
         /// implement this; otherwise two concurrent sequences whose first
         /// attention block is shared via prefix-cache hit would collide on
         /// the same recurrent-state slot and trample each other's hidden
-        /// state.</summary>
+        /// state. Models implementing <see cref="SupportsPerSequenceFusedForward"/>
+        /// also free the released request's per-request KV cache here.</summary>
         void OnSequenceReleased(string requestId) { }
+
+        // ---- Per-sequence fused forward (high-throughput concurrent decode) ----
+        //
+        // When true, the executor serves concurrent (N>=2) sequences by running
+        // each one through the model's fused single-graph <c>Forward</c> with its
+        // own per-request KV cache, instead of the op-by-op batched paged path.
+        // The op-by-op path issues ~20 Metal-queue-draining dispatches per layer,
+        // which starves the GPU (~30% utilisation) and makes aggregate throughput
+        // at N=2 fall below the single-stream rate; the fused per-sequence path
+        // keeps the GPU saturated (one fused decode graph per token per sequence).
+        //
+        // A model opting in must:
+        //   * give each RequestId its own KV cache (BindSequenceCache),
+        //   * be able to hand the current single-stream owner's cache to a
+        //     per-request holder cheaply (AdoptPrimaryCacheToFused), and
+        //   * reinstate the single-stream cache for the N==1 path
+        //     (RestorePrimaryCache).
+        // It must also free per-request caches in OnSequenceReleased.
+
+        /// <summary>True iff this model supports the per-sequence fused-decode
+        /// path described above. Default false (model keeps the batched path).</summary>
+        bool SupportsPerSequenceFusedForward => false;
+
+        /// <summary>Make <paramref name="requestId"/>'s per-request KV cache the
+        /// model's active cache (creating an empty one the first time). Returns
+        /// true when the cache was freshly created, signalling the caller to
+        /// inject any prefix-cache-reused prefix before the first forward.</summary>
+        bool BindSequenceCache(string requestId) => false;
+
+        /// <summary>Transition the current single-stream (N==1) owner — whose
+        /// live K/V is in the model's primary cache — into a per-request holder
+        /// without copying KV bytes, and give the primary cache a fresh empty
+        /// allocation. Called once when the first concurrent step finds a prior
+        /// owner so its history is preserved as an isolated per-request cache.</summary>
+        void AdoptPrimaryCacheToFused(string requestId) { }
+
+        /// <summary>Reinstate the primary (single-stream) cache as the model's
+        /// active cache before an N==1 step that follows a multi-sequence
+        /// episode. No-op when the primary cache is already active.</summary>
+        void RestorePrimaryCache() { }
+
+        /// <summary>True iff a per-request fused cache holder already exists for
+        /// <paramref name="requestId"/> (i.e. the sequence has run on the fused
+        /// path before and must stay on it — its tail K/V isn't reconstructable
+        /// from paged storage).</summary>
+        bool HasFusedSequenceCache(string requestId) => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

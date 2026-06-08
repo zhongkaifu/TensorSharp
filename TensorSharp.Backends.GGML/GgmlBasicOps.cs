@@ -1364,6 +1364,18 @@ namespace TensorSharp.GGML
             GgmlNative.Gemma4MoELayerDecode(in args);
         }
 
+        /// <summary>
+        /// Model-wide MoE decode: runs every layer (attention + dense FFN +
+        /// in-graph MoE experts) as ONE GGML graph, dispatched/synchronised once
+        /// per token instead of once per layer. Amortises the per-layer graph
+        /// build / Metal encode / sync so the GPU stays saturated. Throws on
+        /// failure (caller falls back to the per-layer path).
+        /// </summary>
+        public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
+        {
+            GgmlNative.Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position);
+        }
+
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
             IntPtr attnNormW,

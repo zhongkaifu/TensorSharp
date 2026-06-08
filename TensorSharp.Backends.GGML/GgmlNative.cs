@@ -1041,6 +1041,20 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_Gemma4MoELayerDecode(in desc), nameof(TSGgml_Gemma4MoELayerDecode));
         }
 
+        // Model-wide MoE decode: the whole transformer as one graph/token.
+        // `layers` is one Gemma4MoELayerDecodeArgs per layer (blittable, marshalled
+        // as a contiguous TSGgmlGemma4MoELayerDesc array). hidden/position come from
+        // the explicit params; the per-element Hidden/Position fields are ignored.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4MoEModelDecode(
+            [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int position);
+
+        public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
+        {
+            CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position), nameof(TSGgml_Gemma4MoEModelDecode));
+        }
+
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
             GgmlTensorView3D q,

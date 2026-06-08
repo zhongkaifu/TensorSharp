@@ -181,6 +181,51 @@ public class BatchedExecutorTests
     }
 
     [Fact]
+    public void BatchExecutor_PerSeqFused_ServesConcurrentSequencesViaForwardNotForwardBatch()
+    {
+        // A model that opts into the per-sequence fused path
+        // (SupportsPerSequenceFusedForward=true, like Gemma 4) must have its
+        // concurrent sequences served by per-sequence Forward — each with its
+        // own bound per-request cache — and never fall into the op-by-op
+        // ForwardBatch path. That is the parallel-decode throughput fix: it
+        // keeps the GPU saturated on models whose fused single-graph decode is
+        // far faster than the batched op-by-op kernel.
+        //
+        // The model declares SupportsLinearKVMigration like Gemma 4, so a
+        // single-sequence step uses the N==1 fused Forward fast path rather than
+        // ForwardBatch — hence ForwardBatch must NEVER be called regardless of
+        // how the scheduler interleaves admission.
+        var model = new PerSeqFusedStubModel("fp-fused");
+        // Long-ish generations so multiple sequences overlap for many steps.
+        using var engine = new InferenceEngine(model, SmallConfig(), NullLogger.Instance);
+
+        var handles = new List<(InferenceRequestHandle handle, string id)>();
+        for (int i = 0; i < 4; i++)
+        {
+            var seq = new SequenceState($"r{i}", Enumerable.Range(1, 4).ToList(),
+                maxNewTokens: 20, BlockSize, SamplingConfig.Default);
+            handles.Add((engine.SubmitRequest(seq), $"r{i}"));
+        }
+
+        foreach (var (h, _) in handles)
+        {
+            var completion = h.Completion.GetAwaiter().GetResult();
+            Assert.True(completion.OutputTokenCount > 0);
+        }
+
+        // The op-by-op batched path was never used for this fused-capable model.
+        Assert.Equal(0, model.NumBatchCalls);
+        Assert.True(model.NumForwardCalls > 0, "Per-sequence Forward was never called.");
+        // Concurrency was actually served by the fused path: at some step at
+        // least two distinct per-request caches were live at once.
+        Assert.True(model.MaxConcurrentBoundCaches >= 2,
+            $"Expected >=2 per-request caches bound concurrently; saw {model.MaxConcurrentBoundCaches}.");
+        // Every request was served through its own per-request cache binding.
+        foreach (var (_, id) in handles)
+            Assert.Contains(id, model.BoundRequestIds);
+    }
+
+    [Fact]
     public async Task InferenceEngine_ExecutorStepException_CompletesErroredRequestAndContinuesWaiting()
     {
         var model = new ThrowingBatchedStubModel("fp-step-error", badRequestId: "bad", peakToken: 7);
@@ -334,6 +379,100 @@ public class BatchedExecutorTests
                 result[i] = logits;
             }
             return result;
+        }
+    }
+
+    /// <summary>
+    /// Stub that opts into the per-sequence fused path. Tracks per-request
+    /// "caches" (just a bound-id set here) and returns logits for the
+    /// currently-bound request, peaked at the token registered in
+    /// <see cref="PeakForRequest"/>. Lets us assert the executor (a) never calls
+    /// ForwardBatch, (b) binds a distinct cache per request, and (c) routes each
+    /// sequence's logits correctly through per-sequence Forward.
+    /// </summary>
+    private sealed class PerSeqFusedStubModel : IModelArchitecture, IBatchedPagedModel
+    {
+        private readonly string _fp;
+        private string _activeReqId;
+        private readonly HashSet<string> _liveCaches = new(StringComparer.Ordinal);
+
+        public PerSeqFusedStubModel(string fp)
+        {
+            _fp = fp;
+            Tokenizer = new StubTokenizer(VocabSize);
+        }
+
+        public Dictionary<string, int> PeakForRequest { get; } = new(StringComparer.Ordinal);
+        public int NumBatchCalls { get; private set; }
+        public int NumForwardCalls { get; private set; }
+        public int MaxConcurrentBoundCaches { get; private set; }
+        public HashSet<string> BoundRequestIds { get; } = new(StringComparer.Ordinal);
+
+        public ModelConfig Config { get; } = new ModelConfig { VocabSize = VocabSize };
+        public ITokenizer Tokenizer { get; }
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => true;
+        public bool SupportsKVStateSnapshot => true;
+        public string KVStateFingerprint => _fp;
+        public long ComputeKVBlockByteSize(int n) => 2L * NumLayers * NumKVHeads * n * HeadDim * sizeof(float);
+
+        public float[] Forward(int[] tokens)
+        {
+            NumForwardCalls++;
+            var logits = new float[VocabSize];
+            int peak = _activeReqId != null && PeakForRequest.TryGetValue(_activeReqId, out var p) ? p : 0;
+            logits[peak] = 10f;
+            return logits;
+        }
+
+        public void ResetKVCache() { }
+        public void TruncateKVCache(int n) { }
+        public bool TryExtractKVBlock(int s, int n, Span<byte> dst) => true;
+        public bool TryInjectKVBlock(int s, int n, ReadOnlySpan<byte> src) => true;
+        public void Dispose() { }
+
+        // The executor must NOT call this for a fused-capable model at N>=2.
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
+        {
+            NumBatchCalls++;
+            var r = new float[ctx.Sequences.Count][];
+            for (int i = 0; i < r.Length; i++) r[i] = new float[VocabSize];
+            return r;
+        }
+
+        public bool SupportsPerSequenceFusedForward => true;
+
+        // Mirror Gemma 4: linear KV migration is supported, so the executor's
+        // N==1 fast path uses fused Forward (not ForwardBatch) for single steps.
+        public bool SupportsLinearKVMigration => true;
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => true;
+
+        public bool BindSequenceCache(string requestId)
+        {
+            BoundRequestIds.Add(requestId);
+            bool fresh = _liveCaches.Add(requestId);
+            _activeReqId = requestId;
+            if (_liveCaches.Count > MaxConcurrentBoundCaches)
+                MaxConcurrentBoundCaches = _liveCaches.Count;
+            return fresh;
+        }
+
+        public void AdoptPrimaryCacheToFused(string requestId)
+        {
+            _liveCaches.Add(requestId);
+            _activeReqId = requestId;
+        }
+
+        public void RestorePrimaryCache() => _activeReqId = null;
+
+        public bool HasFusedSequenceCache(string requestId) => _liveCaches.Contains(requestId);
+
+        public void OnSequenceReleased(string requestId)
+        {
+            _liveCaches.Remove(requestId);
+            if (string.Equals(_activeReqId, requestId, StringComparison.Ordinal))
+                _activeReqId = null;
         }
     }
 

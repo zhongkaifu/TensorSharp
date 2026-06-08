@@ -71,6 +71,9 @@ namespace TensorSharp.Models
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
         private int[] _kvCacheSize; // per-layer cache capacity (slidingWindow for SWA, maxSeqLen for global)
+        // Initial global-layer cache capacity recorded at InitKVCache so fresh
+        // per-request fused-decode cache holders start at the same size.
+        private int _initialGlobalCacheLength;
 
         private float[] _layerScalars;
         private bool _hasTiedOutput;
@@ -146,6 +149,16 @@ namespace TensorSharp.Models
         // off at runtime if the kernel ever throws (graceful degradation).
         private bool _moeFusedDecodeEnabled =
             Environment.GetEnvironmentVariable("TS_GGML_MOE_FUSED_DECODE") != "0";
+        // Model-wide MoE decode (TSGgml_Gemma4MoEModelDecode): runs the whole
+        // transformer as ONE fused GGML graph per token instead of one graph per
+        // layer, amortising the per-layer build/encode/sync that leaves the GPU
+        // idle (~60% util) for MoE Gemma 4. Disable via TS_GEMMA4_MOE_MODEL_DECODE=0.
+        private static readonly bool s_MoeModelDecodeEnabled =
+            Environment.GetEnvironmentVariable("TS_GEMMA4_MOE_MODEL_DECODE") != "0";
+        private bool _canUseFusedMoEModelDecode;
+        private bool _moeModelDecodeChecked;
+        private bool _moeModelDecodeDisabled;
+        private Gemma4MoELayerDecodeArgs[] _moeModelArgs;
         private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
@@ -508,19 +521,40 @@ namespace TensorSharp.Models
         private void InitKVCache(int initialGlobalSeqLen, int maxSeqLen)
         {
             _maxContextLength = maxSeqLen;
+            _initialGlobalCacheLength = initialGlobalSeqLen;
             _kvCacheGlobalCapacity = initialGlobalSeqLen;
-            _kvCacheK = new Tensor[Config.NumLayers];
-            _kvCacheV = new Tensor[Config.NumLayers];
-            _kvCacheSize = new int[Config.NumLayers];
 
             // Pick a model-aligned default cache dtype (F16 for any non-F32
             // weights) when the user hasn't explicitly chosen one. This gives
             // quantized models the bandwidth/memory benefits of F16 cache by
             // default while staying byte-identical to F32 outputs.
             ApplyModelAlignedKvCacheDefault(_quantWeights);
+
+            AllocateKvCacheArrays(initialGlobalSeqLen,
+                out _kvCacheK, out _kvCacheV, out _kvCacheSize, out long totalCacheBytes);
+
+            Console.WriteLine($"  KV cache: {totalCacheBytes / 1024 / 1024} MB " +
+                $"(dtype: {_kvCacheDtype.ToShortString()}, global layers: {initialGlobalSeqLen} seq, SWA layers: {_slidingWindow} seq)");
+        }
+
+        /// <summary>Allocate one fresh per-layer K/V cache array set at the
+        /// given initial global-layer capacity (SWA layers always use
+        /// <see cref="_slidingWindow"/>). Donor layers alias their source. Used
+        /// both for the model's primary cache (<see cref="InitKVCache"/>) and
+        /// for per-request fused-decode cache holders
+        /// (Gemma4Model.PerSeqCache.cs), so a concurrent sequence can be served
+        /// from its own isolated cache without a byte-level KV swap.</summary>
+        private void AllocateKvCacheArrays(
+            int initialGlobalSeqLen,
+            out Tensor[] cacheK, out Tensor[] cacheV, out int[] cacheSize,
+            out long totalCacheBytes)
+        {
+            cacheK = new Tensor[Config.NumLayers];
+            cacheV = new Tensor[Config.NumLayers];
+            cacheSize = new int[Config.NumLayers];
             DType kvDtype = _kvCacheDtype.ToDType();
 
-            long totalCacheBytes = 0;
+            totalCacheBytes = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_kvDonorMap.ContainsKey(l)) continue;
@@ -528,11 +562,11 @@ namespace TensorSharp.Models
                 int kvHeads = KVHeadsForLayer(l);
                 int hd = HeadDimForLayer(l);
                 int cacheLen = IsLocalLayer(l) ? _slidingWindow : initialGlobalSeqLen;
-                _kvCacheSize[l] = cacheLen;
-                _kvCacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
-                _kvCacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
-                InitializeCacheTensor(_kvCacheK[l]);
-                InitializeCacheTensor(_kvCacheV[l]);
+                cacheSize[l] = cacheLen;
+                cacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
+                cacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
+                InitializeCacheTensor(cacheK[l]);
+                InitializeCacheTensor(cacheV[l]);
                 // Q8_0 has fractional bytes/elem (1.0625) - go through ByteLengthFor
                 // so block-quantized layouts are accounted for correctly.
                 long perLayerElems = (long)kvHeads * cacheLen * hd;
@@ -541,13 +575,10 @@ namespace TensorSharp.Models
 
             foreach (var kv in _kvDonorMap)
             {
-                _kvCacheK[kv.Key] = _kvCacheK[kv.Value];
-                _kvCacheV[kv.Key] = _kvCacheV[kv.Value];
-                _kvCacheSize[kv.Key] = _kvCacheSize[kv.Value];
+                cacheK[kv.Key] = cacheK[kv.Value];
+                cacheV[kv.Key] = cacheV[kv.Value];
+                cacheSize[kv.Key] = cacheSize[kv.Value];
             }
-
-            Console.WriteLine($"  KV cache: {totalCacheBytes / 1024 / 1024} MB " +
-                $"(dtype: {_kvCacheDtype.ToShortString()}, global layers: {initialGlobalSeqLen} seq, SWA layers: {_slidingWindow} seq)");
         }
 
         // Grow the global-attention layers' KV cache to fit requiredSeqLen
@@ -1009,6 +1040,15 @@ namespace TensorSharp.Models
                 NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
                 _linearTicks += Stopwatch.GetTimestamp() - tFused;
                 _kvCacheHostDirty = true;
+            }
+            else if (seqLen == 1 && exceptPositions == null && perLayerInputs == null
+                     && TryFusedMoEModelDecode(hidden, startPos))
+            {
+                // Whole MoE transformer ran as ONE fused GGML graph (one
+                // dispatch/sync this token instead of one per layer).
+                // _kvCacheHostDirty is set inside TryFusedMoEModelDecode. This
+                // branch is skipped (per-layer loop below runs) when the shape is
+                // unsupported or the model-wide kernel is disabled.
             }
             else
             {
@@ -2104,8 +2144,15 @@ namespace TensorSharp.Models
         /// scale fold in <see cref="TryMoEForwardResidual"/> exactly, so output
         /// is numerically equivalent to the per-op path.
         /// </summary>
-        private unsafe bool TryFusedMoELayerDecode(Tensor hidden, int layer, int startPos)
+        /// <summary>Validate that <paramref name="layer"/> can run through the
+        /// fused MoE kernel and, if so, populate <paramref name="args"/> with its
+        /// descriptor. Shared by the single-layer (<see cref="TryFusedMoELayerDecode"/>)
+        /// and model-wide (<see cref="TryFusedMoEModelDecode"/>) MoE decode paths.
+        /// <paramref name="hiddenPtr"/> is the residual-stream pointer (ignored by
+        /// the model-wide kernel, which chains hidden internally).</summary>
+        private unsafe bool TryBuildMoELayerArgs(int layer, IntPtr hiddenPtr, int startPos, out Gemma4MoELayerDecodeArgs args)
         {
+            args = default;
             if (!IsGgmlBackend || _decodeArrays == null) return false;
             // Requires the stacked (fused-gate_up) expert weights; the separate
             // gate/up expert layout isn't handled by this kernel.
@@ -2164,9 +2211,9 @@ namespace TensorSharp.Models
             var gateW = _layerStackedGate[layer];
             var downW = _layerStackedDown[layer];
 
-            var args = new Gemma4MoELayerDecodeArgs
+            args = new Gemma4MoELayerDecodeArgs
             {
-                Hidden = (IntPtr)GetFloatPtr(hidden),
+                Hidden = hiddenPtr,
                 AttnNormW = a.AttnNorm[layer],
                 QkvW = a.Qkv[layer], QkvType = a.QkvType[layer], QkvNe0 = a.QkvNe0[layer], QkvNe1 = a.QkvNe1[layer], QkvBytes = a.QkvBytes[layer],
                 KW = a.K[layer], KType = a.KType[layer], KNe0 = a.KNe0[layer], KNe1 = a.KNe1[layer], KBytes = a.KBytes[layer],
@@ -2211,7 +2258,15 @@ namespace TensorSharp.Models
                 InvSqrtHidden = 1f / MathF.Sqrt(H),
                 LayerOutputScale = a.LayerScalar[layer],
             };
+            return true;
+        }
 
+        /// <summary>Decode one MoE layer as a single fused GGML graph. Builds the
+        /// descriptor via <see cref="TryBuildMoELayerArgs"/> and dispatches it.</summary>
+        private unsafe bool TryFusedMoELayerDecode(Tensor hidden, int layer, int startPos)
+        {
+            if (!TryBuildMoELayerArgs(layer, (IntPtr)GetFloatPtr(hidden), startPos, out var args))
+                return false;
             try
             {
                 GgmlBasicOps.Gemma4MoELayerDecode(in args);
@@ -2230,6 +2285,64 @@ namespace TensorSharp.Models
             // any later host read of the cache syncs first (mirrors the fused
             // full-model decode path).
             _kvCacheHostDirty = true;
+            return true;
+        }
+
+        /// <summary>Decode the ENTIRE MoE transformer as one fused GGML graph
+        /// (<c>TSGgml_Gemma4MoEModelDecode</c>) — a single dispatch/sync per token
+        /// instead of one per layer, which keeps the GPU saturated (the per-layer
+        /// path leaves it idle in the inter-layer graph-build/encode gaps). Returns
+        /// false (caller falls back to the per-layer loop) when the model shape
+        /// isn't supported (PLE, KV donors, any non-MoE layer, block-quant KV) or a
+        /// layer's weights are missing. Permanently disabled if the kernel throws.
+        /// Output is numerically identical to the per-layer path (same graph nodes).</summary>
+        private unsafe bool TryFusedMoEModelDecode(Tensor hidden, int startPos)
+        {
+            if (_moeModelDecodeDisabled || !s_MoeModelDecodeEnabled) return false;
+            if (!_moeModelDecodeChecked)
+            {
+                _moeModelDecodeChecked = true;
+                _canUseFusedMoEModelDecode =
+                    IsGgmlBackend && _decodeArrays != null && _moeFusedDecodeEnabled
+                    && _pleDim == 0 && _kvDonorMap.Count == 0
+                    && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
+            }
+            if (!_canUseFusedMoEModelDecode) return false;
+
+            int n = Config.NumLayers;
+            _moeModelArgs ??= new Gemma4MoELayerDecodeArgs[n];
+            IntPtr hiddenPtr = (IntPtr)GetFloatPtr(hidden);
+            for (int l = 0; l < n; l++)
+            {
+                // KCache/VCache pointers can shift between tokens (cache growth or
+                // per-request fused-cache binding), so rebuild the descriptor each
+                // call. The cost is ~microseconds; the win is collapsing 30 native
+                // dispatches into one.
+                if (!TryBuildMoELayerArgs(l, hiddenPtr, startPos, out _moeModelArgs[l]))
+                {
+                    _canUseFusedMoEModelDecode = false; // a layer can't fuse after all
+                    return false;
+                }
+            }
+
+            try
+            {
+                GgmlBasicOps.Gemma4MoEModelDecode(_moeModelArgs, n, hiddenPtr, Config.HiddenSize, startPos);
+            }
+            catch (Exception ex)
+            {
+                System.Console.WriteLine($"[gemma4] fused MoE model decode disabled after error: {ex.Message}");
+                _moeModelDecodeDisabled = true;
+                return false;
+            }
+            _kvCacheHostDirty = true;
+            return true;
+        }
+
+        private bool AllLayersMoE()
+        {
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (!HasMoE(l)) return false;
             return true;
         }
 
@@ -5507,6 +5620,10 @@ namespace TensorSharp.Models
                 emb?.Dispose();
             _pendingAudioEmbeddingsList.Clear();
             DisposeSwaPrevWindows();
+            // Free any per-request fused-decode cache holders before tearing
+            // down the active cache (the active holder's arrays ARE _kvCacheK and
+            // are disposed by the loop below).
+            DisposeAllFusedHolders();
             if (_kvCacheK != null)
             {
                 var disposed = new HashSet<int>();
