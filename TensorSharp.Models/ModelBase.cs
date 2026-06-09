@@ -1357,6 +1357,12 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda)
                 return true;
 
+            // ggml-cuda's get_rows kernel only implements the legacy round-number
+            // quant types (see ExternalProjects/ggml/src/ggml-cuda/getrows.cu:
+            // ggml_cuda_get_rows_switch_src0_type). k-quants such as Q6_K are NOT
+            // supported and abort at runtime, so they must fall back to the host
+            // dequant path (PopulateQuantizedRows). Keep this list in sync with the
+            // upstream kernel's supported src0 types.
             return ((GgmlTensorType)ggmlType) switch
             {
                 GgmlTensorType.Q4_0 => true,
@@ -1364,7 +1370,6 @@ namespace TensorSharp.Models
                 GgmlTensorType.Q5_0 => true,
                 GgmlTensorType.Q5_1 => true,
                 GgmlTensorType.Q8_0 => true,
-                GgmlTensorType.Q6_K => true,
                 _ => false,
             };
         }
