@@ -8,6 +8,96 @@
 
 A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
+## Quick Start
+
+Zero to a streaming reply in about 30 seconds (after the model download).
+
+**1. Prerequisites** — [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0), `git`, and (optionally) a GPU toolchain: NVIDIA → CUDA Toolkit 12.x; Apple Silicon → Xcode command-line tools (Metal is built in). Full list in [Prerequisites](#prerequisites).
+
+**2. Clone & build** — the native GGML library is compiled automatically on the first build.
+
+```bash
+git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release
+```
+
+**3. Download a model** — a small, well-tested starting point is Qwen3-4B (Q8_0) from [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF). More options in [Verified Models](#verified-models).
+
+**4. Run it** — choose the `--backend` for your hardware (see [Pick a Backend](#pick-a-backend)):
+
+```bash
+# One-shot generation
+echo "Explain mixture-of-experts in one sentence." > prompt.txt
+
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend cpu          # portable / debugging
+
+# Interactive chat (REPL)
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf -i --backend ggml_metal
+```
+
+Prefer a browser UI plus HTTP APIs? Start the server instead:
+
+```bash
+./TensorSharp.Server --model Qwen3-4B-Q8_0.gguf --backend ggml_metal
+# open http://localhost:5000 — also serves Ollama- and OpenAI-compatible endpoints
+```
+
+The CLI binary lands in `TensorSharp.Cli/bin/...` and the server in `TensorSharp.Server/bin/...` after the build. Full options: [CLI usage](#console-application) · [Server usage](#web-application).
+
+## Pick a Backend
+
+Not sure which backend to use? Start here. Every backend falls back to CPU for any op it does not yet implement, so output stays correct on all of them.
+
+| Your hardware | Recommended backend | Flag | Notes |
+|---|---|---|---|
+| **Apple Silicon (Mac)** | GGML Metal | `--backend ggml_metal` | Default on macOS. `--backend mlx` is an alternative Apple-Silicon GPU path. |
+| **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | Most-tested NVIDIA path. `--backend cuda` is the direct PTX/cuBLAS backend for experimentation. |
+| **No GPU / portability / debugging** | Pure C# CPU | `--backend cpu` | No native dependencies. For faster CPU inference use `--backend ggml_cpu` (native kernels). |
+
+See [Compute Backends](#compute-backends) for the full description of every backend and what each one accelerates.
+
+## Verified Models
+
+These architectures are implemented and exercised by the test/benchmark matrix. Pick a quantization that fits your hardware (e.g. Q4_K_M for low memory, Q8_0 for higher quality). More sizes and multimodal projector files are in [Model Downloads](#model-downloads-gguf).
+
+| Family | Example model (GGUF) | Image / Video / Audio | Thinking | Tools | Card |
+|---|---|---|---|---|---|
+| Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) (also 31B, 26B-A4B MoE) | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4.md](docs/models/gemma4.md) |
+| Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) (also 35B-A3B MoE) | ✅ / — / — | ✅ | ✅ | [qwen35.md](docs/models/qwen35.md) |
+| Qwen 3 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) | — / — / — | ✅ | ✅ | [qwen3.md](docs/models/qwen3.md) |
+| GPT OSS | [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) (MoE) | — / — / — | ✅ | ✅ | [gptoss.md](docs/models/gptoss.md) |
+| Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) (also 47B, Omni) | ✅ (Omni) / — / — | ✅ | ✅ | [nemotron.md](docs/models/nemotron.md) |
+| Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3.md](docs/models/mistral3.md) |
+| Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3.md](docs/models/gemma3.md) |
+
+## Benchmarks at a Glance
+
+Measured on `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` (~10 GB GGUF, MoE) on an Apple M4 Pro with 24 GB unified memory — current branch vs the `v1` baseline:
+
+| Metric | Before (`v1`) | After | Change |
+|---|---|---|---|
+| Process peak memory | ~17 GB | **~8 GB** | **−52%** |
+| Decode throughput (256 prefill / 64 decode, warm) | ~3.8 tok/s | **~10.8 tok/s** | **+2.85×** |
+| Decode latency | ~264 ms/tok | **~92 ms/tok** | **−65%** |
+
+Full methodology, the reproduce command, and the cross-engine matrix (TensorSharp vs llama.cpp vs Ollama) are in [Benchmarks](#benchmarks) and [docs/inference_benchmark_matrix.md](docs/inference_benchmark_matrix.md).
+
+## Highlights
+
+- **Continuous batching & paged KV cache** — vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
+- **Multimodal** — image / video / audio inputs (Gemma 4); image inputs for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → [Multimodal Support](#multimodal-support)
+- **Tool calling / function calling** — multi-turn tool calls across all three API styles, with architecture-agnostic output parsing. → [Tool Calling](#tool-calling--function-calling)
+- **Thinking / reasoning mode** — structured chain-of-thought for Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, and Nemotron-H. → [Thinking Mode](#thinking--reasoning-mode)
+- **Ollama- & OpenAI-compatible APIs** — drop-in endpoints for existing tooling, plus a browser chat UI. → [HTTP APIs](#http-apis)
+- **Native quantized compute** — Q4_K_M / Q8_0 / MXFP4 / IQ2_XXS and more run in matmul without dequantizing to FP32.
+
+---
+
+Everything below is detailed reference. New here? The five sections above are all you need to get running.
+
 ## Documentation Map
 
 | Start here | Use this when you want to... |

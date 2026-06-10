@@ -8,6 +8,96 @@
 
 一个用于在本地运行大型语言模型（LLM）的 C# 推理引擎，使用 GGUF 模型文件。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 
+## 快速开始
+
+下载模型后，大约 30 秒即可看到流式输出。
+
+**1. 前置要求** —— [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)、`git`，以及（可选）GPU 工具链：NVIDIA → CUDA Toolkit 12.x；Apple Silicon → Xcode 命令行工具（Metal 已内置）。完整列表见 [前置要求](#前置要求)。
+
+**2. 克隆并构建** —— 首次构建会自动编译原生 GGML 库。
+
+```bash
+git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release
+```
+
+**3. 下载模型** —— 推荐从体积小、测试充分的 Qwen3-4B（Q8_0）开始：[Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF)。更多选择见 [已验证模型](#已验证模型)。
+
+**4. 运行** —— 按你的硬件选择 `--backend`（参见 [选择后端](#选择后端)）：
+
+```bash
+# 单次生成
+echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
+
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend cpu          # 可移植 / 调试
+
+# 交互式聊天（REPL）
+./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf -i --backend ggml_metal
+```
+
+想要浏览器界面和 HTTP API？改为启动服务端：
+
+```bash
+./TensorSharp.Server --model Qwen3-4B-Q8_0.gguf --backend ggml_metal
+# 打开 http://localhost:5000 —— 同时提供 Ollama 与 OpenAI 兼容端点
+```
+
+构建完成后，CLI 可执行文件位于 `TensorSharp.Cli/bin/...`，服务端位于 `TensorSharp.Server/bin/...`。完整参数：[CLI 用法](#控制台应用) · [服务端用法](#web-应用)。
+
+## 选择后端
+
+不确定用哪个后端？从这里开始。每个后端对尚未实现的算子都会回退到 CPU，因此所有后端的输出都正确。
+
+| 你的硬件 | 推荐后端 | 标志 | 说明 |
+|---|---|---|---|
+| **Apple Silicon（Mac）** | GGML Metal | `--backend ggml_metal` | macOS 默认。`--backend mlx` 是另一条 Apple Silicon GPU 路径。 |
+| **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | 测试最充分的 NVIDIA 路径。`--backend cuda` 是用于实验的 Direct PTX/cuBLAS 后端。 |
+| **无 GPU / 可移植 / 调试** | 纯 C# CPU | `--backend cpu` | 无原生依赖。需要更快的 CPU 推理可用 `--backend ggml_cpu`（原生算子）。 |
+
+每个后端的完整说明及其加速范围见 [计算后端](#计算后端)。
+
+## 已验证模型
+
+以下架构均已实现，并由测试 / 基准矩阵覆盖。请选择适配你硬件的量化（如低内存用 Q4_K_M、更高质量用 Q8_0）。更多尺寸与多模态投影器文件见下方「模型下载」章节，或参阅 [按模型架构卡片](docs/models/README_zh-cn.md)。
+
+| 家族 | 示例模型（GGUF） | 图像 / 视频 / 音频 | 思维链 | 工具 | 卡片 |
+|---|---|---|---|---|---|
+| Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)（另有 31B、26B-A4B MoE） | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4](docs/models/gemma4_zh-cn.md) |
+| Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（另有 35B-A3B MoE） | ✅ / — / — | ✅ | ✅ | [qwen35](docs/models/qwen35_zh-cn.md) |
+| Qwen 3 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B-GGUF) | — / — / — | ✅ | ✅ | [qwen3](docs/models/qwen3_zh-cn.md) |
+| GPT OSS | [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF)（MoE） | — / — / — | ✅ | ✅ | [gptoss](docs/models/gptoss_zh-cn.md) |
+| Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF)（另有 47B、Omni） | ✅（Omni） / — / — | ✅ | ✅ | [nemotron](docs/models/nemotron_zh-cn.md) |
+| Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3](docs/models/mistral3_zh-cn.md) |
+| Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3](docs/models/gemma3_zh-cn.md) |
+
+## 性能速览
+
+在 Apple M4 Pro（24 GB 统一内存）上，基于 `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`（约 10 GB GGUF，MoE）测得 —— 当前分支 vs `v1` 基线：
+
+| 指标 | 之前（`v1`） | 之后 | 变化 |
+|---|---|---|---|
+| 进程峰值内存 | ~17 GB | **~8 GB** | **−52%** |
+| 解码吞吐（256 prefill / 64 decode，热态） | ~3.8 tok/s | **~10.8 tok/s** | **+2.85×** |
+| 解码延迟 | ~264 ms/tok | **~92 ms/tok** | **−65%** |
+
+完整方法、复现命令与跨引擎矩阵（TensorSharp vs llama.cpp vs Ollama）见 [性能数据](#性能数据) 与 [docs/inference_benchmark_matrix_zh-cn.md](docs/inference_benchmark_matrix_zh-cn.md)。
+
+## 亮点功能
+
+- **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
+- **多模态** —— 图像 / 视频 / 音频输入（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）。→ [多模态支持](#多模态支持)
+- **工具调用 / 函数调用** —— 三种 API 风格均支持多轮工具调用，输出解析与架构无关。→ [工具调用](#工具调用--函数调用)
+- **思维链 / 推理模式** —— Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H 支持结构化思维链。→ [思维链模式](#思维链--推理模式)
+- **Ollama 与 OpenAI 兼容 API** —— 现有工具可直接接入的端点，外加浏览器聊天 UI。→ [HTTP API](#http-api)
+- **原生量化计算** —— Q4_K_M / Q8_0 / MXFP4 / IQ2_XXS 等量化权重直接参与 matmul，无需反量化为 FP32。
+
+---
+
+以下均为详细参考文档。初次使用？上面五个章节足以让你跑起来。
+
 ## 文档导航
 
 | 从这里开始 | 适合你想要... |
