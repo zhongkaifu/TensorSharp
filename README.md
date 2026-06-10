@@ -22,7 +22,7 @@ cd TensorSharp
 dotnet build TensorSharp.slnx -c Release
 ```
 
-**3. Download a model** — a small, well-tested starting point is Qwen3-4B (Q8_0) from [Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF). More options in [Verified Models](#verified-models).
+**3. Download a model** — a small, well-tested starting point is Gemma-4-E4B (Q8_0) from [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF). More options in [Verified Models](#verified-models).
 
 **4. Run it** — choose the `--backend` for your hardware (see [Pick a Backend](#pick-a-backend)):
 
@@ -30,18 +30,18 @@ dotnet build TensorSharp.slnx -c Release
 # One-shot generation
 echo "Explain mixture-of-experts in one sentence." > prompt.txt
 
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend cpu          # portable / debugging
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu          # portable / debugging
 
 # Interactive chat (REPL)
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf -i --backend ggml_metal
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf -i --backend ggml_metal
 ```
 
 Prefer a browser UI plus HTTP APIs? Start the server instead:
 
 ```bash
-./TensorSharp.Server --model Qwen3-4B-Q8_0.gguf --backend ggml_metal
+./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
 # open http://localhost:5000 — also serves Ollama- and OpenAI-compatible endpoints
 ```
 
@@ -72,18 +72,6 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) (also 47B, Omni) | ✅ (Omni) / — / — | ✅ | ✅ | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3.md](docs/models/mistral3.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3.md](docs/models/gemma3.md) |
-
-## Benchmarks at a Glance
-
-Measured on `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` (~10 GB GGUF, MoE) on an Apple M4 Pro with 24 GB unified memory — current branch vs the `v1` baseline:
-
-| Metric | Before (`v1`) | After | Change |
-|---|---|---|---|
-| Process peak memory | ~17 GB | **~8 GB** | **−52%** |
-| Decode throughput (256 prefill / 64 decode, warm) | ~3.8 tok/s | **~10.8 tok/s** | **+2.85×** |
-| Decode latency | ~264 ms/tok | **~92 ms/tok** | **−65%** |
-
-Full methodology, the reproduce command, and the cross-engine matrix (TensorSharp vs llama.cpp vs Ollama) are in [Benchmarks](#benchmarks) and [docs/inference_benchmark_matrix.md](docs/inference_benchmark_matrix.md).
 
 ## Highlights
 
@@ -867,22 +855,22 @@ curl http://localhost:5000/api/tags
 # Generate text
 curl -X POST http://localhost:5000/api/generate \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "prompt": "Hello!", "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "prompt": "Hello!", "stream": false}'
 
 # Chat
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "stream": false}'
 
 # Chat with thinking mode
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Solve 17*23"}], "think": true, "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Solve 17*23"}], "think": true, "stream": false}'
 
 # Chat with tool calling
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "What is the weather?"}], "tools": [{"function": {"name": "get_weather", "description": "Get current weather", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "What is the weather?"}], "tools": [{"function": {"name": "get_weather", "description": "Get current weather", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
 ```
 
 **OpenAI-compatible API:**
@@ -891,13 +879,13 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 # Chat completions
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
 # Structured outputs (OpenAI response_format)
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-4B-Q8_0.gguf",
+    "model": "gemma-4-E4B-it-Q8_0.gguf",
     "messages": [{"role": "user", "content": "Extract the city and country from: Paris, France."}],
     "response_format": {
       "type": "json_schema",
@@ -926,7 +914,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
 response = client.chat.completions.create(
-    model="Qwen3-4B-Q8_0.gguf",
+    model="gemma-4-E4B-it-Q8_0.gguf",
     messages=[{"role": "user", "content": "What is 2+3?"}],
     max_tokens=50
 )

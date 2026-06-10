@@ -22,7 +22,7 @@ cd TensorSharp
 dotnet build TensorSharp.slnx -c Release
 ```
 
-**3. 下载模型** —— 推荐从体积小、测试充分的 Qwen3-4B（Q8_0）开始：[Qwen/Qwen3-4B-GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF)。更多选择见 [已验证模型](#已验证模型)。
+**3. 下载模型** —— 推荐从体积小、测试充分的 Gemma-4-E4B（Q8_0）开始：[ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)。更多选择见 [已验证模型](#已验证模型)。
 
 **4. 运行** —— 按你的硬件选择 `--backend`（参见 [选择后端](#选择后端)）：
 
@@ -30,18 +30,18 @@ dotnet build TensorSharp.slnx -c Release
 # 单次生成
 echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf --input prompt.txt --backend cpu          # 可移植 / 调试
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal   # macOS
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda    # Windows/Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu          # 可移植 / 调试
 
 # 交互式聊天（REPL）
-./TensorSharp.Cli --model Qwen3-4B-Q8_0.gguf -i --backend ggml_metal
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf -i --backend ggml_metal
 ```
 
 想要浏览器界面和 HTTP API？改为启动服务端：
 
 ```bash
-./TensorSharp.Server --model Qwen3-4B-Q8_0.gguf --backend ggml_metal
+./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
 # 打开 http://localhost:5000 —— 同时提供 Ollama 与 OpenAI 兼容端点
 ```
 
@@ -72,18 +72,6 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF)（另有 47B、Omni） | ✅（Omni） / — / — | ✅ | ✅ | [nemotron](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3](docs/models/mistral3_zh-cn.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3](docs/models/gemma3_zh-cn.md) |
-
-## 性能速览
-
-在 Apple M4 Pro（24 GB 统一内存）上，基于 `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`（约 10 GB GGUF，MoE）测得 —— 当前分支 vs `v1` 基线：
-
-| 指标 | 之前（`v1`） | 之后 | 变化 |
-|---|---|---|---|
-| 进程峰值内存 | ~17 GB | **~8 GB** | **−52%** |
-| 解码吞吐（256 prefill / 64 decode，热态） | ~3.8 tok/s | **~10.8 tok/s** | **+2.85×** |
-| 解码延迟 | ~264 ms/tok | **~92 ms/tok** | **−65%** |
-
-完整方法、复现命令与跨引擎矩阵（TensorSharp vs llama.cpp vs Ollama）见 [性能数据](#性能数据) 与 [docs/inference_benchmark_matrix_zh-cn.md](docs/inference_benchmark_matrix_zh-cn.md)。
 
 ## 亮点功能
 
@@ -861,22 +849,22 @@ curl http://localhost:5000/api/tags
 # 文本生成
 curl -X POST http://localhost:5000/api/generate \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "prompt": "Hello!", "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "prompt": "Hello!", "stream": false}'
 
 # 聊天
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "stream": false}'
 
 # 启用思维链模式的聊天
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "计算 17*23"}], "think": true, "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "计算 17*23"}], "think": true, "stream": false}'
 
 # 带工具调用的聊天
 curl -X POST http://localhost:5000/api/chat/ollama \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "天气怎么样？"}], "tools": [{"function": {"name": "get_weather", "description": "获取当前天气", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "天气怎么样？"}], "tools": [{"function": {"name": "get_weather", "description": "获取当前天气", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
 ```
 
 **兼容 OpenAI 的 API：**
@@ -885,13 +873,13 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 # Chat completions
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
 # 结构化输出（OpenAI response_format）
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-4B-Q8_0.gguf",
+    "model": "gemma-4-E4B-it-Q8_0.gguf",
     "messages": [{"role": "user", "content": "从“Paris, France”中提取城市与国家。"}],
     "response_format": {
       "type": "json_schema",
@@ -920,7 +908,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
 response = client.chat.completions.create(
-    model="Qwen3-4B-Q8_0.gguf",
+    model="gemma-4-E4B-it-Q8_0.gguf",
     messages=[{"role": "user", "content": "What is 2+3?"}],
     max_tokens=50
 )
