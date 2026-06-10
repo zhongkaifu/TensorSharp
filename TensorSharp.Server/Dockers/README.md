@@ -72,16 +72,16 @@ short_description: C# LLM inference server (GGML CPU) with a chat UI + OpenAI/Ol
 
 # TensorSharp
 
-C# inference engine for GGUF LLMs. This Space hosts gemma-4-12B-it
-(abliterated/uncensored, Q4_K_M) on the native GGML CPU backend and exposes the
-web chat UI plus OpenAI- and Ollama-compatible HTTP APIs.
+C# inference engine for GGUF LLMs. This Space hosts gemma-4-E2B-it
+(abliterated, QAT Q4_0) with its multimodal projector on the native GGML CPU
+backend and exposes the web chat UI plus OpenAI- and Ollama-compatible HTTP APIs.
 See https://github.com/zhongkaifu/TensorSharp.
 ```
 
-> The ~7.4 GB Q4_K_M weights fit comfortably in the `cpu-upgrade` tier (8 vCPU,
-> 32 GB) and load on `cpu-basic` (2 vCPU, 16 GB) too, but a 12B model decodes
-> slowly on 2 vCPU. For a snappier `cpu-basic` demo, switch to a smaller model
-> via the build args below.
+> The ~3.4 GB Q4_0 weights plus the ~1 GB projector fit comfortably in the
+> `cpu-upgrade` tier (8 vCPU, 32 GB) and load on `cpu-basic` (2 vCPU, 16 GB)
+> too. For a snappier text-only `cpu-basic` demo, switch to a smaller model via
+> the build args below.
 
 ## Choosing a different model
 
@@ -102,13 +102,15 @@ Model sizing guidance:
 |---|---|---|
 | Qwen3-1.7B | ~1.1 GB | Fastest; best for a snappy `cpu-basic` demo |
 | Qwen3-4B | ~2.5 GB | Good quality/speed balance on CPU |
-| **gemma-4-12B-it (abliterated)** (default) | ~7.4 GB | High quality; slow to decode on CPU — prefer `cpu-upgrade` |
+| **gemma-4-E2B-it (abliterated, QAT)** (default) | ~3.4 GB | Multimodal; decodes acceptably on CPU |
+| gemma-4-12B-it (abliterated) | ~7.4 GB | Higher quality; slow to decode on CPU — prefer `cpu-upgrade` |
 
-gemma-4 is also multimodal (image/video/audio). To enable vision, download an
-`mmproj` file from the same repo and pass `--mmproj <path>` in the `CMD`; for
-real multimodal throughput, use a paid GPU hardware tier — base the image on a
-CUDA runtime and build the native bridge with `bash build-linux.sh --cuda` and
-run with `--backend ggml_cuda`.
+The default gemma-4-E2B image already downloads the `mmproj` projector and passes
+`--mmproj` in the `CMD`, so vision input works out of the box. To host a
+text-only server, build with `--build-arg MMPROJ_FILE=` (empty) so the projector
+download and `--mmproj` flag are dropped. For real multimodal throughput, use a
+paid GPU hardware tier — base the image on a CUDA runtime, build the native
+bridge with `bash build-linux.sh --cuda`, and run with `--backend ggml_cuda`.
 
 ## Troubleshooting: Space shows "TensorSharp.Server is running"
 

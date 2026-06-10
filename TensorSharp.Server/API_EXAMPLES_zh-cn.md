@@ -574,7 +574,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 ### 工具型接口
 
 ```bash
-# 推理队列快照（busy 标志、待处理请求数、累计处理数）
+# 实时推理负载快照：processing（并发生成中的请求数）、pending_requests（排队等待批处理槽位的请求数）、busy 标志、累计处理数
 curl http://localhost:5000/api/queue/status
 
 # 服务版本

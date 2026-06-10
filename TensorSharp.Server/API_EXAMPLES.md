@@ -576,7 +576,8 @@ Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_
 ### Utilities
 
 ```bash
-# Inference queue snapshot (busy flag, pending requests, total processed)
+# Live inference load snapshot: processing (requests generating concurrently),
+# pending_requests (waiting for a batch slot), busy flag, total processed
 curl http://localhost:5000/api/queue/status
 
 # Server version

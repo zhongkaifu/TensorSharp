@@ -92,6 +92,36 @@ header h1 {
   color: var(--success);
 }
 
+#queue-badge.queue-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+#queue-badge.queue-active.processing-only {
+  background: #1a3a1a;
+  color: var(--success);
+}
+
+#queue-badge.queue-active.has-waiting {
+  background: #3a2a1a;
+  color: #fa5;
+}
+
+.queue-badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+  animation: pulseDot 1.2s ease-in-out infinite;
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+
 button {
   background: var(--surface2);
   color: var(--text);
@@ -771,7 +801,7 @@ button.primary:hover { background: var(--accent-hover); }
     <span class="brand-text">TensorSharp Chat</span>
   </h1>
   <div class="header-controls">
-    <span id="queue-badge" class="status-badge" style="display:none" title="Request queue status"></span>
+    <span id="queue-badge" class="status-badge" style="display:none" title="Live inference load: requests processing concurrently and waiting in the queue"></span>
     <span id="status-badge" class="status-badge">No model configured</span>
     <button id="btn-clear" title="New chat">&#x2795; New Chat</button>
   </div>
@@ -1442,28 +1472,48 @@ fetchServerState();
 
 const queueBadge = document.getElementById('queue-badge');
 
+function pluralReq(n) {
+  return n === 1 ? '1 request' : `${n} requests`;
+}
+
+function renderQueueBadge(processing, waiting) {
+  // Reset to a known-idle state, then re-apply the active classes if needed so
+  // the badge color/layout always matches the current counts.
+  queueBadge.classList.remove('queue-active', 'processing-only', 'has-waiting');
+  queueBadge.style.removeProperty('background');
+  queueBadge.style.removeProperty('color');
+
+  if (processing <= 0 && waiting <= 0) {
+    queueBadge.style.display = 'none';
+    queueBadge.innerHTML = '';
+    return;
+  }
+
+  const segments = [`${pluralReq(processing)} processing`];
+  if (waiting > 0) segments.push(`${pluralReq(waiting)} queued`);
+
+  queueBadge.innerHTML = '<span class="queue-badge-dot"></span><span>' + segments.join(' · ') + '</span>';
+  queueBadge.classList.add('queue-active', waiting > 0 ? 'has-waiting' : 'processing-only');
+  queueBadge.title = `Live inference load: ${processing} processing concurrently, ${waiting} waiting in queue`;
+  queueBadge.style.display = '';
+}
+
 async function pollQueueStatus() {
   try {
     const res = await fetch('/api/queue/status');
     const data = await res.json();
-    if (data.pending_requests > 0 || data.busy) {
-      queueBadge.style.display = '';
-      if (data.pending_requests > 0) {
-        queueBadge.textContent = `Queue: ${data.pending_requests} waiting`;
-        queueBadge.style.background = '#3a2a1a';
-        queueBadge.style.color = '#fa5';
-      } else {
-        queueBadge.textContent = 'Queue: processing';
-        queueBadge.style.background = '#1a3a1a';
-        queueBadge.style.color = '#5b5';
-      }
-    } else {
-      queueBadge.style.display = 'none';
-    }
+    // `processing` is the count of requests being generated concurrently; older
+    // servers only sent the boolean `busy`, so fall back to that.
+    const processing = typeof data.processing === 'number'
+      ? data.processing
+      : (data.busy ? 1 : 0);
+    const waiting = typeof data.pending_requests === 'number' ? data.pending_requests : 0;
+    renderQueueBadge(processing, waiting);
   } catch {}
 }
 
-setInterval(pollQueueStatus, 2000);
+pollQueueStatus();
+setInterval(pollQueueStatus, 1000);
 </script>
 </body>
 </html>

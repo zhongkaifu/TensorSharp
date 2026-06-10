@@ -87,15 +87,25 @@ WORKDIR /home/user/app
 # the native libGgmlOps.so, runtimes/<rid>/native/* and the wwwroot/ web UI.
 COPY --chown=1000:1000 --from=build /src/TensorSharp.Server/bin/ ./
 
-# Download the GGUF model for the demo (gemma-4-12B Q4_K_M, ~7.4 GB). Override
-# either build arg to host a different model, e.g. a smaller/faster one:
+# Download the GGUF model for the demo (gemma-4-E2B QAT Q4_0, ~3.4 GB) plus its
+# multimodal projector (mmproj, ~1 GB) so vision input works out of the box.
+# Override either build arg to host a different model, e.g. a smaller/faster one:
 #   docker build \
 #     --build-arg MODEL_URL=https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf \
 #     --build-arg MODEL_FILE=Qwen3-4B-Q4_K_M.gguf ...
-ARG MODEL_URL=https://huggingface.co/mradermacher/gemma-4-12B-it-abliterated-uncensored-GGUF/resolve/main/gemma-4-12B-it-abliterated-uncensored.Q4_K_M.gguf
-ARG MODEL_FILE=gemma-4-12B-it-abliterated-uncensored.Q4_K_M.gguf
+ARG MODEL_URL=https://huggingface.co/huihui-ai/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-GGUF/resolve/main/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+ARG MODEL_FILE=Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
 ENV MODEL_FILE=${MODEL_FILE}
 RUN wget -q -O "/home/user/app/models/${MODEL_FILE}" "${MODEL_URL}"
+
+# The multimodal projector from the same repo. Set MMPROJ_FILE to an empty
+# string at build time to host a text-only server (the CMD drops --mmproj then).
+ARG MMPROJ_URL=https://huggingface.co/huihui-ai/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-GGUF/resolve/main/mmproj-model-bf16.gguf
+ARG MMPROJ_FILE=mmproj-model-bf16.gguf
+ENV MMPROJ_FILE=${MMPROJ_FILE}
+RUN if [ -n "${MMPROJ_FILE}" ]; then \
+        wget -q -O "/home/user/app/models/${MMPROJ_FILE}" "${MMPROJ_URL}"; \
+    fi
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
@@ -104,8 +114,10 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 # 7860 is the port Hugging Face Spaces routes to by default (no app_port needed).
 EXPOSE 7860
 
-# Shell form so ${MODEL_FILE} expands. Host the model on the native GGML CPU backend.
+# Shell form so the variables expand. Host the model (and its projector, when
+# MMPROJ_FILE is set) on the native GGML CPU backend.
 CMD dotnet TensorSharp.Server.dll \
     --model "/home/user/app/models/${MODEL_FILE}" \
+    ${MMPROJ_FILE:+--mmproj "/home/user/app/models/${MMPROJ_FILE}"} \
     --backend ggml_cpu \
     --max-tokens 4096

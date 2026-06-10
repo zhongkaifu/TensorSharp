@@ -68,12 +68,27 @@ namespace TensorSharp.Server.ProtocolAdapters
 
         public IResult GetQueueStatus()
         {
-            var status = _queue.GetStatus();
+            // Real concurrency now lives in the per-model inference engine, not the
+            // legacy InferenceQueue (which always reports zero). Peek the engine's
+            // live counters so the Web UI can show, in real time, how many requests
+            // are being processed concurrently versus waiting for admission.
+            // TryGetLiveStats is side-effect free and returns false before the
+            // engine is built (no model loaded / no request yet), in which case
+            // everything is idle.
+            _svc.EngineHost.TryGetLiveStats(out int processing, out int waiting, out long totalCompleted);
+
+            // total_processed kept for API compatibility; sourced from the engine's
+            // completed count (per loaded model) rather than the legacy queue.
+            long totalProcessed = totalCompleted != 0 ? totalCompleted : _queue.GetStatus().TotalProcessed;
+
             return Results.Ok(new
             {
-                busy = status.Busy,
-                pending_requests = status.PendingRequests,
-                total_processed = status.TotalProcessed,
+                busy = processing > 0,
+                // Number of requests currently being generated concurrently.
+                processing,
+                // Requests admitted to the engine but still waiting for a batch slot.
+                pending_requests = waiting,
+                total_processed = totalProcessed,
             });
         }
 

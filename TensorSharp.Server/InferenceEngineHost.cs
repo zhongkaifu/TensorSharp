@@ -79,6 +79,30 @@ namespace TensorSharp.Server
             }
         }
 
+        /// <summary>Peek at the live concurrency counters of the already-built
+        /// engine without constructing one. Returns false when no engine exists
+        /// yet (no model loaded, the model can't use the engine, or no request
+        /// has been submitted yet) - in that case the out values are zero.
+        ///
+        /// This is deliberately side-effect free: a status poll must never
+        /// trigger lazy engine construction (and the matching block-pool
+        /// allocation) the way <see cref="TryGetEngine"/> does.</summary>
+        public bool TryGetLiveStats(out int processing, out int waiting, out long totalCompleted)
+        {
+            processing = 0;
+            waiting = 0;
+            totalCompleted = 0;
+            lock (_gate)
+            {
+                if (_disposed || _engine == null)
+                    return false;
+                processing = _engine.RunningCount;
+                waiting = _engine.WaitingCount;
+                totalCompleted = _engine.TotalCompleted;
+                return true;
+            }
+        }
+
         /// <summary>Drop the engine (if any). Called by <see cref="ModelLifecycleService"/>
         /// when the model is unloaded so we don't hold onto a stale block pool.</summary>
         public void Reset()
