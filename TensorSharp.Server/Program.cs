@@ -105,6 +105,11 @@ if (pagedKvFlagsApplied)
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);
 
 app.UseTensorSharpRequestLogging();
+// Rewrite "/" to "/index.html" so the bare root serves the chat UI (the
+// MapGet("/") health route below would otherwise win). UseDefaultFiles is a
+// no-op when wwwroot/index.html is absent, so headless/text-only deployments
+// still get the plain-text liveness string at "/".
+app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseStaticFiles(new StaticFileOptions
 {

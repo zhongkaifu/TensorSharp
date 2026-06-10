@@ -45,13 +45,10 @@ ARG APP_PORT=7860
 RUN sed -i "s#0.0.0.0:5000#0.0.0.0:${APP_PORT}#g" TensorSharp.Server/Program.cs \
     && grep -q "0.0.0.0:${APP_PORT}" TensorSharp.Server/Program.cs
 
-# Serve the chat UI at "/" as well. Program.cs maps GET "/" to a plain-text
-# health string ("TensorSharp.Server is running") and serves the web UI only at
-# /index.html, so an embedded Hugging Face Space view of "/" shows that string.
-# Inserting UseDefaultFiles ahead of UseStaticFiles rewrites "/" to /index.html
-# (served before the health endpoint runs), so the root shows the chatbot UI.
-RUN sed -i "s#^app.UseStaticFiles();#app.UseDefaultFiles();\napp.UseStaticFiles();#" TensorSharp.Server/Program.cs \
-    && grep -q "app.UseDefaultFiles();" TensorSharp.Server/Program.cs
+# The app serves the chat UI at "/" itself: Program.cs calls app.UseDefaultFiles(),
+# which rewrites "/" to /index.html ahead of the plain-text health route, so the
+# Space root (https://<user>-<space>.hf.space) shows the chatbot UI directly. No
+# source patch is needed here for that — only the port rewrite above.
 
 # Building the server transitively builds Runtime/Models/Backends and runs the
 # native GGML CMake build. No nvcc is present, so ggml-cuda is auto-disabled and

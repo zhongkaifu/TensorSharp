@@ -53,9 +53,9 @@ git push
 
 ## Space `README.md` template
 
-Put this at the top of the Space's `README.md`. `base_path: /index.html` opens
-the embedded chat UI directly (the bare `/` route returns a plain health string;
-the UI is served at `/index.html`).
+Put this at the top of the Space's `README.md`. The app serves the chat UI at
+`/`, so both the direct Space URL (`https://<user>-<space>.hf.space`) and the
+embedded iframe open straight into the UI — no `base_path` override is needed.
 
 ```yaml
 ---
@@ -64,7 +64,6 @@ emoji: 🔥
 colorFrom: indigo
 colorTo: purple
 sdk: docker
-base_path: /index.html
 pinned: false
 suggested_hardware: cpu-upgrade
 short_description: C# LLM inference server (GGML CPU) with a chat UI + OpenAI/Ollama APIs
@@ -114,16 +113,12 @@ bridge with `bash build-linux.sh --cuda`, and run with `--backend ggml_cuda`.
 
 ## Troubleshooting: Space shows "TensorSharp.Server is running"
 
-`GET /` is a plain-text liveness route; the chat UI is served at `/index.html`.
-Two independent fixes (the Dockerfile applies the second; either alone works):
-
-- **`base_path: /index.html`** in the Space README YAML (above) points the Space
-  iframe at the UI. This is HF proxy config — editing the README restarts the
-  Space in seconds with **no image rebuild / no model re-download**.
-- The Dockerfile **patches the app to serve the UI at `/`** too (inserts
-  `app.UseDefaultFiles()` so `/` is rewritten to `/index.html` before the health
-  route runs). This makes the image self-contained but only takes effect after a
-  rebuild.
+The app serves the chat UI at `/` (Program.cs calls `app.UseDefaultFiles()`, so
+`/` is rewritten to `/index.html` before the plain-text health route runs). If
+the Space root still shows the health string, it is running an **older image
+built before this change** — re-copy the current `Dockerfile_CPU.txt` to the
+Space's `Dockerfile` and trigger a rebuild (Settings → **Factory rebuild**). The
+fix takes effect once the new image is built; no `base_path` override is needed.
 
 Also note `GET /api/chat` returns 404 in a browser because it is a **POST**-only
 endpoint — the web UI calls it with POST; it is not a deployment error.
