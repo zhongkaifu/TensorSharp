@@ -1,0 +1,111 @@
+# TensorSharp.Server on Hugging Face Spaces — Docker SDK, CPU-only (GGML CPU backend).
+#
+# Read the docs: https://huggingface.co/docs/hub/spaces-sdks-docker
+#
+# Deploy steps (Space: https://huggingface.co/spaces/zhongkaifu/tensorsharp):
+#   1. Copy this file into the Space repo as a file named exactly `Dockerfile`.
+#   2. Add the YAML header from Dockers/README.md to the Space's README.md
+#      (it must contain `sdk: docker`).
+#   3. Push. The Space builds the image and starts the server.
+#
+# Program.cs hard-codes the listen address to port 5000 and passes it to
+# app.Run(), which overrides PORT / ASPNETCORE_URLS. The build stage below
+# patches it to 7860 (the Hugging Face Spaces default port), so the Space needs
+# no `app_port` override.
+
+############################################################
+# Stage 1 — build the server and the native GGML CPU bridge
+############################################################
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+# git    : clones TensorSharp and (during the build) ggml-org/ggml into ExternalProjects/ggml
+# cmake  : configures/builds the native GGML bridge (TensorSharp.GGML.Native/CMakeLists.txt)
+# build-essential : C/C++ toolchain (gcc/g++/make) the CMake build needs
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git cmake build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1
+
+# Override TENSORSHARP_REF to pin a tag/branch/commit of your choice.
+ARG TENSORSHARP_REPO=https://github.com/zhongkaifu/TensorSharp.git
+ARG TENSORSHARP_REF=main
+
+WORKDIR /src
+RUN git clone --depth 1 --branch ${TENSORSHARP_REF} ${TENSORSHARP_REPO} .
+
+# The listen address is hard-coded to 0.0.0.0:5000 in Program.cs and passed to
+# app.Run(), which overrides PORT / ASPNETCORE_URLS. Rewrite the constant to
+# 7860 (the Hugging Face Spaces default port) so the app binds the port the
+# Space routes to. The grep asserts the rewrite took effect — it keeps the build
+# green if upstream already uses 7860, and fails loudly if neither matches.
+ARG APP_PORT=7860
+RUN sed -i "s#0.0.0.0:5000#0.0.0.0:${APP_PORT}#g" TensorSharp.Server/Program.cs \
+    && grep -q "0.0.0.0:${APP_PORT}" TensorSharp.Server/Program.cs
+
+# Serve the chat UI at "/" as well. Program.cs maps GET "/" to a plain-text
+# health string ("TensorSharp.Server is running") and serves the web UI only at
+# /index.html, so an embedded Hugging Face Space view of "/" shows that string.
+# Inserting UseDefaultFiles ahead of UseStaticFiles rewrites "/" to /index.html
+# (served before the health endpoint runs), so the root shows the chatbot UI.
+RUN sed -i "s#^app.UseStaticFiles();#app.UseDefaultFiles();\napp.UseStaticFiles();#" TensorSharp.Server/Program.cs \
+    && grep -q "app.UseDefaultFiles();" TensorSharp.Server/Program.cs
+
+# Building the server transitively builds Runtime/Models/Backends and runs the
+# native GGML CMake build. No nvcc is present, so ggml-cuda is auto-disabled and
+# only the CPU backend is compiled (this is what the ggml_cpu backend needs).
+# The native build fetches ggml sources over the network on first build.
+RUN dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release
+
+############################################################
+# Stage 2 — runtime image
+############################################################
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+
+# libgomp1 : OpenMP runtime the native GGML CPU kernels link against.
+# wget     : downloads the GGUF model below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Both the .NET base image and Hugging Face Spaces use UID 1000. The image
+# already defines a user at that UID, so reuse it instead of creating one
+# (`useradd -m -u 1000` would fail with "UID 1000 is not unique"). Just make the
+# working tree (where the server writes uploads/, logs/, and the model lands)
+# owned by UID 1000 so every runtime write succeeds.
+RUN mkdir -p /home/user/app/models \
+    && chown -R 1000:1000 /home/user
+USER 1000
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+WORKDIR /home/user/app
+
+# The Release build output is a runnable framework-dependent app: managed DLLs,
+# the native libGgmlOps.so, runtimes/<rid>/native/* and the wwwroot/ web UI.
+COPY --chown=1000:1000 --from=build /src/TensorSharp.Server/bin/ ./
+
+# Download the GGUF model for the demo (gemma-4-12B Q4_K_M, ~7.4 GB). Override
+# either build arg to host a different model, e.g. a smaller/faster one:
+#   docker build \
+#     --build-arg MODEL_URL=https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf \
+#     --build-arg MODEL_FILE=Qwen3-4B-Q4_K_M.gguf ...
+ARG MODEL_URL=https://huggingface.co/mradermacher/gemma-4-12B-it-abliterated-uncensored-GGUF/resolve/main/gemma-4-12B-it-abliterated-uncensored.Q4_K_M.gguf
+ARG MODEL_FILE=gemma-4-12B-it-abliterated-uncensored.Q4_K_M.gguf
+ENV MODEL_FILE=${MODEL_FILE}
+RUN wget -q -O "/home/user/app/models/${MODEL_FILE}" "${MODEL_URL}"
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    BACKEND=ggml_cpu
+
+# 7860 is the port Hugging Face Spaces routes to by default (no app_port needed).
+EXPOSE 7860
+
+# Shell form so ${MODEL_FILE} expands. Host the model on the native GGML CPU backend.
+CMD dotnet TensorSharp.Server.dll \
+    --model "/home/user/app/models/${MODEL_FILE}" \
+    --backend ggml_cpu \
+    --max-tokens 4096
