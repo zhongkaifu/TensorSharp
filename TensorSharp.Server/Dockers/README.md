@@ -135,3 +135,95 @@ docker run --rm -p 7860:7860 tensorsharp-server
 
 First boot loads the model and warms up kernels before serving; allow a minute
 or two on CPU. The Space's `startup_duration_timeout` (default 30 min) is ample.
+
+---
+
+# Deploying to a GPU Space ([`Dockerfile_GPU.txt`](Dockerfile_GPU.txt))
+
+[`Dockerfile_GPU.txt`](Dockerfile_GPU.txt) is the GPU counterpart of the CPU
+file. It builds and runs `TensorSharp.Server` on a **paid GPU** Docker Space
+using the native **GGML CUDA** backend (`--backend ggml_cuda`, the most-tested
+NVIDIA path).
+
+## What differs from the CPU Dockerfile
+
+1. **Build stage** is based on `nvidia/cuda:<ver>-devel-ubuntu22.04` (provides
+   `nvcc` + cuBLAS headers) with the .NET 10 SDK installed via the official
+   script. `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` makes `dotnet build` compile
+   the native GGML bridge with the **ggml-cuda** backend (it runs
+   `build-linux.sh --cuda`), and the direct-CUDA PTX kernels are compiled too.
+2. **Runtime stage** is based on `nvidia/cuda:<ver>-runtime-ubuntu22.04`
+   (provides the CUDA runtime + cuBLAS shared libraries the bridge loads at
+   runtime), with the ASP.NET Core 10 runtime installed via the script. It
+   creates the UID‑1000 user Spaces run as, downloads the model, and launches
+   with `--backend ggml_cuda`.
+
+The port rewrite to 7860 and the chat UI at `/` work exactly as in the CPU file.
+
+## CUDA architectures (build host has no GPU)
+
+The Space build host has no GPU, so the CUDA targets must be set explicitly via
+the `CUDA_ARCHS` build arg (default `75-real;75-virtual`). The default emits
+native SASS for Turing (T4) plus compute_75 PTX that the driver JIT-compiles for
+any newer GPU, so it runs on **every** current HF GPU tier. For the fastest
+build, set it to just your GPU's arch; for native speed on a bigger GPU, add its
+`-real` entry.
+
+| HF GPU tier | GPU | Arch | `CUDA_ARCHS` for native speed |
+|---|---|---|---|
+| `t4-small` / `t4-medium` | Tesla T4 | 75 | `75-real` |
+| `a10g-small` / `a10g-large` | A10G | 86 | `86-real` |
+| `a100-large` | A100 | 80 | `80-real` |
+| `l4x1` / `l40sx1` | L4 / L40S | 89 | `89-real` |
+| (Hopper) | H100 | 90 | `90-real` |
+
+```bash
+docker build -f Dockerfile \
+  --build-arg CUDA_ARCHS=86-real \
+  -t tensorsharp-server-gpu .
+```
+
+Pin the CUDA toolkit with `--build-arg CUDA_VERSION=12.4.1` (the `-devel` and
+`-runtime` tags share it). 12.2.2 (default) JIT-compiles on any driver ≥ 535.
+
+## Configure the Space
+
+Copy `Dockerfile_GPU.txt` to `Dockerfile`, pick a **GPU** tier under
+Settings → Hardware (a CPU tier builds but fails to start — no CUDA device), and
+push. The CUDA compile makes the build noticeably longer than the CPU image.
+
+### Space `README.md` template (GPU)
+
+```yaml
+---
+title: TensorSharp
+emoji: 🔥
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: false
+suggested_hardware: t4-small
+short_description: C# LLM inference server (GGML CUDA) with a chat UI + OpenAI/Ollama APIs
+---
+
+# TensorSharp
+
+C# inference engine for GGUF LLMs, GPU-accelerated via the native GGML CUDA
+backend. This Space hosts gemma-4-E2B-it (abliterated, QAT Q4_0) with its
+multimodal projector and exposes the web chat UI plus OpenAI- and
+Ollama-compatible HTTP APIs. See https://github.com/zhongkaifu/TensorSharp.
+```
+
+> Set `suggested_hardware` to the tier you actually selected (`t4-small`,
+> `a10g-small`, `a100-large`, …). The default gemma-4-E2B (~3.4 GB + ~1 GB
+> projector) fits the 16 GB T4; on a larger GPU host a bigger model via the
+> `MODEL_URL`/`MODEL_FILE` build args (see the CPU section above).
+
+## Verifying locally (needs an NVIDIA GPU + nvidia-container-toolkit)
+
+```bash
+docker build -f TensorSharp.Server/Dockers/Dockerfile_GPU.txt \
+  --build-arg CUDA_ARCHS=75-real -t tensorsharp-server-gpu .
+docker run --rm --gpus all -p 7860:7860 tensorsharp-server-gpu
+# open http://localhost:7860/index.html
+```

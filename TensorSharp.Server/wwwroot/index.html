@@ -57,17 +57,40 @@ header h1 {
   gap: 8px;
 }
 
-.brand-logo {
-  height: 56px;
-  width: auto;
-  display: block;
-  object-fit: contain;
+/* Colorful animated "TensorSharp" wordmark, used in place of the old banner image. */
+.brand-wordmark,
+.big-wordmark {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  background: linear-gradient(100deg, #6c8cff 0%, #b06cff 28%, #ff6cab 52%, #ff8c6c 74%, #ffd76c 100%);
+  background-size: 220% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: brandShimmer 7s linear infinite;
+}
+
+.brand-wordmark {
+  font-size: 28px;
+  line-height: 1;
   flex-shrink: 0;
-  filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.35));
+}
+
+@keyframes brandShimmer {
+  to { background-position: 220% center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-wordmark,
+  .big-wordmark { animation: none; }
 }
 
 .brand-text {
   white-space: nowrap;
+  color: var(--text2);
+  font-weight: 500;
 }
 
 .header-controls {
@@ -630,15 +653,15 @@ button.primary:hover { background: var(--accent-hover); }
   padding: 40px;
 }
 
-.empty-state .big-logo {
-  width: min(280px, 60vw);
-  height: auto;
-  display: block;
-  filter: drop-shadow(0 14px 28px rgba(0, 0, 0, 0.28));
+.empty-state .big-wordmark {
+  font-size: clamp(40px, 9vw, 76px);
+  line-height: 1.05;
+  padding: 0 8px;
+  filter: drop-shadow(0 14px 28px rgba(108, 140, 255, 0.22));
 }
 
-.empty-state .big-logo.assistant-preview {
-  width: min(220px, 48vw);
+.empty-state .big-wordmark.assistant-preview {
+  font-size: clamp(34px, 7vw, 60px);
 }
 
 .empty-state p { font-size: 14px; max-width: 400px; line-height: 1.6; }
@@ -653,8 +676,8 @@ button.primary:hover { background: var(--accent-hover); }
     gap: 10px;
   }
 
-  .brand-logo {
-    height: 44px;
+  .brand-wordmark {
+    font-size: 22px;
   }
 
   .avatar {
@@ -678,8 +701,8 @@ button.primary:hover { background: var(--accent-hover); }
     padding: 28px 20px;
   }
 
-  .empty-state .big-logo {
-    width: min(220px, 72vw);
+  .empty-state .big-wordmark {
+    font-size: clamp(34px, 12vw, 56px);
   }
 }
 
@@ -797,8 +820,8 @@ button.primary:hover { background: var(--accent-hover); }
 
 <header>
   <h1>
-    <img class="brand-logo" src="/images/banner_1.png" alt="TensorSharp logo">
-    <span class="brand-text">TensorSharp Chat</span>
+    <span class="brand-wordmark">TensorSharp</span>
+    <span class="brand-text">Chat</span>
   </h1>
   <div class="header-controls">
     <span id="queue-badge" class="status-badge" style="display:none" title="Live inference load: requests processing concurrently and waiting in the queue"></span>
@@ -810,7 +833,7 @@ button.primary:hover { background: var(--accent-hover); }
 <div class="main-area">
   <div id="chat-container">
     <div class="empty-state" id="empty-state">
-      <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
+      <div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div>
       <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
     </div>
   </div>
@@ -897,7 +920,7 @@ function renderEmptyState() {
   if (!currentLoadedModel) {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
-        <img class="big-logo" src="/images/banner_1.png" alt="TensorSharp Chat logo">
+        <div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div>
         <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
       </div>`;
     return;
@@ -905,7 +928,7 @@ function renderEmptyState() {
 
   chatContainer.innerHTML = `
     <div class="empty-state">
-      <img class="big-logo assistant-preview" src="/images/assistant_logo.png" alt="Assistant banner">
+      <div class="big-wordmark assistant-preview" aria-label="TensorSharp">TensorSharp</div>
       <p>Start a conversation with the configured model. You can attach images, videos, audio, and text files for multimodal inference.</p>
     </div>`;
 }

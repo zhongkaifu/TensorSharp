@@ -1,0 +1,186 @@
+# TensorSharp.Server on Hugging Face Spaces — Docker SDK, NVIDIA GPU (GGML CUDA backend).
+#
+# Read the docs: https://huggingface.co/docs/hub/spaces-sdks-docker
+#                https://huggingface.co/docs/hub/spaces-gpus
+#
+# Deploy steps (Space: https://huggingface.co/spaces/zhongkaifu/tensorsharp):
+#   1. Copy this file into the Space repo as a file named exactly `Dockerfile`.
+#   2. Add the YAML header from the "Space README.md (GPU)" section of
+#      Dockers/README.md to the Space's README.md (it must contain `sdk: docker`
+#      and a GPU `suggested_hardware`, e.g. `t4-small`).
+#   3. In the Space, pick a GPU hardware tier (Settings → Hardware). A CPU tier
+#      will build but fail to start because no CUDA device is present.
+#   4. Push. The Space builds the image (CUDA compile takes a while) and starts
+#      the server on the GPU.
+#
+# This is the GPU counterpart of Dockerfile_CPU.txt. The differences:
+#   * The build stage is based on an NVIDIA CUDA *devel* image (provides nvcc +
+#     cuBLAS headers), so `dotnet build` compiles the native GGML bridge with the
+#     ggml-cuda backend (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON → build-linux.sh
+#     --cuda) and also compiles the direct-CUDA PTX kernels.
+#   * The runtime stage is based on an NVIDIA CUDA *runtime* image (provides the
+#     CUDA runtime + cuBLAS shared libraries the bridge links against at runtime).
+#   * The server runs with `--backend ggml_cuda` (the most-tested NVIDIA path).
+#
+# Program.cs hard-codes the listen address to port 5000 and passes it to
+# app.Run(), which overrides PORT / ASPNETCORE_URLS. The build stage below
+# patches it to 7860 (the Hugging Face Spaces default port), so the Space needs
+# no `app_port` override.
+
+# CUDA toolkit / OS for both stages. Override at build time to match the CUDA
+# version your target driver supports (the *devel* and *runtime* tags must
+# share the same CUDA_VERSION). 12.2.2 JIT-compiles on any reasonably recent
+# NVIDIA driver (>= 535), which covers every current Hugging Face GPU tier.
+ARG CUDA_VERSION=12.2.2
+ARG UBUNTU_VERSION=22.04
+
+############################################################
+# Stage 1 — build the server + the CUDA-enabled GGML bridge
+############################################################
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build
+
+# git    : clones TensorSharp and (during the build) ggml-org/ggml into ExternalProjects/ggml
+# cmake  : configures/builds the native GGML bridge (TensorSharp.GGML.Native/CMakeLists.txt; needs >= 3.20)
+# build-essential : C/C++ toolchain (gcc/g++/make) the CMake + nvcc build needs
+# curl   : downloads the .NET install script
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git cmake build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The CUDA *devel* base ships nvcc + cuBLAS but no .NET. Install the .NET 10 SDK
+# via the official script (the Microsoft apt feed does not cover every distro),
+# then symlink it onto PATH so `dotnet` resolves for the build below.
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet \
+    && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+    && rm /tmp/dotnet-install.sh
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1
+
+# Turn on the ggml-cuda backend in the native build. The TensorSharp.Backends.GGML
+# csproj reads this env var as an MSBuild property and passes `--cuda` to
+# build-linux.sh; build-linux.sh also reads it directly.
+ENV TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON
+
+# CUDA architectures for the ggml-cuda compile. The Space build host has no GPU,
+# so nvidia-smi auto-detection cannot run — the targets MUST be set explicitly.
+#
+# Default `75-real;75-virtual`: native SASS for Turing (T4, the cheapest HF GPU
+# tier) plus compute_75 PTX so the driver JIT-compiles for any newer GPU
+# (A100 8.0, A10G 8.6, L4/L40S 8.9, H100 9.0). This builds in two gencode passes
+# yet runs on every current HF GPU tier. For the fastest possible build, set this
+# to just your GPU's arch (e.g. `86-real` for A10G); for native speed on a bigger
+# GPU, add its `-real` entry (e.g. `80-real` A100, `89-real` L4, `90-real` H100).
+#   GPU → arch:  T4=75  A100=80  A10G=86  L4/L40S=89  H100=90
+ARG CUDA_ARCHS=75-real;75-virtual
+ENV TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES=${CUDA_ARCHS}
+
+# The direct-CUDA PTX backend (`--backend cuda`) is compiled too because nvcc is
+# present. PTX is forward-compatible, so target compute_75 once and let the
+# driver JIT it on any GPU >= 7.5. (The default runtime backend is ggml_cuda;
+# this just keeps `--backend cuda` available for experimentation.)
+ENV TENSORSHARP_CUDA_ARCH=compute_75
+
+# Override TENSORSHARP_REF to pin a tag/branch/commit of your choice.
+ARG TENSORSHARP_REPO=https://github.com/zhongkaifu/TensorSharp.git
+ARG TENSORSHARP_REF=main
+
+WORKDIR /src
+RUN git clone --depth 1 --branch ${TENSORSHARP_REF} ${TENSORSHARP_REPO} .
+
+# The listen address is hard-coded to 0.0.0.0:5000 in Program.cs and passed to
+# app.Run(), which overrides PORT / ASPNETCORE_URLS. Rewrite the constant to
+# 7860 (the Hugging Face Spaces default port) so the app binds the port the
+# Space routes to. The grep asserts the rewrite took effect — it keeps the build
+# green if upstream already uses 7860, and fails loudly if neither matches.
+ARG APP_PORT=7860
+RUN sed -i "s#0.0.0.0:5000#0.0.0.0:${APP_PORT}#g" TensorSharp.Server/Program.cs \
+    && grep -q "0.0.0.0:${APP_PORT}" TensorSharp.Server/Program.cs
+
+# Building the server transitively builds Runtime/Models/Backends and runs the
+# native GGML CMake build. nvcc IS present here, so the native build fetches ggml
+# sources over the network and compiles ggml-cuda for ${CUDA_ARCHS}, and the
+# TensorSharp.Backends.Cuda project compiles its PTX kernels. The CUDA compile is
+# the slow part of this image — minutes to tens of minutes depending on arches.
+RUN dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release
+
+############################################################
+# Stage 2 — runtime image (CUDA runtime + cuBLAS)
+############################################################
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+# The CUDA *runtime* base provides libcudart + libcublas (what the ggml-cuda
+# bridge links at runtime). Add:
+#   libgomp1   : OpenMP runtime the native GGML CPU kernels link against
+#   libicu70   : ICU, required by .NET unless invariant globalization is forced
+#   curl/wget  : .NET install script (curl) and GGUF model download (wget)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 libicu70 curl wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the ASP.NET Core 10 runtime (framework-dependent app built in stage 1).
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel 10.0 --runtime aspnetcore --install-dir /usr/share/dotnet \
+    && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+    && rm /tmp/dotnet-install.sh
+
+# Hugging Face Spaces run the container as UID 1000. The CUDA base image has no
+# such user, so create one and make the app tree (where the server writes
+# uploads/, logs/, and the model lands) owned by it.
+RUN useradd -m -u 1000 -s /bin/bash user \
+    && mkdir -p /home/user/app/models \
+    && chown -R 1000:1000 /home/user
+USER 1000
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+WORKDIR /home/user/app
+
+# The Release build output is a runnable framework-dependent app: managed DLLs,
+# the native libGgmlOps.so (CUDA-enabled), runtimes/<rid>/native/*, the
+# cuda_kernels/*.ptx, and the wwwroot/ web UI.
+COPY --chown=1000:1000 --from=build /src/TensorSharp.Server/bin/ ./
+
+# Download the GGUF model for the demo (gemma-4-E2B QAT Q4_0, ~3.4 GB) plus its
+# multimodal projector (mmproj, ~1 GB) so vision input works out of the box. This
+# fits the smallest HF GPU tier (T4, 16 GB) with room for the KV cache. On a
+# larger GPU you can host a bigger model via these build args, e.g.:
+#   docker build -f Dockerfile \
+#     --build-arg MODEL_URL=.../gemma-4-12B-it-...-Q4_K_M.gguf \
+#     --build-arg MODEL_FILE=gemma-4-12B-it-...-Q4_K_M.gguf ...
+ARG MODEL_URL=https://huggingface.co/huihui-ai/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-GGUF/resolve/main/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+ARG MODEL_FILE=Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+ENV MODEL_FILE=${MODEL_FILE}
+RUN wget -q -O "/home/user/app/models/${MODEL_FILE}" "${MODEL_URL}"
+
+# The multimodal projector from the same repo. Set MMPROJ_FILE to an empty
+# string at build time to host a text-only server (the CMD drops --mmproj then).
+ARG MMPROJ_URL=https://huggingface.co/huihui-ai/Huihui-gemma-4-E2B-it-qat-q4_0-unquantized-abliterated-GGUF/resolve/main/mmproj-model-bf16.gguf
+ARG MMPROJ_FILE=mmproj-model-bf16.gguf
+ENV MMPROJ_FILE=${MMPROJ_FILE}
+RUN if [ -n "${MMPROJ_FILE}" ]; then \
+        wget -q -O "/home/user/app/models/${MMPROJ_FILE}" "${MMPROJ_URL}"; \
+    fi
+
+# Expose the GPU to the container. The NVIDIA Container Runtime (used by HF GPU
+# Spaces) reads these to mount the driver and grant compute access. They are
+# already set by the CUDA base image; re-assert them here for clarity.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    BACKEND=ggml_cuda
+
+# 7860 is the port Hugging Face Spaces routes to by default (no app_port needed).
+EXPOSE 7860
+
+# Shell form so the variables expand. Host the model (and its projector, when
+# MMPROJ_FILE is set) on the native GGML CUDA backend.
+CMD dotnet TensorSharp.Server.dll \
+    --model "/home/user/app/models/${MODEL_FILE}" \
+    ${MMPROJ_FILE:+--mmproj "/home/user/app/models/${MMPROJ_FILE}"} \
+    --backend ggml_cuda \
+    --max-tokens 4096

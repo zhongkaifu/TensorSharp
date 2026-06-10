@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using TensorSharp.Cuda.Interop;
 
@@ -9,19 +8,19 @@ namespace TensorSharp.Cuda
     public sealed class CudaAllocator : IAllocator, IDisposable
     {
         private int disposed;
-        private readonly object poolSync = new object();
-        private readonly Dictionary<long, Stack<IntPtr>> devicePool = new Dictionary<long, Stack<IntPtr>>();
-        private readonly long maxCachedBytes;
-        private readonly long maxCachedBlockBytes;
-        private long cachedBytes;
-        private bool poolEnabled;
+
+        // Striped, size-classed device-memory cache. Replaces the original single
+        // global `poolSync` monitor + Dictionary<long, Stack<IntPtr>>, which became a
+        // contention hot spot when high-concurrency serving churned many small
+        // transient tensors. See CudaDeviceMemoryPool for the design.
+        private readonly CudaDeviceMemoryPool pool;
 
         public CudaAllocator(int deviceId = 0)
         {
             CudaBackend.Register();
-            poolEnabled = !string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_CUDA_POOL"), "0", StringComparison.Ordinal);
-            maxCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_MB", 512L) * 1024L * 1024L;
-            maxCachedBlockBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_BLOCK_MB", 256L) * 1024L * 1024L;
+            bool poolEnabled = !string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_CUDA_POOL"), "0", StringComparison.Ordinal);
+            long maxCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_MB", 512L) * 1024L * 1024L;
+            long maxCachedBlockBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MAX_BLOCK_MB", 256L) * 1024L * 1024L;
 
             CudaContext context = null;
             CudaStream stream = null;
@@ -51,6 +50,13 @@ namespace TensorSharp.Cuda
             Blas = blas;
             Kernels = kernels;
             DeviceId = deviceId;
+
+            pool = new CudaDeviceMemoryPool(
+                maxCachedBytes,
+                maxCachedBlockBytes,
+                poolEnabled,
+                backingAllocate: AllocateDeviceMemory,
+                backingFree: FreeDeviceMemory);
         }
 
         public BlasEnum BlasEnum => BlasEnum.CUDA;
@@ -73,49 +79,23 @@ namespace TensorSharp.Cuda
         internal IntPtr RentDeviceMemory(long requestedBytes, out long allocationBytes)
         {
             ThrowIfDisposed();
-            allocationBytes = RoundAllocationSize(Math.Max(requestedBytes, 1));
+            return pool.Rent(requestedBytes, out allocationBytes);
+        }
 
-            if (poolEnabled)
-            {
-                lock (poolSync)
-                {
-                    if (devicePool.TryGetValue(allocationBytes, out Stack<IntPtr> stack) && stack.Count > 0)
-                    {
-                        cachedBytes -= allocationBytes;
-                        return stack.Pop();
-                    }
-                }
-            }
+        internal void ReturnDeviceMemory(IntPtr ptr, long allocationBytes)
+        {
+            pool.Return(ptr, allocationBytes);
+        }
 
+        private IntPtr AllocateDeviceMemory(long allocationBytes)
+        {
             Context.MakeCurrent();
             CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)allocationBytes)).ThrowOnError();
             return ptr;
         }
 
-        internal void ReturnDeviceMemory(IntPtr ptr, long allocationBytes)
+        private void FreeDeviceMemory(IntPtr ptr)
         {
-            if (ptr == IntPtr.Zero)
-                return;
-
-            if (poolEnabled && allocationBytes > 0 && allocationBytes <= maxCachedBlockBytes)
-            {
-                lock (poolSync)
-                {
-                    if (cachedBytes + allocationBytes <= maxCachedBytes)
-                    {
-                        if (!devicePool.TryGetValue(allocationBytes, out Stack<IntPtr> stack))
-                        {
-                            stack = new Stack<IntPtr>();
-                            devicePool[allocationBytes] = stack;
-                        }
-
-                        stack.Push(ptr);
-                        cachedBytes += allocationBytes;
-                        return;
-                    }
-                }
-            }
-
             Context.MakeCurrent();
             CudaDriverApi.cuMemFree(ptr);
         }
@@ -132,6 +112,11 @@ namespace TensorSharp.Cuda
             return (float)(1.0 - (double)freeBytes / totalBytes);
         }
 
+        /// <summary>
+        /// Snapshot of allocator pool counters for diagnostics / load testing.
+        /// </summary>
+        public CudaAllocatorStats GetStats() => pool.GetStats();
+
         public void Synchronize()
         {
             Context.MakeCurrent();
@@ -145,30 +130,11 @@ namespace TensorSharp.Cuda
 
             Context.MakeCurrent();
             Stream.Synchronize();
-            FreeCachedDeviceMemory();
+            pool.DrainAndFree();
             Kernels?.Dispose();
             Blas.Dispose();
             Stream.Dispose();
             Context.Dispose();
-        }
-
-        private void FreeCachedDeviceMemory()
-        {
-            lock (poolSync)
-            {
-                foreach (Stack<IntPtr> stack in devicePool.Values)
-                {
-                    while (stack.Count > 0)
-                    {
-                        IntPtr ptr = stack.Pop();
-                        if (ptr != IntPtr.Zero)
-                            CudaDriverApi.cuMemFree(ptr);
-                    }
-                }
-
-                devicePool.Clear();
-                cachedBytes = 0;
-            }
         }
 
         private void ThrowIfDisposed()
@@ -177,30 +143,85 @@ namespace TensorSharp.Cuda
                 throw new ObjectDisposedException(nameof(CudaAllocator));
         }
 
-        private static long RoundAllocationSize(long bytes)
-        {
-            const long smallMax = 1L << 20;
-            if (bytes <= 256)
-                return 256;
-
-            if (bytes <= smallMax)
-            {
-                long size = 256;
-                while (size < bytes)
-                    size <<= 1;
-                return size;
-            }
-
-            const long largeAlignment = 1L << 20;
-            return ((bytes + largeAlignment - 1) / largeAlignment) * largeAlignment;
-        }
-
         private static long ReadPoolLimit(string name, long defaultMb)
         {
             string value = Environment.GetEnvironmentVariable(name);
             if (long.TryParse(value, out long parsed) && parsed >= 0)
                 return parsed;
             return defaultMb;
+        }
+    }
+
+    /// <summary>
+    /// Immutable snapshot of <see cref="CudaAllocator"/> pool counters.
+    /// </summary>
+    public readonly struct CudaAllocatorStats
+    {
+        internal CudaAllocatorStats(
+            bool poolEnabled,
+            long poolHitCount,
+            long poolMissCount,
+            long cuMemAllocCount,
+            long cuMemFreeCount,
+            long returnedToPoolCount,
+            long cachedBytes,
+            long peakCachedBytes,
+            long maxCachedBytes,
+            long maxCachedBlockBytes,
+            int shardCount)
+        {
+            PoolEnabled = poolEnabled;
+            PoolHitCount = poolHitCount;
+            PoolMissCount = poolMissCount;
+            CuMemAllocCount = cuMemAllocCount;
+            CuMemFreeCount = cuMemFreeCount;
+            ReturnedToPoolCount = returnedToPoolCount;
+            CachedBytes = cachedBytes;
+            PeakCachedBytes = peakCachedBytes;
+            MaxCachedBytes = maxCachedBytes;
+            MaxCachedBlockBytes = maxCachedBlockBytes;
+            ShardCount = shardCount;
+        }
+
+        public bool PoolEnabled { get; }
+
+        /// <summary>Rent calls served from the pool (no backing allocation).</summary>
+        public long PoolHitCount { get; }
+
+        /// <summary>Rent calls that fell through to a backing allocation.</summary>
+        public long PoolMissCount { get; }
+
+        /// <summary>Total cuMemAlloc driver calls issued (== <see cref="PoolMissCount"/>).</summary>
+        public long CuMemAllocCount { get; }
+
+        /// <summary>Total cuMemFree driver calls issued.</summary>
+        public long CuMemFreeCount { get; }
+
+        /// <summary>Return calls that parked a block back into the pool.</summary>
+        public long ReturnedToPoolCount { get; }
+
+        /// <summary>Bytes currently held in the pool (summed across shards).</summary>
+        public long CachedBytes { get; }
+
+        /// <summary>Sum of per-shard high-water marks (conservative upper bound, ≤ MaxCachedBytes).</summary>
+        public long PeakCachedBytes { get; }
+
+        public long MaxCachedBytes { get; }
+
+        public long MaxCachedBlockBytes { get; }
+
+        /// <summary>Number of independent pool shards.</summary>
+        public int ShardCount { get; }
+
+        public long TotalRentCount => PoolHitCount + PoolMissCount;
+
+        public double PoolHitRatio => TotalRentCount == 0 ? 0.0 : (double)PoolHitCount / TotalRentCount;
+
+        public override string ToString()
+        {
+            return $"CudaAllocatorStats(shards={ShardCount}, hits={PoolHitCount}, misses={PoolMissCount}, hitRatio={PoolHitRatio:P1}, " +
+                   $"cuMemAlloc={CuMemAllocCount}, cuMemFree={CuMemFreeCount}, returnedToPool={ReturnedToPoolCount}, " +
+                   $"cachedBytes={CachedBytes}, peakCachedBytes={PeakCachedBytes})";
         }
     }
 }
