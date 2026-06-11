@@ -67,15 +67,26 @@ ENV TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON
 # CUDA architectures for the ggml-cuda compile. The Space build host has no GPU,
 # so nvidia-smi auto-detection cannot run — the targets MUST be set explicitly.
 #
-# Default `75-real;75-virtual`: native SASS for Turing (T4, the cheapest HF GPU
-# tier) plus compute_75 PTX so the driver JIT-compiles for any newer GPU
-# (A100 8.0, A10G 8.6, L4/L40S 8.9, H100 9.0). This builds in two gencode passes
-# yet runs on every current HF GPU tier. For the fastest possible build, set this
-# to just your GPU's arch (e.g. `86-real` for A10G); for native speed on a bigger
-# GPU, add its `-real` entry (e.g. `80-real` A100, `89-real` L4, `90-real` H100).
+# Default `75-virtual`: compute_75 PTX only (no SASS). This is the lightest build
+# — it skips ptxas (the memory- and time-hungry SASS pass) that otherwise makes
+# the large ggml-cuda compile OOM-kill the Space build container — and the driver
+# JIT-compiles the PTX for whatever GPU runs the Space, so the one image runs on
+# EVERY current HF tier (T4 7.5, A100 8.0, A10G 8.6, L4/L40S 8.9, H100 9.0). The
+# only cost is a one-time JIT at first model load.
+#
+# For native SASS (marginally faster steady-state, but a heavier build that can
+# OOM), set this to your GPU's `-real` arch, e.g. `--build-arg CUDA_ARCHS=86-real`:
 #   GPU → arch:  T4=75  A100=80  A10G=86  L4/L40S=89  H100=90
-ARG CUDA_ARCHS=75-real;75-virtual
+ARG CUDA_ARCHS=75-virtual
 ENV TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES=${CUDA_ARCHS}
+
+# Cap the native build's parallelism. build-linux.sh otherwise sizes the job
+# count from /proc/meminfo, which reports the build *host's* total RAM, not the
+# memory cgroup limit of the Space build container — so on a big host it launches
+# many parallel nvcc processes and the container is OOM-killed (exit 137). A small
+# fixed cap keeps peak memory bounded. Lower to 1 if the build still OOMs.
+ARG GGML_BUILD_JOBS=2
+ENV TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL=${GGML_BUILD_JOBS}
 
 # The direct-CUDA PTX backend (`--backend cuda`) is compiled too because nvcc is
 # present. PTX is forward-compatible, so target compute_75 once and let the
