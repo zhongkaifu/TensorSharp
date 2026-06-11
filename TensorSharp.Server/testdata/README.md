@@ -2,13 +2,13 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-Two test suites exercise TensorSharp.Server's current public compatibility surface:
+The test suites exercise TensorSharp.Server's current public compatibility surface:
 
 - Web UI SSE: `/api/chat`
 - Ollama chat compatibility: `/api/chat/ollama`
 - OpenAI Chat Completions compatibility: `/v1/chat/completions`
 
-The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities.
+The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities. They target autoregressive compatibility behavior; DiffusionGemma's Web UI whole-message `replace` preview frames are not covered until a dedicated diffusion suite is added.
 
 ## Current Suite Status
 
@@ -18,6 +18,7 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 | Ollama compatibility | Chat streaming/non-streaming, multi-turn history, thinking, tool-call request plumbing |
 | OpenAI compatibility | Chat Completions streaming/non-streaming, tool calls, structured outputs, validation errors |
 | Operational behavior | Continuous-batching concurrency, queue-status compatibility, mixed API handoff, architecture-aware skips |
+| DiffusionGemma | Not covered by the current compatibility scripts beyond generic endpoint shape; live denoising previews need a dedicated Web UI SSE test |
 
 ## Quick Start
 
@@ -57,6 +58,7 @@ python3 test_multiturn.py
   Gemma 4, Qwen 3, Qwen 3.5, GPT OSS, and Nemotron-H
 - Tool-calling tests run only on architectures that currently support tool calling in TensorSharp:
   Gemma 4, Qwen 3, Qwen 3.5, and Nemotron-H
+- GPT OSS thinking is exercised, but GPT OSS tool-call checks are currently skipped by these scripts even though the general parser/API surface supports Harmony tool-call framing.
 
 Unsupported architectures are reported as `SKIP`, not `FAIL`.
 
@@ -80,6 +82,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 - The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server currently emulates here.
 - Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` or `think` are expected to return HTTP `400`.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
+- DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames.
 
 ## Usage
 

@@ -17,19 +17,38 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Server
 {
-    internal sealed class ChatGenerationPipeline
+    /// <summary>A single streaming update from the DiffusionGemma denoising pipeline.
+    /// Previews are intermediate best-guess canvases (whole-text "replace" semantics); the final
+    /// update carries the trimmed answer; the done update carries metrics.</summary>
+    internal readonly record struct DiffusionStreamUpdate(
+        string Text, bool IsPreview, bool Done, int Step, int TotalSteps,
+        int PromptTokens, int EvalTokens, long TotalNs);
+
+    internal sealed class ChatGenerationPipeline : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
         private readonly InferenceEngineHost _engineHost;
         private readonly KVCachePromptRenderer _kvCacheRenderer;
         private readonly InferenceTelemetry _telemetry;
         private readonly ILogger _logger;
+
+        // DiffusionGemma's continuous-batching scheduler (the diffusion analog of the AR InferenceEngine).
+        // Created lazily and rebound when the loaded model changes; disposed on model swap / shutdown.
+        private readonly object _diffSchedLock = new();
+        private DiffusionBatchScheduler _diffScheduler;
+        private DiffusionGemmaModel _diffSchedModel;
+        // Max canvases denoised together. Each extra concurrent request adds ~one canvas's worth of
+        // activation memory, so on a memory-tight box (e.g. 24 GB running a 16.8 GB model) 2 is the safe
+        // default; raise via DIFFUSION_MAX_BATCH when there's GPU headroom for more aggregate throughput.
+        private static readonly int DiffusionMaxBatch =
+            int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_MAX_BATCH"), out int mb) && mb > 0 ? mb : 2;
 
         // Per-pipeline lock guarding multimodal-prompt preparation. The
         // multimodal-prep serialisation is now handled by
@@ -81,6 +100,24 @@ namespace TensorSharp.Server
             session ??= new ChatSession("__svc_intrinsic__");
             var model = _lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded.");
+
+            // DiffusionGemma does not use the autoregressive continuous-batching engine; it generates a
+            // whole block via iterative denoising. Drive it here and surface only the final answer to the
+            // append-only protocols (OpenAI/Ollama/non-streaming). The Web UI uses DiffusionChatStreamAsync
+            // directly for a live denoising preview.
+            if (model is DiffusionGemmaModel)
+            {
+                await foreach (var u in DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    if (u.Done)
+                        yield return ("", true, u.PromptTokens, u.EvalTokens, 0, u.TotalNs, 0, u.TotalNs);
+                    else if (!u.IsPreview && u.Text.Length > 0)
+                        yield return (u.Text, false, 0, 0, 0, 0, 0, 0);
+                }
+                yield break;
+            }
+
             var engine = _engineHost.TryGetEngine()
                 ?? throw new InvalidOperationException(
                     "Continuous-batching engine is unavailable for this model " +
@@ -89,7 +126,9 @@ namespace TensorSharp.Server
 
             string arch = model.Config.Architecture;
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
-            var renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
+            List<ChatMessage> renderHistory;
+            lock (session.HistoryLock)
+                renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
 
             using var chatScope = _telemetry.BeginInferenceScope(
                 session, _lifecycle.LoadedModelName, _lifecycle.LoadedBackend, "chat.stream");
@@ -265,8 +304,9 @@ namespace TensorSharp.Server
             evalSw.Stop();
             totalSw.Stop();
 
-            ChatHistoryPreparer.UpdateTrackedHistory(
-                session.TrackedHistory, renderHistory, assistantText, generatedTokens);
+            lock (session.HistoryLock)
+                ChatHistoryPreparer.UpdateTrackedHistory(
+                    session.TrackedHistory, renderHistory, assistantText, generatedTokens);
 
             double evalSeconds = evalSw.Elapsed.TotalSeconds;
             double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
@@ -298,6 +338,141 @@ namespace TensorSharp.Server
                     model.MultimodalInjector.ClearPreparedPromptState(requestId);
                 }
             }
+        }
+
+        /// <summary>
+        /// Drives a DiffusionGemma chat turn via the EntropyBound denoising sampler and yields rich
+        /// streaming updates: a live preview after every denoising step (the current best-guess canvas,
+        /// "replace" semantics), then the final trimmed answer, then a done update with metrics.
+        /// The sampler runs on a background thread under <see cref="ModelBase.GpuComputeLock"/> and pushes
+        /// updates through a channel so the request thread can stream them without blocking.
+        /// </summary>
+        public async IAsyncEnumerable<DiffusionStreamUpdate> DiffusionChatStreamAsync(
+            ChatSession session,
+            List<ChatMessage> history,
+            int maxTokens,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            session ??= new ChatSession("__svc_intrinsic__");
+            var model = (DiffusionGemmaModel)(_lifecycle.Model
+                ?? throw new InvalidOperationException("No model is loaded."));
+            string arch = model.Config.Architecture;
+
+            var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
+            // Snapshot the (shared, for DefaultSession) tracked history under the session lock so a parallel
+            // request's turn-end rewrite can't race this read.
+            List<ChatMessage> renderHistory;
+            lock (session.HistoryLock)
+                renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
+
+            using var chatScope = _telemetry.BeginInferenceScope(
+                session, _lifecycle.LoadedModelName, _lifecycle.LoadedBackend, "diffusion.chat.stream");
+
+            var promptSw = Stopwatch.StartNew();
+            List<int> inputTokens = _kvCacheRenderer.RenderToTokens(
+                model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
+                addGenerationPrompt: true, tools: null, enableThinking: false);
+            inputTokens = TruncatePromptToContext(session, inputTokens, maxTokens);
+            int promptTokenCount = inputTokens.Count;
+            promptSw.Stop();
+
+            int canvas = model.CanvasLength;
+            int blocks = Math.Max(1, (Math.Max(1, maxTokens) + canvas - 1) / canvas);
+            var ebParams = new DiffusionEbParams
+            {
+                MaxDenoisingSteps = DiffusionMaxSteps,
+                Seed = Random.Shared.Next(),
+                MaxBlocks = blocks,
+            };
+
+            // Submit to the shared continuous-batching scheduler. Several concurrent requests are denoised
+            // together in one batched forward per step (one background thread owns the GPU lock), so a second
+            // parallel request streams immediately instead of waiting for the first to finish.
+            var scheduler = GetDiffusionScheduler(model);
+            var handle = scheduler.Submit(inputTokens.ToArray(), ebParams, cancellationToken);
+
+            var totalSw = Stopwatch.StartNew();
+
+            // Stream previews as they arrive (cancellation surfaces as OperationCanceledException, which the
+            // adapter catches and finalizes).
+            await foreach (var preview in handle.Previews.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                string previewText = DecodeDiffusionPreview(model, preview.Tokens);
+                yield return new DiffusionStreamUpdate(
+                    previewText, IsPreview: true, Done: false, preview.Step + 1, preview.TotalSteps, 0, 0, 0);
+            }
+
+            var generated = await handle.Completion.ConfigureAwait(false);
+            totalSw.Stop();
+
+            generated ??= new List<int>();
+            string finalText = model.Tokenizer.Decode(generated);
+
+            lock (session.HistoryLock)
+                ChatHistoryPreparer.UpdateTrackedHistory(
+                    session.TrackedHistory, renderHistory, finalText, generated);
+
+            long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
+            _telemetry.LogChatFinished(
+                cancellationToken.IsCancellationRequested, generated.Count, promptTokenCount, 0, 0.0,
+                0, totalSw.Elapsed.TotalMilliseconds,
+                totalSw.Elapsed.TotalSeconds > 0 ? generated.Count / totalSw.Elapsed.TotalSeconds : 0,
+                cancellationToken.IsCancellationRequested ? "cancelled" : "stop", finalText);
+
+            // Final answer (replaces the last preview), then the terminal metrics update.
+            yield return new DiffusionStreamUpdate(finalText, IsPreview: false, Done: false, 0, 0, 0, 0, 0);
+            yield return new DiffusionStreamUpdate("", IsPreview: false, Done: true, 0, 0,
+                promptTokenCount, generated.Count, totalNs);
+        }
+
+        /// <summary>Get the diffusion batch scheduler bound to the currently-loaded model, (re)creating it
+        /// when the model changes. The scheduler owns a single GPU-compute worker thread.</summary>
+        private DiffusionBatchScheduler GetDiffusionScheduler(DiffusionGemmaModel model)
+        {
+            lock (_diffSchedLock)
+            {
+                if (_diffScheduler != null && ReferenceEquals(_diffSchedModel, model))
+                    return _diffScheduler;
+                _diffScheduler?.Dispose();
+                _diffScheduler = new DiffusionBatchScheduler(model, _logger, DiffusionMaxBatch);
+                _diffSchedModel = model;
+                _logger.LogInformation("DiffusionGemma batch scheduler constructed (maxBatch={MaxBatch})", DiffusionMaxBatch);
+                return _diffScheduler;
+            }
+        }
+
+        /// <summary>Tear down the diffusion scheduler (joins its worker thread). Called on model swap and
+        /// shutdown so the worker doesn't outlive / race the model it references.</summary>
+        public void ResetDiffusionScheduler()
+        {
+            lock (_diffSchedLock)
+            {
+                _diffScheduler?.Dispose();
+                _diffScheduler = null;
+                _diffSchedModel = null;
+            }
+        }
+
+        public void Dispose() => ResetDiffusionScheduler();
+
+        // Default number of denoising steps for server-driven generation (adaptive stop usually
+        // terminates earlier). Overridable via the DIFFUSION_STEPS environment variable.
+        private static readonly int DiffusionMaxSteps =
+            int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_STEPS"), out int s) && s > 0 ? s : 48;
+
+        /// <summary>Decode a denoising preview canvas for display, trimmed at the first end-of-sequence
+        /// token so the live view reads cleanly as it converges.</summary>
+        private static string DecodeDiffusionPreview(DiffusionGemmaModel model, int[] tokens)
+        {
+            int cut = tokens.Length;
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                if (model.Tokenizer.IsEos(tokens[i])) { cut = i; break; }
+            }
+            var slice = new List<int>(cut);
+            for (int i = 0; i < cut; i++) slice.Add(tokens[i]);
+            try { return model.Tokenizer.Decode(slice); }
+            catch { return string.Empty; }
         }
 
         public async IAsyncEnumerable<(string piece, bool done, int promptTokens, int evalTokens, int kvCacheReusedTokens, long totalNs, long promptNs, long evalNs)>

@@ -6,7 +6,7 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-A C# inference engine for running large language models (LLMs) locally using GGUF model files. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
+A C# inference engine for running GGUF language models locally, including autoregressive LLMs and DiffusionGemma-style text-diffusion models. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
 ## Quick Start
 
@@ -72,10 +72,12 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) (also 47B, Omni) | ✅ (Omni) / — / — | ✅ | ✅ | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3.md](docs/models/mistral3.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3.md](docs/models/gemma3.md) |
+| DiffusionGemma | diffusion-gemma GGUFs | — / — / — | — | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 
 ## Highlights
 
 - **Continuous batching & paged KV cache** — vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
+- **DiffusionGemma text diffusion** — block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI generation flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
 - **Multimodal** — image / video / audio inputs (Gemma 4); image inputs for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → [Multimodal Support](#multimodal-support)
 - **Tool calling / function calling** — multi-turn tool calls across all three API styles, with architecture-agnostic output parsing. → [Tool Calling](#tool-calling--function-calling)
 - **Thinking / reasoning mode** — structured chain-of-thought for Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, and Nemotron-H. → [Thinking Mode](#thinking--reasoning-mode)
@@ -106,8 +108,8 @@ Everything below is detailed reference. New here? The five sections above are al
 
 | Area | Status |
 |---|---|
-| Model families | Gemma 3/4, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3 |
-| Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API |
+| Model families | Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3 |
+| Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. DiffusionGemma currently uses the CLI diffusion run mode and Web UI denoising stream. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
@@ -117,7 +119,7 @@ Everything below is detailed reference. New here? The five sections above are al
 
 ## Features
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3
+- **Multi-architecture support** -- Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
@@ -129,9 +131,10 @@ Everything below is detailed reference. New here? The five sections above are al
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
 - **Chat templates** -- auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture
-- **Inference engine** -- the new `InferenceEngine` (worker-thread scheduler + paged block pool) replaces the legacy single-request FIFO queue inside `TensorSharp.Server`. The HTTP adapters still emit queue-position chunks for backward compatibility but the engine itself handles concurrency.
+- **Inference engine** -- the new `InferenceEngine` (worker-thread scheduler + paged block pool) replaces the legacy single-request FIFO queue inside `TensorSharp.Server`. The old queue object is now a compatibility shim for status/event shapes; the engine itself handles concurrency.
 - **Batch processing** -- JSONL input support in the console application, plus a built-in inference benchmark for prefill/decode throughput
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
+- **Text-diffusion generation** -- DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive `Forward()`. The CLI exposes `--diffusion-steps`, `--diffusion-seed`, and `--diffusion-blocks`; the Web UI streams whole-message `replace` events for live denoising previews and batches concurrent diffusion requests through `DiffusionBatchScheduler`.
 - **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model. The Mamba2 step has both a per-sequence native kernel and a batched native kernel (`TSGgml_NemotronMamba2BatchedStepF32`, NEON SIMD + GCD parallelism) used by the batched path.
 - **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers; the batched path keeps recurrent running state in a per-slot recurrent-state pool
 - **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5/3.6-family MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
@@ -152,6 +155,7 @@ Everything below is detailed reference. New here? The five sections above are al
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | [gptoss.md](docs/models/gptoss.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | [mistral3.md](docs/models/mistral3.md) |
+| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 
 See the [per-model architecture cards](docs/models/README.md) for end-to-end documentation of each architecture (origin, forward graph, components, parameters, weight naming, and how TensorSharp implements / optimizes prefill and decode).
 
@@ -174,6 +178,7 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | Mistral 3 | mistral3-mmproj (Pixtral vision projector) | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
+| DiffusionGemma | diffusion-gemma text-diffusion GGUFs | Use GGUF files whose `general.architecture` is `diffusion-gemma` or `diffusion_gemma` |
 
 ## Compute Backends
 
@@ -202,7 +207,7 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # Content-addressed block hash for prefix-cache sharing
 │   └── Logging/                 # JSON-line file logger + per-turn telemetry
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
-│   ├── Models/<Family>/         # One folder per architecture (Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35)
+│   ├── Models/<Family>/         # One folder per architecture (DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35)
 │   │   ├── <Family>Model.cs                # Legacy per-sequence ModelBase implementation
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
 │   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
@@ -222,6 +227,7 @@ TensorSharp/
 │   ├── ggml_ops_gated_delta_net.cpp       # Qwen 3.5/3.6 GatedDeltaNet kernels (per-seq + batched)
 │   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 kernels (per-seq + batched SIMD)
 │   ├── ggml_ops_paged_attention.cpp       # Paged-attention native kernel (drives ggml_flash_attn_ext + sinks variant)
+│   ├── ggml_ops_diffusion.cpp             # DiffusionGemma fused decode-layer / whole-model / lm-head kernels
 │   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
 │   └── tests/                              # Native unit + smoke tests
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
@@ -422,6 +428,10 @@ cd TensorSharp.Cli/bin
 # Audio inference (Gemma 4)
 ./TensorSharp.Cli --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# DiffusionGemma text-diffusion generation
+./TensorSharp.Cli --model <diffusion-gemma.gguf> --input prompt.txt --backend ggml_metal \
+    --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
+
 # Thinking / reasoning mode
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -500,6 +510,9 @@ cd TensorSharp.Cli/bin
 | `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
+| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48) |
+| `--diffusion-seed <N>` | DiffusionGemma deterministic sampler seed (default: 0) |
+| `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
 | `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
 | `--log-level <lvl>` | Console + file logger level: `trace`, `debug`, `info`, `warning`, `error`, `critical`, `off` |
@@ -607,6 +620,7 @@ Open `http://localhost:5000` in your browser. The web interface supports:
 - Thinking/reasoning mode toggle
 - Tool calling with function definitions
 - Streaming token generation via Server-Sent Events
+- DiffusionGemma denoising previews when a `diffusion-gemma` GGUF is hosted (the UI replaces the whole assistant message on each denoising step, then emits the final answer)
 - Backward-compatible queue-status events (the engine itself handles concurrency)
 - Message editing and deletion with regeneration from any point in the conversation
 - Free scrolling: scroll up to read earlier replies while new tokens stream in; the chat auto-scrolls again as soon as the user scrolls back to the bottom
@@ -652,7 +666,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
 | `VIDEO_MAX_FRAMES` | Optional upper bound on extracted video frames (evenly down-sampled); unset/`0` means no cap (default: no cap) |
-| `PORT` / `ASPNETCORE_URLS` | Standard ASP.NET Core listener configuration (default port: `5000`) |
+| `PORT` / `ASPNETCORE_URLS` | Currently overridden by the fixed `http://0.0.0.0:5000` listener in `Program.cs`; Docker Space images rewrite that constant with `APP_PORT` at build time. |
 | `TENSORSHARP_TEMPERATURE` | Default sampling temperature when neither `--temperature` nor the request body sets one |
 | `TENSORSHARP_TOP_K` | Default top-K when neither `--top-k` nor the request body sets one |
 | `TENSORSHARP_TOP_P` | Default top-P when neither `--top-p` nor the request body sets one |
@@ -664,6 +678,8 @@ server-wide defaults; the defaults only fill in fields the client omits.
 | `TENSORSHARP_LOG_LEVEL` | Minimum log level for both console and file loggers: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical` (default: `Information`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
+| `DIFFUSION_STEPS` | Server-side DiffusionGemma denoising steps per block (default: `48`; CLI equivalent is `--diffusion-steps`) |
+| `DIFFUSION_MAX_BATCH` | Maximum concurrent DiffusionGemma requests batched by the Web UI diffusion scheduler (default: `2`) |
 
 **Paged KV cache & continuous-batching tunables (read at process / model start)**
 
@@ -704,6 +720,19 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Gemma 4 defaults to every 4 layers via `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS`; Qwen 3 / Qwen 3.5 / Nemotron-H default to every 16 layers via `TS_MLX_EVAL_EVERY_N_LAYERS`. Set to `0` to disable where supported. |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
 
+**DiffusionGemma-specific tunables**
+
+| Variable | Description |
+|---|---|
+| `DIFFUSION_NO_SC` | Set to `1` to disable self-conditioning. Enabled by default. |
+| `DIFFUSION_SC_TOPK` | Experimental self-conditioning top-K cutoff (default: `32`). |
+| `DIFFUSION_NO_PKV` | Set to `1` to disable prompt-KV caching on device-glue backends. Enabled by default where supported. |
+| `DIFFUSION_NO_FUSED_DECODE` | Set to `1` to disable the GGML fused model decode path and fall back to per-op / per-layer diffusion decode. |
+| `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | Set to `1` to disable the fused output-norm + lm-head + softcap tail. |
+| `DIFFUSION_BATCHED_FORWARD` | Set to `1` to use true batched `DecodeCanvasBatched` for active diffusion canvases; default time-slices the faster fused single-canvas path. |
+| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Memory cap for batched diffusion lm-head logits before falling back to per-sequence lm-head (default: `300`). |
+| `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | Development diagnostics for per-section diffusion timing and fused-kernel debug logging. |
+
 Sampling parameter precedence (highest wins):
 
 1. Per-request JSON fields in the API call (e.g. `temperature`, `top_p`, `stop`).
@@ -737,6 +766,7 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | GPT OSS | ON | `TS_GPTOSS_BATCHED=0` to force legacy per-seq | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the managed (C#) sinks softmax instead of the native paged-attention-with-sinks kernel |
 | Nemotron-H | ON | `TS_NEMOTRON_BATCHED=0` to force legacy per-seq | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |
 | Gemma 3 | not implemented (per-seq fallback) | — | — |
+| DiffusionGemma | Separate diffusion scheduler in the Web UI path; not an `IBatchedPagedModel` autoregressive path | `DIFFUSION_MAX_BATCH`, `DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` enables true batched canvas decode; fused GGML decode is on by default unless disabled with `DIFFUSION_NO_FUSED_DECODE=1` |
 
 #### Backends
 
@@ -775,9 +805,10 @@ These fill in fields the request body omits; per-request JSON always wins, CLI f
 
 | Feature | Default | Env vars |
 |---|---|---|
-| ASP.NET Core listener | `http://0.0.0.0:5000` | `PORT`, `ASPNETCORE_URLS` |
+| ASP.NET Core listener | `http://0.0.0.0:5000` | Fixed in `Program.cs`; Docker Space images rewrite it with the `APP_PORT` build arg |
 | Plain-text upload character cap (when no tokenizer available) | 8000 chars | `MAX_TEXT_FILE_CHARS` |
 | Video-frame extraction | 1 fps (time-based, no cap) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
+| DiffusionGemma Web UI denoising | 48 steps, max batch 2 | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH` |
 
 #### Logging (server + CLI)
 
@@ -989,7 +1020,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), the `IKvBlockCodec` interface plus the `TurboQuantKvCodec` Q4/Q8 implementation, and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Each architecture ships both the legacy per-sequence forward and an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, DiffusionGemma, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 
@@ -997,7 +1028,7 @@ TensorSharp is structured as a layered system:
 
 6. **TensorSharp.Backends.MLX** is the Apple Silicon MLX path. It wraps [mlx-c](https://github.com/ml-explore/mlx-c) (`libmlxc`) with allocator, storage, async worker dispatch, quantized + fused + compiled kernels, MoE expert offload, and a CPU fallback layer for ops that aren't yet wired up.
 
-7. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, an `InferenceEngineHost` that owns the per-model continuous-batching engine, and a thin queue-status surface for backward compatibility.
+7. **TensorSharp.Server** is the HTTP/application layer. It provides Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, upload handling, an `InferenceEngineHost` that owns the per-model continuous-batching engine for autoregressive models, a `DiffusionBatchScheduler` for DiffusionGemma Web UI turns, and a thin queue-status surface for backward compatibility.
 
 8. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and the built-in prefill / decode benchmarks.
 
@@ -1029,6 +1060,7 @@ the fused path engages.
 - **Paged KV cache & block-hash prefix sharing**: the continuous-batching engine partitions KV into fixed-size blocks, content-hashes each full block, and shares them across concurrent and sequential requests. Models that have not implemented `IBatchedPagedModel` still use the engine's isolated per-sequence KV-swap fallback.
 - **Native paged-attention kernel**: `TSGgml_PagedAttentionForward` (and the `WithSinks` variant for GPT OSS) does a C++ gather of K/V from the paged buffer, builds a small GGML graph per sequence, and dispatches `ggml_flash_attn_ext` — the same fused Metal/CUDA flash-attention kernel the legacy single-sequence path uses. On Ministral-3-14B long-context (4×~800 tokens) it is **~21 % faster than the legacy per-sequence GGML path**.
 - **Batched / paged forward passes**: Mistral 3, Gemma 4, GPT OSS, Qwen 3.5/3.6 (incl. GatedDeltaNet recurrent state pool), and Nemotron-H (incl. Mamba2 recurrent state pool + native batched Mamba2 kernel) pack N sequences into a single `ForwardBatch` call with one batched linear-projection matmul per layer, paged K/V scatter via `slotMapping`, and per-sequence attention via the native kernel. Gemma 4 batched path reaches **1.5×** legacy throughput at batch=8 short prompts and **1.6×** at 4×800-token prompts; Nemotron-H Mamba2 batched reaches **3.95×** at batch=3 on Apple M4 Pro. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+- **DiffusionGemma prompt-KV caching and fused denoising**: on GPU backends, the prompt side of `[prompt | canvas]` is prefetched once per block and reused across denoising steps; GGML backends default to fused whole-model diffusion decode plus a fused lm-head tail. The Web UI batches concurrent diffusion requests at block boundaries through `DiffusionBatchScheduler`.
 - **Kernel warmup**: both CLI and Server run a tiny forward pass at startup to pre-compile GPU kernels (Metal pipeline states, CUDA JIT) and warm the memory pool, avoiding cold-start latency on the first real inference request.
 - **Prefill caching** (Gemma 4, Qwen 3.5/3.6-family): per-forward-pass SWA mask cache (Gemma 4), NeoX RoPE cos/sin lookup table cache across global layers (Gemma 4), and RoPE position tensor cache across layers (Gemma 4, Qwen 3.5/3.6-family) eliminate redundant recomputation during prefill.
 - **In-place QK RMSNorm** (Qwen 3.5/3.6-family): per-head QK normalization is performed in-place using a `View`, avoiding one tensor allocation and copy per Q/K per layer.
@@ -1072,7 +1104,7 @@ For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the 
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), DiffusionGemma denoising / prompt-KV / batched-generation probes (`DiffusionGemmaTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

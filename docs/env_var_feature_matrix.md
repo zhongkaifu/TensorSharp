@@ -30,6 +30,12 @@ The "Runtime baseline" column below describes the behavior when the variable is
 unset. The "Swept by default" column describes the current default config, not
 the full set of registered variables.
 
+DiffusionGemma is currently outside the registered TestMatrix feature catalog:
+there is no diffusion prompt type, no diffusion-specific env sweep, and inherited
+`DIFFUSION_*` variables are not scrubbed by the runner. Use explicit model
+configs plus a dedicated feature/env registration before treating diffusion
+results as part of the standard matrix.
+
 ## Continuous Batching / Batched Forward
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
@@ -76,6 +82,22 @@ the full set of registered variables.
 | `TS_MLX_PIPELINED_DECODE` | MLX decode features | Pipelined greedy decode with device-side argmax where supported | ON when eligible | `0`, `1` | yes |
 | `TS_MLX_DEVICE_KV_COPY` | MLX | On-device KV scatter | ON | `0`, `1` | no |
 | `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | Qwen 3.5 / 3.6 family on MLX | Packed GDN kernels | OFF | `0`, `1` | yes |
+
+## Out-of-Matrix DiffusionGemma Knobs
+
+These variables are real runtime knobs, but they are not registered in
+`EnvVarMatrix.All` today and are not swept by the default TestMatrix config.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `DIFFUSION_STEPS` | DiffusionGemma Web UI | Denoising steps per block in the server path | `48` | not registered | no |
+| `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | Max active requests in `DiffusionBatchScheduler` | `2` | not registered | no |
+| `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | True batched canvas decode vs time-sliced fused single-canvas decode | OFF | not registered | no |
+| `DIFFUSION_NO_PKV` | DiffusionGemma | Disable prompt-KV caching on device-glue backends | OFF | not registered | no |
+| `DIFFUSION_NO_SC` / `DIFFUSION_SC_TOPK` | DiffusionGemma | Self-conditioning enablement and experimental top-K cutoff | ON / `32` | not registered | no |
+| `DIFFUSION_NO_FUSED_DECODE` / `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | DiffusionGemma on GGML backends | Disable fused whole-model diffusion decode or fused lm-head tail | OFF | not registered | no |
+| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | DiffusionGemma | Transient lm-head logits memory cap before per-sequence fallback | `300` | not registered | no |
+| `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | DiffusionGemma | Development timing and fused-kernel debug diagnostics | OFF | not registered | no |
 
 ## Feature Coverage
 

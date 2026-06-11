@@ -16,6 +16,9 @@ Apple Metal，F32 KV），用于和 GGML Metal 路径对比。
 commit、后端版本或机器，请重新运行 `benchmarks/inference_matrix/scripts/`
 中的脚本。
 
+该快照早于 DiffusionGemma 覆盖，不应当视为当前支持矩阵。当前文本扩散实现状态见
+项目根 README 与 [`docs/models/diffusiongemma_zh-cn.md`](models/diffusiongemma_zh-cn.md)。
+
 ## TL;DR
 
 Gemma 4 E4B Q8_0 在真实长文本 prompt（`long_text`，约 1043-token prompt ->

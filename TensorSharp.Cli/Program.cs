@@ -119,6 +119,10 @@ namespace TensorSharp.Cli
             bool runInteractive = false;
             string systemPrompt = null;
             int warmupInferenceRuns = 0;
+            // DiffusionGemma sampler knobs (used only for the diffusion-gemma architecture).
+            int diffusionSteps = 48;
+            int diffusionSeed = 0;
+            int diffusionBlocks = 0;   // 0 => derive from --max-tokens and canvas_length
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -203,6 +207,9 @@ namespace TensorSharp.Cli
                         break;
                     }
                     case "--warmup-runs": warmupInferenceRuns = int.Parse(args[++i]); break;
+                    case "--diffusion-steps": diffusionSteps = int.Parse(args[++i]); break;
+                    case "--diffusion-seed": diffusionSeed = int.Parse(args[++i]); break;
+                    case "--diffusion-blocks": diffusionBlocks = int.Parse(args[++i]); break;
                     case "--kv-cache-dtype":
                         {
                             string kvDtypeStr = args[++i];
@@ -489,6 +496,14 @@ namespace TensorSharp.Cli
                 rawText = "What is 1+1?";
                 _log.LogInformation(LogEventIds.HostConfiguration,
                     "No input file specified; using default prompt: \"{Prompt}\"", rawText);
+            }
+
+            // DiffusionGemma uses an iterative denoising sampler rather than autoregressive decode.
+            if (model is DiffusionGemmaModel diffusionModel)
+            {
+                RunDiffusion(diffusionModel, rawText, systemPrompt, maxTokens, outputFile,
+                    diffusionSteps, diffusionSeed, diffusionBlocks);
+                return;
             }
 
             List<string> imagePaths = null;
@@ -1050,6 +1065,62 @@ namespace TensorSharp.Cli
             }
 
             return hasAny ? cfg : fallback;
+        }
+
+        static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,
+            int maxTokens, string outputFile, int steps, int seed, int blocks)
+        {
+            var messages = new List<ChatMessage>();
+            if (!string.IsNullOrEmpty(systemPrompt))
+                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+            messages.Add(new ChatMessage { Role = "user", Content = rawText });
+
+            string rendered = PromptRenderer.Render(
+                model.Config.ChatTemplate, messages, addGenerationPrompt: true,
+                architecture: model.Config.Architecture);
+
+            var promptTokens = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
+
+            int canvas = model.CanvasLength;
+            int nBlocks = blocks > 0 ? blocks : Math.Max(1, (Math.Max(1, maxTokens) + canvas - 1) / canvas);
+
+            var p = new DiffusionEbParams
+            {
+                MaxDenoisingSteps = steps,
+                Seed = seed,
+                MaxBlocks = nBlocks,
+            };
+
+            Console.WriteLine();
+            Console.WriteLine("=== DiffusionGemma generation ===");
+            Console.WriteLine($"Prompt tokens: {promptTokens.Length}, canvas={canvas}, max_steps={steps}, blocks={nBlocks}, seed={seed}, self_conditioning={model.SelfConditioningEnabled}");
+
+            var sampler = new DiffusionGemmaSampler(model);
+            var sw = Stopwatch.StartNew();
+            int totalSteps = 0;
+            var generated = sampler.Generate(promptTokens, p, (block, step, total, _) =>
+            {
+                totalSteps++;
+                Console.Write($"\rblock {block + 1}/{nBlocks}  step {step + 1}/{total}  (elapsed {sw.Elapsed.TotalSeconds:F1}s)   ");
+            });
+            sw.Stop();
+            Console.WriteLine();
+
+            string output = model.Tokenizer.Decode(generated);
+            Console.WriteLine();
+            Console.WriteLine("=== Output ===");
+            Console.WriteLine(output);
+            Console.WriteLine();
+            Console.WriteLine("=== Stats ===");
+            Console.WriteLine($"Generated {generated.Count} tokens in {totalSteps} forward steps over {nBlocks} block(s).");
+            Console.WriteLine($"Total time: {sw.Elapsed.TotalSeconds:F2}s; {sw.Elapsed.TotalMilliseconds / Math.Max(1, totalSteps):F1} ms/step.");
+            model.PrintForwardTiming();
+
+            if (outputFile != null)
+            {
+                File.WriteAllText(outputFile, output);
+                Console.WriteLine($"Wrote output to {outputFile}");
+            }
         }
 
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,

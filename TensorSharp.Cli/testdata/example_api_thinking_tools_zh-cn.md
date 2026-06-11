@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。命令片段默认使用 `ggml_metal`；请根据机器替换为 `cuda`、`ggml_cuda`、`ggml_cpu` 或 `cpu`。
+这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。命令片段默认使用 `ggml_metal`；请根据机器替换为 `mlx`、`cuda`、`ggml_cuda`、`ggml_cpu` 或 `cpu`。
 
 | 架构 | 思维链 | 工具调用 | 说明 |
 |---|---|---|---|
@@ -11,6 +11,7 @@
 | Qwen 3.5 / 3.6 family | 支持 | 支持 | 覆盖 `qwen35`、`qwen35moe`、`qwen3next` GGUF |
 | GPT OSS | 支持 | 支持 | Harmony 解析器会拆分 analysis/final channel；工具调用走 commentary channel |
 | Nemotron-H | 支持 | 支持 | 使用 Qwen 风格思维链/工具调用标签 |
+| DiffusionGemma | 不支持 | 不支持 | 使用 `--diffusion-steps` 等独立文本扩散生成参数，不属于思维链 / 工具调用模板 |
 | Gemma 3 / Mistral 3 | 不支持 | 不支持 | 在 TensorSharp 中支持多模态，但不支持思维链/工具调用 |
 
 ## 控制台应用
@@ -344,6 +345,7 @@ else:
 | Qwen 3.5 / 3.6 family | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
 | GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final`（Harmony 格式） | `<\|channel\|>commentary to=functions.NAME <\|constrain\|>json<\|message\|>{args}<\|call\|>` |
 | Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
+| DiffusionGemma | n/a | n/a |
 
 ## 工作原理
 
@@ -356,6 +358,7 @@ else:
 3. **Qwen3.5 / 3.6-family GGUF**：与 Qwen3 相同。当思维链被禁用时，会在前面插入一个空的 `<think>\n\n</think>\n\n` 块。
 4. **GPT OSS**：Harmony 模板始终输出结构化的 channel 框架：`<|channel|>analysis ... <|channel|>final`。该架构的输出解析器始终启用，无论是否传入 `think: true`，都会拆出思维内容。
 5. **Nemotron-H**：使用与 Qwen3 一致的 `<think>...</think>` 框架。
+6. **DiffusionGemma**：使用 `DiffusionGemmaSampler`，不走自回归聊天模板路径；应使用 diffusion CLI 参数，而不是 `--think`。
 
 ### 工具调用
 
@@ -366,3 +369,4 @@ else:
 3. **Qwen3.5 / 3.6-family GGUF**：工具定义使用 `<tools>...</tools>` 格式。模型输出调用为 `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`。
 4. **Nemotron-H**：与 Qwen3 共用相同的 `<tool_call>{"name":"...","arguments":{...}}</tool_call>` 线协议。
 5. **GPT OSS**：工具以 TypeScript namespace 形式声明在 developer 消息中（`namespace functions { type NAME = (_: { ... }) => any; }`）。模型在 commentary channel 输出调用：`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`，并在 `<|call|>` 停止 token 处结束生成。工具结果以 `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>` 回传。
+6. **DiffusionGemma**：TensorSharp 中不支持工具调用 framing；仅用于文本扩散生成。

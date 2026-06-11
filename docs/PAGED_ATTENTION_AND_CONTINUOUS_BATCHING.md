@@ -5,8 +5,8 @@
 This document is the current implementation reference for TensorSharp's
 vLLM-style paged KV cache, block-hash prefix sharing, and iteration-level
 continuous batching. The server now routes inference through this engine by
-default; the old single-request FIFO queue remains only as a compatibility
-surface for queue-status events.
+default; the old single-request FIFO queue object remains only as a no-op
+compatibility shim for queue-status/event shapes.
 
 ## Current Status
 
@@ -18,7 +18,8 @@ surface for queue-status events.
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Models or feature combinations that cannot run batched throw `NotSupportedException`; `BatchExecutor` falls back to the isolated per-sequence KV-swap path inside the same engine. |
 | Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
-| Queue API | `InferenceQueue` is a no-op shim. `/api/queue/status` and queue-position chunks are retained for clients that expect the fields, not because requests are serialized there. |
+| Queue API | `InferenceQueue` is a no-op shim. `/api/queue/status` and queue-position event shapes are retained for clients that expect the fields, not because requests are serialized there. |
+| Diffusion models | DiffusionGemma does not enter this autoregressive `ForwardBatch` contract. CLI generation uses `DiffusionGemmaSampler`; the Web UI uses `DiffusionBatchScheduler` to batch denoising work at block boundaries. |
 
 ## Layered Architecture
 
@@ -144,6 +145,7 @@ compute.
 | GPT OSS | Default batched path. Handles Q/K/V/O bias, YaRN RoPE, sliding-window layers, attention sinks, MXFP4 MoE experts, and native sinks attention. Greedy correctness has been validated against the legacy path; performance remains limited by per-layer graph construction. | `TS_GPTOSS_BATCHED=0`; `TS_GPTOSS_PAGED_ATTN_MANAGED=1`. |
 | Nemotron-H | Default batched path. Attention layers use paged K/V; Mamba2 layers use per-slot conv/SSM state pools; MoE layers use batched expert kernels; prepared image/audio embeddings can be injected into the batched hidden state. | `TS_NEMOTRON_BATCHED=0`; `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step. |
 | Gemma 3 | No true `ForwardBatch` port yet; runs through the engine's per-sequence fallback. | Global fallback only. |
+| DiffusionGemma | Separate text-diffusion path. `Forward(int[] tokens)` is intentionally unsupported; generation iteratively denoises fixed-length canvas blocks. Web UI requests share `DiffusionBatchScheduler`, which admits concurrent requests between blocks and can optionally batch active canvases. | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH`, `DIFFUSION_BATCHED_FORWARD`; `DIFFUSION_NO_FUSED_DECODE=1` disables the GGML whole-model diffusion decode. |
 
 ## Test Coverage
 
@@ -153,6 +155,7 @@ compute.
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`, optional `Qwen3BatchedForwardTests` |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
+| DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |
 | End-to-end engine behavior | `EngineParallelInferenceTests` with opt-in real GGUFs via `TS_TEST_MODEL_DIR` |
 | Server option translation | `ServerOptionsBuilderTests` for `--continuous-batching`, `--no-continuous-batching`, and paged-KV compatibility flags |
 
@@ -170,6 +173,9 @@ compute.
 | `TS_SCHED_DECODE_QUANTUM` | block size | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_BATCHED_N1_FAST_PATH` | `0` | Routes eligible single-sequence steps through the batched path for A/B testing. |
 | `TS_KV_PAGED_QUANT_BITS` | `0` | Optional TurboQuant codec bits for paged KV blocks (`4` or `8`); recurrent-state models may fall back to passthrough. |
+| `DIFFUSION_STEPS` | `48` | Web UI DiffusionGemma denoising steps per block. This is separate from autoregressive scheduler step budgets. |
+| `DIFFUSION_MAX_BATCH` | `2` | Maximum active DiffusionGemma Web UI requests in the diffusion scheduler. |
+| `DIFFUSION_BATCHED_FORWARD` | `0` | Enables true batched canvas decode for active DiffusionGemma canvases; the default favors the fused single-canvas path. |
 
 Server CLI aliases:
 
@@ -193,6 +199,9 @@ owned by `InferenceEngine`.
   indexed gathers where backend support makes it worthwhile.
 - Complete Gemma 4 batched coverage for MoE variants, multimodal pending
   embeddings, and block-quantized KV cache.
+- Decide whether DiffusionGemma scheduler metrics should be surfaced through
+  `/api/queue/status` or a dedicated diffusion endpoint once operational usage
+  needs per-batch visibility.
 - Move prepared multimodal embedding lists out of model-level mutable state and
   into `SequenceState`, so multimodal prompt preparation can run fully in
   parallel instead of being serialized before submission.

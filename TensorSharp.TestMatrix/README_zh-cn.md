@@ -13,10 +13,10 @@ TensorSharp 推理测试与基准矩阵运行器。它通过把 `TensorSharp.Cli
 
 | 维度 | 取值 |
 |---|---|
-| **模型** | 默认从 `/Users/ZhongkaiFu/work/model` 自动发现 GGUF（可配置）；也支持显式配置覆盖 |
+| **模型** | 默认从 `/Users/ZhongkaiFu/work/model` 自动发现 GGUF（可配置）；也支持显式配置覆盖。DiffusionGemma 目前还不会被自动分类为一等矩阵模型家族；实验时请使用显式配置项。 |
 | **后端** | `cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`cuda`、`mlx`（按主机能力过滤） |
-| **功能 / prompt 类型** | 合成 prefill（512、2048）、合成 decode（128）、短文本、长文本、上传文本、多轮聊天、函数 / 工具调用、思维链模式、图像、音频、视频 |
-| **环境变量 sweep** | Baseline cell 加上 [`Defaults/matrix-config.json`](Defaults/matrix-config.json) 中 `default_env_vars` 选择的高影响开关。已注册全集在 `EnvVarMatrix.All`，详见[矩阵文档](../docs/env_var_feature_matrix_zh-cn.md)。 |
+| **功能 / prompt 类型** | 自回归 CLI 功能：合成 prefill（512、2048）、合成 decode（128）、短文本、长文本、上传文本、多轮聊天、函数 / 工具调用、思维链模式、图像、音频、视频。目前没有专门的 diffusion feature。 |
+| **环境变量 sweep** | Baseline cell 加上 [`Defaults/matrix-config.json`](Defaults/matrix-config.json) 中 `default_env_vars` 选择的高影响开关。已注册全集在 `EnvVarMatrix.All`；DiffusionGemma 的 `DIFFUSION_*` 变量当前在矩阵外，默认不会清理或 sweep。详见[矩阵文档](../docs/env_var_feature_matrix_zh-cn.md)。 |
 
 ## 构建
 
@@ -100,6 +100,11 @@ JSON 配置文件控制模型发现、默认值与每模型覆盖。默认配置
 
 相对路径会基于 `model_dir` 解析。自动发现的模型如果与配置项共享同一个 `id`，
 配置项会替换自动发现结果。
+
+DiffusionGemma GGUF 在 `ModelDiscovery` 支持 `diffusion-gemma` /
+`diffusion_gemma` 架构识别之前，应通过显式 `models[]` 条目加入。当前 feature
+目录仍偏向 append/decode 式自回归生成；如需把 TestMatrix 输出作为正式 diffusion
+回归信号，请先新增专门的 diffusion feature。
 
 ## 媒体文件（图像 / 音频 / 视频）
 
@@ -185,6 +190,7 @@ dotnet TensorSharp.TestMatrix/bin/TensorSharp.TestMatrix.dll \
 | 新 prompt 类型 / feature | [`Matrix/FeatureCatalog.cs`](Matrix/FeatureCatalog.cs) + [`Runners/CliRunner.cs`](Runners/CliRunner.cs) 的 `BuildArgs` switch；把新 prompt 放到 `Inputs/prompts/` |
 | 新环境变量 sweep | [`Matrix/EnvVarMatrix.cs`](Matrix/EnvVarMatrix.cs)：新增带 `AppliesTo` 谓词的 `EnvVarSpec`；如需默认运行则加入 [`Defaults/matrix-config.json`](Defaults/matrix-config.json)；同步更新 [`docs/env_var_feature_matrix_zh-cn.md`](../docs/env_var_feature_matrix_zh-cn.md) 及英文版 |
 | 自动发现漏掉的模型 | 在 `matrix-config.json` 的 `models[]` 中加入 `ModelConfig` |
+| DiffusionGemma 覆盖 | 增加家族识别或显式配置、在 `FeatureCatalog.cs` 中新增 diffusion feature、为 diffusion 生成补充 CLI 参数映射，并在需要 sweep 时注册 `DIFFUSION_*` env-var |
 
 ## CI
 

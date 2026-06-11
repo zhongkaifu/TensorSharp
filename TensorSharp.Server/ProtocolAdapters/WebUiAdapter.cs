@@ -395,6 +395,14 @@ namespace TensorSharp.Server.ProtocolAdapters
                 await ticket.WaitAsync(TimeSpan.FromSeconds(1));
             }
 
+            // DiffusionGemma streams a live "denoising preview" (whole-message replace per step)
+            // rather than appended tokens, so it has its own SSE loop.
+            if (_svc.IsDiffusionModel)
+            {
+                await ChatStreamDiffusionAsync(ctx, chatSession, messages, maxTokens, webUiLogger);
+                return;
+            }
+
             var sw = Stopwatch.StartNew();
             int tokenCount = 0;
             bool alwaysNeedsParsing = OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
@@ -465,6 +473,66 @@ namespace TensorSharp.Server.ProtocolAdapters
                 inferenceError = ex.Message;
             }
 
+            await FinalizeChatStreamAsync(ctx, uiParser, aborted, inferenceError, chatSession, sw, tokenCount,
+                turnPromptTokens, turnKvReusedTokens);
+        }
+
+        // ---- Chat (SSE) for DiffusionGemma: live denoising preview ------------
+
+        private async Task ChatStreamDiffusionAsync(
+            HttpContext ctx, ChatSession chatSession, List<ChatMessage> messages, int maxTokens, ILogger webUiLogger)
+        {
+            var sw = Stopwatch.StartNew();
+            bool aborted = false;
+            string inferenceError = null;
+            int finalTokenCount = 0;
+            int turnPromptTokens = 0;
+            try
+            {
+                await foreach (var u in _svc.DiffusionChatStreamAsync(chatSession, messages, maxTokens, ctx.RequestAborted))
+                {
+                    if (u.Done)
+                    {
+                        finalTokenCount = u.EvalTokens;
+                        turnPromptTokens = u.PromptTokens;
+                        continue;
+                    }
+                    // Both intermediate previews and the final answer use whole-message replace.
+                    await SseWriter.WriteEventAsync(ctx.Response,
+                        WebUiSseEvents.Replace(u.Text, u.Step, u.TotalSteps, u.IsPreview), ctx.RequestAborted);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                aborted = true;
+                webUiLogger.LogWarning(LogEventIds.ChatAborted,
+                    "Web UI diffusion chat aborted by client (sessionId={SessionId})", chatSession.Id);
+            }
+            catch (Exception ex)
+            {
+                webUiLogger.LogError(LogEventIds.ChatFailed, ex,
+                    "Web UI diffusion chat failed (sessionId={SessionId})", chatSession.Id);
+                inferenceError = ex.Message;
+            }
+
+            try
+            {
+                sw.Stop();
+                double tokPerSec = finalTokenCount > 0 ? finalTokenCount / sw.Elapsed.TotalSeconds : 0;
+                await SseWriter.WriteEventAsync(ctx.Response,
+                    WebUiSseEvents.Done(finalTokenCount, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError,
+                        chatSession.Id, turnPromptTokens, 0));
+            }
+            catch (Exception)
+            {
+                // Best-effort final flush.
+            }
+        }
+
+        private static async Task FinalizeChatStreamAsync(
+            HttpContext ctx, IOutputParser uiParser, bool aborted, string inferenceError,
+            ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens)
+        {
             try
             {
                 if (uiParser != null && !aborted)

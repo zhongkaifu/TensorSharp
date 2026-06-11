@@ -477,6 +477,20 @@ namespace TensorSharp.MLX
             return !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_Q5K_RAW"), "0", StringComparison.Ordinal);
         }
 
+        // When true, the K-quant families (Q4_K / Q5_K / Q6_K) preload into MLX-native AFFINE form
+        // (driving the built-in mlx_quantized_matmul / gather_qmm) instead of the raw GGUF custom
+        // Metal kernels. The affine repack is a LOSSLESS reinterpretation of K-quant — each 32-element
+        // group becomes scale = d*scaleByte, bias = -dmin*minByte, which is exactly ggml's K-quant
+        // dequant (w = scale*q + bias) — so accuracy is unchanged. The custom kernels are competitive
+        // for decode (rows == 1, autoregressive models); the affine path is markedly faster in the
+        // MULTI-ROW regime (e.g. DiffusionGemma denoises a C=256 canvas every step, where the raw
+        // kernels are tuned for rows==1 and only reach ~150 GFLOP/s). Default follows
+        // TS_MLX_KQUANT_AFFINE (default off, AR-friendly); DiffusionGemma turns it on at load. The flag
+        // is read only at weight-creation time — the per-matmul path keys off the created weight's Mode,
+        // so once a model's weights are preloaded the choice is fixed for them regardless of later writes.
+        public static bool PreferAffineKQuant =
+            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_KQUANT_AFFINE"), "1", StringComparison.Ordinal);
+
         public static bool TryAddmmQuantizedToFloat32(
             Tensor result,
             Tensor input,
@@ -560,7 +574,7 @@ namespace TensorSharp.MLX
                     SetDeviceResult(result, output);
                     output = default;
                 }
-                else if (ggmlType == (int)GgmlTensorType.Q6_K)
+                else if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 {
                     output = MlxNative.Q6KMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
                     SetDeviceResult(result, output);
@@ -1164,7 +1178,7 @@ namespace TensorSharp.MLX
                     SetDeviceResult(result, dequantized);
                     dequantized = default;
                 }
-                else if (ggmlType == (int)GgmlTensorType.Q6_K)
+                else if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 {
                     dequantized = MlxNative.Q6KGetRows(weight.Weight, indicesView, (int)indices.Sizes[0], (int)ne0);
                     SetDeviceResult(result, dequantized);
@@ -1256,7 +1270,7 @@ namespace TensorSharp.MLX
                 return MlxNative.Q4KMatmul(input, weight.Weight, rows, inDim, outDim);
             if (ggmlType == (int)GgmlTensorType.Q5_K && string.Equals(weight.Mode, "q5_k", StringComparison.Ordinal))
                 return MlxNative.Q5KMatmul(input, weight.Weight, rows, inDim, outDim);
-            if (ggmlType == (int)GgmlTensorType.Q6_K)
+            if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 return MlxNative.Q6KMatmul(input, weight.Weight, rows, inDim, outDim);
 
             return MlxNative.QuantizedMatmul(
@@ -1371,12 +1385,18 @@ namespace TensorSharp.MLX
                 {
                     (int)GgmlTensorType.Q4_0 => CreateQ4Weight(deviceId, hostData, ne0, ne1, rawBytes, hasExplicitBias: false),
                     (int)GgmlTensorType.Q4_1 => CreateQ4Weight(deviceId, hostData, ne0, ne1, rawBytes, hasExplicitBias: true),
-                    (int)GgmlTensorType.Q4_K => CreateQ4KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
+                    (int)GgmlTensorType.Q4_K => PreferAffineKQuant
+                        ? CreateQ4KWeight(deviceId, hostData, ne0, ne1, rawBytes)
+                        : CreateQ4KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.Q5_0 => CreateQ5Weight(deviceId, hostData, ne0, ne1, rawBytes, hasExplicitBias: false),
                     (int)GgmlTensorType.Q5_1 => CreateQ5Weight(deviceId, hostData, ne0, ne1, rawBytes, hasExplicitBias: true),
-                    (int)GgmlTensorType.Q5_K => UseRawQ5KKernel()
-                        ? CreateQ5KRawWeight(deviceId, hostData, ne0, ne1, rawBytes)
-                        : CreateQ5KWeight(deviceId, hostData, ne0, ne1, rawBytes),
+                    (int)GgmlTensorType.Q5_K => (PreferAffineKQuant || !UseRawQ5KKernel())
+                        ? CreateQ5KWeight(deviceId, hostData, ne0, ne1, rawBytes)
+                        : CreateQ5KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
+                    // Q6_K stays on the raw custom kernel: its natural affine group size is 16, which MLX's
+                    // built-in quantized kernels don't support (only group ∈ {32,64,128}); the affine repack
+                    // would need a lossy regroup. Q6_K is a minority here (token_embd/lm_head, some attn_v)
+                    // and not the per-layer bottleneck, so keeping it raw is both lossless and sufficient.
                     (int)GgmlTensorType.Q6_K => CreateQ6KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.Q8_0 => CreateQ8Weight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ2_XXS => CreateIq2XxsRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
@@ -2203,6 +2223,204 @@ namespace TensorSharp.MLX
 
             scale = (byte)((packed[index + 4] & 0x0F) | ((packed[index - 4] >> 6) << 4));
             min = (byte)((packed[index + 4] >> 4) | ((packed[index] >> 6) << 4));
+        }
+
+        // ============================================================================
+        //  Fused MoE via mlx_gather_qmm: stack all experts of a layer into one MLX-affine
+        //  [E, out, in] quantized weight (built ONCE, directly from the GGUF stacked bytes —
+        //  no per-expert intermediates, so expert residency isn't duplicated) and let one
+        //  gather_qmm dispatch apply each token's selected experts. Replaces the 128 separate
+        //  per-expert matmuls of TryMoEMlx (tiny, occupancy-bound) with a single batched kernel,
+        //  the MLX analogue of GGML's ggml_mul_mat_id. The stacked affine packing is bit-identical
+        //  to the per-expert CreateQ4KWeight / CreateQ8Weight conversions, just written into the
+        //  e-th [out, in] slice — so it is numerically the same as the per-expert path (verified at
+        //  runtime by the caller's self-check).
+        // ============================================================================
+        internal sealed class StackedAffineWeight
+        {
+            public MlxNative.MlxArray Weight;   // [E, out, in_packed_u32]
+            public MlxNative.MlxArray Scales;   // [E, out, in/group] f16
+            public MlxNative.MlxArray Biases;   // [E, out, in/group] f16
+            public int GroupSize;
+            public int Bits;
+        }
+
+        private static readonly Dictionary<CacheKey, StackedAffineWeight> StackedCache = new();
+
+        /// <summary>Build (once, cached) the stacked MLX-affine weight [E, out, in] for a layer's
+        /// experts, directly from the stacked GGUF tensor bytes. Q4_K -> 4-bit/group-32, Q8_0 ->
+        /// 8-bit/group-32. Returns null for unsupported types.</summary>
+        internal static unsafe StackedAffineWeight EnsureStackedAffine(
+            int deviceId, IntPtr cacheKey, IntPtr data, int ggmlType, int inDim, int outDim, int numExperts, long totalBytes,
+            float[] perExpertScale = null)
+        {
+            var key = new CacheKey(deviceId, cacheKey);
+            lock (Sync)
+            {
+                if (StackedCache.TryGetValue(key, out var existing))
+                    return existing;
+            }
+            if (data == IntPtr.Zero) return null;
+
+            int groupSize = 32;
+            int bits;
+            int inPackedU32;
+            int groups = inDim / groupSize;
+            byte[] packed;
+            System.Half[] scales;
+            System.Half[] biases;
+
+            if (ggmlType == (int)GgmlTensorType.Q4_K)
+            {
+                if (inDim % QK_K != 0) return null;
+                bits = 4;
+                inPackedU32 = inDim / 8;
+                int superBlocksPerRow = inDim / QK_K;
+                long perExpertBytes = (long)outDim * superBlocksPerRow * Q4_KBlockBytes;
+                packed = new byte[(long)numExperts * outDim * (inDim / 2)];
+                scales = new System.Half[(long)numExperts * outDim * groups];
+                biases = new System.Half[scales.Length];
+                byte* src = (byte*)data;
+                byte[] values = new byte[32];
+                for (int e = 0; e < numExperts; e++)
+                {
+                    float scaleE = perExpertScale != null ? perExpertScale[e] : 1f;   // fold per-expert output scale
+                    byte* eSrc = src + (long)e * perExpertBytes;
+                    long wEBase = (long)e * outDim * (inDim / 2);
+                    long sEBase = (long)e * outDim * groups;
+                    for (int row = 0; row < outDim; row++)
+                    {
+                        for (int sb = 0; sb < superBlocksPerRow; sb++)
+                        {
+                            byte* block = eSrc + ((long)row * superBlocksPerRow + sb) * Q4_KBlockBytes;
+                            float d = (float)BitConverter.UInt16BitsToHalf((ushort)(block[0] | (block[1] << 8)));
+                            float min = (float)BitConverter.UInt16BitsToHalf((ushort)(block[2] | (block[3] << 8)));
+                            byte* packedScales = block + 4;
+                            byte* q = block + 4 + KScaleSize;
+                            for (int group = 0; group < 8; group++)
+                            {
+                                GetScaleMinK4(group, packedScales, out byte scaleByte, out byte minByte);
+                                int pairIndex = group / 2;
+                                bool highNibble = (group & 1) != 0;
+                                byte* qGroup = q + pairIndex * 32;
+                                for (int i = 0; i < 32; i++)
+                                    values[i] = highNibble ? (byte)(qGroup[i] >> 4) : (byte)(qGroup[i] & 0x0F);
+                                long scaleIndex = sEBase + (long)row * groups + sb * 8 + group;
+                                scales[scaleIndex] = (System.Half)(d * scaleByte * scaleE);
+                                biases[scaleIndex] = (System.Half)(-min * minByte * scaleE);
+                                long dstOffset = wEBase + (long)row * (inDim / 2) + sb * (QK_K / 2) + group * 16;
+                                PackUnsignedBits(values, 4, packed, dstOffset);
+                            }
+                        }
+                    }
+                }
+            }
+            else if (ggmlType == (int)GgmlTensorType.Q8_0)
+            {
+                if (inDim % Q8_0BlockElements != 0) return null;
+                bits = 8;
+                inPackedU32 = inDim / 4;
+                int blocksPerRow = inDim / Q8_0BlockElements;
+                long perExpertBytes = (long)outDim * blocksPerRow * Q8_0BlockBytes;
+                packed = new byte[(long)numExperts * outDim * inDim];
+                scales = new System.Half[(long)numExperts * outDim * blocksPerRow];
+                biases = new System.Half[scales.Length];
+                byte* src = (byte*)data;
+                for (int e = 0; e < numExperts; e++)
+                {
+                    float scaleE = perExpertScale != null ? perExpertScale[e] : 1f;   // fold per-expert output scale
+                    byte* eSrc = src + (long)e * perExpertBytes;
+                    long wEBase = (long)e * outDim * inDim;
+                    long sEBase = (long)e * outDim * blocksPerRow;
+                    for (int row = 0; row < outDim; row++)
+                    {
+                        for (int block = 0; block < blocksPerRow; block++)
+                        {
+                            byte* blockPtr = eSrc + ((long)row * blocksPerRow + block) * Q8_0BlockBytes;
+                            float scale = (float)BitConverter.UInt16BitsToHalf((ushort)(blockPtr[0] | (blockPtr[1] << 8)));
+                            long scaleIndex = sEBase + (long)row * blocksPerRow + block;
+                            scales[scaleIndex] = (System.Half)(scale * scaleE);
+                            biases[scaleIndex] = (System.Half)(-128.0f * scale * scaleE);
+                            long dstOffset = wEBase + (long)row * inDim + block * Q8_0BlockElements;
+                            for (int j = 0; j < Q8_0BlockElements; j++)
+                                packed[dstOffset + j] = (byte)(blockPtr[2 + j] ^ 0x80);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                return null;
+            }
+
+            StackedAffineWeight result = MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray w = default, s = default, b = default;
+                fixed (byte* pp = packed)
+                fixed (System.Half* sp = scales)
+                fixed (System.Half* bp = biases)
+                {
+                    w = MlxNative.NewArrayFromHostUInt32((IntPtr)pp, new[] { numExperts, outDim, inPackedU32 });
+                    s = MlxNative.NewArrayFromHost((IntPtr)sp, new[] { numExperts, outDim, groups }, DType.Float16);
+                    b = MlxNative.NewArrayFromHost((IntPtr)bp, new[] { numExperts, outDim, groups }, DType.Float16);
+                }
+                MlxNative.Eval(w); MlxNative.Eval(s); MlxNative.Eval(b);
+                return new StackedAffineWeight { Weight = w, Scales = s, Biases = b, GroupSize = groupSize, Bits = bits };
+            });
+
+            lock (Sync)
+            {
+                if (StackedCache.TryGetValue(key, out var raced))
+                {
+                    // Lost the race; free ours and return the cached one.
+                    MlxNative.FreeArray(result.Weight); MlxNative.FreeArray(result.Scales); MlxNative.FreeArray(result.Biases);
+                    return raced;
+                }
+                StackedCache[key] = result;
+                return result;
+            }
+        }
+
+        /// <summary>One fused gather_qmm: result[..b.., M, out] = x[lhs] @ stacked_w[rhs].T, where the
+        /// stacked affine weight for this layer's experts is built/cached from the GGUF bytes. Returns
+        /// false (caller falls back to the per-expert path) if storages aren't MLX or the type is
+        /// unsupported.</summary>
+        public static bool TryGatherQmm(
+            Tensor result, Tensor input, Tensor lhsIndices, Tensor rhsIndices,
+            IntPtr cacheKey, IntPtr data, int ggmlType, long inDim, long outDim, int numExperts, long totalBytes,
+            bool sortedIndices = false, float[] perExpertScale = null)
+        {
+            if (result.Storage is not MlxStorage resultStorage) return false;
+            if (input.Storage is not MlxStorage inputStorage) return false;
+            if (lhsIndices.Storage is not MlxStorage lhsStorage) return false;
+            if (rhsIndices.Storage is not MlxStorage rhsStorage) return false;
+
+            StackedAffineWeight sa = EnsureStackedAffine(
+                resultStorage.DeviceId, cacheKey, data, ggmlType, (int)inDim, (int)outDim, numExperts, totalBytes, perExpertScale);
+            if (sa == null) return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray xv = default, lv = default, rv = default, outArr = default;
+                try
+                {
+                    xv = inputStorage.CreateArrayView(input);
+                    lv = lhsStorage.CreateArrayView(lhsIndices);
+                    rv = rhsStorage.CreateArrayView(rhsIndices);
+                    outArr = MlxNative.GatherQMM(xv, sa.Weight, sa.Scales, sa.Biases, lv, rv,
+                        transpose: true, sa.GroupSize, sa.Bits, MlxAffineMode, sortedIndices);
+                    SetDeviceResult(result, outArr);
+                    outArr = default;
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(xv);
+                    MlxNative.FreeArray(lv);
+                    MlxNative.FreeArray(rv);
+                    MlxNative.FreeArray(outArr);
+                }
+            });
         }
 
         private static unsafe DeviceWeight CreateDeviceWeight(

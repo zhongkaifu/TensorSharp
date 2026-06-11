@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `cuda`, `ggml_cuda`, `ggml_cpu`, or `cpu` to match your machine.
+These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `mlx`, `cuda`, `ggml_cuda`, `ggml_cpu`, or `cpu` to match your machine.
 
 | Architecture | Thinking | Tool calls | Notes |
 |---|---|---|---|
@@ -11,6 +11,7 @@ These examples cover the current thinking/tool-call surface for the CLI and the 
 | Qwen 3.5 / 3.6 family | Yes | Yes | Covers `qwen35`, `qwen35moe`, and `qwen3next` GGUFs |
 | GPT OSS | Yes | Yes | Harmony parser separates analysis/final channels; tool calls go on the commentary channel |
 | Nemotron-H | Yes | Yes | Uses Qwen-style thinking/tool-call tags |
+| DiffusionGemma | No | No | Uses separate text-diffusion generation flags such as `--diffusion-steps`; not a thinking/tool-call template |
 | Gemma 3 / Mistral 3 | No | No | Multimodal-capable, but not thinking/tool-call capable in TensorSharp |
 
 ## Console Application
@@ -344,6 +345,7 @@ else:
 | Qwen 3.5 / 3.6 family | `<think>...</think>` | `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` |
 | GPT OSS | `<\|channel\|>analysis ... <\|channel\|>final` (Harmony) | `<\|channel\|>commentary to=functions.NAME <\|constrain\|>json<\|message\|>{args}<\|call\|>` |
 | Nemotron-H | `<think>...</think>` | `<tool_call>{"name":"...","arguments":{...}}</tool_call>` |
+| DiffusionGemma | n/a | n/a |
 
 ## How It Works
 
@@ -356,6 +358,7 @@ When `think: true` is passed:
 3. **Qwen3.5 / 3.6-family GGUFs**: Same as Qwen3. When thinking is disabled, an empty `<think>\n\n</think>\n\n` block is prepended.
 4. **GPT OSS**: The Harmony-format template always emits structured channel framing: `<|channel|>analysis ... <|channel|>final`. The output parser is always on for this architecture, so thinking content is split out whether or not `think: true` is passed.
 5. **Nemotron-H**: Uses the Qwen3-style `<think>...</think>` framing.
+6. **DiffusionGemma**: Uses `DiffusionGemmaSampler` rather than the autoregressive chat-template path; use the diffusion CLI options instead of `--think`.
 
 ### Tool Calls
 
@@ -366,4 +369,4 @@ When `tools` are provided:
 3. **Qwen3.5 / 3.6-family GGUFs**: Tool definitions use `<tools>...</tools>` format. The model outputs calls as `<tool_call><function=NAME><parameter=key>\nvalue\n</parameter></function></tool_call>`.
 4. **Nemotron-H**: Uses the same `<tool_call>{"name":"...","arguments":{...}}</tool_call>` wire format as Qwen3.
 5. **GPT OSS**: Tools are declared in the developer message as a TypeScript namespace (`namespace functions { type NAME = (_: { ... }) => any; }`). The model emits calls on the commentary channel as `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>`, which stops generation on the `<|call|>` token. Tool results are returned as `<|start|>functions.NAME to=assistant<|channel|>commentary<|message|>{result}<|end|>`.
-
+6. **DiffusionGemma**: Does not support tool-call framing in TensorSharp; use it for text-diffusion generation only.

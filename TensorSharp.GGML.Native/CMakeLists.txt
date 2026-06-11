@@ -103,6 +103,7 @@ add_library(GgmlOps SHARED
     ggml_ops_training.cpp
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
+    ggml_ops_diffusion.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_mamba2.cpp
     ggml_ops_moe.cpp

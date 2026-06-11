@@ -17,8 +17,9 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 |---|---|
 | 承载模型 | 单个 GGUF 文件，通过 `--model` 选择；请求中的 `model` 必须是该文件名或 basename |
 | 投影器 | 可选单个投影器，通过 `--mmproj` 选择；供多模态模型使用 |
-| 后端 | `cpu`、`cuda`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`；`/api/models` 会返回当前主机可用项 |
-| 并发 | FIFO 队列；等待期间通过队列位置事件/chunk 提示客户端 |
+| 后端 | `mlx`、`cuda`、`ggml_metal`、`ggml_cuda`、`ggml_cpu`、`cpu`；`/api/models` 会返回当前主机可用项 |
+| 并发 | 自回归聊天使用连续批处理引擎。旧队列 API 只保留状态 / 兼容字段；DiffusionGemma Web UI 请求使用独立的 block 边界 diffusion scheduler。 |
+| 生成模式 | 自回归模型流式追加 token chunk。DiffusionGemma 在 append-only 兼容端点返回最终文本，在 Web UI `/api/chat` 上提供整条消息替换式实时去噪预览。 |
 | 会话 | Web UI 使用每个浏览器 tab 独立会话；Ollama/OpenAI 兼容端点共享默认会话 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`json_schema` 不能与 `think` 或 `tools` 同时使用 |
 
@@ -34,15 +35,24 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 # Windows/Linux + NVIDIA，GGML CUDA 后端
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_cuda
 
+# Apple Silicon，MLX 后端
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend mlx
+
 # 多模态模型（显式指定投影器）
 ./TensorSharp.Server --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
     --mmproj ~/work/model/gemma-4-mmproj-F16.gguf --backend ggml_metal
+
+# DiffusionGemma 文本扩散模型
+DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
+  ./TensorSharp.Server --model ~/work/model/diffusion-gemma.gguf --backend ggml_metal
 
 # 覆盖默认请求 token 上限（请求未提供 max_tokens / num_predict 时使用）
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-服务默认监听 `http://localhost:5000`（可通过 ASP.NET Core 标准的 `PORT` / `ASPNETCORE_URLS` 环境变量覆盖）。
+服务默认监听 `http://localhost:5000`。当前二进制会把固定的
+`http://0.0.0.0:5000` 监听地址传给 ASP.NET Core；Docker Space 文件会在镜像构建时
+把这个常量改写为 `7860`。
 
 后端速查：
 
@@ -50,6 +60,7 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 |---|---|
 | `cpu` | 纯 C# CPU 后端 |
 | `cuda` | Direct CUDA 后端，使用 CUDA Driver API、cuBLAS、PTX 内核与 CPU 回退 |
+| `mlx` | Apple Silicon 上的 MLX Metal 后端 |
 | `ggml_cpu` | 原生 GGML CPU 后端 |
 | `ggml_metal` | macOS 的 GGML Metal 后端 |
 | `ggml_cuda` | NVIDIA GPU 的 GGML CUDA 后端 |
@@ -574,7 +585,8 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 ### 工具型接口
 
 ```bash
-# 实时推理负载快照：processing（并发生成中的请求数）、pending_requests（排队等待批处理槽位的请求数）、busy 标志、累计处理数
+# 兼容旧字段的推理负载快照：并发由连续批处理引擎管理，
+# pending_requests 通常为 0
 curl http://localhost:5000/api/queue/status
 
 # 服务版本
@@ -584,7 +596,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -592,6 +604,9 @@ curl http://localhost:5000/api/models
 
 这是内置聊天界面使用的协议，单独列在这里方便外部 Web UI 接入同一接口。每个事
 件都是一个 JSON 对象，通过单条 `data: ...` SSE 帧下发。
+
+当承载模型是 DiffusionGemma 时，该端点会使用整条消息替换帧展示实时去噪预览。
+Ollama/OpenAI 兼容端点保持 append-oriented 响应形状，只接收最终文本。
 
 ### 聊天会话
 
@@ -635,8 +650,9 @@ curl -N -X POST http://localhost:5000/api/chat \
 
 | 事件字段 | 触发时机 | 含义 |
 |---|---|---|
-| `queue_position`、`queue_pending` | 排队期间每秒一次 | 当前请求排在队列中的位置 |
+| `queue_position`、`queue_pending` | 请求等待旧队列 shim 时的兼容事件 | 为旧客户端保留的队列位置字段 |
 | `token` | 每个生成的 token（启用 `think` / `tools` 时为解析后的内容片段） | 流式正文 |
+| `replace`、`diffusionStep`、`diffusionTotal`、`preview` | 每个 DiffusionGemma 去噪预览与最终替换 | 替换整条 assistant 消息，而不是追加 token |
 | `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
 | `tool_calls` | 模型输出工具调用 | `{name, arguments}` 数组 |
 | `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总 |
@@ -645,6 +661,12 @@ curl -N -X POST http://localhost:5000/api/chat \
 
 ```
 data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+```
+
+DiffusionGemma 预览帧示例：
+
+```
+data: {"replace":"A refined draft of the whole answer","diffusionStep":12,"diffusionTotal":48,"preview":true}
 ```
 
 `kvReusedTokens` / `kvReusePercent` 与 Ollama 的 `prompt_cache_hit_*` 以及

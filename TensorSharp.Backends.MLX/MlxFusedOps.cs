@@ -174,6 +174,56 @@ namespace TensorSharp.MLX
             });
         }
 
+        /// <summary>BATCHED on-device MoE router top-K for N tokens at once (vs the single-token
+        /// <see cref="TryMoeRouterTopKSoftmax"/>): given router logits [N, E], writes the per-token top-K
+        /// expert indices [N, K] (int32) and their softmax-over-top-K weights [N, K] (f32) — ALL on device,
+        /// with NO host read. This is what lets the diffusion decode forward stay device-resident across all
+        /// layers (one lazy eval), instead of syncing to the host at every layer's router (the per-op MoE
+        /// bottleneck). softmax-over-top-K-logits == renormalised full-softmax-over-top-K (the host
+        /// MoERoute semantics), since softmax is monotonic. Returns false (caller uses host routing) on
+        /// non-MLX storage / dtype / shape mismatch.</summary>
+        public static bool TryBatchedMoeRouterTopK(Tensor scores, Tensor topIndices, Tensor routeWeights)
+        {
+            if (scores == null || topIndices == null || routeWeights == null) return false;
+            if (scores.Storage is not MlxStorage || topIndices.Storage is not MlxStorage || routeWeights.Storage is not MlxStorage)
+                return false;
+            if (scores.ElementType != DType.Float32 || topIndices.ElementType != DType.Int32 || routeWeights.ElementType != DType.Float32)
+                return false;
+            if (scores.DimensionCount != 2 || topIndices.DimensionCount != 2 || routeWeights.DimensionCount != 2)
+                return false;
+            int N = checked((int)scores.Sizes[0]);
+            int E = checked((int)scores.Sizes[1]);
+            int K = checked((int)topIndices.Sizes[1]);
+            if (K <= 0 || K >= E) return false;
+            if (topIndices.Sizes[0] != N || routeWeights.Sizes[0] != N || routeWeights.Sizes[1] != K) return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray sv = default, neg = default, part = default, idxU = default,
+                    idxI = default, topLogits = default, w = default;
+                try
+                {
+                    sv = GetView(scores);                                    // [N, E]
+                    neg = MlxNative.Unary(MlxNative.MlxUnaryOp.Neg, sv);     // argpartition gives k-SMALLEST
+                    part = MlxNative.ArgPartitionAxis(neg, K - 1, axis: 1);  // [N, E] uint32 (first K = top-K largest)
+                    idxU = MlxNative.Slice(part, new[] { 0, 0 }, new[] { N, K }, new[] { 1, 1 });  // [N, K] uint32
+                    idxI = MlxNative.Astype(idxU, DType.Int32);              // [N, K] int32 (gather_qmm rhs)
+                    topLogits = MlxNative.TakeAlongAxis(sv, idxU, axis: 1);  // [N, K] per-row top-K logits
+                    w = MlxNative.SoftmaxLastAxis(topLogits);               // [N, K] renormalised weights
+                    SetDeviceResult(topIndices, idxI); idxI = default;
+                    SetDeviceResult(routeWeights, w); w = default;
+                    return true;
+                }
+                catch { return false; }
+                finally
+                {
+                    MlxNative.FreeArray(sv); MlxNative.FreeArray(neg); MlxNative.FreeArray(part);
+                    MlxNative.FreeArray(idxU); MlxNative.FreeArray(idxI);
+                    MlxNative.FreeArray(topLogits); MlxNative.FreeArray(w);
+                }
+            });
+        }
+
         // In-place fused output += scalar * src for MLX tensors. Replaces
         // the two-kernel mulv+addt chain with one fused Metal kernel
         // (via mlx_compile). Used by the MoE decode accumulator where

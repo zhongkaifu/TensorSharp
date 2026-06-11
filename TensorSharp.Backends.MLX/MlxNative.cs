@@ -4249,6 +4249,23 @@ if (kind == 0) {
             });
         }
 
+        // Per-row (take_along_axis) gather: for a 2D [R, C] input and a [R, K] index array,
+        // result[r, j] = input[r, indices[r, j]] (axis = 1). Unlike TakeAxis (mx.take, which
+        // gathers the SAME columns for every row), this gathers a different set per row — the
+        // primitive needed for a batched MoE router's per-token top-K logit gather.
+        internal static MlxArray TakeAlongAxis(MlxArray input, MlxArray indices, int axis)
+        {
+            if (!input.IsValid || !indices.IsValid)
+                throw new ArgumentException("MLX take_along_axis inputs must be valid arrays.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_take_along_axis(out result, input, indices, axis, DefaultStream()), "running MLX take_along_axis");
+                return result;
+            });
+        }
+
         // Argmax along the given axis. With keepDims=false the reduced axis
         // is dropped; on a [1, V] logits tensor with axis=-1 the result is
         // [1] uint32 — the predicted next token for greedy decoding.
@@ -8956,6 +8973,9 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_take_axis")]
         private static extern int mlx_take_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
+
+        [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_take_along_axis")]
+        private static extern int mlx_take_along_axis(out MlxArray result, MlxArray input, MlxArray indices, int axis, MlxStream stream);
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "mlx_argmax_axis")]
         private static extern int mlx_argmax_axis(out MlxArray result, MlxArray input, int axis, [MarshalAs(UnmanagedType.I1)] bool keepdims, MlxStream stream);

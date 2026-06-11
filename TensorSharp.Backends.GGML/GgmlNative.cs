@@ -209,6 +209,76 @@ public struct Gemma4MoELayerDecodeArgs
     public float LayerOutputScale;
 }
 
+// Descriptor for the fused DiffusionGemma decode-layer kernel
+// (TSGgml_DiffusionDecodeLayer). Field order/types MUST match the native
+// TSGgmlDiffusionDecodeLayerDesc struct EXACTLY.
+[StructLayout(LayoutKind.Sequential)]
+public struct DiffusionDecodeLayerArgs
+{
+    // pointers (25)
+    public IntPtr Hidden;
+    public IntPtr AttnNormW;
+    public IntPtr QW;
+    public IntPtr KW;
+    public IntPtr VW;
+    public IntPtr QNormW;
+    public IntPtr KNormW;
+    public IntPtr OW;
+    public IntPtr PostAttnNormW;
+    public IntPtr PromptK;
+    public IntPtr PromptV;
+    public IntPtr FreqFactors;
+    public IntPtr FfnNormW;
+    public IntPtr GateW;
+    public IntPtr UpW;
+    public IntPtr DownW;
+    public IntPtr PostFfwNorm1W;
+    public IntPtr GateInpW;
+    public IntPtr GateInpScale;
+    public IntPtr PreFfwNorm2W;
+    public IntPtr GateUpExps;
+    public IntPtr DownExps;
+    public IntPtr DownExpsScale;
+    public IntPtr PostFfwNorm2W;
+    public IntPtr PostFfwNormW;
+
+    // int64 weight shapes (27)
+    public long QNe0, QNe1, QBytes;
+    public long KNe0, KNe1, KBytes;
+    public long VNe0, VNe1, VBytes;
+    public long ONe0, ONe1, OBytes;
+    public long GateNe0, GateNe1, GateBytes;
+    public long UpNe0, UpNe1, UpBytes;
+    public long DownNe0, DownNe1, DownBytes;
+    public long GueNe0, GueNe1, GueBytes;
+    public long DeNe0, DeNe1, DeBytes;
+
+    // int32 scalars / shapes (23)
+    public int StructBytes;
+    public int HiddenSize;
+    public int CanvasLen;
+    public int PromptLen;
+    public int NumHeads;
+    public int NumKvHeads;
+    public int HeadDim;
+    public int IsLocal;
+    public int HasVProj;
+    public int SlidingWindow;
+    public int RopeNDims;
+    public int NumExperts;
+    public int NumExpertsUsed;
+    public int FreqFactorsLen;
+    public int QType, KType, VType, OType;
+    public int GateType, UpType, DownType;
+    public int GueType, DeType;
+
+    // float scalars (4)
+    public float Eps;
+    public float RopeBase;
+    public float InvSqrtHidden;
+    public float DecScale;
+}
+
 internal enum GgmlUnaryOp
 {
     Neg = 1,
@@ -1041,6 +1111,64 @@ internal enum GgmlIndexReductionOp
             CheckResult(TSGgml_Gemma4MoELayerDecode(in desc), nameof(TSGgml_Gemma4MoELayerDecode));
         }
 
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DiffusionDecodeLayer(in DiffusionDecodeLayerArgs desc);
+
+        /// <summary>Fused DiffusionGemma decode layer. Returns true on success; false (without throwing)
+        /// when the backend can't run it (e.g. flash-attn unsupported) so the caller falls back.</summary>
+        public static bool TryDiffusionDecodeLayer(in DiffusionDecodeLayerArgs desc)
+        {
+            int r = TSGgml_DiffusionDecodeLayer(in desc);
+            if (r == 0 && Environment.GetEnvironmentVariable("DIFFUSION_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[fused-decode FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DiffusionLmHead(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW,
+            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap);
+
+        /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.
+        /// Reads canvas hidden [H*C], writes canvas logits [C*vocab]. Returns false on failure.</summary>
+        public static bool TryDiffusionLmHead(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap)
+        {
+            int r = TSGgml_DiffusionLmHead(hidden, hiddenSize, canvasLen, outputNormW,
+                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, eps, finalLogitSoftcap);
+            if (r == 0 && Environment.GetEnvironmentVariable("DIFFUSION_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[fused-lmhead FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DiffusionModelDecode(
+            [In] DiffusionDecodeLayerArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
+            IntPtr outputNormW,
+            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float finalLogitSoftcap);
+
+        /// <summary>Fused DiffusionGemma whole-model decode: all layers + output_norm + lm_head + softcap
+        /// in one GGML graph (canvas hidden stays on-device). Writes canvas logits [C*vocab] to logitsOut.
+        /// Returns false (caller falls back) when the backend can't run it.</summary>
+        public static bool TryDiffusionModelDecode(
+            DiffusionDecodeLayerArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float finalLogitSoftcap)
+        {
+            int r = TSGgml_DiffusionModelDecode(layers, numLayers, hidden, hiddenSize, canvasLen, promptLen,
+                outputNormW, lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, finalLogitSoftcap);
+            if (r == 0 && Environment.GetEnvironmentVariable("DIFFUSION_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[fused-model FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
         // Model-wide MoE decode: the whole transformer as one graph/token.
         // `layers` is one Gemma4MoELayerDecodeArgs per layer (blittable, marshalled
         // as a contiguous TSGgmlGemma4MoELayerDesc array). hidden/position come from
@@ -1186,6 +1314,9 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_SyncHostBuffer(IntPtr ptr, long byteCount);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern long TSGgml_DeviceCopyCacheResidentBytes();
 
         // Async dispatch (deferred ggml_backend_synchronize). When enabled, per-op
         // kernels return without waiting on the Metal command buffer; subsequent ops
@@ -2487,6 +2618,11 @@ internal enum GgmlIndexReductionOp
             if (ptr != IntPtr.Zero)
                 TSGgml_InvalidateHostBuffer(ptr);
         }
+
+        /// <summary>Diagnostic: total bytes of device-local COPY buffers resident in the GGML
+        /// host-buffer cache (excludes zero-copy weight wrappers). Used by tests to assert that
+        /// per-block activation/KV device copies are reclaimed rather than leaked.</summary>
+        public static long DeviceCopyCacheResidentBytes() => TSGgml_DeviceCopyCacheResidentBytes();
 
         public static void SyncHostBuffer(IntPtr ptr, long byteCount)
         {

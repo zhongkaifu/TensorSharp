@@ -17,9 +17,9 @@ Each card follows the same shape so you can diff architectures cleanly:
    and which capabilities (modalities, thinking, tools) it exposes.
 2. **Model architecture** — the high-level block diagram, layer counts, and any
    per-layer heterogeneity.
-3. **Forward graph** — the exact ordered list of ops a single token (decode) and
-   a multi-token sequence (prefill) flow through, including residuals and
-   normalizations.
+3. **Forward graph** — the exact ordered list of ops a single token (decode), a
+   multi-token sequence (prefill), or a diffusion denoising step flows through,
+   including residuals and normalizations.
 4. **Components** — every sub-block (attention, FFN/SSM, routing, normalization,
    RoPE flavor, vision/audio encoder) explained in detail with the math that
    governs it.
@@ -47,6 +47,7 @@ Each card follows the same shape so you can diff architectures cleanly:
 |---|---|---|---|---|---|---|---|---|
 | Gemma 3 | [gemma3.md](gemma3.md) | `Gemma3Model` | `gemma3` | Text, image | No | No | No (legacy per-seq) | Alternating SWA / global attention, GeGLU FFN, QK-norm, V-norm |
 | Gemma 4 | [gemma4.md](gemma4.md) | `Gemma4Model` | `gemma4` | Text, image, video, audio | Yes | Yes | **Default** (toggle off with `TS_GEMMA4_BATCHED=0`) | Single-graph fused decode (all layers in one GGML dispatch), fused per-layer prefill, chunked prefill, circular SWA cache, PLE, KV sharing, MoE variants. Batched path matches legacy logits within FP noise (`Gemma4BatchedForwardTests`); reaches ~1.5× legacy at batch=8 and ~1.6× at 4×800-token prompts. |
+| DiffusionGemma | [diffusiongemma.md](diffusiongemma.md) | `DiffusionGemmaModel` + `DiffusionGemmaSampler` | `diffusion-gemma`, `diffusion_gemma` | Text | No | No | Separate Web UI `DiffusionBatchScheduler`; not an autoregressive `IBatchedPagedModel` path | EntropyBound block denoising over `[prompt | canvas]`, prompt-KV caching on GPU backends, self-conditioning, fused GGML whole-model diffusion decode and fused lm-head tail |
 | Qwen 3 | [qwen3.md](qwen3.md) | `Qwen3Model` | `qwen3` | Text | Yes | Yes | Reference port (`Qwen3Model.BatchedForward.cs`) — exercised by `Qwen3BatchedForwardTests` when a base-Qwen3 GGUF is provided | Native whole-model decode with pre-resolved weight pointers |
 | Qwen 3.5 / 3.6 family | [qwen35.md](qwen35.md) | `Qwen35Model` | `qwen35`, `qwen35moe`, `qwen3next` | Text, image | Yes | Yes | **Default** (toggle off with `TS_QWEN35_BATCHED=0` or `--no-continuous-batching`). Per-slot recurrent-state pool + optional native GatedDeltaNet kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`) | Hybrid FullAttention + GatedDeltaNet recurrent, fused attention layer decode, fused prefill attention, fused output-projection + FFN, fused output-projection + norm + router, batched MoE (routed + shared + residual in a single kernel), fused vision encoder blocks |
 | GPT OSS | [gptoss.md](gptoss.md) | `GptOssModel` | `gptoss`, `gpt-oss` | Text | Yes (always) | Yes | **Default** (toggle off with `TS_GPTOSS_BATCHED=0`). Per-head attention sinks via `TSGgml_PagedAttentionForwardWithSinks` (or `TS_GPTOSS_PAGED_ATTN_MANAGED=1` for the C# fallback). 100% greedy match vs legacy in `GptOssBatchedCorrectnessTests`. | Stacked MoE prefill kernel (mul_mat_id + add_id + swiglu_oai), attention sinks, MXFP4 expert weights |
@@ -75,47 +76,49 @@ managed CPU or direct CUDA backends.
 
 ## Continuous batching & paged KV cache
 
-All architectures listed above also run through the shared
+All autoregressive architectures listed above run through the shared
 `InferenceEngine` + `ContinuousBatchScheduler` + `BatchExecutor` stack documented
 in [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 Models that implement `IBatchedPagedModel.ForwardBatch` execute one batched
 forward per scheduler step (with `slotMapping`-based K/V scatter into a
 shared paged buffer and per-sequence attention via the native paged kernel);
 the others run through the per-sequence KV-swap fallback inside the same engine.
+DiffusionGemma does not support autoregressive `Forward()`, so it uses
+`DiffusionGemmaSampler` and the server-side `DiffusionBatchScheduler` instead.
 The opt-in env vars are summarised in the matrix above and in the project root
 README.
 
 ## Architecture comparison
 
-| Feature | Gemma 3 | Gemma 4 | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
-|---|---|---|---|---|---|---|---|
-| Layer type | Dense | Dense / MoE | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
-| Attention | SWA + Global | SWA + Global | Full GQA | Full GQA + Sigmoid Gate | Full + Sinks | Full GQA (no RoPE) | Full GQA |
-| FFN activation | GeGLU | GeGLU | SwiGLU | SwiGLU | SiLUAlphaLimit (clamped GLU) | ReLU² | SwiGLU |
-| RoPE variant | NeoX (dual base) | NeoX + proportional / partial | NeoX | NeoX / MRoPE | NeoX + YaRN | None | GPT-J + YaRN |
-| QK-norm | Yes | Yes | Yes | Yes | No | No | No |
-| V-norm | No | Yes (unweighted) | No | No | No | No | No |
-| Bias in projections | No | No | No | No | Yes (all linear) | No | No |
-| Per-layer scaling | No | Yes | No | No | No | No | No |
-| Per-Layer Embedding (PLE) | No | Yes | No | No | No | No | No |
-| KV sharing | No | Yes (tail layers) | No | No | No | No | No |
-| Attention sinks | No | No | No | No | Yes | No | No |
-| Circular KV cache | No | Yes (SWA layers) | No | No | No | No | No |
-| SSM / recurrent layers | No | No | No | Yes (GatedDeltaNet) | No | Yes (Mamba2) | No |
-| Shared experts | No | No | No | Yes (qwen35moe / qwen3next) | No | Yes (optional) | No |
-| Latent bottleneck FFN | No | No | No | No | No | Yes (optional) | No |
-| Position-dependent Q scaling | No | No | No | No | No | No | Yes (with YaRN) |
-| Vision | Yes | Yes | No | Yes | No | Yes (Omni) | Yes (Pixtral) |
-| Audio | No | Yes | No | No | No | Yes (Parakeet, when mmproj present) | No |
-| Video | No | Yes | No | No | No | No | No |
-| Thinking | No | Yes | Yes | Yes | Yes (always) | Yes | No |
-| Tool calling | No | Yes | Yes | Yes | Yes | Yes | No |
-| Fused QKV | No | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
-| Fused single-graph decode | No | Yes (Gemma4ModelDecode) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
-| Fused single-graph prefill | No | Yes (Gemma4LayerPrefill, dense layers) | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
-| Batched GPU MoE | n/a | Pending | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
-| Fused vision encoder | n/a | Standard | n/a | Yes (FusedVisionAttention + FusedVisionMLP) | n/a | Standard (RADIO ViT) | Standard (Pixtral) |
-| Output parser | `PassthroughOutputParser` | `Gemma4OutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser` (always required) | `Qwen3OutputParser` | `PassthroughOutputParser` |
+| Feature | Gemma 3 | Gemma 4 | DiffusionGemma | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
+|---|---|---|---|---|---|---|---|---|
+| Layer type | Dense | Dense / MoE | Gemma-4-derived MoE encoder/decoder | Dense | Hybrid (Attn + Recurrent) ± MoE | MoE | Hybrid (Mamba2 + Attn + MoE FFN) | Dense |
+| Attention | SWA + Global | SWA + Global | Region-aware prompt/canvas attention | Full GQA | Full GQA + Sigmoid Gate | Full + Sinks | Full GQA (no RoPE) | Full GQA |
+| FFN activation | GeGLU | GeGLU | Dense GeGLU + top-8 MoE | SwiGLU | SwiGLU | SiLUAlphaLimit (clamped GLU) | ReLU² | SwiGLU |
+| RoPE variant | NeoX (dual base) | NeoX + proportional / partial | NeoX, local/global bases | NeoX | NeoX / MRoPE | NeoX + YaRN | None | GPT-J + YaRN |
+| QK-norm | Yes | Yes | Yes | Yes | Yes | No | No | No |
+| V-norm | No | Yes (unweighted) | Yes (unweighted) | No | No | No | No | No |
+| Bias in projections | No | No | No | No | No | Yes (all linear) | No | No |
+| Per-layer scaling | No | Yes | Encoder / decoder scalars | No | No | No | No | No |
+| Per-Layer Embedding (PLE) | No | Yes | No | No | No | No | No | No |
+| KV sharing | No | Yes (tail layers) | Prompt-KV cache across denoising steps | No | No | No | No | No |
+| Attention sinks | No | No | No | No | No | Yes | No | No |
+| Circular KV cache | No | Yes (SWA layers) | No autoregressive KV | No | No | No | No | No |
+| SSM / recurrent layers | No | No | No | No | Yes (GatedDeltaNet) | No | Yes (Mamba2) | No |
+| Shared experts | No | No | No | No | Yes (qwen35moe / qwen3next) | No | Yes (optional) | No |
+| Latent bottleneck FFN | No | No | No | No | No | No | Yes (optional) | No |
+| Position-dependent Q scaling | No | No | No | No | No | No | No | Yes (with YaRN) |
+| Vision | Yes | Yes | No | No | Yes | No | Yes (Omni) | Yes (Pixtral) |
+| Audio | No | Yes | No | No | No | No | Yes (Parakeet, when mmproj present) | No |
+| Video | No | Yes | No | No | No | No | No | No |
+| Thinking | No | Yes | No | Yes | Yes | Yes (always) | Yes | No |
+| Tool calling | No | Yes | No | Yes | Yes | Yes | Yes | No |
+| Fused QKV | No | Yes | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
+| Fused single-graph decode | No | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
+| Fused single-graph prefill | No | Yes (Gemma4LayerPrefill, dense layers) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
+| Batched GPU MoE | n/a | Pending | Fused per-canvas MoE; concurrent requests batched by diffusion scheduler | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
+| Fused vision encoder | n/a | Standard | n/a | n/a | Yes (FusedVisionAttention + FusedVisionMLP) | n/a | Standard (RADIO ViT) | Standard (Pixtral) |
+| Output parser | `PassthroughOutputParser` | `Gemma4OutputParser` | `PassthroughOutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser` (always required) | `Qwen3OutputParser` | `PassthroughOutputParser` |
 
 ## Adding a new architecture
 
@@ -126,9 +129,10 @@ When you add a new model:
 2. In the constructor: read GGUF metadata via `_gguf.GetXxx()`, call
    `ParseBaseConfig()` and `ParseTokenizer()`, call `LoadWeights()`, fuse
    weights, then initialize caches.
-3. Implement `Forward(int[] tokens) → float[]`: embedding → optional
-   multimodal injection → transformer blocks → final norm → LM head → logit
-   copy.
+3. Implement `Forward(int[] tokens) → float[]` for autoregressive models:
+   embedding → optional multimodal injection → transformer blocks → final norm
+   → LM head → logit copy. For diffusion models, document the alternate sampler
+   entry point and make unsupported autoregressive paths explicit.
 4. Implement `ResetKVCache()` and `Dispose()`. Implement `TruncateKVCache()`
    when KV-cache reuse is supported.
 5. Register in `ModelBase.Create()` switch expression in

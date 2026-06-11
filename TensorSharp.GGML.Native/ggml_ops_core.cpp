@@ -1646,6 +1646,24 @@ TSG_EXPORT int TSGgml_SyncHostBuffer(void* ptr, size_t size)
     return 0;
 }
 
+// Diagnostic: total bytes of device-local COPY buffers currently resident in the
+// host-buffer cache (CachedBufferMode::DeviceCopy). On Metal these are the
+// activation/KV buffers that the per-op and fused kernels duplicate on-device
+// (read-only weights are wrapped zero-copy as HostPtr and are excluded). Used by
+// the diffusion multi-turn regression test to assert the prompt K/V device copies
+// are reclaimed across blocks/turns instead of accumulating (the OOM regression).
+TSG_EXPORT int64_t TSGgml_DeviceCopyCacheResidentBytes()
+{
+    std::int64_t total = 0;
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    for (const auto& kv : g_host_buffer_cache)
+    {
+        if (kv.second.mode == CachedBufferMode::DeviceCopy)
+            total += static_cast<std::int64_t>(kv.second.buffer_size);
+    }
+    return total;
+}
+
 // Toggle the lazy-sync code path on the per-op kernels. When enabled, ops that
 // wrote their result to host-mapped memory (zero-copy) on the Metal backend skip
 // the trailing ggml_backend_synchronize so the next op's command buffer can be

@@ -2,13 +2,13 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-两套测试套件用于覆盖 TensorSharp.Server 当前对外的兼容接口：
+这些测试套件用于覆盖 TensorSharp.Server 当前对外的兼容接口：
 
 - Web UI SSE：`/api/chat`
 - Ollama 聊天兼容接口：`/api/chat/ollama`
 - OpenAI Chat Completions 兼容接口：`/v1/chat/completions`
 
-测试脚本会自动检测当前加载模型的架构，并在该模型不支持思维链或工具调用时自动跳过相关用例。
+测试脚本会自动检测当前加载模型的架构，并在该模型不支持思维链或工具调用时自动跳过相关用例。它们主要覆盖自回归兼容行为；DiffusionGemma Web UI 的整条消息 `replace` 去噪预览帧，需等专门的 diffusion 套件加入后才会覆盖。
 
 ## 当前套件状态
 
@@ -18,6 +18,7 @@
 | Ollama 兼容 | 聊天流式/非流式、多轮历史、思维链、工具调用请求链路 |
 | OpenAI 兼容 | Chat Completions 流式/非流式、工具调用、结构化输出、校验错误 |
 | 运维行为 | 连续批处理并发、队列状态兼容、混合 API 切换、按架构自动跳过 |
+| DiffusionGemma | 当前兼容脚本只覆盖通用端点形状；实时去噪预览需要专门的 Web UI SSE 测试 |
 
 ## 快速开始
 
@@ -57,6 +58,7 @@ python3 test_multiturn.py
   Gemma 4、Qwen 3、Qwen 3.5、GPT OSS、Nemotron-H
 - 工具调用测试仅在当前 TensorSharp 中支持工具调用的架构上运行：
   Gemma 4、Qwen 3、Qwen 3.5、Nemotron-H
+- GPT OSS 思维链会被测试，但当前脚本会跳过 GPT OSS 工具调用检查，尽管通用解析器 / API 表面支持 Harmony 工具调用帧。
 
 不支持的架构会被标记为 `SKIP`，而不是 `FAIL`。
 
@@ -80,6 +82,7 @@ python3 test_multiturn.py
 - 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server 当前模拟的兼容范围内。
 - 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 或 `think` 同时使用时预期返回 HTTP `400`。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
+- DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。
 
 ## 使用方法
 

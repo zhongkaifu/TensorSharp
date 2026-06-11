@@ -31,6 +31,18 @@ namespace TensorSharp.Server.ResponseSerializers
 
         public static object Thinking(string thinking) => new { thinking };
 
+        /// <summary>Replace the entire assistant message body with <paramref name="text"/>. Used by the
+        /// DiffusionGemma live denoising preview, where each step refines the whole canvas (not a
+        /// left-to-right append). <paramref name="step"/>/<paramref name="totalSteps"/> drive a progress
+        /// indicator; <paramref name="preview"/> marks intermediate (still-denoising) frames.</summary>
+        public static object Replace(string text, int step, int totalSteps, bool preview) => new
+        {
+            replace = text,
+            diffusionStep = step,
+            diffusionTotal = totalSteps,
+            preview,
+        };
+
         public static object ToolCalls(IReadOnlyList<ToolCall> toolCalls) => new
         {
             tool_calls = toolCalls.Select(tc => (object)new

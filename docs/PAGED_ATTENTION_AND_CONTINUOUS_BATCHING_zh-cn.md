@@ -4,7 +4,7 @@
 
 本文是 TensorSharp 当前 vLLM 风格分页 KV cache、基于块哈希的前缀共享、
 以及迭代级连续批处理的实现参考。服务端默认通过这套引擎执行推理；旧的
-单请求 FIFO 队列只保留为队列状态事件的兼容接口。
+单请求 FIFO 队列对象只作为队列状态 / 事件形状的 no-op 兼容 shim 保留。
 
 ## 当前状态
 
@@ -16,7 +16,8 @@
 | 批处理执行 | 实现 `IBatchedPagedModel.ForwardBatch` 的模型会把本轮所有序列打包到一次模型调用中，显式传入 `positions`、`slotMapping`、`queryStartLoc` 与每序列 block table。 |
 | 回退执行 | 模型或某些功能组合无法批处理时会抛出 `NotSupportedException`；`BatchExecutor` 会在同一引擎内回退到隔离的按序列 KV-swap 路径。 |
 | 原生注意力 | `TSGgml_PagedAttentionForward` 在 C++ 中聚合分页 K/V 并派发 `ggml_flash_attn_ext`；GPT OSS 使用 `TSGgml_PagedAttentionForwardWithSinks`。 |
-| 队列 API | `InferenceQueue` 是 no-op 兼容层。`/api/queue/status` 与队列位置事件保留给依赖这些字段的客户端，不再承担请求串行化。 |
+| 队列 API | `InferenceQueue` 是 no-op 兼容层。`/api/queue/status` 与队列位置事件形状保留给依赖这些字段的客户端，不再承担请求串行化。 |
+| 扩散模型 | DiffusionGemma 不进入这套自回归 `ForwardBatch` 契约。CLI 生成使用 `DiffusionGemmaSampler`；Web UI 使用 `DiffusionBatchScheduler` 在 block 边界批处理去噪工作。 |
 
 ## 分层架构
 
@@ -136,6 +137,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与旧路径做贪心正确性验证；性能仍主要受逐层图构建限制。 | `TS_GPTOSS_BATCHED=0`；`TS_GPTOSS_PAGED_ATTN_MANAGED=1`。 |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。 | `TS_NEMOTRON_BATCHED=0`；`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
 | Gemma 3 | 尚无真正 `ForwardBatch` 移植；通过引擎的按序列回退执行。 | 仅全局回退。 |
+| DiffusionGemma | 独立文本扩散路径。`Forward(int[] tokens)` 刻意不支持；生成会迭代去噪固定长度 canvas block。Web UI 请求共享 `DiffusionBatchScheduler`，在 block 之间接纳并发请求，并可选择批处理活跃 canvas。 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH`、`DIFFUSION_BATCHED_FORWARD`；`DIFFUSION_NO_FUSED_DECODE=1` 关闭 GGML 融合整模型 diffusion decode。 |
 
 ## 测试覆盖
 
@@ -145,6 +147,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由 |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`、可选 `Qwen3BatchedForwardTests` |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
+| DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |
 | 端到端引擎行为 | 通过 `TS_TEST_MODEL_DIR` 指向真实 GGUF 后运行的 `EngineParallelInferenceTests` |
 | 服务端参数翻译 | `ServerOptionsBuilderTests` 覆盖 `--continuous-batching`、`--no-continuous-batching` 与分页 KV 兼容参数 |
 
@@ -162,6 +165,9 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | `TS_SCHED_DECODE_QUANTUM` | block size | 在偏回退路径中，允许切换序列前的 decode token 数。 |
 | `TS_BATCHED_N1_FAST_PATH` | `0` | 将符合条件的单序列步骤也走批处理路径，用于 A/B 测试。 |
 | `TS_KV_PAGED_QUANT_BITS` | `0` | 可选 TurboQuant 分页 KV 块编码位数（`4` 或 `8`）；带递归状态的模型可能回退到 passthrough。 |
+| `DIFFUSION_STEPS` | `48` | Web UI DiffusionGemma 每个 block 的去噪步数；与自回归调度器的 step 预算无关。 |
+| `DIFFUSION_MAX_BATCH` | `2` | diffusion scheduler 中同时活跃的 DiffusionGemma Web UI 请求数上限。 |
+| `DIFFUSION_BATCHED_FORWARD` | `0` | 对活跃 DiffusionGemma canvas 启用真正的批处理 decode；默认更偏向融合单 canvas 路径。 |
 
 服务端 CLI 别名：
 
@@ -180,5 +186,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 - 为整批注意力构建一个原生 GGML 图，而不是每个序列一个小图。这会降低大量短序列场景下的 launch / compile 开销。
 - 在后端支持且收益明确时，将 K/V 聚合从 CPU memcpy 迁移到 GPU 侧 `ggml_get_rows` 或等价 indexed gather。
 - 补齐 Gemma 4 对 MoE 变体、多模态待注入 embedding、块量化 KV cache 的批处理覆盖。
+- 根据实际运维需要，决定是否把 DiffusionGemma scheduler 指标接入
+  `/api/queue/status` 或单独的 diffusion 端点。
 - 将准备好的多模态 embedding 列表从模型级可变状态迁移到 `SequenceState`，使多模态 prompt 准备也能完全并行，而不是提交前串行化。
 - 当客户端不再依赖旧字段后，移除队列位置兼容事件。

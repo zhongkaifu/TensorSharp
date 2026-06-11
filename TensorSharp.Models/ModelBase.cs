@@ -3022,7 +3022,7 @@ namespace TensorSharp.Models
         /// doesn't pay the compilation cost.  Resets KV cache and timing counters
         /// afterwards so the warmup is invisible to callers.
         /// </summary>
-        public void WarmUpKernels()
+        public virtual void WarmUpKernels()
         {
             if (_backend == BackendType.Mlx && !IsMlxKernelWarmupEnabled())
             {
@@ -3351,6 +3351,7 @@ namespace TensorSharp.Models
                 "qwen35" or "qwen35moe" or "qwen3next" => new Qwen35Model(ggufPath, backend),
                 "gemma3" => new Gemma3Model(ggufPath, backend),
                 "gemma4" => new Gemma4Model(ggufPath, backend),
+                "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend),
                 "mistral3" => new Mistral3Model(ggufPath, backend),

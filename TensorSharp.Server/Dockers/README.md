@@ -18,9 +18,9 @@ Target Space: <https://huggingface.co/spaces/zhongkaifu/tensorsharp>
 2. **Runtime stage** (`mcr.microsoft.com/dotnet/aspnet:10.0`): installs
    `libgomp1` (OpenMP runtime for the GGML CPU kernels), reuses the image's
    UID‑1000 user (the UID Spaces run as) and makes the app tree writable by it,
-   copies the build output, downloads a GGUF model (default:
-   `gemma-4-12B-it-abliterated-uncensored` Q4_K_M, ~7.4 GB), and launches the
-   server with `--backend ggml_cpu`.
+   copies the build output, downloads the default Huihui Gemma 4 E2B QAT Q4_K
+   GGUF plus its `mmproj` projector, and launches the server with
+   `--backend ggml_cpu`.
 
 ### Port
 
@@ -66,18 +66,18 @@ colorTo: purple
 sdk: docker
 pinned: false
 suggested_hardware: cpu-upgrade
-short_description: C# LLM inference server (GGML CPU) with a chat UI + OpenAI/Ollama APIs
+short_description: C# GGUF inference server (GGML CPU) with a chat UI + OpenAI/Ollama APIs
 ---
 
 # TensorSharp
 
-C# inference engine for GGUF LLMs. This Space hosts gemma-4-E2B-it
-(abliterated, QAT Q4_0) with its multimodal projector on the native GGML CPU
+C# inference engine for GGUF language models. This Space hosts gemma-4-E2B-it
+(abliterated, QAT Q4_K) with its multimodal projector on the native GGML CPU
 backend and exposes the web chat UI plus OpenAI- and Ollama-compatible HTTP APIs.
 See https://github.com/zhongkaifu/TensorSharp.
 ```
 
-> The ~3.4 GB Q4_0 weights plus the ~1 GB projector fit comfortably in the
+> The ~3.4 GB Q4_K weights plus the ~1 GB projector fit comfortably in the
 > `cpu-upgrade` tier (8 vCPU, 32 GB) and load on `cpu-basic` (2 vCPU, 16 GB)
 > too. For a snappier text-only `cpu-basic` demo, switch to a smaller model via
 > the build args below.
@@ -110,6 +110,8 @@ text-only server, build with `--build-arg MMPROJ_FILE=` (empty) so the projector
 download and `--mmproj` flag are dropped. For real multimodal throughput, use a
 paid GPU hardware tier — base the image on a CUDA runtime, build the native
 bridge with `bash build-linux.sh --cuda`, and run with `--backend ggml_cuda`.
+For a DiffusionGemma GGUF, also leave `MMPROJ_FILE` empty; the Web UI exposes
+live denoising previews while the compatibility APIs return final text.
 
 ## Troubleshooting: Space shows "TensorSharp.Server is running"
 
@@ -225,13 +227,13 @@ colorTo: purple
 sdk: docker
 pinned: false
 suggested_hardware: t4-small
-short_description: C# LLM inference server (GGML CUDA) with a chat UI + OpenAI/Ollama APIs
+short_description: C# GGUF inference server (GGML CUDA) with a chat UI + OpenAI/Ollama APIs
 ---
 
 # TensorSharp
 
-C# inference engine for GGUF LLMs, GPU-accelerated via the native GGML CUDA
-backend. This Space hosts gemma-4-E2B-it (abliterated, QAT Q4_0) with its
+C# inference engine for GGUF language models, GPU-accelerated via the native GGML CUDA
+backend. This Space hosts gemma-4-E2B-it (abliterated, QAT Q4_K) with its
 multimodal projector and exposes the web chat UI plus OpenAI- and
 Ollama-compatible HTTP APIs. See https://github.com/zhongkaifu/TensorSharp.
 ```

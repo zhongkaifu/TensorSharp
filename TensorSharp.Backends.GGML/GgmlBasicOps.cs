@@ -1105,6 +1105,7 @@ namespace TensorSharp.GGML
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void Shutdown() => GgmlNative.Shutdown();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
+        public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();
@@ -1362,6 +1363,35 @@ namespace TensorSharp.GGML
         public static void Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs args)
         {
             GgmlNative.Gemma4MoELayerDecode(in args);
+        }
+
+        /// <summary>Fused DiffusionGemma decode layer (whole layer in one GGML graph). Returns false
+        /// without throwing when the backend can't run it, so the caller falls back to the per-op path.</summary>
+        public static bool TryDiffusionDecodeLayer(in DiffusionDecodeLayerArgs args)
+        {
+            return GgmlNative.TryDiffusionDecodeLayer(in args);
+        }
+
+        /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.</summary>
+        public static bool TryDiffusionLmHead(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float eps, float finalLogitSoftcap)
+        {
+            return GgmlNative.TryDiffusionLmHead(hidden, hiddenSize, canvasLen, outputNormW,
+                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, eps, finalLogitSoftcap);
+        }
+
+        /// <summary>Fused DiffusionGemma whole-model decode (all layers + lm_head in one graph). Returns
+        /// false without throwing when the backend can't run it, so the caller falls back.</summary>
+        public static bool TryDiffusionModelDecode(
+            DiffusionDecodeLayerArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr logitsOut, int vocab, float finalLogitSoftcap)
+        {
+            return GgmlNative.TryDiffusionModelDecode(layers, numLayers, hidden, hiddenSize, canvasLen, promptLen,
+                outputNormW, lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, finalLogitSoftcap);
         }
 
         /// <summary>

@@ -37,6 +37,11 @@ namespace TensorSharp.Server
         /// </summary>
         public List<ChatMessage> TrackedHistory { get; }
 
+        /// <summary>Guards <see cref="TrackedHistory"/> against concurrent access. Two parallel requests
+        /// that omit an explicit session id share the manager's default session, so the read at prompt-prep
+        /// time and the clear+rewrite at turn end (and a <c>newChat</c> reset) can race without this lock.</summary>
+        public object HistoryLock { get; } = new object();
+
         /// <summary>Creation timestamp (UTC).</summary>
         public DateTime CreatedAt { get; }
 

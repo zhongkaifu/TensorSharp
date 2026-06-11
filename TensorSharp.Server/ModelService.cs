@@ -89,9 +89,10 @@ namespace TensorSharp.Server
 
         public void LoadModel(string modelPath, string mmProjPath, string backendStr)
         {
-            // Tear down the per-model engine BEFORE the model is unloaded so
-            // the engine's worker thread doesn't race the model disposal.
+            // Tear down the per-model engine and the diffusion batch scheduler BEFORE the model is
+            // unloaded so their worker threads don't race the model disposal.
             _engineHost.Reset();
+            _generation.ResetDiffusionScheduler();
             _intrinsicSession.TrackedHistory.Clear();
             _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
         }
@@ -114,7 +115,10 @@ namespace TensorSharp.Server
         {
             if (session == null)
                 return;
-            session.TrackedHistory.Clear();
+            // Guard against a concurrent request on the same (e.g. default) session reading/rewriting
+            // TrackedHistory while we clear it.
+            lock (session.HistoryLock)
+                session.TrackedHistory.Clear();
             session.LastUsedAt = DateTime.UtcNow;
         }
 
@@ -188,6 +192,22 @@ namespace TensorSharp.Server
                 bool enableThinking = false)
         {
             return _generation.ChatStreamWithMetricsAsync(session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
+        }
+
+        /// <summary>True when the loaded model is a DiffusionGemma block-diffusion model, which is
+        /// generated via an iterative denoising sampler instead of the autoregressive engine.</summary>
+        public bool IsDiffusionModel => _lifecycle.Model is DiffusionGemmaModel;
+
+        /// <summary>Stream a DiffusionGemma chat turn as rich denoising updates (live preview canvases +
+        /// final answer + metrics). Used by the Web UI for a live denoising view. Must be called within
+        /// the InferenceQueue.</summary>
+        internal IAsyncEnumerable<DiffusionStreamUpdate> DiffusionChatStreamAsync(
+            ChatSession session,
+            List<ChatMessage> history,
+            int maxTokens,
+            CancellationToken cancellationToken)
+        {
+            return _generation.DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken);
         }
 
         /// <summary>
@@ -283,6 +303,7 @@ namespace TensorSharp.Server
         public void Dispose()
         {
             _engineHost.Dispose();
+            _generation.Dispose();
             _lifecycle.Dispose();
             _intrinsicSession.Dispose();
         }

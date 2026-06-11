@@ -13,6 +13,7 @@
 |---|---|---|
 | Gemma 3 | [models/gemma3_zh-cn.md](models/gemma3_zh-cn.md) | [models/gemma3.md](models/gemma3.md) |
 | Gemma 4 | [models/gemma4_zh-cn.md](models/gemma4_zh-cn.md) | [models/gemma4.md](models/gemma4.md) |
+| DiffusionGemma | [models/diffusiongemma_zh-cn.md](models/diffusiongemma_zh-cn.md) | [models/diffusiongemma.md](models/diffusiongemma.md) |
 | Qwen 3 | [models/qwen3_zh-cn.md](models/qwen3_zh-cn.md) | [models/qwen3.md](models/qwen3.md) |
 | Qwen 3.5 / 3.6 family | [models/qwen35_zh-cn.md](models/qwen35_zh-cn.md) | [models/qwen35.md](models/qwen35.md) |
 | GPT OSS | [models/gptoss_zh-cn.md](models/gptoss_zh-cn.md) | [models/gptoss.md](models/gptoss.md) |

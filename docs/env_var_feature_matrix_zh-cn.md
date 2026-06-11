@@ -26,6 +26,11 @@
 下表中的“运行时 baseline”表示变量未设置时的行为。“默认 sweep”表示当前默认
 配置是否会扫描该变量，而不是所有已注册变量。
 
+DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 diffusion prompt
+类型，没有 diffusion 专属 env sweep，运行器也不会清理继承来的 `DIFFUSION_*`
+变量。要把 diffusion 结果纳入标准矩阵，请先显式配置模型，并新增对应 feature
+与 env-var 注册。
+
 ## 连续批处理 / 批处理前向
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
@@ -72,6 +77,22 @@
 | `TS_MLX_PIPELINED_DECODE` | MLX decode 功能 | 模型支持时使用 device-side argmax 的流水化贪心 decode | 满足条件时启用 | `0`, `1` | 是 |
 | `TS_MLX_DEVICE_KV_COPY` | MLX | Device 侧 KV scatter | 启用 | `0`, `1` | 否 |
 | `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | MLX 上的 Qwen 3.5 / 3.6 family | Packed GDN kernel | 关闭 | `0`, `1` | 是 |
+
+## 矩阵外的 DiffusionGemma 变量
+
+这些变量是真实运行时开关，但目前未注册到 `EnvVarMatrix.All`，也不在默认
+TestMatrix 配置中 sweep。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
+|---|---|---|---|---|---|
+| `DIFFUSION_STEPS` | DiffusionGemma Web UI | 服务端路径每个 block 的去噪步数 | `48` | 未注册 | 否 |
+| `DIFFUSION_MAX_BATCH` | DiffusionGemma Web UI | `DiffusionBatchScheduler` 的最大活跃请求数 | `2` | 未注册 | 否 |
+| `DIFFUSION_BATCHED_FORWARD` | DiffusionGemma | 真正批处理 canvas decode vs 按时间片执行融合单 canvas decode | 关闭 | 未注册 | 否 |
+| `DIFFUSION_NO_PKV` | DiffusionGemma | 关闭 device-glue 后端上的 prompt-KV 缓存 | 关闭 | 未注册 | 否 |
+| `DIFFUSION_NO_SC` / `DIFFUSION_SC_TOPK` | DiffusionGemma | self-conditioning 开关与实验 top-K 截断 | 启用 / `32` | 未注册 | 否 |
+| `DIFFUSION_NO_FUSED_DECODE` / `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | GGML 后端上的 DiffusionGemma | 关闭融合整模型 diffusion decode 或融合 lm-head tail | 关闭 | 未注册 | 否 |
+| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | DiffusionGemma | 回退到按序列 lm-head 前的临时 logits 内存上限 | `300` | 未注册 | 否 |
+| `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | DiffusionGemma | 开发用计时与融合 kernel 调试诊断 | 关闭 | 未注册 | 否 |
 
 ## 功能覆盖
 

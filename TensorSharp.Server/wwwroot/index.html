@@ -1257,6 +1257,16 @@ async function requestAssistantResponse() {
             bubbleText.textContent = fullText;
             scrollChatToBottom();
           }
+          if (data.replace !== undefined) {
+            // DiffusionGemma live denoising preview: each frame refines the whole
+            // canvas, so replace (not append) the assistant message body.
+            fullText = data.replace;
+            bubbleText.textContent = fullText;
+            if (data.preview && data.diffusionTotal > 0) {
+              statsDiv.textContent = `Denoising\u2026 step ${data.diffusionStep}/${data.diffusionTotal}`;
+            }
+            scrollChatToBottom();
+          }
           if (data.done) {
             if (data.sessionId) currentSessionId = data.sessionId;
             if (data.error) {

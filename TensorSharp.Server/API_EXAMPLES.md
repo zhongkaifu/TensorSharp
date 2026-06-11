@@ -17,8 +17,9 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 |---|---|
 | Hosted models | One GGUF file, selected with `--model`; requests must name that hosted file or its basename |
 | Projectors | Optional single projector, selected with `--mmproj`; used for multimodal-capable models |
-| Backends | `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`; `/api/models` reports which are available on the host |
-| Concurrency | FIFO queue with queue-position events/chunks while a request waits |
+| Backends | `mlx`, `cuda`, `ggml_metal`, `ggml_cuda`, `ggml_cpu`, `cpu`; `/api/models` reports which are available on the host |
+| Concurrency | Autoregressive chat uses the continuous-batching engine. The legacy queue API remains for status/compatibility fields; DiffusionGemma Web UI requests use a separate block-boundary diffusion scheduler. |
+| Generation modes | Autoregressive models stream appended token chunks. DiffusionGemma returns final text on append-only compatibility endpoints and exposes live whole-message denoising previews on Web UI `/api/chat`. |
 | Sessions | Web UI uses per-tab sessions; Ollama/OpenAI compatibility endpoints share the default session |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `json_schema` cannot be combined with `think` or `tools` |
 
@@ -34,15 +35,24 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 # Windows/Linux + NVIDIA, GGML CUDA backend
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_cuda
 
+# Apple Silicon, MLX backend
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend mlx
+
 # Multimodal model (explicit projector)
 ./TensorSharp.Server --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
     --mmproj ~/work/model/gemma-4-mmproj-F16.gguf --backend ggml_metal
+
+# DiffusionGemma text-diffusion model
+DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
+  ./TensorSharp.Server --model ~/work/model/diffusion-gemma.gguf --backend ggml_metal
 
 # Override default request budget (used when a request omits max_tokens / num_predict)
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
-The server starts on `http://localhost:5000` (override with the standard ASP.NET Core `PORT` / `ASPNETCORE_URLS` environment variables).
+The server starts on `http://localhost:5000`. The current binary passes a fixed
+`http://0.0.0.0:5000` listen address to ASP.NET Core; the Docker Space files
+patch that constant to `7860` during image build.
 
 Backend quick reference:
 
@@ -50,6 +60,7 @@ Backend quick reference:
 |---|---|
 | `cpu` | Pure C# CPU backend |
 | `cuda` | Direct CUDA backend using CUDA Driver API, cuBLAS, PTX kernels, and CPU fallbacks |
+| `mlx` | MLX Metal backend for Apple Silicon |
 | `ggml_cpu` | Native GGML CPU backend |
 | `ggml_metal` | GGML Metal backend for macOS |
 | `ggml_cuda` | GGML CUDA backend for NVIDIA GPUs |
@@ -576,8 +587,8 @@ Append the assistant `tool_calls` plus a follow-up `{"role": "tool", "tool_call_
 ### Utilities
 
 ```bash
-# Live inference load snapshot: processing (requests generating concurrently),
-# pending_requests (waiting for a batch slot), busy flag, total processed
+# Legacy-compatible inference load snapshot: pending_requests is normally 0
+# because the continuous-batching engine, not InferenceQueue, owns concurrency
 curl http://localhost:5000/api/queue/status
 
 # Server version
@@ -587,7 +598,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -596,6 +607,10 @@ curl http://localhost:5000/api/models
 This is the protocol the bundled chat UI uses; documented here so external Web
 UIs can plug into the same endpoint. Every event is a JSON object delivered as a
 single `data: ...` SSE frame.
+
+When the hosted model is DiffusionGemma, this endpoint uses whole-message
+replacement frames for live denoising previews. Ollama/OpenAI compatibility
+endpoints keep their append-oriented response shapes and receive only final text.
 
 ### Chat Sessions
 
@@ -641,8 +656,9 @@ Event shapes:
 
 | Event field(s) | When | Meaning |
 |---|---|---|
-| `queue_position`, `queue_pending` | once per second while the request is queued | how many requests are ahead of this one |
+| `queue_position`, `queue_pending` | compatibility event if a request waits on the legacy queue shim | queue-position fields retained for older clients |
 | `token` | each generated token (or parsed content chunk when `think`/`tools` are active) | streaming content |
+| `replace`, `diffusionStep`, `diffusionTotal`, `preview` | each DiffusionGemma denoising preview and final replacement | replace the whole assistant message body instead of appending a token |
 | `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
 | `tool_calls` | when the model emits a tool call | array of `{name, arguments}` |
 | `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary |
@@ -651,6 +667,12 @@ Sample terminal frame:
 
 ```
 data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+```
+
+Sample DiffusionGemma preview frame:
+
+```
+data: {"replace":"A refined draft of the whole answer","diffusionStep":12,"diffusionTotal":48,"preview":true}
 ```
 
 Use `kvReusedTokens` / `kvReusePercent` in the same way as the Ollama
@@ -841,4 +863,3 @@ while IFS= read -r line; do
   echo -e "\n"
 done < test_requests.jsonl
 ```
-

@@ -13,6 +13,11 @@ for the current working tree. Re-run the scripts in
 `benchmarks/inference_matrix/scripts/` to refresh the numbers for a new commit,
 backend version, or machine.
 
+This snapshot predates DiffusionGemma coverage and should not be read as the
+current support matrix. See the root README and
+[`docs/models/diffusiongemma.md`](models/diffusiongemma.md) for the current
+text-diffusion implementation status.
+
 ## TL;DR
 
 Headline numbers on Gemma 4 E4B Q8_0, decode throughput on a real text prompt (`long_text`, ~1043-token prompt -> 64 tokens generated), in tokens/second. TensorSharp is represented by four backend / KV-dtype variants (three on the GGML Metal backend with F32 / F16 / Q8 KV, and one on the MLX backend with F32 KV).

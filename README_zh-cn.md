@@ -6,7 +6,7 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-一个用于在本地运行大型语言模型（LLM）的 C# 推理引擎，使用 GGUF 模型文件。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
+一个用于在本地运行 GGUF 语言模型的 C# 推理引擎，覆盖自回归 LLM 与 DiffusionGemma 风格的文本扩散模型。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 
 ## 快速开始
 
@@ -72,10 +72,12 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF)（另有 47B、Omni） | ✅（Omni） / — / — | ✅ | ✅ | [nemotron](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3](docs/models/mistral3_zh-cn.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3](docs/models/gemma3_zh-cn.md) |
+| DiffusionGemma | diffusion-gemma GGUF | — / — / — | — | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
 
 ## 亮点功能
 
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
+- **DiffusionGemma 文本扩散** —— 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪生成，提供 CLI 扩散参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
 - **多模态** —— 图像 / 视频 / 音频输入（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）。→ [多模态支持](#多模态支持)
 - **工具调用 / 函数调用** —— 三种 API 风格均支持多轮工具调用，输出解析与架构无关。→ [工具调用](#工具调用--函数调用)
 - **思维链 / 推理模式** —— Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H 支持结构化思维链。→ [思维链模式](#思维链--推理模式)
@@ -106,8 +108,8 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 | 范围 | 状态 |
 |---|---|
-| 模型家族 | Gemma 3/4、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3 |
-| 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API |
+| 模型家族 | Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3 |
+| 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。DiffusionGemma 当前走 CLI 扩散运行模式与 Web UI 去噪流。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA |
 | 多模态 | Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像输入 |
 | 连续批处理 | vLLM 风格的分页 KV 缓存、跨请求基于内容哈希的前缀共享、迭代级调度器（默认启用，可通过 `--no-continuous-batching` 关闭） |
@@ -117,7 +119,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3
+- **多架构支持** —— Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni）
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
@@ -129,9 +131,10 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
 - **聊天模板** —— 从 GGUF 元数据自动加载（Jinja2），并为不同架构提供硬编码回退模板
-- **推理引擎** —— `TensorSharp.Server` 中的新 `InferenceEngine`（工作线程调度器 + 分页块池）取代了旧的单请求 FIFO 队列。HTTP 适配器仍会向客户端发送队列位置事件以保持向后兼容，但引擎本身已经处理并发。
+- **推理引擎** —— `TensorSharp.Server` 中的新 `InferenceEngine`（工作线程调度器 + 分页块池）取代了旧的单请求 FIFO 队列。旧队列对象现在只是状态 / 事件形状的兼容 shim；引擎本身已经处理并发。
 - **批处理** —— 控制台应用支持 JSONL 输入，并内置用于测量 prefill / decode 吞吐的推理基准
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout），并支持中断/停止正在生成的请求
+- **文本扩散生成** —— DiffusionGemma 使用 EntropyBound 迭代去噪采样器，而不是自回归 `Forward()`。CLI 提供 `--diffusion-steps`、`--diffusion-seed` 与 `--diffusion-blocks`；Web UI 使用整条消息 `replace` 事件展示实时去噪预览，并通过 `DiffusionBatchScheduler` 批处理并发扩散请求。
 - **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层；Mamba2 步现在同时提供单序列原生内核与批处理原生内核（`TSGgml_NemotronMamba2BatchedStepF32`，NEON SIMD + GCD 并行）。
 - **混合注意力-递归网络** —— Qwen 3.5/3.6-family 在同一模型中混合全注意力层与 GatedDeltaNet 递归层；批处理路径下递归运行状态保存在每槽位的递归状态池中
 - **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5/3.6-family MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
@@ -152,6 +155,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 支持 | [gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md) |
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni（图像） | 图像（Omni） | 支持 | 支持 | [nemotron_zh-cn.md](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | [mistral3_zh-cn.md](docs/models/mistral3_zh-cn.md) |
+| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | [diffusiongemma_zh-cn.md](docs/models/diffusiongemma_zh-cn.md) |
 
 各架构的端到端文档见[按模型架构卡片](docs/models/README_zh-cn.md)（来源、前向计算图、组件、参数、权重命名，以及 TensorSharp 如何实现并优化 prefill 与 decode）。
 
@@ -174,6 +178,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | Nemotron-H | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) |
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | Mistral 3 | mistral3-mmproj（Pixtral 视觉投影器） | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
+| DiffusionGemma | diffusion-gemma 文本扩散 GGUF | 使用 `general.architecture` 为 `diffusion-gemma` 或 `diffusion_gemma` 的 GGUF 文件 |
 
 ## 计算后端
 
@@ -202,7 +207,7 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # 内容寻址的块哈希，用于跨请求前缀复用
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
-│   ├── Models/<Family>/         # 每个架构一个目录（Gemma3、Gemma4、GptOss、Mistral3、Nemotron、Qwen3、Qwen35）
+│   ├── Models/<Family>/         # 每个架构一个目录（DiffusionGemma、Gemma3、Gemma4、GptOss、Mistral3、Nemotron、Qwen3、Qwen35）
 │   │   ├── <Family>Model.cs                # 旧的单序列 ModelBase 实现
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、GptOss、Qwen35、Nemotron、Qwen3）
 │   ├── Paged/                   # 张量侧的分页注意力辅助（TensorPagedAttention）
@@ -222,6 +227,7 @@ TensorSharp/
 │   ├── ggml_ops_gated_delta_net.cpp       # Qwen 3.5/3.6 GatedDeltaNet 内核（按序列 + 批处理）
 │   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 内核（按序列 + 批处理 SIMD）
 │   ├── ggml_ops_paged_attention.cpp       # 分页注意力原生内核（驱动 ggml_flash_attn_ext + sinks 变体）
+│   ├── ggml_ops_diffusion.cpp             # DiffusionGemma 融合 decode-layer / 整模型 / lm-head 内核
 │   ├── ggml_ops_training.cpp              # 仅训练用内核（运行时不使用）
 │   └── tests/                              # 原生单元 + 烟雾测试
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
@@ -422,6 +428,10 @@ cd TensorSharp.Cli/bin
 # 音频推理（Gemma 4）
 ./TensorSharp.Cli --model <model.gguf> --audio speech.wav --backend ggml_metal
 
+# DiffusionGemma 文本扩散生成
+./TensorSharp.Cli --model <diffusion-gemma.gguf> --input prompt.txt --backend ggml_metal \
+    --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
+
 # 思维链 / 推理模式
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -500,6 +510,9 @@ cd TensorSharp.Cli/bin
 | `--test-chunked-prefill` | 运行分块 prefill 正确性检查（对比分块与非分块 logits） |
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
 | `--correct-decode <N>` | `--test-chunked-prefill` 使用的 decode 长度 |
+| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48） |
+| `--diffusion-seed <N>` | DiffusionGemma 确定性采样种子（默认：0） |
+| `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
 | `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
 | `--log-level <lvl>` | 控制台与文件日志级别：`trace`、`debug`、`info`、`warning`、`error`、`critical`、`off` |
@@ -606,6 +619,7 @@ cd TensorSharp.Server/bin
 - 思维链/推理模式切换
 - 带函数定义的工具调用
 - 通过 Server-Sent Events 进行流式 token 生成
+- 承载 `diffusion-gemma` GGUF 时展示 DiffusionGemma 去噪预览（每一步替换整条 assistant 消息，最终再发出定稿）
 - 向后兼容的队列状态事件（实际并发由推理引擎处理）
 - 消息编辑和删除，支持从对话中任意位置重新生成
 - 自由滚动：在生成过程中可向上滚动查看历史消息；只要重新滚回底部，新内容会继续自动跟随
@@ -651,7 +665,7 @@ cd TensorSharp.Server/bin
 | `MAX_TEXT_FILE_CHARS` | 在没有可用分词器时，对纯文本上传按字符数截断的上限（默认：`8000`） |
 | `VIDEO_SAMPLE_FPS` | 视频提示词每秒抽取的帧数；基于时间的抽帧（默认：`1`） |
 | `VIDEO_MAX_FRAMES` | 抽取视频帧数量的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制） |
-| `PORT` / `ASPNETCORE_URLS` | 标准 ASP.NET Core 监听配置（默认端口：`5000`） |
+| `PORT` / `ASPNETCORE_URLS` | 当前会被 `Program.cs` 中固定的 `http://0.0.0.0:5000` 监听地址覆盖；Docker Space 镜像会在构建时用 `APP_PORT` 改写该常量。 |
 | `TENSORSHARP_TEMPERATURE` | `--temperature` 与请求体均未指定时的默认采样温度 |
 | `TENSORSHARP_TOP_K` | `--top-k` 与请求体均未指定时的默认 Top-K |
 | `TENSORSHARP_TOP_P` | `--top-p` 与请求体均未指定时的默认 Top-P |
@@ -663,6 +677,8 @@ cd TensorSharp.Server/bin
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+| `DIFFUSION_STEPS` | 服务端 DiffusionGemma 每个 block 的去噪步数（默认：`48`；CLI 对应 `--diffusion-steps`） |
+| `DIFFUSION_MAX_BATCH` | Web UI 扩散调度器可批处理的最大并发 DiffusionGemma 请求数（默认：`2`） |
 
 **分页 KV 缓存 & 连续批处理可调参数（进程 / 模型启动时读取）**
 
@@ -703,6 +719,19 @@ cd TensorSharp.Server/bin
 | `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。Gemma 4 通过 `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` 默认每 4 层一次；Qwen 3 / Qwen 3.5 / Nemotron-H 通过 `TS_MLX_EVAL_EVERY_N_LAYERS` 默认每 16 层一次。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
 
+**DiffusionGemma 专属调优变量**
+
+| 变量 | 说明 |
+|---|---|
+| `DIFFUSION_NO_SC` | 设为 `1` 关闭 self-conditioning。默认开启。 |
+| `DIFFUSION_SC_TOPK` | 实验用 self-conditioning top-K 截断（默认：`32`）。 |
+| `DIFFUSION_NO_PKV` | 设为 `1` 关闭 device-glue 后端上的 prompt-KV 缓存。支持处默认开启。 |
+| `DIFFUSION_NO_FUSED_DECODE` | 设为 `1` 关闭 GGML 融合整模型 diffusion decode，回退到逐算子 / 逐层 diffusion decode。 |
+| `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | 设为 `1` 关闭融合 output-norm + lm-head + softcap 尾部。 |
+| `DIFFUSION_BATCHED_FORWARD` | 设为 `1` 后，对活跃 diffusion canvas 使用真正的 `DecodeCanvasBatched`；默认按请求时间片执行更快的融合单 canvas 路径。 |
+| `DIFFUSION_LMHEAD_BATCH_CAP_MB` | diffusion lm-head logits 批处理内存上限，超过后回退到按序列 lm-head（默认：`300`）。 |
+| `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | 开发诊断用的 diffusion 分段计时与融合 kernel 调试日志开关。 |
+
 采样参数的优先级（从高到低）：
 
 1. API 请求 JSON 中的字段（如 `temperature`、`top_p`、`stop`）。
@@ -736,6 +765,7 @@ cd TensorSharp.Server/bin
 | GPT OSS | 启用 | `TS_GPTOSS_BATCHED=0` 强制走旧的按序列路径 | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制使用托管 (C#) sinks softmax，而非原生带 sinks 的分页注意力内核 |
 | Nemotron-H | 启用 | `TS_NEMOTRON_BATCHED=0` 强制走旧的按序列路径 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 步（NEON SIMD + GCD 并行） |
 | Gemma 3 | 未实现（走按序列回退） | — | — |
+| DiffusionGemma | Web UI 路径使用独立 diffusion 调度器；不是 `IBatchedPagedModel` 自回归路径 | `DIFFUSION_MAX_BATCH`、`DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` 启用真正的批处理 canvas decode；GGML 融合 decode 默认开启，可用 `DIFFUSION_NO_FUSED_DECODE=1` 关闭 |
 
 #### 后端
 
@@ -774,9 +804,10 @@ cd TensorSharp.Server/bin
 
 | 功能 | 默认 | 环境变量 |
 |---|---|---|
-| ASP.NET Core 监听 | `http://0.0.0.0:5000` | `PORT`、`ASPNETCORE_URLS` |
+| ASP.NET Core 监听 | `http://0.0.0.0:5000` | 固定在 `Program.cs`；Docker Space 镜像用 `APP_PORT` 构建参数改写 |
 | 没有分词器时的纯文本上传字符上限 | 8000 字符 | `MAX_TEXT_FILE_CHARS` |
 | 视频帧抽取 | 1 fps（基于时间，不限制） | `VIDEO_SAMPLE_FPS`、`VIDEO_MAX_FRAMES` |
+| DiffusionGemma Web UI 去噪 | 48 步，最大 batch 2 | `DIFFUSION_STEPS`、`DIFFUSION_MAX_BATCH` |
 
 #### 日志（服务端 + CLI）
 
@@ -983,7 +1014,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` Q4/Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3）。每个架构都同时提供旧的单序列前向以及面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、DiffusionGemma、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 
@@ -991,7 +1022,7 @@ TensorSharp 采用分层系统结构：
 
 6. **TensorSharp.Backends.MLX** 是 Apple Silicon 上的 MLX 路径。它封装 [mlx-c](https://github.com/ml-explore/mlx-c)（`libmlxc`），提供分配器、存储、异步 worker 派发、量化 / 融合 / 编译内核、MoE 专家 offload，以及对未实现算子的 CPU 回退层。
 
-7. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理；其中 `InferenceEngineHost` 持有按模型的连续批处理引擎，旧的队列状态接口保留作为向后兼容。
+7. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理；其中 `InferenceEngineHost` 持有自回归模型的连续批处理引擎，`DiffusionBatchScheduler` 处理 DiffusionGemma 的 Web UI 轮次，旧的队列状态接口保留作为向后兼容。
 
 8. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查、JSONL 批处理、交互式 REPL 与内置的 prefill / decode 基准。
 
@@ -1020,6 +1051,7 @@ TensorSharp 采用分层系统结构：
 - **分页 KV 缓存 & 块哈希前缀共享**：连续批处理引擎把 KV 切分成固定大小的块，对每个写满的块做内容哈希，并在并发 / 历史请求间共享。尚未实现 `IBatchedPagedModel` 的模型仍会走同一引擎内隔离的按序列 KV-swap 回退路径。
 - **原生分页注意力内核**：`TSGgml_PagedAttentionForward`（及面向 GPT OSS 的 `WithSinks` 变体）在 C++ 中按序列从分页缓冲区聚合 K/V，按序列构建小型 GGML 图，并派发 `ggml_flash_attn_ext`——也就是旧的单序列路径所使用的同一融合 Metal/CUDA flash 注意力内核。在 Ministral-3-14B 长上下文（4×~800 tokens）上比旧的按序列 GGML 路径**快 ~21%**。
 - **批处理 / 分页前向**：Mistral 3、Gemma 4、GPT OSS、Qwen 3.5/3.6（含 GatedDeltaNet 递归状态池）、Nemotron-H（含 Mamba2 递归状态池 + 原生批处理 Mamba2 内核）把 N 个序列打包到一次 `ForwardBatch` 调用中，每层执行一次批处理线性投影 matmul，通过 `slotMapping` 写入分页 K/V，并通过原生内核做按序列注意力。Gemma 4 批处理路径在 batch=8 短 prompt 下达到 **1.5×** 旧吞吐，在 4×800-token prompt 下达到 **1.6×**；Nemotron-H Mamba2 批处理在 Apple M4 Pro 上 batch=3 时达到 **3.95×**。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
+- **DiffusionGemma prompt-KV 缓存与融合去噪**：GPU 后端会在每个 block 中只对 `[prompt | canvas]` 的 prompt 部分预填充一次 K/V，并在去噪多步中复用；GGML 后端默认使用融合整模型 diffusion decode 与融合 lm-head tail。Web UI 通过 `DiffusionBatchScheduler` 在 block 边界批处理并发 diffusion 请求。
 - **内核预热**：CLI 和 Server 在启动时运行一次微型前向传播，以预编译 GPU 内核（Metal pipeline state、CUDA JIT）并预热内存池，避免首次推理请求的冷启动延迟。
 - **Prefill 缓存**（Gemma 4、Qwen 3.5/3.6-family）：逐 forward 传播的 SWA 掩码缓存（Gemma 4）、跨全局层的 NeoX RoPE cos/sin 查找表缓存（Gemma 4）、以及跨层的 RoPE 位置张量缓存（Gemma 4、Qwen 3.5/3.6-family），消除了 prefill 期间的冗余重复计算。
 - **原地 QK RMSNorm**（Qwen 3.5/3.6-family）：逐头 QK 归一化通过 `View` 原地执行，避免了每层每个 Q/K 的一次张量分配与拷贝。
@@ -1063,7 +1095,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

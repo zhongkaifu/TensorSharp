@@ -16,10 +16,10 @@ affect — keep them in sync when you add a new flag.
 
 | Axis | Values |
 |---|---|
-| **Models** | Auto-discovered GGUFs in `/Users/ZhongkaiFu/work/model` (configurable); explicit overrides also supported |
+| **Models** | Auto-discovered GGUFs in `/Users/ZhongkaiFu/work/model` (configurable); explicit overrides also supported. DiffusionGemma is not auto-classified as a first-class matrix family yet; use an explicit config entry before experimenting with it. |
 | **Backends** | `cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `cuda`, `mlx` (host-availability filtered) |
-| **Features / prompt types** | Synthetic prefill (512, 2048), synthetic decode (128), short text, long text, uploaded text, multi-turn chat, function/tool calling, thinking mode, image, audio, video |
-| **Env-var sweeps** | Baseline cells plus the curated high-impact flags selected by `default_env_vars` in [`Defaults/matrix-config.json`](Defaults/matrix-config.json). The registered superset lives in `EnvVarMatrix.All`; see the [matrix doc](../docs/env_var_feature_matrix.md). |
+| **Features / prompt types** | Autoregressive CLI features: synthetic prefill (512, 2048), synthetic decode (128), short text, long text, uploaded text, multi-turn chat, function/tool calling, thinking mode, image, audio, video. There is no dedicated diffusion feature yet. |
+| **Env-var sweeps** | Baseline cells plus the curated high-impact flags selected by `default_env_vars` in [`Defaults/matrix-config.json`](Defaults/matrix-config.json). The registered superset lives in `EnvVarMatrix.All`; DiffusionGemma `DIFFUSION_*` knobs are currently out of matrix and not scrubbed/swept by default. See the [matrix doc](../docs/env_var_feature_matrix.md). |
 
 ## Building
 
@@ -105,6 +105,12 @@ Per-model overrides look like this:
 
 Relative paths are resolved against `model_dir`. Auto-discovered models that
 share an `id` with a config entry are replaced by the config entry.
+
+DiffusionGemma GGUFs should be added through an explicit `models[]` entry until
+`ModelDiscovery` grows architecture-aware detection for `diffusion-gemma` /
+`diffusion_gemma`. The current feature catalog is still append/decode oriented,
+so add a dedicated diffusion feature before using TestMatrix output as a formal
+diffusion regression signal.
 
 ## Media files (image / audio / video)
 
@@ -192,6 +198,7 @@ host-class layout, and update workflow.
 | A new prompt type / feature | [`Matrix/FeatureCatalog.cs`](Matrix/FeatureCatalog.cs) + [`Runners/CliRunner.cs`](Runners/CliRunner.cs) `BuildArgs` switch; drop any new prompt under `Inputs/prompts/` |
 | A new env-var sweep | [`Matrix/EnvVarMatrix.cs`](Matrix/EnvVarMatrix.cs) — add an `EnvVarSpec` with an `AppliesTo` predicate; add it to [`Defaults/matrix-config.json`](Defaults/matrix-config.json) if it should run by default; add a row to [`docs/env_var_feature_matrix.md`](../docs/env_var_feature_matrix.md) and its Chinese version |
 | A model the auto-discovery misses | Add a `ModelConfig` entry under `models[]` in `matrix-config.json` |
+| DiffusionGemma coverage | Add family detection or explicit configs, a diffusion feature in `FeatureCatalog.cs`, CLI argument mapping for diffusion generation, and `DIFFUSION_*` env-var specs if those knobs should be swept |
 
 ## CI
 
