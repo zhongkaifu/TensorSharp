@@ -163,11 +163,15 @@ The port rewrite to 7860 and the chat UI at `/` work exactly as in the CPU file.
 ## CUDA architectures (build host has no GPU)
 
 The Space build host has no GPU, so the CUDA targets must be set explicitly via
-the `CUDA_ARCHS` build arg (default `75-real;75-virtual`). The default emits
-native SASS for Turing (T4) plus compute_75 PTX that the driver JIT-compiles for
-any newer GPU, so it runs on **every** current HF GPU tier. For the fastest
-build, set it to just your GPU's arch; for native speed on a bigger GPU, add its
-`-real` entry.
+the `CUDA_ARCHS` build arg (default `75-virtual`). The default emits **compute_75
+PTX only** — no SASS — which the driver JIT-compiles at first model load for
+whatever GPU runs the Space, so the one image runs on **every** current HF GPU
+tier. PTX-only is also the lightest build: it skips `ptxas` (the memory-hungry
+SASS pass), which is what makes the full ggml-cuda compile OOM-kill the build
+container (exit 137).
+
+For native SASS (marginally faster steady-state, heavier build) set it to your
+GPU's `-real` arch instead:
 
 | HF GPU tier | GPU | Arch | `CUDA_ARCHS` for native speed |
 |---|---|---|---|
@@ -185,6 +189,24 @@ docker build -f Dockerfile \
 
 Pin the CUDA toolkit with `--build-arg CUDA_VERSION=12.4.1` (the `-devel` and
 `-runtime` tags share it). 12.2.2 (default) JIT-compiles on any driver ≥ 535.
+
+## Build OOM-killed (exit code 137 / `OOMKilled`)
+
+The native ggml-cuda compile is memory-hungry, and `build-linux.sh` sizes its
+parallel `nvcc` job count from `/proc/meminfo` — which reports the build host's
+total RAM, not the build container's cgroup limit — so on a large host it
+over-subscribes memory and the container is OOM-killed. The Dockerfile defaults
+guard against this by (a) building PTX-only (`CUDA_ARCHS=75-virtual`, no `ptxas`)
+and (b) capping parallelism with `GGML_BUILD_JOBS=2`. If a build still OOMs:
+
+```bash
+# Serialize the native compile (slowest but lowest peak memory)
+docker build -f Dockerfile --build-arg GGML_BUILD_JOBS=1 -t tensorsharp-server-gpu .
+```
+
+and keep `CUDA_ARCHS=75-virtual` (don't add `-real` arches, which re-enable the
+heavy `ptxas` pass). On a Space, set these under
+Settings → **Variables and secrets → Build args**.
 
 ## Configure the Space
 
