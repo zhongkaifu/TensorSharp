@@ -184,15 +184,26 @@ namespace TensorSharp.Models
             for (int s = 0; s < numSeqs; s++)
                 seqLens[s] = ctx.Sequences[s].NumComputedTokens + ctx.NumScheduledTokens[s];
 
-            int[] flatTokens = new int[numTokens];
-            int cursor = 0;
-            for (int s = 0; s < numSeqs; s++)
+            // Speculative verify batches forward drafted tokens that are not
+            // part of the sequence's token list yet; the spec trunk passes
+            // them explicitly.
+            int[] flatTokens;
+            if (ctx.OverrideFlatTokens != null)
             {
-                var seq = ctx.Sequences[s];
-                int startTok = seq.NumComputedTokens;
-                int take = ctx.NumScheduledTokens[s];
-                for (int i = 0; i < take; i++)
-                    flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                flatTokens = ctx.OverrideFlatTokens;
+            }
+            else
+            {
+                flatTokens = new int[numTokens];
+                int cursor = 0;
+                for (int s = 0; s < numSeqs; s++)
+                {
+                    var seq = ctx.Sequences[s];
+                    int startTok = seq.NumComputedTokens;
+                    int take = ctx.NumScheduledTokens[s];
+                    for (int i = 0; i < take; i++)
+                        flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                }
             }
             var (blockTableFlat, blockTableOffsets) = FlattenBlockTablesQ35(ctx.BlockTables);
 
@@ -468,6 +479,19 @@ namespace TensorSharp.Models
             hiddenStates.Dispose();
 
             float[] finalFlat = finalNormed.GetElementsAsFloat(numTokens * hidden);
+
+            // Speculative-trunk captures: per-row post-final-norm hidden
+            // states (h_nextn for the MTP draft head) and, for verify
+            // batches, per-row LM-head logits. The buffers may be larger than
+            // this batch; copy exactly numTokens rows.
+            if (ctx.CaptureHiddenAll != null)
+                Array.Copy(finalFlat, ctx.CaptureHiddenAll, (long)numTokens * hidden);
+            if (ctx.CaptureLogitsAll != null)
+            {
+                using Tensor allRowsLogits = LinearForwardCached(finalNormed, _lmHeadQW, _lmHeadF32);
+                float[] allRowsFlat = allRowsLogits.GetElementsAsFloat(numTokens * Config.VocabSize);
+                Array.Copy(allRowsFlat, ctx.CaptureLogitsAll, (long)numTokens * Config.VocabSize);
+            }
             finalNormed.Dispose();
             float[] lastTokensPacked = PagedKvBatchOps.GatherLastTokenPerSeq(
                 finalFlat, hidden, queryStartLoc, numSeqs);

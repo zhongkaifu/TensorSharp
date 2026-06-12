@@ -32,10 +32,11 @@ using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
-    // IMtpSpeculativeModel is the Runtime-side contract BatchExecutor drives
-    // for engine-path speculation; every member is implemented below or
-    // inherited from ModelBase (CacheSeqLen, MaxContextLength).
-    public partial class Qwen35Model : IMtpSpeculativeModel
+    // IMtpBatchedSpeculativeModel (extends IMtpSpeculativeModel) is the
+    // Runtime-side contract BatchExecutor drives for engine-path speculation;
+    // every member is implemented below or inherited from ModelBase
+    // (CacheSeqLen, MaxContextLength).
+    public partial class Qwen35Model : IMtpBatchedSpeculativeModel
     {
         // NextN/MTP weights (cached once at load; null when the GGUF has no MTP block).
         private QuantizedWeight _mtpEhProjQW;
@@ -363,6 +364,144 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(length),
                     $"Rewind length {length} outside [0, {_cacheSeqLen}].");
             _cacheSeqLen = length;
+        }
+
+        // ====================================================================
+        // Batched-trunk speculative decoding (IMtpBatchedSpeculativeModel):
+        // trunk passes run through ForwardBatch (paged KV via the sequence's
+        // block table, per-slot GDN state) so speculation rides the same
+        // kernels as the non-speculative batched baseline. The MTP draft head
+        // above is unchanged — it runs on the linear cache at _mtpLayerIdx,
+        // which is private to the speculative context.
+        // ====================================================================
+
+        // Per-slot GDN snapshot used to roll back a partially-rejected verify
+        // batch: per recurrent layer, ONE slot's conv ring buffer + write
+        // index + SSM state + init flag.
+        private float[][] _mtpSlotConvSnapshot;
+        private int[] _mtpSlotConvIdxSnapshot;
+        private float[][] _mtpSlotSsmSnapshot;
+        private bool[] _mtpSlotInitSnapshot;
+        private int _mtpSlotSnapshotSlot = -1;
+
+        /// <summary>Batched spec trunk needs the GGML batched paged path (the
+        /// MLX backend keeps GDN state inside opaque per-slot MLX caches the
+        /// snapshot/restore below cannot capture).</summary>
+        public bool SupportsBatchedSpecTrunk => HasMtp && IsGgmlBackend && IsBatchedPathEnabled();
+
+        public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
+            float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            ArgumentNullException.ThrowIfNull(seq);
+            if (tokens == null || tokens.Length == 0)
+                throw new ArgumentException("Tokens must not be empty.", nameof(tokens));
+            // The batched path reads the sequence's committed length for its
+            // attention extents, so every spec pass must start exactly there
+            // (the executor advances the sequence only after the step).
+            if (startPos != seq.NumComputedTokens)
+                throw new InvalidOperationException(
+                    $"SpecForwardBatched at position {startPos} but sequence has {seq.NumComputedTokens} computed tokens.");
+
+            int n = tokens.Length;
+            var bt = seq.BlockTable;
+            if (bt.CapacityTokens < startPos + n)
+                throw new InvalidOperationException(
+                    $"Block table covers {bt.CapacityTokens} tokens but the spec pass needs {startPos + n}.");
+
+            var positions = new System.Collections.Generic.List<int>(n);
+            var slotMapping = new System.Collections.Generic.List<int>(n);
+            for (int i = 0; i < n; i++)
+            {
+                int pos = startPos + i;
+                positions.Add(pos);
+                int blockIdx = pos / bt.BlockSize;
+                slotMapping.Add(bt.Blocks[blockIdx].Id * bt.BlockSize + pos % bt.BlockSize);
+            }
+            var table = new int[bt.NumBlocks];
+            for (int b = 0; b < bt.NumBlocks; b++)
+                table[b] = bt.Blocks[b].Id;
+
+            var ctx = new BatchedForwardContext
+            {
+                Sequences = new System.Collections.Generic.List<SequenceState> { seq },
+                NumScheduledTokens = new System.Collections.Generic.List<int> { n },
+                QueryStartLoc = new System.Collections.Generic.List<int> { 0, n },
+                Positions = positions,
+                SlotMapping = slotMapping,
+                BlockTables = new[] { table },
+                MaxQueryLen = n,
+                MaxSeqLen = startPos + n,
+                OverrideFlatTokens = tokens,
+                CaptureHiddenAll = hAllOut,
+                CaptureLogitsAll = allLogitsRows ? logitsOut : null,
+            };
+
+            var perSeq = ForwardBatch(ctx);
+            if (!allLogitsRows && logitsOut != null)
+                Array.Copy(perSeq[0], logitsOut, Config.VocabSize);
+        }
+
+        public unsafe void MtpSnapshotRecurrentStateSlots(SequenceState seq)
+        {
+            ArgumentNullException.ThrowIfNull(seq);
+            if (_q35GdnSlotConvBuf == null)
+                throw new InvalidOperationException(
+                    "Batched GDN slot state not initialized (no batched forward has run for this sequence yet).");
+
+            int slot = seq.BlockTable.Blocks[0].Id;
+            int layers = Config.NumLayers;
+            _mtpSlotConvSnapshot ??= new float[layers][];
+            _mtpSlotSsmSnapshot ??= new float[layers][];
+            _mtpSlotConvIdxSnapshot ??= new int[layers];
+            _mtpSlotInitSnapshot ??= new bool[layers];
+
+            int ssmLen = _numVHeads * _headVDim * _headKDim;
+            for (int l = 0; l < layers; l++)
+            {
+                if (!_isRecurrent[l])
+                    continue;
+                EnsureGdnSlotAllocated(l, slot);
+                float[] conv = _q35GdnSlotConvBuf[l][slot];
+                if (_mtpSlotConvSnapshot[l] == null || _mtpSlotConvSnapshot[l].Length != conv.Length)
+                    _mtpSlotConvSnapshot[l] = new float[conv.Length];
+                Array.Copy(conv, _mtpSlotConvSnapshot[l], conv.Length);
+                _mtpSlotConvIdxSnapshot[l] = _q35GdnSlotConvWriteIdx[l][slot];
+                _mtpSlotInitSnapshot[l] = _q35GdnSlotInit[l][slot];
+                // Pointer copy into a reused buffer: GetElementsAsFloat would
+                // allocate a fresh ~3 MB array per layer per verify step
+                // (gigabytes of GC churn per request — measured 92 ms/step
+                // vs ~12 ms for the raw copy).
+                if (_mtpSlotSsmSnapshot[l] == null || _mtpSlotSsmSnapshot[l].Length != ssmLen)
+                    _mtpSlotSsmSnapshot[l] = new float[ssmLen];
+                float* src = GetFloatPtr(_q35GdnSlotSsmTensor[l][slot]);
+                fixed (float* dst = _mtpSlotSsmSnapshot[l])
+                    Buffer.MemoryCopy(src, dst, (long)ssmLen * 4, (long)ssmLen * 4);
+            }
+            _mtpSlotSnapshotSlot = slot;
+        }
+
+        public unsafe void MtpRestoreRecurrentStateSlots(SequenceState seq)
+        {
+            ArgumentNullException.ThrowIfNull(seq);
+            int slot = seq.BlockTable.Blocks[0].Id;
+            if (_mtpSlotSnapshotSlot != slot)
+                throw new InvalidOperationException(
+                    $"No recurrent-state snapshot for slot {slot} (snapshot holds slot {_mtpSlotSnapshotSlot}).");
+
+            int ssmLen = _numVHeads * _headVDim * _headKDim;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l])
+                    continue;
+                Array.Copy(_mtpSlotConvSnapshot[l], _q35GdnSlotConvBuf[l][slot], _mtpSlotConvSnapshot[l].Length);
+                _q35GdnSlotConvWriteIdx[l][slot] = _mtpSlotConvIdxSnapshot[l];
+                _q35GdnSlotInit[l][slot] = _mtpSlotInitSnapshot[l];
+                Tensor ssm = _q35GdnSlotSsmTensor[l][slot];
+                float* dst = GetFloatPtr(ssm);
+                fixed (float* src = _mtpSlotSsmSnapshot[l])
+                    Buffer.MemoryCopy(src, dst, (long)ssmLen * 4, (long)ssmLen * 4);
+                InvalidateTensorDeviceCache(ssm);
+            }
         }
     }
 }

@@ -68,6 +68,96 @@ namespace TensorSharp.Runtime.Scheduling
         void MtpRewindCache(int length);
     }
 
+    /// <summary>
+    /// Model contract for serving the speculative TRUNK passes through the
+    /// batched paged path (paged KV via slot mapping, per-slot recurrent
+    /// state) instead of the single live linear cache. This is the
+    /// high-throughput option: the trunk runs on the same kernels as the
+    /// non-speculative batched baseline, composes with prefix caching, and
+    /// transitions gracefully to/from concurrent batches (the sequence's K/V
+    /// always lives in paged storage). The MTP draft head itself still runs
+    /// on the linear cache at the draft layer — it is one decoder block whose
+    /// state is private to the speculative context.
+    /// </summary>
+    public interface IMtpBatchedSpeculativeModel : IMtpSpeculativeModel
+    {
+        /// <summary>True when the loaded model/backend can serve speculative
+        /// trunk passes through its batched paged path.</summary>
+        bool SupportsBatchedSpecTrunk { get; }
+
+        /// <summary>
+        /// Trunk forward of <paramref name="tokens"/> for ONE sequence through
+        /// the batched paged path. <paramref name="startPos"/> must equal
+        /// <c>seq.NumComputedTokens</c> (the caller advances the sequence only
+        /// after the step completes); the sequence's block table must already
+        /// cover <c>startPos + tokens.Length</c> positions. Captures per-row
+        /// post-final-norm hidden states into <paramref name="hAllOut"/>
+        /// (n*hidden floats; may be null) and logits into
+        /// <paramref name="logitsOut"/> (n*vocab floats when
+        /// <paramref name="allLogitsRows"/>, else vocab floats for the last row).
+        /// </summary>
+        void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
+            float[] hAllOut, float[] logitsOut, bool allLogitsRows);
+
+        /// <summary>Snapshot the per-slot recurrent (GDN/SSM) state of
+        /// <paramref name="seq"/> before a verify batch.</summary>
+        void MtpSnapshotRecurrentStateSlots(SequenceState seq);
+
+        /// <summary>Restore the per-slot recurrent state captured by
+        /// <see cref="MtpSnapshotRecurrentStateSlots"/>. Paged attention KV
+        /// needs no rewind: reads are bounded by the per-pass sequence length
+        /// and rejected slots are overwritten by the kept-prefix re-forward
+        /// and subsequent steps.</summary>
+        void MtpRestoreRecurrentStateSlots(SequenceState seq);
+    }
+
+    /// <summary>
+    /// The trunk backend a speculative execution drives: prompt/verify/plain
+    /// forwards plus recurrent-state snapshot/rollback. Two implementations:
+    /// <see cref="LinearMtpTrunk"/> (the model's live linear cache — the
+    /// standalone decoder and the per-sequence engine fallback) and the
+    /// executor's batched trunk (paged KV + per-slot state via
+    /// <see cref="IMtpBatchedSpeculativeModel"/>).
+    /// </summary>
+    public interface IMtpSpecTrunk
+    {
+        /// <summary>Forward <paramref name="tokens"/> at the trunk's current
+        /// position, capturing per-row hidden states and logits like
+        /// <see cref="IMtpSpeculativeModel.SpecForward"/>. Advances the trunk
+        /// by <c>tokens.Length</c>.</summary>
+        void Forward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows);
+
+        /// <summary>Snapshot recurrent state before a verify batch.</summary>
+        void SnapshotRecurrentState();
+
+        /// <summary>Roll the trunk back to <paramref name="position"/>
+        /// committed tokens: restore the recurrent snapshot and rewind any
+        /// attention-KV bookkeeping.</summary>
+        void Rollback(int position);
+    }
+
+    /// <summary>Linear-cache trunk: forwards through
+    /// <see cref="IMtpSpeculativeModel.SpecForward"/> on the model's single
+    /// live KV cache.</summary>
+    public sealed class LinearMtpTrunk : IMtpSpecTrunk
+    {
+        private readonly IMtpSpeculativeModel _model;
+
+        public LinearMtpTrunk(IMtpSpeculativeModel model)
+            => _model = model ?? throw new ArgumentNullException(nameof(model));
+
+        public void Forward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+            => _model.SpecForward(tokens, hAllOut, logitsOut, allLogitsRows);
+
+        public void SnapshotRecurrentState() => _model.MtpSnapshotRecurrentState();
+
+        public void Rollback(int position)
+        {
+            _model.MtpRestoreRecurrentState();
+            _model.MtpRewindCache(position);
+        }
+    }
+
     /// <summary>Cumulative speculative-decoding counters for one execution
     /// (one request on the engine path; one GenerateGreedy call on the
     /// standalone path). The engine logs these when a request finishes.</summary>
@@ -162,6 +252,7 @@ namespace TensorSharp.Runtime.Scheduling
     public sealed class MtpSpeculativeExecution
     {
         private readonly IMtpSpeculativeModel _model;
+        private readonly IMtpSpecTrunk _trunk;
         private readonly int _hidden;
         private readonly int _vocab;
 
@@ -196,13 +287,14 @@ namespace TensorSharp.Runtime.Scheduling
 
         public MtpSpecStats Stats { get; } = new();
 
-        public MtpSpeculativeExecution(IMtpSpeculativeModel model, int maxDraftTokens = 8)
+        public MtpSpeculativeExecution(IMtpSpeculativeModel model, int maxDraftTokens = 8, IMtpSpecTrunk trunk = null)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             if (!model.HasMtp)
                 throw new ArgumentException("Model has no NextN/MTP draft block.", nameof(model));
             if (maxDraftTokens < 1)
                 throw new ArgumentOutOfRangeException(nameof(maxDraftTokens));
+            _trunk = trunk ?? new LinearMtpTrunk(model);
 
             MaxDraftTokens = maxDraftTokens;
             _hidden = model.Config.HiddenSize;
@@ -229,20 +321,20 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>
         /// Forward one prompt chunk through the trunk (capturing h_nextn) and
         /// replay it through the MTP block so its KV cache covers the chunk.
-        /// Must be called with the model's cache positioned exactly at the
-        /// chunk's start (chunks are contiguous from position 0). Returns a
-        /// caller-owned copy of the last-position logits.
+        /// <paramref name="startPos"/> is the chunk's first trunk position
+        /// (chunks are contiguous from position 0); the trunk must be
+        /// positioned there. Returns a caller-owned copy of the last-position
+        /// logits.
         /// </summary>
-        public float[] PrefillStep(int[] chunk)
+        public float[] PrefillStep(int[] chunk, int startPos)
         {
             if (chunk == null || chunk.Length == 0)
                 throw new ArgumentException("Chunk must not be empty.", nameof(chunk));
 
             int n = chunk.Length;
             EnsureChunkBuffers(n);
-            int startPos = _model.CacheSeqLen;
 
-            _model.SpecForward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
+            _trunk.Forward(chunk, _chunkH, _stepLogits, allLogitsRows: false);
 
             // Pair token k with the hidden state of the token before it.
             Array.Copy(_pendingH, 0, _chunkHPairs, 0, _hidden);
@@ -318,7 +410,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // Plain decode step (still captures h + keeps the MTP cache in sync).
                 Stats.PlainSteps++;
                 long tPlain0 = Stopwatch.GetTimestamp();
-                _model.SpecForward(new[] { lastToken }, _verifyH, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(new[] { lastToken }, _verifyH, _stepLogits, allLogitsRows: false);
                 Array.Copy(_pendingH, 0, _catchUpH, 0, _hidden);
                 _model.MtpCatchUp(new[] { lastToken }, _catchUpH, position);
                 Array.Copy(_verifyH, 0, _pendingH, 0, _hidden);
@@ -344,10 +436,10 @@ namespace TensorSharp.Runtime.Scheduling
                 batch[i + 1] = _draftTokens[i];
 
             long tSnap0 = Stopwatch.GetTimestamp();
-            _model.MtpSnapshotRecurrentState();
+            _trunk.SnapshotRecurrentState();
             long tVerify0 = Stopwatch.GetTimestamp();
             Stats.SnapshotTicks += tVerify0 - tSnap0;
-            _model.SpecForward(batch, _verifyH, _verifyLogits, allLogitsRows: true);
+            _trunk.Forward(batch, _verifyH, _verifyLogits, allLogitsRows: true);
             Stats.VerifyTicks += Stopwatch.GetTimestamp() - tVerify0;
 
             int m = 0;
@@ -375,11 +467,10 @@ namespace TensorSharp.Runtime.Scheduling
                 // pre-verify checkpoint and re-advance over the kept prefix.
                 Stats.RollbackSteps++;
                 long tRoll0 = Stopwatch.GetTimestamp();
-                _model.MtpRestoreRecurrentState();
-                _model.MtpRewindCache(position);
+                _trunk.Rollback(position);
                 int[] keep = new int[m + 1];
                 Array.Copy(batch, keep, m + 1);
-                _model.SpecForward(keep, null, _stepLogits, allLogitsRows: false);
+                _trunk.Forward(keep, null, _stepLogits, allLogitsRows: false);
                 Stats.RollbackTicks += Stopwatch.GetTimestamp() - tRoll0;
             }
 

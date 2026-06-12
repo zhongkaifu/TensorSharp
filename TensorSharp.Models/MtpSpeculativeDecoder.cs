@@ -97,7 +97,9 @@ namespace TensorSharp.Models
                 int n = Math.Min(chunkSize, promptTokens.Length - offset);
                 int[] chunk = new int[n];
                 Array.Copy(promptTokens, offset, chunk, 0, n);
-                logits = _exec.PrefillStep(chunk);
+                // Linear trunk: the chunk's start position is the model's
+                // current cache length (contiguous from the ResetKVCache).
+                logits = _exec.PrefillStep(chunk, _model.CacheSeqLen);
                 offset += n;
             }
             return logits;

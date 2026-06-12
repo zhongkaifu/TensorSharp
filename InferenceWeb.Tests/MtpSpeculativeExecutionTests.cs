@@ -188,6 +188,54 @@ public class MtpSpeculativeExecutionTests
     }
 
     [Fact]
+    public void EngineMtpSpec_BatchedTrunk_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
+    {
+        // Batched-trunk speculation: every trunk pass must go through
+        // SpecForwardBatched (the linear SpecForward stays untouched), the
+        // sequence's K/V is flagged as paged storage, rollbacks use the
+        // per-slot snapshot APIs — and the output stream still equals the
+        // deterministic plain-greedy chain exactly.
+        const int promptLen = 5;
+        const int maxNew = 40;
+
+        var model = new FakeMtpModel { BatchedTrunkEnabled = true };
+        model.DraftWrongPositions.Add(promptLen + 7);
+        model.DraftWrongPositions.Add(promptLen + 19);
+
+        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: true);
+
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, seq.Status);
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
+        Assert.NotNull(seq.SpecStats);
+        Assert.True(seq.SpecStats.TokensAccepted > 0, "speculation never accepted a draft");
+        Assert.True(seq.SpecStats.RollbackSteps >= 1, "wrong drafts should have caused a rollback");
+        Assert.True(model.BatchedSpecForwardCalls > 0, "spec trunk never used the batched path");
+        Assert.Equal(0, model.LinearSpecForwardCalls);
+        Assert.True(model.SlotSnapshotCalls > 0, "verify never snapshotted the slot state");
+        Assert.True(model.SlotRestoreCalls >= 1, "rollback never restored the slot state");
+        Assert.True(seq.KvStateInPagedStorage, "batched-trunk steps must mark K/V as paged");
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
+    public void EngineMtpSpec_BatchedTrunk_EosInsideAcceptedWindow_StopsAndTruncates()
+    {
+        const int promptLen = 5;
+        var model = new FakeMtpModel { BatchedTrunkEnabled = true };
+        int eosToken = model.ExpectedNext(promptLen + 4);
+        model.EosTokenId = eosToken;
+
+        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, mtpEnabled: true);
+
+        Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
+        Assert.Equal(ExpectedChain(model, promptLen, 5), seq.OutputTokens.Take(5));
+        Assert.Equal(eosToken, seq.OutputTokens[^1]);
+        Assert.Equal(6, seq.OutputTokens.Count);
+        Assert.True(model.BatchedSpecForwardCalls > 0);
+        Assert.Empty(model.ProtocolViolations);
+    }
+
+    [Fact]
     public void EngineMtpSpec_Disabled_ProducesSameStreamWithoutSpeculation()
     {
         const int promptLen = 5;
@@ -205,7 +253,7 @@ public class MtpSpeculativeExecutionTests
     private static int PrefillPrompt(FakeMtpModel model, MtpSpeculativeExecution exec, int promptLen, out int lastToken)
     {
         int[] prompt = Enumerable.Range(1, promptLen).ToArray();
-        float[] logits = exec.PrefillStep(prompt);
+        float[] logits = exec.PrefillStep(prompt, 0);
         lastToken = Argmax(logits);
         Assert.Equal(model.ExpectedNext(promptLen - 1), lastToken);
         return promptLen;
@@ -274,7 +322,7 @@ public class MtpSpeculativeExecutionTests
     /// <see cref="ProtocolViolations"/> rather than thrown so a buggy caller
     /// fails the test with a readable message instead of a hung engine.
     /// </summary>
-    private sealed class FakeMtpModel : IMtpSpeculativeModel
+    private sealed class FakeMtpModel : IMtpBatchedSpeculativeModel
     {
         private readonly List<int> _trunk = new();
         private int _recurrentState;       // advances with the trunk
@@ -286,6 +334,15 @@ public class MtpSpeculativeExecutionTests
         public int SnapshotCalls { get; private set; }
         public int RestoreCalls { get; private set; }
         public int EosTokenId { get; set; } = -1;
+
+        // Batched-trunk bookkeeping: when enabled, the engine must serve
+        // every speculative trunk pass through SpecForwardBatched (the
+        // linear SpecForward must stay untouched).
+        public bool BatchedTrunkEnabled { get; set; }
+        public int LinearSpecForwardCalls { get; private set; }
+        public int BatchedSpecForwardCalls { get; private set; }
+        public int SlotSnapshotCalls { get; private set; }
+        public int SlotRestoreCalls { get; private set; }
 
         public FakeMtpModel()
         {
@@ -301,6 +358,8 @@ public class MtpSpeculativeExecutionTests
             LowConfidencePositions.Clear();
             ProtocolViolations.Clear();
             SnapshotCalls = RestoreCalls = 0;
+            LinearSpecForwardCalls = BatchedSpecForwardCalls = 0;
+            SlotSnapshotCalls = SlotRestoreCalls = 0;
         }
 
         public int ExpectedNext(int position) => ((position * 13) + 7) % VocabSize;
@@ -351,6 +410,12 @@ public class MtpSpeculativeExecutionTests
         public int MaxContextLength => 4096;
 
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            LinearSpecForwardCalls++;
+            ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
+        }
+
+        private void ForwardCore(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
             int startPos = _trunk.Count;
             _trunk.AddRange(tokens);
@@ -435,6 +500,42 @@ public class MtpSpeculativeExecutionTests
                 return;
             }
             _trunk.RemoveRange(length, _trunk.Count - length);
+        }
+
+        // ---- IMtpBatchedSpeculativeModel ----
+        public bool SupportsBatchedSpecTrunk => BatchedTrunkEnabled;
+
+        public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
+            float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            BatchedSpecForwardCalls++;
+            if (startPos != _trunk.Count)
+                ProtocolViolations.Add($"batched forward at startPos {startPos} but trunk holds {_trunk.Count}");
+            if (seq != null && startPos != seq.NumComputedTokens)
+                ProtocolViolations.Add($"batched forward at startPos {startPos} but sequence has {seq.NumComputedTokens} computed");
+            if (seq != null && seq.BlockTable.CapacityTokens < startPos + tokens.Length)
+                ProtocolViolations.Add($"block table covers {seq.BlockTable.CapacityTokens} tokens but pass needs {startPos + tokens.Length}");
+            ForwardCore(tokens, hAllOut, logitsOut, allLogitsRows);
+        }
+
+        public void MtpSnapshotRecurrentStateSlots(SequenceState seq)
+        {
+            SlotSnapshotCalls++;
+            _recurrentSnapshot = _recurrentState;
+        }
+
+        public void MtpRestoreRecurrentStateSlots(SequenceState seq)
+        {
+            SlotRestoreCalls++;
+            if (_recurrentSnapshot < 0)
+                ProtocolViolations.Add("slot restore without snapshot");
+            _recurrentState = _recurrentSnapshot;
+            // The real batched rollback never rewinds attention KV (reads are
+            // extent-bounded and rejected slots get overwritten); model that
+            // by truncating to the snapshot position so the next pass's
+            // position checks see the rolled-back extent.
+            if (_recurrentSnapshot >= 0 && _recurrentSnapshot <= _trunk.Count)
+                _trunk.RemoveRange(_recurrentSnapshot, _trunk.Count - _recurrentSnapshot);
         }
 
         private sealed class FakeTokenizer : ITokenizer

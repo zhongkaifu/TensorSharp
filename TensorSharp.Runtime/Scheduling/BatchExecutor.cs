@@ -72,13 +72,57 @@ namespace TensorSharp.Runtime.Scheduling
         {
             public SequenceState Seq;
             public MtpSpeculativeExecution Exec;
+            // Non-null when the speculative trunk runs through the batched
+            // paged path (IMtpBatchedSpeculativeModel) instead of the linear
+            // cache. The trunk's own position must agree with NextPosition.
+            public BatchedMtpTrunk BatchedTrunk;
             // Trunk position the next forward for Seq must start at; must equal
-            // seq.NumComputedTokens (and the model's CacheSeqLen) to stay armed.
+            // seq.NumComputedTokens (and, on the linear trunk, the model's
+            // CacheSeqLen) to stay armed.
             public int NextPosition;
             // The token DRAWN from the last verify's mismatch/bonus row. It IS
             // the sequence's next output token (re-sampling from LastLogits
             // would bias toward the drafts); -1 when no draw is pending.
             public int PendingNextToken = -1;
+        }
+
+        /// <summary>Speculative trunk over the batched paged path: forwards go
+        /// through <see cref="IMtpBatchedSpeculativeModel.SpecForwardBatched"/>
+        /// (paged KV via the sequence's block table, per-slot recurrent
+        /// state), so the spec trunk runs on the same kernels as the
+        /// non-speculative batched baseline.</summary>
+        internal sealed class BatchedMtpTrunk : IMtpSpecTrunk
+        {
+            private readonly IMtpBatchedSpeculativeModel _model;
+            private readonly SequenceState _seq;
+
+            /// <summary>Tokens committed to the trunk so far (advances with
+            /// each Forward; rolled back on rejection).</summary>
+            public int Position { get; private set; }
+
+            public BatchedMtpTrunk(IMtpBatchedSpeculativeModel model, SequenceState seq, int position)
+            {
+                _model = model;
+                _seq = seq;
+                Position = position;
+            }
+
+            public void Forward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+            {
+                _model.SpecForwardBatched(_seq, tokens, Position, hAllOut, logitsOut, allLogitsRows);
+                Position += tokens.Length;
+            }
+
+            public void SnapshotRecurrentState() => _model.MtpSnapshotRecurrentStateSlots(_seq);
+
+            public void Rollback(int position)
+            {
+                // Paged attention KV needs no rewind: every pass passes its
+                // sequence length explicitly, and rejected slots are simply
+                // overwritten by the kept-prefix re-forward / later steps.
+                _model.MtpRestoreRecurrentStateSlots(_seq);
+                Position = position;
+            }
         }
 
         public BatchExecutor(
@@ -164,12 +208,20 @@ namespace TensorSharp.Runtime.Scheduling
                     ? (new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>(output.ScheduledWork))
                     : SplitMultimodalWork(output);
 
-                // NextN/MTP speculative decoding: solo text sequences on a
-                // draft-head model are served on the per-sequence linear-cache
-                // path, where the draft/verify machinery lives. This MUST run
-                // before the fused/batched dispatch below or speculation never
-                // engages (e.g. Qwen3.5's solo traffic otherwise goes through
-                // ForwardBatch).
+                // NextN/MTP speculative decoding. Models whose batched paged
+                // path can serve the speculative trunk (paged KV + per-slot
+                // recurrent state) run spec directly on that path — the same
+                // kernels as the non-speculative batched baseline, no
+                // linear-cache detour, composing with prefix caching and
+                // concurrency transitions. When the handler declines (multi-
+                // sequence step, disarmed context, prefix-reused admission)
+                // the normal paths below serve the step. Models without
+                // batched-trunk support fall back to the per-sequence
+                // linear-cache route, which MUST run before the fused/batched
+                // dispatch or speculation never engages.
+                var mtpBatched = TryExecuteStepMtpBatchedTrunk(output);
+                if (mtpBatched != null)
+                    return mtpBatched;
                 if (ShouldRouteMtpSpeculative(output))
                     return ExecuteStepPerSequence(output);
 
@@ -385,6 +437,11 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (!_scheduler.Config.MtpSpeculativeEnabled) return false;
             if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp) return false;
+            // Batched-trunk-capable models never take the per-sequence
+            // detour: when TryExecuteStepMtpBatchedTrunk declines, the normal
+            // batched path serves the step (faster and keeps the sequence's
+            // K/V in paged storage).
+            if (spec is IMtpBatchedSpeculativeModel bm && bm.SupportsBatchedSpecTrunk) return false;
             if (output.ScheduledWork.Count != 1) return false;
 
             var seq = output.ScheduledWork[0].Sequence;
@@ -925,17 +982,22 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>Serve one scheduled work item via NextN/MTP speculative
-        /// decoding when the speculative context is (or can be) armed for it.
-        /// Returns null when the step must run on the plain path instead.
-        /// Assumes <see cref="EnsureOwnership"/> has already run for
-        /// <paramref name="seq"/> (a fresh sequence therefore starts with a
-        /// clean model cache).</summary>
+        /// decoding on the LINEAR-cache trunk when the speculative context is
+        /// (or can be) armed for it. Returns null when the step must run on
+        /// the plain path instead. Assumes <see cref="EnsureOwnership"/> has
+        /// already run for <paramref name="seq"/> (a fresh sequence therefore
+        /// starts with a clean model cache). Models whose batched path can
+        /// serve the speculative trunk never arm here — they are handled by
+        /// <see cref="TryExecuteStepMtpBatchedTrunk"/> before the per-seq
+        /// route is ever taken.</summary>
         private SequenceStepResult TryExecuteMtpStep(
             SequenceState seq, ScheduledSequenceWork work, int prevComputed)
         {
             if (!_scheduler.Config.MtpSpeculativeEnabled)
                 return null;
             if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp)
+                return null;
+            if (spec is IMtpBatchedSpeculativeModel batchedSpec && batchedSpec.SupportsBatchedSpecTrunk)
                 return null;
             // Multimodal prefill needs Forward's embedding-inject hook, which
             // SpecForward doesn't have.
@@ -966,7 +1028,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // One line per request so operators can SEE speculation engage
                 // at generation start (the cumulative stats only log at finish).
                 _logger.LogInformation(
-                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin})",
+                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, trunk=linear)",
                     seq.RequestId, cfg.MtpMaxDraftTokens, cfg.MtpMinDraftProb);
             }
 
@@ -974,6 +1036,7 @@ namespace TensorSharp.Runtime.Scheduling
             // model's live cache agrees. Anything else (swap, preemption,
             // interleaved batched step) ran through an invalidation above.
             if (_mtpCtx == null
+                || _mtpCtx.BatchedTrunk != null
                 || !ReferenceEquals(_mtpCtx.Seq, seq)
                 || _mtpCtx.NextPosition != prevComputed
                 || spec.CacheSeqLen != prevComputed)
@@ -981,14 +1044,112 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             }
 
+            return ExecuteMtpWorkCore(seq, work, prevComputed);
+        }
+
+        /// <summary>
+        /// NextN/MTP speculative decoding with the trunk on the BATCHED paged
+        /// path (see <see cref="IMtpBatchedSpeculativeModel"/>): solo text
+        /// sequences arm at a fresh full prefill and run draft/verify with
+        /// trunk passes through <c>SpecForwardBatched</c> — the same kernels
+        /// the non-speculative batched baseline uses, with the sequence's K/V
+        /// in paged storage throughout (prefix caching and concurrency
+        /// transitions compose). Returns null when this step should be served
+        /// by the normal paths (speculation disabled/unsupported, multi-
+        /// sequence step, multimodal pending, disarmed context, prefix-reused
+        /// admission); the normal batched path then drops any stale context.
+        /// </summary>
+        private List<SequenceStepResult> TryExecuteStepMtpBatchedTrunk(SchedulerOutput output)
+        {
+            if (!_scheduler.Config.MtpSpeculativeEnabled)
+                return null;
+            if (_model is not IMtpBatchedSpeculativeModel spec || !spec.SupportsBatchedSpecTrunk || !spec.HasMtp)
+                return null;
+            if (output.ScheduledWork.Count != 1)
+                return null;
+            var work = output.ScheduledWork[0];
+            var seq = work.Sequence;
+            if (_model.MultimodalInjector != null
+                && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
+            {
+                return null;
+            }
+            // A sequence living in a per-request fused cache must stay fused —
+            // its tail K/V isn't reconstructable from paged storage.
+            if (_model is IBatchedPagedModel fused
+                && fused.SupportsPerSequenceFusedForward
+                && fused.HasFusedSequenceCache(seq.RequestId))
+            {
+                return null;
+            }
+
+            int prevComputed = seq.NumComputedTokens;
+
+            // (Re-)arm at a fresh full prefill from position 0. A prefix-cache
+            // or live-cache adoption skips trunk positions the MTP head never
+            // saw; those requests run on the normal batched path instead.
+            if (work.IsPrefill && prevComputed == 0)
+            {
+                var cfg = _scheduler.Config;
+                var trunk = new BatchedMtpTrunk(spec, seq, 0);
+                _mtpCtx = new MtpSeqContext
+                {
+                    Seq = seq,
+                    BatchedTrunk = trunk,
+                    Exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens, trunk)
+                    {
+                        MinDraftProb = cfg.MtpMinDraftProb,
+                    },
+                    NextPosition = 0,
+                };
+                seq.SpecStats = _mtpCtx.Exec.Stats;
+                _logger.LogInformation(
+                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin}, trunk=batched)",
+                    seq.RequestId, cfg.MtpMaxDraftTokens, cfg.MtpMinDraftProb);
+            }
+
+            // Continuity gate: a batched context for this exact sequence at
+            // this exact position. The drawn-token stash dies with a stale
+            // context; the normal path re-samples from LastLogits (identical
+            // under greedy, a one-token bias on rare disarm events otherwise).
+            if (_mtpCtx == null
+                || _mtpCtx.BatchedTrunk == null
+                || !ReferenceEquals(_mtpCtx.Seq, seq)
+                || _mtpCtx.NextPosition != prevComputed
+                || _mtpCtx.BatchedTrunk.Position != prevComputed)
+            {
+                return null;
+            }
+
+            var results = new List<SequenceStepResult>(1);
+            try
+            {
+                results.Add(ExecuteMtpWorkCore(seq, work, prevComputed));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Batched-trunk MTP step failed for sequence {RequestId}", seq.RequestId);
+                _mtpCtx = null;
+                seq.Error = ex;
+                results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
+            }
+            return results;
+        }
+
+        /// <summary>Shared MTP step body for both trunks; the caller has
+        /// already validated arming and continuity on <see cref="_mtpCtx"/>.</summary>
+        private SequenceStepResult ExecuteMtpWorkCore(
+            SequenceState seq, ScheduledSequenceWork work, int prevComputed)
+        {
+            bool batchedTrunk = _mtpCtx.BatchedTrunk != null;
             if (work.IsPrefill)
             {
                 int[] chunk = BuildPrefillChunk(seq, work);
                 var swPrefill = Stopwatch.StartNew();
-                float[] logits = _mtpCtx.Exec.PrefillStep(chunk);
+                float[] logits = _mtpCtx.Exec.PrefillStep(chunk, prevComputed);
                 swPrefill.Stop();
                 seq.LastLogits = logits;
-                CompleteMtpStepBookkeeping(seq, chunk.Length);
+                CompleteMtpStepBookkeeping(seq, chunk.Length, batchedTrunk);
                 _mtpCtx.NextPosition = seq.NumComputedTokens;
 
                 return new SequenceStepResult
@@ -997,7 +1158,7 @@ namespace TensorSharp.Runtime.Scheduling
                     TokensForwarded = chunk.Length,
                     SampledToken = -1,
                     IsPrefill = true,
-                    FullBlocksCaptured = CaptureNewlyFullBlocks(seq),
+                    FullBlocksCaptured = batchedTrunk ? 0 : CaptureNewlyFullBlocks(seq),
                     ForwardElapsedTicks = swPrefill.ElapsedTicks,
                 };
             }
@@ -1052,11 +1213,11 @@ namespace TensorSharp.Runtime.Scheduling
 
             seq.LastLogits = outcome.NextLogits;
             int advanced = 1 + outcome.AcceptedCount;
-            CompleteMtpStepBookkeeping(seq, advanced);
+            CompleteMtpStepBookkeeping(seq, advanced, batchedTrunk);
             _mtpCtx.NextPosition = prevComputed + advanced;
             _mtpCtx.PendingNextToken = outcome.NextToken;
 
-            int capturedBlocks = CaptureNewlyFullBlocks(seq);
+            int capturedBlocks = batchedTrunk ? 0 : CaptureNewlyFullBlocks(seq);
             if (!seq.FirstTokenAt.HasValue)
                 seq.FirstTokenAt = DateTime.UtcNow;
 
@@ -1072,17 +1233,31 @@ namespace TensorSharp.Runtime.Scheduling
             };
         }
 
-        /// <summary>Owner/live-cache bookkeeping the plain per-seq path does
-        /// after its Forward, mirrored for MTP steps (which may advance more
-        /// than one token).</summary>
-        private void CompleteMtpStepBookkeeping(SequenceState seq, int tokensForwarded)
+        /// <summary>Per-step bookkeeping for MTP steps (which may advance more
+        /// than one token). Linear trunk mirrors the plain per-seq path
+        /// (owner counters + live-cache tracking + the caller's block
+        /// capture); batched trunk mirrors <see cref="ExecuteStepBatched"/>
+        /// (K/V lives in the model's paged storage, blocks get hash-registered
+        /// for prefix sharing).</summary>
+        private void CompleteMtpStepBookkeeping(SequenceState seq, int tokensForwarded, bool batchedTrunk)
         {
+            int prevComputed = seq.NumComputedTokens;
             seq.AdvanceComputedTokens(tokensForwarded);
-            _ownerTokensInModel += tokensForwarded;
-            _ownerForwardedTokens += tokensForwarded;
-            _liveCacheSeq = seq;
-            _liveCacheLen = seq.NumComputedTokens;
-            _liveCacheValid = true;
+            if (batchedTrunk)
+            {
+                _liveCacheValid = false;
+                seq.KvStateInPagedStorage = true;
+                int prevFullBlocks = prevComputed / _blockSize;
+                _scheduler.OnBlocksCommitted(seq, prevFullBlocks * _blockSize);
+            }
+            else
+            {
+                _ownerTokensInModel += tokensForwarded;
+                _ownerForwardedTokens += tokensForwarded;
+                _liveCacheSeq = seq;
+                _liveCacheLen = seq.NumComputedTokens;
+                _liveCacheValid = true;
+            }
         }
 
         /// <summary>
@@ -1543,5 +1718,22 @@ namespace TensorSharp.Runtime.Scheduling
         public int[][] BlockTables { get; init; }
         public int MaxQueryLen { get; set; }
         public int MaxSeqLen { get; set; }
+
+        // ---- NextN/MTP speculative-trunk extensions ----
+
+        /// <summary>When set, these tokens are forwarded instead of reading
+        /// <c>seq.TokenAt(...)</c>. Speculative verify batches forward drafted
+        /// tokens that are not (yet) part of the sequence's token list.</summary>
+        public int[] OverrideFlatTokens { get; init; }
+
+        /// <summary>When non-null, receives the post-final-norm hidden state of
+        /// every row (numTokens × hidden floats) — llama.cpp's h_nextn, consumed
+        /// by the MTP draft head.</summary>
+        public float[] CaptureHiddenAll { get; init; }
+
+        /// <summary>When non-null, receives LM-head logits for every row
+        /// (numTokens × vocab floats) — speculative verification needs per-row
+        /// logits, not just the last position.</summary>
+        public float[] CaptureLogitsAll { get; init; }
     }
 }
