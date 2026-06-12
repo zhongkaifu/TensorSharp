@@ -1345,6 +1345,18 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_ClearOffloadableState();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_SetDeviceCopyBudget(long bytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DeviceMemoryInfo(out long freeBytes, out long totalBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_RegisterPinnedHostBuffer(IntPtr ptr, long bytes);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_UnregisterPinnedHostBuffer(IntPtr ptr);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern UIntPtr TSGgml_RowSize(int ggmlType, long ne);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -2707,6 +2719,46 @@ internal enum GgmlIndexReductionOp
         public static void ClearOffloadableState()
         {
             TSGgml_ClearOffloadableState();
+        }
+
+        /// <summary>
+        /// Byte ceiling for device-local copy residency (discrete-GPU weight
+        /// caching). Once resident copies reach the budget, further cacheable
+        /// binds stream per-graph instead of becoming resident — this is what
+        /// keeps VRAM from oversubscribing (and WDDM from paging) when the
+        /// model is larger than the GPU. Zero disables the cap.
+        /// </summary>
+        public static void SetDeviceCopyBudget(long bytes)
+        {
+            TSGgml_SetDeviceCopyBudget(bytes > 0 ? bytes : 0);
+        }
+
+        /// <summary>
+        /// Free/total memory of the active backend device in bytes (VRAM on
+        /// CUDA). Returns false when the backend has no meaningful device
+        /// memory (e.g. CPU).
+        /// </summary>
+        public static bool TryGetDeviceMemoryInfo(out long freeBytes, out long totalBytes)
+        {
+            freeBytes = 0;
+            totalBytes = 0;
+            return TSGgml_DeviceMemoryInfo(out freeBytes, out totalBytes) != 0;
+        }
+
+        /// <summary>
+        /// Page-lock a host region (cudaHostRegister) so per-step device uploads
+        /// from it take the fast DMA path (~2x pageable throughput). CUDA only;
+        /// returns false (no-op) elsewhere. Callers MUST unregister before the
+        /// memory is unmapped or freed.
+        /// </summary>
+        public static bool TryRegisterPinnedHostBuffer(IntPtr ptr, long bytes)
+        {
+            return TSGgml_RegisterPinnedHostBuffer(ptr, bytes) != 0;
+        }
+
+        public static void UnregisterPinnedHostBuffer(IntPtr ptr)
+        {
+            TSGgml_UnregisterPinnedHostBuffer(ptr);
         }
 
         /// <summary>Bytes for one row along ne[0]; 0 if type/shape invalid.</summary>

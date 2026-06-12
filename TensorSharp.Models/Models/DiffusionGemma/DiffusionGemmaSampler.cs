@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Numerics.Tensors;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -121,9 +122,9 @@ namespace TensorSharp.Models
 
             // Self-conditioning reads the PREVIOUS step's logits. The model reads scBuffer at the START of
             // the forward (before it overwrites/produces the new logits), so we can hand it the previous
-            // step's returned logits array directly instead of copying 268 MB into a side buffer each step
-            // (safe for the fused path — fresh array per step — and the non-fused path, whose reusable
-            // _canvasLogits buffer is only overwritten at the END of the forward, after SC has read it).
+            // step's returned logits array directly instead of copying 268 MB into a side buffer each step.
+            // Both paths return a reusable buffer (fused: _fusedLogitsBuffer, per-op: _canvasLogits) that
+            // is only overwritten at the END of the forward — after SC has read it — so the alias is safe.
             float[] scBuffer = null;
             int[] argmaxCanvas = new int[C];
             int[] prevArgmax = new int[C];
@@ -207,37 +208,42 @@ namespace TensorSharp.Models
                 renoise[pos] = rng.NextInt(vocab);
             }
 
-            // per position: argmax + entropy of softmax(logits*tempInv) + one multinomial sample
-            Parallel.For(0, C, pos =>
-            {
-                long baseOff = (long)pos * vocab;
-                float m = float.NegativeInfinity;
-                int amax = 0;
-                for (int v = 0; v < vocab; v++)
+            // per position: argmax + entropy of softmax(logits*tempInv) + one multinomial sample.
+            // SIMD-vectorized via TensorPrimitives (exp/sum/dot), with per-worker scratch rows:
+            //   s = logits*tempInv;  e = exp(s - max(s));  Z = Σe
+            //   H = -Σ p ln p  with  p = e/Z  and  ln p = (s - m) - ln Z
+            //     = ln Z + m - (Σ e·s)/Z
+            //   sample = first v with cumulative Σe >= u*Z (the same CDF-inverse draw as the scalar
+            //   reference, over the same token ordering).
+            Parallel.For(0, C,
+                () => (scaled: new float[vocab], exps: new float[vocab]),
+                (pos, _, scratch) =>
                 {
-                    float z = logits[baseOff + v] * tempInv;
-                    if (z > m) { m = z; amax = v; }
-                }
-                float Z = 0f;
-                for (int v = 0; v < vocab; v++)
-                    Z += MathF.Exp(logits[baseOff + v] * tempInv - m);
+                    var row = logits.AsSpan(pos * vocab, vocab);
+                    var s = scratch.scaled.AsSpan();
+                    var e = scratch.exps.AsSpan();
+                    TensorPrimitives.Multiply(row, tempInv, s);
+                    int amax = TensorPrimitives.IndexOfMax<float>(s);
+                    float m = s[amax];
+                    TensorPrimitives.Subtract(s, m, e);
+                    TensorPrimitives.Exp(e, e);
+                    float Z = TensorPrimitives.Sum<float>(e);
+                    float sz = TensorPrimitives.Dot<float>(e, s);
+                    entropy[pos] = MathF.Log(Z) + m - sz / Z;
 
-                float target = u[pos] * Z;
-                float cum = 0f, H = 0f;
-                int sampled = vocab - 1;
-                bool picked = false;
-                for (int v = 0; v < vocab; v++)
-                {
-                    float e = MathF.Exp(logits[baseOff + v] * tempInv - m);
-                    float pr = e / Z;
-                    if (pr > 0f) H -= pr * MathF.Log(pr);
-                    cum += e;
-                    if (!picked && cum >= target) { sampled = v; picked = true; }
-                }
-                entropy[pos] = H;
-                argmaxCanvas[pos] = amax;
-                denoiser[pos] = sampled;
-            });
+                    float target = u[pos] * Z;
+                    float cum = 0f;
+                    int sampled = vocab - 1;
+                    for (int v = 0; v < vocab; v++)
+                    {
+                        cum += e[v];
+                        if (cum >= target) { sampled = v; break; }
+                    }
+                    argmaxCanvas[pos] = amax;
+                    denoiser[pos] = sampled;
+                    return scratch;
+                },
+                _ => { });
 
             // accept lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
             for (int i = 0; i < C; i++) order[i] = i;
@@ -300,12 +306,29 @@ namespace TensorSharp.Models
             var prevTempInv = new float[A];
             int Smax = 1;
 
+            // Prompt-KV caching (device-glue backends): prefill each sequence's prefix K/V once, then each
+            // step decodes only its canvas. CPU backends have no prompt-KV store, so each step runs the
+            // unified [prefix|canvas] forward per sequence instead — the same fallback DenoiseBlock uses.
+            bool usePkv = _model.SupportsPromptKvCache;
+            var unifiedTokens = usePkv ? null : new int[A][];   // per-seq [prefix|canvas] buffer
+            var promptLen = usePkv ? null : new int[A];
+
             // per-sequence prefill + block init
             for (int a = 0; a < A; a++)
             {
                 var run = active[a];
                 seqs[a] = run.State;
-                _model.PrefillSeq(run.State, run.Prefix.ToArray());
+                if (usePkv)
+                {
+                    _model.PrefillSeq(run.State, run.Prefix.ToArray());
+                }
+                else
+                {
+                    int P = run.Prefix.Count;
+                    promptLen[a] = P;
+                    unifiedTokens[a] = new int[P + C];
+                    run.Prefix.CopyTo(unifiedTokens[a], 0);
+                }
 
                 int S = Math.Max(1, run.Params.MaxDenoisingSteps);
                 if (S > Smax) Smax = S;
@@ -341,7 +364,7 @@ namespace TensorSharp.Models
                 int L = live.Count;
                 if (L == 0) break;
 
-                if (_useBatchedForward && L > 1)
+                if (_useBatchedForward && usePkv && L > 1)
                 {
                     // EXPERIMENTAL true-batched forward: all live canvases through one per-op forward. A win
                     // only when a single canvas under-utilises the GPU; a loss when compute-bound (this model).
@@ -382,7 +405,8 @@ namespace TensorSharp.Models
                     // DEFAULT: decode each live sequence with the fast FUSED single-canvas kernel, then sample
                     // immediately (the kernel returns the model's shared readback buffer, so its logits must be
                     // consumed before the next sequence's decode overwrites it). Time-slices the GPU across the
-                    // active requests at full fused speed.
+                    // active requests at full fused speed. Without prompt-KV (CPU backends) each sequence runs
+                    // the unified [prefix|canvas] forward instead, which has the same shared-buffer contract.
                     for (int j = 0; j < L; j++)
                     {
                         int a = live[j];
@@ -391,7 +415,16 @@ namespace TensorSharp.Models
                         int curStep = S - stepIdx;                  // mirrors single-seq: curStep counts S..1
                         float tempInv = 1f / (run.Params.TMin + (run.Params.TMax - run.Params.TMin) * ((float)curStep / S));
                         float scUse = stepIdx == 0 ? 0f : 1f;
-                        float[] lg = _model.DecodeCanvasSeq(seqs[a], canvas[a], scBuffer[a], scUse, prevTempInv[a]);
+                        float[] lg;
+                        if (usePkv)
+                        {
+                            lg = _model.DecodeCanvasSeq(seqs[a], canvas[a], scBuffer[a], scUse, prevTempInv[a]);
+                        }
+                        else
+                        {
+                            Array.Copy(canvas[a], 0, unifiedTokens[a], promptLen[a], C);
+                            lg = _model.ForwardCanvas(unifiedTokens[a], promptLen[a], scBuffer[a], scUse, prevTempInv[a]);
+                        }
                         if (scBuffer[a] != null) Array.Copy(lg, scBuffer[a], (long)C * vocab);
                         bool seqFinished = DenoiseStep(lg, tempInv, rng[a], run.Params,
                             canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], entropy, denoiser, order, u, renoise);

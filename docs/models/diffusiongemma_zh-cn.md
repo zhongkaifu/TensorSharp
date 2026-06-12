@@ -111,6 +111,17 @@ Diffusion 专属元数据：
 - GPU 后端的 prompt-KV 缓存。
 - 默认启用 self-conditioning；可用 `DIFFUSION_NO_SC=1` 关闭。
 - GGML 融合 decode layer、融合整模型 decode、融合 lm-head tail。
+- CUDA VRAM 常驻规划：当模型大于 VRAM 时，按优先级把权重预加载到设备
+  （lm_head/embedding、逐层 attention/dense、再到 MoE 专家堆叠），上限为
+  可用 VRAM 减去余量；对 device-copy 缓存设置上限；并把 decode 切换到
+  逐层分段融合路径，使未常驻的部分通过一个有界的复用 staging 缓冲流式
+  上传，而不是超订 VRAM（超订会让 Windows WDDM 在每次提交时换页，实测
+  比流式上传慢约 4 倍）。
+- 与去噪步无关的 decode mask 在 host 端缓存并以 cacheable 方式绑定
+  （每个 block 几何只上传一次，而不是每层每步重建并上传）。
+- SIMD 向量化 host 路径（`TensorPrimitives`）：每位置
+  argmax/熵/多项式采样以及 final-logit softcap；融合 lm-head 的 logits
+  写入一个池化的 pinned 缓冲，而不是每步新分配 268 MB。
 - 针对 DiffusionGemma 多行 canvas 工作负载的 MLX K-quant affine repack。
 - `TensorSharp.Server` 中通过 `DiffusionBatchScheduler` 做 block 边界连续批处理。
 
@@ -127,6 +138,10 @@ Diffusion 专属元数据：
 | `DIFFUSION_NO_FUSED_DECODE=1` | 关闭 GGML 融合整模型 diffusion decode |
 | `DIFFUSION_NO_FUSED_LMHEAD_TAIL=1` | 关闭融合 output-norm + lm-head + softcap tail |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | 临时批处理 lm-head logits 的内存上限，默认 300 MB |
+| `DIFFUSION_VRAM_HEADROOM_MB` | ggml_cuda：预加载权重之外保留的 VRAM 余量，默认 2048 |
+| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | ggml_cuda：模型放不进 VRAM 时 device-copy 缓存上限，默认 768 |
+| `DIFFUSION_SEGMENTED_DECODE` | ggml_cuda：强制开启/关闭逐层融合 decode（`1`/`0`，放不进 VRAM 时自动启用） |
+| `DIFFUSION_PIN_STREAMED=1` | ggml_cuda：把流式权重复制到页锁定内存以 DMA 速度上传（消耗 RAM） |
 | `DIFFUSION_PROFILE=1` / `DIFFUSION_STEPTIME=1` / `DIFFUSION_FUSED_DEBUG=1` | 开发用计时与融合 kernel 调试诊断 |
 
 ## 6. 服务端行为
@@ -137,6 +152,9 @@ Diffusion 专属元数据：
 - 流式输出发送 `replace` 事件而不是 token append，因为每一步都会重新修正整个 canvas。
 - 在 `done` 事件前会先发送最终定稿 replacement。
 - 并发请求共享一个后台 diffusion scheduler，并在 block 之间被接纳。
+- 在没有 prompt-KV 缓存的后端（`cpu`、`ggml_cpu`）上，scheduler 会让每个序列
+  的每一步走统一的 `[prefix|canvas]` 前向，而不是 prefill + canvas decode；
+  行为与输出完全一致。
 
 Ollama 与 OpenAI 兼容适配器仍通过 `ChatStreamWithMetricsAsync` 使用 append-oriented
 响应形状。它们可以返回 DiffusionGemma 的最终文本，但实时去噪预览与 `replace`

@@ -231,6 +231,21 @@ namespace tsg
     extern std::int64_t g_offloadable_resident_bytes;
     extern std::int64_t g_offloadable_budget;
 
+    // --- Device-copy VRAM budget (discrete-GPU backends, e.g. CUDA) ---
+    //
+    // When g_device_copy_budget_bytes > 0, try_get_cacheable_tensor_buffer
+    // refuses to create a NEW device-local copy buffer once the resident
+    // device-copy total would exceed the budget; the caller's bind falls back
+    // to the per-graph upload path (the tensor streams to the GPU each graph
+    // instead of becoming resident). This prevents VRAM oversubscription: on
+    // Windows WDDM an oversubscribed working set is transparently paged
+    // between VRAM and system RAM on every command submission, which measured
+    // far slower than explicit per-step streaming for diffusion decode.
+    // 0 = unlimited (legacy behaviour, correct when everything fits).
+    // Both guarded by g_host_buffer_cache_mutex.
+    extern std::int64_t g_device_copy_resident_bytes;
+    extern std::int64_t g_device_copy_budget_bytes;
+
     // --- Backend constants ---
 
     constexpr int BACKEND_TYPE_METAL = 1;

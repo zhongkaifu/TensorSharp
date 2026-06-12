@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
@@ -176,6 +177,29 @@ namespace TensorSharp.Models
         // separate small graph keeps it correct (unlike folding lm_head into the layer graph).
         private readonly bool _fusedLmHeadTailDisabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_FUSED_LMHEAD_TAIL") == "1";
         private bool _fusedLmHeadTailOk = true;
+        // Segmented (per-layer) fused decode: run each layer as its own fused graph so layers whose
+        // weights are NOT device-resident stream through one bounded, reused staging buffer instead of
+        // all coexisting in VRAM. Selected automatically by PrepareCudaWeightResidency when the model
+        // does not fit; override with DIFFUSION_SEGMENTED_DECODE=1/0.
+        private bool _segmentedDecode;
+        // Reusable host buffer for the fused lm_head logits (268 MB at vocab 256K, C 256). A fresh
+        // array per step costs a large-object-heap allocation + zeroing every step; one pooled buffer
+        // is safe because each step's logits are fully consumed (sampling + self-conditioning read)
+        // before the next step's lm_head overwrites it — the same contract the batched scheduler
+        // already documents for the shared readback buffer. Allocated on the pinned object heap and
+        // cudaHostRegister'ed so the per-step 268 MB device->host logits download takes the fast DMA
+        // path instead of the pageable one.
+        private float[] _fusedLogitsBuffer;
+        // Host regions page-locked for fast per-step DMA (streamed weights + the logits buffer).
+        // cudaHostRegister'ed memory MUST be unregistered before it is unmapped/freed (the streamed
+        // weights live in the GGUF mmap), so Dispose undoes these.
+        private readonly List<IntPtr> _pinnedHostRegions = new();
+        // Streamed (non-resident) weights re-homed into page-locked PRIVATE host copies: Windows
+        // cannot cudaHostRegister file-mapped (GGUF mmap) pages, so the bytes are copied once into
+        // an owned allocation that CAN be page-locked — per-step uploads then run at DMA speed
+        // (~2x pageable mmap throughput). Maps original weight pointer -> pinned copy; the fused
+        // decode arg builder substitutes these. Freed (after unregistering) in Dispose.
+        private readonly Dictionary<IntPtr, IntPtr> _pinnedStreamCopies = new();
         // Batched-decode lm_head memory cap: batch the [B*C, vocab] lm_head into one weight-read while the
         // logits tensor fits under this many bytes, else fall back to a per-sequence lm_head (one [C, vocab]
         // transient — the per-seq weight re-read costs ~1ms, negligible vs the per-step compute). Default 300
@@ -237,6 +261,8 @@ namespace TensorSharp.Models
                 or BackendType.Mlx or BackendType.Cuda;
             // Prompt-KV caching needs the device-resident attention path (it stores/concats K/V tensors).
             _pkvEnabled = _useDeviceGlue && Environment.GetEnvironmentVariable("DIFFUSION_NO_PKV") != "1";
+
+            PrepareCudaWeightResidency();
 
             // Self-conditioning (matches the reference sampler) materially improves quality on longer
             // outputs and converges in far fewer steps. The top-K soft-embedding makes its per-step cost
@@ -332,6 +358,142 @@ namespace TensorSharp.Models
             }
             _fusedMoeAvailable = IsGgmlBackend && ok == L;
             Console.WriteLine($"  Fused MoE FFN kernel available on {ok}/{L} layers (enabled={_fusedMoeAvailable}).");
+        }
+
+        /// <summary>
+        /// CUDA VRAM residency plan. The fused decode reads EVERY weight every denoising step, and
+        /// ggml's allocator model means a monolithic whole-model graph needs all of them device-resident
+        /// at once — when the model is larger than VRAM, Windows WDDM transparently pages the
+        /// oversubscribed working set in and out of system RAM on every command submission (measured
+        /// ~4.9 s/step for a ~150 ms compute on a 16 GB GPU with a 16 GB model). The fix mirrors
+        /// llama.cpp's partial-offload discipline: never oversubscribe. We preload weights device-side
+        /// in priority order (lm_head/embedding first — it is also read by every step's lm_head tail —
+        /// then per-layer attention/dense weights, then MoE expert stacks by layer) until a budget of
+        /// free-VRAM-minus-headroom is reached, cap incidental device copies (prompt K/V, masks) with
+        /// the device-copy budget, and switch the decode to the SEGMENTED per-layer fused path so the
+        /// non-resident remainder streams through one bounded reused staging buffer (PCIe-speed
+        /// streaming, ~no paging) instead of joining the whole-model graph's working set.
+        /// No-op when everything fits (the whole-model fused graph stays the default) or off-CUDA.
+        /// </summary>
+        private void PrepareCudaWeightResidency()
+        {
+            if (_backend != BackendType.GgmlCuda)
+                return;
+            EnsureQuantBackendAvailable();   // memory query / preloads must hit the CUDA backend
+            if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out _))
+                return;
+
+            long headroomMb = long.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_VRAM_HEADROOM_MB"), out long hm) && hm > 0 ? hm : 2048;
+            long copyBudgetMb = long.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_DEVICE_COPY_BUDGET_MB"), out long cm) && cm > 0 ? cm : 768;
+            // Opt-in: re-home streamed weights into page-locked private copies (costs RAM equal to
+            // the streamed bytes). Measured neutral on Windows/WDDM (the pageable mmap upload already
+            // ran near DMA speed once the file cache was warm), so default off; may pay off on Linux.
+            bool pinStreamed = Environment.GetEnvironmentVariable("DIFFUSION_PIN_STREAMED") == "1";
+            long preloadBudget = freeBytes - headroomMb * 1024 * 1024;
+
+            // Priority order: tied lm_head/embedding (read by the per-step lm_head tail), per-layer
+            // non-expert weights (attention + dense MLP), then the per-layer expert stacks — the bulk
+            // of the model; whatever does not fit streams per step.
+            var priority = new List<(IntPtr key, IntPtr host, int type, long ne0, long ne1, long bytes)>();
+            void AddQuant(string name)
+            {
+                if (_quantWeights.TryGetValue(name, out var qw) && qw.HasHostData)
+                    priority.Add((qw.CacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes));
+            }
+            AddQuant("token_embd.weight");
+            int L = Config.NumLayers;
+            for (int l = 0; l < L; l++)
+            {
+                AddQuant($"blk.{l}.attn_q.weight");
+                AddQuant($"blk.{l}.attn_k.weight");
+                AddQuant($"blk.{l}.attn_v.weight");
+                AddQuant($"blk.{l}.attn_output.weight");
+                AddQuant($"blk.{l}.ffn_gate.weight");
+                AddQuant($"blk.{l}.ffn_up.weight");
+                AddQuant($"blk.{l}.ffn_down.weight");
+            }
+            for (int l = 0; l < L; l++)
+            {
+                var gu = _stackedGateUp[l];
+                var dn = _stackedDown[l];
+                if (gu != null) priority.Add((gu.Data, gu.Data, gu.GgmlType, gu.PerExpertNe0, gu.PerExpertNe1 * _numExperts, gu.TotalRawBytes));
+                if (dn != null) priority.Add((dn.Data, dn.Data, dn.GgmlType, dn.PerExpertNe0, dn.PerExpertNe1 * _numExperts, dn.TotalRawBytes));
+            }
+
+            long preloadedBytes = 0;
+            int preloadedCount = 0;
+            long streamedBytes = 0;
+            int streamedCount = 0;
+            long pinnedBytes = 0;
+            foreach (var w in priority)
+            {
+                if (preloadedBytes + w.bytes <= preloadBudget)
+                {
+                    try
+                    {
+                        GgmlBasicOps.PreloadQuantizedWeight(w.key, w.host, w.type, w.ne0, w.ne1, w.bytes);
+                        preloadedBytes += w.bytes;
+                        preloadedCount++;
+                        continue;
+                    }
+                    catch (Exception)
+                    {
+                        // Device allocation failed despite the budget (fragmentation); treat the rest
+                        // as streamed.
+                    }
+                }
+                streamedBytes += w.bytes;
+                streamedCount++;
+                // Re-home the streamed weight into a page-locked private copy so its per-step PCIe
+                // upload uses the fast DMA path (~2x pageable mmap throughput; the mmap itself cannot
+                // be page-locked on Windows). Costs RAM equal to the streamed bytes, so opt out with
+                // DIFFUSION_PIN_STREAMED=0. Unregistered + freed in Dispose.
+                if (pinStreamed)
+                {
+                    IntPtr copy = IntPtr.Zero;
+                    try
+                    {
+                        copy = GgmlBasicOps.AlignedAlloc(w.bytes);
+                        if (copy != IntPtr.Zero)
+                        {
+                            unsafe { Buffer.MemoryCopy((void*)w.host, (void*)copy, w.bytes, w.bytes); }
+                            if (GgmlBasicOps.TryRegisterPinnedHostBuffer(copy, w.bytes))
+                            {
+                                _pinnedHostRegions.Add(copy);
+                                _pinnedStreamCopies[w.key] = copy;
+                                pinnedBytes += w.bytes;
+                            }
+                            else
+                            {
+                                GgmlBasicOps.AlignedFree(copy);
+                            }
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        if (copy != IntPtr.Zero && !_pinnedHostRegions.Contains(copy))
+                            GgmlBasicOps.AlignedFree(copy);
+                    }
+                }
+            }
+
+            bool everythingFits = streamedCount == 0;
+            string segEnv = Environment.GetEnvironmentVariable("DIFFUSION_SEGMENTED_DECODE");
+            _segmentedDecode = segEnv == "1" || (segEnv != "0" && !everythingFits);
+            if (!everythingFits)
+            {
+                // Cap incidental device copies (prompt K/V, decode masks, activations bound by per-op
+                // kernels) so they cannot push VRAM past physical either. When everything fits there is
+                // no oversubscription risk, so the legacy unlimited behaviour is kept.
+                GgmlBasicOps.SetDeviceCopyBudget(copyBudgetMb * 1024 * 1024);
+            }
+            Console.WriteLine(
+                $"  CUDA weight residency: preloaded {preloadedBytes / 1024 / 1024} MB / {preloadedCount} tensors " +
+                $"(free VRAM {freeBytes / 1024 / 1024} MB, headroom {headroomMb} MB); " +
+                (everythingFits
+                    ? "model fully resident."
+                    : $"streaming {streamedBytes / 1024 / 1024} MB / {streamedCount} tensors per step " +
+                      $"({pinnedBytes / 1024 / 1024} MB page-locked); segmented decode={(_segmentedDecode ? "on" : "off")}, device-copy budget {copyBudgetMb} MB."));
         }
 
         private void PrecomputeRoPE()
@@ -919,11 +1081,16 @@ namespace TensorSharp.Models
             // Fast path: all transformer layers (attention + dense + MoE) in one fused GGML graph with the
             // canvas hidden staying on-device across all layers (the throughput win). C# does the lm_head tail.
             bool fusedLayers = false;
+            long tLayers0 = Stopwatch.GetTimestamp();
             if (IsGgmlBackend && _fusedDecodeEnabled && _fusedDecodeOk)
             {
-                if (TryFusedModelLayers(hidden, C, P, pk, pv)) fusedLayers = true;
+                bool ok = _segmentedDecode
+                    ? TryFusedModelLayersSegmented(hidden, C, P, pk, pv)
+                    : TryFusedModelLayers(hidden, C, P, pk, pv);
+                if (ok) fusedLayers = true;
                 else _fusedDecodeOk = false;
             }
+            long tLayers1 = Stopwatch.GetTimestamp();
 
             for (int l = 0; !fusedLayers && l < Config.NumLayers; l++)
             {
@@ -966,7 +1133,12 @@ namespace TensorSharp.Models
                 {
                     hidden.Dispose();
                     _swForward.Stop();
-                    if (_stepTime) { long now = Stopwatch.GetTimestamp(); Console.Error.WriteLine($"[decode] {(now - _stepT0) * 1000.0 / Stopwatch.Frequency:F1} ms"); }
+                    if (_stepTime)
+                    {
+                        long now = Stopwatch.GetTimestamp();
+                        double f = 1000.0 / Stopwatch.Frequency;
+                        Console.Error.WriteLine($"[decode] {(now - _stepT0) * f:F1} ms (layers={(tLayers1 - tLayers0) * f:F1} lmhead={(now - tLayers1) * f:F1})");
+                    }
                     return flLogits;
                 }
                 _fusedLmHeadTailOk = false;
@@ -1297,6 +1469,11 @@ namespace TensorSharp.Models
 
         private unsafe IntPtr WPtr(string name) => (IntPtr)GetFloatPtr(_weights[name]);
 
+        /// <summary>Swap a streamed weight's pointer for its page-locked private copy when one exists
+        /// (see <see cref="PrepareCudaWeightResidency"/>); identity for resident weights.</summary>
+        private IntPtr PinnedOr(IntPtr weightPtr)
+            => _pinnedStreamCopies.TryGetValue(weightPtr, out var pinned) ? pinned : weightPtr;
+
         /// <summary>Run a whole diffusion decode layer (attention over cached prompt K/V + canvas, dense MLP,
         /// 128-expert MoE) as a single fused GGML graph dispatch. Updates <paramref name="hidden"/> in place.
         /// Returns false (caller uses the per-op path) if any weight is missing or the backend rejects the
@@ -1334,21 +1511,21 @@ namespace TensorSharp.Models
                 {
                     Hidden = IntPtr.Zero,   // per-layer path sets this; ignored by model-wide
                     AttnNormW = WPtr($"{prefix}.attn_norm.weight"),
-                    QW = qw.CacheKey, KW = kw.CacheKey, VW = vwPtr,
+                    QW = PinnedOr(qw.CacheKey), KW = PinnedOr(kw.CacheKey), VW = PinnedOr(vwPtr),
                     QNormW = WPtr($"{prefix}.attn_q_norm.weight"),
                     KNormW = WPtr($"{prefix}.attn_k_norm.weight"),
-                    OW = ow.CacheKey,
+                    OW = PinnedOr(ow.CacheKey),
                     PostAttnNormW = WPtr($"{prefix}.post_attention_norm.weight"),
                     PromptK = (IntPtr)GetFloatPtr(pk[layer]),
                     PromptV = (IntPtr)GetFloatPtr(pv[layer]),
                     FreqFactors = (!local && _ropeFreqsRawTensor != null) ? (IntPtr)GetFloatPtr(_ropeFreqsRawTensor) : IntPtr.Zero,
                     FfnNormW = WPtr($"{prefix}.ffn_norm.weight"),
-                    GateW = gatew.CacheKey, UpW = upw.CacheKey, DownW = downw.CacheKey,
+                    GateW = PinnedOr(gatew.CacheKey), UpW = PinnedOr(upw.CacheKey), DownW = PinnedOr(downw.CacheKey),
                     PostFfwNorm1W = WPtr($"{prefix}.post_ffw_norm_1.weight"),
                     GateInpW = (IntPtr)GetFloatPtr(gateInpW),
                     GateInpScale = gateInpScale != null ? (IntPtr)GetFloatPtr(gateInpScale) : IntPtr.Zero,
                     PreFfwNorm2W = WPtr($"{prefix}.pre_ffw_norm_2.weight"),
-                    GateUpExps = gateUp.Data, DownExps = down.Data,
+                    GateUpExps = PinnedOr(gateUp.Data), DownExps = PinnedOr(down.Data),
                     DownExpsScale = downExpsScale != null ? (IntPtr)GetFloatPtr(downExpsScale) : IntPtr.Zero,
                     PostFfwNorm2W = WPtr($"{prefix}.post_ffw_norm_2.weight"),
                     PostFfwNormW = WPtr($"{prefix}.post_ffw_norm.weight"),
@@ -1403,7 +1580,14 @@ namespace TensorSharp.Models
                 if (!_quantWeights.TryGetValue("token_embd.weight", out var lmHead)) return null;
                 if (!_weights.ContainsKey("output_norm.weight")) return null;
                 int vocab = Config.VocabSize;
-                var logits = new float[(long)C * vocab];
+                long total = (long)C * vocab;
+                // Pooled buffer: each step's logits are fully consumed (sampling + self-conditioning)
+                // before the next step's lm_head overwrites it, so one reusable buffer replaces a
+                // 268 MB LOH allocation per step. (Not cudaHostRegister'ed: ggml registers read-only,
+                // which is for upload sources, and the device WRITES this buffer.)
+                if (_fusedLogitsBuffer == null || _fusedLogitsBuffer.LongLength != total)
+                    _fusedLogitsBuffer = GC.AllocateArray<float>(checked((int)total), pinned: true);
+                float[] logits = _fusedLogitsBuffer;
                 // The kernel outputs RAW logits (no softcap): the in-graph softcap on the 268 MB logits
                 // tensor produces wrong results on Metal (both in-place and fresh-tensor variants), while
                 // host softcap is correct. Apply the final-logit softcap on the host below.
@@ -1412,7 +1596,7 @@ namespace TensorSharp.Models
                     bool ok = GgmlBasicOps.TryDiffusionLmHead(
                         (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, C,
                         WPtr("output_norm.weight"),
-                        lmHead.CacheKey, lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
+                        PinnedOr(lmHead.CacheKey), lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
                         (IntPtr)logitsPtr, vocab, Config.Eps, 0f);
                     if (!ok) return null;
                 }
@@ -1421,8 +1605,10 @@ namespace TensorSharp.Models
                     float sc = _finalLogitSoftcap, inv = 1f / sc;
                     System.Threading.Tasks.Parallel.For(0, C, c =>
                     {
-                        long b = (long)c * vocab;
-                        for (int v = 0; v < vocab; v++) logits[b + v] = MathF.Tanh(logits[b + v] * inv) * sc;
+                        var row = logits.AsSpan(c * vocab, vocab);
+                        TensorPrimitives.Multiply(row, inv, row);
+                        TensorPrimitives.Tanh(row, row);
+                        TensorPrimitives.Multiply(row, sc, row);
                     });
                 }
                 return logits;
@@ -1458,6 +1644,38 @@ namespace TensorSharp.Models
             {
                 return false;
             }
+        }
+
+        /// <summary>Segmented fused decode: one fused graph dispatch PER LAYER instead of one
+        /// whole-model graph. Numerically identical (the per-layer kernel computes the same layer
+        /// math), but each layer's non-resident weights stream through one bounded, reused staging
+        /// buffer (alloc_ctx_tensors_reuse) rather than the whole model's spill coexisting in VRAM —
+        /// the mode <see cref="PrepareCudaWeightResidency"/> selects when the model is larger than
+        /// VRAM. Costs a small per-layer hidden host round-trip ([H, C] ≈ a few MB).
+        /// Returns false only on layer-0 rejection (clean fallback to the per-op path); a mid-model
+        /// failure cannot fall back (hidden is partially transformed) and throws instead.</summary>
+        private unsafe bool TryFusedModelLayersSegmented(Tensor hidden, int C, int P, Tensor[] pk, Tensor[] pv)
+        {
+            int L = Config.NumLayers;
+            var args = new DiffusionDecodeLayerArgs[L];
+            for (int l = 0; l < L; l++)
+            {
+                if (!TryBuildLayerArgs(l, $"blk.{l}", C, P, _isLocal[l], _headDim[l], _kvHeads[l], pk, pv, out args[l]))
+                    return false;
+            }
+            IntPtr hiddenPtr = (IntPtr)GetFloatPtr(hidden);
+            for (int l = 0; l < L; l++)
+            {
+                args[l].Hidden = hiddenPtr;
+                if (!GgmlBasicOps.TryDiffusionDecodeLayer(in args[l]))
+                {
+                    if (l == 0) return false;   // hidden untouched -> caller can fall back cleanly
+                    throw new InvalidOperationException(
+                        $"Segmented diffusion decode failed at layer {l} after earlier layers ran; cannot fall back mid-model.");
+                }
+            }
+            InvalidateTensorDeviceCache(hidden);
+            return true;
         }
 
         private void AllocPromptStore()
@@ -2246,6 +2464,12 @@ namespace TensorSharp.Models
             // copies are freed rather than orphaned.
             if (_promptK != null) for (int l = 0; l < _promptK.Length; l++) ReleasePromptKvTensor(ref _promptK[l]);
             if (_promptV != null) for (int l = 0; l < _promptV.Length; l++) ReleasePromptKvTensor(ref _promptV[l]);
+            // Unregister page-locked regions, then free the private streamed-weight copies (the
+            // logits buffer in _pinnedHostRegions is GC-owned and must NOT be freed here).
+            foreach (var region in _pinnedHostRegions) GgmlBasicOps.UnregisterPinnedHostBuffer(region);
+            _pinnedHostRegions.Clear();
+            foreach (var copy in _pinnedStreamCopies.Values) GgmlBasicOps.AlignedFree(copy);
+            _pinnedStreamCopies.Clear();
             base.Dispose();
         }
     }

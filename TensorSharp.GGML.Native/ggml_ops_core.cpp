@@ -14,6 +14,10 @@
 #include <unistd.h>
 #endif
 
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
+
 #include <cstdio>
 
 // ============================================================================
@@ -109,6 +113,10 @@ namespace tsg
     std::unordered_map<void*, std::list<void*>::iterator> g_offloadable_lru_map;
     std::int64_t g_offloadable_resident_bytes = 0;
     std::int64_t g_offloadable_budget = 0;
+
+    // Device-copy VRAM budget — see ggml_ops_internal.h for the contract.
+    std::int64_t g_device_copy_resident_bytes = 0;
+    std::int64_t g_device_copy_budget_bytes = 0;
 
     // Async dispatch state. The defaults keep the legacy (eager-sync) behaviour;
     // C# enables async at backend init time via TSGgml_SetAsyncCompute(1).
@@ -637,6 +645,17 @@ namespace tsg
 #endif
     }
 
+    // --- Device-copy budget accounting (caller holds g_host_buffer_cache_mutex) ---
+
+    static void device_copy_account_remove_locked(const CachedHostBuffer& entry)
+    {
+        if (entry.mode != CachedBufferMode::DeviceCopy)
+            return;
+        const std::int64_t sz = static_cast<std::int64_t>(entry.buffer_size);
+        g_device_copy_resident_bytes = g_device_copy_resident_bytes >= sz
+            ? g_device_copy_resident_bytes - sz : 0;
+    }
+
     // --- Offloadable LRU helpers (caller holds g_host_buffer_cache_mutex) ---
 
     void offloadable_lru_remove_locked(void* key)
@@ -681,6 +700,7 @@ namespace tsg
         if (cit == g_host_buffer_cache.end())
             return 0;
         std::size_t freed = cit->second.bytes;
+        device_copy_account_remove_locked(cit->second);
         ggml_backend_buffer_free(cit->second.buffer);
         g_host_buffer_cache.erase(cit);
         advise_pages_dont_need(key, freed);
@@ -731,6 +751,7 @@ namespace tsg
                 else
                     g_offloadable_resident_bytes = 0;
             }
+            device_copy_account_remove_locked(it->second);
             ggml_backend_buffer_free(it->second.buffer);
             g_host_buffer_cache.erase(it);
         }
@@ -861,6 +882,7 @@ namespace tsg
                     out_addr = use_device_copy ? ggml_backend_buffer_get_base(out_buffer) : data;
                     return true;
                 }
+                device_copy_account_remove_locked(it->second);
                 ggml_backend_buffer_free(it->second.buffer);
                 g_host_buffer_cache.erase(it);
             }
@@ -872,6 +894,20 @@ namespace tsg
             if (buft == nullptr)
                 return false;
             const std::size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+
+            // Device-copy budget: refuse to create a NEW resident copy past the
+            // budget so VRAM is never oversubscribed (the caller streams the
+            // tensor through the per-graph upload path instead). Existing cache
+            // hits returned above are unaffected.
+            {
+                std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+                if (g_device_copy_budget_bytes > 0 &&
+                    g_device_copy_resident_bytes + static_cast<std::int64_t>(alloc_size) > g_device_copy_budget_bytes)
+                {
+                    return false;
+                }
+            }
+
             out_buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
             if (out_buffer == nullptr)
                 return false;
@@ -885,6 +921,7 @@ namespace tsg
                 ggml_backend_buffer_get_size(out_buffer),
                 CachedBufferMode::DeviceCopy
             };
+            g_device_copy_resident_bytes += static_cast<std::int64_t>(ggml_backend_buffer_get_size(out_buffer));
             return true;
         }
 
@@ -1542,6 +1579,10 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         g_offloadable_lru.clear();
         g_offloadable_lru_map.clear();
         g_offloadable_resident_bytes = 0;
+        g_device_copy_resident_bytes = 0;
+        // The budget belongs to the model whose load configured it (model
+        // unload clears this cache); don't let it leak onto the next model.
+        g_device_copy_budget_bytes = 0;
     }
 }
 
@@ -1578,6 +1619,8 @@ TSG_EXPORT void TSGgml_Shutdown()
         g_offloadable_lru_map.clear();
         g_offloadable_resident_bytes = 0;
         g_offloadable_budget = 0;
+        g_device_copy_resident_bytes = 0;
+        g_device_copy_budget_bytes = 0;
     }
 
     // Release the reusable per-graph compute buffer before the backend it was
@@ -1628,6 +1671,76 @@ TSG_EXPORT void TSGgml_ClearOffloadableState()
     g_offloadable_lru_map.clear();
     g_offloadable_resident_bytes = 0;
     g_offloadable_budget = 0;
+}
+
+// Page-lock (cudaHostRegister) a host memory region so device uploads from it
+// use the fast DMA path (~2x pageable copy throughput). Used for weight regions
+// that stream to the GPU every step because they did not fit the residency
+// budget. CUDA-only; returns 0 (no-op) on other backends or failure. The caller
+// MUST unregister before the memory is unmapped/freed (mmap'd GGUF regions!).
+TSG_EXPORT int TSGgml_RegisterPinnedHostBuffer(void* ptr, int64_t bytes)
+{
+#if defined(GGML_USE_CUDA)
+    if (g_backend_type == BACKEND_TYPE_CUDA && g_backend != nullptr && ptr != nullptr && bytes > 0)
+    {
+        // ggml-cuda gates cudaHostRegister behind this env var (returns false
+        // without it); our callers opt in explicitly, so satisfy the gate here.
+        static const int s_env_once = []() {
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
+#else
+            setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
+#endif
+            return 0;
+        }();
+        (void)s_env_once;
+        // NOTE: ggml registers with cudaHostRegisterReadOnly, so this is for
+        // host->device upload sources (streamed weights) only — do not use it
+        // for buffers the device writes back to.
+        return ggml_backend_cuda_register_host_buffer(ptr, static_cast<std::size_t>(bytes)) ? 1 : 0;
+    }
+#else
+    (void)ptr; (void)bytes;
+#endif
+    return 0;
+}
+
+TSG_EXPORT void TSGgml_UnregisterPinnedHostBuffer(void* ptr)
+{
+#if defined(GGML_USE_CUDA)
+    if (g_backend_type == BACKEND_TYPE_CUDA && g_backend != nullptr && ptr != nullptr)
+        ggml_backend_cuda_unregister_host_buffer(ptr);
+#else
+    (void)ptr;
+#endif
+}
+
+// Set the byte ceiling for device-local copy residency (discrete-GPU weight
+// caching). Zero (or negative) disables the cap. See ggml_ops_internal.h.
+TSG_EXPORT void TSGgml_SetDeviceCopyBudget(int64_t bytes)
+{
+    std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
+    g_device_copy_budget_bytes = bytes > 0 ? bytes : 0;
+}
+
+// Current free/total memory of the active backend's device, in bytes. For the
+// CUDA backend this is physical VRAM; C# uses it to size weight preloading and
+// the device-copy budget so VRAM is never oversubscribed. Returns 0 on failure
+// (e.g. CPU backend), leaving free/total untouched.
+TSG_EXPORT int TSGgml_DeviceMemoryInfo(int64_t* free_bytes, int64_t* total_bytes)
+{
+    if (!ensure_backend() || free_bytes == nullptr || total_bytes == nullptr)
+        return 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr)
+        return 0;
+    std::size_t free_sz = 0, total_sz = 0;
+    ggml_backend_dev_memory(dev, &free_sz, &total_sz);
+    if (total_sz == 0)
+        return 0;
+    *free_bytes = static_cast<int64_t>(free_sz);
+    *total_bytes = static_cast<int64_t>(total_sz);
+    return 1;
 }
 
 TSG_EXPORT void TSGgml_InvalidateHostBuffer(void* ptr)

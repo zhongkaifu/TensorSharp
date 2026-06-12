@@ -45,9 +45,70 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <vector>
 
 using namespace tsg;
+
+namespace {
+
+// Decode-mask host cache. The rectangular decode mask depends only on
+// (C, kvLen, klo, kvPad): identical for every denoising step of a block and
+// shared by every layer of the same type (local/global). Caching the host
+// vector gives a STABLE pointer, so the mask binds as a *cacheable* tensor —
+// uploaded to the device once and reused by all subsequent graphs — instead of
+// being refilled (kvPad*C fp16 per layer) and re-uploaded on every step, which
+// cost ~12 MB of host fill + upload per decode step on a 30-layer model.
+// Geometries change only when P changes (block boundaries), so a tiny LRU is
+// plenty; the device-side cache entry is invalidated before a host vector is
+// discarded so the device copy is reclaimed, not orphaned.
+struct DiffusionMaskEntry
+{
+    std::uint64_t key;
+    std::vector<ggml_fp16_t> data;
+};
+std::mutex g_diffusion_mask_mutex;
+std::deque<DiffusionMaskEntry> g_diffusion_mask_cache;   // front = most recent
+
+ggml_fp16_t* get_decode_mask_cached(int C, int kvLen, int klo, int kvPad)
+{
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(static_cast<std::uint16_t>(C)) << 48) |
+        (static_cast<std::uint64_t>(static_cast<std::uint16_t>(kvLen)) << 32) |
+        (static_cast<std::uint64_t>(static_cast<std::uint16_t>(klo)) << 16) |
+        static_cast<std::uint64_t>(static_cast<std::uint16_t>(kvPad));
+
+    std::lock_guard<std::mutex> lock(g_diffusion_mask_mutex);
+    for (auto it = g_diffusion_mask_cache.begin(); it != g_diffusion_mask_cache.end(); ++it)
+    {
+        if (it->key == key)
+            return it->data.data();
+    }
+
+    DiffusionMaskEntry entry;
+    entry.key = key;
+    entry.data.resize(static_cast<std::size_t>(kvPad) * C);
+    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+    for (int qi = 0; qi < C; qi++)
+    {
+        ggml_fp16_t* row = &entry.data[static_cast<std::size_t>(qi) * kvPad];
+        for (int ki = 0; ki < kvPad; ki++)
+            row[ki] = (ki < klo || ki >= kvLen) ? neg_inf : zero_val;
+    }
+    g_diffusion_mask_cache.push_front(std::move(entry));
+
+    constexpr std::size_t k_max_masks = 8;
+    while (g_diffusion_mask_cache.size() > k_max_masks)
+    {
+        invalidate_cached_buffer(g_diffusion_mask_cache.back().data.data());
+        g_diffusion_mask_cache.pop_back();
+    }
+    return g_diffusion_mask_cache.front().data.data();
+}
+
+} // anonymous namespace
 
 extern "C" {
 
@@ -221,27 +282,32 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
         ggml_tensor* v_fresh = ggml_reshape_3d(ctx,
             ggml_cont(ctx, ggml_permute(ctx, v_3d_pre, 0, 2, 1, 3)), hd, C, kvH);     // [hd, C, kvH]
 
+        // Zero-pad the KV sequence up to a multiple of 256 (the CUDA FATTN_KQ_STRIDE):
+        // the CUDA flash-attn kernels accept the 512-head-dim global layers only via
+        // the GQA-batched path, which requires K->ne[1] % 256 == 0 — an arbitrary P+C
+        // otherwise selects no kernel and aborts at execution. The padded keys are
+        // masked with -inf below so the softmax ignores them (llama.cpp pads its KV
+        // cache to the same stride for flash attention).
+        const int kvPad = (kvLen + 255) / 256 * 256;
+        if (kvPad != kvLen)
+        {
+            k_fresh = ggml_pad(ctx, k_fresh, 0, kvPad - kvLen, 0, 0);   // [hd, C+pad, kvH]
+            v_fresh = ggml_pad(ctx, v_fresh, 0, kvPad - kvLen, 0, 0);
+        }
         ggml_tensor* k_attn = k_fresh;
         ggml_tensor* v_attn = v_fresh;
         if (P > 0)
         {
-            k_attn = ggml_concat(ctx, prompt_k_t, k_fresh, 1);   // [hd, P+C, kvH]
+            k_attn = ggml_concat(ctx, prompt_k_t, k_fresh, 1);   // [hd, kvPad, kvH]
             v_attn = ggml_concat(ctx, prompt_v_t, v_fresh, 1);
         }
 
-        // Rectangular decode mask: every canvas query sees keys [klo, kvLen).
-        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, C, 1, 1);
-        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * C);
-        {
-            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
-            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
-            for (int qi = 0; qi < C; qi++)
-            {
-                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(qi) * kvLen];
-                for (int ki = 0; ki < kvLen; ki++)
-                    row[ki] = (ki < klo) ? neg_inf : zero_val;
-            }
-        }
+        // Rectangular decode mask: every canvas query sees keys [klo, kvLen);
+        // the KV-pad columns [kvLen, kvPad) are masked out. The host data comes
+        // from the step-invariant mask cache (stable pointer), so the bind below
+        // is cacheable: one device upload per block geometry, not one per call.
+        ggml_tensor* mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvPad, C, 1, 1);
+        ggml_fp16_t* mask_data = get_decode_mask_cached(C, kvLen, klo, kvPad);
 
         ggml_tensor* flash = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, mask_t, 1.0f, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
@@ -392,7 +458,7 @@ TSG_EXPORT int TSGgml_DiffusionDecodeLayer(const TSGgmlDiffusionDecodeLayerDesc*
             bind_or_mark(prompt_k_t, d->prompt_k, pk_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             bind_or_mark(prompt_v_t, d->prompt_v, pk_bytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }
-        bind_or_mark(mask_t, mask_data.data(), mask_data.size() * sizeof(ggml_fp16_t), false);
+        bind_or_mark(mask_t, mask_data, static_cast<std::size_t>(kvPad) * C * sizeof(ggml_fp16_t), true);
 
         // Reuse a persistent compute buffer across the per-layer calls (as Gemma4MoELayerDecode
         // does) so we don't pay a fresh backend allocation for every layer of every step.
@@ -479,6 +545,9 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
         const int C = canvas_len;
         const int P = prompt_len;
         const int kvLen = P + C;
+        // KV padded to the CUDA FATTN_KQ_STRIDE so the 512-head-dim global layers keep
+        // the flash-attn fast path (see the comment in TSGgml_DiffusionDecodeLayer).
+        const int kvPad = (kvLen + 255) / 256 * 256;
         const float eps = layers[0].eps;
 
         const std::size_t ctx_size = 32 * 1024 * 1024;
@@ -508,7 +577,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             ggml_tensor *prompt_k_t, *prompt_v_t, *ffn_norm_w, *gate_w, *up_w, *down_w, *post_ffw_norm_1_w;
             ggml_tensor *gate_inp_w, *gate_inp_scale_t, *pre_ffw_norm_2_w, *gate_up_exps_t, *down_exps_t;
             ggml_tensor *down_exps_scale_t, *post_ffw_norm_2_w, *post_ffw_norm_w, *mask_t;
-            std::vector<ggml_fp16_t> mask_data;
+            ggml_fp16_t* mask_data;   // step-invariant cached mask (stable pointer, cacheable bind)
         };
         std::vector<LT> lt(num_layers);
 
@@ -568,20 +637,22 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
             ggml_tensor* q_attn = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
             ggml_tensor* k_fresh = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)), hd, C, kvH);
             ggml_tensor* v_fresh = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v_normed, hd, kvH, C, 1), 0, 2, 1, 3)), hd, C, kvH);
+            if (kvPad != kvLen)
+            {
+                k_fresh = ggml_pad(ctx, k_fresh, 0, kvPad - kvLen, 0, 0);   // [hd, C+pad, kvH], zero-filled
+                v_fresh = ggml_pad(ctx, v_fresh, 0, kvPad - kvLen, 0, 0);
+            }
             ggml_tensor* k_attn = k_fresh, *v_attn = v_fresh;
             if (P > 0) { k_attn = ggml_concat(ctx, t.prompt_k_t, k_fresh, 1); v_attn = ggml_concat(ctx, t.prompt_v_t, v_fresh, 1); }
 
-            t.mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, C, 1, 1);
-            t.mask_data.resize(static_cast<std::size_t>(kvLen) * C);
-            {
-                const ggml_fp16_t ni = ggml_fp32_to_fp16(-INFINITY), zv = ggml_fp32_to_fp16(0.0f);
-                for (int qi = 0; qi < C; qi++)
-                    for (int ki = 0; ki < kvLen; ki++)
-                        t.mask_data[static_cast<std::size_t>(qi) * kvLen + ki] = (ki < klo) ? ni : zv;
-            }
+            t.mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvPad, C, 1, 1);
+            t.mask_data = get_decode_mask_cached(C, kvLen, klo, kvPad);
             ggml_tensor* flash = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, t.mask_t, 1.0f, 0.0f, 0.0f);
             ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
-            if (l == 0 && !backend_supports_op(flash))
+            // Check every layer, not just layer 0: the local (head_dim 256) and global
+            // (head_dim 512) layers have different flash-attn support envelopes, and an
+            // unsupported op aborts the process inside the CUDA backend at execution.
+            if (!backend_supports_op(flash))
             {
                 set_last_error("Diffusion model decode: flash_attn unsupported for this head_dim/backend.");
                 return 0;
@@ -717,7 +788,7 @@ TSG_EXPORT int TSGgml_DiffusionModelDecode(
                 bind_or_mark(t.prompt_k_t, d.prompt_k, pk, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 bind_or_mark(t.prompt_v_t, d.prompt_v, pk, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             }
-            bind_or_mark(t.mask_t, t.mask_data.data(), t.mask_data.size() * sizeof(ggml_fp16_t), false);
+            bind_or_mark(t.mask_t, t.mask_data, static_cast<std::size_t>(kvPad) * C * sizeof(ggml_fp16_t), true);
         }
         if (freq_factors_t != nullptr) bind_or_mark(freq_factors_t, freq_data, (std::size_t)freq_len * sizeof(float), true);
         if (do_lm_head)

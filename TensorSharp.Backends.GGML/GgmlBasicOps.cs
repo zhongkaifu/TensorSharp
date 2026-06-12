@@ -1099,6 +1099,12 @@ namespace TensorSharp.GGML
         public static void RegisterOffloadable(IntPtr key) => GgmlNative.RegisterOffloadable(key);
         public static void SetOffloadableBudget(long bytes) => GgmlNative.SetOffloadableBudget(bytes);
         public static void ClearOffloadableState() => GgmlNative.ClearOffloadableState();
+        public static void SetDeviceCopyBudget(long bytes) => GgmlNative.SetDeviceCopyBudget(bytes);
+        public static bool TryGetDeviceMemoryInfo(out long freeBytes, out long totalBytes)
+            => GgmlNative.TryGetDeviceMemoryInfo(out freeBytes, out totalBytes);
+        public static bool TryRegisterPinnedHostBuffer(IntPtr ptr, long bytes)
+            => GgmlNative.TryRegisterPinnedHostBuffer(ptr, bytes);
+        public static void UnregisterPinnedHostBuffer(IntPtr ptr) => GgmlNative.UnregisterPinnedHostBuffer(ptr);
 
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);

@@ -118,6 +118,19 @@ Current optimized paths include:
 - Prompt-KV cache for GPU backends.
 - Self-conditioning enabled by default; disable with `DIFFUSION_NO_SC=1`.
 - GGML fused decode layer, fused whole-model decode, and fused lm-head tail.
+- CUDA VRAM residency planning: when the model is larger than VRAM, weights are
+  preloaded device-side in priority order (lm_head/embedding, per-layer
+  attention/dense, then MoE expert stacks) up to free-VRAM-minus-headroom, the
+  device-copy cache is capped, and decode switches to the SEGMENTED per-layer
+  fused path so the non-resident remainder streams through one bounded staging
+  buffer instead of oversubscribing VRAM (which makes Windows WDDM page the
+  working set every submission — measured ~4x slower than streaming).
+- Step-invariant decode masks are cached host-side and bound cacheable (one
+  device upload per block geometry instead of a rebuild+upload per layer/step).
+- SIMD-vectorized host paths (`TensorPrimitives`): per-position
+  argmax/entropy/multinomial sampling and the final-logit softcap; the fused
+  lm-head logits land in one pooled pinned buffer instead of a fresh 268 MB
+  allocation per step.
 - MLX K-quant affine repacking for DiffusionGemma's multi-row canvas workload.
 - Block-boundary continuous batching in `TensorSharp.Server` through
   `DiffusionBatchScheduler`.
@@ -135,6 +148,10 @@ Important toggles:
 | `DIFFUSION_NO_FUSED_DECODE=1` | Disable GGML fused whole-model diffusion decode |
 | `DIFFUSION_NO_FUSED_LMHEAD_TAIL=1` | Disable fused output-norm + lm-head + softcap tail |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Cap transient batched lm-head logits memory, default 300 MB |
+| `DIFFUSION_VRAM_HEADROOM_MB` | ggml_cuda: VRAM kept free of preloaded weights, default 2048 |
+| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | ggml_cuda: device-copy cache cap when the model spills VRAM, default 768 |
+| `DIFFUSION_SEGMENTED_DECODE` | ggml_cuda: force per-layer fused decode `1`/`0` (auto when the model spills VRAM) |
+| `DIFFUSION_PIN_STREAMED=1` | ggml_cuda: page-locked copies of streamed weights for DMA uploads (costs RAM) |
 | `DIFFUSION_PROFILE=1` / `DIFFUSION_STEPTIME=1` / `DIFFUSION_FUSED_DEBUG=1` | Development timing and fused-kernel debug diagnostics |
 
 ## 6. Server behavior
@@ -147,6 +164,9 @@ When the Web UI hosts a DiffusionGemma GGUF:
 - A final replacement is emitted before the `done` event.
 - Concurrent requests share one background diffusion scheduler and are admitted
   between blocks.
+- On backends without prompt-KV caching (`cpu`, `ggml_cpu`) the scheduler runs
+  each sequence's step through the unified `[prefix|canvas]` forward instead of
+  prefill + canvas decode; behavior and output are identical.
 
 The Ollama and OpenAI compatibility adapters still use append-oriented response
 shapes through `ChatStreamWithMetricsAsync`. They can surface the final
