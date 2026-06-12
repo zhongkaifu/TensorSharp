@@ -59,6 +59,28 @@ namespace TensorSharp.Runtime.Scheduling
         // Re-used scratch buffer for inject/extract. Sized to one full block.
         private byte[] _scratch;
 
+        // ---- NextN/MTP speculative decoding (see MtpSpeculativeExecution) ----
+        // At most one sequence at a time runs speculatively: the draft head's
+        // KV cache and pending hidden state live in the model's single live
+        // (linear) cache, so continuity is (sequence identity, exact trunk
+        // position). Any KV rebuild/swap — ownership change, batched/fused
+        // step, preemption — invalidates the context; it re-arms only at a
+        // fresh full prefill from position 0.
+        private MtpSeqContext _mtpCtx;
+
+        private sealed class MtpSeqContext
+        {
+            public SequenceState Seq;
+            public MtpSpeculativeExecution Exec;
+            // Trunk position the next forward for Seq must start at; must equal
+            // seq.NumComputedTokens (and the model's CacheSeqLen) to stay armed.
+            public int NextPosition;
+            // The token DRAWN from the last verify's mismatch/bonus row. It IS
+            // the sequence's next output token (re-sampling from LastLogits
+            // would bias toward the drafts); -1 when no draw is pending.
+            public int PendingNextToken = -1;
+        }
+
         public BatchExecutor(
             IModelArchitecture model,
             BlockPool pool,
@@ -141,6 +163,15 @@ namespace TensorSharp.Runtime.Scheduling
                 var (multimodalWork, textWork) = batchedModalSafe
                     ? (new List<ScheduledSequenceWork>(), new List<ScheduledSequenceWork>(output.ScheduledWork))
                     : SplitMultimodalWork(output);
+
+                // NextN/MTP speculative decoding: solo text sequences on a
+                // draft-head model are served on the per-sequence linear-cache
+                // path, where the draft/verify machinery lives. This MUST run
+                // before the fused/batched dispatch below or speculation never
+                // engages (e.g. Qwen3.5's solo traffic otherwise goes through
+                // ForwardBatch).
+                if (ShouldRouteMtpSpeculative(output))
+                    return ExecuteStepPerSequence(output);
 
                 // Per-sequence fused decode: for models that expose a fast fused
                 // single-graph Forward backed by per-request KV caches, serve
@@ -344,6 +375,41 @@ namespace TensorSharp.Runtime.Scheduling
             return false;
         }
 
+        /// <summary>True when this step should be served by the per-sequence
+        /// path so MTP speculative decoding can engage (or keep a sequence
+        /// that already lives in the linear cache on a correct path).
+        /// Speculation itself additionally requires an armed context — a
+        /// routed sequence that can't arm (e.g. prefix-cache reuse skipped the
+        /// full prefill) simply runs plain per-seq decode.</summary>
+        private bool ShouldRouteMtpSpeculative(SchedulerOutput output)
+        {
+            if (!_scheduler.Config.MtpSpeculativeEnabled) return false;
+            if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp) return false;
+            if (output.ScheduledWork.Count != 1) return false;
+
+            var seq = output.ScheduledWork[0].Sequence;
+            // A sequence whose K/V history lives in the model's paged storage
+            // can't run on the per-seq path (Forward would attend against an
+            // empty linear cache); keep it on the batched path.
+            if (seq.KvStateInPagedStorage) return false;
+            // Multimodal prefill needs Forward's embedding-inject hook, which
+            // SpecForward doesn't have.
+            if (_model.MultimodalInjector != null
+                && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
+            {
+                return false;
+            }
+            // A sequence living in a per-request fused cache must stay fused —
+            // its tail K/V isn't reconstructable from the shared caches.
+            if (_model is IBatchedPagedModel fused
+                && fused.SupportsPerSequenceFusedForward
+                && fused.HasFusedSequenceCache(seq.RequestId))
+            {
+                return false;
+            }
+            return true;
+        }
+
         private static bool IsBatchedN1FastPathEnabled()
         {
             // Default ON. The bug that previously made this dangerous (a
@@ -391,6 +457,10 @@ namespace TensorSharp.Runtime.Scheduling
             // not the single live linear cache the continuation fast-path tracks.
             // Drop any live-cache claim so a follow-up can't continue from stale state.
             _liveCacheValid = false;
+            // Batched steps clobber the linear-cache world the speculative
+            // context depends on (e.g. per-slot GDN state swaps model-level
+            // references), so speculation must re-arm from a fresh prefill.
+            _mtpCtx = null;
             int numSeqs = output.ScheduledWork.Count;
             var ctx = new BatchedForwardContext
             {
@@ -565,6 +635,9 @@ namespace TensorSharp.Runtime.Scheduling
             // meaningless; drop any claim so a later same-session N==1 turn
             // re-establishes it cleanly from the primary cache.
             _liveCacheValid = false;
+            // Fused per-request caches replace the shared linear cache the
+            // speculative context tracks.
+            _mtpCtx = null;
 
             foreach (var work in output.ScheduledWork)
             {
@@ -733,6 +806,21 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     EnsureOwnership(seq);
 
+                    // NextN/MTP speculative decoding (handles its own advance/
+                    // owner/live-cache/capture bookkeeping; null when the step
+                    // must run on the plain path below).
+                    var mtpResult = TryExecuteMtpStep(seq, work, prevComputed);
+                    if (mtpResult != null)
+                    {
+                        results.Add(mtpResult);
+                        return results;
+                    }
+                    // A context for this sequence that didn't serve the step is
+                    // stale from here on: the plain Forward below advances the
+                    // trunk without capturing the hidden states drafting needs.
+                    if (_mtpCtx != null && ReferenceEquals(_mtpCtx.Seq, seq))
+                        _mtpCtx = null;
+
                     // For decode steps we sample the next token from the
                     // sequence's last logits BEFORE forwarding it. The forward
                     // then runs on the freshly-sampled token; its returned
@@ -828,11 +916,173 @@ namespace TensorSharp.Runtime.Scheduling
                     _currentOwner = null;
                     _ownerTokensInModel = 0;
                     _ownerForwardedTokens = 0;
+                    _mtpCtx = null;
                     seq.Error = ex;
                 }
             }
 
             return results;
+        }
+
+        /// <summary>Serve one scheduled work item via NextN/MTP speculative
+        /// decoding when the speculative context is (or can be) armed for it.
+        /// Returns null when the step must run on the plain path instead.
+        /// Assumes <see cref="EnsureOwnership"/> has already run for
+        /// <paramref name="seq"/> (a fresh sequence therefore starts with a
+        /// clean model cache).</summary>
+        private SequenceStepResult TryExecuteMtpStep(
+            SequenceState seq, ScheduledSequenceWork work, int prevComputed)
+        {
+            if (!_scheduler.Config.MtpSpeculativeEnabled)
+                return null;
+            if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp)
+                return null;
+            // Multimodal prefill needs Forward's embedding-inject hook, which
+            // SpecForward doesn't have.
+            if (_model.MultimodalInjector != null
+                && _model.MultimodalInjector.HasPendingEmbeddings(seq.RequestId))
+            {
+                return null;
+            }
+
+            // (Re-)arm at a fresh full prefill from position 0 with a clean
+            // cache. A prefix-cache or live-cache adoption skips trunk
+            // positions the MTP head never saw, so those admissions stay on
+            // the plain path. Replaces any stale context (including this
+            // sequence's own, e.g. after preemption + re-prefill).
+            if (work.IsPrefill && prevComputed == 0 && spec.CacheSeqLen == 0)
+            {
+                var cfg = _scheduler.Config;
+                _mtpCtx = new MtpSeqContext
+                {
+                    Seq = seq,
+                    Exec = new MtpSpeculativeExecution(spec, cfg.MtpMaxDraftTokens)
+                    {
+                        MinDraftProb = cfg.MtpMinDraftProb,
+                    },
+                    NextPosition = 0,
+                };
+                seq.SpecStats = _mtpCtx.Exec.Stats;
+                // One line per request so operators can SEE speculation engage
+                // at generation start (the cumulative stats only log at finish).
+                _logger.LogInformation(
+                    "MTP speculative decoding armed for {RequestId} (maxDraft={MaxDraft}, pMin={PMin})",
+                    seq.RequestId, cfg.MtpMaxDraftTokens, cfg.MtpMinDraftProb);
+            }
+
+            // Continuity gate: same sequence, exact trunk position, and the
+            // model's live cache agrees. Anything else (swap, preemption,
+            // interleaved batched step) ran through an invalidation above.
+            if (_mtpCtx == null
+                || !ReferenceEquals(_mtpCtx.Seq, seq)
+                || _mtpCtx.NextPosition != prevComputed
+                || spec.CacheSeqLen != prevComputed)
+            {
+                return null;
+            }
+
+            if (work.IsPrefill)
+            {
+                int[] chunk = BuildPrefillChunk(seq, work);
+                var swPrefill = Stopwatch.StartNew();
+                float[] logits = _mtpCtx.Exec.PrefillStep(chunk);
+                swPrefill.Stop();
+                seq.LastLogits = logits;
+                CompleteMtpStepBookkeeping(seq, chunk.Length);
+                _mtpCtx.NextPosition = seq.NumComputedTokens;
+
+                return new SequenceStepResult
+                {
+                    Sequence = seq,
+                    TokensForwarded = chunk.Length,
+                    SampledToken = -1,
+                    IsPrefill = true,
+                    FullBlocksCaptured = CaptureNewlyFullBlocks(seq),
+                    ForwardElapsedTicks = swPrefill.ElapsedTicks,
+                };
+            }
+
+            // ---- Speculative decode step ----
+            // The next output token: the one DRAWN during the previous step's
+            // verification when available (emitting anything else would bias
+            // the stream toward the drafts), otherwise sampled as usual.
+            int sampledToken;
+            if (_mtpCtx.PendingNextToken >= 0)
+            {
+                sampledToken = _mtpCtx.PendingNextToken;
+                _mtpCtx.PendingNextToken = -1;
+            }
+            else
+            {
+                sampledToken = SampleFromLogits(seq);
+            }
+            seq.AppendOutputToken(sampledToken);
+
+            // Cap the draft window so this step's 1+K forwarded tokens fit in
+            // (a) the request's remaining token budget and (b) the KV blocks
+            // the scheduler allocated — it reserves capacity for ONE decode
+            // token per step, so block-boundary steps degrade to plain decode
+            // for one step instead of overrunning the block table.
+            int kMax = Math.Min(
+                seq.MaxNewTokens - seq.OutputTokens.Count,
+                seq.BlockTable.FreeSlotsInCurrentBlocks - 1);
+
+            var accepted = new List<int>();
+            var penaltySampler = new TokenSampler(seq.SamplingConfig);
+            var swDecode = Stopwatch.StartNew();
+            MtpDecodeOutcome outcome = _mtpCtx.Exec.DecodeStep(
+                sampledToken,
+                prevComputed,
+                kMax,
+                // Each verify row is drawn with the request's own sampler over
+                // the live output history (kept exact by onDraftAccepted).
+                drawNext: rowLogits =>
+                    new TokenSampler(seq.SamplingConfig).Sample(rowLogits, seq.OutputTokens),
+                // Penalty-aligned drafting: the draft head must argmax the
+                // same penalized distribution verification draws from, or
+                // acceptance decays toward zero as the output history grows.
+                adjustDraftLogits: (draftLogits, pendingDrafts) =>
+                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts),
+                onDraftAccepted: d =>
+                {
+                    seq.AppendOutputToken(d);
+                    accepted.Add(d);
+                });
+            swDecode.Stop();
+
+            seq.LastLogits = outcome.NextLogits;
+            int advanced = 1 + outcome.AcceptedCount;
+            CompleteMtpStepBookkeeping(seq, advanced);
+            _mtpCtx.NextPosition = prevComputed + advanced;
+            _mtpCtx.PendingNextToken = outcome.NextToken;
+
+            int capturedBlocks = CaptureNewlyFullBlocks(seq);
+            if (!seq.FirstTokenAt.HasValue)
+                seq.FirstTokenAt = DateTime.UtcNow;
+
+            return new SequenceStepResult
+            {
+                Sequence = seq,
+                TokensForwarded = advanced,
+                SampledToken = sampledToken,
+                ExtraTokens = accepted.Count > 0 ? accepted : null,
+                IsPrefill = false,
+                FullBlocksCaptured = capturedBlocks,
+                ForwardElapsedTicks = swDecode.ElapsedTicks,
+            };
+        }
+
+        /// <summary>Owner/live-cache bookkeeping the plain per-seq path does
+        /// after its Forward, mirrored for MTP steps (which may advance more
+        /// than one token).</summary>
+        private void CompleteMtpStepBookkeeping(SequenceState seq, int tokensForwarded)
+        {
+            seq.AdvanceComputedTokens(tokensForwarded);
+            _ownerTokensInModel += tokensForwarded;
+            _ownerForwardedTokens += tokensForwarded;
+            _liveCacheSeq = seq;
+            _liveCacheLen = seq.NumComputedTokens;
+            _liveCacheValid = true;
         }
 
         /// <summary>
@@ -918,6 +1168,11 @@ namespace TensorSharp.Runtime.Scheduling
                 // should match the sequence's computed-token counter.)
                 return;
             }
+
+            // Any ownership change rebuilds the model's KV state (reset+inject
+            // or live-cache adoption by a different request), which orphans the
+            // MTP draft head's cache and pending hidden state.
+            _mtpCtx = null;
 
             // Live-cache continuation: the new sequence's prompt extends exactly the
             // tokens still resident in the model's live KV cache (planned by the
@@ -1141,6 +1396,7 @@ namespace TensorSharp.Runtime.Scheduling
             _liveCacheSeq = null;
             _liveCacheLen = 0;
             _liveCacheValid = false;
+            _mtpCtx = null;
             _model.ResetKVCache();
         }
     }
@@ -1152,6 +1408,14 @@ namespace TensorSharp.Runtime.Scheduling
         public SequenceState Sequence { get; init; }
         public int TokensForwarded { get; init; }
         public int SampledToken { get; init; } = -1;
+
+        /// <summary>Speculatively drafted tokens accepted by verification this
+        /// step, in order, FOLLOWING <see cref="SampledToken"/>. Already
+        /// appended to the sequence's OutputTokens by the executor; the engine
+        /// streams them with per-token EOS / length checks. Null when the step
+        /// produced no extra tokens.</summary>
+        public IReadOnlyList<int> ExtraTokens { get; init; }
+
         public bool IsPrefill { get; init; }
         public int FullBlocksCaptured { get; init; }
         public long ForwardElapsedTicks { get; init; }

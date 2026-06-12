@@ -80,29 +80,59 @@ namespace TensorSharp.Runtime
 
         private bool HasPenalties()
         {
-            return _config.RepetitionPenalty != 1.0f ||
+            // RepetitionPenalty <= 0 means "disabled" to operators
+            // (--repeat-penalty 0); applying it literally would divide
+            // positive logits by zero and infinitely boost repeats.
+            return (_config.RepetitionPenalty > 0f && _config.RepetitionPenalty != 1.0f) ||
                    _config.PresencePenalty != 0f ||
                    _config.FrequencyPenalty != 0f;
         }
 
         #region Penalty Application
 
-        private void ApplyPenalties(float[] scores, IList<int>? generatedTokenIds)
+        /// <summary>
+        /// Apply the configured repetition/presence/frequency penalties to
+        /// <paramref name="scores"/> in place. Public so speculative decoding
+        /// can penalize the MTP draft head's logits with the SAME history the
+        /// verification sampler uses — without that alignment, drafting argmaxes
+        /// raw logits while verification draws from penalized ones, and
+        /// acceptance decays toward zero as the output history grows.
+        /// <paramref name="pendingTokens"/> carries tokens drafted in the
+        /// current speculative window that are not yet in
+        /// <paramref name="generatedTokenIds"/>.
+        /// </summary>
+        public void ApplyPenalties(
+            float[] scores,
+            IList<int>? generatedTokenIds,
+            IReadOnlyList<int>? pendingTokens = null)
         {
-            if (generatedTokenIds == null || generatedTokenIds.Count == 0)
+            bool anyHistory = (generatedTokenIds != null && generatedTokenIds.Count > 0)
+                || (pendingTokens != null && pendingTokens.Count > 0);
+            if (!anyHistory)
                 return;
             if (!HasPenalties())
                 return;
 
             // Count occurrences
             var counts = new Dictionary<int, int>();
-            foreach (int id in generatedTokenIds)
+            if (generatedTokenIds != null)
             {
-                counts.TryGetValue(id, out int c);
-                counts[id] = c + 1;
+                foreach (int id in generatedTokenIds)
+                {
+                    counts.TryGetValue(id, out int c);
+                    counts[id] = c + 1;
+                }
+            }
+            if (pendingTokens != null)
+            {
+                foreach (int id in pendingTokens)
+                {
+                    counts.TryGetValue(id, out int c);
+                    counts[id] = c + 1;
+                }
             }
 
-            float repPenalty = _config.RepetitionPenalty;
+            float repPenalty = _config.RepetitionPenalty > 0f ? _config.RepetitionPenalty : 1.0f;
             float presPenalty = _config.PresencePenalty;
             float freqPenalty = _config.FrequencyPenalty;
 

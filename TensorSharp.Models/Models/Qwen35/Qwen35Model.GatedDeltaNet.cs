@@ -53,10 +53,18 @@ namespace TensorSharp.Models
 
         // Minimum prefill length at which the fused chunked GatedDeltaNet GGML kernel
         // beats the per-token CPU loop. The chunked kernel pads to a multiple of
-        // GdnChunkSize (64) and dispatches once per layer; for very short prefills the
-        // padding overhead and the host->device copies dominate. Set
-        // GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N to override (e.g. =1 to always use it,
-        // =1000000 to disable).
+        // GdnChunkSize (64) and dispatches once per layer — one graph submit
+        // instead of the per-token managed loop's per-layer host/device
+        // round-trips. Backend-dependent default (resolved in InitGDNBuffers):
+        //   - ggml_cuda: 2 — measured on Qwen3.6-27B IQ2_XXS (RTX 3080 Laptop)
+        //     the chunked kernel wins for every multi-token batch (MTP
+        //     speculative verify batches of 2–9 tokens dropped from 217 to
+        //     174 ms/token end-to-end) because the per-token loop's per-layer
+        //     sync cost dwarfs the 64-padding waste on CUDA;
+        //   - other backends (Metal/CPU): 6 — compute-bound, so the padding
+        //     waste matters and the measured crossover sits near 6.
+        // Set GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N to override (e.g. =64 for the
+        // old long-prefill-only behavior, =1000000 to disable). -1 = unset.
         private static readonly int GdnChunkedPrefillMinSeqLenEnv = ResolveGdnChunkedPrefillMinSeqLen();
 
         private static int ResolveGdnChunkedPrefillMinSeqLen()
@@ -64,7 +72,7 @@ namespace TensorSharp.Models
             string env = Environment.GetEnvironmentVariable("GDN_CHUNK_PREFILL_MIN_SEQ_LEN");
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            return GdnChunkSize;
+            return -1;
         }
 
         private static readonly bool GdnChunkedPrefillDisabledEnv =
@@ -217,7 +225,9 @@ namespace TensorSharp.Models
         //   * seqLen >= _gdnChunkPrefillThreshold
         //   * the kernel has not previously failed for this run (kill switch)
         private const int GdnChunkSize = 64;
-        private int _gdnChunkPrefillThreshold = GdnChunkedPrefillMinSeqLenEnv;
+        // Conservative placeholder until InitGDNBuffers resolves the
+        // backend-dependent default (env override > per-backend value).
+        private int _gdnChunkPrefillThreshold = GdnChunkSize;
         private bool _gdnDisableChunkedPrefill = GdnChunkedPrefillDisabledEnv;
         private long _gdnChunkedTicks;       // Total time spent in the chunked path
         private long _gdnPerTokenTicks;      // Total time spent in the per-token path (prefill only)
@@ -449,6 +459,15 @@ namespace TensorSharp.Models
         /// </summary>
         private void InitGDNBuffers()
         {
+            // Backend-dependent chunked-kernel threshold (see the comment on
+            // GdnChunkedPrefillMinSeqLenEnv). The env override, when set,
+            // always wins; _backend is only known here (instance init), not
+            // at static-field time.
+            if (GdnChunkedPrefillMinSeqLenEnv > 0)
+                _gdnChunkPrefillThreshold = GdnChunkedPrefillMinSeqLenEnv;
+            else
+                _gdnChunkPrefillThreshold = _backend == BackendType.GgmlCuda ? 2 : 6;
+
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
             int qkDim = _headKDim * _numKHeads;
             int vDim = _headVDim * _numVHeads;

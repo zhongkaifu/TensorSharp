@@ -36,6 +36,19 @@ namespace TensorSharp.Models
         private bool[] _isRecurrent;
         private int _fullAttentionInterval;
 
+        // NextN/MTP (Qwen3.5/3.6): number of extra draft decoder blocks appended
+        // after the main stack in the GGUF (`{arch}.nextn_predict_layers`).
+        // Config.NumLayers is reduced to the trunk-only count at load; the MTP
+        // block lives at layer index _mtpLayerIdx (== trunk count) and is only
+        // executed by the speculative-decoding paths in Qwen35Model.Mtp.cs.
+        private int _numNextnLayers;
+        private int _mtpLayerIdx = -1;
+
+        // Per-layer arrays must cover the MTP block (it reuses AttentionBlock
+        // and the standard KV-cache machinery) while the main forward loops
+        // iterate only Config.NumLayers trunk layers.
+        private int TotalLayerCount => Config.NumLayers + _numNextnLayers;
+
         // MoE configuration (qwen35moe / qwen3next variants)
         private int _numExperts;
         private int _numExpertsUsed;
@@ -372,6 +385,17 @@ namespace TensorSharp.Models
             ParseGdnConfig(arch);
             _fullAttentionInterval = (int)_gguf.GetUint32($"{arch}.full_attention_interval", 4);
 
+            // NextN/MTP draft blocks: the GGUF block_count includes them, but they
+            // are not part of the main decoder stack. Split them off so the main
+            // forward loops never execute the MTP block (llama.cpp does the same:
+            // hparams.n_layer() = n_layer_all - n_layer_nextn).
+            _numNextnLayers = (int)_gguf.GetUint32($"{arch}.nextn_predict_layers", 0);
+            if (_numNextnLayers > 0)
+            {
+                Config.NumLayers -= _numNextnLayers;
+                _mtpLayerIdx = Config.NumLayers;
+            }
+
             // MRoPE sections
             var sections = _gguf.GetInt32Array($"{arch}.rope.dimension_sections");
             _mropeSections = sections;
@@ -393,7 +417,9 @@ namespace TensorSharp.Models
             // qwen3_5.py:230; future fine-tunes can ship a non-default pattern).
             // Fall back to the period-`full_attention_interval` pattern that stock
             // 27B/35B-A3B GGUFs use (no layer_types array shipped).
-            _isRecurrent = new bool[Config.NumLayers];
+            // Sized to TotalLayerCount: the MTP block (if any) is always a
+            // full-attention layer, which the default `false` already encodes.
+            _isRecurrent = new bool[TotalLayerCount];
             var layerTypes = _gguf.GetStringArray($"{arch}.layer_types");
             if (layerTypes != null && layerTypes.Length == Config.NumLayers)
             {
@@ -422,6 +448,9 @@ namespace TensorSharp.Models
             }
             Console.WriteLine($"Layer types: {attnCount} full attention, {recCount} recurrent (GatedDeltaNet)");
 
+            if (_numNextnLayers > 0)
+                Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {_mtpLayerIdx} (excluded from main stack)");
+
             if (_numExperts > 0)
                 Console.WriteLine($"MoE: experts={_numExperts}, used={_numExpertsUsed}, " +
                     $"expertFFN={_expertFfnLength}, sharedFFN={_sharedExpertFfnLength}");
@@ -429,7 +458,7 @@ namespace TensorSharp.Models
             LoadWeights();
             FuseAttentionProjectionWeights();
             FuseRecurrentInputWeights();
-            FuseGateUpWeights();
+            FuseGateUpWeights(TotalLayerCount);
             DetectMoeLayers();
             BuildLayerKeys();
             InitMoeBuffers();
@@ -442,12 +471,13 @@ namespace TensorSharp.Models
             PrecomputeRoPE();
             InitGDNBuffers();
             CacheRecurrentWeights();
+            CacheMtpWeights();
         }
 
         private unsafe void FuseAttentionProjectionWeights()
         {
             int fused = 0;
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            for (int layer = 0; layer < TotalLayerCount; layer++)
             {
                 if (_isRecurrent[layer])
                     continue;
@@ -578,7 +608,7 @@ namespace TensorSharp.Models
 
         private void DetectMoeLayers()
         {
-            int numLayers = Config.NumLayers;
+            int numLayers = TotalLayerCount;
             _isMoeLayer = new bool[numLayers];
             _hasSharedExperts = new bool[numLayers];
             _hasSharedExpertGate = new bool[numLayers];
@@ -617,7 +647,7 @@ namespace TensorSharp.Models
             _moeTopExperts = new int[_numExpertsUsed];
             _moeRouteW = new float[_numExpertsUsed];
 
-            int numLayers = Config.NumLayers;
+            int numLayers = TotalLayerCount;
             _expertGateKeys = new string[numLayers][];
             _expertUpKeys = new string[numLayers][];
             _expertDownKeys = new string[numLayers][];
@@ -736,7 +766,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void BuildLayerKeys()
         {
-            int n = Config.NumLayers;
+            int n = TotalLayerCount;
             _layerPrefix = new string[n];
             _attnNormKey = new string[n];
             _postAttnNormKey = new string[n];
@@ -786,7 +816,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe void CacheRecurrentWeights()
         {
-            int n = Config.NumLayers;
+            int n = TotalLayerCount;
             InitGdnWeightArrays(n);
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
 
@@ -854,7 +884,7 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
-            int numLayers = Config.NumLayers;
+            int numLayers = TotalLayerCount;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
             _mlxAttentionCache = _backend == BackendType.Mlx
@@ -897,7 +927,7 @@ namespace TensorSharp.Models
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
 
             DType kvDtype = _kvCacheDtype.ToDType();
-            for (int l = 0; l < Config.NumLayers; l++)
+            for (int l = 0; l < TotalLayerCount; l++)
             {
                 if (_isRecurrent[l])
                     continue;
@@ -941,7 +971,7 @@ namespace TensorSharp.Models
 
         public override void ResetKVCache()
         {
-            for (int l = 0; l < Config.NumLayers; l++)
+            for (int l = 0; l < TotalLayerCount; l++)
             {
                 if (!_isRecurrent[l])
                 {

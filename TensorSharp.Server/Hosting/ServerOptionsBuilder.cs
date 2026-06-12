@@ -160,6 +160,59 @@ namespace TensorSharp.Server.Hosting
         }
 
         /// <summary>
+        /// Translate <c>--mtp-spec</c> / <c>--no-mtp-spec</c> /
+        /// <c>--mtp-draft N</c> / <c>--mtp-pmin X</c> into the <c>TS_MTP_*</c>
+        /// env vars read by <c>SchedulerConfig.FromEnvironment</c> when the
+        /// inference engine is constructed. NextN/MTP speculative decoding only
+        /// engages on models that ship a draft head (Qwen3.6) and is off by
+        /// default. Returns true when at least one flag was applied so the
+        /// caller can emit a startup-log line.
+        /// </summary>
+        public static bool ApplyMtpSpeculativeCliFlags(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            bool changed = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (string.Equals(a, "--mtp-spec", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_MTP_SPEC", "1");
+                    changed = true;
+                    continue;
+                }
+                if (string.Equals(a, "--no-mtp-spec", StringComparison.OrdinalIgnoreCase))
+                {
+                    Environment.SetEnvironmentVariable("TS_MTP_SPEC", "0");
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--mtp-draft", out string draftOpt))
+                {
+                    if (!int.TryParse(draftOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int draft) || draft <= 0)
+                        throw new ArgumentException($"Invalid value for --mtp-draft: '{draftOpt}'. Expected a positive integer.");
+                    Environment.SetEnvironmentVariable("TS_MTP_DRAFT", draft.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--mtp-pmin", out string pminOpt))
+                {
+                    if (!float.TryParse(pminOpt, NumberStyles.Float, CultureInfo.InvariantCulture, out float pmin)
+                        || pmin <= 0f || pmin > 1f)
+                    {
+                        throw new ArgumentException($"Invalid value for --mtp-pmin: '{pminOpt}'. Expected a probability in (0, 1].");
+                    }
+                    Environment.SetEnvironmentVariable("TS_MTP_PMIN", pmin.ToString(CultureInfo.InvariantCulture));
+                    changed = true;
+                    continue;
+                }
+            }
+            return changed;
+        }
+
+        /// <summary>
         /// Translate <c>--paged-kv*</c> CLI flags into the env vars consumed by
         /// <see cref="PagedKvCacheConfig.FromEnvironment"/>. Returns true when at
         /// least one flag was applied so the caller can emit a startup-log line.
@@ -395,6 +448,20 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
+                // MTP speculative-decoding flags are consumed by
+                // ApplyMtpSpeculativeCliFlags(args) in a separate earlier pass.
+                // Recognise + skip them here so they don't trip the
+                // unknown-arg trap below.
+                if (string.Equals(args[i], "--mtp-spec", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--no-mtp-spec", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--mtp-draft", out _)
+                    || TryReadOption(args, ref i, "--mtp-pmin", out _))
+                {
+                    continue;
+                }
 
                 // Anything else that starts with `--` is an unknown flag and we
                 // refuse to start. Previously these were silently dropped, so a
@@ -433,6 +500,7 @@ namespace TensorSharp.Server.Hosting
                 "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching",
+                "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin",
             };
             string best = null;
             int bestDist = int.MaxValue;

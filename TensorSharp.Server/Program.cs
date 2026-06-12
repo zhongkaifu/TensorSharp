@@ -44,6 +44,9 @@ bool pagedKvFlagsApplied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(args);
 // (TS_QWEN35_BATCHED). Must run before InferenceEngine constructs its
 // BatchExecutor and the per-model batched-paged adapters initialise.
 bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(args);
+// Translate --mtp-spec / --mtp-draft / --mtp-pmin into the TS_MTP_* env vars
+// read by SchedulerConfig.FromEnvironment when the engine is constructed.
+bool mtpSpecFlagsApplied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
@@ -100,6 +103,14 @@ if (pagedKvFlagsApplied)
         pagedCfg.Enabled, pagedCfg.BlockSize, pagedCfg.MaxRamBytes / (1024 * 1024),
         string.IsNullOrEmpty(pagedCfg.SsdDirectory) ? "(disabled)" : pagedCfg.SsdDirectory,
         pagedCfg.MaxSsdBytes / (1024 * 1024));
+}
+
+if (mtpSpecFlagsApplied)
+{
+    var schedCfg = TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment();
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} (engages on NextN/MTP draft-head models only)",
+        schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens, schedCfg.MtpMinDraftProb);
 }
 
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);

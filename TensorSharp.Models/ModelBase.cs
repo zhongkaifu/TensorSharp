@@ -1461,10 +1461,12 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(result);
         }
 
-        protected unsafe void FuseGateUpWeights()
+        protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
+            if (numLayers <= 0)
+                numLayers = Config.NumLayers;
             int fused = 0;
-            for (int l = 0; l < Config.NumLayers; l++)
+            for (int l = 0; l < numLayers; l++)
             {
                 string gateName = $"blk.{l}.ffn_gate.weight";
                 string upName = $"blk.{l}.ffn_up.weight";

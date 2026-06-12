@@ -459,8 +459,13 @@ kernels:
 
 Tunable env vars:
 
-- `GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N` overrides the threshold (default 64). Set
-  to `1` to always use the chunked path; set very high to disable.
+- `GDN_CHUNK_PREFILL_MIN_SEQ_LEN=N` overrides the threshold (default: 2 on
+  ggml_cuda, 6 elsewhere). On CUDA the chunked kernel wins for every
+  multi-token batch — the per-token loop's per-layer host/device sync dwarfs
+  the 64-padding waste; measured on Qwen3.6-27B IQ2_XXS it cut MTP
+  speculative-verify decode from 217 to 174 ms/token. Single-token decode
+  steps still use the per-token loop. Set to `64` for the old
+  long-prefill-only behavior; set very high to disable.
 - `GDN_DISABLE_CHUNKED_PREFILL=1` forces the per-token CPU loop on every
   prefill call; useful for A/B comparison.
 - `GDN_VERIFY_CHUNKED=1` runs the chunked path on a snapshot of the

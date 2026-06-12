@@ -61,6 +61,20 @@ namespace TensorSharp.Runtime.Scheduling
         /// swap at block boundaries.</summary>
         public int DecodeQuantumTokens { get; init; } = 256;
 
+        /// <summary>Enable NextN/MTP speculative decoding for solo sequences on
+        /// models that expose a draft head (Qwen3.6). Default OFF. CLI:
+        /// <c>--mtp-spec</c>; env: <c>TS_MTP_SPEC</c>.</summary>
+        public bool MtpSpeculativeEnabled { get; init; }
+
+        /// <summary>Maximum tokens drafted per speculative step (llama.cpp
+        /// n_max). CLI: <c>--mtp-draft</c>; env: <c>TS_MTP_DRAFT</c>.</summary>
+        public int MtpMaxDraftTokens { get; init; } = 8;
+
+        /// <summary>Minimum draft confidence for a drafted token to be kept
+        /// (top-1 probability over the draft head's top-10 logits). CLI:
+        /// <c>--mtp-pmin</c>; env: <c>TS_MTP_PMIN</c>.</summary>
+        public float MtpMinDraftProb { get; init; } = 0.75f;
+
         public static SchedulerConfig Default => new();
 
         public static SchedulerConfig FromEnvironment()
@@ -74,6 +88,9 @@ namespace TensorSharp.Runtime.Scheduling
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
+                MtpSpeculativeEnabled = ReadBool("TS_MTP_SPEC", false),
+                MtpMaxDraftTokens = ReadInt("TS_MTP_DRAFT", 8),
+                MtpMinDraftProb = ReadFloat("TS_MTP_PMIN", 0.75f),
             };
             return cfg;
         }
@@ -83,6 +100,19 @@ namespace TensorSharp.Runtime.Scheduling
             string raw = System.Environment.GetEnvironmentVariable(name);
             if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out int v) && v > 0)
                 return v;
+            return fallback;
+        }
+
+        private static float ReadFloat(string name, float fallback)
+        {
+            string raw = System.Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(raw)
+                && float.TryParse(raw, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out float v)
+                && v > 0f)
+            {
+                return v;
+            }
             return fallback;
         }
 

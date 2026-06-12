@@ -110,6 +110,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// hits) at admission time. Diagnostic only.</summary>
         public int PrefixCacheReusedTokens { get; internal set; }
 
+        /// <summary>Cumulative NextN/MTP speculative-decoding counters for this
+        /// request, attached by the executor when speculation arms. Null when
+        /// the sequence never ran speculatively. Diagnostic only; the engine
+        /// logs it when the request finishes.</summary>
+        public MtpSpecStats SpecStats { get; internal set; }
+
         /// <summary>True when this sequence reuses the model's LIVE KV cache
         /// directly (its prompt extends exactly the tokens still resident in the
         /// model's cache from the previous request on the same session), instead of

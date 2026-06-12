@@ -58,7 +58,6 @@ header h1 {
 }
 
 /* Colorful animated "TensorSharp" wordmark, used in place of the old banner image. */
-.brand-wordmark,
 .big-wordmark {
   font-weight: 800;
   letter-spacing: -0.02em;
@@ -72,25 +71,49 @@ header h1 {
   animation: brandShimmer 7s linear infinite;
 }
 
-.brand-wordmark {
-  font-size: 28px;
-  line-height: 1;
-  flex-shrink: 0;
-}
-
 @keyframes brandShimmer {
   to { background-position: 220% center; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .brand-wordmark,
-  .big-wordmark { animation: none; }
+  .big-wordmark,
+  .brand-site-link { animation: none; }
 }
 
-.brand-text {
+/* Wordmark links to tensorsharp.ai without disturbing the gradient text. */
+a.brand-home {
+  text-decoration: none;
+  display: inline-flex;
+}
+
+.brand-site-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  padding: 9px 20px;
+  border-radius: 999px;
+  color: #fff;
+  text-decoration: none;
   white-space: nowrap;
-  color: var(--text2);
-  font-weight: 500;
+  background: linear-gradient(100deg, #6c8cff 0%, #b06cff 45%, #ff6cab 100%);
+  background-size: 200% auto;
+  box-shadow: 0 4px 16px rgba(108, 140, 255, 0.38);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  animation: brandShimmer 7s linear infinite;
+}
+
+.brand-site-link:hover {
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 6px 24px rgba(176, 108, 255, 0.55);
+  color: #fff;
+}
+
+.brand-site-link .link-arrow {
+  font-size: 13px;
+  opacity: 0.9;
 }
 
 .header-controls {
@@ -676,8 +699,9 @@ button.primary:hover { background: var(--accent-hover); }
     gap: 10px;
   }
 
-  .brand-wordmark {
-    font-size: 22px;
+  .brand-site-link {
+    font-size: 14px;
+    padding: 6px 14px;
   }
 
   .avatar {
@@ -820,8 +844,7 @@ button.primary:hover { background: var(--accent-hover); }
 
 <header>
   <h1>
-    <span class="brand-wordmark">TensorSharp</span>
-    <span class="brand-text">Chat</span>
+    <a class="brand-site-link" href="https://tensorsharp.ai" target="_blank" rel="noopener" title="Visit TensorSharp.ai">&#x1F310; TensorSharp.ai <span class="link-arrow">&#x2197;</span></a>
   </h1>
   <div class="header-controls">
     <span id="queue-badge" class="status-badge" style="display:none" title="Live inference load: requests processing concurrently and waiting in the queue"></span>
@@ -833,7 +856,7 @@ button.primary:hover { background: var(--accent-hover); }
 <div class="main-area">
   <div id="chat-container">
     <div class="empty-state" id="empty-state">
-      <div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div>
+      <a class="brand-home" href="https://tensorsharp.ai" target="_blank" rel="noopener" title="Visit tensorsharp.ai"><div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div></a>
       <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
     </div>
   </div>
@@ -920,7 +943,7 @@ function renderEmptyState() {
   if (!currentLoadedModel) {
     chatContainer.innerHTML = `
       <div class="empty-state" id="empty-state">
-        <div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div>
+        <a class="brand-home" href="https://tensorsharp.ai" target="_blank" rel="noopener" title="Visit tensorsharp.ai"><div class="big-wordmark" aria-label="TensorSharp">TensorSharp</div></a>
         <p>Start TensorSharp.Server with <code>--model &lt;path.gguf&gt; --backend &lt;type&gt; [--mmproj &lt;path&gt;] [--max-tokens 20000]</code>, then refresh this page.</p>
       </div>`;
     return;
@@ -928,7 +951,7 @@ function renderEmptyState() {
 
   chatContainer.innerHTML = `
     <div class="empty-state">
-      <div class="big-wordmark assistant-preview" aria-label="TensorSharp">TensorSharp</div>
+      <a class="brand-home" href="https://tensorsharp.ai" target="_blank" rel="noopener" title="Visit tensorsharp.ai"><div class="big-wordmark assistant-preview" aria-label="TensorSharp">TensorSharp</div></a>
       <p>Start a conversation with the configured model. You can attach images, videos, audio, and text files for multimodal inference.</p>
     </div>`;
 }

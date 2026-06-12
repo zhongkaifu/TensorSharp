@@ -330,7 +330,14 @@ namespace TensorSharp.Runtime.Scheduling
                 case EngineCommandKind.Abort:
                     _scheduler.Abort(cmd.RequestId);
                     if (_handles.TryRemove(cmd.RequestId, out var handle))
+                    {
+                        // Aborted requests (stop button, client disconnect,
+                        // stop-sequence hit in the adapter) never reach the
+                        // ApplyResults finish paths, so surface speculative
+                        // stats here too.
+                        LogMtpStatsIfAny(handle.Sequence);
                         handle.CompleteAborted();
+                    }
                     if (_model is Runtime.Scheduling.IBatchedPagedModel batchedAbort)
                         batchedAbort.OnSequenceReleased(cmd.RequestId);
                     break;
@@ -347,6 +354,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.Error != null)
                 {
+                    LogMtpStatsIfAny(seq);
                     _scheduler.NotifyError(seq, r.Error, output);
                     handle?.CompleteWithError(r.Error);
                     _handles.TryRemove(seq.RequestId, out _);
@@ -356,33 +364,78 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (r.SampledToken >= 0)
                 {
-                    // Stop on EOS. Do NOT publish the EOS token to the
-                    // consumer channel: its textual form is a special
-                    // marker (e.g. <end_of_turn>, <|im_end|>) that would
-                    // otherwise be decoded by AppendTokenBytes and leak
-                    // into the streamed assistant output.
-                    if (_model.Tokenizer != null && _model.Tokenizer.IsEos(r.SampledToken))
-                    {
-                        _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
-                        handle?.CompleteFinished();
-                        _handles.TryRemove(seq.RequestId, out _);
-                        Interlocked.Increment(ref _totalCompleted);
-                        continue;
-                    }
+                    // A speculative step emits the sampled token plus the
+                    // accepted draft tokens (ExtraTokens); each gets the same
+                    // per-token EOS / length checks the one-token path applied.
+                    int extraCount = r.ExtraTokens?.Count ?? 0;
+                    int totalNew = 1 + extraCount;
+                    // Tokens already in OutputTokens before this step's batch;
+                    // OutputTokens may not be consulted directly mid-loop
+                    // because the executor appended the whole batch up front.
+                    int baseCount = seq.OutputTokens.Count - totalNew;
 
-                    handle?.PublishToken(r.SampledToken);
-
-                    // Stop on max-new-tokens.
-                    if (seq.OutputTokens.Count >= seq.MaxNewTokens)
+                    bool finished = false;
+                    for (int t = 0; t < totalNew && !finished; t++)
                     {
-                        _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
-                        handle?.CompleteFinished();
-                        _handles.TryRemove(seq.RequestId, out _);
-                        Interlocked.Increment(ref _totalCompleted);
-                        continue;
+                        int token = t == 0 ? r.SampledToken : r.ExtraTokens[t - 1];
+                        int emittedCount = baseCount + t + 1;
+
+                        // Stop on EOS. Do NOT publish the EOS token to the
+                        // consumer channel: its textual form is a special
+                        // marker (e.g. <end_of_turn>, <|im_end|>) that would
+                        // otherwise be decoded by AppendTokenBytes and leak
+                        // into the streamed assistant output.
+                        if (_model.Tokenizer != null && _model.Tokenizer.IsEos(token))
+                        {
+                            TruncateUnpublishedTail(seq, emittedCount);
+                            LogMtpStatsIfAny(seq);
+                            _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
+                            handle?.CompleteFinished();
+                            _handles.TryRemove(seq.RequestId, out _);
+                            Interlocked.Increment(ref _totalCompleted);
+                            finished = true;
+                            break;
+                        }
+
+                        handle?.PublishToken(token);
+
+                        // Stop on max-new-tokens.
+                        if (emittedCount >= seq.MaxNewTokens)
+                        {
+                            TruncateUnpublishedTail(seq, emittedCount);
+                            LogMtpStatsIfAny(seq);
+                            _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
+                            handle?.CompleteFinished();
+                            _handles.TryRemove(seq.RequestId, out _);
+                            Interlocked.Increment(ref _totalCompleted);
+                            finished = true;
+                            break;
+                        }
                     }
                 }
             }
+        }
+
+        /// <summary>Drop speculatively accepted tokens past a mid-batch stop
+        /// point so the sequence's recorded output matches what was streamed.</summary>
+        private static void TruncateUnpublishedTail(SequenceState seq, int keepCount)
+        {
+            if (seq.OutputTokens.Count > keepCount)
+                seq.OutputTokens.RemoveRange(keepCount, seq.OutputTokens.Count - keepCount);
+        }
+
+        /// <summary>Log cumulative NextN/MTP speculative-decoding counters when
+        /// a request that ran speculatively finishes.</summary>
+        private void LogMtpStatsIfAny(SequenceState seq)
+        {
+            var st = seq.SpecStats;
+            if (st == null || (st.VerifySteps + st.PlainSteps) == 0)
+                return;
+            _logger.LogInformation(
+                "MTP speculative stats for {RequestId}: drafted={Drafted} accepted={Accepted} acceptance={Acceptance:P0} verifySteps={VerifySteps} plainSteps={PlainSteps} rollbacks={Rollbacks} | phaseMs draft={DraftMs:F0} verify={VerifyMs:F0} snapshot={SnapshotMs:F0} rollback={RollbackMs:F0} catchUp={CatchUpMs:F0} plain={PlainMs:F0}",
+                seq.RequestId, st.TokensDrafted, st.TokensAccepted, st.AcceptanceRate,
+                st.VerifySteps, st.PlainSteps, st.RollbackSteps,
+                st.DraftMs, st.VerifyMs, st.SnapshotMs, st.RollbackMs, st.CatchUpMs, st.PlainMs);
         }
 
         private static long ComputeBlockByteSize(IModelArchitecture model, int blockSize)
