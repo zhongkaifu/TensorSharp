@@ -59,6 +59,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
         private readonly IntPtr quantMatmulF32;
+        private readonly IntPtr quantMatmulBatchedF32;
         private readonly IntPtr quantMatmulIq2XxsQ81F32;
         private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ80SingleF32;
@@ -113,6 +114,7 @@ namespace TensorSharp.Cuda
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
+            quantMatmulBatchedF32 = module.GetFunction("ts_quant_matmul_batched_f32");
             quantMatmulIq2XxsQ81F32 = module.GetFunction("ts_quant_matmul_iq2_xxs_q8_1_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
@@ -1190,6 +1192,36 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
             Launch(quantMatmulF32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Row tile height of the batched quantized matmul kernels; must
+        /// match <c>TS_QMM_ROW_TILE</c> in the kernel source.</summary>
+        private const int QuantMatmulRowTile = 4;
+
+        /// <summary>Maximum row count routed to the row-batched quantized matmul
+        /// kernels. The kernels themselves tile over rows (grid.y), so this is a
+        /// policy cap that keeps the batched path on the small speculative-verify
+        /// / short-prefill windows it is tuned for.</summary>
+        public const int QuantMatmulBatchMaxRows = 32;
+
+        /// <summary>Row-batched quantized matmul: streams each weight row once per
+        /// 4-row tile and reuses every dequantized weight across the tile's rows
+        /// (weight traffic ~ceil(rows/4) instead of rows).</summary>
+        public void LaunchQuantMatmulBatchedF32(IntPtr weights, IntPtr input, IntPtr output, int type, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg, &rowsArg };
+            // One warp per output column; rows tiled by 4 down grid.y.
+            uint warpsPerBlock = (uint)(BlockSize >> 5);
+            uint gridX = ((uint)outDim + warpsPerBlock - 1) / warpsPerBlock;
+            uint gridY = (uint)((rows + QuantMatmulRowTile - 1) / QuantMatmulRowTile);
+            Launch(quantMatmulBatchedF32, gridX, gridY, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantMatmulIq2XxsQ81F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)

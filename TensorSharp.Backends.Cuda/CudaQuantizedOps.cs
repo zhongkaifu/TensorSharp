@@ -28,6 +28,12 @@ namespace TensorSharp.Cuda
         private static readonly object Sync = new object();
         private static readonly Dictionary<CacheKey, DeviceWeight> Cache = new Dictionary<CacheKey, DeviceWeight>();
 
+        // Row-batched quantized matmul (weight-reuse across small row counts).
+        // On by default; set TS_CUDA_QMM_BATCHED=0 to force the legacy per-row
+        // kernels (A/B benchmarking).
+        internal static readonly bool BatchedMatmulEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QMM_BATCHED"), "0", StringComparison.Ordinal);
+
         public static bool SupportsQuantizedType(int ggmlType)
         {
             return ggmlType == 2 ||  // Q4_0
@@ -138,6 +144,27 @@ namespace TensorSharp.Cuda
             int inDim = checked((int)ne0);
             int outDim = checked((int)ne1);
             int rows = checked((int)input.Sizes[0]);
+            // Small multi-row batches (speculative MTP verify windows, short
+            // prefill chunks) run the slow SCALAR per-row k-quant/iq-quant kernel
+            // (ts_quant_matmul_f32) once per output row -- the whole weight row is
+            // re-read AND re-dequantized per row, so a B-row matmul costs ~B x a
+            // single decode and speculative verification can never amortize. The
+            // generic batched kernel tiles 4 rows per block, decoding each weight
+            // ONCE and reusing it across the tile (measured 2.7-2.9x at B>=4 for
+            // Q2_K / Q5_K-class weights -- ffn_down and the LM head here).
+            //   * IQ2_XXS / Q4_0 / Q8_0 already have fast per-row dp4a/tiled
+            //     kernels that amortize well across rows (IQ2_XXS measures a flat
+            //     ~0.5 ms/row), so they keep those paths -- the scalar batched
+            //     kernel would be SLOWER for them.
+            if (BatchedMatmulEnabled && rows >= 2 && rows <= CudaKernels.QuantMatmulBatchMaxRows
+                && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
+            {
+                kernels.LaunchQuantMatmulBatchedF32(
+                    weight.DevicePtr, inputPtr, resultPtr,
+                    ggmlType, inDim, outDim, rows, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
             if (ggmlType == 2)
             {
                 kernels.LaunchQuantMatmulQ40F32(

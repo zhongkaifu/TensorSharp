@@ -59,6 +59,10 @@ namespace TensorSharp.Models
         public long RollbackSteps => _exec.Stats.RollbackSteps;
         public double AcceptanceRate => _exec.Stats.AcceptanceRate;
 
+        /// <summary>Wall-clock phase breakdown of the speculative decode loop
+        /// (draft / verify / snapshot / rollback / catch-up / plain).</summary>
+        public MtpSpecStats Stats => _exec.Stats;
+
         /// <summary>Wall-clock seconds the last GenerateGreedy call spent in prompt prefill.</summary>
         public double LastPrefillSeconds { get; private set; }
 

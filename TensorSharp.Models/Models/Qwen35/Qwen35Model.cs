@@ -2161,6 +2161,46 @@ namespace TensorSharp.Models
                         attnOutput = null;
                     }
                 }
+                // Direct-CUDA fused prefill attention for the speculative verify
+                // window (and any multi-row continuation). The legacy fallback
+                // below materializes the whole expanded KV cache and runs
+                // QK^T / mask / softmax / *V as separate dispatches -- the
+                // dominant attention cost during MTP verify. The fused kernel
+                // reads the head-first KV cache in place (F16 or F32). Gated to
+                // text continuations (no per-axis MRoPE staged) and the kernel's
+                // kvLen<=8192 limit; on any miss it returns false and we fall
+                // through to the legacy path unchanged.
+                if (!usedFusedAttn && _backend == BackendType.Cuda && !useMRoPE
+                    && totalSeqLen <= 8192)
+                {
+                    int cacheSize = (int)_kvCacheK[layer].Sizes[1];
+                    var cudaPrefill = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                    Tensor qHeadsCuda = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
+                    bool okCuda;
+                    try
+                    {
+                        okCuda = CudaFusedOps.TryGqaPrefillAttentionWithSinks(
+                            cudaPrefill, qHeadsCuda, _kvCacheK[layer], _kvCacheV[layer],
+                            sinks: null,
+                            numQHeads: numHeads, numKVHeads: numKVHeads, headDim: headDim,
+                            seqLen: seqLen, kvLen: totalSeqLen, cacheSize: cacheSize,
+                            maskStart: startPos, windowSize: 0, scale: attentionScale);
+                    }
+                    catch { okCuda = false; }
+                    qHeadsCuda.Dispose();
+                    if (okCuda)
+                    {
+                        attnOutput = cudaPrefill;
+                        usedFusedAttn = true;
+                        qTensor.Dispose();
+                        kTensor.Dispose();
+                        vTensor.Dispose();
+                    }
+                    else
+                    {
+                        cudaPrefill.Dispose();
+                    }
+                }
                 kHeads.Dispose();
                 vHeads.Dispose();
 
@@ -4455,6 +4495,33 @@ namespace TensorSharp.Models
         /// such as MoE routers and shared expert projections.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        /// <summary>Debug-only: time a representative quantized matmul at a given
+        /// row count to isolate the matmul's batch scaling (independent of the
+        /// recurrent/attention layers). Forces a device sync per measured batch.</summary>
+        public double DebugTimeQuantMatmul(string which, int rows, int reps, out int ggmlType, out long inDim, out long outDim)
+        {
+            QuantizedWeight qw = which switch
+            {
+                "down" => _ffnDownQW[0],
+                "lmhead" => _lmHeadQW,
+                _ => _ffnGateUpQW[0],
+            };
+            ggmlType = qw.GgmlType;
+            inDim = qw.Ne0;
+            outDim = qw.Ne1;
+            using var input = new Tensor(_allocator, DType.Float32, rows, (int)qw.Ne0);
+            Ops.Fill(input, 0.02f);
+            using var result = new Tensor(_allocator, DType.Float32, rows, (int)qw.Ne1);
+            AddmmQuantManaged(result, input, qw);
+            result.GetElementsAsFloat(1); // drain warmup
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < reps; i++)
+                AddmmQuantManaged(result, input, qw);
+            result.GetElementsAsFloat(1); // single drain captures all queued reps
+            sw.Stop();
+            return sw.Elapsed.TotalMilliseconds / reps;
+        }
+
         private Tensor LinearForwardCached(Tensor input, QuantizedWeight qw, Tensor wF32)
         {
             long t0 = Stopwatch.GetTimestamp();

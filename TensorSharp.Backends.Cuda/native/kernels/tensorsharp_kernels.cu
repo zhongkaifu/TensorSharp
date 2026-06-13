@@ -2472,6 +2472,77 @@ extern "C" __global__ void ts_quant_matmul_f32(
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
 }
 
+// Row tile height for the row-batched quantized matmul kernels below. Each
+// block handles a contiguous tile of up to TS_QMM_ROW_TILE rows for one output
+// column, decoding the weight ONCE and reusing it across the tile's rows;
+// grid.y = ceil(rows/TILE) covers the rest. Kept small (matches the 4-row
+// ts_quant_matmul_q8_0_f32 tiling) so the accumulators stay in registers.
+// Weight memory traffic / dequant work drops from B x to ceil(B/TILE) x.
+#define TS_QMM_ROW_TILE 4
+
+// Row-batched quantized matmul for SMALL row counts (speculative MTP verify
+// windows, short prefill chunks). The per-row kernels elsewhere re-read AND
+// re-dequantize the whole weight row once per output row, so a B-row matmul
+// costs B x the (memory-bound) weight traffic -- on a multi-GB quantized model
+// that makes a B-token forward cost ~B single-token decodes and speculative
+// verification can never amortize.
+//
+// One WARP per output column (warp-shuffle reduction, no block-wide sync); the
+// warp streams the weight row a SINGLE time per tile and reuses each
+// dequantized weight across the tile's rows (activations read from the
+// L2-resident input). Numerically matches the generic ts_quant_matmul_f32 path
+// (full-precision activations x dequantized weights), not the q8_1 dp4a path.
+extern "C" __global__ void ts_quant_matmul_batched_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int type,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int warps_per_block = blockDim.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    int row0 = blockIdx.y * TS_QMM_ROW_TILE;
+    if (out_col >= out_dim || row0 >= rows)
+        return;
+    int tile = min(TS_QMM_ROW_TILE, rows - row0);
+
+    int row_bytes = qrow_bytes(type, in_dim);
+    const uint8_t* w_row = weights + (size_t)out_col * row_bytes;
+    const float* in0 = input + (size_t)row0 * in_dim;
+
+    float acc[TS_QMM_ROW_TILE];
+#pragma unroll
+    for (int r = 0; r < TS_QMM_ROW_TILE; r++)
+        acc[r] = 0.0f;
+
+    for (int k = lane; k < in_dim; k += 32)
+    {
+        float wv = qvalue_at(w_row, type, k);
+#pragma unroll
+        for (int r = 0; r < TS_QMM_ROW_TILE; r++)
+        {
+            if (r < tile)
+                acc[r] += wv * in0[(size_t)r * in_dim + k];
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < TS_QMM_ROW_TILE; r++)
+    {
+        if (r >= tile)
+            break;
+        float a = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+        if (lane == 0)
+            output[(size_t)(row0 + r) * out_dim + out_col] = a;
+    }
+}
+
 // One warp per output column. For batch=1 decode the old design used the whole
 // block to compute 4 outputs with four sequential block-wide reductions (most
 // threads idle since dot_groups = in_dim/32 < blockDim). Giving each warp its own

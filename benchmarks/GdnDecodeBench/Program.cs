@@ -38,7 +38,8 @@ Console.WriteLine($"[gdn-bench] loading {Path.GetFileName(modelPath)} backend={b
 using var model = (Qwen35Model)ModelBase.Create(modelPath, backend);
 Console.WriteLine($"[gdn-bench] HasMtp={model.HasMtp}");
 
-string prompt = "Write a short story about a robot learning to paint. " +
+string prompt = Environment.GetEnvironmentVariable("TS_MTP_PROMPT") ??
+                "Write a short story about a robot learning to paint. " +
                 "Once upon a time, in a small workshop at the edge of the city,";
 int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: false).ToArray();
 
@@ -47,6 +48,48 @@ model.ResetKVCache();
 model.ForwardRefill(tokens);
 model.Forward(new[] { tokens[^1] });
 
+if (mode is "matmul")
+{
+    // Isolate the quantized-matmul batch scaling (no recurrent/attention layers).
+    foreach (string which in new[] { "gateup", "down", "lmhead" })
+    {
+        Console.WriteLine($"[gdn-bench] matmul '{which}':");
+        foreach (int b in new[] { 1, 2, 4, 8 })
+        {
+            double ms = model.DebugTimeQuantMatmul(which, b, 50, out int gt, out long inD, out long outD);
+            Console.WriteLine($"    B={b}: {ms:F3} ms/call ({ms / b:F3} ms/row)  type={gt} in={inD} out={outD}");
+        }
+    }
+    return;
+}
+
+if (mode is "scaling")
+{
+    // Isolate how a single trunk forward scales with batch width B (the verify
+    // window). If GDN/attention amortize, forward(B) should be ~flat per token.
+    model.ResetKVCache();
+    model.ForwardRefill(tokens);
+    int basePos = tokens.Length;
+    int[] bs = { 1, 2, 4, 8 };
+    foreach (int b in bs)
+    {
+        // Fresh KV position each trial so attention KV length is comparable.
+        int reps = 20;
+        var probe = new int[b];
+        for (int i = 0; i < b; i++) probe[i] = tokens[i % tokens.Length];
+        // Warmup
+        model.SpecForward(probe, new float[b * model.Config.HiddenSize], new float[model.Config.VocabSize], allLogitsRows: false);
+        var sw2 = Stopwatch.StartNew();
+        for (int r = 0; r < reps; r++)
+            model.SpecForward(probe, new float[b * model.Config.HiddenSize], new float[model.Config.VocabSize], allLogitsRows: false);
+        sw2.Stop();
+        double msPer = sw2.Elapsed.TotalMilliseconds / reps;
+        Console.WriteLine($"[gdn-bench] forward(B={b}): {msPer:F1} ms/call = {msPer / b:F1} ms/token-in-batch");
+    }
+    return;
+}
+
+List<int> baselineTokens = null;
 if (mode is "baseline" or "both")
 {
     model.ResetKVCache();
@@ -66,6 +109,7 @@ if (mode is "baseline" or "both")
     Console.WriteLine($"[gdn-bench] baseline decode {sw.Elapsed.TotalSeconds:F2}s = {tps:F2} tok/s ({1000.0 * sw.Elapsed.TotalSeconds / maxNew:F1} ms/token)");
     string baseText = model.Tokenizer.Decode(baseline).Replace("\n", "\\n");
     Console.WriteLine($"[gdn-bench] baseline text: \"{(baseText.Length > 200 ? baseText.Substring(0, 200) : baseText)}\"");
+    baselineTokens = baseline;
 }
 
 if (mode is "spec" or "both")
@@ -84,4 +128,27 @@ if (mode is "spec" or "both")
     Console.WriteLine($"[gdn-bench] split: attn={model.SpecAttnLayerTicks * msPerTick:F0}ms ({100 * model.SpecAttnLayerTicks * msPerTick / decodeMs:F1}%) " +
         $"gdn={model.SpecRecurrentLayerTicks * msPerTick:F0}ms ({100 * model.SpecRecurrentLayerTicks * msPerTick / decodeMs:F1}%) " +
         $"lmhead={model.SpecLmHeadTicks * msPerTick:F0}ms ({100 * model.SpecLmHeadTicks * msPerTick / decodeMs:F1}%)");
+    var st = spec.Stats;
+    Console.WriteLine($"[gdn-bench] phases: draft={st.DraftMs:F0}ms ({100 * st.DraftMs / decodeMs:F1}%) " +
+        $"verify={st.VerifyMs:F0}ms ({100 * st.VerifyMs / decodeMs:F1}%) " +
+        $"snapshot={st.SnapshotMs:F0}ms ({100 * st.SnapshotMs / decodeMs:F1}%) " +
+        $"rollback={st.RollbackMs:F0}ms ({100 * st.RollbackMs / decodeMs:F1}%) " +
+        $"catchup={st.CatchUpMs:F0}ms ({100 * st.CatchUpMs / decodeMs:F1}%) " +
+        $"plain={st.PlainMs:F0}ms ({100 * st.PlainMs / decodeMs:F1}%)");
+    Console.WriteLine($"[gdn-bench] counts: drafted={st.TokensDrafted} accepted={st.TokensAccepted} " +
+        $"verifySteps={st.VerifySteps} plainSteps={st.PlainSteps} rollbackSteps={st.RollbackSteps} " +
+        $"avgWindow={(st.VerifySteps > 0 ? (double)st.TokensDrafted / st.VerifySteps : 0):F2}");
+    string specText = model.Tokenizer.Decode(specTokens).Replace("\n", "\\n");
+    Console.WriteLine($"[gdn-bench] spec text:     \"{(specText.Length > 200 ? specText.Substring(0, 200) : specText)}\"");
+    if (baselineTokens != null)
+    {
+        int n = Math.Min(baselineTokens.Count, specTokens.Count);
+        int diverge = -1;
+        for (int i = 0; i < n; i++)
+            if (baselineTokens[i] != specTokens[i]) { diverge = i; break; }
+        Console.WriteLine(diverge < 0
+            ? $"[gdn-bench] correctness: spec == baseline for all {n} compared tokens"
+            : $"[gdn-bench] correctness: first divergence at token {diverge}/{n} (FP drift between batched-verify and sequential-decode is expected past near-ties)");
+    }
+    model.PrintTimingStats();
 }
