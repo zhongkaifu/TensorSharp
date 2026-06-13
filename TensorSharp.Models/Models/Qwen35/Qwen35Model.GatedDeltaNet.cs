@@ -523,6 +523,11 @@ namespace TensorSharp.Models
                 }
             }
 
+            if (_mtpGdnConvDevSnap != null)
+                foreach (var t in _mtpGdnConvDevSnap) t?.Dispose();
+            if (_mtpGdnDeltaDevSnap != null)
+                foreach (var t in _mtpGdnDeltaDevSnap) t?.Dispose();
+
             _gdnGatedOutT?.Dispose();
             _gdnChunkedQBuf?.Dispose();
             _gdnChunkedKBuf?.Dispose();

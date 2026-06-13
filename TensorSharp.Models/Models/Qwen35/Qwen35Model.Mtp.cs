@@ -325,6 +325,19 @@ namespace TensorSharp.Models
         /// </summary>
         public void MtpSnapshotRecurrentState()
         {
+            // Direct-CUDA fast path: snapshot the GDN state device-to-device
+            // (async cuMemcpyDtoD on the stream) instead of draining it to host
+            // bytes. The host path does an EnsureHostReadable DtoH per recurrent
+            // layer (48 syncs) every verify step, but the snapshot is only ever
+            // consumed on a partial-rejection rollback (~1 in this model) -- so
+            // those DtoH stalls were almost entirely wasted on a sync-bound
+            // backend.
+            if (_backend == BackendType.Cuda)
+            {
+                MtpSnapshotRecurrentStateCudaDevice();
+                return;
+            }
+
             _mtpGdnSnapshot ??= new byte[Config.NumLayers][];
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -341,6 +354,12 @@ namespace TensorSharp.Models
         /// <summary>Restore the GDN recurrent state captured by <see cref="MtpSnapshotRecurrentState"/>.</summary>
         public void MtpRestoreRecurrentState()
         {
+            if (_backend == BackendType.Cuda)
+            {
+                MtpRestoreRecurrentStateCudaDevice();
+                return;
+            }
+
             if (_mtpGdnSnapshot == null)
                 throw new InvalidOperationException("No GDN snapshot to restore.");
             for (int l = 0; l < Config.NumLayers; l++)
@@ -349,6 +368,54 @@ namespace TensorSharp.Models
                     continue;
                 if (!CopyGdnStateIn(l, _mtpGdnSnapshot[l], out _))
                     throw new InvalidOperationException($"Failed to restore GDN state for layer {l}.");
+            }
+        }
+
+        // Reusable device-resident GDN snapshot buffers for the CUDA linear-trunk
+        // path (conv ring buffer + SSM/delta state + conv ring write index).
+        private Tensor[] _mtpGdnConvDevSnap;
+        private Tensor[] _mtpGdnDeltaDevSnap;
+        private int[] _mtpGdnConvIdxDevSnap;
+
+        private void MtpSnapshotRecurrentStateCudaDevice()
+        {
+            int layers = Config.NumLayers;
+            _mtpGdnDeltaDevSnap ??= new Tensor[layers];
+            _mtpGdnConvDevSnap ??= new Tensor[layers];
+            _mtpGdnConvIdxDevSnap ??= new int[layers];
+            for (int l = 0; l < layers; l++)
+            {
+                if (!_isRecurrent[l])
+                    continue;
+                Tensor delta = _deltaStateTensor[l];
+                _mtpGdnDeltaDevSnap[l] ??= new Tensor(_allocator, delta.ElementType, _numVHeads, _headVDim, _headKDim);
+                Ops.Copy(_mtpGdnDeltaDevSnap[l], delta);
+
+                Tensor conv = _cudaGdnConvStateTensor?[l];
+                if (conv != null)
+                {
+                    _mtpGdnConvDevSnap[l] ??= new Tensor(_allocator, conv.ElementType, conv.Sizes[0], conv.Sizes[1]);
+                    Ops.Copy(_mtpGdnConvDevSnap[l], conv);
+                }
+                _mtpGdnConvIdxDevSnap[l] = _convStateWriteIdx[l];
+            }
+        }
+
+        private void MtpRestoreRecurrentStateCudaDevice()
+        {
+            if (_mtpGdnDeltaDevSnap == null)
+                throw new InvalidOperationException("No GDN snapshot to restore.");
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l])
+                    continue;
+                // Ops.Copy is device-to-device and MarkDeviceModified(), so the
+                // recurrence kernel reads the restored device state directly (the
+                // stale host mirror is never re-uploaded over it).
+                Ops.Copy(_deltaStateTensor[l], _mtpGdnDeltaDevSnap[l]);
+                if (_cudaGdnConvStateTensor?[l] != null && _mtpGdnConvDevSnap[l] != null)
+                    Ops.Copy(_cudaGdnConvStateTensor[l], _mtpGdnConvDevSnap[l]);
+                _convStateWriteIdx[l] = _mtpGdnConvIdxDevSnap[l];
             }
         }
 
