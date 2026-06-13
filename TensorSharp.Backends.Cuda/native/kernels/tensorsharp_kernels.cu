@@ -13,10 +13,15 @@
 #define GGML_Q5_1 7
 #define GGML_Q8_0 8
 #define GGML_Q8_1 9
+#define GGML_Q2_K 10
+#define GGML_Q3_K 11
 #define GGML_Q4_K 12
 #define GGML_Q5_K 13
 #define GGML_Q6_K 14
 #define GGML_IQ2_XXS 16
+#define GGML_IQ3_XXS 18
+#define GGML_IQ3_S 21
+#define GGML_IQ2_S 22
 #define TS_QK8_1 32
 
 struct ts_block_q8_1
@@ -69,10 +74,15 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_Q5_1: return (cols / 32) * 24;
         case GGML_Q8_0: return (cols / 32) * 34;
         case GGML_Q8_1: return (cols / 32) * 36;
+        case GGML_Q2_K: return (cols / 256) * 84;
+        case GGML_Q3_K: return (cols / 256) * 110;
         case GGML_Q4_K: return (cols / 256) * 144;
         case GGML_Q5_K: return (cols / 256) * 176;
         case GGML_Q6_K: return (cols / 256) * 210;
         case GGML_IQ2_XXS: return (cols / 256) * 66;
+        case GGML_IQ3_XXS: return (cols / 256) * 98;
+        case GGML_IQ2_S: return (cols / 256) * 82;
+        case GGML_IQ3_S: return (cols / 256) * 110;
         default: return 0;
     }
 }
@@ -244,6 +254,142 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         return d * (float)sc_half[isc + group * 2] * (float)q;
     }
 
+    if (type == GGML_Q2_K)
+    {
+        // block_q2_K: scales[16], qs[64], d (half), dmin (half) = 84 bytes.
+        const uint8_t* block = row + (col / 256) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        float d = __half2float(*reinterpret_cast<const half*>(block + 80));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
+        int t = col & 255;
+        int group128 = t >> 7;       // 0 or 1 (128-element half)
+        int within = t & 127;
+        int j = within >> 5;         // 0..3 -> 2-bit shift = 2*j
+        int pos = within & 31;       // 0..31 byte within the 32-byte chunk
+        int half_sel = pos >> 4;     // 0 or 1 -> scale pair selector
+        int sc_index = group128 * 8 + j * 2 + half_sel;
+        uint8_t sc = scales[sc_index];
+        float dl = d * (float)(sc & 0xF);
+        float ml = dmin * (float)(sc >> 4);
+        uint8_t q = qs[group128 * 32 + pos];
+        int v = (q >> (2 * j)) & 3;
+        return dl * (float)v - ml;
+    }
+
+    if (type == GGML_Q3_K)
+    {
+        // block_q3_K: hmask[32], qs[64], scales[12], d (half) = 110 bytes.
+        const uint8_t* block = row + (col / 256) * 110;
+        const uint8_t* hmask = block;
+        const uint8_t* qs = block + 32;
+        const uint8_t* scales = block + 96;
+        float d_all = __half2float(*reinterpret_cast<const half*>(block + 108));
+        int t = col & 255;
+        int group128 = t >> 7;
+        int within = t & 127;
+        int j = within >> 5;         // 0..3
+        int pos = within & 31;       // 0..31
+        int half_sel = pos >> 4;
+        int sc_index = group128 * 8 + j * 2 + half_sel;
+        int global_j = group128 * 4 + j;
+        int shift = 2 * j;
+
+        // Unpack the 6-bit scale at sc_index from the 12-byte packed layout
+        // (ggml dequantize_row_q3_K aux recombination, evaluated for one index).
+        int aux_idx = sc_index >> 2;
+        int b = sc_index & 3;
+        int sc6;
+        if (aux_idx == 0)
+            sc6 = (scales[b] & 0x0F) | (((scales[8 + b] >> 0) & 3) << 4);
+        else if (aux_idx == 1)
+            sc6 = (scales[4 + b] & 0x0F) | (((scales[8 + b] >> 2) & 3) << 4);
+        else if (aux_idx == 2)
+            sc6 = ((scales[b] >> 4) & 0x0F) | (((scales[8 + b] >> 4) & 3) << 4);
+        else
+            sc6 = ((scales[4 + b] >> 4) & 0x0F) | (((scales[8 + b] >> 6) & 3) << 4);
+        int sc = sc6 - 32;
+
+        uint8_t q = qs[group128 * 32 + pos];
+        int low2 = (q >> shift) & 3;
+        int high = (hmask[pos] & (1 << global_j)) ? 0 : 4;
+        return d_all * (float)sc * (float)(low2 - high);
+    }
+
+    if (type == GGML_IQ3_XXS)
+    {
+        // block_iq3_xxs: d (half), qs[96] = grid indices[64] + scales_and_signs[32].
+        const uint8_t* block = row + (col / 256) * 98;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+        const uint8_t* sas = qs + 64;
+        int t = col & 255;
+        int ib32 = t >> 5;
+        int within = t & 31;
+        int l = within >> 3;         // 0..3
+        int p = within & 7;          // 0..7 position in the 8-element group
+        uint32_t aux32 = read_u32_unaligned(sas + 4 * ib32);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+        uint8_t grid_index = qs[8 * ib32 + 2 * l + (p >= 4 ? 1 : 0)];
+        uint32_t grid = iq3xxs_grid[grid_index];
+        int gv = (int)((grid >> (8 * (p & 3))) & 0xFF);
+        uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        float v = db * (float)gv;
+        return (signs & (1u << p)) ? -v : v;
+    }
+
+    if (type == GGML_IQ2_S)
+    {
+        // block_iq2_s: d (half), qs[64], qh[8], scales[8] = 82 bytes.
+        // qs[0..31] hold grid low bytes, qs[32..63] hold the per-group sign bytes.
+        const uint8_t* block = row + (col / 256) * 82;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+        const uint8_t* qh = block + 66;
+        const uint8_t* signs = qs + 32;
+        const uint8_t* scales = block + 74;
+        int t = col & 255;
+        int ib32 = t >> 5;
+        int within = t & 31;
+        int l = within >> 3;     // 0..3
+        int p = within & 7;      // 0..7
+        int grid_index = qs[ib32 * 4 + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+        uint64_t grid = iq2s_grid[grid_index];
+        int gv = (int)((grid >> (8 * p)) & 0xFF);
+        uint8_t sc = scales[ib32];
+        float db = d * (0.5f + (float)((l < 2) ? (sc & 0xf) : (sc >> 4))) * 0.25f;
+        uint8_t sign_byte = signs[ib32 * 4 + l];
+        float v = db * (float)gv;
+        return (sign_byte & (1u << p)) ? -v : v;
+    }
+
+    if (type == GGML_IQ3_S)
+    {
+        // block_iq3_s: d (half), qs[64], qh[8], signs[32], scales[4] = 110 bytes.
+        const uint8_t* block = row + (col / 256) * 110;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+        const uint8_t* qh = block + 66;
+        const uint8_t* signs = block + 74;
+        const uint8_t* scales = block + 106;
+        int t = col & 255;
+        int ib32 = t >> 5;
+        int within = t & 31;
+        int l = within >> 3;     // 0..3
+        int p = within & 7;      // 0..7 (pos 0..3 -> grid1, 4..7 -> grid2)
+        uint8_t sc = scales[ib32 >> 1];
+        float db = d * (float)(1 + 2 * ((ib32 & 1) ? (sc >> 4) : (sc & 0xf)));
+        int qs_off = 8 * ib32;
+        int grid_index = (p < 4)
+            ? (qs[qs_off + 2 * l + 0] | ((qh[ib32] << (8 - 2 * l)) & 256))
+            : (qs[qs_off + 2 * l + 1] | ((qh[ib32] << (7 - 2 * l)) & 256));
+        uint32_t grid = iq3s_grid[grid_index];
+        int gv = (int)((grid >> (8 * (p & 3))) & 0xFF);
+        uint8_t sign_byte = signs[ib32 * 4 + l];
+        float v = db * (float)gv;
+        return (sign_byte & (1u << p)) ? -v : v;
+    }
+
     return 0.0f;
 }
 
@@ -345,6 +491,16 @@ __device__ __forceinline__ float block_reduce_max(float v)
             v = fmaxf(v, __shfl_down_sync(0xFFFFFFFF, v, offset));
     }
 
+    return v;
+}
+
+// All-lanes warp reduction (every lane receives the full sum) via butterfly shuffle.
+// Used by the GatedDeltaNet kernel where each warp owns one delta-net row and all
+// lanes need the reduced dot product to apply the rank-1 state update.
+__device__ __forceinline__ float warp_allreduce_sum(float v)
+{
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
     return v;
 }
 
@@ -607,6 +763,11 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
     if (h >= num_v_heads)
         return;
 
+    // The delta-net rows of a head are mutually independent: row r reads and writes
+    // only state_head[r, :]. The shared inputs (the normalized conv outputs q/k and
+    // the per-head scalars) are computed once, then every row is processed by its own
+    // warp in parallel. This replaces the old design that walked the rows one at a
+    // time with a full block reduction per row (head_v_dim sequential sync points).
     extern __shared__ float scratch[];
     float* q = scratch;
     float* k = q + head_k_dim;
@@ -616,10 +777,14 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
     __shared__ float k_scale;
     __shared__ float gate_h;
     __shared__ float beta_h;
-    __shared__ float delta_h;
     __shared__ float rms_inv;
 
     int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int num_warps = nthreads >> 5;
+
     int src_h = h % num_k_heads;
     int q_offset = src_h * head_k_dim;
     int k_offset = qk_dim + src_h * head_k_dim;
@@ -633,9 +798,12 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
 
     for (int s = 0; s < seq_len; s++)
     {
+        const float* packed_row = packed + (size_t)s * packed_dim;
+
+        // Causal conv + L2-norm accumulation for the shared q/k vectors.
         float q_sum = 0.0f;
         float k_sum = 0.0f;
-        for (int d = tid; d < head_k_dim; d += blockDim.x)
+        for (int d = tid; d < head_k_dim; d += nthreads)
         {
             float qv = qwen35_gdn_conv_channel(
                 packed, conv_state, conv_w, s, q_offset + d,
@@ -650,61 +818,63 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
         }
 
         q_sum = block_reduce_sum(q_sum);
+        __syncthreads();
         k_sum = block_reduce_sum(k_sum);
         if (tid == 0)
         {
             q_scale = rsqrtf(q_sum + eps) * q_head_scale;
             k_scale = rsqrtf(k_sum + eps);
-            const float* packed_row = packed + (size_t)s * packed_dim;
             gate_h = softplus_f32(packed_row[alpha_offset] + dt_bias[h]) * a_log[h];
             beta_h = sigmoid_f32(packed_row[beta_offset]);
         }
         __syncthreads();
 
-        for (int d = tid; d < head_k_dim; d += blockDim.x)
+        // Normalize the shared q/k and decay the recurrent state in place.
+        float state_scale = expf(gate_h);
+        for (int d = tid; d < head_k_dim; d += nthreads)
         {
             q[d] *= q_scale;
             k[d] *= k_scale;
         }
-        __syncthreads();
-
-        float state_scale = expf(gate_h);
-        for (int i = tid; i < state_per_head; i += blockDim.x)
+        for (int i = tid; i < state_per_head; i += nthreads)
             state_head[i] *= state_scale;
         __syncthreads();
 
-        for (int row = 0; row < head_v_dim; row++)
+        // One warp per row: kv = <state_row, k>, rank-1 update, core = <state_row, q>.
+        // All lanes share the same row, so __shfl broadcasts/reductions are warp-safe.
+        float beta = beta_h;
+        for (int row = warp; row < head_v_dim; row += num_warps)
         {
-            float* state_row = state_head + row * head_k_dim;
+            float* state_row = state_head + (size_t)row * head_k_dim;
             float kv_mem = 0.0f;
-            for (int d = tid; d < head_k_dim; d += blockDim.x)
+            for (int d = lane; d < head_k_dim; d += 32)
                 kv_mem += state_row[d] * k[d];
-            kv_mem = block_reduce_sum(kv_mem);
+            kv_mem = warp_allreduce_sum(kv_mem);
 
-            if (tid == 0)
-            {
-                float v = qwen35_gdn_conv_channel(
+            float vrow;
+            if (lane == 0)
+                vrow = qwen35_gdn_conv_channel(
                     packed, conv_state, conv_w, s, v_offset + row,
                     seq_len, packed_dim, qkv_dim, conv_kernel, conv_write_idx);
-                delta_h = (v - kv_mem) * beta_h;
-            }
-            __syncthreads();
+            vrow = __shfl_sync(0xFFFFFFFF, vrow, 0);
+            float delta = (vrow - kv_mem) * beta;
 
-            for (int d = tid; d < head_k_dim; d += blockDim.x)
-                state_row[d] += k[d] * delta_h;
-            __syncthreads();
-
+            // Fuse the state update with the core dot product to read state once.
             float core_v = 0.0f;
-            for (int d = tid; d < head_k_dim; d += blockDim.x)
-                core_v += state_row[d] * q[d];
-            core_v = block_reduce_sum(core_v);
-            if (tid == 0)
+            for (int d = lane; d < head_k_dim; d += 32)
+            {
+                float sd = state_row[d] + k[d] * delta;
+                state_row[d] = sd;
+                core_v += sd * q[d];
+            }
+            core_v = warp_allreduce_sum(core_v);
+            if (lane == 0)
                 core[row] = core_v;
-            __syncthreads();
         }
+        __syncthreads();
 
         float sum_sq = 0.0f;
-        for (int row = tid; row < head_v_dim; row += blockDim.x)
+        for (int row = tid; row < head_v_dim; row += nthreads)
             sum_sq += core[row] * core[row];
         sum_sq = block_reduce_sum(sum_sq);
         if (tid == 0)
@@ -712,8 +882,7 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
         __syncthreads();
 
         float* out_row = output + (size_t)s * v_dim + h * head_v_dim;
-        const float* packed_row = packed + (size_t)s * packed_dim;
-        for (int row = tid; row < head_v_dim; row += blockDim.x)
+        for (int row = tid; row < head_v_dim; row += nthreads)
         {
             float z = packed_row[z_offset + row];
             out_row[row] = core[row] * rms_inv * ssm_norm[row] * silu(z);
@@ -2303,6 +2472,12 @@ extern "C" __global__ void ts_quant_matmul_f32(
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
 }
 
+// One warp per output column. For batch=1 decode the old design used the whole
+// block to compute 4 outputs with four sequential block-wide reductions (most
+// threads idle since dot_groups = in_dim/32 < blockDim). Giving each warp its own
+// output replaces those block reductions with a single warp shuffle (no
+// __syncthreads), keeps every lane busy, and halves the number of blocks that
+// redundantly re-quantize the activation row.
 extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
     const uint8_t* weights,
     const float* input,
@@ -2311,17 +2486,23 @@ extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
     int out_dim,
     int rows)
 {
-    const int cols_per_block = 4;
-    int out_col0 = blockIdx.x * cols_per_block;
     int row = blockIdx.y;
-    if (out_col0 >= out_dim || row >= rows || (in_dim & 255) != 0)
+    if (row >= rows || (in_dim & 255) != 0)
         return;
+
+    int warps_per_block = blockDim.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
 
     int iq_blocks = in_dim / 256;
     int q8_blocks = in_dim / TS_QK8_1;
     int row_bytes = iq_blocks * (int)sizeof(ts_block_iq2_xxs);
     const float* x_row = input + (size_t)row * in_dim;
 
+    // The whole block quantizes the activation row to q8_1 in shared memory once,
+    // then every warp reuses it. All threads must reach this barrier, so the
+    // out-of-range check happens afterwards.
     extern __shared__ __align__(16) unsigned char shared_q8_bytes[];
     ts_block_q8_1* xq = reinterpret_cast<ts_block_q8_1*>(shared_q8_bytes);
 
@@ -2329,50 +2510,24 @@ extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
         quantize_q8_1_block(x_row + (size_t)qb * TS_QK8_1, xq + qb);
     __syncthreads();
 
-    const uint8_t* w_row0 = weights + (size_t)(out_col0 + 0) * row_bytes;
-    const uint8_t* w_row1 = out_col0 + 1 < out_dim ? weights + (size_t)(out_col0 + 1) * row_bytes : 0;
-    const uint8_t* w_row2 = out_col0 + 2 < out_dim ? weights + (size_t)(out_col0 + 2) * row_bytes : 0;
-    const uint8_t* w_row3 = out_col0 + 3 < out_dim ? weights + (size_t)(out_col0 + 3) * row_bytes : 0;
+    if (out_col >= out_dim)
+        return;
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    float acc2 = 0.0f;
-    float acc3 = 0.0f;
+    const uint8_t* w_row = weights + (size_t)out_col * row_bytes;
     int dot_groups = iq_blocks * 8;
-    for (int g = threadIdx.x; g < dot_groups; g += blockDim.x)
+    float acc = 0.0f;
+    for (int g = lane; g < dot_groups; g += 32)
     {
         int ib = g >> 3;
         int group = g & 7;
-        const ts_block_q8_1* q8_block = xq + ib * 8;
-        int block_offset = ib * (int)sizeof(ts_block_iq2_xxs);
-
-        acc0 += dot_iq2_xxs_q8_1(w_row0 + block_offset, q8_block, group);
-        if (w_row1 != 0)
-            acc1 += dot_iq2_xxs_q8_1(w_row1 + block_offset, q8_block, group);
-        if (w_row2 != 0)
-            acc2 += dot_iq2_xxs_q8_1(w_row2 + block_offset, q8_block, group);
-        if (w_row3 != 0)
-            acc3 += dot_iq2_xxs_q8_1(w_row3 + block_offset, q8_block, group);
+        acc += dot_iq2_xxs_q8_1(w_row + ib * (int)sizeof(ts_block_iq2_xxs), xq + ib * 8, group);
     }
 
-    acc0 = block_reduce_sum(acc0);
-    if (threadIdx.x == 0)
-        output[(size_t)row * out_dim + out_col0] = acc0;
-    __syncthreads();
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
 
-    acc1 = block_reduce_sum(acc1);
-    if (threadIdx.x == 0 && w_row1 != 0)
-        output[(size_t)row * out_dim + out_col0 + 1] = acc1;
-    __syncthreads();
-
-    acc2 = block_reduce_sum(acc2);
-    if (threadIdx.x == 0 && w_row2 != 0)
-        output[(size_t)row * out_dim + out_col0 + 2] = acc2;
-    __syncthreads();
-
-    acc3 = block_reduce_sum(acc3);
-    if (threadIdx.x == 0 && w_row3 != 0)
-        output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+    if (lane == 0)
+        output[(size_t)row * out_dim + out_col] = acc;
 }
 
 extern "C" __global__ void ts_quant_matmul_q4_0_f32(

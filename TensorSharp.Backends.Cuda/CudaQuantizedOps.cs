@@ -36,10 +36,15 @@ namespace TensorSharp.Cuda
                 ggmlType == 7 ||     // Q5_1
                 ggmlType == 8 ||     // Q8_0
                 ggmlType == 9 ||     // Q8_1
+                ggmlType == 10 ||    // Q2_K
+                ggmlType == 11 ||    // Q3_K
                 ggmlType == 12 ||    // Q4_K
                 ggmlType == 13 ||    // Q5_K
                 ggmlType == 14 ||    // Q6_K
-                ggmlType == 16;      // IQ2_XXS
+                ggmlType == 16 ||    // IQ2_XXS
+                ggmlType == 18 ||    // IQ3_XXS
+                ggmlType == 21 ||    // IQ3_S
+                ggmlType == 22;      // IQ2_S
         }
 
         public static void PreloadQuantizedWeight(

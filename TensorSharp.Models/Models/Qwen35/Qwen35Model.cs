@@ -17,6 +17,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.MLX;
 
@@ -1905,7 +1906,10 @@ namespace TensorSharp.Models
             }
             else if (seqLen == 1)
             {
-                if (_backend == BackendType.Mlx)
+                // The in-place CPU RoPE reads Q/K to the host (a draining sync on
+                // MLX/CUDA). Those backends use the on-device prefill RoPE instead so
+                // the whole attention block stays resident on the GPU.
+                if (_backend == BackendType.Mlx || _backend == BackendType.Cuda)
                 {
                     qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
                     kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
@@ -1985,8 +1989,21 @@ namespace TensorSharp.Models
                     if (!cacheCopied)
                         CopyToCacheDecode(_kvCacheK[layer], kTensor, _kvCacheV[layer], vTensor,
                             numKVHeads, headDim, startPos);
-                    AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
-                        attnOutput, numHeads, numKVHeads, headDim, totalSeqLen, attentionScale);
+
+                    // Direct-CUDA GQA decode attention runs entirely on the GPU, reading
+                    // the (head-first) KV cache in place. The legacy AttentionDecodePureCS
+                    // path copies the whole allocated cache to the host every layer (a 4 MB
+                    // DtoH that drains the pipeline 16x per token) and computes attention on
+                    // the CPU — by far the dominant per-token stall on the cuda backend.
+                    bool cudaAttn = _backend == BackendType.Cuda &&
+                        CudaFusedOps.TryGqaDecodeAttention(
+                            attnOutput, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                            numHeads, numKVHeads, headDim,
+                            0, totalSeqLen, maxSeqLen, false, attentionScale);
+
+                    if (!cudaAttn)
+                        AttentionDecodePureCS(qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                            attnOutput, numHeads, numKVHeads, headDim, totalSeqLen, attentionScale);
                 }
 
                 kTensor.Dispose();
@@ -2194,7 +2211,7 @@ namespace TensorSharp.Models
             // Decode hot path: do the sigmoid-gated mix on CPU. The data is tiny
             // (single row, numHeads * headDim floats) so the GPU dispatch overhead
             // dominates. Eliminates one Metal command buffer per attention layer.
-            if (seqLen == 1 && _backend != BackendType.Mlx && attnOutput != null && gateTensor != null
+            if (seqLen == 1 && _backend != BackendType.Mlx && _backend != BackendType.Cuda && attnOutput != null && gateTensor != null
                 && attnOutput.ElementType == DType.Float32 && gateTensor.ElementType == DType.Float32)
                 ApplySigmoidGateCpu(attnOutput, gateTensor);
             else
@@ -2912,7 +2929,11 @@ namespace TensorSharp.Models
             // device→host copy. With 4 syncs/attn-layer × 60 layers that's a
             // lot of round trips, so stay on device for MLX. Other backends
             // keep the CPU SIMD fast path which saves 2 GPU dispatches.
-            if (seqLen == 1 && _backend != BackendType.Mlx)
+            // CPU SIMD norm avoids a GPU dispatch for tiny decode tensors, but on
+            // backends where reading the data to host forces a pipeline-draining
+            // sync (MLX mlx_eval, direct CUDA cuMemcpyDtoH) the round trip costs far
+            // more than the dispatch. Keep those on the device.
+            if (seqLen == 1 && _backend != BackendType.Mlx && _backend != BackendType.Cuda)
             {
                 RMSNormInPlaceCpu(data, alpha, numHeads, headDim, Config.Eps);
                 return data;

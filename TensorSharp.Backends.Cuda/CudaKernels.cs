@@ -8,6 +8,11 @@ namespace TensorSharp.Cuda
     {
         private const int BlockSize = 256;
 
+        // The GatedDeltaNet kernel assigns one warp per delta-net row, so a wider
+        // block processes more rows concurrently (head_v_dim / num_warps passes).
+        // 512 threads = 16 warps keeps occupancy high without exhausting shared mem.
+        private const int GdnBlockSize = 512;
+
         private readonly CudaModule module;
         private readonly IntPtr fillF32;
         private readonly IntPtr fillF16;
@@ -325,7 +330,7 @@ namespace TensorSharp.Cuda
                 &headKDimArg, &headVDimArg, &convKernelArg, &convWriteIdxArg, &epsArg
             };
             uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
-            Launch(qwen35GdnPackedF32, (uint)numVHeads, 1, 1, BlockSize, 1, 1, sharedBytes, stream, args);
+            Launch(qwen35GdnPackedF32, (uint)numVHeads, 1, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
 
             int convDim = convKernel - 1;
             if (convDim <= 0)
@@ -1196,7 +1201,9 @@ namespace TensorSharp.Cuda
             int outDimArg = outDim;
             int rowsArg = rows;
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
-            uint gridX = (uint)((outDim + 3) / 4);
+            // One warp per output column; BlockSize/32 outputs per block.
+            uint warpsPerBlock = (uint)(BlockSize >> 5);
+            uint gridX = ((uint)outDim + warpsPerBlock - 1) / warpsPerBlock;
             uint sharedBytes = checked((uint)((inDim / 32) * 36));
             Launch(quantMatmulIq2XxsQ81F32, gridX, (uint)rows, 1, BlockSize, 1, 1, sharedBytes, stream, args);
         }
