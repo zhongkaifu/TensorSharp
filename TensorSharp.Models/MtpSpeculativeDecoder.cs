@@ -28,7 +28,7 @@ namespace TensorSharp.Models
     /// </summary>
     public sealed class MtpSpeculativeDecoder
     {
-        private readonly Qwen35Model _model;
+        private readonly IMtpSpeculativeModel _model;
         private readonly MtpSpeculativeExecution _exec;
         private readonly int _vocab;
         private readonly List<int> _acceptedScratch = new();
@@ -73,7 +73,7 @@ namespace TensorSharp.Models
         // first low-confidence token, so a longer window only extends confident
         // streaks — measured 1.21x vs 1.08x (window 4) on Qwen3.6-35B-A3B
         // ggml_cpu at unchanged 86% acceptance; neutral on 27B ggml_cuda.
-        public MtpSpeculativeDecoder(Qwen35Model model, int maxDraftTokens = 8)
+        public MtpSpeculativeDecoder(IMtpSpeculativeModel model, int maxDraftTokens = 8)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             _exec = new MtpSpeculativeExecution(model, maxDraftTokens);

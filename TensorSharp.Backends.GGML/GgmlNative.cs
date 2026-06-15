@@ -1104,6 +1104,98 @@ internal enum GgmlIndexReductionOp
             IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4ModelVerify(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int numTokens,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int startPos,
+            float eps,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4DraftStep(
+            int token, IntPtr hPrev, int fixedPos,
+            int backbone, int draftHidden, int numDLayers, int numHeads, int vocab,
+            float eps, int kvCacheType,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            IntPtr tgtTokEmbd, int tteType, long tteNe0, long tteNe1, long tteBytes,
+            IntPtr nextnPre, int npreType, long npreNe0, long npreNe1, long npreBytes,
+            IntPtr nextnPost, int npostType, long npostNe0, long npostNe1, long npostBytes,
+            IntPtr draftTokEmbd, int dteType, long dteNe0, long dteNe1, long dteBytes,
+            IntPtr outputNormW,
+            IntPtr[] attnNormArr, IntPtr[] wqArr, int[] wqType, long[] wqNe0, long[] wqNe1, long[] wqBytes,
+            IntPtr[] qNormArr, IntPtr[] woArr, int[] woType, long[] woNe0, long[] woNe1, long[] woBytes,
+            IntPtr[] postAttnNormArr, IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateType, long[] gateNe0, long[] gateNe1, long[] gateBytes,
+            IntPtr[] upArr, int[] upType, long[] upNe0, long[] upNe1, long[] upBytes,
+            IntPtr[] downArr, int[] downType, long[] downNe0, long[] downNe1, long[] downBytes,
+            IntPtr[] postFfwNormArr, float[] outScaleArr,
+            int[] hdArr, int[] kvHeadsArr, int[] isLocalArr, float[] ropeBaseArr, int[] ropeDimsArr,
+            IntPtr[] donorKArr, IntPtr[] donorVArr, int[] donorCacheSizeArr,
+            IntPtr logitsOut, IntPtr hOut);
+
+        /// <summary>Fused Gemma 4 MTP draft step. Returns false (no throw) when the
+        /// native kernel declines (e.g. fixed_pos past the donor SWA window) so the
+        /// caller falls back to the per-op draft.</summary>
+        public static unsafe bool Gemma4DraftStep(
+            int token, IntPtr hPrev, int fixedPos,
+            int backbone, int draftHidden, int numDLayers, int numHeads, int vocab,
+            float eps, int kvCacheType,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            IntPtr tgtTokEmbd, int tteType, long tteNe0, long tteNe1, long tteBytes,
+            IntPtr nextnPre, int npreType, long npreNe0, long npreNe1, long npreBytes,
+            IntPtr nextnPost, int npostType, long npostNe0, long npostNe1, long npostBytes,
+            IntPtr draftTokEmbd, int dteType, long dteNe0, long dteNe1, long dteBytes,
+            IntPtr outputNormW,
+            IntPtr[] attnNormArr, IntPtr[] wqArr, int[] wqType, long[] wqNe0, long[] wqNe1, long[] wqBytes,
+            IntPtr[] qNormArr, IntPtr[] woArr, int[] woType, long[] woNe0, long[] woNe1, long[] woBytes,
+            IntPtr[] postAttnNormArr, IntPtr[] ffnNormArr,
+            IntPtr[] gateArr, int[] gateType, long[] gateNe0, long[] gateNe1, long[] gateBytes,
+            IntPtr[] upArr, int[] upType, long[] upNe0, long[] upNe1, long[] upBytes,
+            IntPtr[] downArr, int[] downType, long[] downNe0, long[] downNe1, long[] downBytes,
+            IntPtr[] postFfwNormArr, float[] outScaleArr,
+            int[] hdArr, int[] kvHeadsArr, int[] isLocalArr, float[] ropeBaseArr, int[] ropeDimsArr,
+            IntPtr[] donorKArr, IntPtr[] donorVArr, int[] donorCacheSizeArr,
+            IntPtr logitsOut, IntPtr hOut)
+        {
+            int r = TSGgml_Gemma4DraftStep(
+                token, hPrev, fixedPos,
+                backbone, draftHidden, numDLayers, numHeads, vocab,
+                eps, kvCacheType,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                tgtTokEmbd, tteType, tteNe0, tteNe1, tteBytes,
+                nextnPre, npreType, npreNe0, npreNe1, npreBytes,
+                nextnPost, npostType, npostNe0, npostNe1, npostBytes,
+                draftTokEmbd, dteType, dteNe0, dteNe1, dteBytes,
+                outputNormW,
+                attnNormArr, wqArr, wqType, wqNe0, wqNe1, wqBytes,
+                qNormArr, woArr, woType, woNe0, woNe1, woBytes,
+                postAttnNormArr, ffnNormArr,
+                gateArr, gateType, gateNe0, gateNe1, gateBytes,
+                upArr, upType, upNe0, upNe1, upBytes,
+                downArr, downType, downNe0, downNe1, downBytes,
+                postFfwNormArr, outScaleArr,
+                hdArr, kvHeadsArr, isLocalArr, ropeBaseArr, ropeDimsArr,
+                donorKArr, donorVArr, donorCacheSizeArr,
+                logitsOut, hOut);
+            if (r == 0 && Environment.GetEnvironmentVariable("TS_GGML_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[gemma4-draft FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs desc);
 
         public static void Gemma4MoELayerDecode(in Gemma4MoELayerDecodeArgs desc)
@@ -2432,6 +2524,50 @@ internal enum GgmlIndexReductionOp
                 plePostNormArr, kvCacheType,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr), "gemma4_model_decode");
+        }
+
+        /// <summary>Fused multi-token verify (the speculative trunk's verify batch).
+        /// Returns false (without throwing) when the native kernel declines (e.g.
+        /// total length exceeds the SWA window) so the caller can fall back to the
+        /// per-op path.</summary>
+        public static bool Gemma4ModelVerify(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int numTokens,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int startPos, float eps,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen, int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr)
+        {
+            int r = TSGgml_Gemma4ModelVerify(
+                hiddenData, hiddenSize, numLayers, numTokens,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, startPos, eps,
+                ropeFreqFactors, ropeFreqFactorsLen, ropeNDimsArr,
+                kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr);
+            if (r == 0 && Environment.GetEnvironmentVariable("TS_GGML_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[gemma4-verify FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
         }
 
         public static void GatedDeltaNetChunked(

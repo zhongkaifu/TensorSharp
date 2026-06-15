@@ -76,6 +76,32 @@ namespace TensorSharp.Server
                     _loadedMmProjPath = mmProjPath;
                 }
 
+                // Gemma 4 MTP: the draft head ships as a SEPARATE GGUF
+                // (gemma4-assistant). Load it onto the target so HasMtp turns on
+                // and --mtp-spec engages. (Qwen3.6 embeds its NextN block in the
+                // trunk and needs no separate file.)
+                string mtpDraftPath = Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL");
+                if (!string.IsNullOrEmpty(mtpDraftPath) && _model is Gemma4Model g4)
+                {
+                    if (!File.Exists(mtpDraftPath))
+                    {
+                        _logger.LogWarning("MTP draft model not found: {Path}; speculation disabled.", mtpDraftPath);
+                    }
+                    else
+                    {
+                        try
+                        {
+                            g4.LoadMtpDraftWeights(mtpDraftPath);
+                            _logger.LogInformation("Loaded Gemma 4 MTP draft head {Draft} (HasMtp={HasMtp})",
+                                Path.GetFileName(mtpDraftPath), g4.HasMtp);
+                        }
+                        catch (Exception mtpEx)
+                        {
+                            _logger.LogWarning(mtpEx, "Failed to load MTP draft {Path}; speculation disabled.", mtpDraftPath);
+                        }
+                    }
+                }
+
                 loadSw.Stop();
                 long modelBytes = SafeGetFileSize(modelPath);
                 long mmProjBytes = SafeGetFileSize(mmProjPath);

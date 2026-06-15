@@ -2127,6 +2127,50 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Fused MULTI-TOKEN trunk forward (the speculative verify batch): runs the
+        /// whole dense transformer over <paramref name="n"/> tokens at positions
+        /// [<paramref name="startPos"/>, startPos+n) as ONE GGML graph (the
+        /// multi-token sibling of <see cref="NativeGemma4ModelDecode"/>).
+        /// <paramref name="hidden"/> is [n, hidden_size] in/out — on return it holds
+        /// the layer-stack output (pre output_norm) for all n rows. Returns false
+        /// (caller falls back to the per-op path) when the native kernel declines —
+        /// e.g. total length exceeds the SWA window so the circular cache has wrapped.
+        /// </summary>
+        private unsafe bool NativeGemma4ModelVerify(Tensor hidden, int startPos, int n)
+        {
+            if (_decodeArrays == null) return false;
+            var a = _decodeArrays;
+
+            float* hiddenPtr = GetFloatPtr(hidden);
+
+            IntPtr freqFactorsPtr = IntPtr.Zero;
+            int freqFactorsLen = 0;
+            if (_weights.TryGetValue("rope_freqs.weight", out var freqTensor))
+            {
+                freqFactorsPtr = (IntPtr)GetFloatPtr(freqTensor);
+                freqFactorsLen = (int)freqTensor.ElementCount();
+            }
+
+            return GgmlBasicOps.Gemma4ModelVerify(
+                (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers, n,
+                a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                a.O, a.PostAttnNorm,
+                a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                a.KCache, a.VCache,
+                a.HeadDim, a.KvHeads, a.CacheSize, a.IsLocal,
+                a.RopeBase, a.LayerScalar,
+                a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                a.OType, a.ONe0, a.ONe1, a.OBytes,
+                a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                Config.NumHeads, startPos, Config.Eps,
+                freqFactorsPtr, freqFactorsLen, a.RopeNDims,
+                _kvCacheDtype.GgmlType(),
+                a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+        }
+
+        /// <summary>
         /// Decode (seqLen == 1) one entire Gemma 4 MoE transformer block as a
         /// single fused GGML graph: attention (norm → QKV → QK/V-norm → RoPE →
         /// KV-cache write → flash attention → O-proj → post-attn-norm → residual)

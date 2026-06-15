@@ -129,15 +129,28 @@ namespace TensorSharp.Models
             for (int s = 0; s < numSeqs; s++)
                 seqLens[s] = ctx.Sequences[s].NumComputedTokens + ctx.NumScheduledTokens[s];
 
-            int[] flatTokens = new int[numTokens];
-            int cursor = 0;
-            for (int s = 0; s < numSeqs; s++)
+            // Speculative verify batches forward drafted tokens that are not (yet)
+            // in the sequence's token list, so the caller supplies them directly.
+            int[] flatTokens;
+            if (ctx.OverrideFlatTokens != null)
             {
-                var seq = ctx.Sequences[s];
-                int startTok = seq.NumComputedTokens;
-                int take = ctx.NumScheduledTokens[s];
-                for (int i = 0; i < take; i++)
-                    flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                if (ctx.OverrideFlatTokens.Length != numTokens)
+                    throw new ArgumentException(
+                        $"OverrideFlatTokens length {ctx.OverrideFlatTokens.Length} != numTokens {numTokens}.");
+                flatTokens = ctx.OverrideFlatTokens;
+            }
+            else
+            {
+                flatTokens = new int[numTokens];
+                int cursor = 0;
+                for (int s = 0; s < numSeqs; s++)
+                {
+                    var seq = ctx.Sequences[s];
+                    int startTok = seq.NumComputedTokens;
+                    int take = ctx.NumScheduledTokens[s];
+                    for (int i = 0; i < take; i++)
+                        flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                }
             }
             var (blockTableFlat, blockTableOffsets) = FlattenBlockTables(ctx.BlockTables);
 
@@ -343,9 +356,44 @@ namespace TensorSharp.Models
 
             perLayerInputs?.Dispose();
 
-            // Final norm + per-sequence LM head.
+            // Final norm + LM head.
             Tensor finalNormed = RMSNormOp(hiddenStates, "output_norm.weight");
             hiddenStates.Dispose();
+
+            string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
+            int vocab = Config.VocabSize;
+
+            // MTP speculative trunk: capture every row's post-final-norm hidden
+            // (h_nextn) and/or every row's logits, instead of just the last token
+            // per sequence. The verify batch is one sequence with K+1 rows.
+            if (ctx.CaptureHiddenAll != null)
+            {
+                float[] hAll = finalNormed.GetElementsAsFloat(numTokens * hidden);
+                Array.Copy(hAll, 0, ctx.CaptureHiddenAll, 0,
+                    Math.Min(hAll.Length, ctx.CaptureHiddenAll.Length));
+            }
+            if (ctx.CaptureLogitsAll != null)
+            {
+                Tensor allLogitsT = LinearForward(finalNormed, outputWeight);
+                finalNormed.Dispose();
+                if (_finalLogitSoftcap > 0f)
+                    ApplyLogitSoftcap(allLogitsT);
+                float[] allRows = allLogitsT.GetElementsAsFloat(numTokens * vocab);
+                allLogitsT.Dispose();
+                Array.Copy(allRows, 0, ctx.CaptureLogitsAll, 0,
+                    Math.Min(allRows.Length, ctx.CaptureLogitsAll.Length));
+
+                var perSeqAll = new float[numSeqs][];
+                for (int s = 0; s < numSeqs; s++)
+                {
+                    int lastRow = queryStartLoc[s + 1] - 1;
+                    var slice = new float[vocab];
+                    Buffer.BlockCopy(allRows, lastRow * vocab * sizeof(float),
+                                     slice, 0, vocab * sizeof(float));
+                    perSeqAll[s] = slice;
+                }
+                return perSeqAll;
+            }
 
             float[] finalFlat = finalNormed.GetElementsAsFloat(numTokens * hidden);
             finalNormed.Dispose();
@@ -353,22 +401,21 @@ namespace TensorSharp.Models
                 finalFlat, hidden, queryStartLoc, numSeqs);
             Tensor lastHidden = CreateFloatTensor(lastTokensPacked, numSeqs, hidden);
 
-            string outputWeight = _hasTiedOutput ? "token_embd.weight" : "output.weight";
             Tensor logitsTensor = LinearForward(lastHidden, outputWeight);
             lastHidden.Dispose();
 
             if (_finalLogitSoftcap > 0f)
                 ApplyLogitSoftcap(logitsTensor);
 
-            float[] allLogits = logitsTensor.GetElementsAsFloat(numSeqs * Config.VocabSize);
+            float[] allLogits = logitsTensor.GetElementsAsFloat(numSeqs * vocab);
             logitsTensor.Dispose();
 
             var perSeq = new float[numSeqs][];
             for (int s = 0; s < numSeqs; s++)
             {
-                var slice = new float[Config.VocabSize];
-                Buffer.BlockCopy(allLogits, s * Config.VocabSize * sizeof(float),
-                                 slice, 0, Config.VocabSize * sizeof(float));
+                var slice = new float[vocab];
+                Buffer.BlockCopy(allLogits, s * vocab * sizeof(float),
+                                 slice, 0, vocab * sizeof(float));
                 perSeq[s] = slice;
             }
             return perSeq;

@@ -208,6 +208,17 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
+                // Path to a SEPARATE draft GGUF for models whose MTP draft head
+                // ships as its own file (Gemma 4's "gemma4-assistant"). Qwen3.6
+                // embeds the NextN block in the trunk GGUF and needs no such flag.
+                if (TryReadOption(args, ref i, "--mtp-draft-model", out string draftModelOpt))
+                {
+                    if (string.IsNullOrWhiteSpace(draftModelOpt) || !File.Exists(draftModelOpt))
+                        throw new ArgumentException($"--mtp-draft-model file not found: '{draftModelOpt}'.");
+                    Environment.SetEnvironmentVariable("TS_MTP_DRAFT_MODEL", draftModelOpt);
+                    changed = true;
+                    continue;
+                }
             }
             return changed;
         }
@@ -458,7 +469,8 @@ namespace TensorSharp.Server.Hosting
                     continue;
                 }
                 if (TryReadOption(args, ref i, "--mtp-draft", out _)
-                    || TryReadOption(args, ref i, "--mtp-pmin", out _))
+                    || TryReadOption(args, ref i, "--mtp-pmin", out _)
+                    || TryReadOption(args, ref i, "--mtp-draft-model", out _))
                 {
                     continue;
                 }
@@ -500,7 +512,7 @@ namespace TensorSharp.Server.Hosting
                 "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching",
-                "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin",
+                "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
             };
             string best = null;
             int bestDist = int.MaxValue;

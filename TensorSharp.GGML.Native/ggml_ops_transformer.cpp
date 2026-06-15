@@ -1932,6 +1932,621 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 }
 
 // ============================================================================
+// Fused MULTI-TOKEN verify (seqLen == num_tokens > 1): runs the whole dense
+// Gemma 4 transformer over a small batch of tokens [start_pos, start_pos+N) as
+// ONE GGML graph — the speculative-decoding verify. The single-token decode
+// kernel above (TSGgml_Gemma4ModelDecode) is the only thing fast enough to beat
+// the per-op verify, and it is seqLen==1 only; this is its multi-token sibling.
+//
+// Simplifications vs the decode kernel, all enforced by the C# caller's gate
+// (Gemma4Model.NativeGemma4ModelVerify): dense only (no MoE), no PLE, no KV
+// donor/sharing, and total_seq_len = start_pos + N <= the (smallest) cache size
+// (the SWA window). The last condition means the SWA cache has NOT wrapped, so
+// every query's window covers [0, total_seq_len) and attention is PURE CAUSAL —
+// no circular-window gymnastics, one ggml_diag_mask_inf(start_pos) mask. The
+// caller still owns the post-final-norm + LM head; this returns the per-row
+// hidden state [hidden_size, N] (the layer-stack output, pre output_norm).
+// ============================================================================
+TSG_EXPORT int TSGgml_Gemma4ModelVerify(
+    float* hidden_data, int hidden_size, int num_layers, int num_tokens,
+    void** attn_norm_arr, void** qkv_arr,
+    void** q_norm_arr, void** k_norm_arr,
+    void** o_arr, void** post_attn_norm_arr,
+    void** ffn_norm_arr, void** gu_arr, void** down_arr, void** post_ffn_norm_arr,
+    void** k_cache_arr, void** v_cache_arr,
+    int* head_dim_arr, int* kv_heads_arr, int* cache_size_arr, int* is_local_arr,
+    float* rope_base_arr, float* layer_scalar_arr,
+    int* qkv_type_arr, std::int64_t* qkv_ne0_arr, std::int64_t* qkv_ne1_arr, std::int64_t* qkv_bytes_arr,
+    int* o_type_arr, std::int64_t* o_ne0_arr, std::int64_t* o_ne1_arr, std::int64_t* o_bytes_arr,
+    int* gu_type_arr, std::int64_t* gu_ne0_arr, std::int64_t* gu_ne1_arr, std::int64_t* gu_bytes_arr,
+    int* down_type_arr, std::int64_t* down_ne0_arr, std::int64_t* down_ne1_arr, std::int64_t* down_bytes_arr,
+    int num_heads, int start_pos,
+    float eps,
+    float* rope_freq_factors, int rope_freq_factors_len,
+    int* rope_n_dims_arr,
+    int kv_cache_type,
+    void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+
+        const int N = num_tokens;
+        const int totalSeqLen = start_pos + N;
+        if (N <= 1)
+            return 0;
+
+        struct LayerInfo { int hd; int kvHeads; int qDim; int kDim; int cacheSize; bool isLocal; };
+        std::vector<LayerInfo> li(num_layers);
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& info = li[l];
+            info.hd = head_dim_arr[l];
+            info.kvHeads = kv_heads_arr[l];
+            info.qDim = num_heads * info.hd;
+            info.kDim = info.kvHeads * info.hd;
+            info.cacheSize = cache_size_arr[l];
+            info.isLocal = is_local_arr[l] != 0;
+            // Global (full-attention) layers use a linear cache that must cover the
+            // whole sequence (the C# caller grows it via EnsureCacheCapacity). SWA
+            // (local) layers use a circular window cache and are handled at any
+            // length below (windowed read + wrap-aware write).
+            if (!info.isLocal && totalSeqLen > info.cacheSize)
+                return 0;
+        }
+
+        const std::size_t ctx_size = 32 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for Gemma4 model verify.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        ggml_tensor* current = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, N);
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+
+        ggml_tensor* freq_factors_t = nullptr;
+        if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
+            freq_factors_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rope_freq_factors_len);
+
+        struct LayerTensors {
+            ggml_tensor* attn_norm_w; ggml_tensor* qkv_w; ggml_tensor* k_w; ggml_tensor* v_w;
+            ggml_tensor* q_norm_w; ggml_tensor* k_norm_w; ggml_tensor* o_w; ggml_tensor* post_attn_norm_w;
+            ggml_tensor* ffn_norm_w; ggml_tensor* gu_w; ggml_tensor* down_w; ggml_tensor* post_ffn_norm_w;
+            ggml_tensor* k_cached_t; ggml_tensor* v_cached_t;
+            ggml_tensor* k_cpy; ggml_tensor* v_cpy;     // primary cache write
+            ggml_tensor* k_cpy2; ggml_tensor* v_cpy2;   // wrapped tail (circular SWA write past the buffer end)
+        };
+        std::vector<LayerTensors> layers(num_layers);
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+            lt.attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.qkv_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(qkv_type_arr[l]), qkv_ne0_arr[l], qkv_ne1_arr[l]);
+            const bool separate_qkv = (k_arr != nullptr && k_arr[l] != nullptr);
+            if (separate_qkv)
+            {
+                lt.k_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(k_type_arr[l]), k_ne0_arr[l], k_ne1_arr[l]);
+                lt.v_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(v_type_arr[l]), v_ne0_arr[l], v_ne1_arr[l]);
+            }
+            else { lt.k_w = nullptr; lt.v_w = nullptr; }
+            lt.q_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
+            lt.k_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, info.hd);
+            lt.o_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(o_type_arr[l]), o_ne0_arr[l], o_ne1_arr[l]);
+            lt.post_attn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.gu_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gu_type_arr[l]), gu_ne0_arr[l], gu_ne1_arr[l]);
+            lt.down_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type_arr[l]), down_ne0_arr[l], down_ne1_arr[l]);
+            lt.post_ffn_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            lt.k_cached_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, info.cacheSize, info.kvHeads);
+            lt.v_cached_t = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, info.cacheSize, info.kvHeads);
+            lt.k_cpy = nullptr; lt.v_cpy = nullptr; lt.k_cpy2 = nullptr; lt.v_cpy2 = nullptr;
+        }
+
+        ggml_tensor* hidden = current;
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+            float rope_base = rope_base_arr[l];
+
+            // attn norm
+            ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), lt.attn_norm_w);  // [hidden, N]
+
+            // QKV projection -> [qDim, N], [kDim, N], [kDim, N]
+            ggml_tensor* q_lin; ggml_tensor* k_lin; ggml_tensor* v_lin;
+            if (lt.k_w != nullptr)
+            {
+                q_lin = ggml_mul_mat(ctx, lt.qkv_w, normed);
+                k_lin = ggml_mul_mat(ctx, lt.k_w, normed);
+                v_lin = ggml_mul_mat(ctx, lt.v_w, normed);
+            }
+            else
+            {
+                ggml_tensor* qkv = ggml_mul_mat(ctx, lt.qkv_w, normed);  // [qDim+2kDim, N]
+                q_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.qDim, N, qkv->nb[1], 0));
+                k_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, N, qkv->nb[1],
+                    static_cast<std::size_t>(info.qDim) * sizeof(float)));
+                v_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, N, qkv->nb[1],
+                    static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float)));
+            }
+
+            // per-head Q/K norm, V norm (unweighted)
+            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_lin, info.hd, num_heads, N);
+            ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_lin, info.hd, info.kvHeads, N);
+            ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_lin, info.hd, info.kvHeads, N);
+            q_3d = ggml_mul(ctx, ggml_rms_norm(ctx, q_3d, eps), lt.q_norm_w);
+            k_3d = ggml_mul(ctx, ggml_rms_norm(ctx, k_3d, eps), lt.k_norm_w);
+            v_3d = ggml_rms_norm(ctx, v_3d, eps);
+
+            // RoPE (NeoX mode 2) over the N positions
+            int rope_dims = rope_n_dims_arr[l];
+            ggml_tensor* rope_ff = info.isLocal ? nullptr : freq_factors_t;
+            ggml_tensor* q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff,
+                rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, num_heads, N]
+            ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff,
+                rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, kvHeads, N]
+
+            // Write N new K/V. Global: linear at start_pos. SWA: circular at
+            // start_pos % cacheSize, split into two cpy ops if it wraps the buffer.
+            ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));  // [hd, N, kvHeads]
+            ggml_tensor* v_write = ggml_cont(ctx, ggml_permute(ctx, v_3d, 0, 2, 1, 3));     // [hd, N, kvHeads]
+            const int cacheBase = info.isLocal ? (start_pos % info.cacheSize) : start_pos;
+            const int n1 = (info.isLocal && cacheBase + N > info.cacheSize) ? (info.cacheSize - cacheBase) : N;
+            auto writePart = [&](ggml_tensor* cache, ggml_tensor* src, int srcOff, int dstSlot, int cnt) -> ggml_tensor* {
+                ggml_tensor* s = ggml_view_3d(ctx, src, info.hd, cnt, info.kvHeads,
+                    src->nb[1], src->nb[2], static_cast<std::size_t>(srcOff) * src->nb[1]);
+                ggml_tensor* d = ggml_view_3d(ctx, cache, info.hd, cnt, info.kvHeads,
+                    cache->nb[1], cache->nb[2], static_cast<std::size_t>(dstSlot) * cache->nb[1]);
+                return ggml_cpy(ctx, s, d);
+            };
+            lt.k_cpy = writePart(lt.k_cached_t, k_write, 0, cacheBase, n1);
+            lt.v_cpy = writePart(lt.v_cached_t, v_write, 0, cacheBase, n1);
+            if (n1 < N)
+            {
+                lt.k_cpy2 = writePart(lt.k_cached_t, k_write, n1, 0, N - n1);
+                lt.v_cpy2 = writePart(lt.v_cached_t, v_write, n1, 0, N - n1);
+            }
+
+            // Read the attention window. SWA: the last min(totalSeqLen, W) positions
+            // (view_kv_cache_window unwraps the circular buffer). Global: [0, total).
+            const int attendLen = info.isLocal ? std::min(totalSeqLen, info.cacheSize) : totalSeqLen;
+            const int activeStart = info.isLocal ? ((totalSeqLen - attendLen) % info.cacheSize) : 0;
+            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+            if (k_full == nullptr || v_full == nullptr)
+            {
+                set_last_error("Failed to create Gemma4 verify KV cache views.");
+                return 0;
+            }
+
+            // Manual masked attention (Gemma scale = 1.0). The window view holds
+            // chronological positions [totalSeqLen-attendLen, totalSeqLen); query
+            // row i (logical pos start_pos+i) keeps keys with view-index
+            // j <= (attendLen-N)+i (causal; the SWA low-end is below the window so
+            // needs no masking). n_past = attendLen-N covers both within- and
+            // beyond-window cases (== start_pos when attendLen==totalSeqLen).
+            ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd, N, num_heads]
+            ggml_tensor* kq = ggml_mul_mat(ctx, k_full, q_t);                          // [attendLen, N, num_heads]
+            kq = ggml_diag_mask_inf(ctx, kq, attendLen - N);
+            kq = ggml_soft_max(ctx, kq);
+            ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [kvLen, hd, kvHeads]
+            ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                              // [hd, N, num_heads]
+            ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd, num_heads, N]
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn, info.qDim, N);
+
+            // O projection -> post-attn norm -> residual
+            ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);                  // [hidden, N]
+            ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), lt.post_attn_norm_w);
+            ggml_tensor* residual1 = ggml_add(ctx, hidden, post_attn);
+
+            // FFN: norm -> gate_up -> gelu*up -> down -> post_ffn norm -> residual
+            ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), lt.ffn_norm_w);
+            ggml_tensor* gu = ggml_mul_mat(ctx, lt.gu_w, ffn_normed);                   // [2*ff, N]
+            std::int64_t ff = gu_ne1_arr[l] / 2;
+            ggml_tensor* gate = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, N, gu->nb[1], 0));
+            ggml_tensor* up = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, N, gu->nb[1],
+                static_cast<std::size_t>(ff) * sizeof(float)));
+            ggml_tensor* ffn_hidden = ggml_mul(ctx, ggml_gelu(ctx, gate), up);          // [ff, N]
+            ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, ffn_hidden);               // [hidden, N]
+            ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down, eps), lt.post_ffn_norm_w);
+            ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn);
+
+            float scalar = layer_scalar_arr[l];
+            if (std::fabs(scalar - 1.0f) > 1e-6f)
+                residual2 = ggml_scale(ctx, residual2, scalar);
+
+            hidden = residual2;
+        }
+
+        ggml_tensor* hidden_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, N);
+        ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
+        ggml_set_output(out_hidden);
+
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 160 + 512;
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        for (int l = 0; l < num_layers; l++)
+        {
+            ggml_build_forward_expand(graph, layers[l].k_cpy);
+            ggml_build_forward_expand(graph, layers[l].v_cpy);
+            if (layers[l].k_cpy2 != nullptr) ggml_build_forward_expand(graph, layers[l].k_cpy2);
+            if (layers[l].v_cpy2 != nullptr) ggml_build_forward_expand(graph, layers[l].v_cpy2);
+        }
+        ggml_build_forward_expand(graph, out_hidden);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (t == nullptr || data == nullptr) return;
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
+                    invalidate_cached_buffer(data);
+                }
+            }
+            if (bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cacheable, buf))
+                {
+                    if (!cacheable) ephemeral_bufs.emplace_back(buf);
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, data);
+                    if (st == GGML_STATUS_SUCCESS) return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        for (int l = 0; l < num_layers; l++)
+        {
+            auto& lt = layers[l];
+            auto& info = li[l];
+            bind_or_mark(lt.qkv_w, qkv_arr[l], static_cast<std::size_t>(qkv_bytes_arr[l]), true);
+            if (lt.k_w != nullptr)
+            {
+                bind_or_mark(lt.k_w, k_arr[l], static_cast<std::size_t>(k_bytes_arr[l]), true);
+                bind_or_mark(lt.v_w, v_arr[l], static_cast<std::size_t>(v_bytes_arr[l]), true);
+            }
+            bind_or_mark(lt.o_w, o_arr[l], static_cast<std::size_t>(o_bytes_arr[l]), true);
+            bind_or_mark(lt.gu_w, gu_arr[l], static_cast<std::size_t>(gu_bytes_arr[l]), true);
+            bind_or_mark(lt.down_w, down_arr[l], static_cast<std::size_t>(down_bytes_arr[l]), true);
+            bind_or_mark(lt.attn_norm_w, attn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.post_attn_norm_w, post_attn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.ffn_norm_w, ffn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.post_ffn_norm_w, post_ffn_norm_arr[l], static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+            bind_or_mark(lt.q_norm_w, q_norm_arr[l], static_cast<std::size_t>(info.hd) * sizeof(float), true);
+            bind_or_mark(lt.k_norm_w, k_norm_arr[l], static_cast<std::size_t>(info.hd) * sizeof(float), true);
+            bind_or_mark(lt.k_cached_t, k_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            bind_or_mark(lt.v_cached_t, v_cache_arr[l], kv_cache_bytes(info.kvHeads, info.cacheSize, info.hd, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(ctx))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr)
+            {
+                set_last_error("Failed to allocate backend buffer for Gemma4 model verify.");
+                return 0;
+            }
+        }
+
+        host_read_barrier();
+
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
+
+        std::vector<std::int32_t> pos_vals(N);
+        for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
+        ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+
+        if (freq_factors_t != nullptr)
+            ggml_backend_tensor_set(freq_factors_t, rope_freq_factors, 0,
+                static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for Gemma4 model verify.");
+            return 0;
+        }
+
+        finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Gemma4 model verify.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused Gemma 4 MTP draft step (the "gemma4-assistant" recurrent draft head):
+// runs the whole draft head — backbone-embed + concat(h_prev) + pre-projection,
+// num_dlayers Gemma blocks whose attention reads the TARGET's donor KV cache
+// (no K/V of its own), output norm, draft LM head, post-projection — as ONE GGML
+// graph. Without this, the C# draft alternates device matmuls with host-side
+// RoPE/attention, and the per-step device↔host ping-pong makes a 4-layer head
+// cost as much as a full 48-layer decode. Single query per call, so attention
+// is unmasked (every cached key is in the past). Gated by the C# caller to
+// fixed_pos <= donor cache size (the SWA window has not wrapped).
+// Outputs: logits[vocab] (draft LM head, no softcap) and h_out[backbone]
+// (post-projection — the recurrent input chaining the next draft step).
+// ============================================================================
+TSG_EXPORT int TSGgml_Gemma4DraftStep(
+    int token, const float* h_prev, int fixed_pos,
+    int backbone, int draft_hidden, int num_dlayers, int num_heads, int vocab,
+    float eps, int kv_cache_type,
+    float* rope_freq_factors, int rope_freq_factors_len,
+    // singleton weights
+    void* tgt_tok_embd, int tte_type, std::int64_t tte_ne0, std::int64_t tte_ne1, std::int64_t tte_bytes,
+    void* nextn_pre, int npre_type, std::int64_t npre_ne0, std::int64_t npre_ne1, std::int64_t npre_bytes,
+    void* nextn_post, int npost_type, std::int64_t npost_ne0, std::int64_t npost_ne1, std::int64_t npost_bytes,
+    void* draft_tok_embd, int dte_type, std::int64_t dte_ne0, std::int64_t dte_ne1, std::int64_t dte_bytes,
+    void* output_norm_w,
+    // per-layer (size num_dlayers)
+    void** attn_norm_arr, void** wq_arr, int* wq_type, std::int64_t* wq_ne0, std::int64_t* wq_ne1, std::int64_t* wq_bytes,
+    void** q_norm_arr, void** wo_arr, int* wo_type, std::int64_t* wo_ne0, std::int64_t* wo_ne1, std::int64_t* wo_bytes,
+    void** post_attn_norm_arr, void** ffn_norm_arr,
+    void** gate_arr, int* gate_type, std::int64_t* gate_ne0, std::int64_t* gate_ne1, std::int64_t* gate_bytes,
+    void** up_arr, int* up_type, std::int64_t* up_ne0, std::int64_t* up_ne1, std::int64_t* up_bytes,
+    void** down_arr, int* down_type, std::int64_t* down_ne0, std::int64_t* down_ne1, std::int64_t* down_bytes,
+    void** post_ffw_norm_arr, float* out_scale_arr,
+    int* hd_arr, int* kv_heads_arr, int* is_local_arr, float* rope_base_arr, int* rope_dims_arr,
+    void** donor_k_arr, void** donor_v_arr, int* donor_cache_size_arr,
+    // outputs
+    float* logits_out, float* h_out)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+        if (fixed_pos <= 0)
+            return 0;
+        // SWA donor caches are circular windows (handled below); a global donor's
+        // linear cache must cover fixed_pos (the target's forward grows it).
+        for (int l = 0; l < num_dlayers; l++)
+            if (is_local_arr[l] == 0 && fixed_pos > donor_cache_size_arr[l])
+                return 0;
+
+        const std::size_t ctx_size = 32 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for Gemma4 draft step.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        ggml_tensor* tok_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* h_prev_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, backbone);
+        ggml_tensor* pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor* freq_t = nullptr;
+        if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
+            freq_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rope_freq_factors_len);
+
+        ggml_tensor* tte_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(tte_type), tte_ne0, tte_ne1);
+        ggml_tensor* npre_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(npre_type), npre_ne0, npre_ne1);
+        ggml_tensor* npost_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(npost_type), npost_ne0, npost_ne1);
+        ggml_tensor* dte_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(dte_type), dte_ne0, dte_ne1);
+        ggml_tensor* onorm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, draft_hidden);
+
+        struct DL {
+            ggml_tensor* attn_norm; ggml_tensor* wq; ggml_tensor* q_norm; ggml_tensor* wo;
+            ggml_tensor* post_attn_norm; ggml_tensor* ffn_norm; ggml_tensor* gate; ggml_tensor* up;
+            ggml_tensor* down; ggml_tensor* post_ffw_norm; ggml_tensor* k_cache; ggml_tensor* v_cache;
+            int hd; int kvHeads; int csize;
+        };
+        std::vector<DL> dl(num_dlayers);
+        for (int l = 0; l < num_dlayers; l++)
+        {
+            auto& d = dl[l];
+            d.hd = hd_arr[l]; d.kvHeads = kv_heads_arr[l]; d.csize = donor_cache_size_arr[l];
+            d.attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, draft_hidden);
+            d.wq = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(wq_type[l]), wq_ne0[l], wq_ne1[l]);
+            d.q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d.hd);
+            d.wo = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(wo_type[l]), wo_ne0[l], wo_ne1[l]);
+            d.post_attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, draft_hidden);
+            d.ffn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, draft_hidden);
+            d.gate = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(gate_type[l]), gate_ne0[l], gate_ne1[l]);
+            d.up = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(up_type[l]), up_ne0[l], up_ne1[l]);
+            d.down = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(down_type[l]), down_ne0[l], down_ne1[l]);
+            d.post_ffw_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, draft_hidden);
+            d.k_cache = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), d.hd, d.csize, d.kvHeads);
+            d.v_cache = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), d.hd, d.csize, d.kvHeads);
+        }
+
+        // x = target.tok_embd[token] * sqrt(backbone) ; xh = concat(x, h_prev)
+        ggml_tensor* x = ggml_get_rows(ctx, tte_w, tok_idx);            // [backbone]
+        x = ggml_scale(ctx, x, sqrtf((float) backbone));
+        ggml_tensor* x1 = ggml_reshape_1d(ctx, x, backbone);
+        ggml_tensor* xh = ggml_concat(ctx, x1, h_prev_t, 0);           // [2*backbone]
+        ggml_tensor* cur = ggml_mul_mat(ctx, npre_w, ggml_reshape_2d(ctx, xh, 2 * backbone, 1)); // [draft_hidden,1]
+        cur = ggml_reshape_1d(ctx, cur, draft_hidden);
+
+        for (int l = 0; l < num_dlayers; l++)
+        {
+            auto& d = dl[l];
+            ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), d.attn_norm);
+            ggml_tensor* q = ggml_mul_mat(ctx, d.wq, ggml_reshape_2d(ctx, normed, draft_hidden, 1)); // [num_heads*hd,1]
+            ggml_tensor* q2 = ggml_reshape_2d(ctx, q, d.hd, num_heads);
+            q2 = ggml_mul(ctx, ggml_rms_norm(ctx, q2, eps), d.q_norm);
+            ggml_tensor* q3 = ggml_reshape_3d(ctx, q2, d.hd, num_heads, 1);
+            ggml_tensor* rff = (is_local_arr[l] != 0) ? nullptr : freq_t;
+            ggml_tensor* q_rope = ggml_rope_ext(ctx, q3, pos_t, rff, rope_dims_arr[l], 2, 0, rope_base_arr[l], 1.0f, 0, 1, 0, 0);
+
+            // SWA donor: read the last min(fixed_pos, window) positions (circular,
+            // unwrapped by view_kv_cache_window). Global donor: read [0, fixed_pos).
+            const int dAttendLen = (is_local_arr[l] != 0) ? std::min(fixed_pos, d.csize) : fixed_pos;
+            const int dActiveStart = (is_local_arr[l] != 0) ? ((fixed_pos - dAttendLen) % d.csize) : 0;
+            ggml_tensor* k_full = view_kv_cache_window(ctx, d.k_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, d.v_cache, d.hd, d.csize, d.kvHeads, dActiveStart, dAttendLen, kv_cache_type);
+            if (k_full == nullptr || v_full == nullptr) { set_last_error("draft donor cache view failed"); return 0; }
+
+            ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd,1,num_heads]
+            ggml_tensor* kq = ggml_mul_mat(ctx, k_full, q_t);                          // [dAttendLen,1,num_heads]
+            kq = ggml_soft_max(ctx, kq);                                               // single query: all window keys valid
+            ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [fixed_pos,hd,kvHeads]
+            ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                             // [hd,1,num_heads]
+            ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd,num_heads,1]
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn, d.hd * num_heads, 1);
+
+            ggml_tensor* o = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, d.wo, attn_flat), draft_hidden);
+            o = ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), d.post_attn_norm);
+            ggml_tensor* attn_out = ggml_add(ctx, cur, o);
+
+            ggml_tensor* fn = ggml_mul(ctx, ggml_rms_norm(ctx, attn_out, eps), d.ffn_norm);
+            ggml_tensor* fn2 = ggml_reshape_2d(ctx, fn, draft_hidden, 1);
+            ggml_tensor* gate = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, d.gate, fn2), gate_ne1[l]);
+            ggml_tensor* up = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, d.up, fn2), up_ne1[l]);
+            ggml_tensor* fh = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+            ggml_tensor* down = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, d.down, ggml_reshape_2d(ctx, fh, gate_ne1[l], 1)), draft_hidden);
+            down = ggml_mul(ctx, ggml_rms_norm(ctx, down, eps), d.post_ffw_norm);
+            ggml_tensor* res = ggml_add(ctx, attn_out, down);
+
+            float sc = out_scale_arr[l];
+            if (std::fabs(sc - 1.0f) > 1e-6f)
+                res = ggml_scale(ctx, res, sc);
+            cur = res;
+        }
+
+        cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), onorm_w);
+        ggml_tensor* cur2 = ggml_reshape_2d(ctx, cur, draft_hidden, 1);
+        ggml_tensor* logits = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, dte_w, cur2), vocab);   // [vocab]
+        ggml_tensor* hnext = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, npost_w, cur2), backbone); // [backbone]
+
+        ggml_tensor* logits_dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+        ggml_tensor* hnext_dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, backbone);
+        ggml_tensor* logits_cpy = ggml_cpy(ctx, logits, logits_dst);
+        ggml_tensor* hnext_cpy = ggml_cpy(ctx, hnext, hnext_dst);
+        ggml_set_output(logits_cpy);
+        ggml_set_output(hnext_cpy);
+
+        const std::size_t graph_size = static_cast<std::size_t>(num_dlayers) * 160 + 512;
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_build_forward_expand(graph, logits_cpy);
+        ggml_build_forward_expand(graph, hnext_cpy);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        std::vector<BufferHandle> ephemeral_bufs;
+        auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
+                                enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (t == nullptr || data == nullptr) return;
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                {
+                    ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (st == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
+                    invalidate_cached_buffer(data);
+                }
+            }
+            if (bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr;
+                if (try_get_host_ptr_buffer(g_backend, dev, data, bytes, cacheable, buf))
+                {
+                    if (!cacheable) ephemeral_bufs.emplace_back(buf);
+                    if (ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS) return;
+                }
+            }
+            upload_list.push_back({t, data, bytes});
+        };
+
+        bind_or_mark(tte_w, tgt_tok_embd, static_cast<std::size_t>(tte_bytes), true);
+        bind_or_mark(npre_w, nextn_pre, static_cast<std::size_t>(npre_bytes), true);
+        bind_or_mark(npost_w, nextn_post, static_cast<std::size_t>(npost_bytes), true);
+        bind_or_mark(dte_w, draft_tok_embd, static_cast<std::size_t>(dte_bytes), true);
+        bind_or_mark(onorm_w, output_norm_w, static_cast<std::size_t>(draft_hidden) * sizeof(float), true);
+        for (int l = 0; l < num_dlayers; l++)
+        {
+            auto& d = dl[l];
+            bind_or_mark(d.attn_norm, attn_norm_arr[l], static_cast<std::size_t>(draft_hidden) * sizeof(float), true);
+            bind_or_mark(d.wq, wq_arr[l], static_cast<std::size_t>(wq_bytes[l]), true);
+            bind_or_mark(d.q_norm, q_norm_arr[l], static_cast<std::size_t>(d.hd) * sizeof(float), true);
+            bind_or_mark(d.wo, wo_arr[l], static_cast<std::size_t>(wo_bytes[l]), true);
+            bind_or_mark(d.post_attn_norm, post_attn_norm_arr[l], static_cast<std::size_t>(draft_hidden) * sizeof(float), true);
+            bind_or_mark(d.ffn_norm, ffn_norm_arr[l], static_cast<std::size_t>(draft_hidden) * sizeof(float), true);
+            bind_or_mark(d.gate, gate_arr[l], static_cast<std::size_t>(gate_bytes[l]), true);
+            bind_or_mark(d.up, up_arr[l], static_cast<std::size_t>(up_bytes[l]), true);
+            bind_or_mark(d.down, down_arr[l], static_cast<std::size_t>(down_bytes[l]), true);
+            bind_or_mark(d.post_ffw_norm, post_ffw_norm_arr[l], static_cast<std::size_t>(draft_hidden) * sizeof(float), true);
+            bind_or_mark(d.k_cache, donor_k_arr[l], kv_cache_bytes(d.kvHeads, d.csize, d.hd, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            bind_or_mark(d.v_cache, donor_v_arr[l], kv_cache_bytes(d.kvHeads, d.csize, d.hd, kv_cache_type), true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        }
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_ctx_tensors_reuse(ctx))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) { set_last_error("Failed to allocate backend buffer for Gemma4 draft step."); return 0; }
+        }
+
+        host_read_barrier();
+        for (auto& u : upload_list)
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        std::int32_t tok = token;
+        ggml_backend_tensor_set(tok_idx, &tok, 0, sizeof(std::int32_t));
+        ggml_backend_tensor_set(h_prev_t, h_prev, 0, static_cast<std::size_t>(backbone) * sizeof(float));
+        std::int32_t posv = fixed_pos;
+        ggml_backend_tensor_set(pos_t, &posv, 0, sizeof(std::int32_t));
+        if (freq_t != nullptr)
+            ggml_backend_tensor_set(freq_t, rope_freq_factors, 0, static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
+
+        if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml backend graph execution failed for Gemma4 draft step.");
+            return 0;
+        }
+
+        host_read_barrier();
+        ggml_backend_tensor_get(logits_dst, logits_out, 0, static_cast<std::size_t>(vocab) * sizeof(float));
+        ggml_backend_tensor_get(hnext_dst, h_out, 0, static_cast<std::size_t>(backbone) * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in Gemma4 draft step.");
+        return 0;
+    }
+}
+
+// ============================================================================
 // Fused single-layer MoE decode (seqLen == 1): runs an ENTIRE Gemma 4 MoE
 // transformer block as one GGML graph on the device, eliminating the ~18-20
 // per-op C#→GGML dispatches the legacy TransformerBlock issues per MoE layer
