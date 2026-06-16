@@ -38,6 +38,7 @@
 // loop drives it with only an attention-KV position rewind on rejection.
 using System;
 using TensorSharp;
+using TensorSharp.Cuda;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
@@ -50,6 +51,7 @@ namespace TensorSharp.Models
         private int _mtpNumLayers;
         private int _mtpHidden;          // draft internal hidden (e.g. 1024)
         private int _mtpBackboneDim;     // = Config.HiddenSize (e.g. 3840)
+        private int _mtpDraftHeads;      // draft query-head count (may be < target's, e.g. E4B: 4 vs 8)
         private bool[] _mtpSwaPattern;   // per draft layer: true = SWA/local
         private float[] _mtpLayerScale;  // per draft layer layer_output_scale
         private int _mtpLocalDonor;      // target layer whose KV the SWA draft layers read
@@ -68,6 +70,26 @@ namespace TensorSharp.Models
         public bool HasMtp { get; private set; }
 
         /// <summary>
+        /// Speculation profitability per backend:
+        /// <list type="bullet">
+        /// <item>ggml backends run the fused single-graph MTP kernels (the multi-token
+        ///   verify <see cref="NativeGemma4ModelVerify"/> / <see cref="TryFusedMoEModelVerify"/>
+        ///   and the fused draft <see cref="NativeGemma4DraftStep"/>) — a clear win.</item>
+        /// <item>The pure-C# CUDA backend has no fused kernels, but its per-op verify and
+        ///   draft are now fully GPU-resident: the draft attends the donor cache on-device
+        ///   (<see cref="TryDraftDecodeAttentionCuda"/>), global verify attention runs the
+        ///   GQA decode kernel per row against the live cache
+        ///   (<see cref="TryGlobalDecodeLoopAttentionCuda"/>), and the global RoPE uses a
+        ///   GPU kernel — so the verify layer loop issues ZERO host-sync stalls (was ~10/
+        ///   step). That makes spec a win on the prose/chat workloads (≈1.1–1.2x, higher
+        ///   acceptance) and ~break-even on low-acceptance greedy. Enabled.</item>
+        /// </list>
+        /// CPU / MLX (no fused kernels AND no GPU-resident per-op path) stay off — there
+        /// the verify can't keep up and the engine serves the fast standard decode.
+        /// </summary>
+        public bool MtpSpeculationProfitable => HasMtp && (IsGgmlBackend || _backend == BackendType.Cuda);
+
+        /// <summary>
         /// Load the Gemma 4 assistant (MTP draft) GGUF and attach it to this target
         /// model. The draft's weights are stored under an <c>mtp.</c> name prefix in
         /// the shared weight dictionaries so the existing matmul/norm machinery serves
@@ -81,14 +103,18 @@ namespace TensorSharp.Models
 
             using var draft = new GgufFile(draftGgufPath);
             string arch = draft.GetString("general.architecture", "");
-            if (arch != "gemma4-assistant")
+            // Accept both spellings of the draft architecture id: the original
+            // converter emitted 'gemma4-assistant' (hyphen; 12B/26B drafts) while
+            // newer converters emit 'gemma4_assistant' (underscore; the E4B draft).
+            // They are the same architecture.
+            if (arch != "gemma4-assistant" && arch != "gemma4_assistant")
                 throw new InvalidOperationException(
                     $"Expected a 'gemma4-assistant' GGUF for the Gemma 4 MTP draft head but got '{arch}'.");
 
             _mtpNumLayers = (int)draft.GetUint32($"{arch}.block_count");
             _mtpHidden = (int)draft.GetUint32($"{arch}.embedding_length");
             _mtpBackboneDim = (int)draft.GetUint32($"{arch}.embedding_length_out", (uint)Config.HiddenSize);
-            int draftHeads = (int)draft.GetUint32($"{arch}.attention.head_count");
+            _mtpDraftHeads = (int)draft.GetUint32($"{arch}.attention.head_count");
             int draftGlobalHd = (int)draft.GetUint32($"{arch}.attention.key_length", (uint)_globalHeadDim);
             int draftLocalHd = (int)draft.GetUint32($"{arch}.attention.key_length_swa", (uint)_localHeadDim);
             _mtpSwaPattern = draft.GetBoolArray($"{arch}.attention.sliding_window_pattern");
@@ -96,9 +122,17 @@ namespace TensorSharp.Models
             if (_mtpBackboneDim != Config.HiddenSize)
                 throw new InvalidOperationException(
                     $"MTP draft backbone dim {_mtpBackboneDim} != target hidden size {Config.HiddenSize}.");
-            if (draftHeads != Config.NumHeads)
+            // The draft may run FEWER query heads than the target (the E4B draft
+            // has 4 vs the target's 8). It still attends the target's KV via GQA,
+            // so the query head count is the draft's own — only the per-head DIM
+            // must match the target, and the count must group cleanly onto the
+            // donor's KV heads (local and global).
+            if (_mtpDraftHeads <= 0
+                || Config.NumKVHeads == 0 || _mtpDraftHeads % Config.NumKVHeads != 0
+                || _numGlobalKVHeads == 0 || _mtpDraftHeads % _numGlobalKVHeads != 0)
                 throw new InvalidOperationException(
-                    $"MTP draft head count {draftHeads} != target head count {Config.NumHeads}.");
+                    $"MTP draft head count {_mtpDraftHeads} does not group onto the target KV heads " +
+                    $"(local {Config.NumKVHeads}, global {_numGlobalKVHeads}).");
             if (draftGlobalHd != _globalHeadDim || draftLocalHd != _localHeadDim)
                 throw new InvalidOperationException(
                     $"MTP draft head dims (local {draftLocalHd}, global {draftGlobalHd}) do not match the target " +
@@ -114,6 +148,18 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException(
                     $"MTP donor layers don't have the expected types (local donor {_mtpLocalDonor} should be SWA, " +
                     $"global donor {_mtpGlobalDonor} should be full-attention).");
+            // When those tail layers SHARE their K/V with an earlier donor (Gemma 4
+            // E-series with shared_kv_layers > 0 — e.g. E4B shares the last 18
+            // layers), the physical K/V lives in that donor; the tail layers have
+            // no cache of their own. Follow the share map to the layer that actually
+            // holds the cache the draft must read.
+            if (_kvDonorMap != null)
+            {
+                if (_kvDonorMap.TryGetValue(_mtpLocalDonor, out int sharedLocalDonor))
+                    _mtpLocalDonor = sharedLocalDonor;
+                if (_kvDonorMap.TryGetValue(_mtpGlobalDonor, out int sharedGlobalDonor))
+                    _mtpGlobalDonor = sharedGlobalDonor;
+            }
 
             LoadMtpDraftTensors(draft);
 
@@ -140,15 +186,20 @@ namespace TensorSharp.Models
                     && _weights.ContainsKey($"{p}.post_ffw_norm.weight");
             }
 
-            if (_pleDim > 0)
-                throw new InvalidOperationException("Gemma 4 MTP speculative decoding does not support per-layer-embedding models yet.");
+            // Per-layer-embedding (PLE) targets (Gemma 4 E-series, e.g. E4B) are
+            // supported: the spec trunk computes PLE and runs the per-op forward
+            // (the fused trunk kernels don't thread PLE). Earlier this threw.
 
+            // The fused single-graph draft kernel is parameterised by the draft's
+            // own query-head count (passed as num_heads), so it serves a smaller-
+            // head draft (E4B: 4 vs the target's 8) too — it reads the donor KV via
+            // GQA grouping onto the donor's KV heads.
             if (HasMtp && IsGgmlBackend)
                 BuildMtpDraftArrays();
 
             Console.WriteLine(HasMtp
                 ? $"  Gemma 4 MTP draft head ready ({_mtpNumLayers} layers, hidden {_mtpHidden}, " +
-                  $"donors local={_mtpLocalDonor}/global={_mtpGlobalDonor}, " +
+                  $"draftHeads={_mtpDraftHeads}, ple={_pleDim}, donors local={_mtpLocalDonor}/global={_mtpGlobalDonor}, " +
                   $"fusedDraft={(_mtpDraftArrays != null ? "yes" : "no")})."
                 : "  Gemma 4 MTP draft GGUF loaded but incomplete; MTP drafting disabled.");
         }
@@ -158,12 +209,25 @@ namespace TensorSharp.Models
             foreach (var kv in draft.Tensors)
             {
                 var info = kv.Value;
-                // rope_freqs is reused from the target (verified identical); the draft
-                // has no other tensors we don't load by name.
-                if (info.Name == "rope_freqs.weight")
-                    continue;
 
-                string name = "mtp." + info.Name;
+                // Normalize across converter conventions. The newer converter
+                // prefixes the draft's own tensors with "mtp." (e.g.
+                // mtp.pre_projection.weight) and drops the "nextn." namespace on
+                // the recurrent projections; the original converter used no "mtp."
+                // prefix and named them "nextn.pre_projection.weight". Map both onto
+                // the internal "mtp.nextn.*" keys the draft step looks up.
+                string core = info.Name;
+                if (core.StartsWith("mtp.", StringComparison.Ordinal))
+                    core = core.Substring(4);
+                // rope_freqs is reused from the target (verified identical).
+                // centroids / token_ordering are an optional clustered draft LM head
+                // (newer format); we decode through the full token_embd head, so skip.
+                if (core == "rope_freqs.weight" || core == "centroids.weight" || core == "token_ordering.weight")
+                    continue;
+                if (core == "pre_projection.weight") core = "nextn.pre_projection.weight";
+                else if (core == "post_projection.weight") core = "nextn.post_projection.weight";
+
+                string name = "mtp." + core;
                 long byteCount = draft.GetTensorByteCount(info);
 
                 if (IsQuantizedLinearWeight(info))
@@ -223,8 +287,6 @@ namespace TensorSharp.Models
         {
             if (!HasMtp)
                 throw new InvalidOperationException("Model has no Gemma 4 MTP draft head.");
-            if (_pleDim > 0)
-                throw new InvalidOperationException("Gemma 4 MTP does not support per-layer-embedding models.");
 
             _mtpBatchedMode = false;   // this is the linear-cache trunk
             int seqLen = tokens.Length;
@@ -235,57 +297,102 @@ namespace TensorSharp.Models
             Tensor h = Embedding(tokens);
             ScaleEmbedding(h);
 
+            // Per-layer embeddings (PLE) for Gemma 4 E-series targets (e.g. E4B).
+            // Threaded into BOTH the fused trunk (the dense decode/verify kernels
+            // accept PLE) and the per-op fallback below.
+            Tensor perLayerInputs = _pleDim > 0 ? ComputePLE(tokens, h, seqLen) : null;
+
             // Fused single-graph trunk: a verify batch (seqLen>1) runs through the
             // multi-token kernel (NativeGemma4ModelVerify), a plain step (seqLen==1)
-            // through the single-token decode kernel — ONE GGML graph for all 48
+            // through the single-token decode kernel — ONE GGML graph for all
             // layers instead of ~800 per-op dispatches, so the verify finally
             // amortises and beats K+1 single-token decodes. Works at ANY context
             // length: the kernel windows the SWA layers' circular cache (wrap-aware
-            // write + windowed read) so there is no per-window-crossing cliff. Gated
-            // to a dense, non-PLE, non-KV-shared, non-block-quant-KV model; otherwise
-            // the per-op path. Keeping plain+verify both on the fused (device-cache)
-            // path avoids mixing device and host cache writers within one spec session.
-            bool fusedOk = _decodeArrays != null && _canUseFusedFullModelDecode
-                && _pleDim == 0 && _kvDonorMap.Count == 0
+            // write + windowed read) so there is no per-window-crossing cliff.
+            // The DENSE kernels now also thread PLE and shared-KV (KV donors), so the
+            // Gemma 4 E-series (E4B) takes this fast path too. The MoE kernels do
+            // not, so they keep the no-PLE/no-donor gate. Keeping plain+verify both
+            // on the fused (device-cache) path avoids mixing device and host cache
+            // writers within one spec session.
+            bool fusedCommon = _decodeArrays != null
                 && !_kvCacheDtype.IsBlockQuantized()
                 && Environment.GetEnvironmentVariable("TS_GMTP_NO_FUSED") != "1";
+            // Dense models take the dense fused trunk; all-MoE models (e.g.
+            // gemma-4-26B-A4B, where _canUseFusedFullModelDecode is false) take the
+            // fused MoE trunk: a single graph for the whole transformer for both the
+            // plain step (seqLen==1, the MoE decode kernel) and the verify batch
+            // (seqLen>1, the MoE verify kernel). Without the MoE branch the verify
+            // (and even plain steps) fell to the per-op path, making spec net-negative.
+            bool fusedDenseOk = fusedCommon && _canUseFusedFullModelDecode;
+            bool fusedMoeOk = fusedCommon && !_canUseFusedFullModelDecode && _numExperts > 0
+                && _pleDim == 0 && _kvDonorMap.Count == 0;
             bool usedFused = false;
-            if (fusedOk)
+            if (fusedDenseOk)
             {
                 RefreshDecodeArraysKvCache();
                 if (seqLen == 1)
                 {
-                    NativeGemma4ModelDecode(h, startPos, null);
+                    NativeGemma4ModelDecode(h, startPos, perLayerInputs);
                     usedFused = true;
                 }
                 else
                 {
-                    usedFused = NativeGemma4ModelVerify(h, startPos, seqLen);
+                    usedFused = NativeGemma4ModelVerify(h, startPos, seqLen, perLayerInputs);
                 }
-                if (usedFused)
-                {
-                    _kvCacheHostDirty = true;   // device write; draft re-syncs donor layers
-                    // The kernel wrote h's host storage via download; drop any
-                    // stale cached device buffer so the final norm re-reads it.
-                    InvalidateTensorDeviceCache(h);
-                }
+            }
+            else if (fusedMoeOk)
+            {
+                RefreshDecodeArraysKvCache();
+                usedFused = seqLen == 1
+                    ? TryFusedMoEModelDecode(h, startPos)
+                    : TryFusedMoEModelVerify(h, startPos, seqLen);
+            }
+            if (usedFused)
+            {
+                _kvCacheHostDirty = true;   // device write; draft re-syncs donor layers
+                // The kernel wrote h's host storage via download; drop any
+                // stale cached device buffer so the final norm re-reads it.
+                InvalidateTensorDeviceCache(h);
             }
 
             if (!usedFused)
             {
-                // Per-op fallback (past the SWA window, or unsupported model shape).
+                // Per-op fallback (past the SWA window, an unsupported model shape,
+                // or a PLE target). Processes the batch exactly like a normal
+                // prefill chunk so a verify batch is numerically a prefill of the
+                // same length: PLE per-layer inputs are threaded in, shared-KV
+                // layers follow their donor, SWA layers get cross-chunk prev
+                // windows, and donor layers publish fresh K/V via _prefillSWAKV.
                 // Capturing each row's hidden just needs the all-row hidden after
-                // the loop — ForwardCore narrows to the last row instead.
+                // the loop.
                 EnsureKvCacheHostSynchronized();
+                if (_swaKVDonorLayers != null && _swaKVDonorLayers.Count > 0 && seqLen > 1)
+                    _prefillSWAKV = new System.Collections.Generic.Dictionary<int, (Tensor k, Tensor v)>();
                 if (seqLen > 1)
                     PrepareSwaPrevWindowsForChunk(startPos, seqLen);
 
                 for (int l = 0; l < Config.NumLayers; l++)
-                    h = TransformerBlock(h, l, seqLen, startPos, isShared: false, perLayerInput: null);
+                {
+                    Tensor perLayerInput = perLayerInputs != null
+                        ? ExtractPerLayerSlice(perLayerInputs, l, seqLen) : null;
+                    bool isShared = _kvDonorMap.ContainsKey(l);
+                    h = TransformerBlock(h, l, seqLen, startPos, isShared, perLayerInput, null);
+                    perLayerInput?.Dispose();
+                }
 
+                if (_prefillSWAKV != null)
+                {
+                    foreach (var entry in _prefillSWAKV.Values)
+                    {
+                        entry.k.Dispose();
+                        entry.v.Dispose();
+                    }
+                    _prefillSWAKV = null;
+                }
                 if (seqLen > 1)
                     DisposeSwaPrevWindows();
             }
+            perLayerInputs?.Dispose();
 
             // Post-output-norm hidden state for every row (h_nextn).
             Ops.RMSNorm(h, h, _weights["output_norm.weight"], null, Config.Eps);
@@ -446,29 +553,38 @@ namespace TensorSharp.Models
             float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
 
             using var attnNormed = RMSNormOp(inpL, $"{p}.attn_norm.weight");
-            Tensor q = LinearForward(attnNormed, $"{p}.attn_q.weight");   // [1, NumHeads*hd]
-            RMSNormInPlace(q, _weights[$"{p}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
-            ApplyNeoXRoPEDecode(q, Config.NumHeads, hd, fixedPos, freqs);
+            Tensor q = LinearForward(attnNormed, $"{p}.attn_q.weight");   // [1, draftHeads*hd]
+            RMSNormInPlace(q, _weights[$"{p}.attn_q_norm.weight"], _mtpDraftHeads, hd, Config.Eps);
+            ApplyNeoXRoPEDecode(q, _mtpDraftHeads, hd, fixedPos, freqs);
 
-            var attn = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
+            var attn = new Tensor(_allocator, DType.Float32, 1, _mtpDraftHeads * hd);
             // Gemma 4 attention scale is 1.0 (no 1/sqrt(d)); see f_attention_scale.
+            // The draft uses its OWN query-head count (_mtpDraftHeads), grouped onto
+            // the donor's KV heads.
             if (_mtpBatchedMode && _mtpBatchedSeq != null)
             {
                 // Batched trunk: attend the sequence's PAGED donor KV.
                 MtpDraftPagedAttention(q, donor, kvHeads, hd, fixedPos, isLocal, _mtpBatchedSeq, attn);
                 InvalidateTensorDeviceCache(attn);
             }
+            else if (TryDraftDecodeAttentionCuda(q, donor, kvHeads, hd, fixedPos, isLocal, attn))
+            {
+                // On-device GQA decode attention (CUDA): reads the donor cache in
+                // place, so the draft head stops DtoH-ing the whole 4 MB donor cache
+                // to the host per layer — the dominant draft-phase sync stall on the
+                // pure-C# CUDA backend. Mirrors the main decode's attention path.
+            }
             else if (isLocal)
             {
                 int cacheLen = _kvCacheSize[donor];
                 int attendLen = Math.Min(fixedPos, _slidingWindow);
                 AttentionDecodeCircular(q, _kvCacheK[donor], _kvCacheV[donor], attn,
-                    Config.NumHeads, kvHeads, hd, hd, fixedPos - 1, attendLen, cacheLen, 1f);
+                    _mtpDraftHeads, kvHeads, hd, hd, fixedPos - 1, attendLen, cacheLen, 1f);
             }
             else
             {
                 AttentionDecodeWithWindow(q, _kvCacheK[donor], _kvCacheV[donor], attn,
-                    Config.NumHeads, kvHeads, hd, hd, 0, fixedPos, 1f);
+                    _mtpDraftHeads, kvHeads, hd, hd, 0, fixedPos, 1f);
             }
             q.Dispose();
 
@@ -492,6 +608,31 @@ namespace TensorSharp.Models
             if (scale != 1f)
                 Ops.Mul(attnOut, attnOut, scale);
             return attnOut;
+        }
+
+        // GPU GQA decode attention for one draft layer (CUDA backend only). The
+        // draft query is at the trunk position <paramref name="fixedPos"/> and
+        // attends the donor cache [0, fixedPos) — windowed for the local donor.
+        // Mirrors the main decode's CudaFusedOps path (query position startPos with
+        // startPos+1 keys ⇒ here startPos+1 == fixedPos) so it is numerically the
+        // same as the AttentionDecodeCircular/WithWindow CPU helpers, but reads the
+        // donor cache ON-DEVICE — no per-layer 4 MB DtoH of the cache to the host.
+        // Returns false on any other backend (caller uses the CPU helpers).
+        private bool TryDraftDecodeAttentionCuda(
+            Tensor q, int donor, int kvHeads, int hd, int fixedPos, bool isLocal, Tensor attn)
+        {
+            if (_backend != BackendType.Cuda || fixedPos <= 0)
+                return false;
+            int cacheLen = _kvCacheSize[donor];
+            if (isLocal)
+            {
+                int attendLen = Math.Min(fixedPos, _slidingWindow);
+                int attendStart = Math.Max(0, fixedPos - attendLen);
+                return CudaFusedOps.TryGqaDecodeAttention(attn, q, _kvCacheK[donor], _kvCacheV[donor],
+                    _mtpDraftHeads, kvHeads, hd, attendStart, fixedPos - attendStart, cacheLen, true, 1f);
+            }
+            return CudaFusedOps.TryGqaDecodeAttention(attn, q, _kvCacheK[donor], _kvCacheV[donor],
+                _mtpDraftHeads, kvHeads, hd, 0, fixedPos, cacheLen, false, 1f);
         }
 
         /// <summary>Gemma 4's draft head holds no KV of its own (it reads the
@@ -528,6 +669,26 @@ namespace TensorSharp.Models
                     $"Rewind length {length} outside [0, {_cacheSeqLen}].");
             _cacheSeqLen = length;
         }
+
+        // Escape hatch: TS_GMTP_NO_FAST_ROLLBACK=1 restores the kept-prefix
+        // re-forward (slower, but refreshes committed-token KV through the decode
+        // kernel so spec output tracks the all-decode no-spec path more closely).
+        private static readonly bool s_noFastRollback =
+            Environment.GetEnvironmentVariable("TS_GMTP_NO_FAST_ROLLBACK") == "1";
+
+        /// <summary>
+        /// Gemma 4's verify (fused MoE/dense or per-op) writes attention KV for every
+        /// token in the batch at its true position, and the model has no recurrent
+        /// state. So on partial acceptance the kept prefix's KV is already correct in
+        /// the live cache — the executor can skip the redundant re-forward and just
+        /// rewind the position. This is the dominant rollback cost on long contexts
+        /// for the MoE model (manual-attention verify), so it is enabled for MoE
+        /// Gemma 4 (e.g. 26B-A4B). It is left OFF for the dense model: there the
+        /// re-forward is cheap and refreshing the committed token's KV through the
+        /// decode kernel keeps spec output byte-identical to the no-spec path (the
+        /// dense exact-match validation). Honoured only on the linear trunk.
+        /// </summary>
+        public bool MtpVerifyPersistsAcceptedKv => (_numExperts > 0 || _pleDim > 0) && !_mtpBatchedMode && !s_noFastRollback;
 
         // ====================================================================
         // IMtpBatchedSpeculativeModel — speculative trunk on the batched paged
@@ -738,7 +899,7 @@ namespace TensorSharp.Models
             {
                 return GgmlBasicOps.Gemma4DraftStep(
                     token, (IntPtr)hp, fixedPos,
-                    Config.HiddenSize, _mtpHidden, _mtpNumLayers, Config.NumHeads, Config.VocabSize,
+                    Config.HiddenSize, _mtpHidden, _mtpNumLayers, _mtpDraftHeads, Config.VocabSize,
                     Config.Eps, _kvCacheDtype.GgmlType(),
                     freqPtr, freqLen,
                     a.TgtTokEmbd, a.TteType, a.TteNe0, a.TteNe1, a.TteBytes,
@@ -777,7 +938,7 @@ namespace TensorSharp.Models
             Tensor q, int donor, int kvHeads, int hd, int fixedPos, bool isLocal,
             SequenceState seq, Tensor result)
         {
-            int numHeads = Config.NumHeads;
+            int numHeads = _mtpDraftHeads;
             int groupSize = numHeads / kvHeads;
             int stride = kvHeads * hd;                 // per-slot K/V stride
             int blockSize = _g4PagedBlockSize;

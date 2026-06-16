@@ -323,6 +323,18 @@ namespace TensorSharp.Models
         /// model doesn't expose stacked views (e.g. some non-mmap paths).
         /// </summary>
         protected readonly Dictionary<string, StackedExpertWeights> _stackedExpertWeights = new();
+
+        /// <summary>
+        /// Names of the per-expert split views in <see cref="_quantWeights"/> that
+        /// were carved out of a 3D <c>_exps.</c> tensor and are also covered by a
+        /// <see cref="_stackedExpertWeights"/> entry (same underlying bytes). A
+        /// model whose CUDA path serves MoE experts exclusively through the
+        /// stacked-expert device buffer can consult this set (via
+        /// <see cref="ShouldPreloadCudaQuantWeightToDevice"/>) to skip giving each
+        /// per-expert view its own device copy, which would otherwise duplicate
+        /// every expert byte a second time in VRAM on top of the stacked copy.
+        /// </summary>
+        protected readonly HashSet<string> _stackedExpertMemberNames = new();
         private bool _quantBackendReady;
         private bool _cudaQuantWeightsPrepared;
         private bool _mlxQuantWeightsPrepared;
@@ -854,8 +866,10 @@ namespace TensorSharp.Models
                             for (int e = 0; e < numExperts; e++)
                             {
                                 IntPtr expertPtr = new IntPtr(mappedTensorPtr.ToInt64() + e * perExpertBytes);
-                                _quantWeights[$"{baseName}.{e}.weight"] = QuantizedWeight.CreateExternalView(
+                                string expertName = $"{baseName}.{e}.weight";
+                                _quantWeights[expertName] = QuantizedWeight.CreateExternalView(
                                     expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, _gguf);
+                                _stackedExpertMemberNames.Add(expertName);
                             }
                             // Free zero-cost stacked view: same bytes the per-expert
                             // views point into, owner is the GgufFile mmap.
@@ -885,8 +899,10 @@ namespace TensorSharp.Models
                             for (int e = 0; e < numExperts; e++)
                             {
                                 IntPtr expertPtr = new IntPtr(bulkPtr.ToInt64() + e * perExpertBytes);
-                                _quantWeights[$"{baseName}.{e}.weight"] = QuantizedWeight.CreateExternalView(
+                                string expertName = $"{baseName}.{e}.weight";
+                                _quantWeights[expertName] = QuantizedWeight.CreateExternalView(
                                     expertPtr, perExpertBytes, (int)info.Type, ne0, ne1, stacked);
+                                _stackedExpertMemberNames.Add(expertName);
                             }
                         }
                         countQuant += numExperts;
@@ -997,6 +1013,15 @@ namespace TensorSharp.Models
                 QuantizedWeight qw = kv.Value;
 
                 if (!qw.HasHostData)
+                    continue;
+
+                // Skip weights the model serves device-resident by another route
+                // (e.g. MoE per-expert split views that are covered by the stacked
+                // expert device buffer). Preloading them here would put a second,
+                // redundant copy of every expert byte in VRAM. The host view is
+                // left intact so the stacked path / any per-op fallback can still
+                // reach the bytes (and lazily upload on demand if ever needed).
+                if (!ShouldPreloadCudaQuantWeightToDevice(weightName))
                     continue;
 
                 IntPtr cacheKey = qw.EnsureDeviceCacheKey();
@@ -1348,6 +1373,16 @@ namespace TensorSharp.Models
             return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
                 string.Equals(weightName, "per_layer_token_embd.weight", StringComparison.Ordinal);
         }
+
+        /// <summary>
+        /// Whether <paramref name="weightName"/> should get its own device-resident
+        /// copy during <see cref="PrepareCudaQuantizedWeightsForInference"/> (the
+        /// <c>ggml_cuda</c> backend). Defaults to true. Models whose CUDA decode and
+        /// prefill paths serve MoE experts exclusively through the stacked-expert
+        /// device buffer override this to return false for the per-expert split
+        /// views, avoiding a second full copy of the experts in VRAM.
+        /// </summary>
+        protected virtual bool ShouldPreloadCudaQuantWeightToDevice(string weightName) => true;
 
         protected bool CanUseGgmlQuantizedGetRows(int ggmlType)
         {

@@ -31,6 +31,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr qwen35GdnUpdateConvStateF32;
         private readonly IntPtr qwen35GdnPackInputsF32;
         private readonly IntPtr rmsNormF32;
+        private readonly IntPtr rmsNormResidualAddF32;
         private readonly IntPtr softmaxF32;
         private readonly IntPtr attentionSoftmaxSinksF32;
         private readonly IntPtr scaledDotProductAttentionF32;
@@ -54,6 +55,7 @@ namespace TensorSharp.Cuda
         private readonly IntPtr gatherCircularHeadFirstF16;
         private readonly IntPtr concatHeadFirstF32;
         private readonly IntPtr neoxRopeHeadFirstF32;
+        private readonly IntPtr neoxRopeFlatF32;
         private readonly IntPtr indexSelectF32;
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
@@ -64,6 +66,20 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ80SingleF32;
         private readonly IntPtr quantMatmulQ80F32;
+        private readonly IntPtr quantMatmulQ80Dp4aF32;
+        private readonly IntPtr quantMatmulQ80MmaF32;
+        private readonly IntPtr quantizeQ81RowsF32;
+
+        // q8_1 block = half d + half s + 32 int8 = 36 bytes (matches ts_block_q8_1).
+        public const int Q81BlockBytes = 36;
+        public const int Q8Dp4aTileRows = 4;   // matches TS_Q8_DP4A_ROWS in the kernel
+        // Multi-row Q8_0 uses the block-tile dp4a kernel by default;
+        // TS_CUDA_Q8_DP4A=0 reverts to the scalar 4-row block-reduce kernel (A/B).
+        public static readonly bool Q8Dp4aEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q8_DP4A"), "0", StringComparison.Ordinal);
+        // Opt-in tensor-core (wmma int8 MMA) multi-row Q8_0 path: TS_CUDA_Q8_MMA=1.
+        public static readonly bool Q8MmaEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q8_MMA"), "1", StringComparison.Ordinal);
         private readonly IntPtr quantGetRowsF32;
 
         private CudaKernels(CudaModule module)
@@ -86,6 +102,7 @@ namespace TensorSharp.Cuda
             qwen35GdnUpdateConvStateF32 = module.GetFunction("ts_qwen35_gdn_update_conv_state_f32");
             qwen35GdnPackInputsF32 = module.GetFunction("ts_qwen35_gdn_pack_inputs_f32");
             rmsNormF32 = module.GetFunction("ts_rmsnorm_f32");
+            rmsNormResidualAddF32 = module.GetFunction("ts_rmsnorm_residual_add_f32");
             softmaxF32 = module.GetFunction("ts_softmax_f32");
             attentionSoftmaxSinksF32 = module.GetFunction("ts_attention_softmax_sinks_f32");
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
@@ -109,6 +126,7 @@ namespace TensorSharp.Cuda
             gatherCircularHeadFirstF16 = module.GetFunction("ts_gather_circular_head_first_f16");
             concatHeadFirstF32 = module.GetFunction("ts_concat_head_first_f32");
             neoxRopeHeadFirstF32 = module.GetFunction("ts_neox_rope_head_first_f32");
+            neoxRopeFlatF32 = module.GetFunction("ts_neox_rope_flat_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
@@ -119,6 +137,9 @@ namespace TensorSharp.Cuda
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
+            quantMatmulQ80Dp4aF32 = module.GetFunction("ts_quant_matmul_q8_0_dp4a_f32");
+            quantMatmulQ80MmaF32 = module.GetFunction("ts_quant_matmul_q8_0_mma_f32");
+            quantizeQ81RowsF32 = module.GetFunction("ts_quantize_q8_1_rows_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
         }
 
@@ -394,6 +415,19 @@ namespace TensorSharp.Cuda
             Launch(rmsNormF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        // residual[row,i] += rms_norm(input[row], alpha)[i] — fused norm + residual add.
+        public void LaunchRMSNormResidualAddF32(IntPtr input, IntPtr alpha, IntPtr residual, int rows, int cols, float eps, IntPtr stream)
+        {
+            IntPtr inputArg = input;
+            IntPtr alphaArg = alpha;
+            IntPtr residualArg = residual;
+            int rowsArg = rows;
+            int colsArg = cols;
+            float epsArg = eps;
+            void** args = stackalloc void*[] { &inputArg, &alphaArg, &residualArg, &rowsArg, &colsArg, &epsArg };
+            Launch(rmsNormResidualAddF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchSoftmaxF32(IntPtr input, IntPtr output, int rows, int cols, IntPtr stream)
         {
             IntPtr inputArg = input;
@@ -483,6 +517,7 @@ namespace TensorSharp.Cuda
             int maskStart,
             int windowSize,
             float scale,
+            int kvStride,
             IntPtr stream)
         {
             IntPtr queryArg = query;
@@ -497,10 +532,11 @@ namespace TensorSharp.Cuda
             int maskStartArg = maskStart;
             int windowSizeArg = windowSize;
             float scaleArg = scale;
+            int kvStrideArg = kvStride;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
-                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg
             };
             Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
@@ -518,6 +554,7 @@ namespace TensorSharp.Cuda
             int maskStart,
             int windowSize,
             float scale,
+            int kvStride,
             IntPtr stream)
         {
             IntPtr queryArg = query;
@@ -532,10 +569,11 @@ namespace TensorSharp.Cuda
             int maskStartArg = maskStart;
             int windowSizeArg = windowSize;
             float scaleArg = scale;
+            int kvStrideArg = kvStride;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
-                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg
             };
             Launch(gqaPrefillAttentionF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
@@ -1095,6 +1133,29 @@ namespace TensorSharp.Cuda
             Launch(neoxRopeHeadFirstF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchNeoXRoPEFlatF32(
+            IntPtr data,
+            IntPtr cosTable,
+            IntPtr sinTable,
+            int numHeads,
+            int seqLen,
+            int headDim,
+            int ropeHalf,
+            IntPtr stream)
+        {
+            IntPtr dataArg = data;
+            IntPtr cosTableArg = cosTable;
+            IntPtr sinTableArg = sinTable;
+            int numHeadsArg = numHeads;
+            int seqLenArg = seqLen;
+            int headDimArg = headDim;
+            int ropeHalfArg = ropeHalf;
+            int count = checked(numHeads * seqLen * ropeHalf);
+            void** args = stackalloc void*[]
+            { &dataArg, &cosTableArg, &sinTableArg, &numHeadsArg, &seqLenArg, &headDimArg, &ropeHalfArg };
+            Launch(neoxRopeFlatF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)
         {
             IntPtr sourceArg = source;
@@ -1263,10 +1324,58 @@ namespace TensorSharp.Cuda
             int rowsArg = rows;
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
-            if (rows < 4)
+            // rows == 1 (decode): single-row kernel. rows >= 2: the scalar 4-row-tile
+            // kernel. The dp4a fast path (rows >= 2) is dispatched one level up in
+            // CudaQuantizedOps (it needs a quantized-activation scratch buffer).
+            if (rows < 2)
                 Launch(quantMatmulQ80SingleF32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
             else
                 Launch(quantMatmulQ80F32, gridX, (uint)((rows + 3) / 4), 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // Quantize `rows` activation rows ([rows, inDim] f32) to q8_1 into `outScratch`
+        // (rows * inDim/32 ts_block_q8_1). One thread per (row, 32-block).
+        public void LaunchQuantizeQ81Rows(IntPtr input, IntPtr outScratch, int inDim, int rows, IntPtr stream)
+        {
+            IntPtr inputArg = input;
+            IntPtr outArg = outScratch;
+            int inDimArg = inDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &inputArg, &outArg, &inDimArg, &rowsArg };
+            long total = (long)rows * (inDim / 32);
+            uint grid = (uint)((total + BlockSize - 1) / BlockSize);
+            Launch(quantizeQ81RowsF32, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // Block-tile dp4a Q8_0 GEMM: weights (q8_0) x pre-quantized q8_1 activations
+        // (xqScratch) -> output [rows, outDim]. 256 threads / 4x4 output tile.
+        public void LaunchQuantMatmulQ80Dp4a(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + 3) / 4);
+            uint gridY = (uint)((rows + Q8Dp4aTileRows - 1) / Q8Dp4aTileRows);
+            Launch(quantMatmulQ80Dp4aF32, gridX, gridY, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // Tensor-core (wmma int8 MMA) Q8_0 GEMM: one warp per 16x16 output tile.
+        public void LaunchQuantMatmulQ80Mma(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + 15) / 16);
+            uint gridY = (uint)((rows + 15) / 16);
+            Launch(quantMatmulQ80MmaF32, gridX, gridY, 1, 32, 1, 1, 0, stream, args);   // one warp / tile
         }
 
         public void LaunchQuantGetRowsF32(IntPtr weights, IntPtr indices, IntPtr output, int type, int cols, int rows, int indicesAreInt32, IntPtr stream)

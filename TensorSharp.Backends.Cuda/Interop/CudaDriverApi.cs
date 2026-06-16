@@ -105,6 +105,28 @@ namespace TensorSharp.Cuda.Interop
         [DllImport(LibName)]
         public static extern int cuStreamSynchronize(IntPtr stream);
 
+        // ---- CUDA Graphs (stream capture) ----
+        [DllImport(LibName, EntryPoint = "cuStreamBeginCapture_v2")]
+        public static extern int cuStreamBeginCapture(IntPtr stream, int mode);
+
+        [DllImport(LibName)]
+        public static extern int cuStreamEndCapture(IntPtr stream, out IntPtr graph);
+
+        [DllImport(LibName)]
+        public static extern int cuGraphInstantiateWithFlags(out IntPtr graphExec, IntPtr graph, ulong flags);
+
+        [DllImport(LibName)]
+        public static extern int cuGraphLaunch(IntPtr graphExec, IntPtr stream);
+
+        [DllImport(LibName)]
+        public static extern int cuGraphExecDestroy(IntPtr graphExec);
+
+        [DllImport(LibName)]
+        public static extern int cuGraphDestroy(IntPtr graph);
+
+        // CUstreamCaptureMode: 0 = GLOBAL, 1 = THREAD_LOCAL, 2 = RELAXED.
+        public const int CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1;
+
         [DllImport(LibName)]
         public static extern int cuGetErrorString(int error, out IntPtr str);
 

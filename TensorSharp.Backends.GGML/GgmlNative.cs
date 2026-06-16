@@ -1122,7 +1122,12 @@ internal enum GgmlIndexReductionOp
             int[] ropeNDimsArr,
             int kvCacheType,
             IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr);
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4DraftStep(
@@ -1273,6 +1278,20 @@ internal enum GgmlIndexReductionOp
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
         {
             CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position), nameof(TSGgml_Gemma4MoEModelDecode));
+        }
+
+        // Model-wide MoE multi-token verify: the whole MoE transformer over N tokens
+        // as one graph. Reuses the same descriptor array as the decode; start_pos +
+        // num_tokens are explicit. Returns 0 (false) when the kernel cannot handle
+        // the shape so the caller falls back to the per-op verify.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4MoEModelVerify(
+            [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens);
+
+        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
+        {
+            return TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens) != 0;
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -2546,7 +2565,12 @@ internal enum GgmlIndexReductionOp
             IntPtr ropeFreqFactors, int ropeFreqFactorsLen, int[] ropeNDimsArr,
             int kvCacheType,
             IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr)
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr)
         {
             int r = TSGgml_Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -2564,7 +2588,12 @@ internal enum GgmlIndexReductionOp
                 ropeFreqFactors, ropeFreqFactorsLen, ropeNDimsArr,
                 kvCacheType,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
-                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr);
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kvSourceArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr);
             if (r == 0 && Environment.GetEnvironmentVariable("TS_GGML_FUSED_DEBUG") == "1")
                 Console.Error.WriteLine($"[gemma4-verify FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;

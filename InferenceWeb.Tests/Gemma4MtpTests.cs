@@ -204,11 +204,17 @@ public class Gemma4MtpTests
         model.LoadMtpDraftWeights(draftPath);
         Xunit.Assert.True(model.HasMtp);
 
-        string prompt = "The capital of France is Paris. The capital of Japan is Tokyo. " +
+        string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
+        if (string.IsNullOrEmpty(prompt))
+            prompt = "The capital of France is Paris. The capital of Japan is Tokyo. " +
                         "The capital of Italy is";
         int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: true).ToArray();
 
-        var greedy = new SamplingConfig { Temperature = 0f, TopK = 0, TopP = 1.0f, MinP = 0f, RepetitionPenalty = 1.0f };
+        // Match the server chat defaults (temp 0.8, repPen 1.1) when requested, so
+        // acceptance/throughput reflect a real interactive session rather than greedy.
+        var greedy = Environment.GetEnvironmentVariable("TS_GMTP_CHAT") == "1"
+            ? new SamplingConfig { Temperature = 0.8f, TopK = 40, TopP = 0.95f, MinP = 0f, RepetitionPenalty = 1.1f }
+            : new SamplingConfig { Temperature = 0f, TopK = 0, TopP = 1.0f, MinP = 0f, RepetitionPenalty = 1.0f };
 
         (double tps, List<int> outTokens, double accept, long drafted) Run(bool mtp)
         {
@@ -216,7 +222,7 @@ public class Gemma4MtpTests
             {
                 MtpSpeculativeEnabled = mtp,
                 MtpMaxDraftTokens = maxDraft,
-                MtpMinDraftProb = 0.6f,
+                MtpMinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.6f),
                 NumBlocks = 64,
                 BlockSize = 256,
                 MaxNumBatchedTokens = 1024,
@@ -254,7 +260,22 @@ public class Gemma4MtpTests
         _output.WriteLine($"[gmtp-engine] off: \"{Trim(model.Tokenizer.Decode(off.outTokens))}\"");
         _output.WriteLine($"[gmtp-engine] on:  \"{Trim(model.Tokenizer.Decode(on.outTokens))}\"");
 
-        Xunit.Assert.True(on.drafted > 0, "batched spec trunk never drafted — MTP not engaged through the engine");
+        // On a backend that can drive the accelerated MTP path, speculation must
+        // engage (drafted>0). On a backend that cannot (e.g. --backend cuda, the
+        // pure-C# CUDA path with no fused multi-token kernels), MtpSpeculationProfitable
+        // is false: the engine intentionally serves standard decode (drafted==0) so
+        // speculation never regresses throughput below MTP-off.
+        if (model.MtpSpeculationProfitable)
+        {
+            Xunit.Assert.True(on.drafted > 0, "spec trunk never drafted — MTP not engaged through the engine");
+        }
+        else
+        {
+            Xunit.Assert.True(on.drafted == 0,
+                $"MTP should be gated off on this backend but drafted {on.drafted}");
+            Xunit.Assert.True(on.tps > off.tps * 0.9,
+                $"gated MTP-on must not regress vs MTP-off (on {on.tps:F1} < off {off.tps:F1} tok/s)");
+        }
 
         int cmp = Math.Min(off.outTokens.Count, on.outTokens.Count);
         int match = 0;
@@ -274,6 +295,12 @@ public class Gemma4MtpTests
     {
         string s = Environment.GetEnvironmentVariable(name);
         return !string.IsNullOrEmpty(s) && int.TryParse(s, out int v) && v > 0 ? v : fallback;
+    }
+
+    private static float EnvFloat(string name, float fallback)
+    {
+        string s = Environment.GetEnvironmentVariable(name);
+        return !string.IsNullOrEmpty(s) && float.TryParse(s, out float v) && v > 0 ? v : fallback;
     }
 
     private static BackendType ResolveBackend() =>

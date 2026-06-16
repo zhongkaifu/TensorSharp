@@ -2,6 +2,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <mma.h>   // nvcuda::wmma int8 tensor-core MMA (sm_72+ / compute_86)
 
 // IQ2_XXS dequant lookup tables, vendored from ggml-org/ggml so the CUDA backend
 // builds without the upstream ggml checkout (see tensorsharp_iq2xxs_tables.cuh).
@@ -994,6 +995,42 @@ extern "C" __global__ void ts_rmsnorm_f32(
     }
 }
 
+// Fused RMSNorm + residual add (Gemma post-norm: residual += rms_norm(sublayer_out)).
+// residual[row,i] += (input[row,i] * inv_rms(input[row])) * alpha[i], in place. Fuses
+// the per-layer RMSNorm and the residual Add into one kernel (4 such pairs per Gemma 4
+// layer) to cut the verify's per-op launch count.
+extern "C" __global__ void ts_rmsnorm_residual_add_f32(
+    const float* input,
+    const float* alpha,
+    float* residual,
+    int rows,
+    int cols,
+    float eps)
+{
+    int row = blockIdx.x;
+    if (row >= rows)
+        return;
+
+    const float* x = input + (size_t)row * cols;
+    float* r = residual + (size_t)row * cols;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+    {
+        float v = x[i];
+        sum_sq += v * v;
+    }
+
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float inv_rms;
+    if (threadIdx.x == 0)
+        inv_rms = rsqrtf(sum_sq / (float)cols + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        r[i] += x[i] * inv_rms * alpha[i];
+}
+
 extern "C" __global__ void ts_softmax_f32(const float* input, float* output, int rows, int cols)
 {
     int row = blockIdx.x;
@@ -1162,6 +1199,10 @@ extern "C" __global__ void ts_scaled_dot_product_attention_f32(
     }
 }
 
+// kv_stride is the per-kv-head element stride of key/value: it equals kv_len for a
+// CONTIGUOUS [num_kv_heads, kv_len, head_dim] tensor (the seq-heads case), or the
+// cache capacity for the LIVE cache [num_kv_heads, cache_size, head_dim] read in
+// place (global full-attention verify — kv_len <= kv_stride logical positions).
 extern "C" __global__ void ts_gqa_prefill_attention_f32(
     const float* query,
     const float* key,
@@ -1174,7 +1215,8 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     int head_dim,
     int mask_start,
     int window_size,
-    float scale)
+    float scale,
+    int kv_stride)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1195,7 +1237,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     float max_v = -FLT_MAX;
     for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        const float* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+        const float* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++)
             dot += q[d] * k[d];
@@ -1231,7 +1273,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
         for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
         {
             float p = scores[k_pos];
-            const float* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+            const float* v = value + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
             acc += p * inv_sum * v[d];
         }
         out[d] = acc;
@@ -1412,7 +1454,8 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     int head_dim,
     int mask_start,
     int window_size,
-    float scale)
+    float scale,
+    int kv_stride)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1433,7 +1476,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     float max_v = -FLT_MAX;
     for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
     {
-        const half* k = key + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+        const half* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++)
             dot += q[d] * __half2float(k[d]);
@@ -1469,7 +1512,7 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
         for (int k_pos = min_visible; k_pos <= max_visible; k_pos++)
         {
             float p = scores[k_pos];
-            const half* v = value + ((size_t)kv_head * kv_len + k_pos) * head_dim;
+            const half* v = value + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
             acc += p * inv_sum * __half2float(v[d]);
         }
         out[d] = acc;
@@ -2216,6 +2259,42 @@ extern "C" __global__ void ts_neox_rope_head_first_f32(
     data[base + j + rope_half] = x0 * sin_v + x1 * cos_v;
 }
 
+// NeoX RoPE for the FLAT [seq_len, num_heads * head_dim] layout (element (s,h,j)
+// at (s*num_heads + h)*head_dim + j) — the layout Gemma 4's q/k carry before
+// ReshapeToHeads. Same rotation/table indexing as the head-first kernel; only the
+// element address differs. cos/sin tables are [seq_len, rope_half] (rope_half =
+// partial-rotary-dims/2, with per-frequency rope_freqs.weight already baked in),
+// so this covers the partial-rotary + freq-factor global RoPE that Ops.RoPEEx
+// cannot express. Replaces the CPU GetFloatPtr rotation (a per-global-layer DtoH
+// stall) in ApplyNeoXRoPEDecode/Prefill on the pure-C# CUDA backend.
+extern "C" __global__ void ts_neox_rope_flat_f32(
+    float* data,
+    const float* cos_table,
+    const float* sin_table,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    int rope_half)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_heads * seq_len * rope_half;
+    if (idx >= total)
+        return;
+
+    int j = idx % rope_half;
+    int tmp = idx / rope_half;
+    int head = tmp % num_heads;
+    int seq = tmp / num_heads;
+    size_t base = ((size_t)seq * num_heads + head) * head_dim;
+    size_t table = (size_t)seq * rope_half + j;
+    float cos_v = cos_table[table];
+    float sin_v = sin_table[table];
+    float x0 = data[base + j];
+    float x1 = data[base + j + rope_half];
+    data[base + j] = x0 * cos_v - x1 * sin_v;
+    data[base + j + rope_half] = x0 * sin_v + x1 * cos_v;
+}
+
 extern "C" __global__ void ts_index_select_f32(
     const float* source,
     const void* indices,
@@ -2918,6 +2997,243 @@ extern "C" __global__ void ts_quant_matmul_q8_0_f32(
     acc33 = block_reduce_sum(acc33);
     if (threadIdx.x == 0 && has_r3 && out_col0 + 3 < out_dim)
         output[(size_t)(row0 + 3) * out_dim + out_col0 + 3] = acc33;
+}
+
+// Quantize a batch of activation rows to q8_1 ONCE into a global scratch, so every
+// output-tile block of the dp4a GEMM reads them (L2-cached) instead of re-quantizing.
+extern "C" __global__ void ts_quantize_q8_1_rows_f32(
+    const float* input,
+    ts_block_q8_1* out,
+    int in_dim,
+    int rows)
+{
+    int q8_blocks = in_dim / TS_QK8_1;
+    long total = (long)rows * q8_blocks;
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total)
+        return;
+    int r = (int)(idx / q8_blocks);
+    int qb = (int)(idx - (long)r * q8_blocks);
+    quantize_q8_1_block(input + (size_t)r * in_dim + (size_t)qb * TS_QK8_1, out + idx);
+}
+
+// Block-tile dp4a (int8-MMA) Q8_0 GEMM — the fast multi-row path for the MTP verify
+// window (rows 2-8). The scalar block-reduce kernels above are compute-bound on the
+// big FFN matmuls (measured ~78% of verify GPU time). This kernel:
+//   * 256 threads compute a TS_Q8_DP4A_ROWS x TS_Q8_DP4A_COLS output tile;
+//   * reads the pre-quantized q8_1 activations (xq) from global (L2-cached; quantized
+//     once by ts_quantize_q8_1_rows_f32), weight read once per row-tile;
+//   * each thread strides the dp4a-GROUPS (4 elements) of in_dim — full parallelism
+//     even for small in_dim (gate_up). Q8_0 is symmetric so the per-32-block scale
+//     d_w*d_act is constant within a block and can be applied per group (exact);
+//   * a SINGLE fused block reduction combines all ROWS*COLS partials (one
+//     __syncthreads, vs the scalar kernel's 16 sequential block reductions).
+// dp4a does 4 int8 MACs/instruction. Numerically ~equal to the dequant-weight x
+// f32-activation path; the only difference is the q8_1 round-trip of the activation
+// (8-bit, same as ggml's mul_mat_q), well within FP noise.
+#define TS_Q8_DP4A_ROWS 4
+#define TS_Q8_DP4A_COLS 4
+extern "C" __global__ void ts_quant_matmul_q8_0_dp4a_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int out_col0 = blockIdx.x * TS_Q8_DP4A_COLS;
+    int row0 = blockIdx.y * TS_Q8_DP4A_ROWS;
+    if (out_col0 >= out_dim || row0 >= rows || (in_dim & 31) != 0)
+        return;
+
+    int q8_blocks = in_dim / TS_QK8_1;
+    int row_bytes = q8_blocks * 34;
+    int tile_rows = min(TS_Q8_DP4A_ROWS, rows - row0);
+
+    float partial[TS_Q8_DP4A_ROWS][TS_Q8_DP4A_COLS];
+#pragma unroll
+    for (int r = 0; r < TS_Q8_DP4A_ROWS; r++)
+#pragma unroll
+        for (int c = 0; c < TS_Q8_DP4A_COLS; c++)
+            partial[r][c] = 0.0f;
+
+    int total_groups = q8_blocks * 8;   // in_dim / 4 dp4a groups
+    for (int g = threadIdx.x; g < total_groups; g += blockDim.x)
+    {
+        int ib = g >> 3;
+        int gib = g & 7;
+
+        // Load each row's activation group + scale ONCE (reused across all columns) —
+        // the activation is identical for every output column of this tile.
+        int   a4[TS_Q8_DP4A_ROWS];
+        float dact[TS_Q8_DP4A_ROWS];
+#pragma unroll
+        for (int r = 0; r < TS_Q8_DP4A_ROWS; r++)
+        {
+            if (r >= tile_rows) continue;
+            const ts_block_q8_1* ablk = &xq[(size_t)(row0 + r) * q8_blocks + ib];
+            a4[r] = get_int_b4(ablk->qs, gib);
+            dact[r] = __half2float(ablk->d);
+        }
+
+#pragma unroll
+        for (int c = 0; c < TS_Q8_DP4A_COLS; c++)
+        {
+            int col = out_col0 + c;
+            if (col >= out_dim)
+                continue;
+            const uint8_t* wblk = weights + (size_t)col * row_bytes + (size_t)ib * 34;
+            float dw = __half2float(*reinterpret_cast<const half*>(wblk));
+            // qs at wblk+2 is 2-byte aligned (block stride 34 is even) -> read as two
+            // uint16 (get_int_b2) instead of 4 byte loads (read_u32_unaligned).
+            int w4 = get_int_b2(wblk + 2, gib);
+#pragma unroll
+            for (int r = 0; r < TS_Q8_DP4A_ROWS; r++)
+            {
+                if (r >= tile_rows)
+                    continue;
+                int s = dp4a_i8(w4, a4[r], 0);
+                partial[r][c] += dw * dact[r] * (float)s;
+            }
+        }
+    }
+
+    // Single fused block reduction of all TS_Q8_DP4A_ROWS*COLS partials: warp-reduce
+    // each (no sync), stash per warp, ONE __syncthreads, warp 0 combines + writes.
+    const int NRC = TS_Q8_DP4A_ROWS * TS_Q8_DP4A_COLS;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+    __shared__ float red[(512 / 32) * NRC];
+#pragma unroll
+    for (int r = 0; r < TS_Q8_DP4A_ROWS; r++)
+#pragma unroll
+        for (int c = 0; c < TS_Q8_DP4A_COLS; c++)
+        {
+            float v = partial[r][c];
+            for (int off = 16; off > 0; off >>= 1)
+                v += __shfl_down_sync(0xFFFFFFFF, v, off);
+            if (lane == 0)
+                red[warp * NRC + r * TS_Q8_DP4A_COLS + c] = v;
+        }
+    __syncthreads();
+    if (warp == 0)
+    {
+#pragma unroll
+        for (int rc = 0; rc < NRC; rc++)
+        {
+            float v = (lane < num_warps) ? red[lane * NRC + rc] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1)
+                v += __shfl_down_sync(0xFFFFFFFF, v, off);
+            if (lane == 0)
+            {
+                int r = rc / TS_Q8_DP4A_COLS;
+                int c = rc - r * TS_Q8_DP4A_COLS;
+                int col = out_col0 + c;
+                if (r < tile_rows && col < out_dim)
+                    output[(size_t)(row0 + r) * out_dim + col] = v;
+            }
+        }
+    }
+}
+
+// Tensor-core (wmma int8 MMA) Q8_0 GEMM: output[M,N] = act[M,K] x weight[N,K]^T,
+// weight Q8_0 (int8 + per-32-block f16 scale), act pre-quantized to q8_1 (xq, int8 +
+// per-block scale). One WARP computes a 16x16 (M-tile x N-tile) output tile. M<16 is
+// padded with zeros (verify window is small); the int8 m16n16k16 MMA does 16 rows
+// regardless. Per Q8_0 32-block (= 2 k16 MMAs) the int32 dot is exact within the block
+// (one scale), so we accumulate int32 for the block, then scale element (m,n) by
+// d_w[n,block] * d_act[m,block] into a float accumulator (the scale is constant within
+// the block). Numerically equals the dp4a path (same q8_1 quantization + int dot).
+#define TS_MMA_TILE 16
+extern "C" __global__ void ts_quant_matmul_q8_0_mma_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    using namespace nvcuda;
+    int n0 = blockIdx.x * TS_MMA_TILE;
+    int m0 = blockIdx.y * TS_MMA_TILE;
+    if (n0 >= out_dim || m0 >= rows)
+        return;
+
+    int q8_blocks = in_dim / TS_QK8_1;        // 32 elems / block
+    int row_bytes = q8_blocks * 34;           // Q8_0 row stride
+    int lane = threadIdx.x & 31;
+
+    __shared__ int8_t smem_a[TS_MMA_TILE * TS_MMA_TILE];   // act tile [m][k]
+    __shared__ int8_t smem_b[TS_MMA_TILE * TS_MMA_TILE];   // weight tile [n][k]
+    __shared__ int    smem_i32[TS_MMA_TILE * TS_MMA_TILE]; // block int32 dot [m][n]
+    __shared__ float  smem_facc[TS_MMA_TILE * TS_MMA_TILE];// float accumulator [m][n]
+    __shared__ float  smem_dw[TS_MMA_TILE];                // weight block scales (per n)
+    __shared__ float  smem_dact[TS_MMA_TILE];              // act block scales (per m)
+
+    for (int i = lane; i < TS_MMA_TILE * TS_MMA_TILE; i += 32)
+        smem_facc[i] = 0.0f;
+    __syncwarp();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int> acc_frag;
+
+    for (int b = 0; b < q8_blocks; b++)
+    {
+        wmma::fill_fragment(acc_frag, 0);
+
+        // 32 elems/block = 2 k16 MMA steps; accumulate int32 within the block.
+        for (int k16 = 0; k16 < 2; k16++)
+        {
+            int koff = k16 * 16;
+            for (int i = lane; i < TS_MMA_TILE * TS_MMA_TILE; i += 32)
+            {
+                int r = i >> 4;          // m for A, n for B
+                int kk = i & 15;
+                // A: act[m0+r][block b, koff+kk]
+                int am = m0 + r;
+                smem_a[i] = (am < rows)
+                    ? xq[(size_t)am * q8_blocks + b].qs[koff + kk] : (int8_t)0;
+                // B: weight[n0+r][block b, koff+kk]  (int8 at +2 in the 34B block)
+                int bn = n0 + r;
+                smem_b[i] = (bn < out_dim)
+                    ? (int8_t)weights[(size_t)bn * row_bytes + (size_t)b * 34 + 2 + koff + kk] : (int8_t)0;
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(a_frag, smem_a, 16);
+            wmma::load_matrix_sync(b_frag, smem_b, 16);
+            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            __syncwarp();
+        }
+
+        wmma::store_matrix_sync(smem_i32, acc_frag, 16, wmma::mem_row_major);
+
+        // Per-block scales: d_w[n] (weight f16 scale at the block start), d_act[m].
+        for (int i = lane; i < TS_MMA_TILE; i += 32)
+        {
+            int bn = n0 + i;
+            smem_dw[i] = (bn < out_dim)
+                ? __half2float(*reinterpret_cast<const half*>(weights + (size_t)bn * row_bytes + (size_t)b * 34)) : 0.0f;
+            int am = m0 + i;
+            smem_dact[i] = (am < rows) ? __half2float(xq[(size_t)am * q8_blocks + b].d) : 0.0f;
+        }
+        __syncwarp();
+
+        for (int i = lane; i < TS_MMA_TILE * TS_MMA_TILE; i += 32)
+        {
+            int m = i >> 4, n = i & 15;
+            smem_facc[i] += (float)smem_i32[i] * smem_dw[n] * smem_dact[m];
+        }
+        __syncwarp();
+    }
+
+    for (int i = lane; i < TS_MMA_TILE * TS_MMA_TILE; i += 32)
+    {
+        int m = i >> 4, n = i & 15;
+        if (m0 + m < rows && n0 + n < out_dim)
+            output[(size_t)(m0 + m) * out_dim + (n0 + n)] = smem_facc[i];
+    }
 }
 
 extern "C" __global__ void ts_quant_get_rows_f32(

@@ -68,6 +68,11 @@ namespace TensorSharp.Runtime.Scheduling
         // fresh full prefill from position 0.
         private MtpSeqContext _mtpCtx;
 
+        // One-time warning when --mtp-spec is requested but the model can't run its
+        // accelerated MTP path on the current backend (speculation would be net-
+        // negative), so the engine serves standard decode instead.
+        private bool _mtpUnprofitableWarned;
+
         private sealed class MtpSeqContext
         {
             public SequenceState Seq;
@@ -437,6 +442,15 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (!_scheduler.Config.MtpSpeculativeEnabled) return false;
             if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp) return false;
+            // Speculation is net-negative when the model can't drive its
+            // accelerated MTP path on the current backend (the per-op verify/draft
+            // fallback doesn't amortize the trunk over the draft window). Serve the
+            // fast standard decode instead, with a single operator-facing notice.
+            if (!spec.MtpSpeculationProfitable)
+            {
+                WarnMtpUnprofitableOnce();
+                return false;
+            }
             // Batched-trunk-capable models never take the per-sequence
             // detour: when TryExecuteStepMtpBatchedTrunk declines, the normal
             // batched path serves the step (faster and keeps the sequence's
@@ -465,6 +479,17 @@ namespace TensorSharp.Runtime.Scheduling
                 return false;
             }
             return true;
+        }
+
+        private void WarnMtpUnprofitableOnce()
+        {
+            if (_mtpUnprofitableWarned) return;
+            _mtpUnprofitableWarned = true;
+            _logger.LogWarning(
+                "MTP speculative decoding was requested (--mtp-spec) but the loaded model " +
+                "cannot run its accelerated multi-token verify/draft kernels on this backend, " +
+                "so speculation would be SLOWER than standard decode. Serving standard decode " +
+                "instead. Use the ggml_cuda backend (--backend ggml_cuda) for the MTP speedup.");
         }
 
         private static bool IsBatchedN1FastPathEnabled()
@@ -997,6 +1022,10 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             if (_model is not IMtpSpeculativeModel spec || !spec.HasMtp)
                 return null;
+            // Net-negative on backends without the accelerated MTP path; the normal
+            // decode path serves the step (see ShouldRouteMtpSpeculative).
+            if (!spec.MtpSpeculationProfitable)
+                return null;
             if (spec is IMtpBatchedSpeculativeModel batchedSpec && batchedSpec.SupportsBatchedSpecTrunk)
                 return null;
             // Multimodal prefill needs Forward's embedding-inject hook, which
@@ -1065,6 +1094,11 @@ namespace TensorSharp.Runtime.Scheduling
                 return null;
             if (_model is not IMtpBatchedSpeculativeModel spec || !spec.SupportsBatchedSpecTrunk || !spec.HasMtp)
                 return null;
+            if (!spec.MtpSpeculationProfitable)
+            {
+                WarnMtpUnprofitableOnce();
+                return null;
+            }
             if (output.ScheduledWork.Count != 1)
                 return null;
             var work = output.ScheduledWork[0];

@@ -26,6 +26,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>True when the loaded weights contain a usable NextN/MTP draft block.</summary>
         bool HasMtp { get; }
 
+        /// <summary>
+        /// True when speculation is expected to be PROFITABLE on the current
+        /// backend — i.e. the model can drive its accelerated MTP path (the fused
+        /// multi-token verify + draft kernels). When false the verify (seqLen=K+1)
+        /// and draft fall to the per-op fallback, which does not amortize the trunk
+        /// over the speculative window and makes speculation net-negative; the
+        /// executor then serves the sequence with the normal (fast) decode path
+        /// instead of arming speculation. Default true (backends/models that always
+        /// have their accelerated path, or where the per-op path still wins).
+        /// </summary>
+        bool MtpSpeculationProfitable => true;
+
         /// <summary>Trunk tokens currently committed to the model's live KV cache.</summary>
         int CacheSeqLen { get; }
 
@@ -66,6 +78,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Rewind the attention KV position counter after rejected
         /// speculative tokens (no data movement needed).</summary>
         void MtpRewindCache(int length);
+
+        /// <summary>
+        /// True when a verify batch has already written reusable attention KV for
+        /// EVERY token it processed (so the accepted prefix's KV is correct in the
+        /// live cache), and the model has no recurrent state that a re-forward would
+        /// need to advance. When true the executor skips the redundant kept-prefix
+        /// re-forward on partial acceptance and simply rewinds the cache position to
+        /// keep the verify's writes — the dominant rollback cost on long contexts.
+        /// Default false (the re-forward path) so recurrent models (e.g. Qwen 3.5
+        /// GatedDeltaNet) are unaffected.
+        /// </summary>
+        bool MtpVerifyPersistsAcceptedKv => false;
     }
 
     /// <summary>
@@ -134,6 +158,16 @@ namespace TensorSharp.Runtime.Scheduling
         /// committed tokens: restore the recurrent snapshot and rewind any
         /// attention-KV bookkeeping.</summary>
         void Rollback(int position);
+
+        /// <summary>
+        /// Fast partial-acceptance commit: when the trunk's verify already wrote
+        /// reusable KV for the accepted prefix (no recurrent state to replay), keep
+        /// those writes and just set the live position to <paramref name="newPosition"/>
+        /// (= committed + accepted + 1), skipping the redundant kept-prefix
+        /// re-forward. Returns false when the trunk cannot do this (caller falls back
+        /// to <see cref="Rollback"/> + re-forward). Default: not supported.
+        /// </summary>
+        bool TryCommitVerifiedPrefix(int newPosition) => false;
     }
 
     /// <summary>Linear-cache trunk: forwards through
@@ -155,6 +189,18 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _model.MtpRestoreRecurrentState();
             _model.MtpRewindCache(position);
+        }
+
+        public bool TryCommitVerifiedPrefix(int newPosition)
+        {
+            if (!_model.MtpVerifyPersistsAcceptedKv)
+                return false;
+            // The verify wrote correct KV for all batch tokens; the accepted prefix's
+            // KV is already live. Just drop the rejected tail by rewinding the position
+            // (rejected slots are overwritten by later writes and never read past the
+            // live position). No recurrent state to restore for such models.
+            _model.MtpRewindCache(newPosition);
+            return true;
         }
     }
 
@@ -463,14 +509,21 @@ namespace TensorSharp.Runtime.Scheduling
 
             if (m < k)
             {
-                // Partial acceptance: roll the recurrent state back to the
+                // Partial acceptance. Fast path: if the verify already persisted
+                // reusable KV for the accepted prefix (no recurrent state), just keep
+                // those writes and advance the position — the kept-prefix re-forward
+                // is redundant (it would recompute byte-identical KV). This is the
+                // dominant rollback cost on long contexts. Otherwise roll back to the
                 // pre-verify checkpoint and re-advance over the kept prefix.
                 Stats.RollbackSteps++;
                 long tRoll0 = Stopwatch.GetTimestamp();
-                _trunk.Rollback(position);
-                int[] keep = new int[m + 1];
-                Array.Copy(batch, keep, m + 1);
-                _trunk.Forward(keep, null, _stepLogits, allLogitsRows: false);
+                if (!_trunk.TryCommitVerifiedPrefix(position + m + 1))
+                {
+                    _trunk.Rollback(position);
+                    int[] keep = new int[m + 1];
+                    Array.Copy(batch, keep, m + 1);
+                    _trunk.Forward(keep, null, _stepLogits, allLogitsRows: false);
+                }
                 Stats.RollbackTicks += Stopwatch.GetTimestamp() - tRoll0;
             }
 

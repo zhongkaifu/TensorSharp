@@ -159,6 +159,12 @@ namespace TensorSharp.Models
         private bool _moeModelDecodeChecked;
         private bool _moeModelDecodeDisabled;
         private Gemma4MoELayerDecodeArgs[] _moeModelArgs;
+        // Model-wide MoE multi-token VERIFY (TSGgml_Gemma4MoEModelVerify): the MTP
+        // speculative verify batch (seqLen>1) as ONE fused graph — the throughput
+        // fix that makes spec pay off on MoE Gemma 4. Separate disable flag so a
+        // verify-kernel issue degrades to the per-op verify without killing decode.
+        private bool _moeModelVerifyDisabled;
+        private Gemma4MoELayerDecodeArgs[] _moeVerifyArgs;
         private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
@@ -382,6 +388,19 @@ namespace TensorSharp.Models
             InitKVCache(initialCacheLength, maxContextLength);
             BuildGemma4DecodeArrays();
         }
+
+        /// <summary>
+        /// On <c>ggml_cuda</c>, Gemma 4 MoE decode (<see cref="TryFusedMoEModelDecode"/>)
+        /// and prefill (<see cref="TryMoEFusedGEGLU"/>) read the experts exclusively
+        /// from the per-layer stacked-expert device buffer (one device copy per
+        /// <c>*_exps</c> tensor, uploaded on first use and cached by host pointer).
+        /// Giving each per-expert split view its own device copy as well would put a
+        /// second full copy of every expert in VRAM — for the 26B-A4B that is an
+        /// extra ~12 GB and the cause of the load-time CUDA OOM. Skip them; the host
+        /// view stays mapped so the rare per-op fallback can still reach the bytes.
+        /// </summary>
+        protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
+            => !_stackedExpertMemberNames.Contains(weightName);
 
         private bool IsLocalLayer(int layer) =>
             _slidingWindowPattern != null && layer < _slidingWindowPattern.Length && _slidingWindowPattern[layer];
@@ -2136,7 +2155,7 @@ namespace TensorSharp.Models
         /// (caller falls back to the per-op path) when the native kernel declines —
         /// e.g. total length exceeds the SWA window so the circular cache has wrapped.
         /// </summary>
-        private unsafe bool NativeGemma4ModelVerify(Tensor hidden, int startPos, int n)
+        private unsafe bool NativeGemma4ModelVerify(Tensor hidden, int startPos, int n, Tensor perLayerInputs)
         {
             if (_decodeArrays == null) return false;
             var a = _decodeArrays;
@@ -2150,6 +2169,8 @@ namespace TensorSharp.Models
                 freqFactorsPtr = (IntPtr)GetFloatPtr(freqTensor);
                 freqFactorsLen = (int)freqTensor.ElementCount();
             }
+
+            IntPtr pleDataPtr = perLayerInputs != null ? (IntPtr)GetFloatPtr(perLayerInputs) : IntPtr.Zero;
 
             return GgmlBasicOps.Gemma4ModelVerify(
                 (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers, n,
@@ -2167,7 +2188,12 @@ namespace TensorSharp.Models
                 freqFactorsPtr, freqFactorsLen, a.RopeNDims,
                 _kvCacheDtype.GgmlType(),
                 a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
-                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                a.KvSource,
+                pleDataPtr, _pleDim,
+                a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
+                a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
+                a.PlePostNorm);
         }
 
         /// <summary>
@@ -2379,6 +2405,55 @@ namespace TensorSharp.Models
                 _moeModelDecodeDisabled = true;
                 return false;
             }
+            _kvCacheHostDirty = true;
+            return true;
+        }
+
+        /// <summary>Run the MTP speculative VERIFY batch (<paramref name="n"/> tokens
+        /// at positions [<paramref name="startPos"/>, startPos+n)) for an all-MoE
+        /// model as ONE fused GGML graph (<c>TSGgml_Gemma4MoEModelVerify</c>) — the
+        /// multi-token sibling of <see cref="TryFusedMoEModelDecode"/>. On success
+        /// <paramref name="hidden"/> holds the per-row layer-stack output (pre
+        /// output_norm). Returns false (caller falls back to the per-op verify) when
+        /// the model shape is unsupported, a layer can't build, the global cache is
+        /// too small for the sequence, or the kernel throws.</summary>
+        private unsafe bool TryFusedMoEModelVerify(Tensor hidden, int startPos, int n)
+        {
+            if (_moeModelVerifyDisabled || !s_MoeModelDecodeEnabled) return false;
+            if (!_moeModelDecodeChecked)
+            {
+                _moeModelDecodeChecked = true;
+                _canUseFusedMoEModelDecode =
+                    IsGgmlBackend && _decodeArrays != null && _moeFusedDecodeEnabled
+                    && _pleDim == 0 && _kvDonorMap.Count == 0
+                    && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
+            }
+            if (!_canUseFusedMoEModelDecode) return false;
+
+            int layerCount = Config.NumLayers;
+            _moeVerifyArgs ??= new Gemma4MoELayerDecodeArgs[layerCount];
+            IntPtr hiddenPtr = (IntPtr)GetFloatPtr(hidden);
+            for (int l = 0; l < layerCount; l++)
+            {
+                if (!TryBuildMoELayerArgs(l, hiddenPtr, startPos, out _moeVerifyArgs[l]))
+                {
+                    _canUseFusedMoEModelDecode = false;
+                    return false;
+                }
+            }
+
+            bool ok;
+            try
+            {
+                ok = GgmlBasicOps.Gemma4MoEModelVerify(_moeVerifyArgs, layerCount, hiddenPtr, Config.HiddenSize, startPos, n);
+            }
+            catch (Exception ex)
+            {
+                System.Console.WriteLine($"[gemma4] fused MoE model verify disabled after error: {ex.Message}");
+                _moeModelVerifyDisabled = true;
+                return false;
+            }
+            if (!ok) return false;   // kernel declined (e.g. global cache too small): per-op fallback
             _kvCacheHostDirty = true;
             return true;
         }
@@ -3884,9 +3959,17 @@ namespace TensorSharp.Models
 
         private bool TryRmsNormAddInPlaceMlx(Tensor residual, Tensor input, string normWeightName)
         {
-            return _backend == BackendType.Mlx
-                && _weights.TryGetValue(normWeightName, out var normW)
-                && MlxFusedOps.TryRmsNormAddInPlace(residual, input, normW, Config.Eps);
+            if (!_weights.TryGetValue(normWeightName, out var normW))
+                return false;
+            // Fuse the Gemma post-norm RMSNorm + residual add into one kernel (4 such
+            // pairs per layer): cuts the verify's per-op launch count on CUDA, mirrors
+            // the existing MLX fused path.
+            return _backend switch
+            {
+                BackendType.Mlx => MlxFusedOps.TryRmsNormAddInPlace(residual, input, normW, Config.Eps),
+                BackendType.Cuda => CudaFusedOps.TryRmsNormResidualAdd(residual, input, normW, Config.Eps),
+                _ => false,
+            };
         }
 
         private void TryEvaluateMlxLayerBoundary(Tensor hidden, int layer, int seqLen)
@@ -4447,6 +4530,25 @@ namespace TensorSharp.Models
                     }
                 }
 
+                // CUDA global (full-attention) verify: the K/V live in the linear cache
+                // (kvIsSeqHeads == false), so the seq-heads fused prefill above can't take
+                // it without a contiguous repack. Run the fused GQA prefill kernel against
+                // the live cache in place (kvStride = cacheLen) — ONE launch, cache read
+                // once — replacing the legacy ExpandKVHeads + batched-matmul + separate-
+                // softmax path that materializes [numHeads,kvLen,hd] + an
+                // [numHeads,seqLen,kvLen] score tensor and scales poorly with the verify
+                // window. Local/SWA layers keep their windowed/seq-heads paths; multimodal
+                // (exceptPositions) keeps the masked path. Bounded to the verify window so
+                // large chunked-prefill chunks stay on the legacy path (no prefill churn).
+                if (result == null && _backend == BackendType.Cuda && !isLocal
+                    && seqLen <= GlobalLiveCacheAttnMaxSeqLen && exceptPositions == null
+                    && TryGlobalLiveCacheAttentionCuda(qHeads, kvSrcK, kvSrcV,
+                        Config.NumHeads, kvHeads, hd, seqLen, kvLen, startPos,
+                        _kvCacheSize[kvCacheLayer], out result))
+                {
+                    qHeads.Dispose();
+                }
+
                 if (result == null && useWindowedAttn)
                 {
                     result = WindowedPrefillAttention(qHeads, kvSrcK, kvSrcV,
@@ -4955,8 +5057,11 @@ namespace TensorSharp.Models
             }
 
             if (EnsureNeoXRopeDeviceTables(1, position, freqs, rebuiltTables) &&
-                MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
-                    numHeads, 1, headDim, ropeHalf))
+                ((_backend == BackendType.Cuda &&
+                    CudaFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                        numHeads, 1, headDim, ropeHalf)) ||
+                 MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    numHeads, 1, headDim, ropeHalf)))
             {
                 return;
             }
@@ -5014,8 +5119,11 @@ namespace TensorSharp.Models
             }
 
             if (EnsureNeoXRopeDeviceTables(seqLen, startPos, freqs, rebuiltTables) &&
-                MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
-                    numHeads, seqLen, headDim, ropeHalf))
+                ((_backend == BackendType.Cuda &&
+                    CudaFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                        numHeads, seqLen, headDim, ropeHalf)) ||
+                 MlxFusedOps.TryNeoXRoPEFlatInPlace(data, _neoXRopeCosTensor, _neoXRopeSinTensor,
+                    numHeads, seqLen, headDim, ropeHalf)))
             {
                 return data;
             }
@@ -5066,6 +5174,43 @@ namespace TensorSharp.Models
                 }
             }
             return data;
+        }
+
+        // Max query rows routed to the global live-cache prefill attention. The MTP
+        // verify window is <= MtpMaxDraftTokens+1 (well under this); larger multi-row
+        // batches (chunked prefill chunk 2+) keep the legacy path, so this stays a
+        // contained verify-window fast path with no prefill blast radius.
+        private const int GlobalLiveCacheAttnMaxSeqLen = 32;
+
+        // Global (full-attention) multi-row attention on CUDA in ONE launch against
+        // the LIVE linear cache (no per-row decode loop, no ExpandKVHeads/score-tensor
+        // materialization). The fused GQA prefill kernel reads the cache
+        // [numKVHeads, cacheLen, headDim] in place via kvStride=cacheLen, attending the
+        // first kvLen positions causally (mask_start = kvLen - seqLen). qHeads is the
+        // head-first query [numHeads, seqLen, headDim]; result is flat
+        // [seqLen, numHeads*headDim]. Numerically identical to the legacy
+        // ExpandKVHeads + batched-matmul + softmax path (full causal, no SWA window).
+        private bool TryGlobalLiveCacheAttentionCuda(
+            Tensor qHeads, Tensor kCache, Tensor vCache, int numHeads, int kvHeads, int headDim,
+            int seqLen, int kvLen, int startPos, int cacheLen, out Tensor result)
+        {
+            result = null;
+            if (_backend != BackendType.Cuda || kCache == null || vCache == null)
+                return false;
+            int maskStart = kvLen - seqLen;
+            if (maskStart < 0 || maskStart >= kvLen || kvLen > cacheLen)
+                return false;
+
+            var res = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+            if (CudaFusedOps.TryGqaPrefillAttention(res, qHeads, kCache, vCache,
+                    numHeads, kvHeads, headDim, seqLen, kvLen, maskStart, /*windowSize*/ 0, 1f,
+                    /*kvStride*/ cacheLen))
+            {
+                result = res;
+                return true;
+            }
+            res.Dispose();
+            return false;
         }
 
         private Tensor ReshapeFromHeadsEx(Tensor data, int numHeads, int seqLen, int headDim)

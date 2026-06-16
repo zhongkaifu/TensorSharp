@@ -1412,6 +1412,19 @@ namespace TensorSharp.GGML
             GgmlNative.Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position);
         }
 
+        /// <summary>
+        /// Run the entire Gemma4 MoE transformer over <paramref name="numTokens"/>
+        /// tokens (the MTP verify batch) as ONE GGML graph — the multi-token sibling
+        /// of <see cref="Gemma4MoEModelDecode"/>. Reuses the same per-layer descriptor
+        /// array; writes the per-row layer-stack hidden state (pre output_norm) back
+        /// into <paramref name="hidden"/>. Returns false when the kernel cannot handle
+        /// the shape (caller falls back to the per-op verify).
+        /// </summary>
+        public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
+        {
+            return GgmlNative.Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens);
+        }
+
         public static void Gemma4LayerPrefill(
             IntPtr hiddenData, int hiddenSize, int seqLen,
             IntPtr attnNormW,
@@ -1968,7 +1981,12 @@ namespace TensorSharp.GGML
             IntPtr ropeFreqFactors, int ropeFreqFactorsLen, int[] ropeNDimsArr,
             int kvCacheType,
             IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
-            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr)
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr)
         {
             return GgmlNative.Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -1986,7 +2004,12 @@ namespace TensorSharp.GGML
                 ropeFreqFactors, ropeFreqFactorsLen, ropeNDimsArr,
                 kvCacheType,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
-                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr);
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                kvSourceArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr);
         }
 
         /// <summary>Fused Gemma 4 MTP draft step. Returns false when the native

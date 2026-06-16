@@ -248,6 +248,33 @@ public class MtpSpeculativeExecutionTests
         Assert.Null(seq.SpecStats);
     }
 
+    // --mtp-spec is requested but the backend can't drive the accelerated MTP
+    // path (MtpSpeculationProfitable=false, e.g. the pure-C# CUDA backend for
+    // Gemma 4). The engine must serve the fast standard decode — never the
+    // net-negative per-op spec path — so speculation never engages: no
+    // SpecForward calls (linear OR batched) and no spec stats, with output
+    // identical to the plain stream. Regression guard for the backend gate.
+    [Theory]
+    [InlineData(false)]   // linear-trunk-capable model
+    [InlineData(true)]    // batched-trunk-capable model
+    public void EngineMtpSpec_UnprofitableBackend_FallsBackToStandardDecode(bool batchedTrunk)
+    {
+        const int promptLen = 5;
+        const int maxNew = 16;
+        var model = new FakeMtpModel
+        {
+            MtpSpeculationProfitable = false,
+            BatchedTrunkEnabled = batchedTrunk,
+        };
+
+        var seq = RunEngineRequest(model, promptLen, maxNew, mtpEnabled: true);
+
+        Assert.Equal(ExpectedChain(model, promptLen, maxNew), seq.OutputTokens);
+        Assert.Equal(0, model.LinearSpecForwardCalls);
+        Assert.Equal(0, model.BatchedSpecForwardCalls);
+        Assert.Null(seq.SpecStats);
+    }
+
     // ----- helpers -----
 
     private static int PrefillPrompt(FakeMtpModel model, MtpSpeculativeExecution exec, int promptLen, out int lastToken)
@@ -406,6 +433,9 @@ public class MtpSpeculativeExecutionTests
 
         // ---- IMtpSpeculativeModel ----
         public bool HasMtp => true;
+        // Mirrors a backend that lacks the accelerated MTP kernels (e.g. the
+        // pure-C# CUDA backend for Gemma 4): the engine must NOT engage spec.
+        public bool MtpSpeculationProfitable { get; set; } = true;
         public int CacheSeqLen => _trunk.Count;
         public int MaxContextLength => 4096;
 

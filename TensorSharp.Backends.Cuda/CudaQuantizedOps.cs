@@ -28,6 +28,26 @@ namespace TensorSharp.Cuda
         private static readonly object Sync = new object();
         private static readonly Dictionary<CacheKey, DeviceWeight> Cache = new Dictionary<CacheKey, DeviceWeight>();
 
+        // Per-device reusable scratch for q8_1-quantized activations (the dp4a Q8_0
+        // matmul path). Grown on demand; reused across calls (one stream per allocator
+        // ⇒ each matmul's read completes before the next quantize overwrites it).
+        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> Q81Scratch = new();
+        private static IntPtr EnsureQ81Scratch(CudaAllocator allocator, long bytes)
+        {
+            lock (Sync)
+            {
+                if (Q81Scratch.TryGetValue(allocator.DeviceId, out var s) && s.bytes >= bytes)
+                    return s.ptr;
+                allocator.Context.MakeCurrent();
+                if (s.ptr != IntPtr.Zero)
+                    CudaDriverApi.cuMemFree(s.ptr);
+                long alloc = Math.Max(bytes, 64 * 1024);
+                CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc)).ThrowOnError();
+                Q81Scratch[allocator.DeviceId] = (ptr, alloc);
+                return ptr;
+            }
+        }
+
         // Row-batched quantized matmul (weight-reuse across small row counts).
         // On by default; set TS_CUDA_QMM_BATCHED=0 to force the legacy per-row
         // kernels (A/B benchmarking).
@@ -107,6 +127,8 @@ namespace TensorSharp.Cuda
             }
         }
 
+        // q8Kernel override for the multi-row Q8_0 path (lets a test drive MMA and dp4a
+        // in one process): 0 = auto (env flags), 1 = dp4a, 2 = tensor-core MMA, 3 = scalar.
         public static bool TryAddmmQuantizedToFloat32(
             Tensor result,
             Tensor input,
@@ -115,7 +137,8 @@ namespace TensorSharp.Cuda
             int ggmlType,
             long ne0,
             long ne1,
-            long rawBytes)
+            long rawBytes,
+            int q8Kernel = 0)
         {
             if (!SupportsQuantizedType(ggmlType))
                 return false;
@@ -175,6 +198,26 @@ namespace TensorSharp.Cuda
                     outDim,
                     rows,
                     allocator.Stream.Handle);
+            }
+            else if (ggmlType == 8 && rows >= 2 && (inDim & 31) == 0
+                     && q8Kernel != 3
+                     && (q8Kernel == 1 || q8Kernel == 2
+                         || (q8Kernel == 0 && (CudaKernels.Q8MmaEnabled || CudaKernels.Q8Dp4aEnabled))))
+            {
+                // Multi-row Q8_0 fast path: quantize the activation rows to q8_1 ONCE
+                // into a reused scratch (single-stream per allocator makes reuse safe),
+                // then either the tensor-core MMA GEMM or the block-tile dp4a GEMM. The
+                // big FFN matmuls are compute-bound for the verify window.
+                bool useMma = q8Kernel == 2 || (q8Kernel == 0 && CudaKernels.Q8MmaEnabled);
+                long scratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
+                IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                kernels.LaunchQuantizeQ81Rows(inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle);
+                if (useMma)
+                    kernels.LaunchQuantMatmulQ80Mma(
+                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                else
+                    kernels.LaunchQuantMatmulQ80Dp4a(
+                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
             }
             else if (ggmlType == 8)
             {

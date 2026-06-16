@@ -2,6 +2,54 @@ namespace TensorSharp.Cuda
 {
     public static class CudaFusedOps
     {
+        // Go/no-go PoC for the CUDA-graph rearchitecture: measure how much of a
+        // launch-heavy op sequence is per-op CPU/WDDM launch overhead (which a captured
+        // graph replays in ONE launch) vs GPU compute. `issueOneLaunch` must issue
+        // exactly one capturable launch on `onStream`'s stream (no host sync / alloc).
+        // Returns wall ms for `iters` per-op launches vs one graph replay of the same.
+        public static (double peropMs, double graphMs, bool captured) MeasureGraphReplay(
+            Tensor onStream, int iters, System.Action issueOneLaunch)
+        {
+            var storage = onStream.Storage as CudaStorage;
+            if (storage == null) return (0, 0, false);
+            System.IntPtr stream = storage.AllocatorImpl.Stream.Handle;
+            storage.AllocatorImpl.Context.MakeCurrent();
+
+            for (int i = 0; i < iters; i++) issueOneLaunch();   // warm up
+            Interop.CudaDriverApi.cuStreamSynchronize(stream);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) issueOneLaunch();
+            Interop.CudaDriverApi.cuStreamSynchronize(stream);
+            sw.Stop();
+            double peropMs = sw.Elapsed.TotalMilliseconds;
+
+            if (Interop.CudaDriverApi.cuStreamBeginCapture(stream,
+                    Interop.CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) != 0)
+                return (peropMs, 0, false);
+            for (int i = 0; i < iters; i++) issueOneLaunch();
+            if (Interop.CudaDriverApi.cuStreamEndCapture(stream, out System.IntPtr graph) != 0)
+                return (peropMs, 0, false);
+            if (Interop.CudaDriverApi.cuGraphInstantiateWithFlags(out System.IntPtr exec, graph, 0) != 0)
+            {
+                Interop.CudaDriverApi.cuGraphDestroy(graph);
+                return (peropMs, 0, false);
+            }
+
+            Interop.CudaDriverApi.cuGraphLaunch(exec, stream);   // warm up replay
+            Interop.CudaDriverApi.cuStreamSynchronize(stream);
+
+            var sw2 = System.Diagnostics.Stopwatch.StartNew();
+            Interop.CudaDriverApi.cuGraphLaunch(exec, stream);
+            Interop.CudaDriverApi.cuStreamSynchronize(stream);
+            sw2.Stop();
+            double graphMs = sw2.Elapsed.TotalMilliseconds;
+
+            Interop.CudaDriverApi.cuGraphExecDestroy(exec);
+            Interop.CudaDriverApi.cuGraphDestroy(graph);
+            return (peropMs, graphMs, true);
+        }
+
         public static bool TryGqaPrefillAttention(
             Tensor result,
             Tensor query,
@@ -14,7 +62,8 @@ namespace TensorSharp.Cuda
             int kvLen,
             int maskStart,
             int windowSize,
-            float scale)
+            float scale,
+            int kvStride = -1)
         {
             return CudaKernelOps.TryGqaPrefillAttention(
                 result,
@@ -28,7 +77,8 @@ namespace TensorSharp.Cuda
                 kvLen,
                 maskStart,
                 windowSize,
-                scale);
+                scale,
+                kvStride);
         }
 
         public static bool TryAttentionSoftmaxWithSinks(
@@ -183,6 +233,17 @@ namespace TensorSharp.Cuda
         public static bool TryNeoXRoPEHeadFirst(Tensor data, Tensor cosTable, Tensor sinTable, int numHeads, int seqLen, int headDim, int ropeHalf)
         {
             return CudaKernelOps.TryNeoXRoPEHeadFirst(data, cosTable, sinTable, numHeads, seqLen, headDim, ropeHalf);
+        }
+
+        public static bool TryNeoXRoPEFlatInPlace(Tensor data, Tensor cosTable, Tensor sinTable, int numHeads, int seqLen, int headDim, int ropeHalf)
+        {
+            return CudaKernelOps.TryNeoXRoPEFlatInPlace(data, cosTable, sinTable, numHeads, seqLen, headDim, ropeHalf);
+        }
+
+        // residual += rms_norm(input, alpha) (Gemma post-norm), fused into one kernel.
+        public static bool TryRmsNormResidualAdd(Tensor residual, Tensor input, Tensor alpha, float eps)
+        {
+            return CudaKernelOps.TryRmsNormResidualAdd(residual, input, alpha, eps);
         }
 
         public static bool TryGELUMulSplit(Tensor result, Tensor gateUp, int halfDim)

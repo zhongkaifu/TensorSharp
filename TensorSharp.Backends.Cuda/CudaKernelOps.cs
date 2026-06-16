@@ -826,8 +826,14 @@ namespace TensorSharp.Cuda
             int kvLen,
             int maskStart,
             int windowSize,
-            float scale)
+            float scale,
+            int kvStride = -1)
         {
+            // kvStride < 0: contiguous [numKVHeads, kvLen, headDim] (seq-heads case).
+            // kvStride > 0: live cache [numKVHeads, kvStride, headDim] read in place;
+            // the kernel attends the first kvLen logical positions (kvLen <= kvStride).
+            bool liveCache = kvStride > 0;
+            int kStride = liveCache ? kvStride : kvLen;
             if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out _) ||
                 !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out _) ||
                 !TryGetContiguousFloatOrHalf(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _, out bool keyIsHalf) ||
@@ -842,15 +848,16 @@ namespace TensorSharp.Cuda
                 seqLen <= 0 ||
                 kvLen <= 0 ||
                 kvLen > 8192 ||
+                kvLen > kStride ||
                 numQHeads % numKVHeads != 0 ||
                 query.Sizes[0] != numQHeads ||
                 query.Sizes[1] != seqLen ||
                 query.Sizes[2] != headDim ||
                 key.Sizes[0] != numKVHeads ||
-                key.Sizes[1] != kvLen ||
+                key.Sizes[1] != kStride ||
                 key.Sizes[2] != headDim ||
                 value.Sizes[0] != numKVHeads ||
-                value.Sizes[1] != kvLen ||
+                value.Sizes[1] != kStride ||
                 value.Sizes[2] != headDim ||
                 result.Sizes[0] != seqLen ||
                 result.Sizes[1] != numQHeads * headDim ||
@@ -884,6 +891,7 @@ namespace TensorSharp.Cuda
                     maskStart,
                     windowSize,
                     scale,
+                    kStride,
                     allocator.Stream.Handle);
             }
             else
@@ -901,6 +909,7 @@ namespace TensorSharp.Cuda
                     maskStart,
                     windowSize,
                     scale,
+                    kStride,
                     allocator.Stream.Handle);
             }
             resultStorage.MarkDeviceModified();
@@ -1508,6 +1517,80 @@ namespace TensorSharp.Cuda
             sinStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
             kernels.LaunchNeoXRoPEHeadFirstF32(
+                dataPtr,
+                cosPtr,
+                sinPtr,
+                numHeads,
+                seqLen,
+                headDim,
+                ropeHalf,
+                allocator.Stream.Handle);
+            dataStorage.MarkDeviceModified();
+            return true;
+        }
+
+        // NeoX RoPE for the FLAT [seqLen, numHeads*headDim] layout. The data tensor
+        // need only be contiguous with numHeads*seqLen*headDim elements (q/k carry a
+        // 2D [seqLen, numHeads*headDim] shape before ReshapeToHeads, or [1, *] for
+        // decode), so this checks element count rather than a fixed rank.
+        // residual = residual + rms_norm(input, alpha) (Gemma post-norm), fused into one
+        // kernel. residual/input are [rows, cols] contiguous f32; alpha is [cols].
+        public static bool TryRmsNormResidualAdd(Tensor residual, Tensor input, Tensor alpha, float eps)
+        {
+            if (!TryGetContiguousFloat(residual, out CudaStorage resStorage, out IntPtr resPtr, out int resCount) ||
+                !TryGetContiguousFloat(input, out CudaStorage inStorage, out IntPtr inPtr, out int inCount) ||
+                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
+                residual.DimensionCount != 2 ||
+                input.DimensionCount != 2 ||
+                residual.Sizes[0] != input.Sizes[0] ||
+                residual.Sizes[1] != input.Sizes[1] ||
+                alphaCount != residual.Sizes[1] ||
+                resCount != inCount)
+            {
+                return false;
+            }
+
+            int rows = checked((int)residual.Sizes[0]);
+            int cols = checked((int)residual.Sizes[1]);
+            CudaAllocator allocator = resStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            inStorage.EnsureDeviceCurrent();
+            alphaStorage.EnsureDeviceCurrent();
+            resStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchRMSNormResidualAddF32(inPtr, alphaPtr, resPtr, rows, cols, eps, allocator.Stream.Handle);
+            resStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryNeoXRoPEFlatInPlace(Tensor data, Tensor cosTable, Tensor sinTable, int numHeads, int seqLen, int headDim, int ropeHalf)
+        {
+            if (!TryGetContiguousFloat(data, out CudaStorage dataStorage, out IntPtr dataPtr, out int dataCount) ||
+                !TryGetContiguousFloat(cosTable, out CudaStorage cosStorage, out IntPtr cosPtr, out int cosCount) ||
+                !TryGetContiguousFloat(sinTable, out CudaStorage sinStorage, out IntPtr sinPtr, out int sinCount) ||
+                numHeads <= 0 ||
+                seqLen <= 0 ||
+                headDim <= 0 ||
+                ropeHalf <= 0 ||
+                ropeHalf * 2 > headDim ||
+                dataCount != numHeads * seqLen * headDim ||
+                cosCount != seqLen * ropeHalf ||
+                sinCount != cosCount)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = dataStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            dataStorage.EnsureDeviceCurrent();
+            cosStorage.EnsureDeviceCurrent();
+            sinStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchNeoXRoPEFlatF32(
                 dataPtr,
                 cosPtr,
                 sinPtr,
