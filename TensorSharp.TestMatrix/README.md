@@ -203,7 +203,27 @@ host-class layout, and update workflow.
 ## CI
 
 The repo's GitHub Actions workflow [`test-matrix.yml`](../.github/workflows/test-matrix.yml)
-runs the full matrix on every PR using self-hosted runners labelled
-`tensorsharp-cuda` and `tensorsharp-mlx`. The PR comment includes a link to
-the uploaded `report.md` artifact. See the workflow file for runner setup
-expectations (model directory, NVIDIA drivers, etc.).
+uses self-hosted runners labelled `tensorsharp-cuda` and `tensorsharp-mlx`.
+
+To keep CI latency low, **automatic triggers (every PR and every push to main)
+run a fast "smoke" profile**, not the full matrix:
+
+| | Smoke (auto: PR / push) | Full (manual / local) |
+|---|---|---|
+| Features | `pp512`, `tg128`, `short_text` | all (12) |
+| Backends | production-fast only (`ggml_cuda,cuda` / `ggml_metal,mlx`) | all (incl. pure-C# `cpu`) |
+| Env-var sweeps | none (baseline cells only) | all curated `default_env_vars` |
+| Regression gating | yes (`--fail-on-regression`) | yes |
+
+The smoke profile still catches the things that matter most on a per-commit
+basis — a throughput regression (`pp512`/`tg128`) or a model that loads but
+answers gibberish (`short_text`) — while dropping the env-var sweeps, which are
+the dominant cost.
+
+**Running the full matrix:** it is no longer run automatically. Trigger it on
+demand from the Actions tab via **`workflow_dispatch`** (leave the `backends` /
+`features` / `env_vars` inputs blank for the complete matrix, or set them for a
+custom subset), or run any subset locally — see [Running](#running) above. The
+PR comment still includes a link to the uploaded `report.md` artifact. See the
+workflow file for runner setup expectations (model directory, NVIDIA drivers,
+etc.).

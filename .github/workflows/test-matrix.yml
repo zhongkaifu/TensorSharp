@@ -1,7 +1,22 @@
 name: Test Matrix
 
-# Runs the full inference test/benchmark matrix
-# (TensorSharp.TestMatrix) on every PR and every push to main.
+# Drives the inference test/benchmark matrix (TensorSharp.TestMatrix).
+#
+# To keep CI latency low, automatic triggers (pull_request, push to main) run a
+# fast "smoke" profile — the curated necessary tests only:
+#
+#   - features : pp512, tg128, short_text   (prefill + decode throughput + a
+#                model-loads-and-answers correctness check; no external media)
+#   - backends : the host's production-fast backends only (the slow pure-C#
+#                `cpu` backend is dropped from smoke; see `smoke_backends` below)
+#   - env-vars : none  (the env-var sweeps are the biggest time sink and are
+#                disabled for smoke; baseline cells only)
+#
+# The FULL matrix (all backends × all features × all curated env-var sweeps) is
+# never run automatically anymore. Run it on demand via `workflow_dispatch`
+# (leave the inputs blank for the full matrix, or set them for a custom subset),
+# or locally with `dotnet run --project TensorSharp.TestMatrix` (see the
+# project README). Regression gating (--fail-on-regression) stays on for smoke.
 #
 # Self-hosted runners required: this workflow drives real GGUF models on
 # real GPUs / Apple Silicon, neither of which is available on
@@ -112,12 +127,18 @@ jobs:
         include:
           - runner: tensorsharp-cuda
             os_label: linux-cuda
+            # Full matrix (workflow_dispatch with blank inputs) vs the automatic
+            # smoke profile. Smoke drops the slow pure-C# `cpu` backend.
             default_backends: "cpu,ggml_cpu,ggml_cuda,cuda"
+            smoke_backends: "ggml_cuda,cuda"
           - runner: tensorsharp-mlx
             os_label: macos-mlx
             default_backends: "cpu,ggml_cpu,ggml_metal,mlx"
+            smoke_backends: "ggml_metal,mlx"
     runs-on: [self-hosted, "${{ matrix.runner }}"]
-    timeout-minutes: 480
+    # Smoke runs finish quickly; only the manual full-matrix dispatch needs the
+    # multi-hour ceiling, so a hung smoke run fails fast.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 480 || 90 }}
     env:
       TESTMATRIX_MODEL_DIR: ${{ vars.TESTMATRIX_MODEL_DIR || '/Users/ZhongkaiFu/work/model' }}
       TESTMATRIX_MEDIA_DIR: ${{ vars.TESTMATRIX_MEDIA_DIR || '' }}
@@ -147,14 +168,42 @@ jobs:
 
       - name: Resolve runtime options
         id: opts
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_BACKENDS: ${{ github.event.inputs.backends }}
+          IN_FEATURES: ${{ github.event.inputs.features }}
+          IN_ENV_VARS: ${{ github.event.inputs.env_vars }}
+          DEFAULT_BACKENDS: ${{ matrix.default_backends }}
+          SMOKE_BACKENDS: ${{ matrix.smoke_backends }}
         run: |
-          BACKENDS="${{ github.event.inputs.backends }}"
-          if [ -z "$BACKENDS" ]; then BACKENDS="${{ matrix.default_backends }}"; fi
-          FEATURES="${{ github.event.inputs.features }}"
-          ENV_VARS="${{ github.event.inputs.env_vars }}"
+          set -euo pipefail
+          # Manual runs (workflow_dispatch) honour the provided inputs and fall
+          # back to the full per-host matrix when an input is left blank.
+          # Automatic triggers (pull_request, push to main) run the fast smoke
+          # profile: necessary tests only, env-var sweeps disabled.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            BACKENDS="${IN_BACKENDS:-$DEFAULT_BACKENDS}"
+            FEATURES="$IN_FEATURES"
+            ENV_VARS="$IN_ENV_VARS"
+            PROFILE="full / custom (workflow_dispatch)"
+          else
+            BACKENDS="$SMOKE_BACKENDS"
+            FEATURES="pp512,tg128,short_text"
+            ENV_VARS="none"
+            PROFILE="smoke (automatic trigger)"
+          fi
           echo "backends=$BACKENDS" >> "$GITHUB_OUTPUT"
           echo "features=$FEATURES" >> "$GITHUB_OUTPUT"
           echo "env_vars=$ENV_VARS" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Test matrix profile — ${{ matrix.os_label }}"
+            echo ""
+            echo "- profile: \`$PROFILE\`"
+            echo "- backends: \`$BACKENDS\`"
+            echo "- features: \`${FEATURES:-<all>}\`"
+            echo "- env-var sweeps: \`${ENV_VARS:-<all>}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run test matrix
         env:

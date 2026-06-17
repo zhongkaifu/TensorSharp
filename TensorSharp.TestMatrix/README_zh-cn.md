@@ -195,6 +195,22 @@ dotnet TensorSharp.TestMatrix/bin/TensorSharp.TestMatrix.dll \
 ## CI
 
 仓库的 GitHub Actions workflow [`test-matrix.yml`](../.github/workflows/test-matrix.yml)
-会在每个 PR 上通过标记为 `tensorsharp-cuda` 与 `tensorsharp-mlx` 的自托管 runner
-运行完整矩阵。PR 评论会包含上传的 `report.md` artifact 链接。runner 准备要求
-（模型目录、NVIDIA 驱动等）见 workflow 文件。
+使用标记为 `tensorsharp-cuda` 与 `tensorsharp-mlx` 的自托管 runner。
+
+为降低 CI 时延，**自动触发（每个 PR、每次推送到 main）只运行快速的「smoke」
+组合**，而不是完整矩阵：
+
+| | Smoke（自动：PR / push） | 完整（手动 / 本地） |
+|---|---|---|
+| 特性 | `pp512`、`tg128`、`short_text` | 全部（12 个） |
+| 后端 | 仅生产快后端（`ggml_cuda,cuda` / `ggml_metal,mlx`） | 全部（含纯 C# 的 `cpu`） |
+| 环境变量 sweep | 无（仅 baseline cell） | 全部 `default_env_vars` |
+| 回归门禁 | 是（`--fail-on-regression`） | 是 |
+
+Smoke 组合仍能抓住每次提交最关心的问题——吞吐回归（`pp512`/`tg128`）或模型能
+加载但输出乱码（`short_text`）——同时去掉了占主要耗时的环境变量 sweep。
+
+**运行完整矩阵：** 它不再自动运行。可在 Actions 页通过 **`workflow_dispatch`**
+按需触发（把 `backends` / `features` / `env_vars` 输入留空即跑完整矩阵，或填入
+自定义子集），或在本地运行任意子集——见上文[运行](#运行)。PR 评论仍会包含上传的
+`report.md` artifact 链接。runner 准备要求（模型目录、NVIDIA 驱动等）见 workflow 文件。
