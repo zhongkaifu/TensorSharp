@@ -64,6 +64,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulBatchedF32;
         private readonly IntPtr quantMatmulIq2XxsQ81F32;
         private readonly IntPtr quantMatmulQ40F32;
+        private readonly IntPtr quantMatmulQ40BatchedF32;
+        private readonly IntPtr quantMatmulQ40Dp4aF32;
         private readonly IntPtr quantMatmulQ80SingleF32;
         private readonly IntPtr quantMatmulQ80F32;
         private readonly IntPtr quantMatmulQ80Dp4aF32;
@@ -73,6 +75,7 @@ namespace TensorSharp.Cuda
         // q8_1 block = half d + half s + 32 int8 = 36 bytes (matches ts_block_q8_1).
         public const int Q81BlockBytes = 36;
         public const int Q8Dp4aTileRows = 4;   // matches TS_Q8_DP4A_ROWS in the kernel
+        public const int Q40Dp4aTileRows = 4;  // matches TS_Q40_DP4A_ROWS in the kernel
         // Multi-row Q8_0 uses the block-tile dp4a kernel by default;
         // TS_CUDA_Q8_DP4A=0 reverts to the scalar 4-row block-reduce kernel (A/B).
         public static readonly bool Q8Dp4aEnabled =
@@ -135,6 +138,8 @@ namespace TensorSharp.Cuda
             quantMatmulBatchedF32 = module.GetFunction("ts_quant_matmul_batched_f32");
             quantMatmulIq2XxsQ81F32 = module.GetFunction("ts_quant_matmul_iq2_xxs_q8_1_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
+            quantMatmulQ40BatchedF32 = module.GetFunction("ts_quant_matmul_q4_0_batched_f32");
+            quantMatmulQ40Dp4aF32 = module.GetFunction("ts_quant_matmul_q4_0_dp4a_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
             quantMatmulQ80Dp4aF32 = module.GetFunction("ts_quant_matmul_q8_0_dp4a_f32");
@@ -1266,8 +1271,9 @@ namespace TensorSharp.Cuda
         public const int QuantMatmulBatchMaxRows = 32;
 
         /// <summary>Row-batched quantized matmul: streams each weight row once per
-        /// 4-row tile and reuses every dequantized weight across the tile's rows
-        /// (weight traffic ~ceil(rows/4) instead of rows).</summary>
+        /// <see cref="QuantMatmulRowTile"/>-row tile and reuses every dequantized
+        /// weight across the tile's rows (weight traffic ~ceil(rows/tile) instead
+        /// of rows).</summary>
         public void LaunchQuantMatmulBatchedF32(IntPtr weights, IntPtr input, IntPtr output, int type, int inDim, int outDim, int rows, IntPtr stream)
         {
             IntPtr weightsArg = weights;
@@ -1278,7 +1284,7 @@ namespace TensorSharp.Cuda
             int outDimArg = outDim;
             int rowsArg = rows;
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg, &rowsArg };
-            // One warp per output column; rows tiled by 4 down grid.y.
+            // One warp per output column; rows tiled by QuantMatmulRowTile down grid.y.
             uint warpsPerBlock = (uint)(BlockSize >> 5);
             uint gridX = ((uint)outDim + warpsPerBlock - 1) / warpsPerBlock;
             uint gridY = (uint)((rows + QuantMatmulRowTile - 1) / QuantMatmulRowTile);
@@ -1312,6 +1318,51 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
             uint gridX = (uint)((outDim + 3) / 4);
             Launch(quantMatmulQ40F32, gridX, (uint)rows, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Row tile height of the batched Q4_0 matmul kernel; must match
+        /// <c>TS_Q40_ROW_TILE</c> in the kernel source.</summary>
+        private const int QuantMatmulQ40RowTile = 12;
+
+        /// <summary>Output columns per block of the batched Q4_0 matmul kernel; must
+        /// match <c>TS_Q40_COLS</c> in the kernel source.</summary>
+        private const int QuantMatmulQ40Cols = 2;
+
+        /// <summary>Row-tiled Q4_0 matmul: <see cref="QuantMatmulQ40Cols"/> output
+        /// columns per block, all threads cooperating on the dot product, with each
+        /// block computing a tile of <see cref="QuantMatmulQ40RowTile"/> rows so
+        /// every unpacked weight nibble is reused across the tile (weight traffic
+        /// ~ceil(rows/tile) instead of rows). Used for the small speculative-verify
+        /// / short-prefill windows.</summary>
+        public void LaunchQuantMatmulQ40BatchedF32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + QuantMatmulQ40Cols - 1) / QuantMatmulQ40Cols);
+            uint gridY = (uint)((rows + QuantMatmulQ40RowTile - 1) / QuantMatmulQ40RowTile);
+            Launch(quantMatmulQ40BatchedF32, gridX, gridY, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // Block-tile int8 dp4a Q4_0 GEMM: weights (q4_0) x pre-quantized q8_1
+        // activations (xqScratch) -> output [rows, outDim]. 256 threads / 4x4 tile.
+        // The fast path for both single-token decode and the verify window.
+        public void LaunchQuantMatmulQ40Dp4a(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int rowsArg = rows;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg, &rowsArg };
+            uint gridX = (uint)((outDim + 3) / 4);
+            uint gridY = (uint)((rows + Q40Dp4aTileRows - 1) / Q40Dp4aTileRows);
+            Launch(quantMatmulQ40Dp4aF32, gridX, gridY, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantMatmulQ80F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)

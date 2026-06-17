@@ -595,6 +595,10 @@ public class CudaBackendTests
             for (int c = 0; c < inDim; c++)
                 input[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.037f) * 0.75f;
 
+        // Pin the exact FP32 dequant path (the dp4a path is validated separately
+        // against the int8 tolerance below).
+        bool savedDp4a = CudaQuantizedOps.Q40Dp4aEnabled;
+        CudaQuantizedOps.Q40Dp4aEnabled = false;
         IntPtr host = Marshal.AllocHGlobal(weights.Length);
         try
         {
@@ -612,6 +616,103 @@ public class CudaBackendTests
         }
         finally
         {
+            CudaQuantizedOps.Q40Dp4aEnabled = savedDp4a;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void CudaQuantizedMatmul_Q4_0BatchedSpansMultipleRowTilesAndColumnEdge_MatchesReference()
+    {
+        // Exercises the row-tiled batched Q4_0 kernel (ts_quant_matmul_q4_0_batched_f32)
+        // used for the speculative-MTP verify window: rows=20 spans more than one
+        // TS_Q40_ROW_TILE (12) tile, and outDim=5 leaves the last TS_Q40_COLS (2)
+        // column block with a single live column — both edges of the kernel.
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 128;
+        const int outDim = 5;
+        const int rows = 20;
+        byte[] weights = CreateQ4_0Rows(outDim, inDim, (r, c) => (sbyte)(((r * 7 + c * 5) % 16) - 8), r => 0.0625f + r * 0.015625f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((r + 3) * (c + 2) * 0.021f) * 0.6f;
+
+        bool savedDp4a = CudaQuantizedOps.Q40Dp4aEnabled;
+        CudaQuantizedOps.Q40Dp4aEnabled = false;   // pin the FP32 batched kernel
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, inputTensor, host, host, 2, inDim, outDim, weights.Length));
+
+            float[] expected = DequantizedMatmulQ40(weights, outDim, inDim, input, rows);
+            AssertClose(expected, output.GetElementsAsFloat(rows * outDim), 1e-3f);
+
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+        }
+        finally
+        {
+            CudaQuantizedOps.Q40Dp4aEnabled = savedDp4a;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]    // single-token decode
+    [InlineData(5)]    // mid speculative-verify window
+    [InlineData(9)]    // full draft window (n_max + 1)
+    public void CudaQuantizedMatmul_Q4_0Dp4aMatchesDequantizedReference(int rows)
+    {
+        // The int8 dp4a Q4_0 GEMM (ts_quant_matmul_q4_0_dp4a_f32) — the production
+        // decode/verify path. The activation is round-tripped through q8_1 (8-bit),
+        // so it matches the FP32 dequant reference only to int8 precision (same as
+        // ggml's mul_mat_q). A wider inDim keeps the relative quantization error well
+        // bounded; the tolerance is scaled to the accumulated dot-product magnitude.
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 256;
+        const int outDim = 6;
+        byte[] weights = CreateQ4_0Rows(outDim, inDim, (r, c) => (sbyte)(((r * 7 + c * 3) % 16) - 8), r => 0.0625f + r * 0.0078125f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.017f) * 0.5f;
+
+        bool savedDp4a = CudaQuantizedOps.Q40Dp4aEnabled;
+        CudaQuantizedOps.Q40Dp4aEnabled = true;
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(output, inputTensor, host, host, 2, inDim, outDim, weights.Length));
+
+            float[] expected = DequantizedMatmulQ40(weights, outDim, inDim, input, rows);
+            float[] actual = output.GetElementsAsFloat(rows * outDim);
+            // 8-bit activation quantization: ~1/127 relative per element, partially
+            // cancelling over the dot product (measured ~2% on this small synthetic
+            // case; real models accumulate over far more elements with more
+            // cancellation). Tolerance scaled to the accumulated value range.
+            float maxAbs = 1e-6f;
+            foreach (float e in expected) maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
+            AssertClose(expected, actual, 0.04f * maxAbs);
+
+            CudaQuantizedOps.ReleaseQuantizedWeight(allocator, host);
+        }
+        finally
+        {
+            CudaQuantizedOps.Q40Dp4aEnabled = savedDp4a;
             Marshal.FreeHGlobal(host);
         }
     }

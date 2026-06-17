@@ -10,6 +10,7 @@
 
 using System;
 using System.IO;
+using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Server.Hosting;
 
 namespace InferenceWeb.Tests;
@@ -346,6 +347,81 @@ public class ServerOptionsBuilderTests : IDisposable
     {
         Assert.Throws<ArgumentException>(() =>
             ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv-quant-bits", "int4" }));
+    }
+
+    // ----- MTP speculative-decoding CLI flags -----
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_SpecFlag_EnablesSchedulerSpeculation()
+    {
+        _env.Set("TS_MTP_SPEC", null);
+        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[] { "--mtp-spec" });
+        Assert.True(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable("TS_MTP_SPEC"));
+        Assert.True(SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled);
+    }
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_NoSpecFlag_DisablesSpeculation()
+    {
+        _env.Set("TS_MTP_SPEC", "1");
+        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[] { "--no-mtp-spec" });
+        Assert.True(applied);
+        Assert.Equal("0", Environment.GetEnvironmentVariable("TS_MTP_SPEC"));
+        Assert.False(SchedulerConfig.FromEnvironment().MtpSpeculativeEnabled);
+    }
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_DraftModel_DoesNotCollideWithDraftCount()
+    {
+        // --mtp-draft is a prefix of --mtp-draft-model; the parser must route each
+        // to its own env var rather than mis-reading the longer flag as the shorter.
+        _env.Set("TS_MTP_DRAFT", null);
+        _env.Set("TS_MTP_DRAFT_MODEL", null);
+        string draftFile = Path.Combine(_baseDir, "draft.gguf");
+        File.WriteAllText(draftFile, "stub");   // the parser validates File.Exists
+
+        bool applied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(new[]
+        {
+            "--mtp-draft", "5",
+            "--mtp-draft-model", draftFile,
+        });
+
+        Assert.True(applied);
+        Assert.Equal("5", Environment.GetEnvironmentVariable("TS_MTP_DRAFT"));
+        Assert.Equal(draftFile, Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL"));
+        Assert.Equal(5, SchedulerConfig.FromEnvironment().MtpMaxDraftTokens);
+    }
+
+    [Fact]
+    public void ApplyMtpSpeculativeCliFlags_MissingDraftModelFile_ThrowsArgumentException()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(
+                new[] { "--mtp-draft-model", Path.Combine(_baseDir, "does-not-exist.gguf") }));
+        Assert.Contains("--mtp-draft-model", ex.Message);
+    }
+
+    [Fact]
+    public void MtpStartupValidation_NoActivationError_ReturnsNull()
+    {
+        Assert.Null(MtpStartupValidation.GetFatalActivationError(null));
+        Assert.Null(MtpStartupValidation.GetFatalActivationError(string.Empty));
+    }
+
+    [Fact]
+    public void MtpStartupValidation_ActivationError_ReturnsFatalMessageWithReasonAndHint()
+    {
+        // Repro for the user-reported bug: pairing the 12B target with the 26B-A4B
+        // draft fails the backbone-dim check; that reason used to be a warning the
+        // operator never saw, so the server ran with speculation silently off.
+        // Startup must now fail fast, surfacing the reason plus a remediation hint.
+        const string reason = "MTP draft backbone dim 2816 != target hidden size 3840.";
+        string msg = MtpStartupValidation.GetFatalActivationError(reason);
+        Assert.NotNull(msg);
+        Assert.Contains(reason, msg);
+        Assert.Contains("--mtp-draft-model", msg);
+        Assert.Contains("embedding_length_out", msg);
     }
 
     /// <summary>

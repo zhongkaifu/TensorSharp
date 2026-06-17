@@ -54,6 +54,14 @@ namespace TensorSharp.Cuda
         internal static readonly bool BatchedMatmulEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QMM_BATCHED"), "0", StringComparison.Ordinal);
 
+        // Q4_0 (the dominant dense quant) uses the int8 dp4a matmul for decode AND
+        // verify by default (~memory-bound, matches ggml's mul_mat_vec_q); set
+        // TS_CUDA_Q40_DP4A=0 to revert to the FP32 dequant kernels. Settable so the
+        // exact-reference tests can pin the FP32 path while a separate test checks
+        // the dp4a path against the (looser) int8 tolerance.
+        public static bool Q40Dp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q40_DP4A"), "0", StringComparison.Ordinal);
+
         public static bool SupportsQuantizedType(int ggmlType)
         {
             return ggmlType == 2 ||  // Q4_0
@@ -168,17 +176,22 @@ namespace TensorSharp.Cuda
             int outDim = checked((int)ne1);
             int rows = checked((int)input.Sizes[0]);
             // Small multi-row batches (speculative MTP verify windows, short
-            // prefill chunks) run the slow SCALAR per-row k-quant/iq-quant kernel
-            // (ts_quant_matmul_f32) once per output row -- the whole weight row is
-            // re-read AND re-dequantized per row, so a B-row matmul costs ~B x a
-            // single decode and speculative verification can never amortize. The
-            // generic batched kernel tiles 4 rows per block, decoding each weight
-            // ONCE and reusing it across the tile (measured 2.7-2.9x at B>=4 for
-            // Q2_K / Q5_K-class weights -- ffn_down and the LM head here).
-            //   * IQ2_XXS / Q4_0 / Q8_0 already have fast per-row dp4a/tiled
-            //     kernels that amortize well across rows (IQ2_XXS measures a flat
-            //     ~0.5 ms/row), so they keep those paths -- the scalar batched
-            //     kernel would be SLOWER for them.
+            // prefill chunks) run the per-row quant kernels once per output row --
+            // the whole weight matrix is re-read (and re-dequantized) per row, so a
+            // B-row matmul costs ~B x a single decode and speculative verification
+            // can never amortize. The generic scalar batched kernel tiles
+            // TS_QMM_ROW_TILE rows per block, streaming each weight ONCE and reusing
+            // it across the tile (measured 2.7-2.9x at B>=4 for the k-quant
+            // ffn_down / LM-head weights).
+            //   * Q4_0 (the dominant dense quant -- the 12B QAT model is entirely
+            //     Q4_0) has its OWN row-tiled kernel below that keeps the efficient
+            //     per-row nibble unpacking AND amortizes the weight read + dequant
+            //     across the tile; the generic scalar batched path is ~2x slower for
+            //     it (warp-per-column under-fills vs the block-per-4-columns design,
+            //     and qvalue_at re-branches per element).
+            //   * IQ2_XXS / Q8_0 keep their own multi-row paths (the q8_1 dp4a/MMA
+            //     GEMM and the IQ2_XXS q8_1 kernel) which already read the weight
+            //     once per tile and beat the scalar batched kernel for those types.
             if (BatchedMatmulEnabled && rows >= 2 && rows <= CudaKernels.QuantMatmulBatchMaxRows
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
@@ -190,6 +203,34 @@ namespace TensorSharp.Cuda
             }
             if (ggmlType == 2)
             {
+                // Q4_0 int8 dp4a: quantize the activation rows to q8_1 ONCE, then the
+                // block-tile dp4a GEMM. This is the fast path for BOTH single-token
+                // decode (rows==1 — the dominant cost, and where the scalar FP32
+                // dequant kernel read the LM head's Q4_0 weights at ~26 GB/s) and the
+                // verify window. dp4a does 4 int8 MACs/instruction so it is ~memory-
+                // bound, matching ggml's mul_mat_vec_q. inDim is always a multiple of
+                // 32 for these models; non-conforming shapes fall through to FP32.
+                if (Q40Dp4aEnabled && (inDim & 31) == 0)
+                {
+                    long scratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
+                    IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                    kernels.LaunchQuantizeQ81Rows(inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle);
+                    kernels.LaunchQuantMatmulQ40Dp4a(
+                        weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
+                    resultStorage.MarkDeviceModified();
+                    return true;
+                }
+                // FP32 fallback: row-tiled batched kernel for the verify window
+                // (decode each weight nibble ONCE and reuse it across the tile's rows)
+                // and the per-row kernel for single-row decode.
+                if (BatchedMatmulEnabled && rows >= 2 && rows <= CudaKernels.QuantMatmulBatchMaxRows)
+                {
+                    kernels.LaunchQuantMatmulQ40BatchedF32(
+                        weight.DevicePtr, inputPtr, resultPtr,
+                        inDim, outDim, rows, allocator.Stream.Handle);
+                    resultStorage.MarkDeviceModified();
+                    return true;
+                }
                 kernels.LaunchQuantMatmulQ40F32(
                     weight.DevicePtr,
                     inputPtr,

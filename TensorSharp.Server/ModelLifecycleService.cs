@@ -29,6 +29,21 @@ namespace TensorSharp.Server
         }
 
         public bool IsLoaded => _model != null;
+
+        /// <summary>
+        /// When the operator explicitly named an MTP draft via
+        /// <c>--mtp-draft-model</c> (<c>TS_MTP_DRAFT_MODEL</c>) but it could not be
+        /// activated on the loaded target (missing file, wrong architecture, an
+        /// incompatible draft, or an incomplete GGUF), this holds a
+        /// human-readable reason. It is <c>null</c> when no draft was requested or
+        /// when the draft loaded successfully (<c>HasMtp</c>). The startup loader
+        /// promotes a non-null value to a fail-fast error so an explicit but
+        /// unusable draft can't silently leave speculation disabled — matching the
+        /// fail-fast contract the rest of startup configuration follows. Runtime
+        /// (Web UI) model switches read the warning log but do not fail.
+        /// </summary>
+        public string MtpDraftActivationError { get; private set; }
+
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
         public string LoadedMmProjName => _loadedMmProjPath != null ? Path.GetFileName(_loadedMmProjPath) : null;
@@ -55,6 +70,7 @@ namespace TensorSharp.Server
             _model = null;
             _loadedModelPath = null;
             _loadedMmProjPath = null;
+            MtpDraftActivationError = null;
 
             if (!string.IsNullOrEmpty(previousModel))
             {
@@ -79,26 +95,53 @@ namespace TensorSharp.Server
                 // Gemma 4 MTP: the draft head ships as a SEPARATE GGUF
                 // (gemma4-assistant). Load it onto the target so HasMtp turns on
                 // and --mtp-spec engages. (Qwen3.6 embeds its NextN block in the
-                // trunk and needs no separate file.)
+                // trunk and needs no separate file.) MtpDraftActivationError was
+                // already cleared above before the model was (re)created.
                 string mtpDraftPath = Environment.GetEnvironmentVariable("TS_MTP_DRAFT_MODEL");
-                if (!string.IsNullOrEmpty(mtpDraftPath) && _model is Gemma4Model g4)
+                if (!string.IsNullOrEmpty(mtpDraftPath))
                 {
-                    if (!File.Exists(mtpDraftPath))
+                    if (_model is Gemma4Model g4)
                     {
-                        _logger.LogWarning("MTP draft model not found: {Path}; speculation disabled.", mtpDraftPath);
+                        if (!File.Exists(mtpDraftPath))
+                        {
+                            MtpDraftActivationError = $"MTP draft model file not found: {mtpDraftPath}";
+                            _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
+                        }
+                        else
+                        {
+                            try
+                            {
+                                g4.LoadMtpDraftWeights(mtpDraftPath);
+                                if (g4.HasMtp)
+                                {
+                                    _logger.LogInformation("Loaded Gemma 4 MTP draft head {Draft} (HasMtp=True)",
+                                        Path.GetFileName(mtpDraftPath));
+                                }
+                                else
+                                {
+                                    MtpDraftActivationError =
+                                        $"MTP draft '{Path.GetFileName(mtpDraftPath)}' loaded but is incomplete (required draft tensors missing).";
+                                    _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
+                                }
+                            }
+                            catch (Exception mtpEx)
+                            {
+                                MtpDraftActivationError =
+                                    $"Failed to load MTP draft '{Path.GetFileName(mtpDraftPath)}': {mtpEx.Message}";
+                                _logger.LogWarning(mtpEx, "Failed to load MTP draft {Path}; speculation disabled.", mtpDraftPath);
+                            }
+                        }
                     }
                     else
                     {
-                        try
-                        {
-                            g4.LoadMtpDraftWeights(mtpDraftPath);
-                            _logger.LogInformation("Loaded Gemma 4 MTP draft head {Draft} (HasMtp={HasMtp})",
-                                Path.GetFileName(mtpDraftPath), g4.HasMtp);
-                        }
-                        catch (Exception mtpEx)
-                        {
-                            _logger.LogWarning(mtpEx, "Failed to load MTP draft {Path}; speculation disabled.", mtpDraftPath);
-                        }
+                        // A draft GGUF was named but the loaded model's architecture
+                        // does not consume a separate draft file (e.g. Qwen3.6 embeds
+                        // its NextN block in the trunk). Record it so the operator
+                        // isn't left wondering why their --mtp-draft-model was ignored.
+                        MtpDraftActivationError =
+                            $"--mtp-draft-model was given but the loaded model architecture " +
+                            $"'{Architecture ?? "unknown"}' does not use a separate MTP draft GGUF.";
+                        _logger.LogWarning("{Error}; speculation disabled.", MtpDraftActivationError);
                     }
                 }
 

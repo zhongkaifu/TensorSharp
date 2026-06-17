@@ -56,6 +56,16 @@ namespace TensorSharp.Server.Hosting
 
             modelService.LoadModel(options.StartupModelPath, options.StartupMmProjPath, startupBackend);
 
+            // An explicit --mtp-draft-model that couldn't be activated (missing,
+            // wrong architecture, an incompatible/incomplete draft) used to be
+            // swallowed as a warning, leaving the server up with speculation
+            // silently off. Promote it to a fail-fast startup error so the operator
+            // sees exactly why MTP didn't engage instead of discovering it later.
+            string mtpFatal = MtpStartupValidation.GetFatalActivationError(
+                modelService.MtpDraftActivationError);
+            if (mtpFatal != null)
+                throw new InvalidOperationException(mtpFatal);
+
             logger.LogInformation(LogEventIds.ModelLoadCompleted,
                 "Startup model loaded: {Model} architecture={Architecture} backend={Backend} mmproj={MmProj}",
                 modelService.LoadedModelName,

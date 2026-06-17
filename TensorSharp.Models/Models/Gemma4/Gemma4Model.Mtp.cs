@@ -681,14 +681,27 @@ namespace TensorSharp.Models
         /// token in the batch at its true position, and the model has no recurrent
         /// state. So on partial acceptance the kept prefix's KV is already correct in
         /// the live cache — the executor can skip the redundant re-forward and just
-        /// rewind the position. This is the dominant rollback cost on long contexts
-        /// for the MoE model (manual-attention verify), so it is enabled for MoE
-        /// Gemma 4 (e.g. 26B-A4B). It is left OFF for the dense model: there the
+        /// rewind the position. This is the dominant rollback cost on long contexts.
+        /// Enabled for:
+        /// <list type="bullet">
+        /// <item>MoE Gemma 4 (e.g. 26B-A4B) on any backend — the manual-attention
+        ///   verify makes the re-forward the dominant rollback cost.</item>
+        /// <item>The pure-C# CUDA backend (dense too): there the per-op verify is
+        ///   ~B single-token decodes, so a kept-prefix re-forward on every partial
+        ///   acceptance is ~18% of decode wall time and the difference between MTP
+        ///   speculation being a net win vs a net loss. The kept prefix's KV is
+        ///   already correct (only the writing kernel differs from the no-spec decode
+        ///   path — a last-few-ULP difference that the greedy verify tolerates).</item>
+        /// </list>
+        /// Left OFF for the dense model on the ggml backends: there the fused
         /// re-forward is cheap and refreshing the committed token's KV through the
         /// decode kernel keeps spec output byte-identical to the no-spec path (the
-        /// dense exact-match validation). Honoured only on the linear trunk.
+        /// dense exact-match validation). Escape hatch: TS_GMTP_NO_FAST_ROLLBACK=1.
+        /// Honoured only on the linear trunk.
         /// </summary>
-        public bool MtpVerifyPersistsAcceptedKv => (_numExperts > 0 || _pleDim > 0) && !_mtpBatchedMode && !s_noFastRollback;
+        public bool MtpVerifyPersistsAcceptedKv =>
+            (_numExperts > 0 || _pleDim > 0 || _backend == BackendType.Cuda)
+            && !_mtpBatchedMode && !s_noFastRollback;
 
         // ====================================================================
         // IMtpBatchedSpeculativeModel — speculative trunk on the batched paged

@@ -2557,6 +2557,8 @@ extern "C" __global__ void ts_quant_matmul_f32(
 // grid.y = ceil(rows/TILE) covers the rest. Kept small (matches the 4-row
 // ts_quant_matmul_q8_0_f32 tiling) so the accumulators stay in registers.
 // Weight memory traffic / dequant work drops from B x to ceil(B/TILE) x.
+// (Q4_0 — the dominant dense quant — has its own row-tiled kernel,
+// ts_quant_matmul_q4_0_batched_f32, that covers a full draft window in one pass.)
 #define TS_QMM_ROW_TILE 4
 
 // Row-batched quantized matmul for SMALL row counts (speculative MTP verify
@@ -2761,6 +2763,103 @@ extern "C" __global__ void ts_quant_matmul_q4_0_f32(
     acc3 = block_reduce_sum(acc3);
     if (threadIdx.x == 0 && out_col0 + 3 < out_dim)
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+}
+
+// Row-tiled Q4_0 matmul for the speculative-MTP verify window. Keeps the
+// ts_quant_matmul_q4_0_f32 structure (every thread in the block cooperating on the
+// dot product -> full column parallelism, unlike the warp-per-column generic
+// scalar batched kernel which under-fills for Q4_0), but each block computes a
+// TILE of consecutive rows for TS_Q40_COLS output columns: every weight nibble is
+// unpacked ONCE and multiply-accumulated into all TILE rows. Weight read + dequant
+// traffic drops from B x to ceil(B/TILE) x, so a B-row verify forward stops
+// costing ~B single-token decodes (the reason MTP speculation was a net loss on
+// the pure-C# CUDA backend for Q4_0 models). The tile covers a full draft window
+// (n_max + 1 = 9 rows) in ONE pass so the most-confident drafts don't spill into a
+// second weight-streaming tile; 2 columns/block keeps the accumulator file
+// (TS_Q40_COLS * TS_Q40_ROW_TILE) in registers at full occupancy (4 cols x tile 12
+// spilled and regressed). Numerically identical to the per-row kernel: same
+// d*(q-8) dequant, same FP32 accumulation order over k.
+#define TS_Q40_ROW_TILE 12
+#define TS_Q40_COLS 2
+extern "C" __global__ void ts_quant_matmul_q4_0_batched_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int out_col0 = blockIdx.x * TS_Q40_COLS;
+    int row0 = blockIdx.y * TS_Q40_ROW_TILE;
+    if (out_col0 >= out_dim || row0 >= rows)
+        return;
+    int tile = min(TS_Q40_ROW_TILE, rows - row0);
+    int ncols = min(TS_Q40_COLS, out_dim - out_col0);
+    int row_bytes = (in_dim / 32) * 18;
+
+    float acc[TS_Q40_COLS][TS_Q40_ROW_TILE];
+#pragma unroll
+    for (int c = 0; c < TS_Q40_COLS; c++)
+#pragma unroll
+        for (int r = 0; r < TS_Q40_ROW_TILE; r++)
+            acc[c][r] = 0.0f;
+
+    for (int k = threadIdx.x; k < in_dim; k += blockDim.x)
+    {
+        int block_offset = (k / 32) * 18;
+        int lane = k & 31;
+        int packed_index = lane & 15;
+        int high = lane >> 4;
+
+        // Unpack the columns' weight at element k ONCE.
+        float wv[TS_Q40_COLS];
+#pragma unroll
+        for (int c = 0; c < TS_Q40_COLS; c++)
+        {
+            if (c < ncols)
+            {
+                const uint8_t* w = weights + (size_t)(out_col0 + c) * row_bytes + block_offset;
+                float d = __half2float(*reinterpret_cast<const half*>(w));
+                uint8_t packed = w[2 + packed_index];
+                int q = (high ? (packed >> 4) : (packed & 0x0F)) - 8;
+                wv[c] = d * (float)q;
+            }
+            else
+                wv[c] = 0.0f;
+        }
+
+        // Reuse it across the tile's rows (activations are L2-resident).
+#pragma unroll
+        for (int r = 0; r < TS_Q40_ROW_TILE; r++)
+        {
+            if (r < tile)
+            {
+                float x = input[(size_t)(row0 + r) * in_dim + k];
+#pragma unroll
+                for (int c = 0; c < TS_Q40_COLS; c++)
+                    acc[c][r] += wv[c] * x;
+            }
+        }
+    }
+
+    // tile / ncols are block-uniform, so every thread runs the same set of
+    // block_reduce_sum calls (each has a __syncthreads); compile-time c/r keep
+    // acc in registers.
+#pragma unroll
+    for (int c = 0; c < TS_Q40_COLS; c++)
+    {
+#pragma unroll
+        for (int r = 0; r < TS_Q40_ROW_TILE; r++)
+        {
+            if (c < ncols && r < tile)
+            {
+                float s = block_reduce_sum(acc[c][r]);
+                if (threadIdx.x == 0)
+                    output[(size_t)(row0 + r) * out_dim + out_col0 + c] = s;
+                __syncthreads();
+            }
+        }
+    }
 }
 
 extern "C" __global__ void ts_quant_matmul_q8_0_single_f32(
@@ -3129,6 +3228,134 @@ extern "C" __global__ void ts_quant_matmul_q8_0_dp4a_f32(
             {
                 int r = rc / TS_Q8_DP4A_COLS;
                 int c = rc - r * TS_Q8_DP4A_COLS;
+                int col = out_col0 + c;
+                if (r < tile_rows && col < out_dim)
+                    output[(size_t)(row0 + r) * out_dim + col] = v;
+            }
+        }
+    }
+}
+
+// dp4a (int8) Q4_0 GEMM — the fast path for BOTH single-token decode (rows == 1)
+// and the MTP verify window (rows 2-9) on the dominant dense quant. Mirrors the
+// Q8_0 dp4a kernel above (256 threads compute a ROWS x COLS output tile from the
+// pre-quantized q8_1 activations) but unpacks Q4_0 nibbles and carries the -8
+// zero-point through the q8_1 block sum, exactly like ggml's vec_dot_q4_0_q8_1:
+//   value_i = (nibble_i - 8) * d_w,  act_i = q8_i * d_act
+//   sum_i value_i*act_i = d_w * ( d_act * dp4a(nibbles, q8) - 8 * s_act )
+// where s_act = d_act * sum(q8) is the q8_1 block's stored 's'. Each block's 4
+// weight ints carry the low (q8[0..15]) and high (q8[16..31]) nibble halves; the
+// -8 correction is applied once per block (at the j==0 weight int). Replaces the
+// scalar FP32 dequant matmul (which read Q4_0 weights at ~26 GB/s on the LM head);
+// dp4a does 4 int8 MACs/instruction so this is ~memory-bound, matching ggml's
+// mul_mat_vec_q. Numerically within FP noise of the dequant path (8-bit activation
+// round-trip only).
+#define TS_Q40_DP4A_ROWS 4
+#define TS_Q40_DP4A_COLS 4
+extern "C" __global__ void ts_quant_matmul_q4_0_dp4a_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim,
+    int rows)
+{
+    int out_col0 = blockIdx.x * TS_Q40_DP4A_COLS;
+    int row0 = blockIdx.y * TS_Q40_DP4A_ROWS;
+    if (out_col0 >= out_dim || row0 >= rows || (in_dim & 31) != 0)
+        return;
+
+    int q8_blocks = in_dim / TS_QK8_1;   // 32 values per block
+    int row_bytes = q8_blocks * 18;       // Q4_0 block = 2-byte d + 16-byte qs
+    int tile_rows = min(TS_Q40_DP4A_ROWS, rows - row0);
+
+    float partial[TS_Q40_DP4A_ROWS][TS_Q40_DP4A_COLS];
+#pragma unroll
+    for (int r = 0; r < TS_Q40_DP4A_ROWS; r++)
+#pragma unroll
+        for (int c = 0; c < TS_Q40_DP4A_COLS; c++)
+            partial[r][c] = 0.0f;
+
+    // One iteration per Q4_0 weight int (4 per 32-block) -> full thread occupancy
+    // even for the small in_dim matmuls (qkv / gate_up / LM head, in_dim = 3840).
+    int total_wints = q8_blocks * 4;
+    for (int gw = threadIdx.x; gw < total_wints; gw += blockDim.x)
+    {
+        int ib = gw >> 2;     // 32-value block
+        int j = gw & 3;       // weight int within the block (covers 4 low + 4 high values)
+
+        // Activation halves for this block, per row: int j (q8 values [4j..4j+3], the
+        // LOW nibbles) and int j+4 (q8 values [16+4j..], the HIGH nibbles), plus the
+        // per-block scale and (once, at j==0) the sum term for the -8 correction.
+        int alo[TS_Q40_DP4A_ROWS], ahi[TS_Q40_DP4A_ROWS];
+        float dact[TS_Q40_DP4A_ROWS], sact[TS_Q40_DP4A_ROWS];
+#pragma unroll
+        for (int r = 0; r < TS_Q40_DP4A_ROWS; r++)
+        {
+            if (r >= tile_rows) continue;
+            const ts_block_q8_1* ablk = &xq[(size_t)(row0 + r) * q8_blocks + ib];
+            alo[r] = get_int_b4(ablk->qs, j);
+            ahi[r] = get_int_b4(ablk->qs, j + 4);
+            dact[r] = __half2float(ablk->d);
+            if (j == 0) sact[r] = __half2float(ablk->s);
+        }
+
+#pragma unroll
+        for (int c = 0; c < TS_Q40_DP4A_COLS; c++)
+        {
+            int col = out_col0 + c;
+            if (col >= out_dim)
+                continue;
+            const uint8_t* wblk = weights + (size_t)col * row_bytes + (size_t)ib * 18;
+            float dw = __half2float(*reinterpret_cast<const half*>(wblk));
+            // qs starts at wblk+2 (2-byte aligned, block stride 18 is even); read its
+            // j-th 4-byte int as two uint16 to stay aligned.
+            int w = get_int_b2(wblk + 2, j);
+            int wlo = (w >> 0) & 0x0F0F0F0F;
+            int whi = (w >> 4) & 0x0F0F0F0F;
+#pragma unroll
+            for (int r = 0; r < TS_Q40_DP4A_ROWS; r++)
+            {
+                if (r >= tile_rows)
+                    continue;
+                int s = dp4a_i8(wlo, alo[r], 0);
+                s = dp4a_i8(whi, ahi[r], s);
+                partial[r][c] += dw * dact[r] * (float)s;
+                if (j == 0)
+                    partial[r][c] += -8.0f * dw * sact[r];
+            }
+        }
+    }
+
+    const int NRC = TS_Q40_DP4A_ROWS * TS_Q40_DP4A_COLS;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+    __shared__ float red[(512 / 32) * NRC];
+#pragma unroll
+    for (int r = 0; r < TS_Q40_DP4A_ROWS; r++)
+#pragma unroll
+        for (int c = 0; c < TS_Q40_DP4A_COLS; c++)
+        {
+            float v = partial[r][c];
+            for (int off = 16; off > 0; off >>= 1)
+                v += __shfl_down_sync(0xFFFFFFFF, v, off);
+            if (lane == 0)
+                red[warp * NRC + r * TS_Q40_DP4A_COLS + c] = v;
+        }
+    __syncthreads();
+    if (warp == 0)
+    {
+#pragma unroll
+        for (int rc = 0; rc < NRC; rc++)
+        {
+            float v = (lane < num_warps) ? red[lane * NRC + rc] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1)
+                v += __shfl_down_sync(0xFFFFFFFF, v, off);
+            if (lane == 0)
+            {
+                int r = rc / TS_Q40_DP4A_COLS;
+                int c = rc - r * TS_Q40_DP4A_COLS;
                 int col = out_col0 + c;
                 if (r < tile_rows && col < out_dim)
                     output[(size_t)(row0 + r) * out_dim + col] = v;
