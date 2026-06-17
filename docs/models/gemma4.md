@@ -16,6 +16,7 @@
 | Thinking mode | Yes (`<\|channel>thought ... <channel\|>`) |
 | Tool calling | Yes (`<\|tool_call>call:name{...}<tool_call\|>`) |
 | Batched / paged forward | **Default-on** — `IBatchedPagedModel.ForwardBatch` with per-layer paged K/V (handles dual head dims, KV donor sharing, PLE injection, SWA + global mix). Set `TS_GEMMA4_BATCHED=0` to force the legacy per-seq KV-swap path. See §11. |
+| MTP speculative decoding | Optional — loads a separate `gemma4-assistant` EAGLE-style draft GGUF via `--mtp-draft-model` (`TS_MTP_DRAFT_MODEL`) and engages with `--mtp-spec`. Profitable on ggml backends and the pure-C# `cuda` backend. See §12. |
 | Output parser | `Gemma4OutputParser` |
 
 ## 1. Origin and intent
@@ -562,7 +563,81 @@ exists for batch-1 workloads.
    after later sequences joined. The fix (copy-on-grow) applies to
    Mistral 3 and Qwen 3 too.
 
-## 12. Output parser and chat template
+## 12. MTP speculative decoding (gemma4-assistant draft head)
+
+Gemma 4 supports lossless **multi-token-prediction (MTP) speculative decoding**
+for solo (non-concurrent) sequences in `TensorSharp.Server`. Unlike Qwen 3.6,
+whose NextN block is embedded in the trunk GGUF, the Gemma 4 draft head ships as
+a **separate small `gemma4-assistant` GGUF** loaded with `--mtp-draft-model`
+(env `TS_MTP_DRAFT_MODEL`). Source:
+[`Gemma4Model.Mtp.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Mtp.cs),
+driven through the shared
+[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
+draft / verify / rollback core.
+
+### 12.1 EAGLE-style recurrent drafter
+
+The draft head is an EAGLE-style recurrent drafter (mirrors llama.cpp's
+`gemma4-assistant.cpp` + `speculative.cpp` draft-mtp). For each drafted token:
+
+```
+x      = target.tok_embd[token] * sqrt(n_embd_backbone)   // backbone embedding (e.g. 3840)
+xh     = concat(x, h_prev)                                 // [2*backbone]
+cur    = nextn.pre_projection @ xh                         // -> draft hidden (e.g. 1024)
+for il in 0..n_nextn-1:                                    // a few Gemma-style decoder blocks
+    Q   = rope(q_norm(wq @ attn_norm(cur)))               // draft computes ONLY Q
+    a   = attn(Q, target_KV)                               // attends the TARGET's last local
+                                                          //   (layer N-2) / global (layer N-1) K/V
+    cur = block_residuals(a, ffn, out_scale)
+cur    = output_norm(cur)
+logits = draft.tok_embd @ cur                             // draft's own LM head
+h_next = nextn.post_projection @ cur                      // -> backbone, chains the next draft step
+```
+
+The draft holds **no K/V of its own** (no `wk`/`wv` tensors): every draft layer
+queries into the target model's existing per-layer KV cache, reusing the same
+position for every drafted token (the recurrence flows purely through `h`). That
+makes the drafter stateless given `(token, h)`, so the only rollback on rejection
+is an attention-KV position rewind — no recurrent-state snapshot is needed (in
+contrast to Qwen 3.6's GatedDeltaNet trunk).
+
+### 12.2 Draft / target pairing (fail-fast)
+
+The draft's output backbone dimension (`{arch}.embedding_length_out`) **must equal
+the target's hidden size** — pair the 12B target with its 12B draft, not the
+26B-A4B draft. When `--mtp-draft-model` is given but the draft can't be activated
+(file missing, hidden-size mismatch, or required draft tensors absent), the server
+**fails fast at startup** with a remediation hint
+([`MtpStartupValidation`](../../TensorSharp.Server/Hosting/MtpStartupValidation.cs))
+rather than silently running without speculation.
+
+### 12.3 Backend profitability and fused kernels
+
+`MtpSpeculationProfitable` gates whether speculation actually engages:
+
+- **ggml backends (CUDA / Metal)** — run fused single-graph kernels: a multi-token
+  verify (`NativeGemma4ModelVerify`, or `TryFusedMoEModelVerify` for the 26B-A4B
+  MoE) and a fused draft step (`NativeGemma4DraftStep`). On partial acceptance a
+  dense fast-rollback avoids re-running the kept prefix (escape hatch
+  `TS_GMTP_NO_FAST_ROLLBACK=1`). The verify trunk runs the linear path by default
+  for solo speculation; `TS_GMTP_BATCHED_TRUNK=1` opts into the batched paged
+  trunk. `TS_GMTP_NO_FUSED=1` falls back to the per-op path for A/B testing.
+- **Direct CUDA (`cuda`, pure C#)** — has no fused kernels, but its per-op verify
+  and draft are fully GPU-resident: the draft attends the donor cache on-device,
+  global verify attention runs the GQA decode kernel per row against the live
+  cache, and global RoPE uses a GPU kernel — so the verify layer loop issues zero
+  host-sync stalls. A win on prose/chat workloads, ~break-even on low-acceptance
+  greedy.
+- **CPU / MLX** — no fused kernels and no GPU-resident per-op path, so speculation
+  stays off and the engine serves the standard fused decode.
+
+The 26B-A4B MoE target additionally required a load-time OOM fix on `ggml_cuda`
+(skipping the per-expert device preload) before MTP speculation became a net win.
+
+Opt-in / opt-out and tuning use the shared `--mtp-spec` / `--mtp-draft` /
+`--mtp-pmin` flags; see the [README MTP section](../../README.md#mtp--nextn-speculative-decoding).
+
+## 13. Output parser and chat template
 
 `Gemma4OutputParser` understands two structural framings:
 
@@ -575,7 +650,7 @@ exists for batch-1 workloads.
 Chat template falls back to the hardcoded Gemma 4 template when the GGUF does
 not ship a Jinja2 one.
 
-## 13. Optimization opportunities
+## 14. Optimization opportunities
 
 - **Fused MoE GPU kernel** for Gemma 4 — MoE layers currently disable both
   `Gemma4ModelDecode` and `Gemma4LayerPrefill`. A batched expert kernel
@@ -589,6 +664,14 @@ not ship a Jinja2 one.
 
 ### Completed
 
+- **MTP speculative decoding (gemma4-assistant draft)** — a separate EAGLE-style
+  draft GGUF (`--mtp-draft-model`) accelerates solo decode (§12). ggml backends run
+  fused multi-token-verify (dense `NativeGemma4ModelVerify` and MoE
+  `TryFusedMoEModelVerify`) and fused draft-step (`NativeGemma4DraftStep`) kernels,
+  with a dense fast-rollback on partial acceptance; the pure-C# `cuda` backend runs
+  a fully GPU-resident per-op verify/draft. The 26B-A4B MoE target also needed a
+  `ggml_cuda` load-time OOM fix (skip per-expert device preload) before speculation
+  became a net win. Mismatched / incomplete draft GGUFs fail fast at startup.
 - **Expert-batched FFN (GEGLU)** — `MoEForward` previously ran a
   batched-by-expert loop that degenerated into `num_experts_used` single-row
   matmuls on the decode path. It now dispatches the entire layer through

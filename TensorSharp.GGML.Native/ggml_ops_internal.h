@@ -507,6 +507,14 @@ namespace tsg
     // Free the cached reuse buffer (called from TSGgml_Shutdown).
     void free_reuse_compute_buffer();
 
+    // Allocate a graph's intermediates into a persistent, reused gallocr (grown on
+    // demand, never freed per call) — for large multi-token fused graphs (e.g. the
+    // MTP MoE verify) whose per-call gallocr alloc/free would fragment Metal VRAM.
+    // Returns false if unavailable (caller falls back to its own gallocr).
+    bool alloc_graph_reuse_gallocr(ggml_cgraph* graph);
+    // Free the cached reuse gallocr (called from TSGgml_Shutdown / backend reset).
+    void free_reuse_gallocr();
+
     // --- Size / layout queries ---
 
     std::size_t required_raw_bytes(const TensorView2DDesc& desc);

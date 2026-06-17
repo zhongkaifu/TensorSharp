@@ -948,6 +948,17 @@ namespace tsg
     static std::size_t g_reuse_compute_size = 0;
     static ggml_backend_t g_reuse_compute_backend = nullptr;
 
+    // Persistent graph allocator for the large multi-token fused graphs (e.g. the
+    // MTP MoE verify). Those used to ggml_gallocr_new()/ggml_gallocr_free() a
+    // ~400 MB device buffer on EVERY call; on Metal that per-call alloc+free of a
+    // large shared (vm_allocate) buffer fragments the device VM over hundreds of
+    // verify steps until a contiguous allocation fails (OOM). A single gallocr
+    // reused across calls grows its buffer once and keeps it, eliminating the
+    // churn (and the per-call ~20 ms Metal allocation). Reset on backend swap.
+    static std::mutex g_reuse_gallocr_mutex;
+    static ggml_gallocr_t g_reuse_gallocr = nullptr;
+    static ggml_backend_t g_reuse_gallocr_backend = nullptr;
+
     void free_reuse_compute_buffer()
     {
         std::lock_guard<std::mutex> lock(g_reuse_compute_mutex);
@@ -958,6 +969,64 @@ namespace tsg
         }
         g_reuse_compute_size = 0;
         g_reuse_compute_backend = nullptr;
+    }
+
+    void free_reuse_gallocr()
+    {
+        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
+        if (g_reuse_gallocr != nullptr)
+        {
+            ggml_gallocr_free(g_reuse_gallocr);
+            g_reuse_gallocr = nullptr;
+        }
+        g_reuse_gallocr_backend = nullptr;
+    }
+
+    // Allocate `graph`'s intermediates into a persistent, reused gallocr (grown on
+    // demand). Returns false if the gallocr could not be created/allocated, in
+    // which case the caller should fall back to its own gallocr or per-op path.
+    // The caller must NOT free the gallocr; it lives for the backend's lifetime.
+    bool alloc_graph_reuse_gallocr(ggml_cgraph* graph)
+    {
+        // Escape hatch (shares the reuse-buffer toggle): TS_GGML_REUSE_COMPUTE_BUF=0
+        // disables both so A/B testing can isolate the persistent allocators.
+        static const bool s_disabled = []() {
+            const char* e = std::getenv("TS_GGML_REUSE_COMPUTE_BUF");
+            return e != nullptr && e[0] == '0';
+        }();
+        if (s_disabled || g_backend == nullptr || graph == nullptr)
+            return false;
+
+        std::lock_guard<std::mutex> lock(g_reuse_gallocr_mutex);
+        if (g_reuse_gallocr_backend != g_backend)
+        {
+            // Backend swapped (model reload). The old backend freed its buffers on
+            // teardown, so drop the stale handle rather than freeing through it.
+            g_reuse_gallocr = nullptr;
+            g_reuse_gallocr_backend = g_backend;
+        }
+        if (g_reuse_gallocr == nullptr)
+        {
+            g_reuse_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            if (g_reuse_gallocr == nullptr)
+                return false;
+        }
+        // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
+        // fits and grows (reallocates) it only when a larger graph appears.
+        bool ok = ggml_gallocr_alloc_graph(g_reuse_gallocr, graph);
+        static const bool s_memlog = std::getenv("TS_GMTP_MEMLOG") != nullptr;
+        if (ok && s_memlog)
+        {
+            static std::size_t s_last = 0;
+            std::size_t sz = ggml_gallocr_get_buffer_size(g_reuse_gallocr, 0);
+            if (sz != s_last)
+            {
+                fprintf(stderr, "[memlog] reuse_gallocr size %zu -> %zu MB\n",
+                        s_last / 1024 / 1024, sz / 1024 / 1024);
+                s_last = sz;
+            }
+        }
+        return ok;
     }
 
     bool alloc_ctx_tensors_reuse(ggml_context* ctx)
@@ -999,15 +1068,33 @@ namespace tsg
 
         if (g_reuse_compute_buf == nullptr || g_reuse_compute_size < needed)
         {
+            // Grow with slack rounded up to a 64 MiB boundary. The graph's
+            // intermediate footprint creeps up by sub-MB amounts every decode step
+            // (the attention scratch scales with the growing context), so allocating
+            // exactly `needed` reallocates the buffer on EVERY step. On Metal each
+            // realloc frees+allocs a multi-hundred-MB shared (vm_allocate) buffer;
+            // doing that hundreds of times fragments the device VM until a large
+            // contiguous allocation (e.g. the MTP verify graph) can no longer be
+            // satisfied -> kIOGPUCommandBufferCallbackErrorOutOfMemory even though
+            // total free bytes remain. Rounding to 64 MiB makes the buffer grow in
+            // rare, big steps and be reused unchanged across thousands of decodes.
+            std::size_t alloc_size = needed;
+            const std::size_t slab = static_cast<std::size_t>(64) * 1024 * 1024;
+            alloc_size = ((alloc_size + slab - 1) / slab) * slab;
+            if (alloc_size > max_size) alloc_size = max_size; // never exceed a single buffer
+            if (alloc_size < needed) alloc_size = needed;
+            if (std::getenv("TS_GMTP_MEMLOG") != nullptr)
+                fprintf(stderr, "[memlog] reuse_compute_buf grow %zu -> %zu MB (needed %zu MB)\n",
+                        g_reuse_compute_size / 1024 / 1024, alloc_size / 1024 / 1024, needed / 1024 / 1024);
             if (g_reuse_compute_buf != nullptr)
                 ggml_backend_buffer_free(g_reuse_compute_buf);
-            g_reuse_compute_buf = ggml_backend_buft_alloc_buffer(buft, needed);
+            g_reuse_compute_buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
             if (g_reuse_compute_buf == nullptr)
             {
                 g_reuse_compute_size = 0;
                 return false;
             }
-            g_reuse_compute_size = needed;
+            g_reuse_compute_size = alloc_size;
             ggml_backend_buffer_set_usage(g_reuse_compute_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         }
 
@@ -1623,9 +1710,10 @@ TSG_EXPORT void TSGgml_Shutdown()
         g_device_copy_budget_bytes = 0;
     }
 
-    // Release the reusable per-graph compute buffer before the backend it was
-    // allocated from is torn down.
+    // Release the reusable per-graph compute buffer + gallocr before the backend
+    // they were allocated from is torn down.
     free_reuse_compute_buffer();
+    free_reuse_gallocr();
 
     if (g_backend != nullptr)
     {
@@ -1775,6 +1863,27 @@ TSG_EXPORT int64_t TSGgml_DeviceCopyCacheResidentBytes()
             total += static_cast<std::int64_t>(kv.second.buffer_size);
     }
     return total;
+}
+
+// Diagnostic: the active backend device's memory accounting. On Metal `total`
+// is recommendedMaxWorkingSetSize and `free` is total - currentAllocatedSize, so
+// (total - free) is the bytes Metal currently has resident (weights + KV + every
+// live compute/graph buffer). Lets a test see how close a run is to the working-
+// set ceiling and which fix actually moves the needle. Returns 0 on success.
+TSG_EXPORT int TSGgml_GetBackendMemory(int64_t* free_bytes, int64_t* total_bytes)
+{
+    if (free_bytes != nullptr) *free_bytes = 0;
+    if (total_bytes != nullptr) *total_bytes = 0;
+    if (!ensure_backend() || g_backend == nullptr)
+        return 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr)
+        return 0;
+    std::size_t f = 0, t = 0;
+    ggml_backend_dev_memory(dev, &f, &t);
+    if (free_bytes != nullptr) *free_bytes = static_cast<std::int64_t>(f);
+    if (total_bytes != nullptr) *total_bytes = static_cast<std::int64_t>(t);
+    return 1;
 }
 
 // Toggle the lazy-sync code path on the per-op kernels. When enabled, ops that

@@ -14,6 +14,7 @@
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
 | 批处理 / 分页前向 | **默认启用** —— 设置 `TS_QWEN35_BATCHED=0`（或 `--no-continuous-batching`）可强制走旧的按序列 KV-swap 路径用于 A/B 对比。带每槽位 GatedDeltaNet 递归状态池与可选的原生批处理 GDN 内核（`TS_QWEN35_BATCHED_GDN_NATIVE=1`）。详见 §11。 |
+| MTP 投机解码 | Qwen 3.6 —— NextN 草稿块内嵌在主干 GGUF 中（无需独立文件）；用 `--mtp-spec` 启用。部分接受时做 GDN 递归状态快照 / 回滚。在 ggml 后端与纯 C# `cuda` 后端上有收益。详见 §12。 |
 | 输出解析器 | `Qwen35OutputParser`（继承 `Qwen3OutputParser`） |
 
 ## 1. 来源与目标
@@ -493,13 +494,56 @@ forward 一致。
 - 在 Qwen 3.6-27B（Apple M4 Pro、GgmlMetal、进程内 legacy-vs-batched 切换）
   上 **n=3 时达到 ~1.83× tps**。
 
-## 12. 输出解析器与聊天模板
+## 12. MTP / NextN 投机解码（Qwen 3.6）
+
+Qwen 3.6 的 GGUF 自带一个 **NextN / 多 token 预测（MTP）草稿块**，`TensorSharp.Server`
+用它为单序列（无并发）请求做无损投机解码。源码：
+[`Qwen35Model.Mtp.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Mtp.cs)，
+由共享的
+[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
+起草 / 验证 / 回滚核心驱动。与 Gemma 4 不同，这里无需独立草稿 GGUF——草稿块就内嵌在主干
+文件中，因此 `--mtp-draft-model` 被忽略。
+
+### 12.1 内嵌 NextN 块
+
+Qwen 3.6 GGUF 在主干栈之后带有一个额外解码块（`blk.N`，`N` == 主干层数），由
+`{arch}.nextn_predict_layers` 标记。它是一个标准的 Qwen 3.5 全注意力解码块（27B 上是
+dense FFN，35B-A3B 上是 MoE FFN），外加四个 NextN 专属张量：
+
+```
+nextn.eh_proj          [2*hidden, hidden]  对 concat(embedding, hidden) 的输入投影
+nextn.enorm            [hidden]            对 token embedding 的 RMS norm
+nextn.hnorm            [hidden]            对主干 hidden state 的 RMS norm
+nextn.shared_head_norm [hidden]            LM 头前的最终 norm
+```
+
+（`nextn.embed_tokens` / `nextn.shared_head_head` 可选，在标准 GGUF 中缺失，代码会回退到
+主干的 token embedding / LM 头。）MTP 步在位置 `p` 消费（token `x_p`、主干 hidden
+`h_{p-1}`），产出预测 `x_{p+1}` 的 logits 以及自己的 hidden state 用于串接后续草稿步——对应
+llama.cpp 的 `graph_mtp` 与 vLLM 的 `Qwen3_5MultiTokenPredictor`。
+
+### 12.2 递归状态回滚
+
+由于 Qwen 3.6 主干混合了 GatedDeltaNet 递归层与全注意力层，部分被拒的验证批次不能简单地
+截断 KV 缓存：GDN 递归状态无法就地回退。MTP 路径在每个验证批次前对 GDN 状态做快照
+（`_mtpGdnSnapshot`），部分接受时恢复。在 CUDA 后端上快照在设备侧完成，避免宿主端往返。
+
+### 12.3 收益与调优
+
+投机默认关闭，用 `--mtp-spec`（环境变量 `TS_MTP_SPEC=1`）启用。它仅在有收益处启用——ggml
+后端与纯 C# `cuda` 后端——否则引擎走标准 decode。`--mtp-draft`（默认 `8`）限制草稿窗口，
+`--mtp-pmin`（默认 `0.75`）是保留 token 所需的最低草稿置信度。在 `ggml_cuda` 上，GDN 分块
+prefill 内核也会加速投机验证：在 Qwen3.6-27B IQ2_XXS 上实测把 MTP 投机验证 decode 从
+217 ms/token 降到 174 ms/token（见 §8，`GDN_CHUNK_PREFILL_MIN_SEQ_LEN`）。完整参数列表见
+[README MTP 章节](../../README_zh-cn.md#mtp--nextn-投机解码)。
+
+## 13. 输出解析器与聊天模板
 
 - `Qwen35OutputParser` 继承 `Qwen3OutputParser`，wire 格式相同：`<think> ... </think>` 表示思维链，`<tool_call>{"name": "...", "arguments": {...}}</tool_call>` 表示工具调用。
 - 聊天模板使用标准 Qwen `<|im_start|>` / `<|im_end|>` 格式，外加视觉占位符 `<|image_pad|>`。
 - `ChatTemplate.ExpandImageTokens(inputTokens, imagePadId, tokenCounts)` 把每个 `<|image_pad|>` 占位符展开为对应图像所需 token 数；多模态注入器随后在这些位置写入编码后的 embedding，再调用 `Forward()`。
 
-## 13. 优化机会
+## 14. 优化机会
 
 - **原生 GDN decode（旧路径）** —— 旧的单序列 GDN decode 当前仍在托管 C#
   中跑（带预分配缓冲与 `Ops.AddmmBatch`）。把 per-token recurrent 更新放

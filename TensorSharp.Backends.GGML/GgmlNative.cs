@@ -1429,6 +1429,9 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern long TSGgml_DeviceCopyCacheResidentBytes();
 
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GetBackendMemory(out long freeBytes, out long totalBytes);
+
         // Async dispatch (deferred ggml_backend_synchronize). When enabled, per-op
         // kernels return without waiting on the Metal command buffer; subsequent ops
         // chain through the Metal command queue, and host-side reads must call
@@ -2800,6 +2803,12 @@ internal enum GgmlIndexReductionOp
         /// host-buffer cache (excludes zero-copy weight wrappers). Used by tests to assert that
         /// per-block activation/KV device copies are reclaimed rather than leaked.</summary>
         public static long DeviceCopyCacheResidentBytes() => TSGgml_DeviceCopyCacheResidentBytes();
+
+        /// <summary>Diagnostic: active backend device memory. On Metal <paramref name="totalBytes"/>
+        /// is recommendedMaxWorkingSetSize and <paramref name="freeBytes"/> = total - currentAllocatedSize,
+        /// so (total - free) is the bytes currently resident. Returns false if unavailable.</summary>
+        public static bool TryGetBackendMemory(out long freeBytes, out long totalBytes)
+            => TSGgml_GetBackendMemory(out freeBytes, out totalBytes) != 0;
 
         public static void SyncHostBuffer(IntPtr ptr, long byteCount)
         {

@@ -77,6 +77,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 ## 亮点功能
 
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
+- **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列 decode：Qwen 3.6（NextN 块内嵌在主干 GGUF 中）与 Gemma 4（独立的 `gemma4-assistant` 草稿 GGUF）。草稿头每步提议若干 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动。通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。→ [投机解码](#mtp--nextn-投机解码)
 - **DiffusionGemma 文本扩散** —— 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪生成，提供 CLI 扩散参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
 - **多模态** —— 图像 / 视频 / 音频输入（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）。→ [多模态支持](#多模态支持)
 - **工具调用 / 函数调用** —— 三种 API 风格均支持多轮工具调用，输出解析与架构无关。→ [工具调用](#工具调用--函数调用)
@@ -113,6 +114,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA |
 | 多模态 | Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像输入 |
 | 连续批处理 | vLLM 风格的分页 KV 缓存、跨请求基于内容哈希的前缀共享、迭代级调度器（默认启用，可通过 `--no-continuous-batching` 关闭） |
+| 投机解码 | MTP / NextN 草稿头用于单序列 decode：Qwen 3.6（内嵌 NextN）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）；默认关闭，通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。在 ggml 后端与纯 C# `cuda` 后端上有收益；CPU / MLX 走标准 decode。 |
 | 服务端模型范围 | 通过 `--model` 显式托管单个 GGUF；可通过 `--mmproj` 显式指定投影器；不再扫描目录 |
 | 可观测性 | 结构化每轮日志、队列状态，以及 Web UI / Ollama / OpenAI 响应中的 KV 缓存复用指标 |
 | 测试 / 评测 | `TensorSharp.TestMatrix` 可按模型、后端、功能与环境变量组合做矩阵扫描，并与每类主机的基线做回归对比 |
@@ -127,6 +129,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
+- **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。通过 `--mtp-spec` 启用（默认关闭）。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 全部默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。每个模型都提供 `TS_<FAMILY>_BATCHED=0` 兜底开关（如 `TS_GEMMA4_BATCHED=0`、`TS_QWEN35_BATCHED=0`、`TS_GPTOSS_BATCHED=0`、`TS_NEMOTRON_BATCHED=0`），可强制回到按序列 KV-swap 路径用于 A/B 对比或回归排查。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
 - **可配置采样** —— temperature、top-k、top-p、min-p、重复/存在/频率惩罚、seed、停止序列
@@ -146,16 +149,16 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 ## 支持的模型架构
 
-| 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 | 卡片 |
-|---|---|---|---|---|---|---|
-| Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | [gemma4_zh-cn.md](docs/models/gemma4_zh-cn.md) |
-| Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 | [gemma3_zh-cn.md](docs/models/gemma3_zh-cn.md) |
-| Qwen 3 | `qwen3` | Qwen3-4B | 仅文本 | 支持 | 支持 | [qwen3_zh-cn.md](docs/models/qwen3_zh-cn.md) |
-| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE） | 图像 | 支持 | 支持 | [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md) |
-| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 支持 | [gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md) |
-| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni（图像） | 图像（Omni） | 支持 | 支持 | [nemotron_zh-cn.md](docs/models/nemotron_zh-cn.md) |
-| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | [mistral3_zh-cn.md](docs/models/mistral3_zh-cn.md) |
-| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | [diffusiongemma_zh-cn.md](docs/models/diffusiongemma_zh-cn.md) |
+| 架构 | GGUF 架构标识 | 示例模型 | 多模态 | 思维链 | 工具调用 | MTP 投机 | 卡片 |
+|---|---|---|---|---|---|---|---|
+| Gemma 4 | `gemma4` | gemma-4-E4B、gemma-4-31B、gemma-4-26B-A4B（MoE） | 图像、视频、音频 | 支持 | 支持 | 支持（独立 `gemma4-assistant` 草稿 GGUF） | [gemma4_zh-cn.md](docs/models/gemma4_zh-cn.md) |
+| Gemma 3 | `gemma3` | gemma-3-4b | 图像 | 不支持 | 不支持 | — | [gemma3_zh-cn.md](docs/models/gemma3_zh-cn.md) |
+| Qwen 3 | `qwen3` | Qwen3-4B | 仅文本 | 支持 | 支持 | — | [qwen3_zh-cn.md](docs/models/qwen3_zh-cn.md) |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5-35B-A3B / Qwen3.6-35B-A3B（MoE） | 图像 | 支持 | 支持 | Qwen 3.6 支持（内嵌 NextN 块） | [qwen35_zh-cn.md](docs/models/qwen35_zh-cn.md) |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持 | 支持 | — | [gptoss_zh-cn.md](docs/models/gptoss_zh-cn.md) |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni（图像） | 图像（Omni） | 支持 | 支持 | — | [nemotron_zh-cn.md](docs/models/nemotron_zh-cn.md) |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | — | [mistral3_zh-cn.md](docs/models/mistral3_zh-cn.md) |
+| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | — | [diffusiongemma_zh-cn.md](docs/models/diffusiongemma_zh-cn.md) |
 
 各架构的端到端文档见[按模型架构卡片](docs/models/README_zh-cn.md)（来源、前向计算图、组件、参数、权重命名，以及 TensorSharp 如何实现并优化 prefill 与 decode）。
 
@@ -198,7 +201,7 @@ TensorSharp/
 ├── TensorSharp.Core/            # 核心张量库（Tensor、Ops、内存、设备抽象，含 CPU SIMD/托管量化内核）
 ├── TensorSharp.Runtime/         # GGUF、分词器、模板、采样、协议解析
 │   ├── Paged/                   # 分页 KV 缓存原语（BlockPool、BlockTable、KvBlock、BlockHashIndex、PagedKvStorage、PagedKvBatchOps、ManagedPagedAttention）
-│   ├── Scheduling/              # 连续批处理引擎（InferenceEngine、BatchExecutor、ContinuousBatchScheduler、SequenceState、SchedulerConfig/Output、InferenceRequestHandle）
+│   ├── Scheduling/              # 连续批处理引擎（InferenceEngine、BatchExecutor、ContinuousBatchScheduler、SequenceState、SchedulerConfig/Output、InferenceRequestHandle）+ MTP 投机解码核心（MtpSpeculativeExecution）
 │   ├── PagedKvCacheManager.cs   # 单会话分页 KV 管理（块分配、前缀复用）
 │   ├── PagedKvBlockStore.cs     # 带可选 SSD 溢出的 RAM/磁盘分级分页块存储
 │   ├── SsdKvBlockTier.cs        # 分页块的 SSD 冷层
@@ -212,6 +215,7 @@ TensorSharp/
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、GptOss、Qwen35、Nemotron、Qwen3）
 │   ├── Paged/                   # 张量侧的分页注意力辅助（TensorPagedAttention）
 │   ├── KvBlockTransfer.cs       # 跨序列的 KV 块 extract/inject 辅助
+│   ├── MtpSpeculativeDecoder.cs # Qwen 3.6 与 Gemma 4 共用的 MTP/NextN 起草-验证-回滚驱动
 │   └── ModelMultimodalInjector.cs # 视觉 / 音频 / 视频嵌入注入
 ├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA 后端（CUDA Driver API、cuBLAS、PTX 内核）
@@ -293,6 +297,22 @@ pwsh ./eng/verify-packages.ps1
 ```
 
 该验证会对上表 7 个公开包运行 `dotnet pack`，并在 `AdvUtils` 等内部依赖泄漏到 `.nuspec`，或 TensorSharp 包依赖了上表之外的分层时失败。
+
+### 平台二进制发行包
+
+除了托管 NuGet 包之外，[`Release Binaries`](.github/workflows/release-binaries.yml) 工作流会为每个平台构建 **TensorSharp.Server** 与 **TensorSharp.Cli** 的自包含、开箱即用归档，并附加到该标签对应的 GitHub Release。每个归档都内置 .NET 10 运行时及该平台的原生库，因此无需单独安装 .NET 或自行构建原生库即可运行：
+
+| 归档后缀 | 内置的原生后端 | 格式 |
+|---|---|---|
+| `win-x64-cpu` | GGML CPU | `.zip` |
+| `win-x64-cuda` | GGML CUDA + 纯 C# CUDA（PTX）+ CUDA 12.x 运行时 | `.zip` |
+| `linux-x64-cpu` | GGML CPU | `.tar.gz` |
+| `linux-x64-cuda` | GGML CUDA + 纯 C# CUDA（PTX）+ CUDA 12.x 运行时 | `.tar.gz` |
+| `osx-arm64` | GGML Metal + MLX | `.tar.gz` |
+
+- 推送 `v*` 标签即会构建这些归档并自动发布 Release——它与 NuGet 工作流由同一个标签触发。
+- `-cuda` 归档已内置 CUDA 运行时库（`cudart` / `cublas` / `cublasLt`），但运行时仍需 NVIDIA GPU 与兼容驱动；`-cpu` 归档可在任意机器运行。macOS 归档需 Apple Silicon。
+- 如需预演，可手动触发该工作流（`workflow_dispatch`）并填写 `version` 输入——它会构建全部平台并创建**草稿** Release。可用 `cuda_arch` 输入覆盖 CUDA 构建的目标 GPU 架构。
 
 ## 前置要求
 
@@ -644,9 +664,10 @@ cd TensorSharp.Server/bin
 | `--seed <N>` | 当请求未提供时使用的默认随机种子（`-1` = 非确定性） |
 | `--stop <string>` | 默认停止序列（可重复指定）。请求体里的 `stop`/`stop_sequences` 会**完全替换**默认列表，而不是与之合并。 |
 | `--continuous-batching` / `--no-continuous-batching` | 启用（默认）或关闭迭代级分页批处理。启用时服务会在批内动态加入 / 抢占序列，并在实现了 `IBatchedPagedModel` 的模型上将多个序列打包到一次前向中执行。`--no-continuous-batching` 会让所有模型回退到按序列 KV 交换。别名：`--paged-batching` / `--no-paged-batching`。 |
-| `--mtp-spec` / `--no-mtp-spec` | 在带有多 token 预测草稿头（Qwen3.6 NextN/MTP）的模型上启用投机解码（默认关闭）。仅对单序列（无并发）请求生效：草稿头每步最多提议 `--mtp-draft` 个 token，主干网络用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动。环境变量：`TS_MTP_SPEC`。 |
+| `--mtp-spec` / `--no-mtp-spec` | 在带有多 token 预测草稿头的模型上启用 NextN/MTP 投机解码（默认关闭）。草稿头可以是 Qwen 3.6 内嵌的 NextN 块，或通过 `--mtp-draft-model` 加载的 Gemma 4 `gemma4-assistant` 草稿。仅对单序列（无并发）请求生效：草稿头每步最多提议 `--mtp-draft` 个 token，主干网络用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，输出与标准 decode 一致。仅在有收益处自动启用（ggml 后端与纯 C# `cuda` 后端）；CPU / MLX 走标准 decode。环境变量：`TS_MTP_SPEC`。 |
 | `--mtp-draft <N>` | 每个投机步最多起草的 token 数（默认 `8`）。环境变量：`TS_MTP_DRAFT`。 |
 | `--mtp-pmin <f>` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`；遇到第一个低置信 token 即停止起草（默认 `0.75`）。环境变量：`TS_MTP_PMIN`。 |
+| `--mtp-draft-model <path>` | 对于草稿头作为独立文件发布的架构（Gemma 4 的 `gemma4-assistant`），指定其草稿 GGUF 路径。草稿的隐藏维度必须与目标一致（例如 12B 目标配 12B 草稿，而非 26B-A4B 草稿）；草稿不匹配或不完整会在启动时立即失败并给出修复提示。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中，此参数对其无效。环境变量：`TS_MTP_DRAFT_MODEL`。 |
 | `--paged-kv` / `--no-paged-kv` | 已移除的按会话分页 KV 管理器的兼容参数。当前服务端 KV 状态由引擎持有；请使用连续批处理 / `TS_SCHED_*` 开关调节引擎。别名：`--paged-kv-cache` / `--no-paged-kv-cache`。 |
 | `--paged-kv-block-size <N>` | 旧的独立分页 KV 块大小。当前引擎使用 `TS_SCHED_BLOCK_SIZE`。 |
 | `--paged-kv-ram-mb <N>` | 旧的独立分页 KV RAM 层上限。 |
@@ -722,6 +743,20 @@ cd TensorSharp.Server/bin
 | `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | 解码时定期触发 `mlx_async_eval` 的层间隔，用于让 GPU 计算和宿主端排队重叠。Gemma 4 通过 `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` 默认每 4 层一次；Qwen 3 / Qwen 3.5 / Nemotron-H 通过 `TS_MLX_EVAL_EVERY_N_LAYERS` 默认每 16 层一次。支持处可设为 `0` 关闭。 |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | 覆盖 `--backend mlx` 时 `libmlxc` 的搜索路径。 |
 
+**MTP / 投机解码调优变量**
+
+这些变量控制可选的多 token 预测投机解码路径（见 [MTP / NextN 投机解码](#mtp--nextn-投机解码)）。`TS_MTP_*` 为通用开关（也可由 `--mtp-*` CLI 参数设置）；`TS_GMTP_*` 为 Gemma 4 草稿路径 A/B 开关。
+
+| 变量 | 说明 |
+|---|---|
+| `TS_MTP_SPEC` | `1` 为单序列启用 MTP/NextN 投机解码（默认 `0`）。CLI：`--mtp-spec` / `--no-mtp-spec`。 |
+| `TS_MTP_DRAFT` | 每个投机步最多起草的 token 数（默认 `8`）。CLI：`--mtp-draft`。 |
+| `TS_MTP_PMIN` | 草稿 token 被保留所需的最低置信度，取值 `(0, 1]`（默认 `0.75`）。CLI：`--mtp-pmin`。 |
+| `TS_MTP_DRAFT_MODEL` | Gemma 4 独立 `gemma4-assistant` 草稿 GGUF 路径。CLI：`--mtp-draft-model`。Qwen 3.6（内嵌 NextN）忽略此项。 |
+| `TS_GMTP_NO_FUSED` | `1` 关闭 Gemma 4 融合多 token 验证 / 草稿步 GGML 内核，回退到逐算子路径（ggml 后端上的 A/B 测试）。 |
+| `TS_GMTP_NO_FAST_ROLLBACK` | `1` 恢复保留前缀的回滚路径，而非部分接受时使用的稠密精确匹配快速回滚。 |
+| `TS_GMTP_BATCHED_TRUNK` | `1` 让 Gemma 4 验证主干走批量分页路径；默认对单序列投机使用更快的线性主干。 |
+
 **DiffusionGemma 专属调优变量**
 
 | 变量 | 说明 |
@@ -769,6 +804,18 @@ cd TensorSharp.Server/bin
 | Nemotron-H | 启用 | `TS_NEMOTRON_BATCHED=0` 强制走旧的按序列路径 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 步（NEON SIMD + GCD 并行） |
 | Gemma 3 | 未实现（走按序列回退） | — | — |
 | DiffusionGemma | Web UI 路径使用独立 diffusion 调度器；不是 `IBatchedPagedModel` 自回归路径 | `DIFFUSION_MAX_BATCH`、`DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` 启用真正的批处理 canvas decode；GGML 融合 decode 默认开启，可用 `DIFFUSION_NO_FUSED_DECODE=1` 关闭 |
+
+#### MTP / NextN 投机解码
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| 投机解码引擎（单序列） | 关闭 | **`TS_MTP_SPEC=1`** | `--mtp-spec` / `--no-mtp-spec` |
+| 每步最多起草 token 数 | `8` | `TS_MTP_DRAFT` | `--mtp-draft N` |
+| 草稿 token 被保留所需最低置信度 | `0.75` | `TS_MTP_PMIN` | `--mtp-pmin X` |
+| Gemma 4 独立草稿 GGUF（`gemma4-assistant`） | 无 | `TS_MTP_DRAFT_MODEL` | `--mtp-draft-model <path>` |
+| Gemma 4 融合验证 / 草稿内核（ggml） | 开启 | `TS_GMTP_NO_FUSED=1` 回退到逐算子 | — |
+| Gemma 4 部分接受时的稠密快速回滚 | 开启 | `TS_GMTP_NO_FAST_ROLLBACK=1` 恢复保留前缀回滚 | — |
+| Gemma 4 验证主干路径 | 线性（单序列） | `TS_GMTP_BATCHED_TRUNK=1` 走批量分页主干 | — |
 
 #### 后端
 
@@ -966,6 +1013,37 @@ curl http://localhost:5000/api/queue/status
 
 通过 `--think`（控制台）、`"think": true`（Ollama API）或 Web 界面中的思维链开关启用。
 
+## MTP / NextN 投机解码
+
+部分架构自带**多 token 预测（MTP / NextN）草稿头**，让 `TensorSharp.Server` 能为单序列（无并发）请求运行无损投机解码。草稿头廉价地提议若干未来 token，主干用一次批量前向验证全部 token，被接受的 token 一步提交。由于起草与验证都由该请求自己的采样器（temperature、top-k/p、重复/存在/频率惩罚）驱动，输出与标准 decode 完全一致——投机只改变产生这些 token 所需的前向次数。
+
+投机解码**默认关闭**。在服务端通过 `--mtp-spec`（环境变量 `TS_MTP_SPEC=1`）启用：
+
+```bash
+# Qwen 3.6 —— NextN 块内嵌在主干 GGUF 中，无需额外文件
+./TensorSharp.Server --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft 8 --mtp-pmin 0.75
+
+# Gemma 4 —— 加载与目标匹配的独立 gemma4-assistant 草稿 GGUF
+./TensorSharp.Server --model gemma-4-12B-it-Q4_K_M.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft-model gemma-4-12B-assistant-Q8_0.gguf
+```
+
+**两种草稿头形态：**
+
+- **Qwen 3.6（内嵌 NextN）** —— GGUF 在主干栈之后带有一个额外解码块（`{arch}.nextn_predict_layers`）以及 NextN 投影 / 归一化张量。无需独立文件，`--mtp-draft-model` 被忽略。主干的递归状态（GatedDeltaNet）会被快照，以便部分被拒的验证批次可以回滚。
+- **Gemma 4（独立 `gemma4-assistant` GGUF）** —— 通过 `--mtp-draft-model` 加载的 EAGLE 风格递归草稿器。它自身不保存任何 K/V：每个草稿层都查询**目标模型**已有的逐层 KV 缓存（最后一个 local 层 + 最后一个 global 层），因此在给定 `(token, hidden)` 时草稿器是无状态的。草稿的隐藏维度必须与目标一致——12B 目标配 12B 草稿，而非 26B-A4B 草稿。草稿 GGUF 不匹配、缺失或不完整会在启动时**立即失败**并给出修复提示，而非静默关闭投机。
+
+**何处有收益**（自动启用；否则引擎走标准 decode）：
+
+| 后端 | Qwen 3.6 | Gemma 4 |
+|---|---|---|
+| GGML CUDA / GGML Metal | ✅ 融合多 token 验证 + 草稿步内核 | ✅ 融合多 token 验证 + 草稿步内核 |
+| Direct CUDA（`cuda`，纯 C#） | ✅ 完全驻留 GPU 的逐算子验证 / 草稿 | ✅ 完全驻留 GPU 的逐算子验证 / 草稿 |
+| CPU / GGML CPU / MLX | 标准 decode（验证跟不上） | 标准 decode |
+
+调优：`--mtp-draft`（默认 `8`）限制每步起草的 token 数；`--mtp-pmin`（默认 `0.75`）是保留 token 所需的最低草稿置信度（遇到第一个低置信 token 即停止起草）。Gemma 4 草稿路径 A/B 开关为 `TS_GMTP_*` 环境变量（见 [Web 应用](#web-应用) 下的 **MTP / 投机解码调优变量** 表）。各架构具体机制见 [Qwen 3.5/3.6 卡片](docs/models/qwen35_zh-cn.md) 与 [Gemma 4 卡片](docs/models/gemma4_zh-cn.md)。
+
 ## 工具调用 / 函数调用
 
 模型可以调用用户定义的工具并参与多轮工具调用对话。将工具定义为 JSON 格式，通过 `--tools`（控制台）或 API 中的 `tools` 参数传入。
@@ -1054,6 +1132,7 @@ TensorSharp 采用分层系统结构：
 - **分页 KV 缓存 & 块哈希前缀共享**：连续批处理引擎把 KV 切分成固定大小的块，对每个写满的块做内容哈希，并在并发 / 历史请求间共享。尚未实现 `IBatchedPagedModel` 的模型仍会走同一引擎内隔离的按序列 KV-swap 回退路径。
 - **原生分页注意力内核**：`TSGgml_PagedAttentionForward`（及面向 GPT OSS 的 `WithSinks` 变体）在 C++ 中按序列从分页缓冲区聚合 K/V，按序列构建小型 GGML 图，并派发 `ggml_flash_attn_ext`——也就是旧的单序列路径所使用的同一融合 Metal/CUDA flash 注意力内核。在 Ministral-3-14B 长上下文（4×~800 tokens）上比旧的按序列 GGML 路径**快 ~21%**。
 - **批处理 / 分页前向**：Mistral 3、Gemma 4、GPT OSS、Qwen 3.5/3.6（含 GatedDeltaNet 递归状态池）、Nemotron-H（含 Mamba2 递归状态池 + 原生批处理 Mamba2 内核）把 N 个序列打包到一次 `ForwardBatch` 调用中，每层执行一次批处理线性投影 matmul，通过 `slotMapping` 写入分页 K/V，并通过原生内核做按序列注意力。Gemma 4 批处理路径在 batch=8 短 prompt 下达到 **1.5×** 旧吞吐，在 4×800-token prompt 下达到 **1.6×**；Nemotron-H Mamba2 批处理在 Apple M4 Pro 上 batch=3 时达到 **3.95×**。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
+- **MTP / NextN 投机解码**：单序列可运行多 token 预测草稿头（Qwen 3.6 内嵌 NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。草稿头最多提议 `--mtp-draft` 个 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动，因此在不改变输出的前提下加速 decode。在 ggml 后端上，融合的单图多 token 验证与草稿步内核（`NativeGemma4ModelVerify` / `TryFusedMoEModelVerify` / `NativeGemma4DraftStep`，以及 Qwen 3.6 的 NextN 图）摊销了验证开销；Gemma 4 路径还增加了 gallocr 验证 scratch 以及部分接受时避免重跑已保留前缀的稠密快速回滚。纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿（donor 缓存注意力、GQA decode 内核、GPU RoPE），使验证层循环零宿主端同步停顿。默认关闭；`--mtp-spec`。
 - **DiffusionGemma prompt-KV 缓存与融合去噪**：GPU 后端会在每个 block 中只对 `[prompt | canvas]` 的 prompt 部分预填充一次 K/V，并在去噪多步中复用；GGML 后端默认使用融合整模型 diffusion decode 与融合 lm-head tail。Web UI 通过 `DiffusionBatchScheduler` 在 block 边界批处理并发 diffusion 请求。
 - **内核预热**：CLI 和 Server 在启动时运行一次微型前向传播，以预编译 GPU 内核（Metal pipeline state、CUDA JIT）并预热内存池，避免首次推理请求的冷启动延迟。
 - **Prefill 缓存**（Gemma 4、Qwen 3.5/3.6-family）：逐 forward 传播的 SWA 掩码缓存（Gemma 4）、跨全局层的 NeoX RoPE cos/sin 查找表缓存（Gemma 4）、以及跨层的 RoPE 位置张量缓存（Gemma 4、Qwen 3.5/3.6-family），消除了 prefill 期间的冗余重复计算。
@@ -1098,7 +1177,7 @@ TensorSharp 采用分层系统结构：
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、MTP / NextN 投机解码正确性与可选端到端探针（`MtpSpeculativeExecutionTests`、`Qwen36MtpTests`、`Gemma4MtpTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，以及服务器 CLI 选项构造（`ServerOptionsBuilderTests`）。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

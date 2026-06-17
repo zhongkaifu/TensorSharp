@@ -88,6 +88,13 @@ DiffusionGemma does not support autoregressive `Forward()`, so it uses
 The opt-in env vars are summarised in the matrix above and in the project root
 README.
 
+Solo (non-concurrent) sequences on architectures that ship a multi-token-prediction
+draft head — Qwen 3.6 (embedded NextN block) and Gemma 4 (separate `gemma4-assistant`
+draft GGUF) — can additionally run lossless MTP speculative decoding through the same
+engine (`--mtp-spec`). The shared draft / verify / rollback core is
+`MtpSpeculativeExecution`; per-architecture mechanics are in the Qwen 3.5/3.6 (§12)
+and Gemma 4 (§12) cards.
+
 ## Architecture comparison
 
 | Feature | Gemma 3 | Gemma 4 | DiffusionGemma | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
@@ -113,6 +120,7 @@ README.
 | Video | No | Yes | No | No | No | No | No | No |
 | Thinking | No | Yes | No | Yes | Yes | Yes (always) | Yes | No |
 | Tool calling | No | Yes | No | Yes | Yes | Yes | Yes | No |
+| MTP / NextN speculative decoding | No | Yes (separate `gemma4-assistant` draft GGUF) | No | No | Yes on Qwen 3.6 (embedded NextN block) | No | No | No |
 | Fused QKV | No | Yes | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
 | Fused single-graph decode | No | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
 | Fused single-graph prefill | No | Yes (Gemma4LayerPrefill, dense layers) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |

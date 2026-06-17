@@ -1112,6 +1112,7 @@ namespace TensorSharp.GGML
         public static void Shutdown() => GgmlNative.Shutdown();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
+        public static bool TryGetBackendMemory(out long freeBytes, out long totalBytes) => GgmlNative.TryGetBackendMemory(out freeBytes, out totalBytes);
         public static void SyncHostBuffer(IntPtr ptr, long byteCount) => GgmlNative.SyncHostBuffer(ptr, byteCount);
         public static void SetAsyncCompute(bool enabled) => GgmlNative.SetAsyncCompute(enabled);
         public static bool GetAsyncCompute() => GgmlNative.GetAsyncCompute();

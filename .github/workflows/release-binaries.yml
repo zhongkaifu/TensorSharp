@@ -1,0 +1,306 @@
+name: Release Binaries
+
+# Builds self-contained, ready-to-run release archives of the TensorSharp apps
+# (TensorSharp.Server and TensorSharp.Cli) for each supported platform and
+# attaches them to a GitHub Release.
+#
+# Unlike `publish-nuget.yml` (which packs managed-only NuGet packages and skips
+# the native build), this workflow builds the native libraries on each OS and
+# bundles them into the published apps, so each archive is runnable without a
+# .NET install or a separate native build:
+#
+#   - win-x64-cpu      GgmlOps.dll (CPU)                       -> .zip
+#   - win-x64-cuda     GgmlOps.dll (+CUDA) + PTX + CUDA redist -> .zip
+#   - linux-x64-cpu    libGgmlOps.so (CPU)                     -> .tar.gz
+#   - linux-x64-cuda   libGgmlOps.so (+CUDA) + PTX + CUDA redist -> .tar.gz
+#   - osx-arm64        libGgmlOps.dylib (Metal) + MLX dylibs   -> .tar.gz
+#
+# The CUDA archives bundle the CUDA 12.x runtime libraries (cudart / cublas /
+# cublasLt) so they run against any NVIDIA driver new enough for the toolkit;
+# they still require an NVIDIA GPU + driver at run time. The CPU archives run
+# anywhere (the GGML CPU backend); their pure-C# `--backend cuda` has no PTX and
+# falls back to CPU — use a `-cuda` archive (or build from source) for GPU.
+#
+# Trigger: push a version tag like `v2.8.6` (the tag, with the leading `v`
+# stripped, becomes the version and a published Release is created). Or run
+# `workflow_dispatch` with a `version` input to produce a draft Release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 2.8.6). Required when not run from a tag."
+        required: false
+        default: ""
+      cuda_arch:
+        description: "CMake CUDA architectures for the ggml CUDA build (semicolon-separated)."
+        required: false
+        default: "75-real;86-real;89-real;90-real;90-virtual"
+      draft:
+        description: "Create the GitHub Release as a draft (manual runs only)."
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel an in-flight release build — a half-uploaded release is worse
+  # than a queue.
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win-x64-cpu
+            os: windows-latest
+            rid: win-x64
+            cuda: false
+          - name: win-x64-cuda
+            os: windows-latest
+            rid: win-x64
+            cuda: true
+          - name: linux-x64-cpu
+            os: ubuntu-latest
+            rid: linux-x64
+            cuda: false
+          - name: linux-x64-cuda
+            os: ubuntu-latest
+            rid: linux-x64
+            cuda: true
+          - name: osx-arm64
+            os: macos-latest
+            rid: osx-arm64
+            cuda: false
+    runs-on: ${{ matrix.os }}
+    # The CUDA ggml build (multiple SASS targets + PTX) and the macOS MLX build
+    # (builds mlx-c from source) are minutes-long; give them headroom.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ggml is not a submodule; the native build scripts fetch it.
+          submodules: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install CUDA toolkit
+        if: ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.6.3"
+          # network installer; full toolkit so the ggml CUDA backend links
+          # cuBLAS and the runtime libs are present to bundle.
+          method: "network"
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::No version resolved. Push a tag like v2.8.6 or supply the 'version' input." >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V"
+
+      - name: Publish apps
+        shell: bash
+        env:
+          # Read by both MSBuild (TensorSharp.Backends.GGML.csproj) and the
+          # native build scripts. The first `dotnet publish` triggers the native
+          # GGML build (and, when nvcc is present, the CUDA PTX compile); the
+          # second is incremental.
+          TENSORSHARP_GGML_NATIVE_ENABLE_CUDA: ${{ matrix.cuda && 'ON' || 'OFF' }}
+          TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES: ${{ matrix.cuda && (github.event.inputs.cuda_arch || '75-real;86-real;89-real;90-real;90-virtual') || '' }}
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          for app in Server Cli; do
+            lc=$(echo "$app" | tr '[:upper:]' '[:lower:]')
+            dotnet publish "TensorSharp.$app/TensorSharp.$app.csproj" \
+              -c Release \
+              -r "${{ matrix.rid }}" \
+              --self-contained true \
+              -p:Version="$V" \
+              -o "publish/$lc"
+          done
+
+      - name: Stage GGML native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Windows)
+              lib=""
+              for c in TensorSharp.GGML.Native/build-windows/Release/GgmlOps.dll \
+                       TensorSharp.GGML.Native/build-windows/GgmlOps.dll; do
+                [ -f "$c" ] && lib="$c" && break
+              done
+              ;;
+            Linux) lib="TensorSharp.GGML.Native/build/libGgmlOps.so" ;;
+            macOS) lib="TensorSharp.GGML.Native/build/libGgmlOps.dylib" ;;
+          esac
+          if [ -z "${lib:-}" ] || [ ! -f "$lib" ]; then
+            echo "::error::GGML native library not found (looked for the ${{ runner.os }} build output)." >&2
+            exit 1
+          fi
+          echo "Bundling GGML native library: $lib"
+          cp "$lib" publish/server/
+          cp "$lib" publish/cli/
+
+      - name: Stage MLX native libraries
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in libmlxc.dylib libmlx.dylib libjaccl.dylib; do
+            src="TensorSharp.Backends.MLX/Native/dist/$f"
+            [ -f "$src" ] || src="TensorSharp.Backends.MLX/Native/dist/lib/$f"
+            if [ -f "$src" ]; then
+              cp "$src" publish/server/
+              cp "$src" publish/cli/
+            else
+              echo "::warning::MLX library $f not found; skipping."
+            fi
+          done
+
+      - name: Stage CUDA PTX kernels
+        # The pure-C# `--backend cuda` loads PTX from a cuda_kernels/ subfolder
+        # next to the app. nvcc (present only for CUDA builds) compiles it during
+        # publish; copy it in explicitly so a propagation miss can't silently
+        # downgrade the backend to its CPU fallback.
+        if: ${{ matrix.cuda }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ptx="TensorSharp.Backends.Cuda/native/ptx/tensorsharp_kernels.ptx"
+          if [ ! -f "$ptx" ]; then
+            echo "::error::CUDA PTX kernel not found at $ptx (was nvcc available during publish?)." >&2
+            exit 1
+          fi
+          for app in server cli; do
+            mkdir -p "publish/$app/cuda_kernels"
+            cp "$ptx" "publish/$app/cuda_kernels/"
+          done
+
+      - name: Stage CUDA runtime (Linux)
+        if: ${{ matrix.cuda && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+            src="$CUDA_PATH/lib64/$f"
+            if [ -f "$src" ]; then
+              cp -L "$src" publish/server/
+              cp -L "$src" publish/cli/
+            else
+              echo "::warning::CUDA runtime library $f not found at $src; archive will require a system CUDA install."
+            fi
+          done
+
+      - name: Stage CUDA runtime (Windows)
+        if: ${{ matrix.cuda && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
+            $src = Join-Path $env:CUDA_PATH "bin\$dll"
+            if (Test-Path $src) {
+              Copy-Item $src publish/server/
+              Copy-Item $src publish/cli/
+            } else {
+              Write-Host "::warning::CUDA runtime library $dll not found at $src; archive will require a system CUDA install."
+            }
+          }
+
+      - name: Archive (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p artifacts
+          tar -C publish/server -czf "artifacts/tensorsharp-server-$V-${{ matrix.name }}.tar.gz" .
+          tar -C publish/cli    -czf "artifacts/tensorsharp-cli-$V-${{ matrix.name }}.tar.gz" .
+
+      - name: Archive (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          SUFFIX: ${{ matrix.name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path publish/server/* -DestinationPath "artifacts/tensorsharp-server-$env:V-$env:SUFFIX.zip"
+          Compress-Archive -Path publish/cli/*    -DestinationPath "artifacts/tensorsharp-cli-$env:V-$env:SUFFIX.zip"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: artifacts/*
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::No version resolved." >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: TensorSharp ${{ steps.ver.outputs.version }}
+          # Tag pushes publish immediately; manual runs default to a draft.
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/**/*

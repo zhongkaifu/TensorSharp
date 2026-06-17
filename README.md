@@ -77,6 +77,7 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 ## Highlights
 
 - **Continuous batching & paged KV cache** — vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
+- **MTP / NextN speculative decoding** — multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (NextN block embedded in the trunk GGUF) and Gemma 4 (separate `gemma4-assistant` draft GGUF). The draft proposes several tokens per step and the trunk verifies them in one batched forward, with the request's own sampler driving both. Opt in with `--mtp-spec` (+ `--mtp-draft-model` for Gemma 4). → [Speculative decoding](#mtp--nextn-speculative-decoding)
 - **DiffusionGemma text diffusion** — block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI generation flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
 - **Multimodal** — image / video / audio inputs (Gemma 4); image inputs for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → [Multimodal Support](#multimodal-support)
 - **Tool calling / function calling** — multi-turn tool calls across all three API styles, with architecture-agnostic output parsing. → [Tool Calling](#tool-calling--function-calling)
@@ -113,6 +114,7 @@ Everything below is detailed reference. New here? The five sections above are al
 | Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
+| Speculative decoding | MTP / NextN draft heads for solo decode on Qwen 3.6 (embedded NextN) and Gemma 4 (separate `gemma4-assistant` draft GGUF); off by default, opt-in via `--mtp-spec` (+ `--mtp-draft-model` for Gemma 4). Profitable on ggml backends and the pure-C# `cuda` backend; CPU / MLX stay on standard decode. |
 | Server model scope | One explicitly hosted GGUF via `--model`; optional explicit projector via `--mmproj`; no directory scanning |
 | Observability | Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes |
 | Test/eval harness | `TensorSharp.TestMatrix` sweeps supported hosts across model, backend, feature, and env-var cells, then compares against per-host baselines |
@@ -127,6 +129,7 @@ Everything below is detailed reference. New here? The five sections above are al
 - **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+- **MTP / NextN speculative decoding** -- multi-token-prediction draft heads accelerate solo (non-concurrent) decode. Qwen 3.6 ships its NextN block fused into the trunk GGUF; Gemma 4 loads a separate EAGLE-style `gemma4-assistant` draft GGUF via `--mtp-draft-model` whose draft layers attend the target's own KV cache. The draft proposes up to `--mtp-draft` tokens per step (kept while draft confidence ≥ `--mtp-pmin`) and the trunk verifies them in a single batched forward; the request's own sampler — penalties included — drives both drafting and verification, so output is identical to standard decode. Opt in with `--mtp-spec` (off by default). On ggml backends fused multi-token-verify / draft-step kernels make it a clear win; the pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft and is also a win. CPU / MLX stay on standard decode. Env: `TS_MTP_*` (shared) and `TS_GMTP_*` (Gemma 4 tuning).
 - **Batched / parallel inference** -- `IBatchedPagedModel.ForwardBatch` implementations for Mistral 3, Gemma 4, GPT OSS, Qwen 3, Qwen 3.5/3.6-family, and Nemotron-H all run by default and pack N sequences into a single forward pass with paged K/V scatter and per-sequence attention via the native kernel. Each model exposes a `TS_<FAMILY>_BATCHED=0` escape hatch (e.g. `TS_GEMMA4_BATCHED=0`, `TS_QWEN35_BATCHED=0`, `TS_GPTOSS_BATCHED=0`, `TS_NEMOTRON_BATCHED=0`) to fall back to the per-sequence KV-swap path for A/B comparison or regression isolation.
 - **Ollama & OpenAI API compatibility** -- drop-in replacement endpoints for existing tooling
 - **Configurable sampling** -- temperature, top-k, top-p, min-p, repetition/presence/frequency penalties, seed, stop sequences
@@ -146,16 +149,16 @@ Everything below is detailed reference. New here? The five sections above are al
 
 ## Supported Model Architectures
 
-| Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tool Calling | Card |
-|---|---|---|---|---|---|---|
-| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | [gemma4.md](docs/models/gemma4.md) |
-| Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | [gemma3.md](docs/models/gemma3.md) |
-| Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | [qwen3.md](docs/models/qwen3.md) |
-| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes | [qwen35.md](docs/models/qwen35.md) |
-| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | [gptoss.md](docs/models/gptoss.md) |
-| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | [nemotron.md](docs/models/nemotron.md) |
-| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | [mistral3.md](docs/models/mistral3.md) |
-| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | [diffusiongemma.md](docs/models/diffusiongemma.md) |
+| Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tool Calling | MTP spec | Card |
+|---|---|---|---|---|---|---|---|
+| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate `gemma4-assistant` draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
+| Gemma 3 | `gemma3` | gemma-3-4b | Image | No | No | — | [gemma3.md](docs/models/gemma3.md) |
+| Qwen 3 | `qwen3` | Qwen3-4B | Text only | Yes | Yes | — | [qwen3.md](docs/models/qwen3.md) |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE) | Image | Yes | Yes | Yes on Qwen 3.6 (embedded NextN block) | [qwen35.md](docs/models/qwen35.md) |
+| GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | — | [gptoss.md](docs/models/gptoss.md) |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | — | [nemotron.md](docs/models/nemotron.md) |
+| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
+| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
 
 See the [per-model architecture cards](docs/models/README.md) for end-to-end documentation of each architecture (origin, forward graph, components, parameters, weight naming, and how TensorSharp implements / optimizes prefill and decode).
 
@@ -198,7 +201,7 @@ TensorSharp/
 ├── TensorSharp.Core/            # Core tensor library (Tensor, Ops, memory, device abstraction, CPU SIMD/managed quantized kernels)
 ├── TensorSharp.Runtime/         # GGUF, tokenizers, templates, sampling, protocol parsing
 │   ├── Paged/                   # Paged KV cache primitives (BlockPool, BlockTable, KvBlock, BlockHashIndex, PagedKvStorage, PagedKvBatchOps, ManagedPagedAttention)
-│   ├── Scheduling/              # Continuous batching engine (InferenceEngine, BatchExecutor, ContinuousBatchScheduler, SequenceState, SchedulerConfig/Output, InferenceRequestHandle)
+│   ├── Scheduling/              # Continuous batching engine (InferenceEngine, BatchExecutor, ContinuousBatchScheduler, SequenceState, SchedulerConfig/Output, InferenceRequestHandle) + MTP speculative decode core (MtpSpeculativeExecution)
 │   ├── PagedKvCacheManager.cs   # Per-session paged KV manager (block allocation, prefix reuse)
 │   ├── PagedKvBlockStore.cs     # On-disk / RAM-tiered paged block storage with optional SSD spillover
 │   ├── SsdKvBlockTier.cs        # SSD-backed cold tier for paged blocks
@@ -212,6 +215,7 @@ TensorSharp/
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
 │   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
 │   ├── KvBlockTransfer.cs       # Helpers for extract/inject of KV blocks across sequences
+│   ├── MtpSpeculativeDecoder.cs # MTP/NextN draft-verify-rollback driver shared by Qwen 3.6 and Gemma 4
 │   └── ModelMultimodalInjector.cs # Vision / audio / video embedding injection
 ├── TensorSharp.Backends.GGML/   # GGML backend bindings (Metal/CUDA/CPU via native library)
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA backend using CUDA Driver API, cuBLAS, and PTX kernels
@@ -293,6 +297,36 @@ pwsh ./eng/verify-packages.ps1
 ```
 
 The verifier runs `dotnet pack` for the public packages above and fails if an internal dependency such as `AdvUtils` leaks into the `.nuspec`, or if a TensorSharp package depends on a layer outside this table.
+
+### Publishing a release
+
+Publishing is automated by the [`Publish NuGet`](.github/workflows/publish-nuget.yml) GitHub Actions workflow. Push a version tag and the workflow packs all of the public packages above and pushes them to **NuGet.org** and the repository's **GitHub Packages** feed:
+
+```bash
+git tag v2.8.6      # tag drives the package version (v2.8.6 -> 2.8.6)
+git push origin v2.8.6
+```
+
+- The tag (with the leading `v` stripped) overrides `TensorSharpVersion` for every package, so all packages ship with a single coordinated version. You do not need to edit `Directory.Build.props` first.
+- Packing is managed-only — the native GGML/CUDA/MLX libraries are not embedded in the packages — so the workflow runs on a stock runner with `eng/verify-packages.ps1 -SkipNativeBuild` (which also sets `TensorSharpSkipGgmlNative=true` / `TensorSharpSkipMlxNative=true`).
+- Configure a `NUGET_API_KEY` repository secret for the NuGet.org push. If it is missing, the NuGet.org step is skipped with a warning and only the GitHub Packages push (which uses the built-in `GITHUB_TOKEN`) runs.
+- To rehearse without publishing, run the workflow manually (`workflow_dispatch`) with a `version` input and `dry_run` checked — it packs, verifies, and uploads the `.nupkg` files as a build artifact without pushing.
+
+### Platform binary releases
+
+Alongside the managed NuGet packages, the [`Release Binaries`](.github/workflows/release-binaries.yml) workflow builds self-contained, ready-to-run archives of **TensorSharp.Server** and **TensorSharp.Cli** for each platform and attaches them to the GitHub Release for the tag. Each archive bundles the .NET 10 runtime and the platform's native libraries, so it runs without a separate .NET install or native build:
+
+| Archive suffix | Native backend(s) bundled | Format |
+|---|---|---|
+| `win-x64-cpu` | GGML CPU | `.zip` |
+| `win-x64-cuda` | GGML CUDA + pure-C# CUDA (PTX) + CUDA 12.x runtime | `.zip` |
+| `linux-x64-cpu` | GGML CPU | `.tar.gz` |
+| `linux-x64-cuda` | GGML CUDA + pure-C# CUDA (PTX) + CUDA 12.x runtime | `.tar.gz` |
+| `osx-arm64` | GGML Metal + MLX | `.tar.gz` |
+
+- Pushing a `v*` tag builds the archives and publishes the Release automatically — both this and the NuGet workflow trigger on the same tag.
+- The `-cuda` archives bundle the CUDA runtime libraries (`cudart` / `cublas` / `cublasLt`) but still require an NVIDIA GPU and a compatible driver at run time; the `-cpu` archives run anywhere. The macOS archive requires Apple Silicon.
+- To rehearse, run the workflow manually (`workflow_dispatch`) with a `version` input — it builds every platform and creates a **draft** Release. Override the target GPU architectures for the CUDA build with the `cuda_arch` input.
 
 ## Prerequisites
 
@@ -645,9 +679,10 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
-| `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen3.6). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification. Env: `TS_MTP_SPEC`. |
+| `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable (ggml backends and the pure-C# `cuda` backend); CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
 | `--mtp-draft <N>` | Maximum tokens drafted per speculative step (default `8`). Env: `TS_MTP_DRAFT`. |
 | `--mtp-pmin <f>` | Minimum draft-head confidence in `(0, 1]` for a drafted token to be kept; drafting stops at the first low-confidence token (default `0.75`). Env: `TS_MTP_PMIN`. |
+| `--mtp-draft-model <path>` | Path to a separate MTP draft GGUF for architectures whose draft head ships as its own file (Gemma 4's `gemma4-assistant`). The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Ignored for Qwen 3.6, which embeds its NextN block in the trunk GGUF. Env: `TS_MTP_DRAFT_MODEL`. |
 | `--paged-kv` / `--no-paged-kv` | Legacy compatibility flags for the removed per-session paged-KV manager. Current server KV state is engine-owned; use continuous-batching / `TS_SCHED_*` knobs for the engine. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
 | `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size. The current server engine uses `TS_SCHED_BLOCK_SIZE`. |
 | `--paged-kv-ram-mb <N>` | Legacy standalone paged-KV RAM-tier cap. |
@@ -723,6 +758,20 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_MLX_EVAL_EVERY_N_LAYERS` / `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS` | Periodic `mlx_async_eval` cadence during decode to overlap GPU work with host queueing. Gemma 4 defaults to every 4 layers via `TS_MLX_GEMMA4_EVAL_EVERY_N_LAYERS`; Qwen 3 / Qwen 3.5 / Nemotron-H default to every 16 layers via `TS_MLX_EVAL_EVERY_N_LAYERS`. Set to `0` to disable where supported. |
 | `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` | Override the search path for `libmlxc` when using `--backend mlx`. |
 
+**MTP / speculative-decoding tunables**
+
+These gate the optional multi-token-prediction speculative decode path (see [MTP / NextN speculative decoding](#mtp--nextn-speculative-decoding)). `TS_MTP_*` are the shared knobs (also set by the `--mtp-*` CLI flags); `TS_GMTP_*` are Gemma 4 draft-path A/B switches.
+
+| Variable | Description |
+|---|---|
+| `TS_MTP_SPEC` | `1` enables MTP/NextN speculative decoding for solo sequences (default `0`). CLI: `--mtp-spec` / `--no-mtp-spec`. |
+| `TS_MTP_DRAFT` | Maximum tokens drafted per speculative step (default `8`). CLI: `--mtp-draft`. |
+| `TS_MTP_PMIN` | Minimum draft-head confidence in `(0, 1]` to keep a drafted token (default `0.75`). CLI: `--mtp-pmin`. |
+| `TS_MTP_DRAFT_MODEL` | Path to the separate Gemma 4 `gemma4-assistant` draft GGUF. CLI: `--mtp-draft-model`. Ignored by Qwen 3.6 (embedded NextN). |
+| `TS_GMTP_NO_FUSED` | `1` disables the Gemma 4 fused multi-token-verify / draft-step GGML kernels and falls back to the per-op path (A/B testing on ggml backends). |
+| `TS_GMTP_NO_FAST_ROLLBACK` | `1` restores the kept-prefix rollback path instead of the dense exact-match fast rollback used on partial draft acceptance. |
+| `TS_GMTP_BATCHED_TRUNK` | `1` opts the Gemma 4 verify trunk back into the batched paged path; the default runs the faster linear trunk for solo speculation. |
+
 **DiffusionGemma-specific tunables**
 
 | Variable | Description |
@@ -770,6 +819,18 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Nemotron-H | ON | `TS_NEMOTRON_BATCHED=0` to force legacy per-seq | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |
 | Gemma 3 | not implemented (per-seq fallback) | — | — |
 | DiffusionGemma | Separate diffusion scheduler in the Web UI path; not an `IBatchedPagedModel` autoregressive path | `DIFFUSION_MAX_BATCH`, `DIFFUSION_STEPS` | `DIFFUSION_BATCHED_FORWARD=1` enables true batched canvas decode; fused GGML decode is on by default unless disabled with `DIFFUSION_NO_FUSED_DECODE=1` |
+
+#### MTP / NextN speculative decoding
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Speculative decode engine (solo sequences) | OFF | **`TS_MTP_SPEC=1`** | `--mtp-spec` / `--no-mtp-spec` |
+| Max tokens drafted per step | `8` | `TS_MTP_DRAFT` | `--mtp-draft N` |
+| Min draft-head confidence to keep a token | `0.75` | `TS_MTP_PMIN` | `--mtp-pmin X` |
+| Gemma 4 separate draft GGUF (`gemma4-assistant`) | none | `TS_MTP_DRAFT_MODEL` | `--mtp-draft-model <path>` |
+| Gemma 4 fused verify / draft kernels (ggml) | ON | `TS_GMTP_NO_FUSED=1` falls back to per-op | — |
+| Gemma 4 dense fast rollback on partial accept | ON | `TS_GMTP_NO_FAST_ROLLBACK=1` restores kept-prefix rollback | — |
+| Gemma 4 verify trunk path | linear (solo) | `TS_GMTP_BATCHED_TRUNK=1` runs the batched paged trunk | — |
 
 #### Backends
 
@@ -972,6 +1033,37 @@ Models that support thinking mode (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS
 
 Enable via `--think` (console), `"think": true` (Ollama API), or the thinking toggle in the web UI.
 
+## MTP / NextN Speculative Decoding
+
+Some architectures ship a **multi-token-prediction (MTP / NextN) draft head** that lets `TensorSharp.Server` run lossless speculative decoding for solo (non-concurrent) sequences. The draft proposes several future tokens cheaply, the trunk verifies all of them in one batched forward, and accepted tokens are committed in a single step. Because the request's own sampler — temperature, top-k/p, and repetition/presence/frequency penalties — drives both the draft and the verify, the output is identical to standard decode; speculation only changes how many forward passes it takes to produce it.
+
+Speculative decoding is **off by default**. Enable it on the server with `--mtp-spec` (env `TS_MTP_SPEC=1`):
+
+```bash
+# Qwen 3.6 — the NextN block is embedded in the trunk GGUF, no extra file needed
+./TensorSharp.Server --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft 8 --mtp-pmin 0.75
+
+# Gemma 4 — load the separate gemma4-assistant draft GGUF that matches the target
+./TensorSharp.Server --model gemma-4-12B-it-Q4_K_M.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft-model gemma-4-12B-assistant-Q8_0.gguf
+```
+
+**Two draft-head shapes:**
+
+- **Qwen 3.6 (embedded NextN)** — the GGUF carries one extra decoder block past the main stack (`{arch}.nextn_predict_layers`) plus the NextN projection/norm tensors. No separate file is required; `--mtp-draft-model` is ignored. The recurrent trunk state (GatedDeltaNet) is snapshotted so a partially-rejected verify batch can be rolled back.
+- **Gemma 4 (separate `gemma4-assistant` GGUF)** — an EAGLE-style recurrent drafter loaded with `--mtp-draft-model`. It holds no K/V of its own: every draft layer queries the **target model's** existing per-layer KV cache (last local + last global layer), so the drafter is stateless given `(token, hidden)`. The draft's hidden size must match the target — pair the 12B target with its 12B draft, not the 26B-A4B draft. A mismatched, missing, or incomplete draft GGUF **fails fast at startup** with a remediation hint instead of silently disabling speculation.
+
+**Where it's profitable** (engaged automatically; otherwise the engine serves standard decode):
+
+| Backend | Qwen 3.6 | Gemma 4 |
+|---|---|---|
+| GGML CUDA / GGML Metal | ✅ fused multi-token-verify + draft-step kernels | ✅ fused multi-token-verify + draft-step kernels |
+| Direct CUDA (`cuda`, pure C#) | ✅ GPU-resident per-op verify/draft | ✅ GPU-resident per-op verify/draft |
+| CPU / GGML CPU / MLX | standard decode (verify can't keep up) | standard decode |
+
+Tuning: `--mtp-draft` (default `8`) bounds tokens drafted per step; `--mtp-pmin` (default `0.75`) is the minimum draft-head confidence to keep a token (drafting stops at the first low-confidence token). Gemma 4 draft-path A/B switches are the `TS_GMTP_*` env vars (see the **MTP / speculative-decoding tunables** table under [Web Application](#web-application)). Per-architecture mechanics are in the [Qwen 3.5/3.6 card](docs/models/qwen35.md) and the [Gemma 4 card](docs/models/gemma4.md).
+
 ## Tool Calling / Function Calling
 
 Models can invoke user-defined tools and participate in multi-turn tool-call conversations. Define tools as JSON and pass them via `--tools` (console) or the `tools` parameter in the API.
@@ -1063,6 +1155,7 @@ the fused path engages.
 - **Paged KV cache & block-hash prefix sharing**: the continuous-batching engine partitions KV into fixed-size blocks, content-hashes each full block, and shares them across concurrent and sequential requests. Models that have not implemented `IBatchedPagedModel` still use the engine's isolated per-sequence KV-swap fallback.
 - **Native paged-attention kernel**: `TSGgml_PagedAttentionForward` (and the `WithSinks` variant for GPT OSS) does a C++ gather of K/V from the paged buffer, builds a small GGML graph per sequence, and dispatches `ggml_flash_attn_ext` — the same fused Metal/CUDA flash-attention kernel the legacy single-sequence path uses. On Ministral-3-14B long-context (4×~800 tokens) it is **~21 % faster than the legacy per-sequence GGML path**.
 - **Batched / paged forward passes**: Mistral 3, Gemma 4, GPT OSS, Qwen 3.5/3.6 (incl. GatedDeltaNet recurrent state pool), and Nemotron-H (incl. Mamba2 recurrent state pool + native batched Mamba2 kernel) pack N sequences into a single `ForwardBatch` call with one batched linear-projection matmul per layer, paged K/V scatter via `slotMapping`, and per-sequence attention via the native kernel. Gemma 4 batched path reaches **1.5×** legacy throughput at batch=8 short prompts and **1.6×** at 4×800-token prompts; Nemotron-H Mamba2 batched reaches **3.95×** at batch=3 on Apple M4 Pro. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
+- **MTP / NextN speculative decoding**: solo sequences can run a multi-token-prediction draft head (Qwen 3.6 embedded NextN block; Gemma 4 separate `gemma4-assistant` draft GGUF). The draft proposes up to `--mtp-draft` tokens and the trunk verifies them in one batched forward, with the request's own sampler driving both, so decode is accelerated without changing the output. On ggml backends, fused single-graph multi-token-verify and draft-step kernels (`NativeGemma4ModelVerify` / `TryFusedMoEModelVerify` / `NativeGemma4DraftStep`, plus the Qwen 3.6 NextN graph) amortize the verify; the Gemma 4 path also adds gallocr verify scratch and a dense fast-rollback that avoids re-running the kept prefix on partial acceptance. The pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft (donor-cache attention, GQA decode kernel, GPU RoPE) so the verify layer loop issues zero host-sync stalls. Off by default; `--mtp-spec`.
 - **DiffusionGemma prompt-KV caching and fused denoising**: on GPU backends, the prompt side of `[prompt | canvas]` is prefetched once per block and reused across denoising steps; GGML backends default to fused whole-model diffusion decode plus a fused lm-head tail. The Web UI batches concurrent diffusion requests at block boundaries through `DiffusionBatchScheduler`.
 - **Kernel warmup**: both CLI and Server run a tiny forward pass at startup to pre-compile GPU kernels (Metal pipeline states, CUDA JIT) and warm the memory pool, avoiding cold-start latency on the first real inference request.
 - **Prefill caching** (Gemma 4, Qwen 3.5/3.6-family): per-forward-pass SWA mask cache (Gemma 4), NeoX RoPE cos/sin lookup table cache across global layers (Gemma 4), and RoPE position tensor cache across layers (Gemma 4, Qwen 3.5/3.6-family) eliminate redundant recomputation during prefill.
@@ -1107,7 +1200,7 @@ For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the 
 
 ### Unit tests (xUnit)
 
-`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), DiffusionGemma denoising / prompt-KV / batched-generation probes (`DiffusionGemmaTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
+`InferenceWeb.Tests` exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA backend kernels when a CUDA device is available, MLX backend kernels when MLX is available, paged KV cache scheduling (`ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests`), batched executor correctness (`BatchedExecutorTests`), per-model batched-forward correctness against the legacy path (`Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`), MTP / NextN speculative-decoding correctness and opt-in end-to-end probes (`MtpSpeculativeExecutionTests`, `Qwen36MtpTests`, `Gemma4MtpTests`), DiffusionGemma denoising / prompt-KV / batched-generation probes (`DiffusionGemmaTests`), per-model batched perf microbenchmarks (`*BatchedPerfBench.cs`), `TurboQuantKvCodec` codec round-trips, prefill chunking, KV cache policies, KV-cache prompt rendering / multi-turn integration, chat-session and session-manager isolation, model service history plumbing, request-logging middleware and file-logger provider, image preprocessing, media helpers, structured-output validation, text-upload helpers, model-service upload logging, web UI chat policy, model context length parsing, backend catalog resolution, and the server CLI options builder (`ServerOptionsBuilderTests`).
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj

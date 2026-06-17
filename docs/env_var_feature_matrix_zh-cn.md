@@ -98,6 +98,24 @@ TestMatrix 配置中 sweep。
 | `DIFFUSION_PIN_STREAMED` | ggml_cuda 上的 DiffusionGemma | 把流式（非常驻）权重复制到页锁定内存以 DMA 速度上传（消耗 RAM） | 关闭 | 未注册 | 否 |
 | `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | DiffusionGemma | 开发用计时与融合 kernel 调试诊断 | 关闭 | 未注册 | 否 |
 
+## 矩阵外的 MTP / 投机解码变量
+
+这些变量控制 `TensorSharp.Server` 中可选的 MTP / NextN 投机解码路径（Qwen 3.6 内嵌
+NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。投机仅对单序列（无并发）请求
+生效，且只在有收益处（ggml 后端与纯 C# `cuda` 后端）启用。它们未注册在
+`EnvVarMatrix.All` 中，也不在默认 TestMatrix 配置里扫描——矩阵特性目录目前没有投机解码
+特性，请用显式服务端运行来验证这些变量。`TS_MTP_*` 也可由 `--mtp-*` 服务端 CLI 参数设置。
+
+| 环境变量 | 适用对象 | 功能影响 | 运行时基线 | 扫描取值 | 默认扫描 |
+|---|---|---|---|---|---|
+| `TS_MTP_SPEC` | Qwen 3.6、Gemma 4（服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_MTP_DRAFT` | Qwen 3.6、Gemma 4（服务端） | 每个投机步最多起草的 token 数 | `8` | 未注册 | 否 |
+| `TS_MTP_PMIN` | Qwen 3.6、Gemma 4（服务端） | 保留草稿 token 所需最低置信度 | `0.75` | 未注册 | 否 |
+| `TS_MTP_DRAFT_MODEL` | Gemma 4（服务端） | 独立 `gemma4-assistant` 草稿 GGUF 路径 | 无 | 未注册 | 否 |
+| `TS_GMTP_NO_FUSED` | ggml 后端上的 Gemma 4 | 关闭融合多 token 验证 / 草稿步内核（逐算子回退） | 关闭 | 未注册 | 否 |
+| `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | 部分接受时恢复保留前缀回滚，而非稠密快速回滚 | 关闭 | 未注册 | 否 |
+| `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | 验证主干走批量分页路径，而非线性主干 | 关闭 | 未注册 | 否 |
+
 ## 功能覆盖
 
 功能目录位于

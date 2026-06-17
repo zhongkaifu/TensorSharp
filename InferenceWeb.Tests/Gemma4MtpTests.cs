@@ -25,8 +25,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
+using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
@@ -281,6 +283,124 @@ public class Gemma4MtpTests
         int match = 0;
         while (match < cmp && off.outTokens[match] == on.outTokens[match]) match++;
         _output.WriteLine($"[gmtp-engine] off/on prefix match {match}/{cmp}");
+    }
+
+    // Long-generation Metal-OOM repro / fix-validation. Drives the production
+    // engine spec path for a large token count while sampling device-copy cache
+    // residency + process footprint, so we can see whether unified memory grows
+    // cumulatively (leak) or is flat (pressure) and confirm the run completes
+    // without kIOGPUCommandBufferCallbackErrorOutOfMemory. Opt-in:
+    //   TS_GMTP_E2E=1 TS_GMTP_OOM=1 TS_GMTP_BACKEND=ggml_metal
+    //   [TS_GMTP_NEW_TOKENS=1500] [TS_GMTP_PROMPT=...] [TS_GMTP_DRAFT_N=8]
+    [Fact]
+    public void Gemma4Mtp_LongGen_NoOom()
+    {
+        if (!TryResolveModels(out string targetPath, out string draftPath) ||
+            Environment.GetEnvironmentVariable("TS_GMTP_OOM") != "1")
+        { _output.WriteLine("[gmtp-oom] set TS_GMTP_OOM=1 (and TS_GMTP_E2E=1) to run; skipping"); return; }
+
+        int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 1500);
+        int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 8);
+
+        _output.WriteLine($"[gmtp-oom] target={Path.GetFileName(targetPath)} backend={ResolveBackend()} maxNew={maxNew} maxDraft={maxDraft}");
+        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        model.LoadMtpDraftWeights(draftPath);
+        Xunit.Assert.True(model.HasMtp);
+
+        // Faithful repro: the reported OOM ran with --mmproj loaded, which holds
+        // ~1.2 GB resident even for text-only chat. Load it when TS_GMTP_MMPROJ
+        // points at the projector GGUF so the headroom matches the server.
+        string mmproj = Environment.GetEnvironmentVariable("TS_GMTP_MMPROJ");
+        if (!string.IsNullOrEmpty(mmproj) && File.Exists(mmproj))
+        {
+            model.MultimodalInjector.LoadProjectors(mmproj);
+            _output.WriteLine($"[gmtp-oom] loaded mmproj {Path.GetFileName(mmproj)}");
+        }
+
+        string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
+        if (string.IsNullOrEmpty(prompt))
+            prompt = "请详细介绍最终幻想7";
+        // Render through the GGUF chat template exactly like the server, so the
+        // workload mirrors the report (a raw prompt derails MTP differently).
+        string rendered = ChatTemplate.RenderFromGgufTemplate(
+            model.Config.ChatTemplate,
+            new List<ChatMessage> { new ChatMessage { Role = "user", Content = prompt } },
+            addGenerationPrompt: true, architecture: model.Config.Architecture);
+        int[] tokens = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
+        _output.WriteLine($"[gmtp-oom] prompt tokens={tokens.Length} (chat-templated)");
+
+        // Match the server chat defaults so the workload mirrors the report.
+        // TS_GMTP_GREEDY=1 forces deterministic argmax for a stable coherence check.
+        var sampling = Environment.GetEnvironmentVariable("TS_GMTP_GREEDY") == "1"
+            ? new SamplingConfig { Temperature = 0f, TopK = 0, TopP = 1.0f, MinP = 0f, RepetitionPenalty = 1.0f }
+            : new SamplingConfig { Temperature = 0.8f, TopK = 40, TopP = 0.95f, MinP = 0f, RepetitionPenalty = 1.1f };
+
+        var cfg = new SchedulerConfig
+        {
+            MtpSpeculativeEnabled = true,
+            MtpMaxDraftTokens = maxDraft,
+            MtpMinDraftProb = EnvFloat("TS_GMTP_PMIN", 0.75f),
+            NumBlocks = 64,
+            BlockSize = 256,
+            MaxNumBatchedTokens = 1024,
+            MaxNumRunningSequences = 1,
+            MaxPrefillChunkSize = 512,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+        };
+        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+
+        long Mb(long b) => b / 1024 / 1024;
+        void Snap(string tag, int produced)
+        {
+            long dev = GgmlBasicOps.DeviceCopyCacheResidentBytes();
+            long ws = Process.GetCurrentProcess().WorkingSet64;
+            string metal = GgmlBasicOps.TryGetBackendMemory(out long free, out long total)
+                ? $" metalResident={Mb(total - free)}MB/{Mb(total)}MB" : "";
+            _output.WriteLine($"[gmtp-oom] {tag} produced={produced} deviceCopyResident={Mb(dev)}MB workingSet={Mb(ws)}MB gc={Mb(GC.GetTotalMemory(false))}MB{metal}");
+        }
+
+        var seq = new SequenceState("oom", tokens, maxNew, cfg.BlockSize, sampling);
+        var handle = engine.SubmitRequest(seq);
+
+        var stop = new ManualResetEventSlim(false);
+        var sampler = new Thread(() =>
+        {
+            int last = -1;
+            while (!stop.Wait(500))
+            {
+                int n = seq.OutputTokens.Count;
+                if (n != last) { Snap("progress", n); last = n; }
+            }
+        }) { IsBackground = true };
+        sampler.Start();
+
+        var sw = Stopwatch.StartNew();
+        Exception failure = null;
+        int outCount = 0;
+        try
+        {
+            var completion = handle.Completion.GetAwaiter().GetResult();
+            outCount = completion.OutputTokenCount;
+        }
+        catch (Exception ex) { failure = ex; }
+        sw.Stop();
+        stop.Set(); sampler.Join();
+
+        Snap("final", seq.OutputTokens.Count);
+        var stats = seq.SpecStats;
+        if (stats != null)
+            _output.WriteLine($"[gmtp-oom] phase ms: draft={stats.DraftMs:F0} verify={stats.VerifyMs:F0} plain={stats.PlainMs:F0} rollback={stats.RollbackMs:F0} | verifySteps={stats.VerifySteps} plainSteps={stats.PlainSteps} rollbacks={stats.RollbackSteps} acceptance={stats.AcceptanceRate:P0} drafted={stats.TokensDrafted}");
+        _output.WriteLine($"[gmtp-oom] produced {seq.OutputTokens.Count} tokens in {sw.Elapsed.TotalSeconds:F1}s = {seq.OutputTokens.Count / Math.Max(0.001, sw.Elapsed.TotalSeconds):F2} tok/s");
+        _output.WriteLine($"[gmtp-oom] text: \"{Trim(model.Tokenizer.Decode(seq.OutputTokens), 400)}\"");
+
+        if (failure != null)
+        {
+            _output.WriteLine($"[gmtp-oom] FAILED: {failure.GetType().Name}: {failure.Message}");
+            throw failure;
+        }
+        Xunit.Assert.True(seq.OutputTokens.Count >= Math.Min(maxNew, 64),
+            $"expected to generate the requested tokens without OOM, got {seq.OutputTokens.Count}");
     }
 
     private static int Argmax(float[] v)

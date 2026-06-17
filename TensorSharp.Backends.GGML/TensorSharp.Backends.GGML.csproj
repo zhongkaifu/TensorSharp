@@ -87,9 +87,15 @@
     <WriteLinesToFile File="$(_GgmlNativeConfigStamp)" Lines="$(_GgmlNativeConfigKey)" Overwrite="true"
                       Condition="'$(_GgmlNativeConfigPrev)' != '$(_GgmlNativeConfigKey)'" />
   </Target>
+  <!-- The native library is not embedded in the produced NuGet package (only the
+       managed assemblies are), so packaging does not need it built. Setting
+       TensorSharpSkipGgmlNative=true (or env TENSORSHARP_GGML_NATIVE_SKIP=true)
+       skips the native build — used by the publish pipeline so packages can be
+       packed on a runner without the CMake/CUDA toolchain. Mirrors the MLX
+       backend's TensorSharpSkipMlxNative switch. -->
   <Target Name="BuildGgmlNativeWindows" BeforeTargets="BeforeBuild"
           DependsOnTargets="_PrepareGgmlNativeIncremental"
-          Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != '' And '$(TensorSharpSkipGgmlNative)' != 'true' And '$(TENSORSHARP_GGML_NATIVE_SKIP)' != 'true'"
           Inputs="@(GgmlNativeSource);$(IntermediateOutputPath)$(GgmlNativeConfigStampName)"
           Outputs="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)">
     <Message Importance="high" Text="Building GGML native library (incremental); CMake recompiles only changed sources." />
@@ -99,7 +105,7 @@
   </Target>
   <Target Name="BuildGgmlNativeUnix" BeforeTargets="BeforeBuild"
           DependsOnTargets="_PrepareGgmlNativeIncremental"
-          Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != ''"
+          Condition="!$([MSBuild]::IsOSPlatform('Windows')) And '$(GgmlNativeBuildScript)' != '' And '$(TensorSharpSkipGgmlNative)' != 'true' And '$(TENSORSHARP_GGML_NATIVE_SKIP)' != 'true'"
           Inputs="@(GgmlNativeSource);$(IntermediateOutputPath)$(GgmlNativeConfigStampName)"
           Outputs="$(IntermediateOutputPath)$(GgmlNativeBuildStampName)">
     <Message Importance="high" Text="Building GGML native library (incremental); CMake recompiles only changed sources." />

@@ -2102,6 +2102,35 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
+        // Additive causal masks for soft_max_ext (the Metal backend has no
+        // DIAG_MASK_INF op; soft_max_ext is portable across Metal/CUDA and fuses
+        // mask+softmax). One mask per distinct attendLen, shared across layers.
+        // mask[qi][ki] = 0 if ki <= (attendLen-N)+qi else -inf — exactly the old
+        // ggml_diag_mask_inf(attendLen-N) semantics (SWA low-end is below the window).
+        struct VerifyMask { int attendLen; ggml_tensor* tensor; int dataIdx; };
+        std::vector<VerifyMask> mask_cache;
+        std::vector<std::vector<ggml_fp16_t>> mask_data_store;
+        auto get_causal_mask = [&](int attendLen) -> ggml_tensor* {
+            for (auto& m : mask_cache)
+                if (m.attendLen == attendLen) return m.tensor;
+            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, attendLen, N);
+            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(attendLen) * N);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            const int nPast = attendLen - N;
+            for (int qi = 0; qi < N; qi++)
+            {
+                const int threshold = nPast + qi;
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * attendLen];
+                for (int ki = 0; ki < attendLen; ki++)
+                    row[ki] = (ki > threshold) ? neg_inf : zero_val;
+            }
+            const int idx = static_cast<int>(mask_data_store.size());
+            mask_data_store.push_back(std::move(data));
+            mask_cache.push_back({attendLen, mt, idx});
+            return mt;
+        };
+
         ggml_tensor* hidden = current;
 
         for (int l = 0; l < num_layers; l++)
@@ -2199,8 +2228,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // beyond-window cases (== start_pos when attendLen==totalSeqLen).
             ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd, N, num_heads]
             ggml_tensor* kq = ggml_mul_mat(ctx, k_full, q_t);                          // [attendLen, N, num_heads]
-            kq = ggml_diag_mask_inf(ctx, kq, attendLen - N);
-            kq = ggml_soft_max(ctx, kq);
+            // Keep the K*Q scores in F32: at head_dim 256 (SWA) / 512 (global) the
+            // Metal kernel's default F16 accumulator overflows for multi-token Q and
+            // silently corrupts the logits (same fix the prefill path applies). CUDA
+            // accumulates in F32 by default so this was invisible there.
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(ctx, kq, get_causal_mask(attendLen), 1.0f, 0.0f);
             ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [kvLen, hd, kvHeads]
             ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                              // [hd, N, num_heads]
             ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd, num_heads, N]
@@ -2350,6 +2383,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             ggml_backend_tensor_set(freq_factors_t, rope_freq_factors, 0,
                 static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
 
+        for (auto& m : mask_cache)
+            ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
+                mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
+
         if (ple_input != nullptr)
             ggml_backend_tensor_set(ple_input, ple_data, 0,
                 static_cast<std::size_t>(N) * num_layers * ple_dim * sizeof(float));
@@ -2363,6 +2400,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
 
+        // If this call allocated a per-call backend buffer (the reuse-buffer
+        // fallback), drain the queued async download before BufferHandle frees
+        // it at scope exit — otherwise the in-flight blit reads a freed buffer
+        // and Metal keeps it resident. No-op (and zero cost) on the common path
+        // where the persistent reuse buffer is used (buffer.value == nullptr).
+        if (buffer.value != nullptr) host_read_barrier();
         clear_last_error();
         return 1;
     }
@@ -3505,8 +3548,18 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         if (freq_factors_t != nullptr)
             bind_or_mark(freq_factors_t, freq_data, static_cast<std::size_t>(freq_len) * sizeof(float), true);
 
+        // Peak-packed gallocr (shared with the MoE verify), NOT the linear
+        // alloc_ctx_tensors_reuse bump allocator. The whole-model decode graph is
+        // ~4000 tensors across all layers; the bump allocator's footprint is the
+        // SUM of every intermediate (~870 MB on the 26B-A4B), which — on top of the
+        // ~16.8 GB resident weights/KV (92% of Metal's ~18 GB working set) and the
+        // verify's own gallocr — exhausts the budget and OOMs. gallocr packs by
+        // tensor LIFETIME (peak, ~10-20x smaller) and the decode reuses the SAME
+        // persistent buffer the verify grew, so the two together cost one peak, not
+        // the sum of both. Falls back to the per-call ctx allocation if gallocr is
+        // unavailable (non-Metal / disabled).
         BufferHandle buffer(nullptr);
-        if (!alloc_ctx_tensors_reuse(ctx))
+        if (!alloc_graph_reuse_gallocr(graph))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (buffer.value == nullptr)
@@ -3535,6 +3588,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         }
 
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(H) * sizeof(float));
+        // If we used the per-call fallback buffer (not the persistent gallocr),
+        // drain the queued async download before BufferHandle frees it. No-op on
+        // the common gallocr path (buffer.value == nullptr).
+        if (buffer.value != nullptr) host_read_barrier();
         clear_last_error();
         return 1;
     }
@@ -3713,6 +3770,41 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             t.k_cpy = nullptr; t.v_cpy = nullptr; t.k_cpy2 = nullptr; t.v_cpy2 = nullptr;
         }
 
+        // Causal masks for ggml_flash_attn_ext. Attention here mirrors the MoE
+        // decode and the prefill paths (flash_attn_ext, not a manual mul_mat +
+        // soft_max chain): the manual chain is numerically unreliable for
+        // multi-token Q at head_dim 256/512 on Metal (silent F16 accumulator
+        // overflow plus barely-exercised soft_max/mul_mat kernels), while
+        // flash_attn_ext is the proven path on Metal AND CUDA and is faster.
+        // One mask per distinct (kvLen, validLen) — at most two: a SWA-windowed
+        // local mask and a (flash-padded) global mask — shared across layers.
+        // mask[qi][ki] = 0 iff ki < validLen (real, not padding) AND
+        // ki <= (validLen-N)+qi (causal). The SWA low-end is below the window
+        // view so it needs no extra windowing (same as the old diag_mask_inf).
+        struct VerifyMask { int kvLen; int validLen; ggml_tensor* tensor; int dataIdx; };
+        std::vector<VerifyMask> mask_cache;
+        std::vector<std::vector<ggml_fp16_t>> mask_data_store;
+        auto get_causal_mask = [&](int kvLen, int validLen) -> ggml_tensor* {
+            for (auto& m : mask_cache)
+                if (m.kvLen == kvLen && m.validLen == validLen) return m.tensor;
+            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvLen, N);
+            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * N);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            const int nPast = validLen - N;
+            for (int qi = 0; qi < N; qi++)
+            {
+                const int threshold = nPast + qi;
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
+                for (int ki = 0; ki < kvLen; ki++)
+                    row[ki] = (ki < validLen && ki <= threshold) ? zero_val : neg_inf;
+            }
+            const int idx = static_cast<int>(mask_data_store.size());
+            mask_data_store.push_back(std::move(data));
+            mask_cache.push_back({kvLen, validLen, mt, idx});
+            return mt;
+        };
+
         ggml_tensor* hidden = current;
         for (int l = 0; l < num_layers; l++)
         {
@@ -3734,7 +3826,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             const int rope_dims = d.rope_n_dims;
             ggml_tensor* rope_ff = isLocal ? nullptr : freq_factors_t;
 
-            // ===== Attention (multi-token, manual masked) =====
+            // ===== Attention (multi-token, flash) =====
             ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), t.attn_norm_w);  // [H, N]
 
             ggml_tensor* q_lin; ggml_tensor* k_lin; ggml_tensor* v_lin;
@@ -3782,23 +3874,35 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
 
             const int attendLen = isLocal ? std::min(totalSeqLen, cacheSize) : totalSeqLen;
             const int activeStart = isLocal ? ((totalSeqLen - attendLen) % cacheSize) : 0;
-            ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attendLen, kvType);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attendLen, kvType);
+            // Flash attention reads a (possibly padded) KV window; the padding slots
+            // beyond attendLen are masked out. Padding only ever applies to global
+            // (linear, activeStart==0) layers — local SWA layers (head_dim 256) need
+            // no padding, so the wrap-around window is never combined with padding.
+            const int attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
+            ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+            ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Gemma4 MoE model verify: failed to build KV cache views.");
                 return 0;
             }
 
-            // Manual masked attention (Gemma scale = 1.0). n_past = attendLen-N.
-            ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd, N, nH]
-            ggml_tensor* kq = ggml_mul_mat(ctx, k_full, q_t);                          // [attendLen, N, nH]
-            kq = ggml_diag_mask_inf(ctx, kq, attendLen - N);
-            kq = ggml_soft_max(ctx, kq);
-            ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [attendLen, hd, kvH]
-            ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                              // [hd, N, nH]
-            ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd, nH, N]
-            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn, qDim, N);
+            // Flash attention (Gemma scale = 1.0), matching the MoE decode + prefill.
+            ggml_tensor* q_t = ggml_permute(ctx, q_rope, 0, 2, 1, 3);                   // [hd, N, nH]
+            ggml_tensor* fa_mask = get_causal_mask(attnKvLen, attendLen);
+            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_t, k_full, v_full, fa_mask, 1.0f, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+            if (!backend_supports_op(attn_out))
+            {
+                // No supported flash kernel for this shape (e.g. an exotic head_dim):
+                // fall back to the per-op verify rather than the numerically-fragile
+                // manual chain.
+                set_last_error("Gemma4 MoE model verify: flash attention unsupported for this shape; use per-op path.");
+                return 0;
+            }
+            // flash_attn_ext returns [hd, nH, N, 1] — already laid out so each column
+            // holds all heads contiguously, exactly what the O projection wants.
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, N);
 
             ggml_tensor* o_out = ggml_mul_mat(ctx, t.o_w, attn_flat);                   // [H, N]
             ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), t.post_attn_norm_w);
@@ -3961,10 +4065,16 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         // resident) that exhausts VRAM and starves the draft/weight caches (the
         // draft step then thrashes). gallocr's peak is ~10-20x smaller. The
         // pre-bound weights/KV caches above already own buffers and are skipped.
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc, graph))
+        // Persistent gallocr (reused across verify calls, grown on demand) instead
+        // of a fresh ggml_gallocr_new()/_free() each step. The MoE verify graph's
+        // intermediate buffer is ~400 MB; allocating and freeing that on every
+        // verify churned Metal's shared (vm_allocate) device memory and fragmented
+        // it over hundreds of steps until a contiguous allocation failed
+        // (kIOGPUCommandBufferCallbackErrorOutOfMemory). Reusing one gallocr keeps
+        // the buffer resident and stable, which removes the fragmentation source
+        // (and the per-call ~20 ms allocation).
+        if (!alloc_graph_reuse_gallocr(graph))
         {
-            if (galloc != nullptr) ggml_gallocr_free(galloc);
             set_last_error("Gemma4 MoE model verify: graph allocation failed.");
             return 0;
         }
@@ -3983,16 +4093,24 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, freq_data, 0, static_cast<std::size_t>(freq_len) * sizeof(float));
 
+        for (auto& m : mask_cache)
+            ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
+                mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
+
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
-            ggml_gallocr_free(galloc);
             set_last_error("Gemma4 MoE model verify: graph execution failed.");
             return 0;
         }
 
+        // The persistent gallocr buffer is NOT freed here — it is reused by the
+        // next verify. The finalize below queues an async device->host blit of
+        // hidden_out (which lives in that persistent buffer); it is drained either
+        // by the C# caller's first logits read (host_read_barrier in
+        // GetFloatPointer) or by the next verify's leading host_read_barrier
+        // before it reuses the buffer, so there is no read-after-write hazard.
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(H) * N * sizeof(float));
-        ggml_gallocr_free(galloc);
         clear_last_error();
         return 1;
     }

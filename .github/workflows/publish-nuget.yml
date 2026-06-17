@@ -1,0 +1,117 @@
+name: Publish NuGet
+
+# Packs the public TensorSharp packages and pushes them to NuGet.org and the
+# repository's GitHub Packages feed.
+#
+# Trigger: push a version tag like `v2.8.6`. The tag (with the leading `v`
+# stripped) becomes the package version, overriding the default in
+# Directory.Build.props. `workflow_dispatch` is also available for manual /
+# dry-run publishes.
+#
+# Packing is managed-only: the native libraries (GGML/CUDA/MLX) are not embedded
+# in the .nupkg, so this job skips the native build (-SkipNativeBuild) and runs
+# on a stock GitHub-hosted runner with no GPU/CMake toolchain.
+#
+# Secrets / configuration required:
+#   - NUGET_API_KEY  (repo or org secret) — API key for nuget.org. If absent,
+#                    the nuget.org push is skipped with a warning and only the
+#                    GitHub Packages push runs.
+#   - GITHUB_TOKEN   (provided automatically) — used for the GitHub Packages
+#                    push; needs `packages: write` (granted below).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish (e.g. 2.8.6). Required when not run from a tag."
+        required: false
+        default: ""
+      dry_run:
+        description: "Pack and verify only; do not push to any feed."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Never cancel an in-flight publish — a half-pushed release is worse than a queue.
+  group: publish-nuget-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Pack & publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Native libraries are not packed, so the ggml sources are not needed.
+          submodules: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Resolve package version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::No version resolved. Push a tag like v2.8.6 or supply the 'version' input." >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved package version: $V"
+
+      - name: Pack & verify packages
+        shell: pwsh
+        run: >-
+          ./eng/verify-packages.ps1
+          -PackageVersion '${{ steps.ver.outputs.version }}'
+          -SkipNativeBuild
+          -OutputDirectory artifacts/packages
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages-${{ steps.ver.outputs.version }}
+          path: artifacts/packages/*.nupkg
+          retention-days: 30
+
+      - name: Push to GitHub Packages
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
+
+      - name: Push to NuGet.org
+        if: ${{ !inputs.dry_run }}
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::warning::NUGET_API_KEY secret is not set; skipping the nuget.org push."
+            exit 0
+          fi
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --source "https://api.nuget.org/v3/index.json" \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate

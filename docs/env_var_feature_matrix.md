@@ -103,6 +103,27 @@ These variables are real runtime knobs, but they are not registered in
 | `DIFFUSION_PIN_STREAMED` | DiffusionGemma on ggml_cuda | Re-home streamed (non-resident) weights into page-locked copies for DMA-speed uploads (costs RAM) | OFF | not registered | no |
 | `DIFFUSION_PROFILE` / `DIFFUSION_STEPTIME` / `DIFFUSION_FUSED_DEBUG` | DiffusionGemma | Development timing and fused-kernel debug diagnostics | OFF | not registered | no |
 
+## Out-of-Matrix MTP / Speculative-Decoding Knobs
+
+These gate the optional MTP / NextN speculative decode path in `TensorSharp.Server`
+(Qwen 3.6 embedded NextN block; Gemma 4 separate `gemma4-assistant` draft GGUF).
+Speculation engages only for solo (non-concurrent) sequences and only where it is
+profitable (ggml backends and the pure-C# `cuda` backend). They are not registered
+in `EnvVarMatrix.All` and are not swept by the default TestMatrix config — the
+matrix feature catalog has no speculative-decode feature today, so use explicit
+server runs to exercise these. `TS_MTP_*` are also settable via the `--mtp-*`
+server CLI flags.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_MTP_SPEC` | Qwen 3.6, Gemma 4 (server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
+| `TS_MTP_DRAFT` | Qwen 3.6, Gemma 4 (server) | Max tokens drafted per speculative step | `8` | not registered | no |
+| `TS_MTP_PMIN` | Qwen 3.6, Gemma 4 (server) | Min draft-head confidence to keep a token | `0.75` | not registered | no |
+| `TS_MTP_DRAFT_MODEL` | Gemma 4 (server) | Path to the separate `gemma4-assistant` draft GGUF | none | not registered | no |
+| `TS_GMTP_NO_FUSED` | Gemma 4 on ggml backends | Disable fused multi-token-verify / draft-step kernels (per-op fallback) | OFF | not registered | no |
+| `TS_GMTP_NO_FAST_ROLLBACK` | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
+| `TS_GMTP_BATCHED_TRUNK` | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
+
 ## Feature Coverage
 
 The matrix feature catalog lives in

@@ -18,6 +18,7 @@ compatibility shim for queue-status/event shapes.
 | Batched execution | Models that implement `IBatchedPagedModel.ForwardBatch` pack all scheduled sequences into one model call with explicit `positions`, `slotMapping`, `queryStartLoc`, and per-sequence block tables. |
 | Fallback execution | Models or feature combinations that cannot run batched throw `NotSupportedException`; `BatchExecutor` falls back to the isolated per-sequence KV-swap path inside the same engine. |
 | Native attention | `TSGgml_PagedAttentionForward` gathers paged K/V in C++ and dispatches `ggml_flash_attn_ext`; GPT OSS uses `TSGgml_PagedAttentionForwardWithSinks`. |
+| Speculative decoding | Optional MTP / NextN draft heads accelerate solo (non-concurrent) sequences. `BatchExecutor` drives the shared `MtpSpeculativeExecution` draft / verify / rollback core for models that implement `IMtpBatchedSpeculativeModel` (Qwen 3.6 embedded NextN; Gemma 4 separate `gemma4-assistant` draft GGUF). Off by default; `--mtp-spec`. See [Speculative decoding (MTP / NextN)](#speculative-decoding-mtp--nextn). |
 | Queue API | `InferenceQueue` is a no-op shim. `/api/queue/status` and queue-position event shapes are retained for clients that expect the fields, not because requests are serialized there. |
 | Diffusion models | DiffusionGemma does not enter this autoregressive `ForwardBatch` contract. CLI generation uses `DiffusionGemmaSampler`; the Web UI uses `DiffusionBatchScheduler` to batch denoising work at block boundaries. |
 
@@ -134,14 +135,47 @@ full blocks, and moves to the next scheduled sequence. This keeps older or
 feature-limited paths correct while they are being ported to true batched
 compute.
 
+### Speculative decoding (MTP / NextN)
+
+When `--mtp-spec` (`TS_MTP_SPEC=1`) is set, `BatchExecutor` runs an optional
+multi-token-prediction speculative path for **solo (non-concurrent)** sequences
+on models that implement `IMtpBatchedSpeculativeModel`. The flow per step:
+
+1. **Draft.** The model's draft head proposes up to `TS_MTP_DRAFT` (default `8`)
+   future tokens, stopping at the first token whose draft confidence falls below
+   `TS_MTP_PMIN` (default `0.75`). The request's own sampler — temperature,
+   top-k/p, and repetition/presence/frequency penalties — drives the drafting so
+   the speculation stays aligned with what standard decode would have produced.
+2. **Verify.** The trunk verifies all drafted tokens in a single batched forward
+   and the same sampler accepts the longest matching prefix. Because verification
+   re-derives every committed token, the output is **identical** to standard
+   decode; speculation only changes how many forward passes it takes.
+3. **Rollback.** On partial acceptance, KV (and any recurrent state) past the
+   accepted prefix is rolled back before the next step.
+
+Two draft-head shapes share the `MtpSpeculativeExecution` core:
+
+| Model | Draft head | State on rejection |
+|---|---|---|
+| Qwen 3.6 | Embedded NextN block in the trunk GGUF (`{arch}.nextn_predict_layers`); no extra file. `--mtp-draft-model` is ignored. | GatedDeltaNet recurrent-state snapshot/restore (device-side on CUDA). |
+| Gemma 4 | Separate EAGLE-style `gemma4-assistant` GGUF via `--mtp-draft-model`; draft layers attend the **target's** last local / global KV (no draft K/V of its own). | Attention-KV position rewind only — the drafter is stateless given `(token, h)`. |
+
+Speculation engages only where it is profitable (`MtpSpeculationProfitable`):
+ggml backends (fused multi-token-verify + draft-step kernels) and the pure-C#
+`cuda` backend (GPU-resident per-op verify/draft). On CPU / GGML CPU / MLX the
+verify can't keep up, so the engine serves standard decode. Concurrent batches
+never speculate — when more than one sequence is running, every sequence uses the
+normal batched/fallback step. A mismatched or incomplete Gemma 4 draft GGUF
+fails fast at server startup (`MtpStartupValidation`).
+
 ## Model Status
 
 | Model family | Batched / paged status | Opt-out / sub-toggle |
 |---|---|---|
 | Mistral 3 | Default `ForwardBatch` path. Uses paged K/V, YaRN-aware positions, native paged attention, and vision embedding injection after prompt preparation. Validated on Ministral-3-14B; long-context native paged attention is about 21% faster than the legacy per-sequence GGML path. | `TS_PAGED_ATTN_KERNEL` selects `native`, `tensor`, or `managed`. |
-| Gemma 4 | Default batched path for dense text workloads, including per-layer SWA/global attention, variable head dims, PLE, and KV-donor layer aliasing. Current fallback cases include pending multimodal embeddings, MoE layers, and block-quantized KV cache. | `TS_GEMMA4_BATCHED=0` forces per-sequence fallback. |
+| Gemma 4 | Default batched path for dense text workloads, including per-layer SWA/global attention, variable head dims, PLE, and KV-donor layer aliasing. Current fallback cases include pending multimodal embeddings, MoE layers, and block-quantized KV cache. Optional MTP speculative decode via a separate `gemma4-assistant` draft GGUF. | `TS_GEMMA4_BATCHED=0` forces per-sequence fallback. `--mtp-spec` + `--mtp-draft-model` enables speculation; `TS_GMTP_*` are draft-path A/B switches. |
 | Qwen 3 | Reference attention-only batched port with paged K/V, per-token RoPE positions, and last-token gather. Optional tests self-validate when a base Qwen 3 GGUF is available. | No model-specific opt-out; global `TS_SCHED_DISABLE_BATCHED=1` forces fallback. |
-| Qwen 3.5 / 3.6 family | Default batched path. Handles full-attention layers, GatedDeltaNet recurrent layers via per-slot state pools, MoE variants, vision injection, and multimodal RoPE tables. | `TS_QWEN35_BATCHED=0`; `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables the native batched GDN kernel. |
+| Qwen 3.5 / 3.6 family | Default batched path. Handles full-attention layers, GatedDeltaNet recurrent layers via per-slot state pools, MoE variants, vision injection, and multimodal RoPE tables. Qwen 3.6 additionally supports MTP speculative decode via its embedded NextN block (GDN recurrent-state snapshot/rollback). | `TS_QWEN35_BATCHED=0`; `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables the native batched GDN kernel; `--mtp-spec` enables speculation on Qwen 3.6. |
 | GPT OSS | Default batched path. Handles Q/K/V/O bias, YaRN RoPE, sliding-window layers, attention sinks, MXFP4 MoE experts, and native sinks attention. Greedy correctness has been validated against the legacy path; performance remains limited by per-layer graph construction. | `TS_GPTOSS_BATCHED=0`; `TS_GPTOSS_PAGED_ATTN_MANAGED=1`. |
 | Nemotron-H | Default batched path. Attention layers use paged K/V; Mamba2 layers use per-slot conv/SSM state pools; MoE layers use batched expert kernels; prepared image/audio embeddings can be injected into the batched hidden state. | `TS_NEMOTRON_BATCHED=0`; `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step. |
 | Gemma 3 | No true `ForwardBatch` port yet; runs through the engine's per-sequence fallback. | Global fallback only. |
@@ -154,6 +188,7 @@ compute.
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests`, optional `Qwen3BatchedForwardTests` |
+| MTP speculative decoding | `MtpSpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36MtpTests` (`TS_MTP_E2E=1`) and `Gemma4MtpTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |
 | End-to-end engine behavior | `EngineParallelInferenceTests` with opt-in real GGUFs via `TS_TEST_MODEL_DIR` |
@@ -173,6 +208,11 @@ compute.
 | `TS_SCHED_DECODE_QUANTUM` | block size | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_BATCHED_N1_FAST_PATH` | `0` | Routes eligible single-sequence steps through the batched path for A/B testing. |
 | `TS_KV_PAGED_QUANT_BITS` | `0` | Optional TurboQuant codec bits for paged KV blocks (`4` or `8`); recurrent-state models may fall back to passthrough. |
+| `TS_MTP_SPEC` | `0` | `1` enables MTP / NextN speculative decoding for solo sequences (CLI `--mtp-spec`). |
+| `TS_MTP_DRAFT` | `8` | Max tokens drafted per speculative step (CLI `--mtp-draft`). |
+| `TS_MTP_PMIN` | `0.75` | Min draft-head confidence to keep a drafted token (CLI `--mtp-pmin`). |
+| `TS_MTP_DRAFT_MODEL` | none | Path to the separate Gemma 4 `gemma4-assistant` draft GGUF (CLI `--mtp-draft-model`); ignored by Qwen 3.6. |
+| `TS_GMTP_NO_FUSED` / `TS_GMTP_NO_FAST_ROLLBACK` / `TS_GMTP_BATCHED_TRUNK` | off | Gemma 4 draft-path A/B switches (disable fused verify/draft kernels; restore kept-prefix rollback; run the batched trunk instead of the linear trunk). |
 | `DIFFUSION_STEPS` | `48` | Web UI DiffusionGemma denoising steps per block. This is separate from autoregressive scheduler step budgets. |
 | `DIFFUSION_MAX_BATCH` | `2` | Maximum active DiffusionGemma Web UI requests in the diffusion scheduler. |
 | `DIFFUSION_BATCHED_FORWARD` | `0` | Enables true batched canvas decode for active DiffusionGemma canvases; the default favors the fused single-canvas path. |

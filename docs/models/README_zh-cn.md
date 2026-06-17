@@ -51,6 +51,8 @@
 
 上表所列的自回归架构都会经过共享的 `InferenceEngine` + `ContinuousBatchScheduler` + `BatchExecutor` 栈，详情见 [`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)。实现了 `IBatchedPagedModel.ForwardBatch` 的模型会在每个调度步骤中执行一次批处理前向（使用基于 `slotMapping` 的 K/V 写入与共享分页缓冲，并通过原生分页内核做按序列注意力）；其余模型则在同一引擎内沿用按序列 KV 交换。DiffusionGemma 不支持自回归 `Forward()`，因此改用 `DiffusionGemmaSampler` 与服务端 `DiffusionBatchScheduler`。各模型的启用方式见上方实现矩阵以及项目根 README。
 
+对于自带多 token 预测草稿头的架构——Qwen 3.6（内嵌 NextN 块）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）——单序列（无并发）请求还可以通过同一引擎运行无损的 MTP 投机解码（`--mtp-spec`）。共享的起草 / 验证 / 回滚核心是 `MtpSpeculativeExecution`；各架构具体机制见 Qwen 3.5/3.6（§12）与 Gemma 4（§12）卡片。
+
 ## 架构对比
 
 | 特性 | Gemma 3 | Gemma 4 | DiffusionGemma | Qwen 3 | Qwen 3.5 / 3.6 family | GPT OSS | Nemotron-H | Mistral 3 |
@@ -76,6 +78,7 @@
 | 视频 | 否 | 是 | 否 | 否 | 否 | 否 | 否 | 否 |
 | 思维链 | 否 | 是 | 否 | 是 | 是 | 是（始终启用） | 是 | 否 |
 | 工具调用 | 否 | 是 | 否 | 是 | 是 | 是 | 是 | 否 |
+| MTP / NextN 投机解码 | 否 | 是（独立 `gemma4-assistant` 草稿 GGUF） | 否 | 否 | Qwen 3.6 支持（内嵌 NextN 块） | 否 | 否 | 否 |
 | 融合 QKV | 否 | 是 | 是 | 是 | 混合（attention 层拆开，递归层融合 5 路） | 是 | 是 | 是 |
 | 融合单调用 decode | 否 | 是（Gemma4ModelDecode） | 是（DiffusionModelDecode + lm-head tail） | 是（TransformerModelDecode，原生循环） | per-layer 融合（Qwen35AttentionLayerDecode、FusedOutProjFFN、FusedOutProjNormRouter） | per-layer | per-layer / 批量 MoE | 否 |
 | 融合单调用 prefill | 否 | 是（Gemma4LayerPrefill，密集层） | prompt-KV prefill cache | 否 | 是（FusedPrefillAttention、FusedOutProjFFN、MoE prefill） | 是（MoE prefill via mul_mat_id） | 否 | 否 |

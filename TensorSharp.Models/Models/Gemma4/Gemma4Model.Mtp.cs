@@ -323,9 +323,23 @@ namespace TensorSharp.Models
             // plain step (seqLen==1, the MoE decode kernel) and the verify batch
             // (seqLen>1, the MoE verify kernel). Without the MoE branch the verify
             // (and even plain steps) fell to the per-op path, making spec net-negative.
+            // The fused MoE verify recomputes the top-k expert router in-graph. On
+            // ggml-metal, flash_attn_ext only uses its precise F32-accumulating "vec"
+            // kernel for query counts < 20; a >= 20-token batch falls to the tiled
+            // kernel whose lower precision tips near-tie expert selections, which
+            // then diverges from the per-op/decode path and breaks speculative
+            // acceptance. A real verify batch is small (<= maxDraft+1); only the
+            // one-shot prompt prefill is large, so route >= 20-token MoE batches to
+            // the per-op path (correct, and prefill is not on the decode hot path).
+            // Chunking the prefill through the fused path does NOT help: its
+            // cross-token attention would round-trip the fresh K/V through the F16
+            // cache, and for an all-fresh prefill that precision loss alone flips
+            // the router. CUDA accumulates in F32 throughout, so this is a no-op there.
+            const int kFusedMoeVerifyMaxBatch = 20;
             bool fusedDenseOk = fusedCommon && _canUseFusedFullModelDecode;
             bool fusedMoeOk = fusedCommon && !_canUseFusedFullModelDecode && _numExperts > 0
-                && _pleDim == 0 && _kvDonorMap.Count == 0;
+                && _pleDim == 0 && _kvDonorMap.Count == 0
+                && (seqLen == 1 || seqLen < kFusedMoeVerifyMaxBatch);
             bool usedFused = false;
             if (fusedDenseOk)
             {

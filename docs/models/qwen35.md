@@ -14,6 +14,7 @@
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
 | Batched / paged forward | **Default ON** — set `TS_QWEN35_BATCHED=0` (or `--no-continuous-batching`) to force the legacy per-sequence KV-swap path for A/B comparison. Includes a per-slot GatedDeltaNet recurrent-state pool and optional native batched GDN kernel (`TS_QWEN35_BATCHED_GDN_NATIVE=1`). See §11. |
+| MTP speculative decoding | Qwen 3.6 — NextN draft block embedded in the trunk GGUF (no separate file); engage with `--mtp-spec`. GDN recurrent-state snapshot/rollback on partial accept. Profitable on ggml backends and the pure-C# `cuda` backend. See §12. |
 | Output parser | `Qwen35OutputParser` (inherits `Qwen3OutputParser`) |
 
 ## 1. Origin and intent
@@ -669,7 +670,58 @@ before the per-layer loop, exactly as in the legacy forward.
 - **~1.83× tps at n=3** on Qwen 3.6-27B (Apple M4 Pro, GgmlMetal,
   legacy-vs-batched in-process toggle).
 
-## 12. Output parser and chat template
+## 12. MTP / NextN speculative decoding (Qwen 3.6)
+
+Qwen 3.6 GGUFs ship a **NextN / multi-token-prediction (MTP) draft block** that
+`TensorSharp.Server` uses for lossless speculative decoding on solo (non-concurrent)
+sequences. Source:
+[`Qwen35Model.Mtp.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Mtp.cs),
+driven through the shared
+[`MtpSpeculativeExecution`](../../TensorSharp.Runtime/Scheduling/MtpSpeculativeExecution.cs)
+draft / verify / rollback core. Unlike Gemma 4, no separate draft GGUF is needed —
+the block is embedded in the trunk file, so `--mtp-draft-model` is ignored.
+
+### 12.1 Embedded NextN block
+
+A Qwen 3.6 GGUF carries one extra decoder block past the main stack (`blk.N`,
+where `N` == trunk layer count), flagged by `{arch}.nextn_predict_layers`. It is a
+standard full-attention Qwen 3.5 decoder block (dense FFN on 27B, MoE FFN on
+35B-A3B) plus four NextN-specific tensors:
+
+```
+nextn.eh_proj          [2*hidden, hidden]  input projection over concat(embedding, hidden)
+nextn.enorm            [hidden]            RMS norm over the token embedding
+nextn.hnorm            [hidden]            RMS norm over the trunk hidden state
+nextn.shared_head_norm [hidden]            final norm before the LM head
+```
+
+(`nextn.embed_tokens` / `nextn.shared_head_head` are optional and absent in the
+stock GGUFs; the code falls back to the trunk token embedding / LM head.) The MTP
+step consumes (token `x_p`, trunk hidden `h_{p-1}`) at position `p` and produces
+logits predicting `x_{p+1}` plus its own hidden state to chain further draft steps
+— mirroring llama.cpp's `graph_mtp` and vLLM's `Qwen3_5MultiTokenPredictor`.
+
+### 12.2 Recurrent-state rollback
+
+Because the Qwen 3.6 trunk mixes GatedDeltaNet recurrent layers with full-attention
+layers, a partially-rejected verify batch cannot simply truncate the KV cache: the
+GDN recurrent state can't be rewound in place. The MTP path snapshots the GDN state
+(`_mtpGdnSnapshot`) before each verify batch and restores it on partial acceptance.
+On the CUDA backend the snapshot is taken device-side to avoid host round-trips.
+
+### 12.3 Profitability and tuning
+
+Speculation is off by default; enable with `--mtp-spec` (env `TS_MTP_SPEC=1`). It
+engages where it pays off — ggml backends and the pure-C# `cuda` backend — and
+otherwise the engine serves standard decode. `--mtp-draft` (default `8`) bounds the
+draft window and `--mtp-pmin` (default `0.75`) is the minimum draft confidence to
+keep a token. On `ggml_cuda`, the GDN chunked-prefill kernel also speeds the
+speculative verify: measured on Qwen3.6-27B IQ2_XXS it cut MTP speculative-verify
+decode from 217 to 174 ms/token (see §8, `GDN_CHUNK_PREFILL_MIN_SEQ_LEN`). See the
+[README MTP section](../../README.md#mtp--nextn-speculative-decoding) for the full
+flag list.
+
+## 13. Output parser and chat template
 
 - `Qwen35OutputParser` inherits `Qwen3OutputParser`, so the wire format is
   identical: `<think> ... </think>` for chain-of-thought reasoning, and
@@ -681,7 +733,7 @@ before the per-layer loop, exactly as in the legacy forward.
   tokens for the corresponding image, and the multimodal injector then writes
   the encoded embeddings into those positions before `Forward()`.
 
-## 13. Optimization opportunities
+## 14. Optimization opportunities
 
 - **Native GDN decode (legacy path)** — the legacy per-seq GDN decode
   still runs in managed C# (with pre-allocated buffers and

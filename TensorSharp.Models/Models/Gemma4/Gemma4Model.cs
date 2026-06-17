@@ -649,6 +649,16 @@ namespace TensorSharp.Models
                     Ops.Copy(dstV, srcV);
                 }
 
+                // Evict the old tensors' device-copy cache entries (Metal binds
+                // the KV cache USAGE_COMPUTE -> a device-local MTLBuffer keyed by
+                // the host pointer) BEFORE disposing, while the host pointer is
+                // still the valid cache key. The new tensors live at a NEW host
+                // address, so without this the old device copies are orphaned in
+                // g_host_buffer_cache forever (a grow-on-demand GPU leak). Mirrors
+                // TruncateKVCache; the preceding EnsureKvCacheHostSynchronized has
+                // already drained any in-flight writes so the eager free is safe.
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
                 _kvCacheK[l].Dispose();
                 _kvCacheV[l].Dispose();
                 _kvCacheK[l] = newK;
