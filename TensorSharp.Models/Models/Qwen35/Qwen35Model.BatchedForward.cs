@@ -463,13 +463,30 @@ namespace TensorSharp.Models
                 // GGUFs (35B-A3B); dense SwiGLU otherwise. Both are per-token
                 // (no cross-token state), so calling with numTokens just works
                 // for the batched layout.
-                Tensor ffnNormed = RMSNormOpQ35(residual, _postAttnNormW[layer]);
-                Tensor ffnOut = (_isMoeLayer != null && _isMoeLayer[layer])
-                    ? MoEForward(ffnNormed, layer, numTokens)
-                    : FFNCached(ffnNormed, layer, numTokens);
-                ffnNormed.Dispose();
-                Ops.Add(residual, residual, ffnOut);
-                ffnOut.Dispose();
+                if (_isMoeLayer != null && _isMoeLayer[layer])
+                {
+                    Tensor ffnNormed = RMSNormOpQ35(residual, _postAttnNormW[layer]);
+                    Tensor moeOut = MoEForward(ffnNormed, layer, numTokens);
+                    ffnNormed.Dispose();
+                    Ops.Add(residual, residual, moeOut);
+                    moeOut.Dispose();
+                }
+                else
+                {
+                    // Dense SwiGLU: fuse post-attn norm + gate/up + SiLU·mul +
+                    // down + residual into one GGML graph via FFNCachedFused so
+                    // the large [tokens, 2·intermediate] activation stays on the
+                    // device instead of round-tripping host<->backend per op (the
+                    // dominant batched-prefill cost on GGML CUDA). Returns null
+                    // when the residual add was fused in; otherwise add the
+                    // returned down output.
+                    Tensor fusedDown = FFNCachedFused(residual, _postAttnNormW[layer], layer, numTokens);
+                    if (fusedDown != null)
+                    {
+                        Ops.Add(residual, residual, fusedDown);
+                        fusedDown.Dispose();
+                    }
+                }
 
                 hiddenStates = residual;
             }

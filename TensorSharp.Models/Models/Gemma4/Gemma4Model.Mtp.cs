@@ -294,6 +294,26 @@ namespace TensorSharp.Models
             int hidden = Config.HiddenSize;
             EnsureCacheCapacity(startPos + seqLen);
 
+            // PROMPT PREFILL (not a decode verify): a large multi-token batch is a
+            // prompt prefill, never a speculative verify window (those are <= K+1,
+            // with allLogitsRows=true). Running a long prefill as ONE batch through
+            // the fused verify kernel (NativeGemma4ModelVerify) materializes a
+            // [totalSeqLen, seqLen, numHeads] score tensor for every global
+            // (full-attention) layer; its scratch allocator sums those across
+            // layers, so a long prompt balloons to tens of GB and CUDA-OOMs (e.g.
+            // "allocating 23104.00 MiB ... out of memory"). This only bites MTP:
+            // the normal prefill goes through ForwardRefill, which already chunks
+            // and uses flash attention. Mirror that here — process the prefill in
+            // bounded chunks through the per-op flash-attention path (no score
+            // materialization), capturing the post-output-norm hidden state of
+            // every row. Decode-time verifies (allLogitsRows=true) and short
+            // batches keep the fast fused verify kernel below.
+            if (!allLogitsRows && seqLen > kSpecPrefillChunkThreshold)
+            {
+                SpecForwardPrefill(tokens, startPos, hAllOut, logitsOut, hidden);
+                return;
+            }
+
             Tensor h = Embedding(tokens);
             ScaleEmbedding(h);
 
@@ -455,6 +475,60 @@ namespace TensorSharp.Models
 
             _cacheSeqLen += seqLen;
             _forwardCount++;
+        }
+
+        // A spec trunk forward with more than this many tokens and no per-row logit
+        // request is a PROMPT PREFILL, not a speculative verify/rollback batch (those
+        // are bounded by the draft window, default 8). Comfortably above any sane
+        // draft window yet far below a prefill chunk (1024), so verify/rollback keep
+        // the fused kernel while real prefills take the chunked flash path.
+        private const int kSpecPrefillChunkThreshold = 32;
+
+        /// <summary>
+        /// Speculative-trunk prefill of a long prompt. Reuses the model's fast,
+        /// fully-tested prefill machinery — <see cref="PrefillWithoutLogits"/>
+        /// (chunked, fused-layer-graph + flash attention; the SAME path
+        /// <see cref="ForwardRefill"/> uses and the one that runs with MTP disabled)
+        /// — for all but the last token, then runs the last token through the fused
+        /// single-token decode to capture its post-output-norm hidden state (h_nextn)
+        /// and logits. This avoids the fused verify kernel's
+        /// O(seqLen × totalSeqLen) materialized global-attention scratch, which
+        /// CUDA-OOMs on long prompts, while keeping prefill throughput identical to
+        /// the non-MTP path. Advances the KV caches and <c>_cacheSeqLen</c> by
+        /// <c>tokens.Length</c>.
+        ///
+        /// Only the LAST row of <paramref name="hAllOut"/> is filled: the draft head
+        /// consumes the hidden state of the token preceding the next pending token
+        /// (the executor's PrefillStep copies only that last row into its pending-h),
+        /// and Gemma 4's <see cref="MtpCatchUp"/> is a no-op, so the earlier rows are
+        /// never read. (A real verify batch, which DOES need every row, never reaches
+        /// here — it sets allLogitsRows and is small.)
+        /// </summary>
+        private unsafe void SpecForwardPrefill(
+            int[] tokens, int startPos, float[] hAllOut, float[] logitsOut, int hidden)
+        {
+            int seqLen = tokens.Length;
+            int prefixLen = seqLen - 1;
+
+            // Prefix: advance the KV cache with the fast chunked prefill (bounded
+            // memory, flash attention — never the verify kernel's O(n^2) scratch).
+            int chunkSize = ComputePrefillChunkSize();
+            for (int pos = 0; pos < prefixLen; pos += chunkSize)
+            {
+                int chunkLen = Math.Min(chunkSize, prefixLen - pos);
+                var chunk = new int[chunkLen];
+                Array.Copy(tokens, pos, chunk, 0, chunkLen);
+                PrefillWithoutLogits(chunk);
+            }
+
+            // Last token: the fused single-token decode (seqLen==1, no O(n^2)
+            // scratch) captures its h_nextn + logits. Re-enter SpecForward for the
+            // 1-token case; _cacheSeqLen now points at the last token's position, so
+            // it writes that token's KV and reads the freshly-prefilled prefix.
+            float[] lastH = hAllOut != null ? new float[hidden] : null;
+            SpecForward(new[] { tokens[seqLen - 1] }, lastH, logitsOut, allLogitsRows: false);
+            if (hAllOut != null)
+                Array.Copy(lastH, 0L, hAllOut, (long)(seqLen - 1) * hidden, (long)hidden);
         }
 
         /// <summary>

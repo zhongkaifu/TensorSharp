@@ -2154,6 +2154,301 @@ TSG_EXPORT int TSGgml_RoPEMRoPEF32(
 }
 
 // ============================================================================
+// Session cache for the head-first fused prefill attention graph.
+//
+// Chunked prefill of a 42-layer Gemma model issues hundreds of fused-prefill
+// attention calls per forward (≈ numLayers × numChunks). Each call otherwise
+// builds a fresh ggml graph AND a fresh backend buffer
+// (ggml_backend_alloc_ctx_tensors) — pure per-call overhead that leaves the GPU
+// idling between bursts. This cache keeps the ggml context / tensors / graph /
+// backend buffer alive across calls and reuses them whenever the shape
+// signature matches, so a hot call only refreshes Q/K/V/mask data and runs the
+// graph. Mirrors PagedAttnSession in ggml_ops_paged_attention.cpp.
+//
+// kvLen is bucketed to the next power of two so monotonically-growing prefill
+// chunks (and the fixed-window SWA layers) hit a small set of cached graphs;
+// the K/V padding region [kvLen, bucket) is zeroed (tracked per session) so the
+// masked-out tail never feeds NaNs into the softmax→V matmul. Head-first
+// (inputFormat == 0) only; flat input falls back to the per-call path.
+// ============================================================================
+namespace
+{
+    inline bool prefill_attn_cache_enabled()
+    {
+        static const bool enabled = []{
+            const char* e = std::getenv("TS_PREFILL_ATTN_CACHE");
+            return !(e != nullptr && std::strcmp(e, "0") == 0);
+        }();
+        return enabled;
+    }
+
+    inline std::uint32_t prefill_float_bits(float v)
+    {
+        std::uint32_t b;
+        std::memcpy(&b, &v, sizeof(b));
+        return b;
+    }
+
+    inline int prefill_kv_bucket(int kv_len)
+    {
+        if (kv_len <= 64) return 64;
+        int v = kv_len - 1;
+        v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+        return v + 1;
+    }
+
+    // Only cache shapes whose retained per-session buffer stays modest. The
+    // scores/probs intermediates (~kv_bucket*seq_len*num_heads*4 bytes each) are
+    // allocated INTO the retained session buffer, so a large-kvLen session would
+    // pin hundreds of MB / GB of VRAM. Those large-bucket calls are compute-bound
+    // anyway (per-call graph-build overhead is a small fraction of their flash
+    // compute), so leaving them on the per-call path costs little while keeping
+    // the cache's VRAM footprint bounded — important near GPU capacity. The big
+    // cache win is the many small-bucket, overhead-dominated calls (e.g. the SWA
+    // local layers: fixed ~window-sized kvLen, hundreds of calls per forward).
+    inline bool prefill_should_cache(int kv_bucket, int seq_len, int num_heads)
+    {
+        const long long scoresBytes = static_cast<long long>(kv_bucket) * seq_len * num_heads * 4;
+        return scoresBytes <= (192LL << 20); // 192 MiB per scores tensor
+    }
+
+    struct PrefillAttnSession
+    {
+        bool valid = false;
+        int num_q = 0;
+        int kv_bucket = 0;
+        int num_heads = 0;
+        int num_kv_heads = 0;
+        int head_dim = 0;
+        std::uint32_t scale_bits = 0;
+        bool kv_f16 = false;
+
+        std::unique_ptr<unsigned char[]> ctx_mem;
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+
+        ggml_tensor* q_in = nullptr;
+        ggml_tensor* k_in = nullptr;
+        ggml_tensor* v_in = nullptr;
+        ggml_tensor* mask = nullptr;
+        ggml_tensor* result = nullptr;
+        ggml_cgraph* graph = nullptr;
+
+        std::uint64_t lru = 0;
+        int kv_zero_covered_from = 0; // max kvLen written into the K/V padding region
+
+        void destroy()
+        {
+            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
+            ctx_mem.reset();
+            q_in = k_in = v_in = mask = result = nullptr;
+            graph = nullptr;
+            valid = false;
+            kv_zero_covered_from = 0;
+        }
+
+        ~PrefillAttnSession() { destroy(); }
+        PrefillAttnSession() = default;
+        PrefillAttnSession(const PrefillAttnSession&) = delete;
+        PrefillAttnSession& operator=(const PrefillAttnSession&) = delete;
+    };
+
+    constexpr std::size_t kPrefillAttnCacheSize = 16;
+    thread_local std::array<PrefillAttnSession, kPrefillAttnCacheSize> g_prefill_attn_cache;
+    thread_local std::uint64_t g_prefill_attn_lru = 0;
+    thread_local std::vector<ggml_fp16_t> g_prefill_mask_scratch;
+    thread_local std::vector<unsigned char> g_prefill_zero_scratch;
+
+    PrefillAttnSession* find_prefill_session(
+        int num_q, int kv_bucket, int num_heads, int num_kv_heads, int head_dim,
+        std::uint32_t scale_bits, bool kv_f16)
+    {
+        for (auto& s : g_prefill_attn_cache)
+        {
+            if (s.valid && s.num_q == num_q && s.kv_bucket == kv_bucket &&
+                s.num_heads == num_heads && s.num_kv_heads == num_kv_heads &&
+                s.head_dim == head_dim && s.scale_bits == scale_bits && s.kv_f16 == kv_f16)
+            {
+                s.lru = ++g_prefill_attn_lru;
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    PrefillAttnSession& acquire_prefill_session_slot()
+    {
+        for (auto& s : g_prefill_attn_cache)
+            if (!s.valid) { s.lru = ++g_prefill_attn_lru; return s; }
+        PrefillAttnSession* victim = &g_prefill_attn_cache[0];
+        for (auto& s : g_prefill_attn_cache)
+            if (s.lru < victim->lru) victim = &s;
+        victim->destroy();
+        victim->lru = ++g_prefill_attn_lru;
+        return *victim;
+    }
+
+    bool build_prefill_session(
+        PrefillAttnSession& s,
+        int num_q, int kv_bucket, int num_heads, int num_kv_heads, int head_dim,
+        float scale, bool kv_f16)
+    {
+        constexpr std::size_t kCtxMemSize = 1024 * 1024;
+        s.ctx_mem.reset(new (std::nothrow) unsigned char[kCtxMemSize]);
+        if (!s.ctx_mem) { set_last_error("prefill-attn session: alloc ctx mem failed."); return false; }
+
+        ggml_init_params params = {};
+        params.mem_size = kCtxMemSize;
+        params.mem_buffer = s.ctx_mem.get();
+        params.no_alloc = true;
+        s.ctx = ggml_init(params);
+        if (s.ctx == nullptr) { set_last_error("prefill-attn session: ggml_init failed."); s.ctx_mem.reset(); return false; }
+
+        const ggml_type kv_type = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        // Head-first: GGML [headDim, seq, heads].
+        s.q_in = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32, head_dim, num_q, num_heads);
+        s.k_in = ggml_new_tensor_3d(s.ctx, kv_type, head_dim, kv_bucket, num_kv_heads);
+        s.v_in = ggml_new_tensor_3d(s.ctx, kv_type, head_dim, kv_bucket, num_kv_heads);
+        s.mask = ggml_new_tensor_4d(s.ctx, GGML_TYPE_F16, kv_bucket, num_q, 1, 1);
+        s.result = ggml_new_tensor_2d(s.ctx, GGML_TYPE_F32, num_heads * head_dim, num_q);
+        if (!s.q_in || !s.k_in || !s.v_in || !s.mask || !s.result)
+        {
+            set_last_error("prefill-attn session: tensor alloc failed.");
+            ggml_free(s.ctx); s.ctx = nullptr; s.ctx_mem.reset(); return false;
+        }
+
+        // scores = mul_mat(K, Q) with GQA broadcast; F32 accumulation.
+        ggml_tensor* scores = ggml_mul_mat(s.ctx, s.k_in, s.q_in);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        ggml_tensor* probs = ggml_soft_max_ext(s.ctx, scores, s.mask, scale, 0.0f);
+        ggml_tensor* v_perm = ggml_cont(s.ctx, ggml_permute(s.ctx, s.v_in, 1, 0, 2, 3));
+        ggml_tensor* attn_out = ggml_mul_mat(s.ctx, v_perm, probs);
+        ggml_tensor* attn_perm = ggml_permute(s.ctx, attn_out, 0, 2, 1, 3);
+        ggml_tensor* attn_cont = ggml_cont(s.ctx, attn_perm);
+        ggml_tensor* attn_flat = ggml_reshape_2d(s.ctx, attn_cont, num_heads * head_dim, num_q);
+        ggml_tensor* out = ggml_cpy(s.ctx, attn_flat, s.result);
+        ggml_set_output(out);
+
+        s.graph = ggml_new_graph(s.ctx);
+        ggml_build_forward_expand(s.graph, out);
+
+        s.buffer = ggml_backend_alloc_ctx_tensors(s.ctx, g_backend);
+        if (s.buffer == nullptr)
+        {
+            set_last_error("prefill-attn session: backend buffer alloc failed.");
+            ggml_free(s.ctx); s.ctx = nullptr; s.ctx_mem.reset(); return false;
+        }
+
+        s.num_q = num_q; s.kv_bucket = kv_bucket; s.num_heads = num_heads;
+        s.num_kv_heads = num_kv_heads; s.head_dim = head_dim;
+        s.scale_bits = prefill_float_bits(scale); s.kv_f16 = kv_f16;
+        s.kv_zero_covered_from = 0; // backend buffer starts zero-initialised
+        s.valid = true;
+        return true;
+    }
+
+    // Cached head-first fused prefill attention. q_data is F32 [numHeads, seqLen,
+    // headDim]; k/v_data are F32 [numKVHeads, kvStride, headDim] or F16 of the same
+    // layout (kvStride = the source seq stride, e.g. the F16 cache's cacheLen, of
+    // which the leading kvLen rows are read). out_data is F32 [seqLen, numHeads*headDim].
+    int fused_prefill_attn_cached(
+        const void* q_data, const void* k_data, const void* v_data, float* out_data,
+        int num_heads, int num_kv_heads, int head_dim,
+        int seq_len, int kv_len, int kv_stride,
+        int mask_start_pos, int sliding_window, float scale, bool kv_f16)
+    {
+        if (!ensure_backend()) return 0;
+
+        const int kv_bucket = prefill_kv_bucket(kv_len);
+        const std::uint32_t scale_bits = prefill_float_bits(scale);
+
+        PrefillAttnSession* sess = find_prefill_session(
+            seq_len, kv_bucket, num_heads, num_kv_heads, head_dim, scale_bits, kv_f16);
+        if (sess == nullptr)
+        {
+            PrefillAttnSession& slot = acquire_prefill_session_slot();
+            if (!build_prefill_session(slot, seq_len, kv_bucket, num_heads, num_kv_heads,
+                                       head_dim, scale, kv_f16))
+                return 0;
+            sess = &slot;
+        }
+
+        const std::size_t kv_elem = kv_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+        const std::size_t q_bytes = static_cast<std::size_t>(num_heads) * seq_len * head_dim * sizeof(float);
+
+        // The previous graph_compute on this cached session may still be reading
+        // q_in/k_in/v_in; drain before overwriting them.
+        host_read_barrier();
+
+        ggml_backend_tensor_set(sess->q_in, q_data, 0, q_bytes);
+
+        // Upload K/V: leading kv_len rows per head into the bucket-sized tensor.
+        const std::size_t srcHeadElems = static_cast<std::size_t>(kv_stride) * head_dim;
+        const std::size_t dstHeadElems = static_cast<std::size_t>(kv_bucket) * head_dim;
+        const std::size_t rowBytes = static_cast<std::size_t>(kv_len) * head_dim * kv_elem;
+        const auto* kb = static_cast<const unsigned char*>(k_data);
+        const auto* vb = static_cast<const unsigned char*>(v_data);
+        for (int h = 0; h < num_kv_heads; ++h)
+        {
+            const std::size_t srcOff = static_cast<std::size_t>(h) * srcHeadElems * kv_elem;
+            const std::size_t dstOff = static_cast<std::size_t>(h) * dstHeadElems * kv_elem;
+            ggml_backend_tensor_set(sess->k_in, kb + srcOff, dstOff, rowBytes);
+            ggml_backend_tensor_set(sess->v_in, vb + srcOff, dstOff, rowBytes);
+        }
+
+        // Zero the K/V padding [kv_len, covered) per head only when this call is
+        // shorter than a previous one (otherwise the tail is still zero from the
+        // freshly-allocated buffer / never written).
+        if (kv_len < sess->kv_zero_covered_from)
+        {
+            const int zero_rows = sess->kv_zero_covered_from - kv_len;
+            const std::size_t zeroBytes = static_cast<std::size_t>(zero_rows) * head_dim * kv_elem;
+            if (g_prefill_zero_scratch.size() < zeroBytes)
+                g_prefill_zero_scratch.assign(zeroBytes, 0);
+            for (int h = 0; h < num_kv_heads; ++h)
+            {
+                const std::size_t padOff =
+                    (static_cast<std::size_t>(h) * dstHeadElems + static_cast<std::size_t>(kv_len) * head_dim) * kv_elem;
+                ggml_backend_tensor_set(sess->k_in, g_prefill_zero_scratch.data(), padOff, zeroBytes);
+                ggml_backend_tensor_set(sess->v_in, g_prefill_zero_scratch.data(), padOff, zeroBytes);
+            }
+        }
+        if (kv_len > sess->kv_zero_covered_from)
+            sess->kv_zero_covered_from = kv_len;
+
+        // Build + upload the causal (+ optional sliding window) mask over the full
+        // bucket. threshold < kv_len, so the [kv_len, bucket) tail is auto-masked.
+        g_prefill_mask_scratch.assign(static_cast<std::size_t>(kv_bucket) * seq_len, ggml_fp32_to_fp16(0.0f));
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int q_idx = 0; q_idx < seq_len; q_idx++)
+            {
+                int threshold = mask_start_pos + q_idx;
+                int winStart = (sliding_window > 0) ? std::max(0, threshold - sliding_window + 1) : 0;
+                ggml_fp16_t* row = &g_prefill_mask_scratch[static_cast<std::size_t>(q_idx) * kv_bucket];
+                for (int kv_idx = 0; kv_idx < kv_bucket; kv_idx++)
+                    row[kv_idx] = (kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
+            }
+        }
+        ggml_backend_tensor_set(sess->mask, g_prefill_mask_scratch.data(), 0,
+                                 g_prefill_mask_scratch.size() * sizeof(ggml_fp16_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, sess->graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml graph compute failed for cached fused prefill attention.");
+            return 0;
+        }
+
+        finalize_compute_with_download(sess->result, out_data, q_bytes);
+        clear_last_error();
+        return 1;
+    }
+} // anonymous namespace
+
+// ============================================================================
 // Fused prefill attention: Q*K^T → causal mask → softmax → *V as one GGML
 // graph. Eliminates ~5 separate C# → GGML round trips per layer.
 //
@@ -2182,6 +2477,17 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
         if (!ensure_backend())
         {
             return 0;
+        }
+
+        // Session-cached fast path (head-first only): reuse the graph + backend
+        // buffer across the hundreds of per-layer/per-chunk prefill calls.
+        if (inputFormat == 0 && prefill_attn_cache_enabled()
+            && prefill_should_cache(prefill_kv_bucket(kvLen), seqLen, numHeads))
+        {
+            return fused_prefill_attn_cached(
+                q_data, k_data, v_data, out_data,
+                numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvLen,
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ false);
         }
 
         const std::size_t ctx_size = 4 * 1024 * 1024;
@@ -2348,6 +2654,179 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
     catch (...)
     {
         set_last_error("Unknown fused prefill attention failure.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused prefill attention reading the K/V straight out of an F16 cache, with NO
+// host F16->F32 dequant. Q stays F32 (head-first [numHeads, seqLen, headDim]);
+// K/V are uploaded as F16 directly from the persistent cache
+// ([numKVHeads, kvCacheLen, headDim] head-first), reading the leading kvLen rows
+// (kvCacheLen is the allocated stride, which can exceed kvLen). mul_mat with the
+// F16 K/V and GGML_PREC_F32 accumulation is numerically identical to dequantizing
+// to F32 first, so this is a drop-in replacement for the
+// ExpandKVHeads(F16->F32) + FusedPrefillAttention(F32) chain — it just removes
+// the per-chunk dequant round-trip (and halves the K/V upload bytes).
+//
+// Same fused mul_mat -> soft_max_ext -> mul_mat graph as the F32 path; GQA is
+// handled by ggml's mul_mat broadcast (numHeads % numKVHeads == 0).
+// ============================================================================
+TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
+    const float* q_data,        // head-first F32 [numHeads, seqLen, headDim]
+    const void* k_data,         // head-first F16 cache [numKVHeads, kvCacheLen, headDim]
+    const void* v_data,         // same layout
+    float* out_data,            // flat F32 [seqLen, numHeads*headDim]
+    int numHeads,
+    int numKVHeads,
+    int headDim,
+    int seqLen,
+    int kvLen,
+    int kvCacheLen,             // allocated seq stride of the cache (>= kvLen)
+    int maskStartPos,
+    int slidingWindow,
+    float scale)
+{
+    try
+    {
+        if (!ensure_backend())
+            return 0;
+        if (numHeads <= 0 || numKVHeads <= 0 || headDim <= 0 || seqLen <= 0 || kvLen <= 0 ||
+            kvCacheLen < kvLen || numHeads % numKVHeads != 0)
+        {
+            set_last_error("Invalid dimensions for fused prefill attention (F16 KV).");
+            return 0;
+        }
+
+        // Session-cached fast path: reuse the graph + backend buffer across calls.
+        if (prefill_attn_cache_enabled()
+            && prefill_should_cache(prefill_kv_bucket(kvLen), seqLen, numHeads))
+        {
+            return fused_prefill_attn_cached(
+                q_data, k_data, v_data, out_data,
+                numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvCacheLen,
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ true);
+        }
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for fused prefill attention (F16 KV).");
+            return 0;
+        }
+        auto* ctx = context.value;
+
+        // Head-first layout: C# [numHeads, seqLen, headDim] == GGML [headDim, seqLen, numHeads].
+        ggml_tensor* q_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, headDim, seqLen, numHeads);
+        ggml_tensor* k_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, headDim, kvLen, numKVHeads);
+        ggml_tensor* v_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, headDim, kvLen, numKVHeads);
+        ggml_tensor* attn_result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numHeads * headDim, seqLen);
+        ggml_tensor* mask_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kvLen, seqLen, 1, 1);
+
+        if (q_in == nullptr || k_in == nullptr || v_in == nullptr ||
+            attn_result == nullptr || mask_tensor == nullptr)
+        {
+            set_last_error("Failed to create ggml tensors for fused prefill attention (F16 KV).");
+            return 0;
+        }
+
+        std::vector<ggml_fp16_t> mask_data(static_cast<std::size_t>(kvLen) * seqLen);
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int q_idx = 0; q_idx < seqLen; q_idx++)
+            {
+                int threshold = maskStartPos + q_idx;
+                int winStart = (slidingWindow > 0) ? std::max(0, threshold - slidingWindow + 1) : 0;
+                ggml_fp16_t* row = &mask_data[static_cast<std::size_t>(q_idx) * kvLen];
+                for (int kv_idx = 0; kv_idx < kvLen; kv_idx++)
+                    row[kv_idx] = (kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
+            }
+        }
+
+        // scores = mul_mat(K_f16, Q_f32); GQA broadcast over heads. F32 accumulation.
+        ggml_tensor* scores = ggml_mul_mat(ctx, k_in, q_in);
+        if (scores == nullptr) { set_last_error("Failed Q*K^T (F16 KV)."); return 0; }
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+
+        ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_tensor, scale, 0.0f);
+        if (probs == nullptr) { set_last_error("Failed softmax (F16 KV)."); return 0; }
+
+        // V permute [headDim, kvLen, numKVHeads] -> [kvLen, headDim, numKVHeads] (stays F16).
+        ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_in, 1, 0, 2, 3));
+        ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
+        if (attn_out == nullptr) { set_last_error("Failed scores*V (F16 KV)."); return 0; }
+
+        // [headDim, seqLen, numHeads] -> flat [headDim*numHeads, seqLen].
+        ggml_tensor* attn_perm = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
+        ggml_tensor* attn_cont = ggml_cont(ctx, attn_perm);
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_cont, numHeads * headDim, seqLen);
+        ggml_tensor* output = ggml_cpy(ctx, attn_flat, attn_result);
+        if (output == nullptr) { set_last_error("Failed output cpy (F16 KV)."); return 0; }
+        ggml_set_output(output);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for fused prefill attention (F16 KV).");
+            return 0;
+        }
+
+        host_read_barrier();
+        ggml_backend_tensor_set(q_in, q_data, 0,
+            static_cast<std::size_t>(numHeads) * seqLen * headDim * sizeof(float));
+
+        // Upload K/V F16 directly from the cache, reading the leading kvLen rows
+        // of each head. When the cache is exactly sized (kvCacheLen == kvLen) the
+        // slice is contiguous and a single upload suffices; otherwise upload
+        // per-head to skip the unused [kvLen, kvCacheLen) tail.
+        const std::size_t dstHeadElems = static_cast<std::size_t>(kvLen) * headDim;
+        if (kvCacheLen == kvLen)
+        {
+            const std::size_t bytes = static_cast<std::size_t>(numKVHeads) * dstHeadElems * sizeof(ggml_fp16_t);
+            ggml_backend_tensor_set(k_in, k_data, 0, bytes);
+            ggml_backend_tensor_set(v_in, v_data, 0, bytes);
+        }
+        else
+        {
+            const ggml_fp16_t* ksrc = static_cast<const ggml_fp16_t*>(k_data);
+            const ggml_fp16_t* vsrc = static_cast<const ggml_fp16_t*>(v_data);
+            const std::size_t srcHeadElems = static_cast<std::size_t>(kvCacheLen) * headDim;
+            const std::size_t headBytes = dstHeadElems * sizeof(ggml_fp16_t);
+            for (int h = 0; h < numKVHeads; ++h)
+            {
+                const std::size_t dstOff = static_cast<std::size_t>(h) * dstHeadElems * sizeof(ggml_fp16_t);
+                ggml_backend_tensor_set(k_in, ksrc + static_cast<std::size_t>(h) * srcHeadElems, dstOff, headBytes);
+                ggml_backend_tensor_set(v_in, vsrc + static_cast<std::size_t>(h) * srcHeadElems, dstOff, headBytes);
+            }
+        }
+        ggml_backend_tensor_set(mask_tensor, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml graph compute failed for fused prefill attention (F16 KV).");
+            return 0;
+        }
+
+        finalize_compute_with_download(attn_result, out_data,
+            static_cast<std::size_t>(numHeads) * seqLen * headDim * sizeof(float));
+
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown fused prefill attention (F16 KV) failure.");
         return 0;
     }
 }

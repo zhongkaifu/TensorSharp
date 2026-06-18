@@ -169,16 +169,17 @@ namespace TensorSharp.Models
                 Ops.Add(residual, residual, attnProj);
                 attnProj.Dispose();
 
-                // Pre-FFN RMSNorm.
-                Tensor ffnNormed = RMSNormOp(residual, wn[5]);
-
-                // FFN.
-                Tensor ffnOut = FFN(ffnNormed, wn[6], wn[7], numTokens);
-                ffnNormed.Dispose();
-
-                // Residual + carry forward.
-                Ops.Add(residual, residual, ffnOut);
-                ffnOut.Dispose();
+                // FFN: fused dense SwiGLU (norm + gate/up + SiLU·mul + down +
+                // residual) in one GGML graph, keeping the large intermediate
+                // on-device. Falls back to the unfused chain when ineligible.
+                if (!TryFusedDenseSwiGLUFFNInto(residual, wn[5], wn[6], wn[7]))
+                {
+                    Tensor ffnNormed = RMSNormOp(residual, wn[5]);
+                    Tensor ffnOut = FFN(ffnNormed, wn[6], wn[7], numTokens);
+                    ffnNormed.Dispose();
+                    Ops.Add(residual, residual, ffnOut);
+                    ffnOut.Dispose();
+                }
 
                 hiddenStates = residual;
             }

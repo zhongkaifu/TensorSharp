@@ -187,6 +187,38 @@ public class MtpSpeculativeExecutionTests
         Assert.Equal(0, model.ProtocolViolations.Count);
     }
 
+    [Theory]
+    [InlineData(false)] // linear trunk
+    [InlineData(true)]  // batched (paged) trunk
+    public void EngineMtpSpec_PrefixCaching_EosPastBlockBoundary_FinishesWithoutThrow(bool batchedTrunk)
+    {
+        // Production repro (the server enables prefix caching by default): a
+        // long speculative generation crosses a generated block boundary, then
+        // EOS lands inside an accepted speculative batch. The step advanced the
+        // committed-token count over the whole batch, so after the engine
+        // truncates the trailing drafts the committed count outruns the
+        // surviving token list. FinishSequence -> CacheFullBlocksForSequence
+        // used to hash positions past the end of that list and throw
+        // ArgumentOutOfRangeException(pos) — the crash this change fixes.
+        const int promptLen = 8; // fills block 0 exactly
+        var model = new FakeMtpModel { BatchedTrunkEnabled = batchedTrunk };
+        // EOS = the 7th generated token (output index 6). Its committed
+        // position (15) sits just below the block-1 boundary (16), so the
+        // accepted draft tail pushes the committed count to/past 16 while the
+        // surviving output stops at 15 -> committed > total at finish time.
+        int eosToken = model.ExpectedNext(promptLen - 1 + 6);
+        model.EosTokenId = eosToken;
+
+        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 64,
+            mtpEnabled: true, enablePrefixCaching: true);
+
+        Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
+        Assert.Equal(7, seq.OutputTokens.Count);
+        Assert.Equal(eosToken, seq.OutputTokens[^1]);
+        Assert.Equal(ExpectedChain(model, promptLen, 6), seq.OutputTokens.Take(6));
+        Assert.Empty(model.ProtocolViolations);
+    }
+
     [Fact]
     public void EngineMtpSpec_BatchedTrunk_GreedyStream_MatchesPlainDecodeAcrossBlockBoundaries()
     {
@@ -296,7 +328,8 @@ public class MtpSpeculativeExecutionTests
         return expected;
     }
 
-    private static SequenceState RunEngineRequest(FakeMtpModel model, int promptLen, int maxNewTokens, bool mtpEnabled)
+    private static SequenceState RunEngineRequest(FakeMtpModel model, int promptLen, int maxNewTokens,
+        bool mtpEnabled, bool enablePrefixCaching = false)
     {
         var cfg = new SchedulerConfig
         {
@@ -305,7 +338,7 @@ public class MtpSpeculativeExecutionTests
             MaxPrefillChunkSize = 64,
             NumBlocks = 32,
             BlockSize = BlockSize,
-            EnablePrefixCaching = false,
+            EnablePrefixCaching = enablePrefixCaching,
             DecodeQuantumTokens = 1,
             MtpSpeculativeEnabled = mtpEnabled,
             MtpMaxDraftTokens = 8,

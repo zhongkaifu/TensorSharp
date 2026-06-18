@@ -354,8 +354,6 @@ namespace TensorSharp.Models
                 if (dumpDiag) Console.WriteLine($"[g4-batched] after-layer-{layer}: {TensorChecksum(hiddenStates, $"L{layer}")}");
             }
 
-            perLayerInputs?.Dispose();
-
             // Final norm + LM head.
             Tensor finalNormed = RMSNormOp(hiddenStates, "output_norm.weight");
             hiddenStates.Dispose();

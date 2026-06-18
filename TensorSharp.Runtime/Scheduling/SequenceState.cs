@@ -193,6 +193,31 @@ namespace TensorSharp.Runtime.Scheduling
             OutputTokens.Add(token);
         }
 
+        /// <summary>
+        /// Shrink the committed-token accounting back to the current total
+        /// token count. Called after a speculative step's output tail was
+        /// truncated at a mid-batch stop (EOS / max-tokens landing before the
+        /// step's last accepted token): the step advanced
+        /// <see cref="NumComputedTokens"/> over the WHOLE forwarded batch, but
+        /// the discarded tail tokens no longer exist in
+        /// <see cref="OutputTokens"/>. Leaving the committed count ahead of
+        /// <see cref="NumTotalTokens"/> makes prefix-cache block registration
+        /// hash positions past the end of the token list (<see cref="TokenAt"/>
+        /// throws <see cref="ArgumentOutOfRangeException"/>). The sequence is
+        /// finishing, so the dropped tail's K/V (the model's live cache, or the
+        /// about-to-be-freed paged blocks) is irrelevant; only the accounting
+        /// must agree. The block table's token counter is left as-is because
+        /// the finishing path frees its blocks wholesale via
+        /// <see cref="Paged.BlockTable.Clear"/> and never reads the counter in
+        /// between.
+        /// </summary>
+        internal void TrimComputedToTotalTokens()
+        {
+            int total = NumTotalTokens;
+            if (NumComputedTokens > total)
+                NumComputedTokens = total;
+        }
+
         public bool ShouldStopForLength() => OutputTokens.Count >= MaxNewTokens;
 
         public override string ToString()

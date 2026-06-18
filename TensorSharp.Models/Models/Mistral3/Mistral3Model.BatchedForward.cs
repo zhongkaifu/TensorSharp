@@ -212,12 +212,18 @@ namespace TensorSharp.Models
                 Ops.Add(residual, residual, attnProj);
                 attnProj.Dispose();
 
-                Tensor ffnNormed = RMSNormOp(residual, wn[ffnNormIdx]);
-                Tensor ffnOut = FFN(ffnNormed, wn[gateUpIdx], wn[downIdx], numTokens);
-                ffnNormed.Dispose();
+                // Fused dense SwiGLU FFN (norm + gate/up + SiLU·mul + down + residual)
+                // in one GGML graph, keeping the large intermediate on-device. Falls
+                // back to the unfused chain when the backend/weights don't qualify.
+                if (!TryFusedDenseSwiGLUFFNInto(residual, wn[ffnNormIdx], wn[gateUpIdx], wn[downIdx]))
+                {
+                    Tensor ffnNormed = RMSNormOp(residual, wn[ffnNormIdx]);
+                    Tensor ffnOut = FFN(ffnNormed, wn[gateUpIdx], wn[downIdx], numTokens);
+                    ffnNormed.Dispose();
 
-                Ops.Add(residual, residual, ffnOut);
-                ffnOut.Dispose();
+                    Ops.Add(residual, residual, ffnOut);
+                    ffnOut.Dispose();
+                }
                 hiddenStates = residual;
             }
 

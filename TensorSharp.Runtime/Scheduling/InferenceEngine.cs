@@ -422,6 +422,12 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (seq.OutputTokens.Count > keepCount)
                 seq.OutputTokens.RemoveRange(keepCount, seq.OutputTokens.Count - keepCount);
+            // The speculative step advanced NumComputedTokens over the whole
+            // forwarded batch; the tokens just dropped are no longer part of the
+            // sequence, so bring the committed-token count back in line or the
+            // scheduler's prefix-cache block registration will hash positions
+            // past the end of the (now shorter) token list and throw.
+            seq.TrimComputedToTotalTokens();
         }
 
         /// <summary>Log cumulative NextN/MTP speculative-decoding counters when

@@ -213,6 +213,70 @@ public class ContinuousBatchSchedulerTests
             $"Expected >= {BlockSize} prefix-cache tokens, got {seqB.PrefixCacheReusedTokens}");
     }
 
+    [Fact]
+    public void TrimComputedToTotalTokens_RestoresInvariantAfterTailTruncation()
+    {
+        // Mirrors what the engine does after a mid-batch speculative stop:
+        // the step advanced the committed count over the whole forwarded
+        // batch, then the output tail was truncated, leaving the committed
+        // count ahead of the token list.
+        var seq = NewSequence("r0", promptLen: BlockSize, maxNew: 64);
+        var pool = NewPool(numBlocks: 4);
+        var blocks = pool.AllocateNew(3);
+        foreach (var b in blocks) seq.BlockTable.AppendBlock(b);
+
+        seq.AdvanceComputedTokens(BlockSize);          // prompt committed (block 0 full)
+        for (int i = 0; i < 4; i++) seq.AppendOutputToken(200 + i);
+        seq.AdvanceComputedTokens(4);                  // speculative batch: computed=12, total=12
+
+        // Engine truncates the output tail to a single surviving token.
+        seq.OutputTokens.RemoveRange(seq.OutputTokens.Count - 3, 3); // total=9, computed=12
+        Assert.True(seq.NumComputedTokens > seq.NumTotalTokens);
+
+        seq.TrimComputedToTotalTokens();
+        Assert.Equal(seq.NumTotalTokens, seq.NumComputedTokens);
+    }
+
+    [Fact]
+    public void NotifyStop_AfterMidBatchSpeculativeStop_DoesNotThrow()
+    {
+        // Regression for the --mtp-spec crash: a speculative step advances
+        // NumComputedTokens past a generated block boundary, then a mid-batch
+        // EOS truncates the output tail so NumComputedTokens > NumTotalTokens.
+        // FinishSequence -> CacheFullBlocksForSequence used to index TokenAt()
+        // past the end of the (shortened) token list and throw
+        // ArgumentOutOfRangeException(pos). This drives the scheduler's
+        // defense-in-depth clamp WITHOUT the engine's trim to prove the
+        // finish path is crash-safe on its own.
+        var pool = NewPool(numBlocks: 8);
+        var sched = NewScheduler(pool, "fp");
+
+        var seq = NewSequence("r0", promptLen: BlockSize, maxNew: 64); // prompt fills block 0
+        var blocks = pool.AllocateNew(3);                              // 24-token capacity
+        foreach (var b in blocks) seq.BlockTable.AppendBlock(b);
+
+        seq.AdvanceComputedTokens(BlockSize);          // prompt committed: computed=8, total=8
+        for (int i = 0; i < 6; i++) seq.AppendOutputToken(100 + i);
+        seq.AdvanceComputedTokens(6);                  // decode to position 14
+
+        // Speculative step forwards [sampled, d1, d2, d3] (all 3 drafts
+        // accepted): 4 output tokens appended, committed count advanced 4 ->
+        // crosses the block-1 boundary at 16.
+        for (int i = 0; i < 4; i++) seq.AppendOutputToken(200 + i);
+        seq.AdvanceComputedTokens(4);                  // computed=18, total=18
+
+        // The sampled (first) token was EOS: keep only it, drop the 3 drafts.
+        seq.OutputTokens.RemoveRange(seq.OutputTokens.Count - 3, 3); // total=15, computed=18
+        Assert.True(seq.NumComputedTokens > seq.NumTotalTokens);
+
+        var output = new SchedulerOutput();
+        var ex = Record.Exception(
+            () => sched.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output));
+        Assert.Null(ex);
+        Assert.Contains("r0", output.FinishedRequestIds);
+        Assert.True(seq.Status.IsFinished());
+    }
+
     // ----------------------- helpers -----------------------
 
     private static BlockPool NewPool(int numBlocks)

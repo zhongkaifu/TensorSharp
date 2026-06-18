@@ -647,6 +647,279 @@ int fused_ffn_swiglu_quant_f32_impl(
 }
 
 // ============================================================================
+// Fused dense FFN PROJECTION (no residual fold). Writes the FFN output to a
+// separate tensor so callers that apply a post-activation norm before the
+// residual add (e.g. Gemma 4's post_ffw_norm) can run it on the small output:
+//
+//   output = down_W^T @ ( act(gate_part) * up_part ),
+//     [gate_part | up_part] = gate_up_W^T @ rms_norm(input, normW, eps)
+//   act = (act_type == 1) ? gelu(tanh approx) : silu
+//
+// Like fused_ffn_swiglu_quant_f32_impl this keeps the large [rows, 2*half_dim]
+// gate_up intermediate resident on the device (the dominant prefill cost on the
+// GGML CUDA backend), but returns the projection instead of folding it into a
+// residual. rms_norm uses the same loaded weight as Ops.RMSNorm, so the result
+// is identical to the unfused norm+gate_up+act+down chain for any model whose
+// norm-weight convention is already baked into the stored weight (Gemma 4
+// included).
+// ============================================================================
+int fused_ffn_act_project_quant_f32_impl(
+    const TensorView2DDesc& output_desc,
+    const TensorView2DDesc& input_desc,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    const QuantizedWeightDesc& gate_up_quant,
+    const QuantizedWeightDesc& down_quant,
+    int half_dim,
+    int act_type)
+{
+    if (!ensure_backend())
+        return 0;
+
+    if (!validate_desc(output_desc, "output") || !validate_desc(input_desc, "input"))
+        return 0;
+
+    if (norm_weight_data == nullptr || norm_weight_count <= 0)
+    {
+        set_last_error("fused_ffn_act: invalid norm weight.");
+        return 0;
+    }
+    if (gate_up_quant.data == nullptr || gate_up_quant.ne0 <= 0 || gate_up_quant.ne1 <= 0 || gate_up_quant.raw_bytes <= 0)
+    {
+        set_last_error("fused_ffn_act: invalid gate_up weight descriptor.");
+        return 0;
+    }
+    if (down_quant.data == nullptr || down_quant.ne0 <= 0 || down_quant.ne1 <= 0 || down_quant.raw_bytes <= 0)
+    {
+        set_last_error("fused_ffn_act: invalid down weight descriptor.");
+        return 0;
+    }
+
+    const int rows = input_desc.dim0;
+    const int hidden = input_desc.dim1;
+    const int gate_up_out = static_cast<int>(gate_up_quant.ne1);
+    const int down_in = static_cast<int>(down_quant.ne0);
+    const int down_out = static_cast<int>(down_quant.ne1);
+
+    if (output_desc.dim0 != rows || output_desc.dim1 != hidden)
+    {
+        set_last_error("fused_ffn_act: output shape mismatch.");
+        return 0;
+    }
+    if (norm_weight_count != hidden)
+    {
+        set_last_error("fused_ffn_act: norm_weight_count != hidden.");
+        return 0;
+    }
+    if (gate_up_quant.ne0 != hidden)
+    {
+        set_last_error("fused_ffn_act: gate_up.ne0 != hidden.");
+        return 0;
+    }
+    if (gate_up_out != 2 * half_dim)
+    {
+        set_last_error("fused_ffn_act: gate_up.ne1 != 2*half_dim.");
+        return 0;
+    }
+    if (down_in != half_dim || down_out != hidden)
+    {
+        set_last_error("fused_ffn_act: down weight shape mismatch.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 4 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("fused_ffn_act: failed to create ggml context.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(input_desc) && can_map_standard_view(output_desc);
+
+    TensorBinding output_binding;
+    TensorBinding input_binding;
+    std::vector<float> packed_input;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t out_buf = nullptr;
+        ggml_backend_buffer_t inp_buf = nullptr;
+        const bool out_ok = create_binding_from_host_ptr_2d(context.value, g_backend, output_desc, output_binding, out_buf);
+        const bool inp_ok = out_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, inp_buf);
+
+        if (out_ok && inp_ok)
+        {
+            host_ptr_buffers.emplace_back(out_buf);
+            host_ptr_buffers.emplace_back(inp_buf);
+        }
+        else
+        {
+            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
+            if (out_buf != nullptr) ggml_backend_buffer_free(out_buf);
+            use_zero_copy = false;
+            output_binding = create_standard_binding(context.value, output_desc);
+            input_binding = can_map_standard_view(input_desc)
+                ? create_standard_binding(context.value, input_desc)
+                : create_packed_standard_binding(context.value, input_desc, packed_input);
+        }
+    }
+    else
+    {
+        output_binding = create_standard_binding(context.value, output_desc);
+        input_binding = can_map_standard_view(input_desc)
+            ? create_standard_binding(context.value, input_desc)
+            : create_packed_standard_binding(context.value, input_desc, packed_input);
+    }
+
+    ggml_tensor* norm_w_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, norm_weight_count);
+
+    ggml_type gate_up_type = static_cast<ggml_type>(gate_up_quant.ggml_type);
+    ggml_tensor* gate_up_tensor = ggml_new_tensor_2d(context.value, gate_up_type, gate_up_quant.ne0, gate_up_quant.ne1);
+    TensorBinding gate_up_binding_w = { gate_up_tensor, gate_up_tensor, static_cast<std::size_t>(gate_up_quant.raw_bytes) };
+
+    ggml_type down_type = static_cast<ggml_type>(down_quant.ggml_type);
+    ggml_tensor* down_tensor = ggml_new_tensor_2d(context.value, down_type, down_quant.ne0, down_quant.ne1);
+    TensorBinding down_binding_w = { down_tensor, down_tensor, static_cast<std::size_t>(down_quant.raw_bytes) };
+
+    if (output_binding.storage == nullptr || input_binding.storage == nullptr ||
+        norm_w_tensor == nullptr || gate_up_tensor == nullptr || down_tensor == nullptr)
+    {
+        set_last_error("fused_ffn_act: failed to allocate ggml tensors.");
+        return 0;
+    }
+
+    auto try_cache_quant = [](ggml_tensor* t, const QuantizedWeightDesc& q, bool& bound, bool& needs_upload) {
+        bound = false;
+        needs_upload = false;
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr || q.raw_bytes < 4096)
+            return;
+        ggml_backend_buffer_t buf = nullptr;
+        void* addr = nullptr;
+        if (try_get_cacheable_tensor_buffer(g_backend, dev, t,
+                q.data, static_cast<std::size_t>(q.raw_bytes),
+                buf, addr, needs_upload))
+        {
+            ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+            bound = (st == GGML_STATUS_SUCCESS);
+            if (!bound) invalidate_cached_buffer(q.data);
+        }
+    };
+
+    bool gate_up_bound = false, gate_up_needs_upload = false;
+    try_cache_quant(gate_up_tensor, gate_up_quant, gate_up_bound, gate_up_needs_upload);
+
+    bool down_bound = false, down_needs_upload = false;
+    try_cache_quant(down_tensor, down_quant, down_bound, down_needs_upload);
+
+    bool norm_bound = false, norm_needs_upload = false;
+    std::size_t norm_bytes = static_cast<std::size_t>(norm_weight_count) * sizeof(float);
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && norm_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, norm_w_tensor,
+                    norm_weight_data, norm_bytes,
+                    buf, addr, norm_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, norm_w_tensor, addr);
+                norm_bound = (st == GGML_STATUS_SUCCESS);
+                if (!norm_bound) invalidate_cached_buffer(norm_weight_data);
+            }
+        }
+    }
+
+    // Build graph: rms_norm -> mul(gamma) -> gate_up matmul -> act*up -> down matmul -> cpy(output).
+    ggml_tensor* contiguous_input = ggml_cont(context.value, input_binding.tensor);
+    ggml_tensor* normed = ggml_rms_norm(context.value, contiguous_input, eps);
+    ggml_tensor* scaled = ggml_mul(context.value, normed, norm_w_tensor);
+
+    ggml_tensor* scaled_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, scaled, hidden, 1)
+        : scaled;
+
+    ggml_tensor* gate_up_mm = ggml_mul_mat(context.value, gate_up_binding_w.tensor, scaled_2d);
+
+    const std::size_t gu_row_bytes = static_cast<std::size_t>(gate_up_out) * sizeof(float);
+    const std::size_t half_bytes = static_cast<std::size_t>(half_dim) * sizeof(float);
+
+    ggml_tensor* gate_view = ggml_view_2d(context.value, gate_up_mm, half_dim, rows, gu_row_bytes, 0);
+    ggml_tensor* up_view = ggml_view_2d(context.value, gate_up_mm, half_dim, rows, gu_row_bytes, half_bytes);
+
+    ggml_tensor* gate_cont = ggml_cont(context.value, gate_view);
+    ggml_tensor* up_cont = ggml_cont(context.value, up_view);
+
+    ggml_tensor* act_gate = (act_type == 1)
+        ? ggml_gelu(context.value, gate_cont)
+        : ggml_silu(context.value, gate_cont);
+    ggml_tensor* glu = ggml_mul(context.value, act_gate, up_cont);
+
+    ggml_tensor* glu_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, glu, half_dim, 1)
+        : glu;
+
+    ggml_tensor* down_mm = ggml_mul_mat(context.value, down_binding_w.tensor, glu_2d);
+
+    ggml_tensor* down_flat = ggml_reshape_1d(context.value, down_mm, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* output_node = ggml_cpy(context.value, down_flat, output_binding.tensor);
+    if (output_node == nullptr)
+    {
+        set_last_error("fused_ffn_act: failed to create output cpy node.");
+        return 0;
+    }
+    ggml_set_output(output_node);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    if (graph == nullptr)
+    {
+        set_last_error("fused_ffn_act: failed to create graph.");
+        return 0;
+    }
+    ggml_build_forward_expand(graph, output_node);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("fused_ffn_act: failed to allocate backend buffer.");
+        return 0;
+    }
+
+    // Output is write-only; never upload it. Upload input + weights as needed.
+    if (!use_zero_copy)
+    {
+        if (packed_input.empty())
+            upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+        else
+            upload_binding(input_binding, packed_input.data(), input_binding.raw_bytes);
+    }
+    if (!gate_up_bound || gate_up_needs_upload)
+        upload_binding(gate_up_binding_w, gate_up_quant.data, gate_up_binding_w.raw_bytes);
+    if (!down_bound || down_needs_upload)
+        upload_binding(down_binding_w, down_quant.data, down_binding_w.raw_bytes);
+    if (!norm_bound || norm_needs_upload)
+    {
+        TensorBinding tmp = { norm_w_tensor, norm_w_tensor, norm_bytes };
+        upload_binding(tmp, norm_weight_data, norm_bytes);
+    }
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("fused_ffn_act: graph execution failed.");
+        return 0;
+    }
+    finalize_compute(use_zero_copy, output_binding.storage, output_desc.data, output_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
+// ============================================================================
 // Fused vision encoder block: runs the entire attention sub-block (minus RoPE)
 // and the entire MLP sub-block as ONE Metal graph dispatch instead of ~14
 // separate dispatches. For 27 encoder blocks this eliminates ~350 Metal command
@@ -1467,6 +1740,497 @@ TSG_EXPORT int TSGgml_FusedFFNSwiGLUQuantF32(
     catch (...)
     {
         set_last_error("Unknown error in fused FFN swiGLU.");
+        return 0;
+    }
+}
+
+// Fused dense FFN projection (norm + gate_up + act*up + down) -> output, no
+// residual fold. act_type: 0 = SiLU (SwiGLU), 1 = GELU tanh (GeGLU, Gemma 4).
+TSG_EXPORT int TSGgml_FusedFFNActProjectQuantF32(
+    TensorView2DDesc output,
+    TensorView2DDesc input,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps,
+    void* gate_up_data,
+    int gate_up_ggml_type,
+    std::int64_t gate_up_ne0,
+    std::int64_t gate_up_ne1,
+    std::int64_t gate_up_raw_bytes,
+    void* down_data,
+    int down_ggml_type,
+    std::int64_t down_ne0,
+    std::int64_t down_ne1,
+    std::int64_t down_raw_bytes,
+    int half_dim,
+    int act_type)
+{
+    try
+    {
+        QuantizedWeightDesc gate_up_quant;
+        gate_up_quant.data = gate_up_data;
+        gate_up_quant.ggml_type = gate_up_ggml_type;
+        gate_up_quant.ne0 = gate_up_ne0;
+        gate_up_quant.ne1 = gate_up_ne1;
+        gate_up_quant.raw_bytes = gate_up_raw_bytes;
+
+        QuantizedWeightDesc down_quant;
+        down_quant.data = down_data;
+        down_quant.ggml_type = down_ggml_type;
+        down_quant.ne0 = down_ne0;
+        down_quant.ne1 = down_ne1;
+        down_quant.raw_bytes = down_raw_bytes;
+
+        return fused_ffn_act_project_quant_f32_impl(
+            output, input, norm_weight_data, norm_weight_count, eps,
+            gate_up_quant, down_quant, half_dim, act_type);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused FFN act-project.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused RMSNorm + residual add in one GGML graph:
+//   residual = residual + rms_norm(input, normW, eps)
+//
+// Gemma applies this "post-norm then residual add" pattern 3x per layer
+// (post-attention, post-FFN, post-PLE). On the GGML backend each was previously
+// two dispatches (Ops.RMSNorm + Ops.Add); this collapses them to one graph,
+// halving the dispatch + host round-trip count for those ops. residual and input
+// are distinct [rows, hidden] F32 tensors. Mirrors the MLX
+// (MlxFusedOps.TryRmsNormAddInPlace) and pure-CUDA (CudaFusedOps.TryRmsNormResidualAdd)
+// fused paths that the GGML backend lacked.
+// ============================================================================
+int fused_rms_norm_residual_add_f32_impl(
+    const TensorView2DDesc& residual_desc,
+    const TensorView2DDesc& input_desc,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps)
+{
+    if (!ensure_backend())
+        return 0;
+    if (!validate_desc(residual_desc, "residual") || !validate_desc(input_desc, "input"))
+        return 0;
+    if (norm_weight_data == nullptr || norm_weight_count <= 0)
+    {
+        set_last_error("fused_rms_norm_add: invalid norm weight.");
+        return 0;
+    }
+
+    const int rows = input_desc.dim0;
+    const int hidden = input_desc.dim1;
+    if (residual_desc.dim0 != rows || residual_desc.dim1 != hidden)
+    {
+        set_last_error("fused_rms_norm_add: residual/input shape mismatch.");
+        return 0;
+    }
+    if (norm_weight_count != hidden)
+    {
+        set_last_error("fused_rms_norm_add: norm_weight_count != hidden.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("fused_rms_norm_add: failed to create ggml context.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(input_desc) && can_map_standard_view(residual_desc);
+
+    TensorBinding residual_binding;
+    TensorBinding input_binding;
+    std::vector<float> packed_input;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t res_buf = nullptr;
+        ggml_backend_buffer_t inp_buf = nullptr;
+        const bool res_ok = create_binding_from_host_ptr_2d(context.value, g_backend, residual_desc, residual_binding, res_buf);
+        const bool inp_ok = res_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, inp_buf);
+        if (res_ok && inp_ok)
+        {
+            host_ptr_buffers.emplace_back(res_buf);
+            host_ptr_buffers.emplace_back(inp_buf);
+        }
+        else
+        {
+            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
+            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            use_zero_copy = false;
+            residual_binding = create_standard_binding(context.value, residual_desc);
+            input_binding = can_map_standard_view(input_desc)
+                ? create_standard_binding(context.value, input_desc)
+                : create_packed_standard_binding(context.value, input_desc, packed_input);
+        }
+    }
+    else
+    {
+        residual_binding = create_standard_binding(context.value, residual_desc);
+        input_binding = can_map_standard_view(input_desc)
+            ? create_standard_binding(context.value, input_desc)
+            : create_packed_standard_binding(context.value, input_desc, packed_input);
+    }
+
+    ggml_tensor* norm_w_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, norm_weight_count);
+    if (residual_binding.storage == nullptr || input_binding.storage == nullptr || norm_w_tensor == nullptr)
+    {
+        set_last_error("fused_rms_norm_add: failed to allocate ggml tensors.");
+        return 0;
+    }
+
+    // Norm weight host-ptr cache (stable pointer across calls).
+    bool norm_bound = false, norm_needs_upload = false;
+    std::size_t norm_bytes = static_cast<std::size_t>(norm_weight_count) * sizeof(float);
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && norm_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, norm_w_tensor, norm_weight_data, norm_bytes, buf, addr, norm_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, norm_w_tensor, addr);
+                norm_bound = (st == GGML_STATUS_SUCCESS);
+                if (!norm_bound) invalidate_cached_buffer(norm_weight_data);
+            }
+        }
+    }
+
+    ggml_tensor* contiguous_input = ggml_cont(context.value, input_binding.tensor);
+    ggml_tensor* contiguous_residual = ggml_cont(context.value, residual_binding.tensor);
+    ggml_tensor* normed = ggml_rms_norm(context.value, contiguous_input, eps);
+    ggml_tensor* scaled = ggml_mul(context.value, normed, norm_w_tensor);
+    ggml_tensor* scaled_flat = ggml_reshape_1d(context.value, scaled, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* added = ggml_add(context.value, res_flat, scaled_flat);
+    ggml_tensor* output = ggml_cpy(context.value, added, residual_binding.tensor);
+    if (output == nullptr)
+    {
+        set_last_error("fused_rms_norm_add: failed to create output cpy node.");
+        return 0;
+    }
+    ggml_set_output(output);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    ggml_build_forward_expand(graph, output);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("fused_rms_norm_add: failed to allocate backend buffer.");
+        return 0;
+    }
+
+    if (!use_zero_copy)
+    {
+        upload_binding(residual_binding, residual_desc.data, residual_binding.raw_bytes);
+        if (packed_input.empty())
+            upload_binding(input_binding, input_desc.data, input_binding.raw_bytes);
+        else
+            upload_binding(input_binding, packed_input.data(), input_binding.raw_bytes);
+    }
+    if (!norm_bound || norm_needs_upload)
+    {
+        TensorBinding tmp = { norm_w_tensor, norm_w_tensor, norm_bytes };
+        upload_binding(tmp, norm_weight_data, norm_bytes);
+    }
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("fused_rms_norm_add: graph execution failed.");
+        return 0;
+    }
+    finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_FusedRmsNormResidualAddF32(
+    TensorView2DDesc residual,
+    TensorView2DDesc input,
+    void* norm_weight_data,
+    int norm_weight_count,
+    float eps)
+{
+    try
+    {
+        return fused_rms_norm_residual_add_f32_impl(residual, input, norm_weight_data, norm_weight_count, eps);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused rms_norm residual add.");
+        return 0;
+    }
+}
+
+// ============================================================================
+// Fused Gemma Per-Layer-Embeddings (PLE) block in one GGML graph:
+//   residual += rms_norm( proj_W^T @ ( gelu(inp_gate_W^T @ residual) * perLayerInput ),
+//                         post_norm_W, eps )
+//
+// Collapses the PLE chain (inp_gate matmul → GELU·mul(perLayerInput) → proj matmul
+// → post_norm → residual add) — previously 4 GGML dispatches (the norm+add was
+// already fused) — into ONE graph, keeping the small [ple_dim, rows] intermediate
+// on-device. inp_gate_W is [hidden, ple_dim], proj_W is [ple_dim, hidden];
+// perLayerInput is [rows, ple_dim] F32. `residual` is both the inp_gate matmul
+// input and the accumulator — read via a contiguous copy made at graph head, so
+// the final cpy-back can't race the matmul read. gelu is the tanh approximation
+// (Gemma's gelu_pytorch_tanh), matching Ops.GELUMul.
+// ============================================================================
+int fused_ple_block_quant_f32_impl(
+    const TensorView2DDesc& residual_desc,
+    const TensorView2DDesc& per_layer_input_desc,
+    const QuantizedWeightDesc& inp_gate_quant,
+    const QuantizedWeightDesc& proj_quant,
+    void* post_norm_data,
+    int post_norm_count,
+    float eps)
+{
+    if (!ensure_backend())
+        return 0;
+    if (!validate_desc(residual_desc, "residual") || !validate_desc(per_layer_input_desc, "per_layer_input"))
+        return 0;
+    if (post_norm_data == nullptr || post_norm_count <= 0)
+    {
+        set_last_error("fused_ple: invalid post-norm weight.");
+        return 0;
+    }
+    if (inp_gate_quant.data == nullptr || inp_gate_quant.ne0 <= 0 || inp_gate_quant.ne1 <= 0 || inp_gate_quant.raw_bytes <= 0 ||
+        proj_quant.data == nullptr || proj_quant.ne0 <= 0 || proj_quant.ne1 <= 0 || proj_quant.raw_bytes <= 0)
+    {
+        set_last_error("fused_ple: invalid weight descriptor.");
+        return 0;
+    }
+
+    const int rows = residual_desc.dim0;
+    const int hidden = residual_desc.dim1;
+    const int ple_dim = per_layer_input_desc.dim1;
+    if (per_layer_input_desc.dim0 != rows)
+    {
+        set_last_error("fused_ple: per_layer_input row count mismatch.");
+        return 0;
+    }
+    if (inp_gate_quant.ne0 != hidden || inp_gate_quant.ne1 != ple_dim ||
+        proj_quant.ne0 != ple_dim || proj_quant.ne1 != hidden || post_norm_count != hidden)
+    {
+        set_last_error("fused_ple: weight shape mismatch.");
+        return 0;
+    }
+
+    const std::size_t ctx_size = 2 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("fused_ple: failed to create ggml context.");
+        return 0;
+    }
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(residual_desc) && can_map_standard_view(per_layer_input_desc);
+
+    TensorBinding residual_binding;
+    TensorBinding pli_binding;
+    std::vector<float> packed_pli;
+
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t res_buf = nullptr;
+        ggml_backend_buffer_t pli_buf = nullptr;
+        const bool res_ok = create_binding_from_host_ptr_2d(context.value, g_backend, residual_desc, residual_binding, res_buf);
+        const bool pli_ok = res_ok && create_binding_from_host_ptr_2d(context.value, g_backend, per_layer_input_desc, pli_binding, pli_buf);
+        if (res_ok && pli_ok)
+        {
+            host_ptr_buffers.emplace_back(res_buf);
+            host_ptr_buffers.emplace_back(pli_buf);
+        }
+        else
+        {
+            if (pli_buf != nullptr) ggml_backend_buffer_free(pli_buf);
+            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            use_zero_copy = false;
+            residual_binding = create_standard_binding(context.value, residual_desc);
+            pli_binding = can_map_standard_view(per_layer_input_desc)
+                ? create_standard_binding(context.value, per_layer_input_desc)
+                : create_packed_standard_binding(context.value, per_layer_input_desc, packed_pli);
+        }
+    }
+    else
+    {
+        residual_binding = create_standard_binding(context.value, residual_desc);
+        pli_binding = can_map_standard_view(per_layer_input_desc)
+            ? create_standard_binding(context.value, per_layer_input_desc)
+            : create_packed_standard_binding(context.value, per_layer_input_desc, packed_pli);
+    }
+
+    ggml_tensor* post_norm_tensor = ggml_new_tensor_1d(context.value, GGML_TYPE_F32, post_norm_count);
+    ggml_type inp_gate_type = static_cast<ggml_type>(inp_gate_quant.ggml_type);
+    ggml_tensor* inp_gate_tensor = ggml_new_tensor_2d(context.value, inp_gate_type, inp_gate_quant.ne0, inp_gate_quant.ne1);
+    TensorBinding inp_gate_binding = { inp_gate_tensor, inp_gate_tensor, static_cast<std::size_t>(inp_gate_quant.raw_bytes) };
+    ggml_type proj_type = static_cast<ggml_type>(proj_quant.ggml_type);
+    ggml_tensor* proj_tensor = ggml_new_tensor_2d(context.value, proj_type, proj_quant.ne0, proj_quant.ne1);
+    TensorBinding proj_binding = { proj_tensor, proj_tensor, static_cast<std::size_t>(proj_quant.raw_bytes) };
+
+    if (residual_binding.storage == nullptr || pli_binding.storage == nullptr ||
+        post_norm_tensor == nullptr || inp_gate_tensor == nullptr || proj_tensor == nullptr)
+    {
+        set_last_error("fused_ple: failed to allocate ggml tensors.");
+        return 0;
+    }
+
+    auto try_cache_quant = [](ggml_tensor* t, const QuantizedWeightDesc& q, bool& bound, bool& needs_upload) {
+        bound = false; needs_upload = false;
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev == nullptr || q.raw_bytes < 4096) return;
+        ggml_backend_buffer_t buf = nullptr; void* addr = nullptr;
+        if (try_get_cacheable_tensor_buffer(g_backend, dev, t, q.data, static_cast<std::size_t>(q.raw_bytes), buf, addr, needs_upload))
+        {
+            ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+            bound = (st == GGML_STATUS_SUCCESS);
+            if (!bound) invalidate_cached_buffer(q.data);
+        }
+    };
+    bool inp_gate_bound = false, inp_gate_needs_upload = false;
+    try_cache_quant(inp_gate_tensor, inp_gate_quant, inp_gate_bound, inp_gate_needs_upload);
+    bool proj_bound = false, proj_needs_upload = false;
+    try_cache_quant(proj_tensor, proj_quant, proj_bound, proj_needs_upload);
+
+    bool norm_bound = false, norm_needs_upload = false;
+    std::size_t norm_bytes = static_cast<std::size_t>(post_norm_count) * sizeof(float);
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        if (dev != nullptr && norm_bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr; void* addr = nullptr;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, post_norm_tensor, post_norm_data, norm_bytes, buf, addr, norm_needs_upload))
+            {
+                ggml_status st = ggml_backend_tensor_alloc(buf, post_norm_tensor, addr);
+                norm_bound = (st == GGML_STATUS_SUCCESS);
+                if (!norm_bound) invalidate_cached_buffer(post_norm_data);
+            }
+        }
+    }
+
+    // Build graph.
+    ggml_tensor* contiguous_residual = ggml_cont(context.value, residual_binding.tensor);
+    ggml_tensor* res_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, contiguous_residual, hidden, 1)
+        : contiguous_residual;
+    ggml_tensor* gate = ggml_mul_mat(context.value, inp_gate_binding.tensor, res_2d); // [ple_dim, rows]
+    ggml_mul_mat_set_prec(gate, GGML_PREC_F32);
+    ggml_tensor* gate_gelu = ggml_gelu(context.value, gate);
+    ggml_tensor* glu = ggml_mul(context.value, gate_gelu, pli_binding.tensor);        // [ple_dim, rows]
+    ggml_tensor* glu_2d = (rows == 1)
+        ? ggml_reshape_2d(context.value, glu, ple_dim, 1)
+        : glu;
+    ggml_tensor* ple_proj = ggml_mul_mat(context.value, proj_binding.tensor, glu_2d); // [hidden, rows]
+    ggml_mul_mat_set_prec(ple_proj, GGML_PREC_F32);
+    ggml_tensor* normed = ggml_rms_norm(context.value, ple_proj, eps);
+    ggml_tensor* scaled = ggml_mul(context.value, normed, post_norm_tensor);
+    ggml_tensor* scaled_flat = ggml_reshape_1d(context.value, scaled, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* res_flat = ggml_reshape_1d(context.value, contiguous_residual, static_cast<int64_t>(rows) * hidden);
+    ggml_tensor* added = ggml_add(context.value, res_flat, scaled_flat);
+    ggml_tensor* output = ggml_cpy(context.value, added, residual_binding.tensor);
+    if (output == nullptr)
+    {
+        set_last_error("fused_ple: failed to create output cpy node.");
+        return 0;
+    }
+    ggml_set_output(output);
+
+    ggml_cgraph* graph = ggml_new_graph(context.value);
+    ggml_build_forward_expand(graph, output);
+
+    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    if (buffer.value == nullptr)
+    {
+        set_last_error("fused_ple: failed to allocate backend buffer.");
+        return 0;
+    }
+
+    if (!use_zero_copy)
+    {
+        upload_binding(residual_binding, residual_desc.data, residual_binding.raw_bytes);
+        if (packed_pli.empty())
+            upload_binding(pli_binding, per_layer_input_desc.data, pli_binding.raw_bytes);
+        else
+            upload_binding(pli_binding, packed_pli.data(), pli_binding.raw_bytes);
+    }
+    if (!inp_gate_bound || inp_gate_needs_upload)
+        upload_binding(inp_gate_binding, inp_gate_quant.data, inp_gate_binding.raw_bytes);
+    if (!proj_bound || proj_needs_upload)
+        upload_binding(proj_binding, proj_quant.data, proj_binding.raw_bytes);
+    if (!norm_bound || norm_needs_upload)
+    {
+        TensorBinding tmp = { post_norm_tensor, post_norm_tensor, norm_bytes };
+        upload_binding(tmp, post_norm_data, norm_bytes);
+    }
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS)
+    {
+        set_last_error("fused_ple: graph execution failed.");
+        return 0;
+    }
+    finalize_compute(use_zero_copy, residual_binding.storage, residual_desc.data, residual_binding.raw_bytes);
+
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_FusedPleBlockQuantF32(
+    TensorView2DDesc residual,
+    TensorView2DDesc per_layer_input,
+    void* inp_gate_data, int inp_gate_ggml_type, std::int64_t inp_gate_ne0, std::int64_t inp_gate_ne1, std::int64_t inp_gate_raw_bytes,
+    void* proj_data, int proj_ggml_type, std::int64_t proj_ne0, std::int64_t proj_ne1, std::int64_t proj_raw_bytes,
+    void* post_norm_data, int post_norm_count, float eps)
+{
+    try
+    {
+        QuantizedWeightDesc inp_gate_quant;
+        inp_gate_quant.data = inp_gate_data;
+        inp_gate_quant.ggml_type = inp_gate_ggml_type;
+        inp_gate_quant.ne0 = inp_gate_ne0;
+        inp_gate_quant.ne1 = inp_gate_ne1;
+        inp_gate_quant.raw_bytes = inp_gate_raw_bytes;
+
+        QuantizedWeightDesc proj_quant;
+        proj_quant.data = proj_data;
+        proj_quant.ggml_type = proj_ggml_type;
+        proj_quant.ne0 = proj_ne0;
+        proj_quant.ne1 = proj_ne1;
+        proj_quant.raw_bytes = proj_raw_bytes;
+
+        return fused_ple_block_quant_f32_impl(
+            residual, per_layer_input, inp_gate_quant, proj_quant, post_norm_data, post_norm_count, eps);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in fused PLE block.");
         return 0;
     }
 }

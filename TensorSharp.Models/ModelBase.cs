@@ -1966,6 +1966,111 @@ namespace TensorSharp.Models
             return down;
         }
 
+        /// <summary>
+        /// Dense SwiGLU FFN block (pre-norm + gate/up + SiLU·mul + down + residual add)
+        /// collapsed into a single GGML graph dispatch via <c>FusedFFNSwiGLUQuant</c>:
+        ///   residual += down_W^T @ ( silu(gate) * up ),  [gate|up] = gateUp_W^T @ rmsnorm(residual, normW)
+        ///
+        /// On the GGML CUDA backend each op keeps its tensors in host memory and
+        /// uploads inputs / downloads outputs across PCIe per dispatch, so the
+        /// unfused chain ping-pongs the large [tokens, 2·intermediate] activation
+        /// (e.g. 114 MB for a 1024-token chunk) host↔device three times per layer.
+        /// Fusing keeps that intermediate resident on the device; only the small
+        /// [tokens, hidden] residual crosses the bus. This is the dominant prefill
+        /// cost in the batched paths (matches the legacy per-sequence fast path in
+        /// Qwen35Model.FFNCachedFused).
+        ///
+        /// Returns false — leaving <paramref name="residual"/> untouched — when the
+        /// backend, weight quantization, or layout does not qualify; callers must
+        /// then run the unfused norm+FFN+add chain.
+        /// </summary>
+        // A/B switch: TS_DISABLE_FUSED_DENSE_FFN=1 forces the unfused norm+FFN+add
+        // chain so the fused vs unfused paths can be compared on the same build.
+        private static readonly bool _disableFusedDenseFFN =
+            Environment.GetEnvironmentVariable("TS_DISABLE_FUSED_DENSE_FFN") is string s
+            && (s == "1" || string.Equals(s, "true", StringComparison.OrdinalIgnoreCase));
+
+        protected bool TryFusedDenseSwiGLUFFNInto(
+            Tensor residual, string normWeightName, string gateUpWeightName, string downWeightName)
+        {
+            if (_disableFusedDenseFFN)
+                return false;
+            if (!IsGgmlBackend || residual == null || residual.DimensionCount != 2)
+                return false;
+            if (!_quantWeights.TryGetValue(gateUpWeightName, out var gateUpQW) || gateUpQW == null)
+                return false;
+            if (!_quantWeights.TryGetValue(downWeightName, out var downQW) || downQW == null)
+                return false;
+            if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
+                return false;
+
+            int intermSize = Config.IntermediateSize;
+            int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
+            long hidden = residual.Sizes[1];
+            if (halfDim <= 0
+                || gateUpQW.Ne1 != 2L * halfDim
+                || gateUpQW.Ne0 != hidden
+                || downQW.Ne0 != halfDim
+                || downQW.Ne1 != hidden)
+                return false;
+
+            long t0 = Stopwatch.GetTimestamp();
+            GgmlBasicOps.FusedFFNSwiGLUQuant(residual, residual, normW, Config.Eps,
+                gateUpQW.CacheKey, gateUpQW.GgmlType, gateUpQW.Ne0, gateUpQW.Ne1, gateUpQW.RawBytes,
+                downQW.CacheKey, downQW.GgmlType, downQW.Ne0, downQW.Ne1, downQW.RawBytes,
+                halfDim);
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+            return true;
+        }
+
+        /// <summary>
+        /// Fused dense FFN <em>projection</em> (pre-norm + gate/up + activation·mul + down)
+        /// in one GGML graph, returning the FFN output instead of folding it into a
+        /// residual. For models that apply a post-FFN norm to the output before the
+        /// residual add (Gemma 4's <c>post_ffw_norm</c>), the caller runs that norm + add
+        /// on the small returned tensor while the large [tokens, 2·intermediate] gate_up
+        /// intermediate stays resident on the device — the dominant batched/legacy prefill
+        /// cost on GGML CUDA. <paramref name="actType"/>: 0 = SiLU (SwiGLU), 1 = GELU tanh
+        /// (GeGLU). The fused rms_norm uses the same loaded weight as <see cref="RMSNormOp"/>,
+        /// so the result is numerically identical to the unfused chain.
+        ///
+        /// Returns the FFN output, or null (caller must run the unfused path) when the
+        /// backend, quantization, or layout does not qualify.
+        /// </summary>
+        protected Tensor TryFusedDenseFFNProject(
+            Tensor input, string normWeightName, string gateUpWeightName, string downWeightName, int actType)
+        {
+            if (_disableFusedDenseFFN)
+                return null;
+            if (!IsGgmlBackend || input == null || input.DimensionCount != 2)
+                return null;
+            if (!_quantWeights.TryGetValue(gateUpWeightName, out var gateUpQW) || gateUpQW == null)
+                return null;
+            if (!_quantWeights.TryGetValue(downWeightName, out var downQW) || downQW == null)
+                return null;
+            if (!_weights.TryGetValue(normWeightName, out var normW) || normW == null)
+                return null;
+
+            int intermSize = Config.IntermediateSize;
+            int halfDim = intermSize > 0 ? intermSize : (int)(gateUpQW.Ne1 / 2);
+            long hidden = input.Sizes[1];
+            if (halfDim <= 0
+                || gateUpQW.Ne1 != 2L * halfDim
+                || gateUpQW.Ne0 != hidden
+                || downQW.Ne0 != halfDim
+                || downQW.Ne1 != hidden)
+                return null;
+
+            long t0 = Stopwatch.GetTimestamp();
+            var output = new Tensor(_allocator, DType.Float32, input.Sizes[0], hidden);
+            GgmlBasicOps.FusedFFNActProjectQuant(output, input, normW, Config.Eps,
+                gateUpQW.CacheKey, gateUpQW.GgmlType, gateUpQW.Ne0, gateUpQW.Ne1, gateUpQW.RawBytes,
+                downQW.CacheKey, downQW.GgmlType, downQW.Ne0, downQW.Ne1, downQW.RawBytes,
+                halfDim, actType);
+            _linearTicks += Stopwatch.GetTimestamp() - t0;
+            return output;
+        }
+
 
         protected void RMSNormInPlace(Tensor data, Tensor alpha, int numHeads, int headDim, float eps)
         {

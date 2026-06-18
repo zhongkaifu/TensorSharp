@@ -456,7 +456,13 @@ namespace TensorSharp.Runtime.Scheduling
         private void CacheFullBlocksForSequence(SequenceState seq)
         {
             if (!PrefixCachingActive) return;
-            int curFull = seq.NumComputedTokens / _cfg.BlockSize;
+            // Hash only over positions that actually exist in the token list.
+            // A speculative step that hit a mid-batch stop can leave
+            // NumComputedTokens ahead of NumTotalTokens (the dropped tail's
+            // K/V was committed but its tokens were truncated); clamping keeps
+            // ComputeHashesForPrefix from indexing past the end of the list.
+            int committed = Math.Min(seq.NumComputedTokens, seq.NumTotalTokens);
+            int curFull = committed / _cfg.BlockSize;
             if (curFull == 0) return;
             int allTokensCovered = curFull * _cfg.BlockSize;
             var hashes = ComputeHashesForPrefix(seq, allTokensCovered);

@@ -106,6 +106,87 @@ public class Gemma4MtpTests
             $"draft acceptance {spec.AcceptanceRate:P0} too low — draft head likely mis-wired");
     }
 
+    // Long-prompt prefill OOM repro / fix-validation on the STANDALONE linear-cache
+    // path (no paged-block ceiling, so the whole long prompt actually prefills).
+    // With MTP a long prompt used to route its prefill through the fused verify
+    // kernel, which materializes a [totalSeqLen, seqLen, numHeads] global-attention
+    // score tensor (tens of GB) and CUDA-OOMs ("allocating 23104.00 MiB ... out of
+    // memory"). The fix routes the prefill through the same fast chunked flash path
+    // ForwardRefill uses. This test prefills + generates with MTP and asserts it
+    // completes (no OOM), that prefill time matches the non-MTP baseline (the fix is
+    // high-performance, not just a slow fallback), and that the greedy output tracks
+    // the baseline for a healthy prefix.
+    //   TS_GMTP_E2E=1 TS_GMTP_LONGPROMPT=1 TS_GMTP_BACKEND=ggml_cuda
+    //   TS_GMTP_PROMPT_FILE=<long.txt> [TS_GMTP_NEW_TOKENS=48] [TS_GMTP_DRAFT_N=6]
+    [Fact]
+    public void Gemma4Mtp_LongPromptPrefill_NoOom()
+    {
+        if (!TryResolveModels(out string targetPath, out string draftPath) ||
+            Environment.GetEnvironmentVariable("TS_GMTP_LONGPROMPT") != "1")
+        { _output.WriteLine("[gmtp-long] set TS_GMTP_LONGPROMPT=1 (and TS_GMTP_E2E=1) to run; skipping"); return; }
+
+        int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 48);
+        int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 6);
+
+        _output.WriteLine($"[gmtp-long] target={Path.GetFileName(targetPath)} backend={ResolveBackend()}");
+        using var model = (Gemma4Model)ModelBase.Create(targetPath, ResolveBackend());
+        model.LoadMtpDraftWeights(draftPath);
+        Xunit.Assert.True(model.HasMtp);
+
+        string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
+        string promptFile = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT_FILE");
+        if (string.IsNullOrEmpty(prompt) && !string.IsNullOrEmpty(promptFile) && File.Exists(promptFile))
+            prompt = File.ReadAllText(promptFile);
+        Xunit.Assert.False(string.IsNullOrEmpty(prompt), "set TS_GMTP_PROMPT_FILE to a long prompt");
+        int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: true).ToArray();
+        _output.WriteLine($"[gmtp-long] prompt={tokens.Length} tok, gen={maxNew}, draft window={maxDraft}");
+
+        // Baseline: the non-MTP path the user runs with MTP disabled (chunked flash
+        // ForwardRefill prefill + fused single-token decode). This always worked.
+        model.ResetKVCache();
+        var swBasePrefill = Stopwatch.StartNew();
+        float[] logits = model.ForwardRefill(tokens);
+        swBasePrefill.Stop();
+        var baseline = new List<int>();
+        int tb = Argmax(logits);
+        baseline.Add(tb);
+        for (int i = 1; i < maxNew; i++) { logits = model.Forward(new[] { tb }); tb = Argmax(logits); baseline.Add(tb); }
+        _output.WriteLine($"[gmtp-long] baseline (MTP off): prefill {swBasePrefill.Elapsed.TotalSeconds:F2}s, " +
+            $"first tokens [{string.Join(",", baseline.Take(8))}]");
+
+        // Spec: MTP through the standalone linear-cache decoder. Pre-fix this OOM'd
+        // during the prompt prefill; post-fix it must complete. Match the prefill
+        // chunk size to the baseline's ForwardRefill chunk (the server's default,
+        // 1024) so the prefill-time comparison is apples-to-apples.
+        var spec = new MtpSpeculativeDecoder(model, maxDraft)
+        {
+            PrefillChunkSize = EnvInt("TS_GMTP_PREFILL_CHUNK", 1024),
+        };
+        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
+        _output.WriteLine($"[gmtp-long] spec   (MTP on):  prefill {spec.LastPrefillSeconds:F2}s, decode " +
+            $"{spec.LastDecodeSeconds:F2}s, acceptance {spec.AcceptanceRate:P0} ({spec.TokensAccepted}/{spec.TokensDrafted})");
+        _output.WriteLine($"[gmtp-long] spec first tokens [{string.Join(",", specTokens.Take(8))}]");
+
+        int cmp = Math.Min(baseline.Count, specTokens.Count);
+        int match = 0;
+        while (match < cmp && baseline[match] == specTokens[match]) match++;
+        _output.WriteLine($"[gmtp-long] baseline/spec prefix match {match}/{cmp}");
+        double prefillRatio = spec.LastPrefillSeconds / Math.Max(1e-6, swBasePrefill.Elapsed.TotalSeconds);
+        _output.WriteLine($"[gmtp-long] prefill time ratio spec/baseline {prefillRatio:F2}x");
+
+        // The whole point: MTP must speculate (drafted>0) and complete without OOM.
+        Xunit.Assert.True(spec.TokensDrafted > 0, "spec never drafted — MTP not engaged");
+        Xunit.Assert.True(specTokens.Count >= Math.Min(8, maxNew), "spec generation did not progress");
+        // The fix reuses the SAME prefill machinery as the baseline, so the first
+        // generated token (identical prefill + identical fused last-token decode)
+        // must match exactly; later tokens may diverge on verify-kernel FP near-ties.
+        Xunit.Assert.True(match >= 1, $"first token diverged (baseline {baseline[0]} vs spec {specTokens[0]})");
+        // Prefill must be in the same ballpark as the non-MTP path (not a 3x-slower
+        // per-op fallback). Generous bound to absorb warmup / measurement noise.
+        Xunit.Assert.True(prefillRatio < 2.0,
+            $"MTP prefill {spec.LastPrefillSeconds:F2}s vs baseline {swBasePrefill.Elapsed.TotalSeconds:F2}s — too slow");
+    }
+
     [Fact]
     public void Gemma4Mtp_PerfBench_SpecVsBaseline()
     {
@@ -207,6 +288,9 @@ public class Gemma4MtpTests
         Xunit.Assert.True(model.HasMtp);
 
         string prompt = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT");
+        string promptFile = Environment.GetEnvironmentVariable("TS_GMTP_PROMPT_FILE");
+        if (string.IsNullOrEmpty(prompt) && !string.IsNullOrEmpty(promptFile) && File.Exists(promptFile))
+            prompt = File.ReadAllText(promptFile);
         if (string.IsNullOrEmpty(prompt))
             prompt = "The capital of France is Paris. The capital of Japan is Tokyo. " +
                         "The capital of Italy is";
@@ -230,7 +314,11 @@ public class Gemma4MtpTests
                 MaxNumBatchedTokens = 1024,
                 MaxNumRunningSequences = 1,
                 MaxPrefillChunkSize = 512,
-                EnablePrefixCaching = false,
+                // Mirror the server (prefix caching on) when requested so the
+                // bench exercises the real finish path — a speculative batch
+                // that hits EOS mid-window leaves committed > total, which the
+                // scheduler's prefix-cache block registration must tolerate.
+                EnablePrefixCaching = Environment.GetEnvironmentVariable("TS_GMTP_PREFIX_CACHE") == "1",
                 DecodeQuantumTokens = 1,
             };
             using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);

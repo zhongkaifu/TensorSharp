@@ -764,6 +764,59 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Fused RMSNorm + residual add in a single GGML graph dispatch:
+        /// residual += rms_norm(input, normWeight, eps). <paramref name="residual"/> and
+        /// <paramref name="input"/> are distinct 2D Float32 tensors. Collapses the
+        /// Ops.RMSNorm + Ops.Add pair (Gemma's 3 post-norm-add sites per layer) into one
+        /// dispatch on the GGML backend, mirroring the MLX / pure-CUDA fused paths.
+        /// </summary>
+        public static void RmsNormResidualAdd(Tensor residual, Tensor input, Tensor normWeight, float eps)
+        {
+            if (residual.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("RmsNormResidualAdd requires 2D tensors.");
+            if (input.ElementType != DType.Float32 || residual.ElementType != DType.Float32 || normWeight.ElementType != DType.Float32)
+                throw new ArgumentException("RmsNormResidualAdd requires Float32 tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(residual) || !HasNativeBufferStorage(normWeight))
+                throw new ArgumentException("RmsNormResidualAdd requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("RmsNormResidualAdd requires supported layouts.");
+
+            GgmlNative.FusedRmsNormResidualAdd(residualView, inputView,
+                GetBufferStart(normWeight), (int)normWeight.ElementCount(), eps);
+        }
+
+        /// <summary>
+        /// Fused Gemma Per-Layer-Embeddings block in one GGML graph:
+        ///   residual += rms_norm(proj_W^T @ (gelu(inp_gate_W^T @ residual) * perLayerInput), postNorm).
+        /// inp_gate is [hidden, ple_dim], proj is [ple_dim, hidden]; perLayerInput is
+        /// [rows, ple_dim] F32. Collapses the PLE matmul/gelu/mul/proj/norm/add chain
+        /// into one dispatch. residual is the inp_gate input AND the accumulator.
+        /// </summary>
+        public static void FusedPleBlockQuant(Tensor residual, Tensor perLayerInput,
+            IntPtr inpGateData, int inpGateGgmlType, long inpGateNe0, long inpGateNe1, long inpGateRawBytes,
+            IntPtr projData, int projGgmlType, long projNe0, long projNe1, long projRawBytes,
+            Tensor postNorm, float eps)
+        {
+            if (residual.DimensionCount != 2 || perLayerInput.DimensionCount != 2)
+                throw new ArgumentException("FusedPleBlockQuant requires 2D residual/perLayerInput tensors.");
+            if (residual.ElementType != DType.Float32 || perLayerInput.ElementType != DType.Float32 || postNorm.ElementType != DType.Float32)
+                throw new ArgumentException("FusedPleBlockQuant requires Float32 residual/perLayerInput/postNorm.");
+            if (!HasNativeBufferStorage(residual) || !HasNativeBufferStorage(perLayerInput) || !HasNativeBufferStorage(postNorm))
+                throw new ArgumentException("FusedPleBlockQuant requires native-backed tensors.");
+
+            if (!TryCreateStandardView(residual, out GgmlTensorView2D residualView)
+                || !TryCreateRawView(perLayerInput, out GgmlTensorView2D pliView))
+                throw new NotSupportedException("FusedPleBlockQuant requires supported tensor layouts.");
+
+            GgmlNative.FusedPleBlockQuant(residualView, pliView,
+                inpGateData, inpGateGgmlType, inpGateNe0, inpGateNe1, inpGateRawBytes,
+                projData, projGgmlType, projNe0, projNe1, projRawBytes,
+                GetBufferStart(postNorm), (int)postNorm.ElementCount(), eps);
+        }
+
+        /// <summary>
         /// Fully fused dense SwiGLU FFN with residual add in a single GGML graph dispatch.
         /// residual += down_W^T @ ( silu(gate_part) * up_part ),
         ///   where [gate_part | up_part] = gate_up_W^T @ rms_norm(input, normW, eps).
@@ -795,6 +848,41 @@ namespace TensorSharp.GGML
                 gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
                 downData, downGgmlType, downNe0, downNe1, downRawBytes,
                 halfDim);
+        }
+
+        /// <summary>
+        /// Fused dense FFN projection (no residual fold) in a single GGML graph dispatch:
+        ///   output = down_W^T @ ( act(gate_part) * up_part ),
+        ///   where [gate_part | up_part] = gate_up_W^T @ rms_norm(input, normW, eps).
+        /// <paramref name="actType"/>: 0 = SiLU (SwiGLU), 1 = GELU tanh (GeGLU, Gemma 4).
+        /// Unlike <see cref="FusedFFNSwiGLUQuant"/> this writes the projection to a
+        /// separate <paramref name="output"/> tensor so callers can apply a post-FFN norm
+        /// before the residual add (Gemma 4). Keeps the large gate_up intermediate on-device.
+        /// </summary>
+        public static void FusedFFNActProjectQuant(Tensor output, Tensor input,
+            Tensor normWeight, float eps,
+            IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
+            int halfDim, int actType)
+        {
+            if (output.DimensionCount != 2 || input.DimensionCount != 2)
+                throw new ArgumentException("FusedFFNActProjectQuant requires 2D output/input tensors.");
+            if (input.ElementType != DType.Float32 || output.ElementType != DType.Float32 || normWeight.ElementType != DType.Float32)
+                throw new ArgumentException("FusedFFNActProjectQuant requires Float32 tensors.");
+            if (!HasNativeBufferStorage(input) || !HasNativeBufferStorage(output) || !HasNativeBufferStorage(normWeight))
+                throw new ArgumentException("FusedFFNActProjectQuant requires native-backed tensors.");
+
+            if (!TryCreateStandardView(output, out GgmlTensorView2D outputView)
+                || !TryCreateRawView(input, out GgmlTensorView2D inputView))
+                throw new NotSupportedException("FusedFFNActProjectQuant requires supported tensor layouts.");
+
+            int normCount = (int)normWeight.ElementCount();
+            IntPtr normPtr = GetBufferStart(normWeight);
+
+            GgmlNative.FusedFFNActProjectQuant(outputView, inputView, normPtr, normCount, eps,
+                gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
+                downData, downGgmlType, downNe0, downNe1, downRawBytes,
+                halfDim, actType);
         }
 
         /// <summary>
@@ -1526,6 +1614,42 @@ namespace TensorSharp.GGML
                 numHeads, numKvHeads, headDim,
                 seqLen, kvLen,
                 maskStartPos, slidingWindow, scale, inputFormat);
+        }
+
+        /// <summary>
+        /// Fused prefill attention that reads K/V straight from an F16 cache (no host
+        /// F16→F32 dequant). Q and output are Float32 head-first; <paramref name="kCache"/>
+        /// / <paramref name="vCache"/> are the persistent Float16 cache tensors laid out
+        /// [numKvHeads, kvCacheLen, headDim], of which the leading <paramref name="kvLen"/>
+        /// rows are attended. Numerically identical to dequantizing to F32 first
+        /// (mul_mat accumulates in F32), but skips the per-chunk dequant round-trip and
+        /// halves the K/V upload. Q is head-first [numHeads, seqLen, headDim].
+        /// </summary>
+        public static void FusedPrefillAttentionF16KV(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen, int kvCacheLen,
+            int maskStartPos, int slidingWindow, float scale)
+        {
+            if (q == null) throw new ArgumentNullException(nameof(q));
+            if (kCache == null) throw new ArgumentNullException(nameof(kCache));
+            if (vCache == null) throw new ArgumentNullException(nameof(vCache));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (q.ElementType != DType.Float32 || output.ElementType != DType.Float32)
+                throw new ArgumentException("FusedPrefillAttentionF16KV requires Float32 Q and output.");
+            if (kCache.ElementType != DType.Float16 || vCache.ElementType != DType.Float16)
+                throw new ArgumentException(
+                    $"FusedPrefillAttentionF16KV requires Float16 K/V cache but got K={kCache.ElementType}, V={vCache.ElementType}.");
+
+            IntPtr qPtr = GetBufferStart(q);
+            IntPtr kPtr = GetBufferStart(kCache);
+            IntPtr vPtr = GetBufferStart(vCache);
+            IntPtr outPtr = GetBufferStart(output);
+
+            GgmlNative.FusedPrefillAttentionF16KV(
+                qPtr, kPtr, vPtr, outPtr,
+                numHeads, numKvHeads, headDim,
+                seqLen, kvLen, kvCacheLen,
+                maskStartPos, slidingWindow, scale);
         }
 
         /// <summary>

@@ -565,9 +565,21 @@ namespace TensorSharp.Models
             if (normed2 == null)
             {
                 Ops.Add(hidden, hidden, attnOut);
+                attnOut.Dispose();
+
+                // GGML fused dense SwiGLU FFN (norm + gate/up + SiLU·mul + down +
+                // residual) in one graph, keeping the large intermediate on-device.
+                // This is the legacy/per-sequence path used by the CLI and the
+                // server's per-seq fallback; the batched path fuses separately.
+                if (TryFusedDenseSwiGLUFFNInto(hidden, wn[ffnNormIdx], wn[gateUpIdx], wn[downIdx]))
+                    return hidden;
+
                 normed2 = RMSNormOp(hidden, wn[ffnNormIdx]);
             }
-            attnOut.Dispose();
+            else
+            {
+                attnOut.Dispose();
+            }
 
             Tensor ffnOut = FFN(normed2, wn[gateUpIdx], wn[downIdx], seqLen);
             normed2.Dispose();

@@ -431,6 +431,42 @@ internal enum GgmlIndexReductionOp
             int halfDim);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedFFNActProjectQuantF32(
+            GgmlTensorView2D output,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps,
+            IntPtr gateUpData,
+            int gateUpGgmlType,
+            long gateUpNe0,
+            long gateUpNe1,
+            long gateUpRawBytes,
+            IntPtr downData,
+            int downGgmlType,
+            long downNe0,
+            long downNe1,
+            long downRawBytes,
+            int halfDim,
+            int actType);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedRmsNormResidualAddF32(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedPleBlockQuantF32(
+            GgmlTensorView2D residual,
+            GgmlTensorView2D perLayerInput,
+            IntPtr inpGateData, int inpGateGgmlType, long inpGateNe0, long inpGateNe1, long inpGateRawBytes,
+            IntPtr projData, int projGgmlType, long projNe0, long projNe1, long projRawBytes,
+            IntPtr postNormData, int postNormCount, float eps);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FusedOutProjNormRouterQuantF32(
             GgmlTensorView2D residual, GgmlTensorView2D input,
             IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outBytes,
@@ -841,6 +877,14 @@ internal enum GgmlIndexReductionOp
             int seqLen, int kvLen,
             int maskStartPos, int slidingWindow,
             float scale, int inputFormat);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedPrefillAttentionF16KV(
+            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen, int kvCacheLen,
+            int maskStartPos, int slidingWindow,
+            float scale);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FlashAttnDecodeF32(
@@ -1726,6 +1770,45 @@ internal enum GgmlIndexReductionOp
                 halfDim), "fused_ffn_swiglu_quant");
         }
 
+        public static void FusedFFNActProjectQuant(
+            GgmlTensorView2D output,
+            GgmlTensorView2D input,
+            IntPtr normWeightData,
+            int normWeightCount,
+            float eps,
+            IntPtr gateUpData, int gateUpGgmlType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
+            IntPtr downData, int downGgmlType, long downNe0, long downNe1, long downRawBytes,
+            int halfDim,
+            int actType)
+        {
+            CheckResult(TSGgml_FusedFFNActProjectQuantF32(
+                output, input, normWeightData, normWeightCount, eps,
+                gateUpData, gateUpGgmlType, gateUpNe0, gateUpNe1, gateUpRawBytes,
+                downData, downGgmlType, downNe0, downNe1, downRawBytes,
+                halfDim, actType), "fused_ffn_act_project_quant");
+        }
+
+        public static void FusedRmsNormResidualAdd(
+            GgmlTensorView2D residual, GgmlTensorView2D input,
+            IntPtr normWeightData, int normWeightCount, float eps)
+        {
+            CheckResult(TSGgml_FusedRmsNormResidualAddF32(
+                residual, input, normWeightData, normWeightCount, eps), "fused_rms_norm_residual_add");
+        }
+
+        public static void FusedPleBlockQuant(
+            GgmlTensorView2D residual, GgmlTensorView2D perLayerInput,
+            IntPtr inpGateData, int inpGateGgmlType, long inpGateNe0, long inpGateNe1, long inpGateRawBytes,
+            IntPtr projData, int projGgmlType, long projNe0, long projNe1, long projRawBytes,
+            IntPtr postNormData, int postNormCount, float eps)
+        {
+            CheckResult(TSGgml_FusedPleBlockQuantF32(
+                residual, perLayerInput,
+                inpGateData, inpGateGgmlType, inpGateNe0, inpGateNe1, inpGateRawBytes,
+                projData, projGgmlType, projNe0, projNe1, projRawBytes,
+                postNormData, postNormCount, eps), "fused_ple_block_quant");
+        }
+
         public static void FusedOutProjNormRouter(
             GgmlTensorView2D residual, GgmlTensorView2D input,
             IntPtr outProjData, int outProjType, long outNe0, long outNe1, long outBytes,
@@ -2234,6 +2317,19 @@ internal enum GgmlIndexReductionOp
                 numHeads, numKvHeads, headDim,
                 seqLen, kvLen,
                 maskStartPos, slidingWindow, scale, inputFormat), "fused_prefill_attention");
+        }
+
+        public static void FusedPrefillAttentionF16KV(
+            IntPtr qData, IntPtr kData, IntPtr vData, IntPtr outData,
+            int numHeads, int numKvHeads, int headDim,
+            int seqLen, int kvLen, int kvCacheLen,
+            int maskStartPos, int slidingWindow, float scale)
+        {
+            CheckResult(TSGgml_FusedPrefillAttentionF16KV(
+                qData, kData, vData, outData,
+                numHeads, numKvHeads, headDim,
+                seqLen, kvLen, kvCacheLen,
+                maskStartPos, slidingWindow, scale), "fused_prefill_attention_f16kv");
         }
 
         public static void FlashAttnDecode(

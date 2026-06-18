@@ -155,6 +155,19 @@ namespace TensorSharp.Models
         // idle (~60% util) for MoE Gemma 4. Disable via TS_GEMMA4_MOE_MODEL_DECODE=0.
         private static readonly bool s_MoeModelDecodeEnabled =
             Environment.GetEnvironmentVariable("TS_GEMMA4_MOE_MODEL_DECODE") != "0";
+
+        // Flash attention for the global-layer chunk-2+ (linear-cache) prefill path
+        // on GGML backends, replacing the materialized [numHeads, seqLen, kvLen]
+        // score-matrix path. TS_GEMMA4_FLASH_GLOBAL=0 forces the legacy materialized
+        // path (A/B / debugging). See FullAttention.
+        private static readonly bool _gemma4FlashGlobalChunk =
+            Environment.GetEnvironmentVariable("TS_GEMMA4_FLASH_GLOBAL") != "0";
+
+        // Read K/V straight from the F16 cache (no per-chunk F16->F32 dequant) in the
+        // global-chunk flash path. TS_GEMMA4_FLASH_F16KV=0 forces the F32-dequant
+        // path (A/B). See FullAttention.
+        private static readonly bool _gemma4FlashF16KV =
+            Environment.GetEnvironmentVariable("TS_GEMMA4_FLASH_F16KV") != "0";
         private bool _canUseFusedMoEModelDecode;
         private bool _moeModelDecodeChecked;
         private bool _moeModelDecodeDisabled;
@@ -1523,6 +1536,22 @@ namespace TensorSharp.Models
             _pipelineNextPLE = null;
         }
 
+        // Bounded prefill chunk size. Bigger chunks amortize per-chunk overhead
+        // (RoPE table rebuild, mask construction, allocations, KV prev-window
+        // gather) but raise peak memory for the full-attention layers (their score
+        // tensor is ~numHeads × chunkLen × totalKvLen × 4B). Past 2048 the score
+        // tensor for the longest-context decode reaches hundreds of MB and starts
+        // thrashing the memory pool. Override via TS_PREFILL_CHUNK when tuning.
+        // Shared by ForwardRefill and the MTP speculative prefill (SpecForward).
+        internal int ComputePrefillChunkSize()
+        {
+            int prefillChunkSize = Math.Min(2048, Math.Max(_slidingWindow * 2, 1024));
+            string chunkOverride = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
+            if (!string.IsNullOrEmpty(chunkOverride) && int.TryParse(chunkOverride, out int chunkOv) && chunkOv > 0)
+                prefillChunkSize = chunkOv;
+            return prefillChunkSize;
+        }
+
         public override float[] ForwardRefill(int[] tokens)
         {
             if (tokens == null || tokens.Length <= 1 || !_canUseFusedDecode)
@@ -1544,10 +1573,7 @@ namespace TensorSharp.Models
             // tensor for the longest-context decode reaches hundreds of MB
             // and starts thrashing the memory pool. Override via
             // TS_PREFILL_CHUNK env var when tuning for unusual contexts.
-            int prefillChunkSize = Math.Min(2048, Math.Max(_slidingWindow * 2, 1024));
-            string chunkOverride = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
-            if (!string.IsNullOrEmpty(chunkOverride) && int.TryParse(chunkOverride, out int chunkOv) && chunkOv > 0)
-                prefillChunkSize = chunkOv;
+            int prefillChunkSize = ComputePrefillChunkSize();
             bool hasMultimodal = _pendingVisionEmbeddingsList.Count > 0
                               || _pendingAudioEmbeddingsList.Count > 0;
 
@@ -3061,6 +3087,10 @@ namespace TensorSharp.Models
             if (perLayerInput != null &&
                 (_weights.ContainsKey($"{prefix}.inp_gate.weight") || _quantWeights.ContainsKey($"{prefix}.inp_gate.weight")))
             {
+              // GGML fast path: the entire PLE block (inp_gate matmul + GELU·mul +
+              // proj matmul + post_norm + residual add) in one fused graph dispatch.
+              if (!TryFusedPleBlockGgml(result, perLayerInput, prefix))
+              {
                 Tensor gate = null;
 
                 // Phase 6h: fused Q8 matmul + GeluMul kernel. Saves one MLX
@@ -3111,6 +3141,7 @@ namespace TensorSharp.Models
                         }
                     }
                 }
+              }
             }
             if (prof) ProfMark(ref _profPleInjectTicks, pPleInject, result);
 
@@ -3923,6 +3954,16 @@ namespace TensorSharp.Models
             if (TryFFNGeluWithNormMlx(input, normWeightName, gateUpWeightName, downWeightName, seqLen, out var fused))
                 return fused;
 
+            // GGML fused GeGLU projection: norm + gate/up + GELU·mul + down in one
+            // graph, keeping the large [tokens, 2·intermediate] activation on-device
+            // (the dominant prefill cost on GGML CUDA). Returns the FFN output; the
+            // caller applies Gemma's post_ffw_norm + residual add. Covers both the
+            // batched (server, dense layers) and legacy/per-seq (CLI, MoE-fallback
+            // dense layers) paths since both route through here.
+            var fusedProj = TryFusedDenseFFNProject(input, normWeightName, gateUpWeightName, downWeightName, actType: 1);
+            if (fusedProj != null)
+                return fusedProj;
+
             using var normed = RMSNormOp(input, normWeightName);
             return FFNGelu(normed, gateUpWeightName, downWeightName, seqLen);
         }
@@ -3978,8 +4019,88 @@ namespace TensorSharp.Models
             {
                 BackendType.Mlx => MlxFusedOps.TryRmsNormAddInPlace(residual, input, normW, Config.Eps),
                 BackendType.Cuda => CudaFusedOps.TryRmsNormResidualAdd(residual, input, normW, Config.Eps),
+                BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu when _ggmlFusedNormAdd
+                    => TryGgmlRmsNormResidualAdd(residual, input, normW),
                 _ => false,
             };
+        }
+
+        // GGML fused RMSNorm + residual add (residual += rms_norm(input, normW)).
+        // Collapses the Ops.RMSNorm + Ops.Add pair at Gemma's 3 post-norm-add sites
+        // per layer into one dispatch. TS_GGML_FUSED_NORM_ADD=0 forces the unfused
+        // pair (A/B). try/catch keeps the Try-semantics: any unsupported layout
+        // falls back to the per-op path.
+        private static readonly bool _ggmlFusedNormAdd =
+            Environment.GetEnvironmentVariable("TS_GGML_FUSED_NORM_ADD") != "0";
+
+        private bool TryGgmlRmsNormResidualAdd(Tensor residual, Tensor input, Tensor normW)
+        {
+            try
+            {
+                GgmlBasicOps.RmsNormResidualAdd(residual, input, normW, Config.Eps);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // GGML fused PLE block: result += rms_norm(proj_W^T @ (gelu(inp_gate_W^T @
+        // result) * perLayerInput), post_norm). Collapses the 4-dispatch PLE chain
+        // (inp_gate matmul + GELU·mul + proj matmul + fused-norm-add) into one graph,
+        // keeping the small [ple_dim, rows] intermediate on-device. Requires quantized
+        // inp_gate/proj weights; F32-weight PLE falls back.
+        //
+        // OPT-IN (TS_GGML_FUSED_PLE=1), default OFF. Correct (argmax-identical to the
+        // unfused PLE; all 16 backend tests pass) and ~+7% at moderate context (8K).
+        // Kept off by default as a precaution: during testing an intermittent
+        // cudaErrorInitializationError appeared on the engine worker thread at long
+        // context (16K, near GPU capacity). It is NOT root-caused to this kernel — it
+        // also reproduces with this flag OFF and disappears when the GPU is idle, so it
+        // looks like memory-pressure / driver-state flakiness rather than a bug here —
+        // but until it's confirmed clean on a fresh environment we don't expose the
+        // server path to even a possible aggravation for a small gain. Enable it for
+        // moderate-context workloads where it's a stable win.
+        private static readonly bool _ggmlFusedPle =
+            Environment.GetEnvironmentVariable("TS_GGML_FUSED_PLE") == "1";
+
+        private bool TryFusedPleBlockGgml(Tensor result, Tensor perLayerInput, string prefix)
+        {
+            if (!_ggmlFusedPle)
+                return false;
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCpu)
+                return false;
+            if (result == null || result.DimensionCount != 2 || perLayerInput == null || perLayerInput.DimensionCount != 2)
+                return false;
+            if (result.ElementType != DType.Float32 || perLayerInput.ElementType != DType.Float32)
+                return false;
+            if (!_quantWeights.TryGetValue($"{prefix}.inp_gate.weight", out var inpGateQw) || inpGateQw == null)
+                return false;
+            if (!_quantWeights.TryGetValue($"{prefix}.proj.weight", out var projQw) || projQw == null)
+                return false;
+            if (!_weights.TryGetValue($"{prefix}.post_norm.weight", out var postNormW) || postNormW == null)
+                return false;
+
+            long hidden = result.Sizes[1];
+            long pleDim = perLayerInput.Sizes[1];
+            if (perLayerInput.Sizes[0] != result.Sizes[0]
+                || inpGateQw.Ne0 != hidden || inpGateQw.Ne1 != pleDim
+                || projQw.Ne0 != pleDim || projQw.Ne1 != hidden)
+                return false;
+
+            try
+            {
+                GgmlBasicOps.FusedPleBlockQuant(result, perLayerInput,
+                    inpGateQw.CacheKey, inpGateQw.GgmlType, inpGateQw.Ne0, inpGateQw.Ne1, inpGateQw.RawBytes,
+                    projQw.CacheKey, projQw.GgmlType, projQw.Ne0, projQw.Ne1, projQw.RawBytes,
+                    postNormW, Config.Eps);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void TryEvaluateMlxLayerBoundary(Tensor hidden, int layer, int seqLen)
@@ -4563,6 +4684,54 @@ namespace TensorSharp.Models
                 {
                     result = WindowedPrefillAttention(qHeads, kvSrcK, kvSrcV,
                         Config.NumHeads, kvHeads, seqLen, hd);
+                    qHeads.Dispose();
+                }
+                else if (result == null && IsGgmlBackend && exceptPositions == null
+                         && _gemma4FlashGlobalChunk)
+                {
+                    // Global-layer chunk-2+ (and any non-seq-heads) path on the
+                    // GGML backend. The K/V come from the linear cache
+                    // (kvIsSeqHeads == false), so the seq-heads fused-prefill
+                    // branch above didn't fire. The legacy fallback below
+                    // materializes an [numHeads, seqLen, kvLen] score tensor +
+                    // softmax — O(n²) memory and the dominant long-prompt prefill
+                    // cost (it grows from ~40% of prefill at one chunk to >55% at
+                    // 8K). Dequantize + GQA-expand the cache once (same buffers
+                    // the materialized path used) and run flash attention over it,
+                    // skipping the score-matrix materialization entirely. Bypassed
+                    // for multimodal bidirectional spans (exceptPositions), which
+                    // need the custom mask the flash kernel can't express.
+                    int windowSize = isLocal ? _slidingWindow : 0;
+                    int maskStart = kvLen - seqLen;
+                    result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                    if (_gemma4FlashF16KV && !ownsKvSrc
+                        && kvSrcK.ElementType == DType.Float16 && kvSrcV.ElementType == DType.Float16)
+                    {
+                        // Read K/V straight from the F16 cache — no per-chunk F16->F32
+                        // dequant round-trip. The kernel reads the leading kvLen rows of
+                        // each head from the [kvHeads, cacheLen, hd] cache and does GQA
+                        // in-kernel (numKvHeads = kvHeads). mul_mat accumulates in F32, so
+                        // the result is identical to dequantizing first.
+                        int kvCacheLen = (int)kvSrcK.Sizes[1];
+                        GgmlBasicOps.FusedPrefillAttentionF16KV(
+                            qHeads, kvSrcK, kvSrcV, result,
+                            Config.NumHeads, kvHeads, hd,
+                            seqLen, kvLen, kvCacheLen,
+                            maskStart, windowSize, 1.0f);
+                    }
+                    else
+                    {
+                        // F32 cache (or owned concat src): dequant to F32 then flash.
+                        Tensor kF32 = ExpandKVHeads(kvSrcK, 1, kvLen);
+                        Tensor vF32 = ExpandKVHeads(kvSrcV, 1, kvLen);
+                        GgmlBasicOps.FusedPrefillAttention(
+                            qHeads, kF32, vF32, result,
+                            Config.NumHeads, kvHeads, hd,
+                            seqLen, kvLen,
+                            maskStart, windowSize, 1.0f);
+                        kF32.Dispose();
+                        vF32.Dispose();
+                    }
                     qHeads.Dispose();
                 }
                 else if (result == null)
