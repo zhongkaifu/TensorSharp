@@ -83,6 +83,52 @@ function Invoke-CheckedDotNet {
     }
 }
 
+function Get-AssemblySafeVersion {
+    param([string] $Version)
+
+    # AssemblyVersion/FileVersion are System.Version values: at most four parts,
+    # each a UInt16 (0-65535). Return the numeric core when it fits, otherwise
+    # $null so the caller can leave the assembly version at the repo default.
+    # Strip any SemVer prerelease/build-metadata suffix (from the first '-' or
+    # '+') because the assembly version only understands the numeric core.
+    $core = ($Version -split '[-+]', 2)[0]
+    $parts = $core.Split('.')
+    if ($parts.Count -lt 1 -or $parts.Count -gt 4) {
+        return $null
+    }
+    foreach ($part in $parts) {
+        $n = 0
+        if (-not [int]::TryParse($part, [ref] $n) -or $n -lt 0 -or $n -gt 65535) {
+            return $null
+        }
+    }
+    return $core
+}
+
+function Get-NormalizedNuGetVersion {
+    param([string] $Version)
+
+    # Replicate NuGetVersion.ToNormalizedString for the version segment of the
+    # .nupkg file name: drop build metadata (+...), split the numeric core from
+    # the prerelease label (-...), pad the core to at least Major.Minor.Patch,
+    # drop a trailing zero revision, and strip leading zeros from each segment.
+    # e.g. "20260618" -> "20260618.0.0", "2.8.6.0" -> "2.8.6", "2.8.6" -> "2.8.6".
+    $noMetadata = ($Version -split '\+', 2)[0]
+    $coreAndPre = $noMetadata -split '-', 2
+    $core = $coreAndPre[0]
+    $prerelease = if ($coreAndPre.Count -gt 1) { $coreAndPre[1] } else { $null }
+
+    $nums = @($core.Split('.') | ForEach-Object { [int]::Parse($_, [System.Globalization.CultureInfo]::InvariantCulture) })
+    while ($nums.Count -lt 3) { $nums += 0 }
+    if ($nums.Count -eq 4 -and $nums[3] -eq 0) { $nums = @($nums[0..2]) }
+
+    $normalized = ($nums -join '.')
+    if (-not [string]::IsNullOrEmpty($prerelease)) {
+        $normalized += "-$prerelease"
+    }
+    return $normalized
+}
+
 function Get-ProjectPackageProperties {
     param([string] $ProjectPath)
 
@@ -170,9 +216,23 @@ $RequestedVersion = $PackageVersion
 # Extra MSBuild properties applied to every `dotnet pack` invocation below.
 $ExtraPackArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
-    # Set both so AssemblyVersion/FileVersion and the package id line up.
-    $ExtraPackArgs += "-p:Version=$RequestedVersion"
+    # The NuGet package version accepts the full requested string (large or
+    # date-style versions like 20260618 are valid here).
     $ExtraPackArgs += "-p:PackageVersion=$RequestedVersion"
+
+    # Line AssemblyVersion/FileVersion up with the package version when it fits
+    # the System.Version range; setting Version drives both. A date-style or
+    # otherwise out-of-range tag would make the C# compiler fail with CS7034, so
+    # in that case leave the assemblies at the repo default ($(TensorSharpVersion))
+    # and just record the true version in the (free-form) informational version.
+    $assemblySafeVersion = Get-AssemblySafeVersion $RequestedVersion
+    if ($null -ne $assemblySafeVersion) {
+        $ExtraPackArgs += "-p:Version=$assemblySafeVersion"
+    }
+    else {
+        $ExtraPackArgs += "-p:InformationalVersion=$RequestedVersion"
+        Write-Warning "Requested version '$RequestedVersion' is not a valid assembly version (each part must be 0-65535); assemblies keep the repo default while the package version is '$RequestedVersion'."
+    }
 }
 if ($SkipNativeBuild) {
     $ExtraPackArgs += "-p:TensorSharpSkipGgmlNative=true"
@@ -203,7 +263,10 @@ foreach ($package in $PublicPackages) {
 
     Invoke-CheckedDotNet (@("pack", $projectPath, "-c", $Configuration, "-o", $PackageOutput) + $ExtraPackArgs)
 
-    $nupkgPath = Join-Path $PackageOutput "$packageId.$packageVersion.nupkg"
+    # NuGet normalizes the version in the produced file name (e.g. a bare
+    # "20260618" becomes "20260618.0.0"), so match against the normalized form.
+    $normalizedVersion = Get-NormalizedNuGetVersion $packageVersion
+    $nupkgPath = Join-Path $PackageOutput "$packageId.$normalizedVersion.nupkg"
     if (-not (Test-Path $nupkgPath)) {
         throw "Expected package was not created: $nupkgPath"
     }
