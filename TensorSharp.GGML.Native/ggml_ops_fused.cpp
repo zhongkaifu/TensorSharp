@@ -1301,6 +1301,239 @@ int fused_vision_attention_f32_impl(
 }
 
 // ============================================================================
+// Fused Gemma-4 SigLIP vision block (attention + gated MLP) in ONE GGML graph.
+//
+// Mirrors Gemma4VisionEncoder.EncoderBlock (the per-op C# path) exactly:
+//   r0 = hidden
+//   n1 = rms_norm(r0)*ln1_w
+//   q  = clampO(matmul(q_w, clampI(n1)));  k,v likewise   (no bias)
+//   q  = rms_norm_perhead(q)*q_norm_w;  k likewise;  v = rms_norm_perhead(v)  (unweighted)
+//   q,k = rope2d(q,k)        [NeoX X-rot on first half, Y-rot on second half]
+//   a  = flash_attn(q,k,v, scale=1)                       (full bidirectional)
+//   o  = clampO(matmul(out_w, clampI(a)))
+//   r1 = r0 + rms_norm(o)*attn_post_norm_w                (sandwich norm)
+//   n2 = rms_norm(r1)*ln2_w
+//   g  = clampO(matmul(gate_w, clampI(n2)));  u = clampO(matmul(up_w, clampI(n2)))
+//   h  = gelu_quick(g) * u                                (QuickGELU gated MLP)
+//   d  = clampO(matmul(down_w, clampI(h)))
+//   out = r1 + rms_norm(d)*ffn_post_norm_w   -> hidden (in place)
+//
+// clamps[28] = {q,k,v,out,gate,up,down} x {inMin,inMax,outMin,outMax} (QAT
+// activation clamps); a |bound| >= 3e38 means "no clamp on that side".
+// All weights (F32) are cached on-device by host pointer across encodes; the
+// whole block is one upload + one download, replacing ~30 per-op round-trips.
+// ============================================================================
+int fused_gemma4_vision_block_f32_impl(
+    const TensorView2DDesc& hidden_desc,        // [N, D] in/out
+    float eps,
+    const float* ln1_w,
+    const float* q_w, int q_ne0, int q_ne1, std::size_t q_bytes,
+    const float* k_w, int k_ne0, int k_ne1, std::size_t k_bytes,
+    const float* v_w, int v_ne0, int v_ne1, std::size_t v_bytes,
+    const float* q_norm_w, const float* k_norm_w,
+    const float* attn_post_norm_w,
+    const float* out_w, int out_ne0, int out_ne1, std::size_t out_bytes,
+    const float* cosx, const float* sinx, const float* cosy, const float* siny,
+    const float* ln2_w,
+    const float* gate_w, int gate_ne0, int gate_ne1, std::size_t gate_bytes,
+    const float* up_w, int up_ne0, int up_ne1, std::size_t up_bytes,
+    const float* down_w, int down_ne0, int down_ne1, std::size_t down_bytes,
+    const float* ffn_post_norm_w,
+    const float* clamps,
+    int num_patches, int num_heads, int head_dim)
+{
+    if (!ensure_backend())
+        return 0;
+    if (!validate_desc(hidden_desc, "hidden"))
+        return 0;
+
+    const int N  = hidden_desc.dim0;       // num_patches
+    const int D  = hidden_desc.dim1;       // hidden_size
+    const int hd = head_dim;
+    const int nH = num_heads;
+    const int quarter = hd / 4;
+    const int ff = gate_ne1;               // intermediate_size
+    const int cs_elems = num_patches * quarter;
+
+    const std::size_t ctx_size = 16 * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size))
+    {
+        set_last_error("fused_gemma4_vision_block: context init failed.");
+        return 0;
+    }
+    ggml_context* ctx = context.value;
+
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(hidden_desc);
+    TensorBinding hidden_binding;
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t buf = nullptr;
+        if (!create_binding_from_host_ptr_2d(ctx, g_backend, hidden_desc, hidden_binding, buf))
+        {
+            use_zero_copy = false;
+            hidden_binding = create_standard_binding(ctx, hidden_desc);
+        }
+        else
+            host_ptr_buffers.emplace_back(buf);
+    }
+    else
+        hidden_binding = create_standard_binding(ctx, hidden_desc);
+
+    // Weights are STREAMED, not cached on-device: the vision tower runs briefly
+    // (once per image) and its ~0.5 GB of F32 weights would otherwise pile into
+    // VRAM via the persistent device-copy cache, stealing residency from the
+    // (much larger) language model and triggering paging that worsens block by
+    // block on a VRAM-tight multimodal model (e.g. 26B-A4B). Each weight is a
+    // plain graph leaf uploaded fresh into the reused per-graph buffer below.
+    struct UP { ggml_tensor* t; const void* data; std::size_t bytes; };
+    std::vector<UP> ups;
+    auto w1d = [&](const float* d, int n) {
+        ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ups.push_back({ t, d, (std::size_t)n * sizeof(float) }); return t; };
+    auto w2d = [&](const float* d, int ne0, int ne1, std::size_t bytes) {
+        ggml_tensor* t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+        ups.push_back({ t, d, bytes }); return t; };
+
+    ggml_tensor* ln1_w_t   = w1d(ln1_w, D);
+    ggml_tensor* q_w_t     = w2d(q_w, q_ne0, q_ne1, q_bytes);
+    ggml_tensor* k_w_t     = w2d(k_w, k_ne0, k_ne1, k_bytes);
+    ggml_tensor* v_w_t     = w2d(v_w, v_ne0, v_ne1, v_bytes);
+    ggml_tensor* q_norm_t  = w1d(q_norm_w, hd);
+    ggml_tensor* k_norm_t  = w1d(k_norm_w, hd);
+    ggml_tensor* apn_t     = w1d(attn_post_norm_w, D);
+    ggml_tensor* out_w_t   = w2d(out_w, out_ne0, out_ne1, out_bytes);
+    ggml_tensor* ln2_w_t   = w1d(ln2_w, D);
+    ggml_tensor* gate_w_t  = w2d(gate_w, gate_ne0, gate_ne1, gate_bytes);
+    ggml_tensor* up_w_t    = w2d(up_w, up_ne0, up_ne1, up_bytes);
+    ggml_tensor* down_w_t  = w2d(down_w, down_ne0, down_ne1, down_bytes);
+    ggml_tensor* fpn_t     = w1d(ffn_post_norm_w, D);
+
+    // cos/sin rope tables (small, geometry-dependent): uploaded fresh each call.
+    ggml_tensor* cosx_t = w1d(cosx, cs_elems);
+    ggml_tensor* sinx_t = w1d(sinx, cs_elems);
+    ggml_tensor* cosy_t = w1d(cosy, cs_elems);
+    ggml_tensor* siny_t = w1d(siny, cs_elems);
+
+    if (!hidden_binding.storage || !ln1_w_t || !q_w_t || !cosx_t)
+    {
+        set_last_error("fused_gemma4_vision_block: tensor alloc failed.");
+        return 0;
+    }
+
+    const float NC = 3.0e38f;
+    auto clampt = [&](ggml_tensor* x, float lo, float hi) -> ggml_tensor* {
+        if (lo <= -NC && hi >= NC) return x;
+        return ggml_clamp(ctx, x, lo, hi);
+    };
+
+    ggml_tensor* cosx_3d = ggml_reshape_3d(ctx, cosx_t, quarter, 1, N);
+    ggml_tensor* sinx_3d = ggml_reshape_3d(ctx, sinx_t, quarter, 1, N);
+    ggml_tensor* cosy_3d = ggml_reshape_3d(ctx, cosy_t, quarter, 1, N);
+    ggml_tensor* siny_3d = ggml_reshape_3d(ctx, siny_t, quarter, 1, N);
+
+    // 2D split RoPE: quarters [0:Q]/[Q:2Q] rotated by X angles, [2Q:3Q]/[3Q:4Q] by Y.
+    auto rope2d = [&](ggml_tensor* x3 /*[hd, nH, N]*/) -> ggml_tensor* {
+        std::size_t nb1 = x3->nb[1], nb2 = x3->nb[2], fb = sizeof(float);
+        ggml_tensor* x0 = ggml_cont(ctx, ggml_view_3d(ctx, x3, quarter, nH, N, nb1, nb2, 0));
+        ggml_tensor* x1 = ggml_cont(ctx, ggml_view_3d(ctx, x3, quarter, nH, N, nb1, nb2, (std::size_t)quarter * fb));
+        ggml_tensor* x2 = ggml_cont(ctx, ggml_view_3d(ctx, x3, quarter, nH, N, nb1, nb2, (std::size_t)2 * quarter * fb));
+        ggml_tensor* x3q = ggml_cont(ctx, ggml_view_3d(ctx, x3, quarter, nH, N, nb1, nb2, (std::size_t)3 * quarter * fb));
+        ggml_tensor* o0 = ggml_sub(ctx, ggml_mul(ctx, x0, cosx_3d), ggml_mul(ctx, x1, sinx_3d));
+        ggml_tensor* o1 = ggml_add(ctx, ggml_mul(ctx, x0, sinx_3d), ggml_mul(ctx, x1, cosx_3d));
+        ggml_tensor* o2 = ggml_sub(ctx, ggml_mul(ctx, x2, cosy_3d), ggml_mul(ctx, x3q, siny_3d));
+        ggml_tensor* o3 = ggml_add(ctx, ggml_mul(ctx, x2, siny_3d), ggml_mul(ctx, x3q, cosy_3d));
+        return ggml_concat(ctx, ggml_concat(ctx, o0, o1, 0), ggml_concat(ctx, o2, o3, 0), 0);
+    };
+
+    // ---------------- Build graph ----------------
+    ggml_tensor* inp = ggml_cont(ctx, hidden_binding.tensor);   // [D, N]
+
+    // Attention sublayer.
+    ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, inp, eps), ln1_w_t);
+    ggml_tensor* q = clampt(ggml_mul_mat(ctx, q_w_t, clampt(n1, clamps[0], clamps[1])), clamps[2], clamps[3]);
+    ggml_tensor* k = clampt(ggml_mul_mat(ctx, k_w_t, clampt(n1, clamps[4], clamps[5])), clamps[6], clamps[7]);
+    ggml_tensor* v = clampt(ggml_mul_mat(ctx, v_w_t, clampt(n1, clamps[8], clamps[9])), clamps[10], clamps[11]);
+
+    ggml_tensor* qn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, q, hd, nH * N), eps), q_norm_t);
+    ggml_tensor* kn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, k, hd, nH * N), eps), k_norm_t);
+    ggml_tensor* vn = ggml_rms_norm(ctx, ggml_reshape_2d(ctx, v, hd, nH * N), eps);  // unweighted
+
+    ggml_tensor* qr = rope2d(ggml_reshape_3d(ctx, qn, hd, nH, N));
+    ggml_tensor* kr = rope2d(ggml_reshape_3d(ctx, kn, hd, nH, N));
+    ggml_tensor* v3 = ggml_reshape_3d(ctx, vn, hd, nH, N);
+
+    ggml_tensor* qp = ggml_permute(ctx, qr, 0, 2, 1, 3);  // [hd, N, nH]
+    ggml_tensor* kp = ggml_permute(ctx, kr, 0, 2, 1, 3);
+    ggml_tensor* vp = ggml_permute(ctx, v3, 0, 2, 1, 3);
+    ggml_tensor* flash = ggml_flash_attn_ext(ctx, qp, kp, vp, nullptr, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
+    if (!backend_supports_op(flash))
+    {
+        set_last_error("fused_gemma4_vision_block: flash_attn unsupported for this head_dim/backend.");
+        return 0;
+    }
+    ggml_tensor* aflat = ggml_reshape_2d(ctx, ggml_cont(ctx, flash), D, N);
+    ggml_tensor* o = clampt(ggml_mul_mat(ctx, out_w_t, clampt(aflat, clamps[12], clamps[13])), clamps[14], clamps[15]);
+    ggml_tensor* postA = ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), apn_t);
+    ggml_tensor* r1 = ggml_add(ctx, postA, inp);
+
+    // MLP sublayer (QuickGELU gated).
+    ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, r1, eps), ln2_w_t);
+    ggml_tensor* g = clampt(ggml_mul_mat(ctx, gate_w_t, clampt(n2, clamps[16], clamps[17])), clamps[18], clamps[19]);
+    ggml_tensor* u = clampt(ggml_mul_mat(ctx, up_w_t, clampt(n2, clamps[20], clamps[21])), clamps[22], clamps[23]);
+    ggml_tensor* act = ggml_mul(ctx, ggml_gelu_quick(ctx, g), u);
+    ggml_tensor* dn = clampt(ggml_mul_mat(ctx, down_w_t, clampt(act, clamps[24], clamps[25])), clamps[26], clamps[27]);
+    ggml_tensor* postF = ggml_mul(ctx, ggml_rms_norm(ctx, dn, eps), fpn_t);
+    ggml_tensor* outv = ggml_add(ctx, r1, postF);
+
+    ggml_tensor* output = ggml_cpy(ctx, outv, hidden_binding.tensor);
+    if (!output)
+    {
+        set_last_error("fused_gemma4_vision_block: output cpy failed.");
+        return 0;
+    }
+    ggml_set_output(output);
+
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, 8192, false);
+    if (!graph) { set_last_error("fused_gemma4_vision_block: graph failed."); return 0; }
+    ggml_build_forward_expand(graph, output);
+
+    // Allocate the per-graph intermediates (and the streamed weight leaves) into
+    // the persistent, reused gallocr buffer rather than a fresh device buffer per
+    // block. A per-call alloc+free of this ~40 MB scratch fragments device VRAM
+    // across the tower's blocks and gets progressively slower on a near-full GPU;
+    // the reused buffer is grown once and kept. Falls back to per-call allocation
+    // when the reuse path is unavailable (disabled / non-Metal-or-CUDA backend).
+    BufferHandle buffer(nullptr);
+    if (!alloc_graph_reuse_gallocr(graph))
+    {
+        buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        if (!buffer.value) { set_last_error("fused_gemma4_vision_block: buffer alloc failed."); return 0; }
+    }
+
+    // Drain the previous block's GPU work before overwriting the shared reused
+    // buffer (no-op on the eager-sync path).
+    host_read_barrier();
+
+    if (!use_zero_copy)
+        upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
+    for (auto& u : ups)
+        ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_gemma4_vision_block: compute failed."); return 0; }
+    finalize_compute(use_zero_copy, hidden_binding.storage, hidden_desc.data, hidden_binding.raw_bytes);
+    // Drain the queued async download before the per-call fallback buffer frees
+    // (no-op on the reuse-gallocr path, where buffer.value == nullptr).
+    if (buffer.value != nullptr) host_read_barrier();
+
+    clear_last_error();
+    return 1;
+}
+
+// ============================================================================
 // Fused output projection + residual + FFN (RMSNorm + SwiGLU) in one graph.
 // Combines what was previously TryLinearAddInto + FusedFFNSwiGLUQuant into a
 // single Metal command buffer. Applied to every layer (32), this saves 32
@@ -2281,6 +2514,41 @@ TSG_EXPORT int TSGgml_FusedVisionAttentionF32(
         cos_table, sin_table, num_patches, num_heads, head_dim, half_dim, attn_scale); }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in fused vision attention."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32(
+    TensorView2DDesc hidden, float eps,
+    const float* ln1_w,
+    const float* q_w, int q_ne0, int q_ne1, std::int64_t q_bytes,
+    const float* k_w, int k_ne0, int k_ne1, std::int64_t k_bytes,
+    const float* v_w, int v_ne0, int v_ne1, std::int64_t v_bytes,
+    const float* q_norm_w, const float* k_norm_w,
+    const float* attn_post_norm_w,
+    const float* out_w, int out_ne0, int out_ne1, std::int64_t out_bytes,
+    const float* cosx, const float* sinx, const float* cosy, const float* siny,
+    const float* ln2_w,
+    const float* gate_w, int gate_ne0, int gate_ne1, std::int64_t gate_bytes,
+    const float* up_w, int up_ne0, int up_ne1, std::int64_t up_bytes,
+    const float* down_w, int down_ne0, int down_ne1, std::int64_t down_bytes,
+    const float* ffn_post_norm_w,
+    const float* clamps,
+    int num_patches, int num_heads, int head_dim)
+{
+    try {
+        return fused_gemma4_vision_block_f32_impl(hidden, eps, ln1_w,
+            q_w, q_ne0, q_ne1, static_cast<std::size_t>(q_bytes),
+            k_w, k_ne0, k_ne1, static_cast<std::size_t>(k_bytes),
+            v_w, v_ne0, v_ne1, static_cast<std::size_t>(v_bytes),
+            q_norm_w, k_norm_w, attn_post_norm_w,
+            out_w, out_ne0, out_ne1, static_cast<std::size_t>(out_bytes),
+            cosx, sinx, cosy, siny, ln2_w,
+            gate_w, gate_ne0, gate_ne1, static_cast<std::size_t>(gate_bytes),
+            up_w, up_ne0, up_ne1, static_cast<std::size_t>(up_bytes),
+            down_w, down_ne0, down_ne1, static_cast<std::size_t>(down_bytes),
+            ffn_post_norm_w, clamps, num_patches, num_heads, head_dim);
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in fused gemma4 vision block."); return 0; }
 }
 
 TSG_EXPORT int TSGgml_FusedOutProjFFNQuantF32(

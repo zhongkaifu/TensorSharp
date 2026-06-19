@@ -9,6 +9,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Numerics;
+using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
 
@@ -188,13 +190,22 @@ namespace TensorSharp.Models
             int headDim = _hiddenSize / _numHeads;
             Rope2DCache ropeCache = GetOrCreateRopeCache(patchesX, patchesY, headDim);
 
+            bool vtime = Environment.GetEnvironmentVariable("TS_VTIME") == "1";
+            double msPerTick = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+
             var hidden = PatchEmbed(pixelValues, imgWidth, imgHeight, patchesX, patchesY);
             AddPositionEmbedding2D(hidden, ropeCache, numPatches);
+            long tPatch = System.Diagnostics.Stopwatch.GetTimestamp();
 
             for (int i = 0; i < _blockCount; i++)
             {
-                Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
+                if (!vtime) Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
+                long tb0 = vtime ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 hidden = EncoderBlock(hidden, i, numPatches, headDim, ropeCache);
+                if (vtime)
+                    Console.WriteLine($"  [gemma4v] block {i}: " +
+                        $"{(System.Diagnostics.Stopwatch.GetTimestamp() - tb0) * msPerTick:F1}ms");
                 // Yield the GPU compute lock between encoder blocks so the
                 // engine worker can run an inference step. Without this,
                 // a single image encode (16–32 blocks, 100ms–2s+ total)
@@ -205,10 +216,17 @@ namespace TensorSharp.Models
                 // running outside a GpuComputeLock scope.
                 _hostModel?.YieldGpuComputeLock();
             }
-            Console.WriteLine(" done");
+            if (!vtime) Console.WriteLine(" done");
+            long tBlocks = System.Diagnostics.Stopwatch.GetTimestamp();
 
             var projected = PoolAndProject(hidden, patchesX, patchesY, numPatches);
             hidden.Dispose();
+            long tProj = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            if (vtime)
+                Console.WriteLine($"  [gemma4v] patchEmbed+pos={ (tPatch - t0) * msPerTick:F0}ms " +
+                    $"blocks={ (tBlocks - tPatch) * msPerTick:F0}ms proj={ (tProj - tBlocks) * msPerTick:F0}ms " +
+                    $"({numPatches} patches, {_blockCount} blocks)");
 
             return projected;
         }
@@ -240,26 +258,32 @@ namespace TensorSharp.Models
             //    SigLIP PatchEmbed above).
             var cols = new Tensor(_allocator, DType.Float32, numPatches, patchDim);
             float* colsPtr = GetFloatPtr(cols);
-            for (int py = 0; py < patchesY; py++)
+            fixed (float* pixSrc = pixelValues)
             {
-                for (int px = 0; px < patchesX; px++)
+                long colsPtrL = (long)colsPtr, pixSrcL = (long)pixSrc;
+                // Each (c, ky) source span of P pixels is contiguous in kx, so the
+                // im2col packing is a parallel set of MemoryCopy row writes.
+                Parallel.For(0, patchesY, py =>
                 {
-                    int patchIdx = py * patchesX + px;
-                    float* row = colsPtr + (long)patchIdx * patchDim;
-                    for (int c = 0; c < C; c++)
+                    float* dst = (float*)colsPtrL;
+                    float* pix = (float*)pixSrcL;
+                    for (int px = 0; px < patchesX; px++)
                     {
-                        for (int ky = 0; ky < P; ky++)
+                        int patchIdx = py * patchesX + px;
+                        float* row = dst + (long)patchIdx * patchDim;
+                        for (int c = 0; c < C; c++)
                         {
-                            int imgY = py * P + ky;
-                            for (int kx = 0; kx < P; kx++)
+                            long imgChannelOffset = (long)c * imgHeight * imgWidth;
+                            long outChannelOffset = (long)c * P * P;
+                            for (int ky = 0; ky < P; ky++)
                             {
-                                int imgX = px * P + kx;
-                                row[c * P * P + ky * P + kx] =
-                                    pixelValues[c * imgHeight * imgWidth + imgY * imgWidth + imgX];
+                                long srcOffset = imgChannelOffset + (long)(py * P + ky) * imgWidth + px * P;
+                                Buffer.MemoryCopy(pix + srcOffset, row + outChannelOffset + (long)ky * P,
+                                    P * sizeof(float), P * sizeof(float));
                             }
                         }
                     }
-                }
+                });
             }
 
             // 2. patch_norm_1: pytorch LayerNorm over the patch vector.
@@ -297,12 +321,20 @@ namespace TensorSharp.Models
         {
             float* p = GetFloatPtr(t);
             float* b = GetFloatPtr(bias);
-            for (int r = 0; r < rows; r++)
+            int vLen = Vector<float>.Count;
+            long pL = (long)p, bL = (long)b;
+            Parallel.For(0, rows, r =>
             {
-                float* row = p + (long)r * cols;
-                for (int d = 0; d < cols; d++)
-                    row[d] += b[d];
-            }
+                float* row = (float*)pL + (long)r * cols;
+                float* bias2 = (float*)bL;
+                int d = 0;
+                for (; d <= cols - vLen; d += vLen)
+                    TensorComputePrimitives.StoreVector(row + d,
+                        TensorComputePrimitives.LoadVector(row + d)
+                        + TensorComputePrimitives.LoadVector(bias2 + d));
+                for (; d < cols; d++)
+                    row[d] += bias2[d];
+            });
         }
 
         private unsafe void AddUnifiedPositionEmbedding(Tensor hidden, int patchesX, int numPatches)
@@ -316,59 +348,99 @@ namespace TensorSharp.Models
             float* xTable = posPtr;
             float* yTable = posPtr + (long)maxPos * _hiddenSize;
             float* dstPtr = GetFloatPtr(hidden);
+            int hiddenSize = _hiddenSize;
+            int vLen = Vector<float>.Count;
+            long dstPtrL = (long)dstPtr, xTableL = (long)xTable, yTableL = (long)yTable;
 
-            for (int p = 0; p < numPatches; p++)
+            Parallel.For(0, numPatches, p =>
             {
                 int x = p % patchesX;
                 int y = p / patchesX;
-                float* dstRow = dstPtr + (long)p * _hiddenSize;
-                float* xRow = xTable + (long)x * _hiddenSize;
-                float* yRow = yTable + (long)y * _hiddenSize;
-                for (int d = 0; d < _hiddenSize; d++)
+                float* dstRow = (float*)dstPtrL + (long)p * hiddenSize;
+                float* xRow = (float*)xTableL + (long)x * hiddenSize;
+                float* yRow = (float*)yTableL + (long)y * hiddenSize;
+                int d = 0;
+                for (; d <= hiddenSize - vLen; d += vLen)
+                {
+                    var acc = TensorComputePrimitives.LoadVector(dstRow + d)
+                            + TensorComputePrimitives.LoadVector(xRow + d)
+                            + TensorComputePrimitives.LoadVector(yRow + d);
+                    TensorComputePrimitives.StoreVector(dstRow + d, acc);
+                }
+                for (; d < hiddenSize; d++)
                     dstRow[d] += xRow[d] + yRow[d];
-            }
+            });
         }
 
+        // Patch embedding (Conv2D, stride = kernel = patch_size) reformulated as
+        // im2col + GEMM, matching llama.cpp's ggml_conv_2d and the already-optimized
+        // Qwen35 path. The per-patch im2col packing is parallelised with SIMD row
+        // copies; the heavy compute becomes a single matmul that the backend
+        // (CPU BLAS or GPU) handles efficiently, replacing the original
+        // single-threaded scalar quintuple loop.
         private unsafe Tensor PatchEmbed(float[] pixelValues, int imgW, int imgH, int patchesX, int patchesY)
         {
             int numPatches = patchesX * patchesY;
-            var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
-            float* dst = GetFloatPtr(result);
-
-            var convWeight = _weights["v.patch_embd.weight"];
-            float* wPtr = GetFloatPtr(convWeight);
-
             int C = 3, P = _patchSize;
+            int patchStride = C * P * P;
 
-            for (int py = 0; py < patchesY; py++)
+            // v.patch_embd.weight post-load is [hiddenSize, C, P, P] contiguous in
+            // [f][c][ky][kx] order — exactly the im2col row ordering below — so it
+            // views directly as a [hiddenSize, patchStride] matmul matrix.
+            Tensor weightT = GetOrCreatePatchEmbedTransposed(patchStride);
+
+            var im2col = new Tensor(_allocator, DType.Float32, numPatches, patchStride);
+            float* im2colPtr = GetFloatPtr(im2col);
+
+            fixed (float* pixSrc = pixelValues)
             {
-                for (int px = 0; px < patchesX; px++)
+                long pixSrcL = (long)pixSrc;
+                Parallel.For(0, patchesY, py =>
                 {
-                    int patchIdx = py * patchesX + px;
-                    float* outPatch = dst + patchIdx * _hiddenSize;
-
-                    for (int f = 0; f < _hiddenSize; f++)
+                    float* pix = (float*)pixSrcL;
+                    for (int px = 0; px < patchesX; px++)
                     {
-                        float sum = 0f;
+                        int patchIdx = py * patchesX + px;
+                        float* outRow = im2colPtr + (long)patchIdx * patchStride;
+                        int yBase = py * P;
+                        int xBase = px * P;
                         for (int c = 0; c < C; c++)
                         {
+                            long imgChannelOffset = (long)c * imgH * imgW;
+                            long outChannelOffset = (long)c * P * P;
                             for (int ky = 0; ky < P; ky++)
                             {
-                                for (int kx = 0; kx < P; kx++)
-                                {
-                                    int imgY = py * P + ky;
-                                    int imgX = px * P + kx;
-                                    float pixel = pixelValues[c * imgH * imgW + imgY * imgW + imgX];
-                                    int wIdx = f * C * P * P + c * P * P + ky * P + kx;
-                                    sum += pixel * wPtr[wIdx];
-                                }
+                                long srcOffset = imgChannelOffset + (long)(yBase + ky) * imgW + xBase;
+                                long dstOffset = outChannelOffset + (long)ky * P;
+                                Buffer.MemoryCopy(pix + srcOffset, outRow + dstOffset,
+                                    P * sizeof(float), P * sizeof(float));
                             }
                         }
-                        outPatch[f] = sum;
                     }
-                }
+                });
             }
 
+            var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+            Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
+            im2col.Dispose();
+            return result;
+        }
+
+        // Cache the transposed [patchStride, hiddenSize] patch-embed weight used by
+        // the im2col GEMM. v.patch_embd.weight is already contiguous as
+        // [hiddenSize, patchStride], so we transpose once.
+        private Tensor GetOrCreatePatchEmbedTransposed(int patchStride)
+        {
+            const string key = "v.patch_embd.weight.2d.T";
+            if (_transposedWeights.TryGetValue(key, out var cached))
+                return cached;
+
+            var convWeight = _weights["v.patch_embd.weight"];
+            int outDim = (int)convWeight.Sizes[0];
+            using var weight2D = convWeight.View(outDim, patchStride);
+            using var weightViewT = weight2D.Transpose();
+            var result = Ops.NewContiguous(weightViewT);
+            _transposedWeights[key] = result;
             return result;
         }
 
@@ -380,21 +452,44 @@ namespace TensorSharp.Models
             float* xTable = posPtr;
             float* yTable = posPtr + maxPos * _hiddenSize;
             float* dstPtr = GetFloatPtr(hidden);
+            int hiddenSize = _hiddenSize;
+            int vLen = Vector<float>.Count;
 
-            for (int p = 0; p < numPatches; p++)
+            long dstPtrL = (long)dstPtr, xTableL = (long)xTable, yTableL = (long)yTable;
+            var posX = ropeCache.PosX;
+            var posY = ropeCache.PosY;
+            Parallel.For(0, numPatches, p =>
             {
-                float* dstRow = dstPtr + p * _hiddenSize;
-                float* xRow = xTable + ropeCache.PosX[p] * _hiddenSize;
-                float* yRow = yTable + ropeCache.PosY[p] * _hiddenSize;
-                for (int d = 0; d < _hiddenSize; d++)
+                float* dstRow = (float*)dstPtrL + (long)p * hiddenSize;
+                float* xRow = (float*)xTableL + (long)posX[p] * hiddenSize;
+                float* yRow = (float*)yTableL + (long)posY[p] * hiddenSize;
+                int d = 0;
+                for (; d <= hiddenSize - vLen; d += vLen)
+                {
+                    var acc = TensorComputePrimitives.LoadVector(dstRow + d)
+                            + TensorComputePrimitives.LoadVector(xRow + d)
+                            + TensorComputePrimitives.LoadVector(yRow + d);
+                    TensorComputePrimitives.StoreVector(dstRow + d, acc);
+                }
+                for (; d < hiddenSize; d++)
                     dstRow[d] += xRow[d] + yRow[d];
-            }
+            });
         }
 
         private Tensor EncoderBlock(Tensor hidden, int blockIdx, int numPatches, int headDim,
             Rope2DCache ropeCache)
         {
             string prefix = $"v.blk.{blockIdx}";
+
+            // Fused fast path: run the whole block (attention + gated MLP) as one
+            // on-device GGML graph, keeping every intermediate on the GPU instead
+            // of round-tripping each of the ~30 sub-ops through host memory. Falls
+            // back to the per-op path on any failure (e.g. flash-attn unsupported
+            // for this head_dim/backend). No-op unless the encoder runs on a GGML
+            // allocator (_useNativeAttention).
+            if (_useNativeAttention && _fusedBlockEnabled
+                && TryFusedEncoderBlock(hidden, prefix, numPatches, headDim, ropeCache))
+                return hidden;
 
             using var attnNormed = RMSNormOp(hidden, $"{prefix}.ln1.weight");
             using var attnOut = VisionSelfAttention(attnNormed, prefix, numPatches, headDim,
@@ -416,6 +511,80 @@ namespace TensorSharp.Models
                 Ops.Mul(result, result, scaleTensor);
 
             return result;
+        }
+
+        // TS_GEMMA4V_FUSED=0 disables the fused single-graph block (for A/B testing).
+        private readonly bool _fusedBlockEnabled =
+            Environment.GetEnvironmentVariable("TS_GEMMA4V_FUSED") != "0";
+
+        private static readonly string[] _clampLinearSuffixes =
+            { "attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down" };
+
+        /// <summary>
+        /// Run the entire SigLIP encoder block through the fused native GGML kernel
+        /// (one graph dispatch). Modifies <paramref name="hidden"/> in place and
+        /// returns true on success; returns false (leaving hidden untouched) when a
+        /// required weight is missing, an out_scale is present (unsupported by the
+        /// kernel), or the native call throws — the caller then uses the per-op path.
+        /// </summary>
+        private bool TryFusedEncoderBlock(Tensor hidden, string prefix, int numPatches,
+            int headDim, Rope2DCache ropeCache)
+        {
+            // The fused kernel doesn't implement the optional per-channel out_scale.
+            if (_weights.ContainsKey($"{prefix}.out_scale.weight"))
+                return false;
+
+            if (!_weights.TryGetValue($"{prefix}.ln1.weight", out var ln1)
+                || !_weights.TryGetValue($"{prefix}.attn_q.weight", out var qW)
+                || !_weights.TryGetValue($"{prefix}.attn_k.weight", out var kW)
+                || !_weights.TryGetValue($"{prefix}.attn_v.weight", out var vW)
+                || !_weights.TryGetValue($"{prefix}.attn_q_norm.weight", out var qNorm)
+                || !_weights.TryGetValue($"{prefix}.attn_k_norm.weight", out var kNorm)
+                || !_weights.TryGetValue($"{prefix}.attn_post_norm.weight", out var apn)
+                || !_weights.TryGetValue($"{prefix}.attn_out.weight", out var outW)
+                || !_weights.TryGetValue($"{prefix}.ln2.weight", out var ln2)
+                || !_weights.TryGetValue($"{prefix}.ffn_gate.weight", out var gateW)
+                || !_weights.TryGetValue($"{prefix}.ffn_up.weight", out var upW)
+                || !_weights.TryGetValue($"{prefix}.ffn_down.weight", out var downW)
+                || !_weights.TryGetValue($"{prefix}.ffn_post_norm.weight", out var fpn))
+                return false;
+
+            float[] clamps = BuildClampArray(prefix);
+            try
+            {
+                GgmlBasicOps.FusedGemma4VisionBlock(hidden, _eps, ln1,
+                    qW, kW, vW, qNorm, kNorm, apn, outW,
+                    ropeCache.CosX, ropeCache.SinX, ropeCache.CosY, ropeCache.SinY,
+                    ln2, gateW, upW, downW, fpn,
+                    clamps, numPatches, _numHeads, headDim);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Pack the per-linear QAT activation clamps into the 28-float layout the
+        // fused kernel expects: {q,k,v,out,gate,up,down} x {inMin,inMax,outMin,outMax}.
+        // Absent clamps use ±float.MaxValue (the kernel treats |bound|>=3e38 as "none").
+        private float[] BuildClampArray(string prefix)
+        {
+            var c = new float[28];
+            for (int i = 0; i < _clampLinearSuffixes.Length; i++)
+            {
+                int b = i * 4;
+                if (_clampParams.TryGetValue($"{prefix}.{_clampLinearSuffixes[i]}", out var cp) && cp.HasClamp)
+                {
+                    c[b] = cp.InMin; c[b + 1] = cp.InMax; c[b + 2] = cp.OutMin; c[b + 3] = cp.OutMax;
+                }
+                else
+                {
+                    c[b] = float.MinValue; c[b + 1] = float.MaxValue;
+                    c[b + 2] = float.MinValue; c[b + 3] = float.MaxValue;
+                }
+            }
+            return c;
         }
 
         private unsafe Tensor VisionSelfAttention(Tensor input, string prefix, int numPatches, int headDim,
@@ -475,38 +644,61 @@ namespace TensorSharp.Models
             return ClippableLinear(flatContig, $"{prefix}.attn_out");
         }
 
+        // 2D RoPE: split the head dim into an X-rotated first half and a
+        // Y-rotated second half. Parallelised across patches with SIMD over the
+        // (quarter-dim) rotation pairs.
         private unsafe void Apply2DRoPE(Tensor data, Rope2DCache ropeCache, int numPatches, int headDim)
         {
             float* ptr = GetFloatPtr(data);
             int halfDim = headDim / 2;
             int quarterDim = halfDim / 2;
+            int numHeads = _numHeads;
+            int vLen = Vector<float>.Count;
 
-            for (int p = 0; p < numPatches; p++)
+            long ptrL = (long)ptr;
+            fixed (float* cosX = ropeCache.CosX, sinX = ropeCache.SinX,
+                          cosY = ropeCache.CosY, sinY = ropeCache.SinY)
             {
-                int ropeBase = p * quarterDim;
-                for (int h = 0; h < _numHeads; h++)
+                long cosXL = (long)cosX, sinXL = (long)sinX, cosYL = (long)cosY, sinYL = (long)sinY;
+                Parallel.For(0, numPatches, p =>
                 {
-                    float* head = ptr + ((long)p * _numHeads + h) * headDim;
-                    for (int j = 0; j < quarterDim; j++)
-                    {
-                        float cos = ropeCache.CosX[ropeBase + j];
-                        float sin = ropeCache.SinX[ropeBase + j];
-                        float x0 = head[j];
-                        float x1 = head[j + quarterDim];
-                        head[j] = x0 * cos - x1 * sin;
-                        head[j + quarterDim] = x0 * sin + x1 * cos;
-                    }
+                    float* dataPtr = (float*)ptrL;
+                    int ropeBase = p * quarterDim;
+                    float* cX = (float*)cosXL + ropeBase, sX = (float*)sinXL + ropeBase;
+                    float* cY = (float*)cosYL + ropeBase, sY = (float*)sinYL + ropeBase;
 
-                    for (int j = 0; j < quarterDim; j++)
+                    for (int h = 0; h < numHeads; h++)
                     {
-                        float cos = ropeCache.CosY[ropeBase + j];
-                        float sin = ropeCache.SinY[ropeBase + j];
-                        float x0 = head[halfDim + j];
-                        float x1 = head[halfDim + j + quarterDim];
-                        head[halfDim + j] = x0 * cos - x1 * sin;
-                        head[halfDim + j + quarterDim] = x0 * sin + x1 * cos;
+                        float* head = dataPtr + ((long)p * numHeads + h) * headDim;
+                        float* headY = head + halfDim;
+                        int j = 0;
+                        for (; j <= quarterDim - vLen; j += vLen)
+                        {
+                            var x0 = TensorComputePrimitives.LoadVector(head + j);
+                            var x1 = TensorComputePrimitives.LoadVector(head + j + quarterDim);
+                            var cv = TensorComputePrimitives.LoadVector(cX + j);
+                            var sv = TensorComputePrimitives.LoadVector(sX + j);
+                            TensorComputePrimitives.StoreVector(head + j, x0 * cv - x1 * sv);
+                            TensorComputePrimitives.StoreVector(head + j + quarterDim, x0 * sv + x1 * cv);
+
+                            var y0 = TensorComputePrimitives.LoadVector(headY + j);
+                            var y1 = TensorComputePrimitives.LoadVector(headY + j + quarterDim);
+                            var cvy = TensorComputePrimitives.LoadVector(cY + j);
+                            var svy = TensorComputePrimitives.LoadVector(sY + j);
+                            TensorComputePrimitives.StoreVector(headY + j, y0 * cvy - y1 * svy);
+                            TensorComputePrimitives.StoreVector(headY + j + quarterDim, y0 * svy + y1 * cvy);
+                        }
+                        for (; j < quarterDim; j++)
+                        {
+                            float x0 = head[j], x1 = head[j + quarterDim];
+                            head[j] = x0 * cX[j] - x1 * sX[j];
+                            head[j + quarterDim] = x0 * sX[j] + x1 * cX[j];
+                            float y0 = headY[j], y1 = headY[j + quarterDim];
+                            headY[j] = y0 * cY[j] - y1 * sY[j];
+                            headY[j + quarterDim] = y0 * sY[j] + y1 * cY[j];
+                        }
                     }
-                }
+                });
             }
         }
 
@@ -597,28 +789,38 @@ namespace TensorSharp.Models
             var pooled = new Tensor(_allocator, DType.Float32, mergedPatches, _hiddenSize);
             float* srcPtr = GetFloatPtr(visionOutput);
             float* dstPtr = GetFloatPtr(pooled);
+            int hiddenSize = _hiddenSize;
+            int nMerge = _nMerge;
+            int vLen = Vector<float>.Count;
 
-            for (int py = 0; py < mergedY; py++)
+            long srcPtrL = (long)srcPtr, dstPtrL = (long)dstPtr;
+            Parallel.For(0, mergedY, py =>
             {
+                float* src = (float*)srcPtrL;
+                float* dst = (float*)dstPtrL;
                 for (int px = 0; px < mergedX; px++)
                 {
                     int outIdx = py * mergedX + px;
-                    float* outRow = dstPtr + outIdx * _hiddenSize;
-                    for (int d = 0; d < _hiddenSize; d++)
+                    float* outRow = dst + (long)outIdx * hiddenSize;
+                    for (int d = 0; d < hiddenSize; d++)
                         outRow[d] = 0;
 
                     int count = 0;
-                    for (int ky = 0; ky < _nMerge; ky++)
+                    for (int ky = 0; ky < nMerge; ky++)
                     {
-                        for (int kx = 0; kx < _nMerge; kx++)
+                        for (int kx = 0; kx < nMerge; kx++)
                         {
-                            int srcY = py * _nMerge + ky;
-                            int srcX = px * _nMerge + kx;
+                            int srcY = py * nMerge + ky;
+                            int srcX = px * nMerge + kx;
                             if (srcY < patchesY && srcX < patchesX)
                             {
-                                int srcIdx = srcY * patchesX + srcX;
-                                float* srcRow = srcPtr + srcIdx * _hiddenSize;
-                                for (int d = 0; d < _hiddenSize; d++)
+                                float* srcRow = src + (long)(srcY * patchesX + srcX) * hiddenSize;
+                                int d = 0;
+                                for (; d <= hiddenSize - vLen; d += vLen)
+                                    TensorComputePrimitives.StoreVector(outRow + d,
+                                        TensorComputePrimitives.LoadVector(outRow + d)
+                                        + TensorComputePrimitives.LoadVector(srcRow + d));
+                                for (; d < hiddenSize; d++)
                                     outRow[d] += srcRow[d];
                                 count++;
                             }
@@ -626,10 +828,15 @@ namespace TensorSharp.Models
                     }
 
                     float invCount = 1f / count;
-                    for (int d = 0; d < _hiddenSize; d++)
-                        outRow[d] *= invCount;
+                    var invVec = new Vector<float>(invCount);
+                    int e = 0;
+                    for (; e <= hiddenSize - vLen; e += vLen)
+                        TensorComputePrimitives.StoreVector(outRow + e,
+                            TensorComputePrimitives.LoadVector(outRow + e) * invVec);
+                    for (; e < hiddenSize; e++)
+                        outRow[e] *= invCount;
                 }
-            }
+            });
 
             // Scale by sqrt(hiddenSize)
             float scale = MathF.Sqrt(_hiddenSize);

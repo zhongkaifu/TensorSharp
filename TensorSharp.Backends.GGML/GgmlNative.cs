@@ -506,6 +506,25 @@ internal enum GgmlIndexReductionOp
             float attnScale);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_FusedGemma4VisionBlockF32(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr cosx, IntPtr sinx, IntPtr cosy, IntPtr siny,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetRowsQuantF32(
             GgmlTensorView2D result,
             IntPtr srcData,
@@ -1871,6 +1890,38 @@ internal enum GgmlIndexReductionOp
                 outW, outNe0, outNe1, outBytes, outB, outBDim,
                 cosTable, sinTable, numPatches, numHeads, headDim, halfDim,
                 attnScale), "fused_vision_attention");
+        }
+
+        public static void FusedGemma4VisionBlock(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr cosx, IntPtr sinx, IntPtr cosy, IntPtr siny,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim)
+        {
+            CheckResult(TSGgml_FusedGemma4VisionBlockF32(hidden, eps, ln1W,
+                qW, qNe0, qNe1, qBytes,
+                kW, kNe0, kNe1, kBytes,
+                vW, vNe0, vNe1, vBytes,
+                qNormW, kNormW, attnPostNormW,
+                outW, outNe0, outNe1, outBytes,
+                cosx, sinx, cosy, siny, ln2W,
+                gateW, gateNe0, gateNe1, gateBytes,
+                upW, upNe0, upNe1, upBytes,
+                downW, downNe0, downNe1, downBytes,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim),
+                "fused_gemma4_vision_block");
         }
 
         public static void GetRowsQuant(GgmlTensorView2D result, IntPtr srcData, int srcGgmlType, long srcNe0, long srcNe1, long srcRawBytes, GgmlContiguousTensor indices)

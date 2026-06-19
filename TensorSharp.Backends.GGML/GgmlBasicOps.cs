@@ -1035,6 +1035,74 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Fused Gemma-4 SigLIP vision block: the whole EncoderBlock (RMSNorm + QKV +
+        /// per-head QK/V RMSNorm + 2D split RoPE + SDPA + out proj + sandwich post-norm
+        /// + residual, then RMSNorm + gated QuickGELU MLP + sandwich post-norm +
+        /// residual) as a single on-device GGML graph. Replaces ~30 per-op dispatches
+        /// (each a host<->device round-trip) with one. Weights are F32. <paramref name="clamps"/>
+        /// is a 28-float array {q,k,v,out,gate,up,down} x {inMin,inMax,outMin,outMax}
+        /// (a |bound| >= 3e38 disables clamping on that side).
+        /// </summary>
+        public static unsafe void FusedGemma4VisionBlock(
+            Tensor hidden, float eps,
+            Tensor ln1W,
+            Tensor qW, Tensor kW, Tensor vW,
+            Tensor qNormW, Tensor kNormW, Tensor attnPostNormW,
+            Tensor outW,
+            float[] cosX, float[] sinX, float[] cosY, float[] sinY,
+            Tensor ln2W,
+            Tensor gateW, Tensor upW, Tensor downW,
+            Tensor ffnPostNormW,
+            float[] clamps,
+            int numPatches, int numHeads, int headDim)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                throw new ArgumentException("FusedGemma4VisionBlock requires native-backed hidden tensor.");
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                throw new NotSupportedException("FusedGemma4VisionBlock requires standard layout for hidden.");
+
+            void WInfo(Tensor w, out IntPtr ptr, out int ne0, out int ne1, out long bytes)
+            {
+                ptr = GetBufferStart(w);
+                ne0 = (int)w.Sizes[w.DimensionCount - 1];
+                ne1 = (int)w.Sizes[0];
+                bytes = w.ElementCount() * sizeof(float);
+            }
+
+            WInfo(qW, out var qPtr, out int qNe0, out int qNe1, out long qBytes);
+            WInfo(kW, out var kPtr, out int kNe0, out int kNe1, out long kBytes);
+            WInfo(vW, out var vPtr, out int vNe0, out int vNe1, out long vBytes);
+            WInfo(outW, out var oPtr, out int oNe0, out int oNe1, out long oBytes);
+            WInfo(gateW, out var gPtr, out int gNe0, out int gNe1, out long gBytes);
+            WInfo(upW, out var uPtr, out int uNe0, out int uNe1, out long uBytes);
+            WInfo(downW, out var dPtr, out int dNe0, out int dNe1, out long dBytes);
+
+            IntPtr ln1Ptr = GetBufferStart(ln1W);
+            IntPtr qNormPtr = GetBufferStart(qNormW);
+            IntPtr kNormPtr = GetBufferStart(kNormW);
+            IntPtr apnPtr = GetBufferStart(attnPostNormW);
+            IntPtr ln2Ptr = GetBufferStart(ln2W);
+            IntPtr fpnPtr = GetBufferStart(ffnPostNormW);
+
+            fixed (float* cxPtr = cosX, sxPtr = sinX, cyPtr = cosY, syPtr = sinY, clPtr = clamps)
+            {
+                GgmlNative.FusedGemma4VisionBlock(hiddenView, eps, ln1Ptr,
+                    qPtr, qNe0, qNe1, qBytes,
+                    kPtr, kNe0, kNe1, kBytes,
+                    vPtr, vNe0, vNe1, vBytes,
+                    qNormPtr, kNormPtr, apnPtr,
+                    oPtr, oNe0, oNe1, oBytes,
+                    (IntPtr)cxPtr, (IntPtr)sxPtr, (IntPtr)cyPtr, (IntPtr)syPtr,
+                    ln2Ptr,
+                    gPtr, gNe0, gNe1, gBytes,
+                    uPtr, uNe0, uNe1, uBytes,
+                    dPtr, dNe0, dNe1, dBytes,
+                    fpnPtr, (IntPtr)clPtr,
+                    numPatches, numHeads, headDim);
+            }
+        }
+
+        /// <summary>
         /// Native row selection (embedding lookup) from a quantized tensor.
         /// Uses GGML's ggml_get_rows which dequantizes on-the-fly (GPU-accelerated on Metal).
         /// </summary>
