@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TensorSharp Wiki — Local GGUF LLM inference for .NET</title>
+  <meta name="description" content="TensorSharp is a native .NET LLM inference engine for GGUF models: a CLI, a web chat server, and Ollama/OpenAI-compatible HTTP APIs.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="index">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+
+  <section class="hero">
+    <div>
+      <span class="pill">⚡ C# · .NET 10 · GGUF · GPU-accelerated</span>
+      <h1>TensorSharp</h1>
+      <p class="lede">A <strong>native .NET LLM inference engine for GGUF models</strong> — with a command-line tool, a browser chat server, and <strong>Ollama- &amp; OpenAI-compatible APIs</strong> for programmatic access.</p>
+      <div class="btn-row">
+        <a class="btn" href="getting-started.html">Get started →</a>
+        <a class="btn secondary" href="overview.html">What is TensorSharp?</a>
+        <a class="btn secondary" href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+    <div class="hero-art" aria-hidden="true">
+      <div><span class="c-cm"># one-shot generation</span></div>
+      <div>./TensorSharp.Cli \</div>
+      <div>&nbsp;&nbsp;--model <span class="c-st">gemma-4-E4B-it-Q8_0.gguf</span> \</div>
+      <div>&nbsp;&nbsp;--input prompt.txt \</div>
+      <div>&nbsp;&nbsp;--backend <span class="c-ac">ggml_cuda</span></div>
+      <div>&nbsp;</div>
+      <div><span class="c-cm"># or serve an OpenAI-compatible API</span></div>
+      <div>./TensorSharp.Server \</div>
+      <div>&nbsp;&nbsp;--model <span class="c-st">model.gguf</span> --backend <span class="c-ac">ggml_metal</span></div>
+      <div><span class="c-cm"># → http://localhost:5000</span></div>
+    </div>
+  </section>
+
+  <p>Everything runs on <strong>your own hardware</strong>: your laptop, workstation, or server. No data leaves the machine, there are no per-token fees, and the same engine powers a quick command-line test, a shared internal chatbot, and a production REST endpoint. This wiki is the complete guide — pick a starting point below or use <kbd>/</kbd> to search.</p>
+
+  <h2 id="explore">Explore the wiki</h2>
+  <div class="card-grid">
+    <a class="card" href="getting-started.html"><div class="ic">🚀</div><h3>Getting Started</h3><p>Prerequisites, build, download a model, and stream your first reply.</p></a>
+    <a class="card" href="cli.html"><div class="ic">⌨️</div><h3>Command Line</h3><p>Run prompts, images, audio, batches, and benchmarks from the CLI.</p></a>
+    <a class="card" href="server.html"><div class="ic">🌐</div><h3>Server &amp; Web UI</h3><p>Host a browser chatbot and HTTP endpoints on localhost.</p></a>
+    <a class="card" href="http-api.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>Call it from curl, Python, or any Ollama/OpenAI client.</p></a>
+    <a class="card" href="code-api.html"><div class="ic">🧩</div><h3>C# Library</h3><p>Embed the engine directly in your .NET application.</p></a>
+    <a class="card" href="api-reference.html"><div class="ic">📚</div><h3>API Reference</h3><p>Searchable tables of flags, env vars, endpoints, and types.</p></a>
+    <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>Supported architectures, downloads, multimodal, and reasoning.</p></a>
+    <a class="card" href="glossary.html"><div class="ic">📖</div><h3>Glossary &amp; FAQ</h3><p>New to LLMs? Plain-language definitions and common questions.</p></a>
+  </div>
+
+  <h2 id="quickstart">Quick start in ~30 seconds</h2>
+  <p>After installing the <a href="getting-started.html#prerequisites">.NET 10 SDK</a>, you are four commands away from a streaming reply (model download aside).</p>
+  <ol class="steps">
+    <li>
+      <h3>Clone &amp; build</h3>
+      <p>The native GGML library compiles automatically on the first build.</p>
+      <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release</code></pre>
+    </li>
+    <li>
+      <h3>Download a model</h3>
+      <p>A small, well-tested starting point is <strong>Gemma-4-E4B (Q8_0)</strong> from Hugging Face. More in <a href="models.html#downloads">Model downloads</a>.</p>
+    </li>
+    <li>
+      <h3>Run it</h3>
+      <p>Pick the <a href="backends.html#table"><code>--backend</code></a> for your hardware.</p>
+      <pre data-lang="bash"><code>echo "Explain mixture-of-experts in one sentence." > prompt.txt
+
+# macOS (Apple Silicon)
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal
+
+# Windows / Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda</code></pre>
+    </li>
+    <li>
+      <h3>Prefer a UI + API?</h3>
+      <p>Start the server and open the browser chat — it also serves the compatibility endpoints.</p>
+      <pre data-lang="bash"><code>./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
+# open http://localhost:5000</code></pre>
+    </li>
+  </ol>
+
+  <h2 id="why">Why TensorSharp?</h2>
+  <div class="card-grid">
+    <div class="card"><div class="ic">🔒</div><h3>Private by default</h3><p>Inference happens on your hardware. Prompts, documents, and images never leave the machine.</p></div>
+    <div class="card"><div class="ic">💸</div><h3>No per-token bill</h3><p>Run as much as your hardware allows — predictable cost, no metered API.</p></div>
+    <div class="card"><div class="ic">🔁</div><h3>Drop-in compatible</h3><p>Speaks the Ollama and OpenAI wire formats, so existing tools and SDKs just work.</p></div>
+    <div class="card"><div class="ic">🖥️</div><h3>Runs anywhere</h3><p>NVIDIA (CUDA), Apple Silicon (Metal/MLX), or pure CPU — with automatic fallbacks.</p></div>
+    <div class="card"><div class="ic">🧠</div><h3>Modern model support</h3><p>Gemma, Qwen, GPT-OSS, Nemotron-H, Mistral, plus vision, audio, reasoning &amp; tools.</p></div>
+    <div class="card"><div class="ic">⚙️</div><h3>Built in .NET</h3><p>A native C# engine you can embed in your apps, not just a black-box binary.</p></div>
+  </div>
+
+  <h2 id="audience">Who is this for?</h2>
+  <p>TensorSharp serves a wide range of visitors. Here is the fastest path for each.</p>
+  <div class="audience">
+    <div class="a"><h4>Beginners &amp; students</h4><p>Start with the <a href="glossary.html">Glossary &amp; FAQ</a>, then <a href="getting-started.html">Getting Started</a>.</p></div>
+    <div class="a"><h4>Developers</h4><p>Jump to the <a href="http-api.html">HTTP API</a>, <a href="code-api.html">C# Library</a>, and <a href="api-reference.html">API Reference</a>.</p></div>
+    <div class="a"><h4>Senior / principal engineers</h4><p>Read <a href="advanced.html">Advanced Features</a> — paged KV, continuous batching, speculative decoding.</p></div>
+    <div class="a"><h4>Managers, CTOs &amp; CEOs</h4><p>See the <a href="overview.html#business">business value</a> and <a href="overview.html#status">capability matrix</a>.</p></div>
+    <div class="a"><h4>Sales &amp; marketing</h4><p>Use the <a href="features.html">feature catalog</a> and <a href="benchmarks.html">benchmarks</a> for positioning.</p></div>
+    <div class="a"><h4>Researchers &amp; professors</h4><p>Explore <a href="models.html">model architectures</a> and the <a href="benchmarks.html#cross-engine">cross-engine matrix</a>.</p></div>
+  </div>
+
+  <div class="content-footer">
+    <span>Welcome to the TensorSharp wiki.</span>
+    <a href="overview.html">Next: Overview &amp; Architecture →</a>
+  </div>
+
+</main>
+</body>
+</html>

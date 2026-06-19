@@ -6,7 +6,7 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-一个用于在本地运行 GGUF 语言模型的 C# 推理引擎，覆盖自回归 LLM 与 DiffusionGemma 风格的文本扩散模型。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
+面向 GGUF 模型的原生 .NET LLM 推理引擎，覆盖自回归 LLM 与 DiffusionGemma 风格的文本扩散模型。TensorSharp 提供控制台应用、基于 Web 的聊天界面，以及兼容 Ollama/OpenAI 的 HTTP API 以便程序化调用。
 
 ## 快速开始
 

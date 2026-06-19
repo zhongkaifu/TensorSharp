@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TensorSharp">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fb923c"/>
+      <stop offset="1" stop-color="#ea580c"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#0f172a"/>
+  <!-- stylized tensor cube / "sharp" blade -->
+  <path d="M32 12 52 23v18L32 52 12 41V23z" fill="none" stroke="url(#g)" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M32 12v40M12 23l20 11 20-11" fill="none" stroke="url(#g)" stroke-width="3" stroke-linejoin="round" opacity="0.85"/>
+  <circle cx="32" cy="34" r="4.2" fill="#fb923c"/>
+</svg>

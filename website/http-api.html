@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP API (Ollama / OpenAI) — TensorSharp Wiki</title>
+  <meta name="description" content="Call TensorSharp.Server over HTTP: Ollama-compatible and OpenAI-compatible endpoints, the Web UI SSE protocol, sampling, tools, structured outputs, and Python clients.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="http-api">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › HTTP API</div>
+  <h1>HTTP API (Ollama / OpenAI)</h1>
+  <p class="lede"><code>TensorSharp.Server</code> exposes three API styles plus utilities, all on <code>http://localhost:5000</code>. Existing Ollama and OpenAI clients work unchanged — just point them at the local base URL.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Style</th><th>Endpoints</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Ollama-compatible</strong></td><td><code>/api/generate</code>, <code>/api/chat/ollama</code>, <code>/api/tags</code>, <code>/api/show</code></td></tr>
+      <tr><td><strong>OpenAI-compatible</strong></td><td><code>/v1/chat/completions</code>, <code>/v1/models</code></td></tr>
+      <tr><td><strong>Web UI (SSE)</strong></td><td><code>/api/chat</code>, <code>/api/sessions</code>, <code>/api/models</code>, <code>/api/upload</code></td></tr>
+      <tr><td><strong>Utilities</strong></td><td><code>/api/version</code>, <code>/api/queue/status</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">📌</div><p>Requests must name the hosted GGUF file (or its basename). The server hosts one model selected with <code>--model</code>; see <a href="server.html">Server &amp; Web UI</a>.</p></div>
+
+  <h2 id="ollama">1 · Ollama-compatible API</h2>
+
+  <h3>List &amp; show models</h3>
+  <pre data-lang="bash"><code>curl http://localhost:5000/api/tags
+
+curl -X POST http://localhost:5000/api/show \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-4B-Q8_0.gguf"}'</code></pre>
+
+  <h3>Generate (non-streaming)</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "prompt": "What is 1+1?",
+    "stream": false,
+    "options": { "num_predict": 50, "temperature": 0.7, "top_p": 0.9 }
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "model": "Qwen3-4B-Q8_0.gguf",
+  "response": "1+1 equals 2.",
+  "done": true,
+  "done_reason": "stop",
+  "prompt_eval_count": 15,
+  "eval_count": 10,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
+}</code></pre>
+  <p><code>prompt_cache_hit_tokens</code> reports how many prompt tokens were served straight from the prior turn's KV cache. <code>/api/generate</code> always resets the session, so it is always <code>0</code>; it is non-zero on <code>/api/chat/ollama</code> when the prompt prefix matches a previous turn.</p>
+
+  <h3>Generate (streaming)</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-4B-Q8_0.gguf", "prompt": "Tell me a joke.", "stream": true, "options": {"num_predict": 100} }'</code></pre>
+  <p>Each line is a JSON object (newline-delimited JSON); the final <code>"done": true</code> chunk carries timing and cache fields.</p>
+
+  <h3>Chat (multi-turn)</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "stream": false,
+    "options": {"num_predict": 100}
+  }'</code></pre>
+
+  <h3>Generate with an image (multimodal)</h3>
+  <p>Images are sent as base64-encoded bytes in the <code>images</code> array:</p>
+  <pre data-lang="bash"><code>IMG_B64=$(base64 < photo.png)
+curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemma-4-E4B-it-Q8_0.gguf\",
+    \"prompt\": \"What is in this image?\",
+    \"images\": [\"$IMG_B64\"],
+    \"stream\": false,
+    \"options\": {\"num_predict\": 200}
+  }"</code></pre>
+
+  <h3>Chat with thinking mode</h3>
+  <p>Thinking-capable models accept <code>"think": true</code> and split chain-of-thought into <code>message.thinking</code>:</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Solve 17 * 23 step by step."}],
+    "think": true, "stream": false, "options": {"num_predict": 200}
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "message": {
+    "role": "assistant",
+    "content": "17 * 23 = 391.",
+    "thinking": "17 * 20 = 340. 17 * 3 = 51. 340 + 51 = 391."
+  },
+  "done": true, "done_reason": "stop"
+}</code></pre>
+
+  <h2 id="openai">2 · OpenAI-compatible API</h2>
+
+  <h3>Chat Completions (non-streaming)</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is 2+3?"}
+    ],
+    "max_tokens": 50, "temperature": 0.7
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "id": "chatcmpl-abc123...",
+  "object": "chat.completion",
+  "model": "Qwen3-4B-Q8_0.gguf",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "2 + 3 = 5."},
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28,
+    "prompt_tokens_details": { "cached_tokens": 0 }
+  }
+}</code></pre>
+  <p><code>usage.prompt_tokens_details.cached_tokens</code> follows OpenAI's KV-cache-hit extension — on a follow-up turn that shares a prefix it approaches <code>prompt_tokens</code>.</p>
+
+  <h3>Chat Completions (streaming)</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50, "stream": true }'</code></pre>
+  <p>Each chunk is an SSE <code>data:</code> frame of <code>object: "chat.completion.chunk"</code>; the stream ends with <code>data: [DONE]</code>.</p>
+
+  <h3>Image input (OpenAI format)</h3>
+  <pre data-lang="bash"><code>IMG_B64=$(base64 < photo.png)
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemma-4-E4B-it-Q8_0.gguf\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"What is in this image?\"},
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$IMG_B64\"}}
+      ]
+    }],
+    \"max_tokens\": 200
+  }"</code></pre>
+
+  <h2 id="tools">3 · Tool calling over HTTP</h2>
+  <p>Send a <code>tools</code> array; the server detects the architecture's wire format and returns structured <code>tool_calls</code>.</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city":  {"type": "string"},
+            "units": {"type": "string", "enum": ["c", "f"]}
+          },
+          "required": ["city"]
+        }
+      }
+    }],
+    "max_tokens": 200
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "choices": [{
+    "message": {
+      "role": "assistant", "content": null,
+      "tool_calls": [{
+        "id": "call_abc123", "type": "function",
+        "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\",\"units\":\"c\"}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}</code></pre>
+  <p>Continue the loop by appending the assistant <code>tool_calls</code> plus a <code>{"role": "tool", "tool_call_id": "...", "content": "..."}</code> message with the function result, then calling the endpoint again. (The Ollama endpoint uses the same flow with a <code>role: "tool"</code> message.)</p>
+
+  <h2 id="structured">4 · Structured outputs (JSON schema)</h2>
+  <p>The OpenAI <code>response_format</code> accepts <code>text</code>, <code>json_object</code>, and validated <code>json_schema</code>. The server injects strict JSON instructions and validates the output before returning it.</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a concise extraction assistant."},
+      {"role": "user", "content": "Extract the city and country from: Paris, France."}
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "location_extraction", "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "country": { "type": "string" },
+            "confidence": { "type": ["string", "null"] }
+          },
+          "required": ["city", "country", "confidence"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 120
+  }'</code></pre>
+  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> cannot be combined with <code>tools</code> or <code>think</code>. Invalid schemas return HTTP <code>400</code>; outputs that fail validation return HTTP <code>422</code>.</p></div>
+
+  <h2 id="webui-sse">5 · Web UI SSE protocol (<code>/api/chat</code>)</h2>
+  <p>This is the protocol the bundled chat UI uses; external UIs can plug into the same endpoint. Every event is a JSON object delivered as a single <code>data: …</code> SSE frame.</p>
+  <pre data-lang="bash"><code># Create / dispose a session (Web UI flow only)
+curl -X POST http://localhost:5000/api/sessions          # {"sessionId":"a3b1c2..."}
+curl -X DELETE http://localhost:5000/api/sessions/a3b1c2...
+
+# Streaming chat
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{ "messages": [{"role": "user", "content": "Hi"}], "maxTokens": 50, "sessionId": null, "newChat": false, "think": false, "tools": [] }'</code></pre>
+  <p>Reusing the same <code>sessionId</code> splices prior assistant tokens into the KV-cache prefix on the next turn. The terminal frame reports reuse:</p>
+  <pre data-lang="text"><code>data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}</code></pre>
+  <p>Event fields include <code>token</code> (content), <code>thinking</code> (reasoning chunk), <code>tool_calls</code>, <code>replace</code>/<code>diffusionStep</code> (DiffusionGemma previews), and the terminal <code>done</code> summary.</p>
+
+  <h2 id="sampling">6 · Sampling parameters</h2>
+  <h4>Ollama-style (inside the <code>options</code> object)</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_predict</code></td><td>int</td><td>200</td><td>Maximum tokens to generate</td></tr>
+      <tr><td><code>temperature</code></td><td>float</td><td>0</td><td>Sampling temperature (0 = greedy)</td></tr>
+      <tr><td><code>top_k</code></td><td>int</td><td>0</td><td>Top-K filtering (0 = disabled)</td></tr>
+      <tr><td><code>top_p</code></td><td>float</td><td>1.0</td><td>Nucleus sampling threshold</td></tr>
+      <tr><td><code>min_p</code></td><td>float</td><td>0</td><td>Minimum probability filtering</td></tr>
+      <tr><td><code>repeat_penalty</code></td><td>float</td><td>1.0</td><td>Repetition penalty</td></tr>
+      <tr><td><code>presence_penalty</code> / <code>frequency_penalty</code></td><td>float</td><td>0</td><td>Presence / frequency penalties</td></tr>
+      <tr><td><code>seed</code></td><td>int</td><td>-1</td><td>Random seed (-1 = random)</td></tr>
+      <tr><td><code>stop</code></td><td>array</td><td>null</td><td>Stop sequences</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>OpenAI-style (top-level)</h4>
+  <p><code>max_tokens</code>, <code>temperature</code>, <code>top_p</code>, <code>presence_penalty</code>, <code>frequency_penalty</code>, <code>seed</code>, <code>stop</code>, and <code>response_format</code> (<code>text</code> / <code>json_object</code> / <code>json_schema</code>).</p>
+
+  <h2 id="python">7 · Python client examples</h2>
+  <h4>Using <code>requests</code> (Ollama-style)</h4>
+  <pre data-lang="python"><code>import requests
+
+resp = requests.post("http://localhost:5000/api/generate", json={
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "prompt": "What is machine learning?",
+    "stream": False,
+    "options": {"num_predict": 100, "temperature": 0.7}
+})
+print(resp.json()["response"])</code></pre>
+
+  <h4>Using the <code>openai</code> SDK</h4>
+  <pre data-lang="python"><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="Qwen3-4B-Q8_0.gguf",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+3?"}
+    ],
+    max_tokens=50, temperature=0.7
+)
+print(response.choices[0].message.content)</code></pre>
+
+  <h4>Streaming with the <code>openai</code> SDK</h4>
+  <pre data-lang="python"><code>stream = client.chat.completions.create(
+    model="Qwen3-4B-Q8_0.gguf",
+    messages=[{"role": "user", "content": "Tell me about Python."}],
+    max_tokens=200, stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()</code></pre>
+
+  <div class="content-footer">
+    <a href="server.html">← Server &amp; Web UI</a>
+    <a href="code-api.html">Next: C# Library →</a>
+  </div>
+</main>
+</body>
+</html>

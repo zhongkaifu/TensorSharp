@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Benchmarks & Testing — TensorSharp Wiki</title>
+  <meta name="description" content="TensorSharp benchmark results, the cross-engine inference matrix vs llama.cpp and Ollama, and how the test harness works.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="benchmarks">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Benchmarks &amp; Testing</div>
+  <h1>Benchmarks &amp; Testing</h1>
+  <p class="lede">How TensorSharp measures performance against itself over time and against other engines, plus the test harness that guards correctness.</p>
+
+  <h2 id="baseline">Internal regression baseline</h2>
+  <p>Reference numbers measured on <code>Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf</code> (~10 GB on disk; 256 routed experts, 8 active per token; 12 full-attention + 30 GatedDeltaNet recurrent layers) on an <strong>Apple M4 Pro with 24 GB</strong> unified memory:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Metric</th><th>Before (v1 baseline)</th><th>After</th><th>Change</th></tr></thead>
+    <tbody>
+      <tr><td>Process peak memory footprint</td><td>~17 GB</td><td><strong>~8 GB</strong></td><td><span class="yes">−52%</span></td></tr>
+      <tr><td>Server resident set after load</td><td>~20 GB</td><td><strong>~8 GB</strong></td><td><span class="yes">−60%</span></td></tr>
+      <tr><td>Decode throughput (256 prefill / 64 decode)</td><td>~3.8 tok/s</td><td><strong>~10.8 tok/s</strong></td><td><span class="yes">+2.85×</span></td></tr>
+      <tr><td>Decode latency</td><td>~264 ms/token</td><td><strong>~92 ms/token</strong></td><td><span class="yes">−65%</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Reproduce with the built-in benchmark:</p>
+  <pre data-lang="bash"><code>./TensorSharp.Cli --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 64 --bench-runs 3</code></pre>
+  <p>The memory reduction comes primarily from no longer copying the GGUF into a separate native heap buffer (it is now mmap-bound zero-copy into Metal command buffers). The throughput gain is largely a side effect of removing that ~10 GB duplicate working set, which previously triggered OS-level memory pressure on machines with ≤24 GB RAM.</p>
+
+  <h2 id="cross-engine">Cross-engine inference matrix</h2>
+  <p>For an apples-to-apples comparison of <strong>TensorSharp vs llama.cpp vs Ollama</strong> on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic-prefill / image / audio / video tasks and KV-cache dtype sweeps for <code>f32</code>, <code>f16</code>, and <code>q8_0</code>), see <code>docs/inference_benchmark_matrix.md</code> in the repository. The driver scripts live in <code>benchmarks/inference_matrix/scripts/</code>; per-cell raw JSON outputs are written under <code>benchmarks/inference_matrix/results/</code> when you run the matrix.</p>
+
+  <h2 id="testing">Testing</h2>
+  <h3>Unit tests (xUnit)</h3>
+  <p><code>InferenceWeb.Tests</code> exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA and MLX backend kernels (when the hardware is available), paged-KV scheduling, batched-executor correctness, per-model batched-forward correctness against the legacy path, MTP / NextN speculative-decoding correctness, DiffusionGemma probes, codec round-trips, prompt rendering, and the server CLI options builder.</p>
+  <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>
+
+  <h3>Server integration tests</h3>
+  <p>Integration tests in <code>TensorSharp.Server/testdata/</code> cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features are auto-detected and skipped when the active model doesn't support them.</p>
+  <pre data-lang="bash"><code># Start TensorSharp.Server, then run:
+python3 TensorSharp.Server/testdata/test_multiturn.py
+# or
+bash TensorSharp.Server/testdata/test_multiturn.sh</code></pre>
+
+  <h3>Inference matrix runner</h3>
+  <p><code>TensorSharp.TestMatrix</code> is the broader CLI-driven harness for long-running model × backend × feature × env-var coverage. It discovers GGUF files, filters unavailable backends and unsupported prompt types, runs baseline plus env-var sweep cells, writes one JSON result per cell, emits an aggregate Markdown report, and compares against per-host baselines.</p>
+  <pre data-lang="bash"><code>dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
+dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run</code></pre>
+
+  <div class="callout note"><div class="ic">📊</div><p>Benchmark numbers depend heavily on hardware, model, quantization, and KV-cache dtype. Treat the figures above as a reproducible reference point on one machine, not a universal guarantee — run the built-in benchmark on your own hardware for the numbers that matter to you.</p></div>
+
+  <div class="content-footer">
+    <a href="advanced.html">← Advanced Features</a>
+    <a href="api-reference.html">Next: API Reference →</a>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Features — TensorSharp Wiki</title>
+  <meta name="description" content="The complete catalog of TensorSharp features: architectures, multimodal, thinking, tool calling, quantization, batching, speculative decoding, and more.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="features">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Features</div>
+  <h1>Features</h1>
+  <p class="lede">A complete catalog of what TensorSharp does today. Each item links to the page where you can use it.</p>
+
+  <h2 id="catalog">Highlights</h2>
+  <div class="card-grid">
+    <div class="card"><div class="ic">🧠</div><h3>Multi-architecture</h3><p>Gemma 4 / 3, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma.</p></div>
+    <div class="card"><div class="ic">🖼️</div><h3>Multimodal</h3><p>Image, video, and audio inputs (Gemma 4); image input for several others.</p></div>
+    <div class="card"><div class="ic">💭</div><h3>Thinking mode</h3><p>Structured chain-of-thought, separated from the visible answer.</p></div>
+    <div class="card"><div class="ic">🛠️</div><h3>Tool calling</h3><p>Multi-turn function calling across all three API styles.</p></div>
+    <div class="card"><div class="ic">📦</div><h3>Native quantized compute</h3><p>Q4_K_M, Q8_0, MXFP4, IQ2_XXS and more run in matmul without dequantizing to FP32.</p></div>
+    <div class="card"><div class="ic">🔀</div><h3>Continuous batching</h3><p>vLLM-style paged KV cache with cross-request prefix sharing.</p></div>
+    <div class="card"><div class="ic">⏩</div><h3>Speculative decoding</h3><p>MTP / NextN draft heads accelerate solo decode losslessly.</p></div>
+    <div class="card"><div class="ic">🔌</div><h3>Ollama &amp; OpenAI APIs</h3><p>Drop-in endpoints for existing tooling, plus a browser chat UI.</p></div>
+  </div>
+
+  <h2 id="models-features">Models &amp; modalities</h2>
+  <ul>
+    <li><strong>Multi-architecture support</strong> — Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3. → <a href="models.html#table">Supported models</a></li>
+    <li><strong>Multimodal inference</strong> — image, video, and audio inputs for Gemma 4; images for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → <a href="models.html#multimodal">Multimodal</a></li>
+    <li><strong>Mixture of Experts (MoE)</strong> — Gemma 4 MoE (e.g. 26B-A4B), GPT OSS MoE (gpt-oss-20b), Qwen 3.5/3.6 MoE (35B-A3B), and Nemotron-H MoE FFN layers, with a fused batched GPU MoE dispatch.</li>
+    <li><strong>Hybrid SSM-Transformer</strong> — Nemotron-H mixes Mamba2 SSM layers, attention layers, and MoE FFN in one model.</li>
+    <li><strong>Hybrid Attention-Recurrent</strong> — Qwen 3.5/3.6-family mix full-attention layers with GatedDeltaNet recurrent layers.</li>
+    <li><strong>Text-diffusion generation</strong> — DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive decode. → <a href="advanced.html#diffusion">DiffusionGemma</a></li>
+  </ul>
+
+  <h2 id="generation">Generation &amp; control</h2>
+  <ul>
+    <li><strong>Thinking / reasoning mode</strong> — structured chain-of-thought with <code>&lt;think&gt;</code> / <code>&lt;|channel&gt;</code> tags (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H). → <a href="models.html#thinking">Thinking mode</a></li>
+    <li><strong>Tool calling / function calling</strong> — architecture-agnostic output parsing turns raw model output into structured <code>tool_calls</code>. → <a href="models.html#toolcalling">Tool calling</a></li>
+    <li><strong>Configurable sampling</strong> — temperature, top-k, top-p, min-p, repetition / presence / frequency penalties, seed, and stop sequences. → <a href="http-api.html#sampling">Sampling</a></li>
+    <li><strong>Structured outputs</strong> — OpenAI <code>response_format</code> with <code>text</code>, <code>json_object</code>, and validated <code>json_schema</code>. → <a href="http-api.html#structured">Structured outputs</a></li>
+    <li><strong>Chat templates</strong> — auto-loaded from GGUF metadata (Jinja2), with hardcoded fallbacks per architecture.</li>
+    <li><strong>Streaming</strong> — token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations.</li>
+  </ul>
+
+  <h2 id="performance">Performance &amp; scale</h2>
+  <ul>
+    <li><strong>GPU-accelerated</strong> — GGML Metal (macOS), GGML CUDA (Windows/Linux + NVIDIA), a direct CUDA/cuBLAS backend, and an MLX backend for Apple Silicon — all with CPU fallbacks. → <a href="backends.html">Backends</a></li>
+    <li><strong>Continuous batching &amp; paged KV cache</strong> — block-paged KV pool with block-hash prefix sharing, an iteration-level scheduler that admits/preempts sequences mid-batch, optional SSD-backed tier, and a native fused paged-attention kernel. → <a href="advanced.html#continuous-batching">Deep dive</a></li>
+    <li><strong>Batched / parallel inference</strong> — N sequences packed into a single forward pass with paged K/V scatter (Mistral 3, Gemma 4, GPT OSS, Qwen 3 / 3.5 / 3.6, Nemotron-H).</li>
+    <li><strong>MTP / NextN speculative decoding</strong> — multi-token-prediction draft heads accelerate solo decode; lossless because the request's own sampler drives both draft and verify. → <a href="advanced.html#mtp">Speculative decoding</a></li>
+    <li><strong>Native quantized compute</strong> — quantized weights are used directly in matmul without expanding to FP32, saving memory and bandwidth.</li>
+    <li><strong>Optimized pure C# CPU backend</strong> — managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, and fused activations.</li>
+    <li><strong>KV cache codecs</strong> — pluggable <code>IKvBlockCodec</code> with a built-in TurboQuant (Q4 / Q8) compressed codec for paged blocks.</li>
+  </ul>
+
+  <h2 id="interfaces">Interfaces &amp; integration</h2>
+  <ul>
+    <li><strong>Ollama &amp; OpenAI API compatibility</strong> — drop-in replacement endpoints for existing tooling. → <a href="http-api.html">HTTP API</a></li>
+    <li><strong>Browser chat UI</strong> — multi-turn chat, file uploads up to 500 MB, thinking toggle, tool calling, message editing, and live streaming. → <a href="server.html#webui">Web UI</a></li>
+    <li><strong>Interactive REPL</strong> — a turn-by-turn console chat with slash commands, hot-swappable model/backend/projector, and live sampling tuning. → <a href="cli.html#repl">REPL</a></li>
+    <li><strong>Batch processing</strong> — JSONL input in the console application, plus a built-in prefill/decode benchmark.</li>
+    <li><strong>NuGet packages</strong> — depend on only the layers you need and embed inference in your own .NET app. → <a href="code-api.html">C# Library</a></li>
+    <li><strong>Per-turn observability</strong> — structured logs of full input/output plus KV-cache hit ratio, surfaced through every API (<code>prompt_cache_hit_*</code>, <code>cached_tokens</code>, <code>kvReused*</code>).</li>
+  </ul>
+
+  <div class="content-footer">
+    <a href="overview.html">← Overview</a>
+    <a href="getting-started.html">Next: Getting Started →</a>
+  </div>
+</main>
+</body>
+</html>

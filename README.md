@@ -6,7 +6,7 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-A C# inference engine for running GGUF language models locally, including autoregressive LLMs and DiffusionGemma-style text-diffusion models. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
+Native .NET LLM inference engine for GGUF models, including autoregressive LLMs and DiffusionGemma-style text-diffusion models. TensorSharp provides a console application, a web-based chatbot interface, and Ollama/OpenAI-compatible HTTP APIs for programmatic access.
 
 ## Quick Start
 

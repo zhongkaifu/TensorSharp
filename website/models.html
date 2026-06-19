@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Supported Models — TensorSharp Wiki</title>
+  <meta name="description" content="Supported model architectures, GGUF downloads, and multimodal, thinking, and tool-calling capabilities per family.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Supported Models</div>
+  <h1>Supported Models</h1>
+  <p class="lede">TensorSharp loads models in GGUF format and auto-detects the architecture from the file's <code>general.architecture</code> metadata. Pick a quantization that fits your hardware (<code>Q4_K_M</code> for low memory, <code>Q8_0</code> for higher quality).</p>
+
+  <h2 id="table">Supported architectures</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Architecture</th><th>GGUF arch keys</th><th>Example models</th><th>Multimodal</th><th>Thinking</th><th>Tools</th><th>MTP spec</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B, 31B, 26B-A4B (MoE)</td><td>Image, Video, Audio</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes (separate draft)</td></tr>
+      <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code></td><td>Qwen3-4B</td><td>Text only</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen 3.5 / 3.6</strong></td><td><code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code></td><td>Qwen3.5-9B, Qwen3.5/3.6-35B-A3B (MoE)</td><td>Image</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes on 3.6 (embedded NextN)</td></tr>
+      <tr><td><strong>GPT OSS</strong></td><td><code>gptoss</code>, <code>gpt-oss</code></td><td>gpt-oss-20b (MoE)</td><td>Text only</td><td class="yes">Yes (always)</td><td class="yes">Yes</td><td class="no">—</td></tr>
+      <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>, <code>nemotron_h_moe</code></td><td>Nemotron-H-8B, 47B, Nemotron 3 Nano Omni</td><td>Image (Omni)</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
+      <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+      <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>, <code>diffusion_gemma</code></td><td>diffusion-gemma text-diffusion GGUFs</td><td>Text only</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="page-foot-note">Detailed per-model architecture cards (forward graph, components, parameters, and how TensorSharp optimizes prefill/decode) live under <code>docs/models/</code> in the repository.</p>
+
+  <h2 id="downloads">Model downloads (GGUF)</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Architecture</th><th>Model</th><th>Download</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4</td><td>gemma-4-E4B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-31B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-31B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-26B-A4B-it (MoE)</td><td><a href="https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-26B-A4B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 3</td><td>gemma-3-4b-it</td><td><a href="https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf" target="_blank" rel="noopener">google/gemma-3-4b-it-qat-q4_0-gguf</a></td></tr>
+      <tr><td>Qwen 3</td><td>Qwen3-4B</td><td><a href="https://huggingface.co/Qwen/Qwen3-4B-GGUF" target="_blank" rel="noopener">Qwen/Qwen3-4B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-9B</td><td><a href="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.5-9B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-35B-A3B (MoE)</td><td><a href="https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF" target="_blank" rel="noopener">ggml-org/Qwen3.5-35B-A3B-GGUF</a></td></tr>
+      <tr><td>GPT OSS</td><td>gpt-oss-20b (MoE)</td><td><a href="https://huggingface.co/ggml-org/gpt-oss-20b-GGUF" target="_blank" rel="noopener">ggml-org/gpt-oss-20b-GGUF</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-8B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-8B-…</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-47B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-47B-…</a></td></tr>
+      <tr><td>Mistral 3</td><td>Mistral-Small-3.1-24B-Instruct</td><td><a href="https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF" target="_blank" rel="noopener">bartowski/Mistral-Small-3.1-24B-…</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">🧩</div><p>Multimodal models need a <strong>projector (mmproj)</strong> file. The Gemma 4 / Gemma 3 / Qwen 3.5 / Mistral 3 projectors ship in or alongside the repos above; place the projector next to the model with a recognized name for auto-loading, or pass it explicitly with <code>--mmproj</code>.</p></div>
+
+  <h2 id="multimodal">Multimodal support</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Family</th><th>Inputs</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4</td><td>Image · Video · Audio</td><td>Images PNG/JPEG/HEIC; Video MP4 (1 fps via OpenCV); Audio WAV 16 kHz mono / MP3 / OGG. Projector: <code>gemma-4-mmproj-F16.gguf</code>.</td></tr>
+      <tr><td>Gemma 3</td><td>Image</td><td>PNG / JPEG / HEIC. Projector: <code>mmproj-gemma3-4b-f16.gguf</code>.</td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Image</td><td>Dynamic-resolution vision encoder. Projector: <code>Qwen3.5-mmproj-F16.gguf</code>.</td></tr>
+      <tr><td>Mistral 3</td><td>Image</td><td>Pixtral vision encoder. Projector: <code>mistral3-mmproj.gguf</code>.</td></tr>
+      <tr><td>Nemotron-H (Omni)</td><td>Image</td><td>RADIO / v2_vl ViT encoder. Pass the matching <code>--mmproj</code>; image tokens expand at <code>&lt;image&gt;</code> placeholders.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Send images/audio/video via the <a href="cli.html#examples">CLI</a> (<code>--image</code>, <code>--video</code>, <code>--audio</code>), the <a href="server.html#webui">Web UI</a> uploads, or the <a href="http-api.html">HTTP API</a> (base64 <code>images</code> array for Ollama, <code>image_url</code> data URI for OpenAI).</p>
+
+  <h2 id="thinking">Thinking / reasoning mode</h2>
+  <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
+  <ul>
+    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
+    <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
+    <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
+  </ul>
+  <p>Enable it via <code>--think</code> (CLI), <code>"think": true</code> (Ollama API / Web UI), or the thinking toggle in the browser. Responses expose the reasoning separately — e.g. <code>message.thinking</code> in the Ollama chat response.</p>
+
+  <h2 id="toolcalling">Tool calling / function calling</h2>
+  <p>Models can invoke user-defined tools and participate in multi-turn tool-call conversations. Define tools as JSON and pass them via <code>--tools</code> (CLI) or the <code>tools</code> parameter (API). Each architecture uses its own wire format, but the output parser extracts calls into structured <code>tool_calls</code> regardless:</p>
+  <ul>
+    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Gemma 4</strong> — <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
+    <li><strong>GPT OSS (Harmony)</strong> — tools declared as a TypeScript namespace; calls emitted on the commentary channel.</li>
+  </ul>
+  <p>See <a href="http-api.html#tools">Tool calling over HTTP</a> for a complete request/response example and the continuation loop.</p>
+
+  <div class="content-footer">
+    <a href="backends.html">← Compute Backends</a>
+    <a href="cli.html">Next: Command Line →</a>
+  </div>
+</main>
+</body>
+</html>

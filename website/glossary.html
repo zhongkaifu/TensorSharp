@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glossary & FAQ — TensorSharp Wiki</title>
+  <meta name="description" content="Plain-language definitions of LLM and TensorSharp terms, plus answers to common questions for beginners and decision-makers.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="glossary">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Glossary &amp; FAQ</div>
+  <h1>Glossary &amp; FAQ</h1>
+  <p class="lede">New to local LLMs? Start here. Plain-language definitions of the terms used across this wiki, followed by the questions people ask most.</p>
+
+  <h2 id="terms">Glossary</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Term</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LLM</strong> (large language model)</td><td>A neural network trained to predict text. You give it a prompt; it produces a continuation.</td></tr>
+      <tr><td><strong>Inference</strong></td><td>Running a trained model to get an answer (as opposed to <em>training</em>, which creates the model). TensorSharp is an inference engine.</td></tr>
+      <tr><td><strong>GGUF</strong></td><td>A single-file model format that packs the model's weights and metadata together. TensorSharp loads GGUF files, typically downloaded from Hugging Face.</td></tr>
+      <tr><td><strong>Quantization</strong></td><td>Compressing model weights to fewer bits (e.g. <code>Q4_K_M</code> ≈ 4-bit, <code>Q8_0</code> ≈ 8-bit) so a model fits in less memory and runs faster, with a small quality trade-off.</td></tr>
+      <tr><td><strong>Token</strong></td><td>The unit a model reads and writes — roughly a word piece. "Tokens per second" measures speed; "context length" is how many tokens fit at once.</td></tr>
+      <tr><td><strong>Tokenizer</strong></td><td>Converts text to tokens and back. TensorSharp ships SentencePiece and BPE tokenizers.</td></tr>
+      <tr><td><strong>Prefill vs decode</strong></td><td><em>Prefill</em> processes your whole prompt at once; <em>decode</em> generates the reply one token at a time. They have different performance characteristics.</td></tr>
+      <tr><td><strong>KV cache</strong></td><td>Stored attention "keys and values" from earlier tokens, so the model doesn't recompute them. It makes long contexts and multi-turn chats efficient. → <a href="advanced.html#paged-kv">paged KV</a></td></tr>
+      <tr><td><strong>TTFT</strong></td><td>"Time to first token" — how long before the answer starts streaming. KV-cache reuse reduces it on follow-up turns.</td></tr>
+      <tr><td><strong>Backend</strong></td><td>The hardware path that runs the math: CPU, NVIDIA GPU (CUDA), or Apple Silicon GPU (Metal/MLX). → <a href="backends.html">Backends</a></td></tr>
+      <tr><td><strong>MoE</strong> (Mixture of Experts)</td><td>A model that routes each token to a few specialized sub-networks ("experts") instead of the whole network, giving large capacity at lower compute per token.</td></tr>
+      <tr><td><strong>Multimodal</strong></td><td>Able to take more than text — images, audio, or video — as input. → <a href="models.html#multimodal">Multimodal</a></td></tr>
+      <tr><td><strong>Thinking / reasoning</strong></td><td>The model produces hidden step-by-step reasoning before its final answer; TensorSharp separates the two. → <a href="models.html#thinking">Thinking mode</a></td></tr>
+      <tr><td><strong>Tool / function calling</strong></td><td>The model can ask your application to run a function (e.g. "get_weather") and use the result. → <a href="models.html#toolcalling">Tool calling</a></td></tr>
+      <tr><td><strong>Continuous batching</strong></td><td>Serving many users at once by interleaving their requests on a single hosted model, instead of one at a time. → <a href="advanced.html#continuous-batching">Deep dive</a></td></tr>
+      <tr><td><strong>Speculative decoding</strong></td><td>A small "draft" head guesses several tokens; the main model verifies them in one pass — faster output, identical result. → <a href="advanced.html#mtp">MTP</a></td></tr>
+      <tr><td><strong>Projector (mmproj)</strong></td><td>A companion file that lets a multimodal model understand images/audio. Place it next to the model or pass <code>--mmproj</code>.</td></tr>
+      <tr><td><strong>Sampling</strong></td><td>How the next token is chosen from the model's probabilities. <em>Temperature</em>, <em>top-p</em>, and <em>top-k</em> control creativity vs. determinism. → <a href="http-api.html#sampling">Sampling</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="faq">Frequently asked questions</h2>
+
+  <h3>Do I need a GPU?</h3>
+  <p>No. TensorSharp runs on plain CPU (<code>--backend cpu</code> or the faster <code>ggml_cpu</code>). A GPU — NVIDIA (CUDA) or Apple Silicon (Metal/MLX) — makes generation substantially faster, especially for larger models. See <a href="backends.html">Backends</a>.</p>
+
+  <h3>Which model should I start with?</h3>
+  <p><strong>Gemma-4-E4B (Q8_0)</strong> is a small, well-tested starting point. For lower memory, choose a <code>Q4_K_M</code> quantization; for higher quality, a larger model or <code>Q8_0</code>. See <a href="models.html#downloads">Model downloads</a>.</p>
+
+  <h3>Is my data private?</h3>
+  <p>Yes — inference happens entirely on your machine. Prompts, documents, and images are not sent to any external service. That is the main reason organizations choose local inference. See <a href="overview.html#business">Business value</a>.</p>
+
+  <h3>Can I keep using my existing OpenAI / Ollama code?</h3>
+  <p>Yes. The server speaks both wire formats. Point an OpenAI client at <code>http://localhost:5000/v1</code> (any API key) or an Ollama client at <code>http://localhost:5000/api/…</code>. See the <a href="http-api.html">HTTP API</a>.</p>
+
+  <h3>How do I serve many users at once?</h3>
+  <p>Run <a href="server.html">TensorSharp.Server</a>. Its continuous-batching engine interleaves concurrent requests against one hosted model and shares common prompt prefixes across them, which keeps throughput high. See <a href="advanced.html#continuous-batching">Continuous batching</a>.</p>
+
+  <h3>How can I make it faster?</h3>
+  <ul>
+    <li>Use a GPU backend (<code>ggml_cuda</code> or <code>ggml_metal</code>).</li>
+    <li>Pick a smaller or more aggressively quantized model.</li>
+    <li>On supported models, enable <a href="advanced.html#mtp">speculative decoding</a> with <code>--mtp-spec</code>.</li>
+    <li>Reuse sessions so the <a href="advanced.html#continuous-batching">KV-cache prefix</a> carries over between turns.</li>
+  </ul>
+
+  <h3>What does it cost?</h3>
+  <p>There are no per-token fees — you run open models on hardware you control. The cost is the hardware and the electricity to run it. See <a href="overview.html#business">Business value</a>.</p>
+
+  <h3>What platforms are supported?</h3>
+  <p>Windows, Linux, and macOS (Apple Silicon), on .NET 10. Pre-built self-contained binaries are published for Windows/Linux (CPU and CUDA) and macOS arm64. See <a href="getting-started.html">Getting Started</a> and <a href="backends.html#binaries">platform binaries</a>.</p>
+
+  <h3>How is it licensed?</h3>
+  <p>TensorSharp is authored by Zhongkai Fu and distributed under the license in the repository's <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/LICENSE" target="_blank" rel="noopener">LICENSE</a> file (BSD-3-Clause). Each model you download has its own separate license from its publisher — check the model card on Hugging Face.</p>
+
+  <h3>Where do I report issues or contribute?</h3>
+  <p>On the <a href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub repository</a>.</p>
+
+  <div class="content-footer">
+    <a href="api-reference.html">← API Reference</a>
+    <a href="index.html">Back to Home →</a>
+  </div>
+</main>
+</body>
+</html>

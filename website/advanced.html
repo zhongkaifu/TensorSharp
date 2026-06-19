@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Advanced Features — TensorSharp Wiki</title>
+  <meta name="description" content="Continuous batching, paged attention, MTP/NextN speculative decoding, DiffusionGemma, and the performance & memory optimizations behind TensorSharp.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="advanced">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Advanced Features</div>
+  <h1>Advanced Features</h1>
+  <p class="lede">The systems that make TensorSharp fast and scalable: continuous batching with a paged KV cache, speculative decoding, text diffusion, and the kernel- and memory-level optimizations underneath.</p>
+
+  <h2 id="continuous-batching">Continuous batching &amp; paged KV cache</h2>
+  <p>The server's <code>InferenceEngine</code> is a vLLM-style continuous-batching engine, on by default. Instead of running one request at a time, it interleaves many at the granularity of a single decode step.</p>
+  <ul>
+    <li><strong>Paged KV pool</strong> — KV cache is partitioned into fixed-size blocks drawn from a shared pool, so memory is allocated per block rather than per worst-case sequence length.</li>
+    <li><strong>Block-hash prefix sharing</strong> — each full block is content-hashed; identical prefixes (system prompts, shared context) are shared across concurrent and sequential requests instead of recomputed.</li>
+    <li><strong>Iteration-level scheduler</strong> — admits and preempts sequences mid-batch and packs them into one forward pass on models that implement <code>IBatchedPagedModel</code>.</li>
+    <li><strong>Optional SSD tier</strong> — cold blocks can spill to an SSD tier for very large KV working sets.</li>
+  </ul>
+  <p>Models that have not implemented the batched path still run on the engine's isolated per-sequence KV-swap fallback. Tune it with the <a href="server.html#tunables"><code>TS_SCHED_*</code></a> variables, or disable it entirely with <code>--no-continuous-batching</code>.</p>
+
+  <h3 id="paged-kv">Native paged attention</h3>
+  <p>The native kernel <code>TSGgml_PagedAttentionForward</code> (and a <code>WithSinks</code> variant for GPT OSS) gathers K/V from the paged buffer in C++, builds a small GGML graph per sequence, and dispatches <code>ggml_flash_attn_ext</code> — the same fused Metal/CUDA flash-attention kernel the single-sequence path uses. On a long-context Ministral-3-14B workload (4×~800 tokens) it runs ~21% faster than the legacy per-sequence GGML path.</p>
+  <p>Batched forward passes (Mistral 3, Gemma 4, GPT OSS, Qwen 3.5/3.6 with a GatedDeltaNet recurrent-state pool, and Nemotron-H with a Mamba2 recurrent-state pool) pack N sequences into one <code>ForwardBatch</code> call with one batched linear-projection matmul per layer and paged K/V scatter. Gemma 4 reaches ~1.5–1.6× legacy throughput; Nemotron-H Mamba2 batched reaches ~3.95× at batch=3 on an Apple M4 Pro.</p>
+  <div class="callout note"><div class="ic">📖</div><p>Full deep dive: <code>docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md</code> in the repository.</p></div>
+
+  <h2 id="mtp">MTP / NextN speculative decoding</h2>
+  <p>Some architectures ship a <strong>multi-token-prediction (MTP / NextN) draft head</strong> that lets the server run <em>lossless</em> speculative decoding for solo (non-concurrent) sequences. The draft proposes several future tokens cheaply, the trunk verifies all of them in one batched forward, and accepted tokens are committed in a single step.</p>
+  <div class="callout tip"><div class="ic">🎯</div><p>Because the request's own sampler — temperature, top-k/p, and all penalties — drives <em>both</em> the draft and the verify, the output is <strong>identical to standard decode</strong>. Speculation only changes how many forward passes it takes to produce the same tokens.</p></div>
+  <p>It is off by default. Enable it on the server with <code>--mtp-spec</code> (env <code>TS_MTP_SPEC=1</code>):</p>
+  <pre data-lang="bash"><code># Qwen 3.6 — the NextN block is embedded in the trunk GGUF, no extra file needed
+./TensorSharp.Server --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft 8 --mtp-pmin 0.75
+
+# Gemma 4 — load the separate gemma4-assistant draft GGUF that matches the target
+./TensorSharp.Server --model gemma-4-12B-it-Q4_K_M.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft-model gemma-4-12B-assistant-Q8_0.gguf</code></pre>
+  <h4>Two draft-head shapes</h4>
+  <ul>
+    <li><strong>Qwen 3.6 (embedded NextN)</strong> — the GGUF carries one extra decoder block plus the NextN projection/norm tensors. No separate file; <code>--mtp-draft-model</code> is ignored. The GatedDeltaNet trunk state is snapshotted so a partially-rejected verify batch can roll back.</li>
+    <li><strong>Gemma 4 (separate <code>gemma4-assistant</code> GGUF)</strong> — an EAGLE-style recurrent drafter loaded with <code>--mtp-draft-model</code>. It holds no K/V of its own: every draft layer queries the target model's existing per-layer KV cache. The draft's hidden size must match the target (pair the 12B target with its 12B draft). A mismatched or incomplete draft <strong>fails fast at startup</strong> with a remediation hint.</li>
+  </ul>
+  <h4>Where it's profitable</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Backend</th><th>Qwen 3.6</th><th>Gemma 4</th></tr></thead>
+    <tbody>
+      <tr><td>GGML CUDA / GGML Metal</td><td class="yes">✅ fused verify + draft kernels</td><td class="yes">✅ fused verify + draft kernels</td></tr>
+      <tr><td>Direct CUDA (<code>cuda</code>, pure C#)</td><td class="yes">✅ GPU-resident per-op verify/draft</td><td class="yes">✅ GPU-resident per-op verify/draft</td></tr>
+      <tr><td>CPU / GGML CPU / MLX</td><td class="no">standard decode</td><td class="no">standard decode</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Tuning: <code>--mtp-draft</code> (default 8) bounds tokens drafted per step; <code>--mtp-pmin</code> (default 0.75) is the minimum draft-head confidence to keep a token. Gemma 4 A/B switches are the <code>TS_GMTP_*</code> env vars.</p>
+
+  <h2 id="diffusion">DiffusionGemma text diffusion</h2>
+  <p>DiffusionGemma is fundamentally different from autoregressive models: it does not call <code>Forward()</code> one token at a time. Instead it uses block-wise <strong>EntropyBound denoising</strong> over fixed-length canvases on a Gemma-4-derived MoE backbone — the whole answer is refined iteratively rather than written left to right.</p>
+  <ul>
+    <li><strong>CLI</strong> — <code>--diffusion-steps</code> (denoising steps per block), <code>--diffusion-seed</code>, and <code>--diffusion-blocks</code>.</li>
+    <li><strong>Web UI</strong> — streams whole-message <code>replace</code> events so you watch the answer denoise live, and batches concurrent diffusion requests at block boundaries via <code>DiffusionBatchScheduler</code>.</li>
+    <li><strong>Optimizations</strong> — on GPU backends the prompt side of <code>[prompt | canvas]</code> is prefetched once per block and reused across steps; GGML backends use a fused whole-model diffusion decode plus a fused lm-head tail.</li>
+  </ul>
+
+  <h2 id="perf">Performance optimizations</h2>
+  <p>A cross-architecture summary; each per-model card in <code>docs/models/</code> walks through the same kernels with the exact GGML graph dispatched.</p>
+  <ul>
+    <li><strong>Fused GPU decode</strong> (Gemma 4) — all transformer layers in a single GGML graph dispatch, cutting CPU↔GPU round-trips from hundreds per token to one (~2.6× over per-op dispatch).</li>
+    <li><strong>Fused GPU prefill</strong> (Gemma 4) — dense layers run the whole block (norms, QKV, RoPE, attention, FFN, residuals) as one dispatch per layer during prefill.</li>
+    <li><strong>Chunked prefill</strong> (Gemma 4) — long prompts are split into bounded chunks to avoid O(n²) attention score tensors for sliding-window layers.</li>
+    <li><strong>Fused Qwen 3.5/3.6 attention &amp; FFN</strong> — single-graph fused attention-layer decode, fused prefill attention, fused out-proj + FFN, and fused vision encoder blocks (~15 ops → 2).</li>
+    <li><strong>Native quantized compute</strong> — Q4_K_M, Q6_K, Q8_0, IQ2_XXS, MXFP4 used directly in matmul without expanding to FP32; a batched <code>AddmmQuantBatch</code> handles multiple sub-weight matmuls in one dispatch.</li>
+    <li><strong>Batched GPU MoE</strong> — all selected experts (plus the optional shared expert and residual add) collapse into a single GGML graph dispatch per MoE layer.</li>
+    <li><strong>KV-cache prefix reuse</strong> — multi-turn conversations reuse the longest matching token prefix; sliding-window models back off truncation by the window size.</li>
+    <li><strong>Kernel warmup</strong> — both CLI and server run a tiny forward pass at startup to pre-compile GPU kernels and warm the pool, avoiding cold-start latency.</li>
+  </ul>
+
+  <h2 id="memory">Memory optimizations</h2>
+  <ul>
+    <li><strong>Zero-copy file-mapped weights</strong> — the GGUF is memory-mapped and quantized tensors bind directly into native ops, removing a per-tensor copy that roughly doubled the resident set. Example: <code>Qwen3.5-35B-A3B-IQ2_XXS</code> (~10 GB GGUF) runs at ~7 GB peak under Metal instead of ~17 GB.</li>
+    <li><strong>Best-fit memory pool</strong> with bounded retention (blocks capped at 64 MB, pool at 32 blocks) keeps the working set tight across long runs.</li>
+    <li><strong>Paged KV block pool with optional SSD spillover</strong> — RAM-capped, LRU-evicted, with content-hash prefix reuse across sessions.</li>
+    <li><strong>KV block codecs</strong> — optional in-place compression with <code>TurboQuantKvCodec</code> (Q4 / Q8) via <code>--paged-kv-quant-bits</code>, trading a small accuracy cost for half/quarter the per-block footprint.</li>
+  </ul>
+
+  <div class="content-footer">
+    <a href="code-api.html">← C# Library</a>
+    <a href="benchmarks.html">Next: Benchmarks &amp; Testing →</a>
+  </div>
+</main>
+</body>
+</html>

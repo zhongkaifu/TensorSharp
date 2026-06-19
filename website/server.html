@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server & Web UI — TensorSharp Wiki</title>
+  <meta name="description" content="Start TensorSharp.Server: a browser chatbot plus Ollama/OpenAI-compatible HTTP endpoints, with options, environment variables, and batching tunables.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="server">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Server &amp; Web UI</div>
+  <h1>Server &amp; Web UI</h1>
+  <p class="lede"><code>TensorSharp.Server</code> is an ASP.NET Core app that hosts a single GGUF model and exposes a browser chat UI plus Ollama- and OpenAI-compatible REST APIs on the same port. The continuous-batching engine handles concurrency.</p>
+
+  <h2 id="start">Start the server</h2>
+  <pre data-lang="bash"><code>cd TensorSharp.Server/bin
+
+# Start the server with the exact hosted model
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal
+
+# Linux + NVIDIA GPU
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_cuda
+
+# Multimodal models: host an explicit projector too
+./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
+  <p>The server starts on <strong><code>http://localhost:5000</code></strong>. Open it in a browser for the chat UI, or point an HTTP client at the <a href="http-api.html">compatibility endpoints</a>.</p>
+  <div class="callout note"><div class="ic">📌</div><p>The server hosts exactly one GGUF chosen with <code>--model</code> (and an optional projector via <code>--mmproj</code>). It does <em>not</em> scan a model directory; requests must name that hosted file or its basename.</p></div>
+
+  <h3>Server-wide default sampling</h3>
+  <p>Defaults fill in any field a request omits; per-request values always win.</p>
+  <pre data-lang="bash"><code>./TensorSharp.Server --model ./models/model.gguf --backend ggml_metal \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
+    --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
+    --stop "&lt;/s&gt;" --stop "&lt;|endoftext|&gt;"</code></pre>
+
+  <h2 id="webui">Web UI features</h2>
+  <p>Open <code>http://localhost:5000</code>. The browser interface supports:</p>
+  <ul>
+    <li>Multi-turn chat conversations with streaming token generation (SSE).</li>
+    <li>Per-tab chat sessions — each browser tab owns its own tracked history and KV cache.</li>
+    <li>Image, video, and audio uploads for multimodal inference (up to 500 MB).</li>
+    <li>Thinking / reasoning mode toggle and tool calling with function definitions.</li>
+    <li>Message editing and deletion with regeneration from any point in the conversation.</li>
+    <li>DiffusionGemma denoising previews when a <code>diffusion-gemma</code> GGUF is hosted (the whole assistant message is replaced on each step, then finalized).</li>
+    <li>Free scrolling — read earlier replies while new tokens stream; auto-scroll resumes at the bottom.</li>
+  </ul>
+
+  <h2 id="options">Server options</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Option</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF file to host (required for inference).</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF (pass <code>none</code> to disable). Requires <code>--model</code>.</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>Default backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Default generation limit when a request omits it (default: <code>20000</code>).</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Default sampling values when a request does not provide them.</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Default penalties and seed.</td></tr>
+      <tr><td><code>--stop &lt;string&gt;</code></td><td>Default stop sequence (repeatable). Per-request <code>stop</code> replaces the list.</td></tr>
+      <tr><td><code>--continuous-batching</code> / <code>--no-continuous-batching</code></td><td>Enable (default) or disable iteration-level paged batching. Alias: <code>--paged-batching</code>.</td></tr>
+      <tr><td><code>--mtp-spec</code> / <code>--no-mtp-spec</code></td><td>Enable / disable NextN / MTP speculative decoding (default off). → <a href="advanced.html#mtp">MTP</a></td></tr>
+      <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>Max tokens drafted per speculative step (default <code>8</code>).</td></tr>
+      <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>Minimum draft-head confidence to keep a token (default <code>0.75</code>).</td></tr>
+      <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>Separate MTP draft GGUF (Gemma 4's <code>gemma4-assistant</code>); ignored for Qwen 3.6.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout tip"><div class="ic">✅</div><p>Per-request fields (<code>temperature</code>, <code>top_p</code>, <code>seed</code>, <code>stop</code>, …) always override these server-wide defaults; the defaults only fill in what a client omits.</p></div>
+
+  <h2 id="env">Environment variables</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Variable</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>BACKEND</code></td><td>Default backend when <code>--backend</code> is not passed (default: <code>ggml_metal</code> on macOS, <code>ggml_cpu</code> elsewhere).</td></tr>
+      <tr><td><code>MAX_TOKENS</code></td><td>Default max generation length (default: <code>20000</code>).</td></tr>
+      <tr><td><code>MAX_TEXT_FILE_CHARS</code></td><td>Character cap for truncating plain-text uploads (default: <code>8000</code>).</td></tr>
+      <tr><td><code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code></td><td>Frames sampled per second of video / optional upper bound on extracted frames.</td></tr>
+      <tr><td><code>TENSORSHARP_TEMPERATURE</code>, <code>…_TOP_K</code>, <code>…_TOP_P</code>, <code>…_MIN_P</code></td><td>Default sampling values when neither the flag nor the request body sets one.</td></tr>
+      <tr><td><code>TENSORSHARP_REPEAT_PENALTY</code>, <code>…_PRESENCE_PENALTY</code>, <code>…_FREQUENCY_PENALTY</code>, <code>…_SEED</code></td><td>Default penalties and seed.</td></tr>
+      <tr><td><code>TENSORSHARP_LOG_LEVEL</code> / <code>…_LOG_DIR</code> / <code>…_LOG_FILE</code></td><td>Logger level, directory, and file toggle (also honored by the CLI).</td></tr>
+      <tr><td><code>DIFFUSION_STEPS</code> / <code>DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma denoising steps per block / max concurrent diffusion requests batched.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="page-foot-note">The current binary listens on a fixed <code>http://0.0.0.0:5000</code>; the Docker Space images patch that constant to <code>7860</code> at build time.</p>
+
+  <h2 id="tunables">Continuous-batching tunables</h2>
+  <p>The scheduler / engine knobs are read at process start. Set them via the environment (or the <code>--continuous-batching</code> flags, which translate to them).</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Variable</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>TS_SCHED_DISABLE_BATCHED</code></td><td><code>1</code> forces per-sequence KV-swap even when a model supports batching (= <code>--no-continuous-batching</code>).</td></tr>
+      <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>Per-step token budget (default <code>4096</code>).</td></tr>
+      <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>Maximum in-flight sequences (default <code>16</code>).</td></tr>
+      <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>Maximum prefill tokens per step (default <code>1024</code>).</td></tr>
+      <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>Physical blocks in the engine pool (default <code>256</code>) / tokens per block (default <code>256</code>).</td></tr>
+      <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables block-hash prefix sharing across requests.</td></tr>
+      <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>Per-model escape hatch (e.g. <code>TS_GEMMA4_BATCHED=0</code>) to fall back to per-sequence KV-swap.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The full environment-variable surface (MLX tunables, MTP knobs, diffusion) is on the <a href="api-reference.html#env-vars">API Reference</a> page and the <a href="advanced.html">Advanced</a> page.</p>
+
+  <div class="content-footer">
+    <a href="cli.html">← Command Line</a>
+    <a href="http-api.html">Next: HTTP API →</a>
+  </div>
+</main>
+</body>
+</html>

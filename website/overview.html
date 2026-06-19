@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overview & Architecture — TensorSharp Wiki</title>
+  <meta name="description" content="What TensorSharp is, the business value of local inference, and how the layered architecture fits together.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="overview">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Overview &amp; Architecture</div>
+  <h1>Overview &amp; Architecture</h1>
+  <p class="lede">TensorSharp is a native .NET LLM inference engine for GGUF models — including autoregressive LLMs and DiffusionGemma-style text-diffusion models. It ships a console application, a web-based chatbot, and Ollama/OpenAI-compatible HTTP APIs.</p>
+
+  <h2 id="what">What it is — in plain terms</h2>
+  <p>A <strong>large language model (LLM)</strong> is a neural network that predicts text. To use one you need an <strong>inference engine</strong>: software that loads the model's weights and runs the math to turn your prompt into a reply. TensorSharp is that engine, written in modern C# / .NET 10, focused on the <a href="glossary.html#terms">GGUF</a> model format used widely in the local-LLM ecosystem.</p>
+  <p>It gives you three ways to use a model, all from one binary set:</p>
+  <ul>
+    <li><strong>Command line</strong> — run a prompt, an image, a batch of questions, or a benchmark. → <a href="cli.html">CLI</a></li>
+    <li><strong>Server</strong> — a browser chatbot plus REST endpoints that mimic Ollama and OpenAI. → <a href="server.html">Server</a></li>
+    <li><strong>Library</strong> — reference the NuGet packages and call the engine from your own .NET code. → <a href="code-api.html">C# Library</a></li>
+  </ul>
+
+  <h2 id="business">Business value</h2>
+  <p>For decision-makers evaluating local inference, the core trade is <em>control and cost</em> in exchange for <em>running your own hardware</em>.</p>
+  <div class="card-grid">
+    <div class="card"><div class="ic">🔒</div><h3>Data privacy &amp; compliance</h3><p>Prompts and documents never leave your infrastructure — a fit for regulated, on-prem, or air-gapped environments.</p></div>
+    <div class="card"><div class="ic">💸</div><h3>Predictable cost</h3><p>No per-token API billing. Capacity is bounded by hardware you already budget for.</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>No vendor lock-in</h3><p>Open GGUF models from Hugging Face, and an OpenAI/Ollama-compatible surface that existing tools already speak.</p></div>
+    <div class="card"><div class="ic">🏗️</div><h3>.NET-native integration</h3><p>Embed inference inside existing C# services instead of bridging to an external runtime.</p></div>
+    <div class="card"><div class="ic">📈</div><h3>Scales on one box</h3><p>Continuous batching serves many concurrent users from a single hosted model.</p></div>
+    <div class="card"><div class="ic">🔁</div><h3>Migrate easily</h3><p>Point existing OpenAI SDK code at <code>http://localhost:5000/v1</code> and keep your application unchanged.</p></div>
+  </div>
+
+  <h2 id="architecture">Architecture</h2>
+  <p>TensorSharp is a layered system. Each layer is an independently publishable NuGet package, so consumers depend only on what they need.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Layer</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TensorSharp.Core</strong></td><td>The core <code>Tensor</code> type, storage abstraction, device abstraction, and the extensible operation registry (<code>Ops</code>). CPU implementations use <code>System.Numerics.Vectors</code> for SIMD.</td></tr>
+      <tr><td><strong>TensorSharp.Runtime</strong></td><td>GGUF parsing, tokenizers (SentencePiece / BPE), chat-template rendering, sampling, output parsing, the paged KV cache, and the continuous-batching scheduler / engine.</td></tr>
+      <tr><td><strong>TensorSharp.Models</strong></td><td><code>ModelBase</code> plus the concrete architectures and multimodal encoders. Models are loaded via <code>ModelBase.Create()</code>, which auto-detects the architecture from GGUF metadata.</td></tr>
+      <tr><td><strong>TensorSharp.Backends.GGML</strong></td><td>Accelerated ops via a native C++ bridge (<code>libGgmlOps</code>) linking <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> — Metal on macOS, CUDA on Windows/Linux, and native CPU.</td></tr>
+      <tr><td><strong>TensorSharp.Backends.Cuda</strong></td><td>The direct CUDA path: CUDA Driver API, cuBLAS GEMM, and PTX kernels for hot ops, with CPU fallbacks.</td></tr>
+      <tr><td><strong>TensorSharp.Backends.MLX</strong></td><td>The Apple-Silicon MLX path, wrapping <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a> with quantized, fused, and compiled kernels.</td></tr>
+      <tr><td><strong>TensorSharp.Server</strong></td><td>The HTTP / application layer: Ollama- and OpenAI-compatible REST APIs, the browser chat UI, upload handling, and the per-model continuous-batching engine host.</td></tr>
+      <tr><td><strong>TensorSharp.Cli</strong></td><td>The console host for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and benchmarks.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">💡</div><p>Every backend <strong>falls back to CPU</strong> for any operation it does not yet implement, so output stays correct on all of them — you trade speed, never correctness.</p></div>
+
+  <h2 id="flow">How a request flows</h2>
+  <ol>
+    <li><strong>Load</strong> — <code>ModelBase.Create(path, backend)</code> reads GGUF metadata, picks the architecture, and maps the quantized weights into the chosen backend.</li>
+    <li><strong>Render</strong> — the prompt (and any system message, images, audio, tools) is turned into tokens via the architecture's chat template and tokenizer.</li>
+    <li><strong>Prefill</strong> — the prompt tokens are processed in a batched forward pass that populates the KV cache.</li>
+    <li><strong>Decode</strong> — tokens are generated one at a time (optionally several at once via <a href="advanced.html#mtp">speculative decoding</a>), sampled with your settings, and streamed back.</li>
+    <li><strong>Serve</strong> — in the server, the <a href="advanced.html#continuous-batching">continuous-batching engine</a> interleaves many requests against one model, sharing KV-cache prefixes across them.</li>
+  </ol>
+
+  <h2 id="structure">Project structure</h2>
+  <p>The repository is organized by the layers above. The most useful entry points:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Path</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><code>TensorSharp.Core/</code></td><td>Tensor library, ops, memory, device abstraction, CPU SIMD/quantized kernels.</td></tr>
+      <tr><td><code>TensorSharp.Runtime/</code></td><td>GGUF, tokenizers, templates, sampling; <code>Paged/</code> KV primitives and <code>Scheduling/</code> the inference engine + MTP core.</td></tr>
+      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>One folder per architecture (Gemma3/4, Qwen3/35, GptOss, Nemotron, Mistral3, DiffusionGemma), each with a legacy and a batched forward.</td></tr>
+      <tr><td><code>TensorSharp.GGML.Native/</code></td><td>The native C++ bridge to ggml (matmul, fused transformer kernels, paged attention, MoE, Mamba2, GatedDeltaNet, diffusion).</td></tr>
+      <tr><td><code>TensorSharp.Server/</code></td><td>ASP.NET Core server: program bootstrap, model service, inference-engine host, chat pipeline, telemetry.</td></tr>
+      <tr><td><code>docs/</code></td><td>Per-model architecture cards, paged-attention deep dive, env-var matrix, benchmark matrix.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="status">Current status &amp; capabilities</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Area</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Model families</td><td>Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3.</td></tr>
+      <tr><td>Inference hosts</td><td>CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API.</td></tr>
+      <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA.</td></tr>
+      <tr><td>Multimodal</td><td>Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input.</td></tr>
+      <tr><td>Continuous batching</td><td>vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (on by default; opt-out via <code>--no-continuous-batching</code>).</td></tr>
+      <tr><td>Speculative decoding</td><td>MTP / NextN draft heads for Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via <code>--mtp-spec</code>.</td></tr>
+      <tr><td>Observability</td><td>Structured per-turn logs, queue status, and KV-cache reuse metrics across Web UI, Ollama, and OpenAI response shapes.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="content-footer">
+    <a href="index.html">← Home</a>
+    <a href="features.html">Next: Features →</a>
+  </div>
+</main>
+</body>
+</html>

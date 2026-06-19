@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Getting Started — TensorSharp Wiki</title>
+  <meta name="description" content="Install prerequisites, build TensorSharp, download a GGUF model, and run your first inference on the CLI or server.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="getting-started">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Getting Started</div>
+  <h1>Getting Started</h1>
+  <p class="lede">From an empty machine to a streaming reply. The native GGML library compiles automatically on the first build, so the only manual install is the .NET SDK (plus a GPU toolchain if you want acceleration).</p>
+
+  <h2 id="prerequisites">1 · Prerequisites</h2>
+  <ul>
+    <li><a href="https://dotnet.microsoft.com/download/dotnet/10.0" target="_blank" rel="noopener"><strong>.NET 10 SDK</strong></a> — required.</li>
+    <li><strong><code>git</code> + network access</strong> — the native build clones the ggml sources from <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">github.com/ggml-org/ggml</a> into <code>ExternalProjects/ggml/</code> on the first build. Set <code>TENSORSHARP_GGML_NO_UPDATE=1</code> to skip the network update on offline rebuilds.</li>
+    <li><strong>A GGUF model file</strong> — e.g. from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. See <a href="models.html#downloads">Model downloads</a>.</li>
+  </ul>
+  <h4>Per-platform toolchains (only for GPU acceleration)</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Platform</th><th>Needed for</th><th>Install</th></tr></thead>
+    <tbody>
+      <tr><td><strong>macOS</strong> (Metal)</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ and Xcode command-line tools. MLX additionally builds <code>libmlxc</code>.</td></tr>
+      <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, Visual Studio 2022 C++ build tools, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
+      <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
+      <tr><td>Any (CPU only)</td><td><code>cpu</code> / <code>ggml_cpu</code></td><td>Nothing beyond the .NET SDK.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="build">2 · Build</h2>
+  <p>Clone and build the whole solution. The first build also compiles the native GGML bridge (this can take a while, especially for CUDA — subsequent builds are fast).</p>
+  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release</code></pre>
+  <p>Or build just one application:</p>
+  <pre data-lang="bash"><code># Console application
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
+
+# Web application
+dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre>
+  <p>The CLI binary lands in <code>TensorSharp.Cli/bin/...</code> and the server in <code>TensorSharp.Server/bin/...</code>. For a CUDA-enabled native build, manual native builds, or MLX, see <a href="backends.html#native-build">Building the native libraries</a>.</p>
+  <div class="callout tip"><div class="ic">📦</div><p>Prefer not to build from source? The <strong>Release Binaries</strong> workflow publishes self-contained archives (Windows/Linux CPU &amp; CUDA, macOS arm64) that bundle the .NET 10 runtime and native libraries — they run with no separate install. See <a href="backends.html#native-build">Backends</a>.</p></div>
+
+  <h2 id="download">3 · Download a model</h2>
+  <p>TensorSharp loads models in <a href="glossary.html#terms">GGUF</a> format. A small, well-tested starting point is <strong>Gemma-4-E4B (Q8_0)</strong> from <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a>. Pick a quantization that fits your hardware — <code>Q4_K_M</code> for low memory, <code>Q8_0</code> for higher quality. The full list is on the <a href="models.html#downloads">Models</a> page.</p>
+  <div class="callout note"><div class="ic">🧩</div><p>For multimodal models, also download the matching <strong>projector</strong> (mmproj) file. If you place it next to the model with a recognized name (e.g. <code>gemma-4-mmproj-F16.gguf</code>), it is auto-detected.</p></div>
+
+  <h2 id="first-run">4 · First run</h2>
+  <p>Choose the <a href="backends.html#table"><code>--backend</code></a> for your hardware. Every backend produces correct output; they differ only in speed.</p>
+
+  <h3>Option A — one-shot generation (CLI)</h3>
+  <pre data-lang="bash"><code>echo "Explain mixture-of-experts in one sentence." > prompt.txt
+
+# macOS (Apple Silicon)
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal
+
+# Windows / Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda
+
+# Portable / debugging (no GPU)
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu</code></pre>
+
+  <h3>Option B — interactive chat (REPL)</h3>
+  <pre data-lang="bash"><code>./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf -i --backend ggml_metal</code></pre>
+  <p>Type messages turn-by-turn; drive the session with <a href="cli.html#repl">slash commands</a> like <code>/reset</code>, <code>/think on</code>, or <code>/image photo.png</code>.</p>
+
+  <h3>Option C — browser UI + HTTP APIs (server)</h3>
+  <pre data-lang="bash"><code>./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
+# open http://localhost:5000</code></pre>
+  <p>This serves the chat UI <em>and</em> the <a href="http-api.html">Ollama- and OpenAI-compatible</a> endpoints on the same port.</p>
+
+  <h2 id="next">Where to go next</h2>
+  <div class="card-grid">
+    <a class="card" href="backends.html"><div class="ic">🖥️</div><h3>Pick a backend</h3><p>Match <code>--backend</code> to your hardware.</p></a>
+    <a class="card" href="cli.html"><div class="ic">⌨️</div><h3>CLI reference</h3><p>All flags, the REPL, and batch workflows.</p></a>
+    <a class="card" href="http-api.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>Call the server from curl, Python, or SDKs.</p></a>
+    <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>What's supported and where to download.</p></a>
+  </div>
+
+  <div class="content-footer">
+    <a href="features.html">← Features</a>
+    <a href="backends.html">Next: Compute Backends →</a>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API Reference — TensorSharp Wiki</title>
+  <meta name="description" content="Searchable reference: CLI flags, server flags, environment variables, HTTP endpoints, sampling parameters, C# public API, and REPL commands.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .ref-filter { position: sticky; top: calc(var(--topbar-h) + 0px); z-index: 10; background: var(--bg);
+      padding: 10px 0 14px; margin-bottom: 6px; }
+    .ref-filter input { width: 100%; padding: 11px 14px; border: 1px solid var(--border-strong);
+      border-radius: 9px; font-size: .95rem; background: var(--surface); color: var(--text); }
+    .ref-filter .hint { font-size: .78rem; color: var(--text-muted); margin-top: 6px; }
+    tr.ref-hide { display: none; }
+    .ref-section.ref-empty { display: none; }
+    .ref-count { font-size: .8rem; color: var(--text-muted); }
+  </style>
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="api-reference">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › API Reference</div>
+  <h1>API Reference</h1>
+  <p class="lede">Every flag, variable, endpoint, and public type in one place. Type in the box to filter all tables below instantly — or press <kbd>/</kbd> for wiki-wide search.</p>
+
+  <div class="ref-filter">
+    <input type="text" id="ref-input" placeholder="Filter the reference — e.g. temperature, mtp, /v1, BackendType, ggml_cuda…" autocomplete="off" spellcheck="false" aria-label="Filter reference">
+    <div class="hint"><span class="ref-count" id="ref-count"></span> · Matching rows are highlighted live across all sections.</div>
+  </div>
+
+  <h2 id="cli-flags">CLI flags — <code>TensorSharp.Cli</code></h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>Path to a GGUF model file (required).</td></tr>
+      <tr><td><code>--input &lt;path&gt;</code></td><td>Text file containing the user prompt.</td></tr>
+      <tr><td><code>--input-jsonl &lt;path&gt;</code></td><td>JSONL file with batch requests (one JSON per line).</td></tr>
+      <tr><td><code>--multi-turn-jsonl &lt;path&gt;</code></td><td>JSONL for multi-turn chat simulation with KV-cache reuse.</td></tr>
+      <tr><td><code>--output &lt;path&gt;</code></td><td>Write generated text to this file.</td></tr>
+      <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>Media for vision / video / audio inference.</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF (auto-detected beside the model).</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Maximum tokens to generate (default 100).</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>.</td></tr>
+      <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL.</td></tr>
+      <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the system prompt.</td></tr>
+      <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode.</td></tr>
+      <tr><td><code>--tools &lt;path&gt;</code></td><td>JSON file with tool / function definitions.</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Sampling controls.</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty</code></td><td>Penalties (1.0 / 0 = off).</td></tr>
+      <tr><td><code>--seed &lt;N&gt;</code> / <code>--stop &lt;string&gt;</code></td><td>Random seed (-1 = random) / stop sequence (repeatable).</td></tr>
+      <tr><td><code>--dump-prompt</code></td><td>Render prompt + tokenization and exit.</td></tr>
+      <tr><td><code>--diffusion-steps / --diffusion-seed / --diffusion-blocks &lt;N&gt;</code></td><td>DiffusionGemma generation controls.</td></tr>
+      <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>Synthetic throughput benchmark.</td></tr>
+      <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>Multi-turn KV-cache reuse benchmark.</td></tr>
+      <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>Throw-away forward passes before timing (default 0).</td></tr>
+      <tr><td><code>--test / --test-templates &lt;dir&gt;</code></td><td>Built-in tokenizer/template tests; validate templates against GGUF Jinja2.</td></tr>
+      <tr><td><code>--log-level / --log-dir / --log-file / --log-console</code></td><td>Logger level, directory, and file/console toggles.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="server-flags">Server flags — <code>TensorSharp.Server</code></h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF file to host (required for inference).</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF; <code>none</code> to disable.</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>Default compute backend.</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Default generation limit when a request omits it (default 20000).</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Default sampling values.</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Default penalties and seed.</td></tr>
+      <tr><td><code>--stop &lt;string&gt;</code></td><td>Default stop sequence (repeatable); per-request replaces the list.</td></tr>
+      <tr><td><code>--continuous-batching / --no-continuous-batching</code></td><td>Enable (default) / disable iteration-level paged batching. Alias <code>--paged-batching</code>.</td></tr>
+      <tr><td><code>--mtp-spec / --no-mtp-spec</code></td><td>Enable / disable NextN/MTP speculative decoding (default off).</td></tr>
+      <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>Max tokens drafted per speculative step (default 8).</td></tr>
+      <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>Minimum draft-head confidence to keep a token (default 0.75).</td></tr>
+      <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>Separate MTP draft GGUF (Gemma 4 <code>gemma4-assistant</code>).</td></tr>
+      <tr><td><code>--paged-kv* / --paged-kv-quant-bits</code></td><td>Legacy standalone paged-KV flags (engine now owns KV state).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="env-vars">Environment variables</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Variable</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>BACKEND</code></td><td>Default backend (<code>ggml_metal</code> on macOS, <code>ggml_cpu</code> elsewhere).</td></tr>
+      <tr><td><code>MAX_TOKENS</code></td><td>Default max generation length (20000).</td></tr>
+      <tr><td><code>MAX_TEXT_FILE_CHARS</code></td><td>Char cap for plain-text uploads (8000).</td></tr>
+      <tr><td><code>VIDEO_SAMPLE_FPS / VIDEO_MAX_FRAMES</code></td><td>Video frame sampling rate / cap.</td></tr>
+      <tr><td><code>TENSORSHARP_TEMPERATURE / _TOP_K / _TOP_P / _MIN_P</code></td><td>Default sampling values.</td></tr>
+      <tr><td><code>TENSORSHARP_REPEAT_PENALTY / _PRESENCE_PENALTY / _FREQUENCY_PENALTY / _SEED</code></td><td>Default penalties and seed.</td></tr>
+      <tr><td><code>TENSORSHARP_LOG_LEVEL / _LOG_DIR / _LOG_FILE</code></td><td>Logging level, directory, file toggle (CLI + server).</td></tr>
+      <tr><td><code>DIFFUSION_STEPS / DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma steps per block / max batched requests.</td></tr>
+      <tr><td><code>TS_SCHED_DISABLE_BATCHED</code></td><td><code>1</code> forces per-sequence KV-swap (= <code>--no-continuous-batching</code>).</td></tr>
+      <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>Per-step token budget (4096).</td></tr>
+      <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>Max in-flight sequences (16).</td></tr>
+      <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>Max prefill tokens per step (1024).</td></tr>
+      <tr><td><code>TS_SCHED_NUM_BLOCKS / TS_SCHED_BLOCK_SIZE</code></td><td>Engine block-pool size (256) / tokens per block (256).</td></tr>
+      <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables block-hash prefix sharing.</td></tr>
+      <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED</code></td><td><code>0</code> forces a family onto the per-sequence path (e.g. <code>TS_GEMMA4_BATCHED</code>, <code>TS_QWEN35_BATCHED</code>).</td></tr>
+      <tr><td><code>TS_MTP_SPEC / TS_MTP_DRAFT / TS_MTP_PMIN / TS_MTP_DRAFT_MODEL</code></td><td>MTP speculative-decoding knobs (mirror the <code>--mtp-*</code> flags).</td></tr>
+      <tr><td><code>TS_GMTP_NO_FUSED / TS_GMTP_NO_FAST_ROLLBACK / TS_GMTP_BATCHED_TRUNK</code></td><td>Gemma 4 MTP draft-path A/B switches.</td></tr>
+      <tr><td><code>TS_MLX_* </code></td><td>MLX backend tuning: pipelined decode, mlock GGUF, fused KV write, batched MoE decode, memory caps.</td></tr>
+      <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>Override the search path for <code>libmlxc</code>.</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>Skip / pin the ggml source clone on native builds.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="endpoints">HTTP endpoints</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Method &amp; path</th><th>Style</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/generate</code></td><td>Ollama</td><td>Single-prompt completion (stream or not).</td></tr>
+      <tr><td><code>POST /api/chat/ollama</code></td><td>Ollama</td><td>Multi-turn chat with optional think / tools / images.</td></tr>
+      <tr><td><code>GET /api/tags</code></td><td>Ollama</td><td>List the hosted model.</td></tr>
+      <tr><td><code>POST /api/show</code></td><td>Ollama</td><td>Model info.</td></tr>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI</td><td>Chat Completions (stream, tools, response_format).</td></tr>
+      <tr><td><code>GET /v1/models</code></td><td>OpenAI</td><td>List models.</td></tr>
+      <tr><td><code>POST /api/chat</code></td><td>Web UI</td><td>SSE chat stream with session + KV-reuse fields.</td></tr>
+      <tr><td><code>POST /api/sessions</code> · <code>DELETE /api/sessions/{id}</code></td><td>Web UI</td><td>Create / dispose a per-tab session.</td></tr>
+      <tr><td><code>POST /api/upload</code></td><td>Web UI</td><td>Upload an image / audio / video / text file.</td></tr>
+      <tr><td><code>GET /api/models</code></td><td>Web UI</td><td>Hosted model, supported backends, defaults.</td></tr>
+      <tr><td><code>POST /api/models/load</code></td><td>Web UI</td><td>Reload the hosted model.</td></tr>
+      <tr><td><code>GET /api/version</code> · <code>GET /api/queue/status</code></td><td>Utility</td><td>Server version / legacy queue snapshot.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="sampling-params">Sampling parameters</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Ollama (<code>options</code>)</th><th>OpenAI (top-level)</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_predict</code></td><td><code>max_tokens</code></td><td>200</td><td>Maximum tokens to generate.</td></tr>
+      <tr><td><code>temperature</code></td><td><code>temperature</code></td><td>0</td><td>Sampling temperature (0 = greedy).</td></tr>
+      <tr><td><code>top_k</code></td><td>—</td><td>0</td><td>Top-K filtering (0 = disabled).</td></tr>
+      <tr><td><code>top_p</code></td><td><code>top_p</code></td><td>1.0</td><td>Nucleus sampling threshold.</td></tr>
+      <tr><td><code>min_p</code></td><td>—</td><td>0</td><td>Minimum probability filtering.</td></tr>
+      <tr><td><code>repeat_penalty</code></td><td>—</td><td>1.0</td><td>Repetition penalty.</td></tr>
+      <tr><td><code>presence_penalty / frequency_penalty</code></td><td><code>presence_penalty / frequency_penalty</code></td><td>0</td><td>Presence / frequency penalties.</td></tr>
+      <tr><td><code>seed</code></td><td><code>seed</code></td><td>-1</td><td>Random seed (-1 = random).</td></tr>
+      <tr><td><code>stop</code></td><td><code>stop</code></td><td>null</td><td>Stop sequences.</td></tr>
+      <tr><td>—</td><td><code>response_format</code></td><td>null</td><td><code>text</code>, <code>json_object</code>, or <code>json_schema</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="csharp">C# public API</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Member</th><th>Signature / values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>ModelBase.Create</code></td><td><code>static ModelBase Create(string ggufPath, BackendType backend)</code></td><td>Auto-detects architecture from GGUF metadata.</td></tr>
+      <tr><td><code>ModelBase.Forward</code></td><td><code>float[] Forward(int[] tokens)</code></td><td>Returns next-token logits (length = vocab size).</td></tr>
+      <tr><td><code>ModelBase.Sample</code></td><td><code>int Sample(float[] logits, SamplingConfig config, IList&lt;int&gt; generated = null)</code></td><td>Applies penalties + sampling.</td></tr>
+      <tr><td><code>ModelBase.SampleGreedy</code></td><td><code>int SampleGreedy(float[] logits)</code></td><td>Deterministic argmax.</td></tr>
+      <tr><td><code>ModelBase.Config</code> / <code>.Tokenizer</code></td><td><code>ModelConfig</code> / <code>ITokenizer</code></td><td><code>Config.VocabSize</code>, context length, etc.</td></tr>
+      <tr><td><code>BackendType</code></td><td><code>Cpu, GgmlCpu, GgmlMetal, GgmlCuda, Cuda, Mlx</code></td><td>Backend selector enum.</td></tr>
+      <tr><td><code>ITokenizer.Encode</code></td><td><code>Encode(string text, bool addSpecial)</code></td><td>Text → token ids.</td></tr>
+      <tr><td><code>ITokenizer.Decode</code></td><td><code>string Decode(List&lt;int&gt; ids)</code></td><td>Token ids → text.</td></tr>
+      <tr><td><code>ITokenizer.IsEos</code> / <code>.EosTokenIds</code></td><td><code>bool IsEos(int id)</code> / <code>int[] EosTokenIds</code></td><td>End-of-sequence detection.</td></tr>
+      <tr><td><code>SamplingConfig</code></td><td>Temperature, TopK, TopP, MinP, penalties, Seed, StopSequences, MaxTokens</td><td>See <a href="code-api.html#sampling">C# Library</a>.</td></tr>
+      <tr><td><code>IBatchedPagedModel.ForwardBatch</code></td><td>batched/paged forward</td><td>Implemented by most architectures for continuous batching.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="repl-commands">REPL commands</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Command</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>/help</code>, <code>/?</code></td><td>Show all interactive commands.</td></tr>
+      <tr><td><code>/exit</code>, <code>/quit</code></td><td>Leave the session.</td></tr>
+      <tr><td><code>/reset</code>, <code>/new</code></td><td>Clear conversation history and KV cache.</td></tr>
+      <tr><td><code>/history</code> · <code>/save &lt;file&gt;</code></td><td>Print / append the transcript.</td></tr>
+      <tr><td><code>/system &lt;text&gt;</code></td><td>Set the system prompt (resets KV cache).</td></tr>
+      <tr><td><code>/think on|off</code> · <code>/multiline on|off</code></td><td>Toggle reasoning mode / multi-line input.</td></tr>
+      <tr><td><code>/info</code>, <code>/status</code></td><td>Show model, backend, architecture, context/vocab, projector, depth.</td></tr>
+      <tr><td><code>/model &lt;path&gt;</code> · <code>/backend &lt;name&gt;</code> · <code>/mmproj &lt;path&gt;</code></td><td>Hot-swap model, backend, or projector.</td></tr>
+      <tr><td><code>/sampling</code>, <code>/show</code></td><td>Print current sampling configuration.</td></tr>
+      <tr><td><code>/max · /temp · /topk · /topp · /minp</code></td><td>Set reply length / temperature / top-k / top-p / min-p.</td></tr>
+      <tr><td><code>/repeat · /presence · /frequency · /seed</code></td><td>Set penalties and seed.</td></tr>
+      <tr><td><code>/stop &lt;text&gt;</code> · <code>/clearstop</code></td><td>Add / clear stop sequences.</td></tr>
+      <tr><td><code>/image · /audio · /video · /text &lt;path&gt;</code> · <code>/clearattach</code></td><td>Attach media / text for the next turn; drop pending attachments.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="content-footer">
+    <a href="benchmarks.html">← Benchmarks &amp; Testing</a>
+    <a href="glossary.html">Next: Glossary &amp; FAQ →</a>
+  </div>
+</main>
+
+<script>
+(function () {
+  function init() {
+    var input = document.getElementById("ref-input");
+    var count = document.getElementById("ref-count");
+    if (!input) return;
+    var sections = Array.prototype.slice.call(document.querySelectorAll(".ref-section"));
+    var rows = Array.prototype.slice.call(document.querySelectorAll(".ref-table tbody tr"));
+    function apply() {
+      var q = input.value.trim().toLowerCase();
+      var shown = 0;
+      rows.forEach(function (r) {
+        var match = !q || r.textContent.toLowerCase().indexOf(q) >= 0;
+        r.classList.toggle("ref-hide", !match);
+        if (match) shown++;
+      });
+      sections.forEach(function (s) {
+        var any = s.querySelectorAll("tbody tr:not(.ref-hide)").length > 0;
+        s.classList.toggle("ref-empty", !any);
+        var h = s.previousElementSibling;
+        if (h && h.tagName === "H2") h.style.display = any ? "" : "none";
+      });
+      count.textContent = q ? (shown + " row" + (shown === 1 ? "" : "s") + " match") : (rows.length + " entries");
+    }
+    input.addEventListener("input", apply);
+    apply();
+  }
+  if (document.readyState !== "loading") init();
+  else document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>

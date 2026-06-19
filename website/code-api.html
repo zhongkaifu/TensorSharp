@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>C# Library / Code — TensorSharp Wiki</title>
+  <meta name="description" content="Embed TensorSharp in your .NET application: NuGet packages, loading a model with ModelBase.Create, a decode loop, and SamplingConfig.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="code-api">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › C# Library / Code</div>
+  <h1>Using TensorSharp from C#</h1>
+  <p class="lede">TensorSharp is a real .NET library, not just a binary. Reference the NuGet packages and drive inference directly from your own code — useful when you want inference inside an existing service without an HTTP hop.</p>
+
+  <h2 id="packages">NuGet packages</h2>
+  <p>The repository is split along package boundaries so consumers depend on only the layers they need.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Package</th><th>Namespace</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>TensorSharp.Core</code></td><td><code>TensorSharp</code></td><td>Tensor primitives, ops, allocators, storage, device abstraction.</td></tr>
+      <tr><td><code>TensorSharp.Runtime</code></td><td><code>TensorSharp.Runtime</code></td><td>GGUF parsing, tokenizers, prompt rendering, sampling, paged KV cache, continuous-batching scheduler.</td></tr>
+      <tr><td><code>TensorSharp.Models</code></td><td><code>TensorSharp.Models</code></td><td><code>ModelBase</code>, architecture implementations, multimodal encoders, batched/paged forward passes.</td></tr>
+      <tr><td><code>TensorSharp.Backends.GGML</code></td><td><code>TensorSharp.GGML</code></td><td>GGML-backed execution and native interop.</td></tr>
+      <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, quantized CUDA ops.</td></tr>
+      <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple-Silicon MLX backend (mlx-c / Metal).</td></tr>
+      <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core server, OpenAI/Ollama adapters, inference engine host, web UI.</td></tr>
+      <tr><td><code>TensorSharp.Cli</code></td><td><code>TensorSharp.Cli</code></td><td>Console host and debugging / batch tooling.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>For a typical embedding scenario you reference <code>TensorSharp.Models</code> (which pulls in <code>Core</code> + <code>Runtime</code>) and the backend package for your hardware (e.g. <code>TensorSharp.Backends.GGML</code>).</p>
+  <pre data-lang="bash"><code>dotnet add package TensorSharp.Models
+dotnet add package TensorSharp.Backends.GGML</code></pre>
+  <div class="callout note"><div class="ic">📦</div><p>The NuGet packages are <strong>managed-only</strong> — the native GGML/CUDA/MLX libraries are not embedded. Build them once (see <a href="backends.html#native-build">Backends</a>) or use a self-contained platform binary, and make sure the native library is discoverable at run time.</p></div>
+
+  <h2 id="quickstart">Minimal example — load, generate, decode</h2>
+  <p>Every model is loaded the same way: <code>ModelBase.Create()</code> reads the GGUF metadata and instantiates the right architecture. From there you tokenize, run forward passes, sample, and decode.</p>
+  <pre data-lang="csharp"><code>using System;
+using System.Collections.Generic;
+using System.Linq;
+using TensorSharp.Models;
+using TensorSharp.Runtime;
+
+// 1. Load any GGUF model — the architecture is auto-detected from metadata.
+using var model = ModelBase.Create("Qwen3-4B-Q8_0.gguf", BackendType.GgmlCuda);
+
+// 2. Configure sampling (defaults match Ollama: temp 0.8, top_k 40, top_p 0.9).
+var sampling = new SamplingConfig { Temperature = 0.7f, TopP = 0.9f, TopK = 40 };
+
+// 3. Tokenize the prompt.
+var tokens = model.Tokenizer
+    .Encode("Explain mixture-of-experts in one sentence.", addSpecial: true)
+    .ToList();
+var generated = new List&lt;int&gt;();
+
+// 4. Autoregressive decode loop.
+for (int step = 0; step &lt; 200; step++)
+{
+    float[] logits = model.Forward(tokens.ToArray());     // logits for the next token
+    int next = model.Sample(logits, sampling, generated); // applies penalties + sampling
+    if (model.Tokenizer.IsEos(next)) break;
+    generated.Add(next);
+    tokens.Add(next);
+}
+
+// 5. Detokenize the result.
+Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
+  <p>For greedy/deterministic decoding, call <code>model.SampleGreedy(logits)</code> instead of <code>Sample</code>.</p>
+
+  <h3>Smoke-test variant</h3>
+  <p>A one-shot sanity check that loads a model, runs a single forward pass, and prints the top token:</p>
+  <pre data-lang="csharp"><code>using var model = ModelBase.Create(modelPath, backend);
+var tokenIds = model.Tokenizer.Encode("Hello", addSpecial: true);
+float[] logits = model.Forward(tokenIds.ToArray());
+
+int topToken = model.SampleGreedy(logits);
+Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, topToken={topToken}");</code></pre>
+
+  <h2 id="sampling">SamplingConfig</h2>
+  <p>The sampling knobs map one-to-one to the CLI flags and API options. Defaults match Ollama.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Property</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>Temperature</code></td><td>float</td><td>0.8</td><td>Randomness; 0 = greedy/deterministic.</td></tr>
+      <tr><td><code>TopK</code></td><td>int</td><td>40</td><td>Limit to the top-K most probable tokens; 0 = disabled.</td></tr>
+      <tr><td><code>TopP</code></td><td>float</td><td>0.9</td><td>Nucleus sampling; 1.0 = disabled.</td></tr>
+      <tr><td><code>MinP</code></td><td>float</td><td>0</td><td>Minimum probability threshold relative to the max.</td></tr>
+      <tr><td><code>RepetitionPenalty</code></td><td>float</td><td>1.1</td><td>Multiplicative penalty; &gt;1 discourages repetition.</td></tr>
+      <tr><td><code>PresencePenalty</code></td><td>float</td><td>0</td><td>Additive penalty for tokens already present.</td></tr>
+      <tr><td><code>FrequencyPenalty</code></td><td>float</td><td>0</td><td>Additive penalty proportional to token frequency.</td></tr>
+      <tr><td><code>Seed</code></td><td>int</td><td>-1</td><td>Reproducible sampling; -1 = time-based.</td></tr>
+      <tr><td><code>StopSequences</code></td><td>List&lt;string&gt;</td><td>null</td><td>Stop when any of these strings is produced.</td></tr>
+      <tr><td><code>MaxTokens</code></td><td>int</td><td>0</td><td>Maximum tokens to generate; 0 = use the caller's default.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="namespaces">Key types &amp; interfaces</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Type</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>ModelBase</code></td><td>Abstract base for every architecture. <code>Create(path, backend)</code>, <code>Forward(int[])</code>, <code>Sample(...)</code>, <code>SampleGreedy(...)</code>, plus <code>Config</code> and <code>Tokenizer</code>.</td></tr>
+      <tr><td><code>BackendType</code></td><td>Enum: <code>Cpu</code>, <code>GgmlCpu</code>, <code>GgmlMetal</code>, <code>GgmlCuda</code>, <code>Cuda</code>, <code>Mlx</code>.</td></tr>
+      <tr><td><code>SamplingConfig</code></td><td>Sampling configuration (table above).</td></tr>
+      <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>, <code>Decode(ids)</code>, <code>IsEos(id)</code>, <code>EosTokenIds</code> (BPE &amp; SentencePiece implementations).</td></tr>
+      <tr><td><code>ModelConfig</code></td><td>Architecture metadata: <code>VocabSize</code>, context length, and more.</td></tr>
+      <tr><td><code>IBatchedPagedModel</code></td><td>Optional batched/paged forward (<code>ForwardBatch</code>) implemented by most architectures for continuous batching.</td></tr>
+      <tr><td><code>InferenceEngine</code></td><td>Worker-thread scheduler + paged block pool that powers the server's continuous batching (in <code>TensorSharp.Runtime.Scheduling</code>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Other runtime contracts worth knowing: <code>IModelArchitecture</code>, <code>IPromptRenderer</code>, <code>IOutputProtocolParser</code>, <code>IMultimodalInjector</code>, <code>IKvBlockCodec</code> (with the built-in <code>TurboQuantKvCodec</code>), and <code>IKVCachePolicy</code>.</p>
+
+  <div class="callout tip"><div class="ic">💡</div><p>For most applications the easiest integration is to run <a href="server.html">TensorSharp.Server</a> and call it over the <a href="http-api.html">OpenAI-compatible API</a> — you keep your app process clean and get continuous batching for free. Reach for the library API when you need in-process control or custom decoding.</p></div>
+
+  <div class="content-footer">
+    <a href="http-api.html">← HTTP API</a>
+    <a href="advanced.html">Next: Advanced Features →</a>
+  </div>
+</main>
+</body>
+</html>
