@@ -155,6 +155,7 @@ namespace TensorSharp.Cuda
                 case DType.Float64:
                 case DType.Int32:
                 case DType.UInt8:
+                case DType.Float16:
                     destination.Storage.SetElementAsFloat(destinationOffset, source.Storage.GetElementAsFloat(sourceOffset));
                     break;
                 default:

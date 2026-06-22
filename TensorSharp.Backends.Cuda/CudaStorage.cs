@@ -224,6 +224,7 @@ namespace TensorSharp.Cuda
                 DType.Float64 => (float)((double*)hostBuffer.ToPointer())[index],
                 DType.Int32 => ((int*)hostBuffer.ToPointer())[index],
                 DType.UInt8 => ((byte*)hostBuffer.ToPointer())[index],
+                DType.Float16 => (float)BitConverter.UInt16BitsToHalf(((ushort*)hostBuffer.ToPointer())[index]),
                 _ => throw new NotSupportedException("Element type " + ElementType + " not supported"),
             };
         }
@@ -260,6 +261,9 @@ namespace TensorSharp.Cuda
                     break;
                 case DType.UInt8:
                     ((byte*)hostBuffer.ToPointer())[index] = (byte)value;
+                    break;
+                case DType.Float16:
+                    ((ushort*)hostBuffer.ToPointer())[index] = BitConverter.HalfToUInt16Bits((Half)value);
                     break;
                 default:
                     throw new NotSupportedException("Element type " + ElementType + " not supported");

@@ -81,6 +81,10 @@ namespace TensorSharp.Cpu
                 {
                     return ((byte*)buffer.ToPointer())[index];
                 }
+                else if (ElementType == DType.Float16)
+                {
+                    return (float)BitConverter.UInt16BitsToHalf(((ushort*)buffer.ToPointer())[index]);
+                }
                 else
                 {
                     throw new NotSupportedException("Element type " + ElementType + " not supported");
@@ -129,6 +133,10 @@ namespace TensorSharp.Cpu
                 else if (ElementType == DType.UInt8)
                 {
                     ((byte*)buffer.ToPointer())[index] = (byte)value;
+                }
+                else if (ElementType == DType.Float16)
+                {
+                    ((ushort*)buffer.ToPointer())[index] = BitConverter.HalfToUInt16Bits((Half)value);
                 }
                 else
                 {
