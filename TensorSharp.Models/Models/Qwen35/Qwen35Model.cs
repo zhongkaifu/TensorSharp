@@ -970,6 +970,19 @@ namespace TensorSharp.Models
                 _ropeFreqs[i] = freqScale / MathF.Pow(Config.RopeBase, (2.0f * i) / ropeDim);
         }
 
+        /// <summary>
+        /// On <c>ggml_cuda</c> the MoE decode/prefill read the experts exclusively
+        /// through the per-layer STACKED expert device buffer (one device copy per
+        /// <c>*_exps</c> tensor, cached on first use). Preloading each per-expert
+        /// split view as well would put a SECOND full copy of every expert in VRAM —
+        /// for the 35B-A3B that is an extra ~10 GB, which overflows the 16 GB card
+        /// into shared GPU memory (WDDM paging) and tanks decode speed. Skip the
+        /// per-expert members; their host views stay mapped so the rare per-op
+        /// sequential fallback can still stream the bytes on demand.
+        /// </summary>
+        protected override bool ShouldPreloadCudaQuantWeightToDevice(string weightName)
+            => !_stackedExpertMemberNames.Contains(weightName);
+
         public override void ResetKVCache()
         {
             for (int l = 0; l < TotalLayerCount; l++)
@@ -986,6 +999,8 @@ namespace TensorSharp.Models
                 }
             }
             _cacheSeqLen = 0;
+            InvalidateFullDecodeState();
+            _fdSpecSessionActive = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _mlxEvalBoundaryTicks = 0;
             _mlxCacheEvalTicks = 0;
@@ -1254,6 +1269,9 @@ namespace TensorSharp.Models
 
         public override float[] ForwardRefill(int[] tokens)
         {
+            // Prefill runs the recurrent state on the host; re-seed the fused
+            // decode's device-resident GDN state afterwards.
+            InvalidateFullDecodeState();
             if (tokens == null || tokens.Length <= 1)
                 return Forward(tokens);
 
@@ -1350,6 +1368,27 @@ namespace TensorSharp.Models
             bool profileDecode = _profileDecodeStages && seqLen == 1;
             if (profileDecode)
                 _decodeForwardCount++;
+
+            // Fast path: run the whole hybrid transformer (incl. final-norm + lm_head)
+            // as one fused, CUDA-graph-captured GGML graph that outputs LOGITS
+            // directly. Collapses ~120-400 per-op dispatches/token + the separate
+            // lm_head graph_compute into a single captured replay.
+            if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                _logitsBuffer = new float[Config.VocabSize];
+            if (seqLen == 1 && TryFullModelDecode(hidden, startPos, _logitsBuffer))
+            {
+                // _logitsBuffer holds the final logits; skip the per-op loop + lm head.
+                hidden.Dispose();
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _pendingMRoPEPositions = null;
+                _forwardSw.Stop();
+                return _logitsBuffer;
+            }
+            {
+            // Per-op path runs the recurrent state on the host, so the fused
+            // decode's device-resident GDN state must be re-seeded next time.
+            InvalidateFullDecodeState();
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 long blkStart = (profilePrefill || profileDecode) ? Stopwatch.GetTimestamp() : 0;
@@ -1370,6 +1409,7 @@ namespace TensorSharp.Models
                     if (_isRecurrent[layer]) _decodeRecBlockTicks += elapsed;
                     else _decodeAttnBlockTicks += elapsed;
                 }
+            }
             }
 
             // Pick out the last token's hidden state BEFORE the final norm so we can
@@ -3773,6 +3813,34 @@ namespace TensorSharp.Models
 
             float* routePtr = GetFloatPtr(routerData);
 
+            // GGML stacked-MoE fast path (CUDA / CPU / Metal). Route top-K on
+            // host, then run EVERY routed expert for ALL tokens through ONE
+            // ggml_mul_mat_id dispatch per projection against the DEVICE-RESIDENT
+            // stacked expert weights (GgmlBasicOps.MoEFFNPrefill), instead of the
+            // per-expert ExpertLinearForwardAlloc loop below. That loop re-streams
+            // each selected expert's quantized weight from host every step — and
+            // the stacked-MoE VRAM fix (ShouldPreloadCudaQuantWeightToDevice)
+            // deliberately makes per-expert weights NON-resident, so on ggml_cuda
+            // it is catastrophically slow (the N>=2 batched decode "deadlock":
+            // ~K*3*numLayers host->device weight uploads per token). The stacked
+            // weights ARE device-resident, so this dispatch amortizes the weight
+            // read across all tokens — the vLLM-style batched MoE. Handles decode
+            // (seqLen==1/N) and prefill chunks uniformly.
+            if (IsGgmlBackend
+                && _layerStackedGate != null && _layerStackedGate[layer] != null
+                && _layerStackedUp != null && _layerStackedUp[layer] != null
+                && _layerStackedDown != null && _layerStackedDown[layer] != null
+                && !IsQwen35GgmlStackedMoeDisabled())
+            {
+                Tensor stackedOut = TryMoEForwardGgmlStacked(input, routePtr, routeRowsAreLogits, layer, seqLen);
+                if (stackedOut != null)
+                {
+                    routerData.Dispose();
+                    InvalidateTensorDeviceCache(stackedOut);
+                    return stackedOut;
+                }
+            }
+
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenSize);
             float* outputPtr = null;
             // MLX decode (seqLen == 1) keeps expert accumulation on-device
@@ -4028,6 +4096,121 @@ namespace TensorSharp.Models
             routerData.Dispose();
 
             InvalidateTensorDeviceCache(output);
+            return output;
+        }
+
+        private static bool IsQwen35GgmlStackedMoeDisabled()
+            => string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_STACKED_MOE"),
+                             "0", StringComparison.Ordinal);
+
+        // GGML stacked-MoE forward over N tokens (decode batch or prefill chunk).
+        // Routes top-K on host, runs the routed experts via ONE
+        // GgmlBasicOps.MoEFFNPrefill (a single ggml_mul_mat_id per projection
+        // over the device-resident stacked weights), then adds the gated shared
+        // expert. Returns null on any precondition miss so MoEForward falls back
+        // to the per-expert path. This is the path that makes N>=2 batched MoE
+        // decode fast on ggml_cuda (see the call-site comment in MoEForward).
+        private unsafe Tensor TryMoEForwardGgmlStacked(
+            Tensor input, float* routePtr, bool routeRowsAreLogits, int layer, int seqLen)
+        {
+            var gateW = _layerStackedGate[layer];
+            var upW = _layerStackedUp[layer];
+            var downW = _layerStackedDown[layer];
+
+            int hiddenSize = Config.HiddenSize;
+            int intermediate = (int)gateW.PerExpertNe1;
+            int K = _numExpertsUsed;
+
+            // Stacked dims must line up with hidden/intermediate, and all three
+            // projections must share a quant type (mul_mat_id requirement).
+            if (gateW.PerExpertNe0 != hiddenSize || upW.PerExpertNe0 != hiddenSize
+                || upW.PerExpertNe1 != intermediate
+                || downW.PerExpertNe0 != intermediate || downW.PerExpertNe1 != hiddenSize)
+                return null;
+            if (gateW.GgmlType != upW.GgmlType || upW.GgmlType != downW.GgmlType)
+                return null;
+
+            // Host top-K routing for every token: ids[t*K+u], weights[t*K+u].
+            int[] selExperts = new int[seqLen * K];
+            float[] routeWts = new float[seqLen * K];
+            int[] tokTop = new int[K];
+            float[] tokW = new float[K];
+            for (int s = 0; s < seqLen; s++)
+            {
+                float* routeRow = routePtr + (long)s * _numExperts;
+                SelectTopKRouteWeights(routeRow, routeRowsAreLogits, tokTop, tokW);
+                for (int k = 0; k < K; k++)
+                {
+                    selExperts[s * K + k] = tokTop[k];
+                    routeWts[s * K + k] = tokW[k];
+                }
+            }
+
+            var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenSize);
+            try
+            {
+                GgmlBasicOps.MoEFFNPrefill(
+                    input, output, seqLen, hiddenSize, intermediate,
+                    gateW.NumExperts, K, selExperts, routeWts,
+                    gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, gateW.TotalRawBytes,
+                    upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, upW.TotalRawBytes,
+                    downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, downW.TotalRawBytes,
+                    gateBias: null, upBias: null, downBias: null,
+                    activation: GgmlBasicOps.MoEActivation.SwiGLUSplit);
+            }
+            catch (Exception ex)
+            {
+                output.Dispose();
+                if (string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_MOE_DEBUG"), "1", StringComparison.Ordinal))
+                    Console.Error.WriteLine($"[qwen35-moe] stacked MoE failed layer {layer}: {ex.Message}");
+                return null;
+            }
+
+            // Gated shared expert, batched over all tokens:
+            //   shared = down(silu(gate(x)) * up(x))
+            //   out[t] += sigmoid(x[t] . gate_inp_shexp) * shared[t]
+            if (_hasSharedExperts != null && _hasSharedExperts[layer])
+            {
+                Tensor sharedGate = LinearForwardCached(input, _ffnGateShexpQW[layer], _ffnGateShexpF32[layer]);
+                Tensor sharedUp = LinearForwardCached(input, _ffnUpShexpQW[layer], _ffnUpShexpF32[layer]);
+                Tensor sharedDown = null;
+                if (sharedGate != null && sharedUp != null)
+                {
+                    Ops.SiLUMul(sharedGate, sharedGate, sharedUp);
+                    sharedDown = LinearForwardCached(sharedGate, _ffnDownShexpQW[layer], _ffnDownShexpF32[layer]);
+                }
+                sharedUp?.Dispose();
+                sharedGate?.Dispose();
+
+                if (sharedDown != null)
+                {
+                    float* sharedGateInpPtr = null;
+                    int sharedGateInpDim = hiddenSize;
+                    if (_hasSharedExpertGate != null && _hasSharedExpertGate[layer]
+                        && _ffnGateInpShexpVec?[layer] != null)
+                    {
+                        sharedGateInpPtr = GetFloatPtr(_ffnGateInpShexpVec[layer]);
+                        sharedGateInpDim = (int)_ffnGateInpShexpVec[layer].ElementCount();
+                    }
+
+                    float* outputPtr = GetFloatPtr(output);
+                    float* inputPtr = GetFloatPtr(input);
+                    float* sharedPtr = GetFloatPtr(sharedDown);
+                    for (int s = 0; s < seqLen; s++)
+                    {
+                        float gateScalar = 1.0f;
+                        if (sharedGateInpPtr != null)
+                        {
+                            int n = Math.Min(sharedGateInpDim, hiddenSize);
+                            gateScalar = SigmoidScalar(VecDot(inputPtr + (long)s * hiddenSize, sharedGateInpPtr, n));
+                        }
+                        VecScaleAdd(outputPtr + (long)s * hiddenSize,
+                                    sharedPtr + (long)s * hiddenSize, gateScalar, hiddenSize);
+                    }
+                    sharedDown.Dispose();
+                }
+            }
+
             return output;
         }
 

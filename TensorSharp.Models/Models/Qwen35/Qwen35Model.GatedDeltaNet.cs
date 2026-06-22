@@ -37,6 +37,7 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cuda;
@@ -787,6 +788,292 @@ namespace TensorSharp.Models
             if (ffnOutC != null) { Ops.Add(hidden, hidden, ffnOutC); ffnOutC.Dispose(); }
             if (profilePrefill) _prefillRecFfnTicks += Stopwatch.GetTimestamp() - ffnStartC;
             return hidden;
+        }
+
+        // ====================================================================
+        // Full-model fused decode (ggml_cuda). Runs the whole hybrid transformer
+        // (full-attention + GatedDeltaNet recurrent layers + per-layer dense FFN)
+        // as ONE GGML graph per token via TSGgml_Qwen35ModelDecode, collapsing the
+        // ~120-400 per-op kernel dispatches/token (the WDDM per-submit tax that
+        // dominates decode) into a single graph_compute. Falls back to the per-op
+        // layer loop on any unsupported shape. Default ON; TS_QWEN35_FULL_DECODE=0
+        // disables. Dense models only for now (MoE FFN routes to per-op).
+        // ====================================================================
+        private static readonly bool _fullDecodeEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_FULL_DECODE"), "0", StringComparison.Ordinal);
+
+        private Qwen35LayerDecodeArgs[] _fdLayers;
+        private IntPtr _fdConvScratch;    // unmanaged [numGdnLayers * convDim * qkvDim], STABLE addr
+                                          // (cache key for the device-resident conv state) ggml [time,channel]
+        private int[] _fdGdnSlot;         // layer -> index into _fdConvScratch blocks (-1 for attn layers)
+        private bool _fdUnsupported;      // latched: gating failed once, never retry
+        private bool _fdDiagPrinted;
+        private bool _fdStateResident;    // GDN conv/delta state currently device-resident
+        private bool _fdSpecSessionActive; // MTP/spec in use this session -> disable fused decode
+
+        // Called whenever host-side GDN state becomes the source of truth again
+        // (reset / prefill / per-op recurrent execution), forcing the next fused
+        // decode to re-seed the device-resident state from the host buffers.
+        internal void InvalidateFullDecodeState()
+        {
+            _fdStateResident = false;
+            // The batched-fused device KV pool is seeded from the host paged pool;
+            // any state reset/rebuild must force a re-seed before the next fused decode.
+            _bfdPoolSeeded = false;
+            if (_backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+            // The persistent (CUDA-graph-captured) decode graph pins the GDN
+            // conv/delta device-buffer addresses; a re-seed can move them, so drop
+            // the cached graph too. No-op when persist mode is off.
+            if (_backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Qwen35ResetDecodeCache();
+        }
+
+        // MTP/spec interleaves the per-op verify/draft (which read/write the HOST
+        // GDN state) with plain decode steps; the fused decode keeps state
+        // device-resident, so once any spec op runs this session the fused decode
+        // must stay off (host state is the single source of truth). Latched until
+        // the next ResetKVCache. Spec is net-negative for this model anyway.
+        internal void EnterSpecSession() { _fdSpecSessionActive = true; InvalidateFullDecodeState(); }
+
+        // Resolve a linear-projection weight to (ptr, ggml-type, ne0, ne1, bytes)
+        // from EITHER its quantized form or its F32 form (small projections such as
+        // ssm_beta / ssm_alpha are stored F32). F32 weights are [out, in] tensors,
+        // mapped to ggml ne0 = in (last dim), ne1 = out (dim 0).
+        private static unsafe (IntPtr ptr, int type, long ne0, long ne1, long bytes)
+            ResolveW(QuantizedWeight qw, Tensor f32)
+        {
+            if (qw != null)
+                return (qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+            long ne0 = f32.Sizes[f32.DimensionCount - 1];
+            long ne1 = f32.Sizes[0];
+            return ((IntPtr)GetFloatPtr(f32), 0, ne0, ne1, f32.ElementCount() * 4L);
+        }
+
+        internal unsafe bool TryFullModelDecode(Tensor hidden, int position, float[] logitsOut)
+        {
+            if (logitsOut == null || logitsOut.Length < Config.VocabSize)
+                return false;
+            // Fold final-norm + lm_head into the graph requires both present.
+            if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
+                return false;
+            if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive || _backend != BackendType.GgmlCuda)
+                return false;
+            if (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
+                || hidden.ElementType != DType.Float32)
+                return false;
+
+            int n = Config.NumLayers;
+            int headDim = Config.HeadDim;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+            if (convDim <= 0)
+                return false;
+
+            // --- one-time gate: every layer must have its required weights/state ---
+            if (_fdLayers == null)
+            {
+                static bool HasW(QuantizedWeight q, Tensor f) => q != null || f != null;
+                for (int l = 0; l < n; l++)
+                {
+                    bool isMoeL = _isMoeLayer != null && _isMoeLayer[l];
+                    bool ffnOk = isMoeL
+                        ? ((_ffnGateInpQW[l] != null || _ffnGateInpF32[l] != null)
+                            && _layerStackedGate[l] != null && _layerStackedUp[l] != null && _layerStackedDown[l] != null
+                            && HasW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]) && HasW(_ffnUpShexpQW[l], _ffnUpShexpF32[l])
+                            && HasW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]) && _ffnGateInpShexpVec[l] != null)
+                        : (HasW(_ffnGateUpQW[l], _ffnGateUpF32[l]) && HasW(_ffnDownQW[l], _ffnDownF32[l]));
+                    bool ok = _attnNormW[l] != null && _postAttnNormW[l] != null && ffnOk;
+                    if (ok && !_isRecurrent[l])
+                        ok = (HasW(_attnQkvQW[l], _attnQkvF32[l])
+                              || (HasW(_attnQQW[l], _attnQF32[l]) && HasW(_attnKQW[l], _attnKF32[l]) && HasW(_attnVQW[l], _attnVF32[l])))
+                            && HasW(_attnOutputQW[l], _attnOutputF32[l])
+                            && _attnQNormW[l] != null && _attnKNormW[l] != null
+                            && _kvCacheK[l] != null && _kvCacheV[l] != null
+                            && (_kvCacheK[l].ElementType == DType.Float32 || _kvCacheK[l].ElementType == DType.Float16);
+                    if (ok && _isRecurrent[l])
+                        ok = HasW(_attnQkvRecQW[l], _attnQkvRecF32[l]) && HasW(_attnGateRecQW[l], _attnGateRecF32[l])
+                            && HasW(_ssmBetaQW[l], _ssmBetaF32[l]) && HasW(_ssmAlphaQW[l], _ssmAlphaF32[l])
+                            && _ssmConv1dW[l] != null && _ssmDtBiasW[l] != null && _ssmAW[l] != null
+                            && _ssmNormW[l] != null && HasW(_ssmOutQW[l], _ssmOutF32[l])
+                            && _deltaStateTensor[l] != null && _convState[l] != null;
+                    if (!ok)
+                    {
+                        _fdUnsupported = true; return false;
+                    }
+                }
+                int gdnCount = 0;
+                _fdGdnSlot = new int[n];
+                for (int l = 0; l < n; l++)
+                    _fdGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
+                _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
+                _fdLayers = new Qwen35LayerDecodeArgs[n];
+            }
+
+            int cacheSize = 0;
+            int kvCacheType = 0;
+            for (int l = 0; l < n; l++)
+            {
+                if (!_isRecurrent[l])
+                {
+                    cacheSize = (int)_kvCacheK[l].Sizes[1];
+                    kvCacheType = _kvCacheK[l].ElementType == DType.Float16 ? 1 : 0;
+                    break;
+                }
+            }
+            if (cacheSize <= 0 || position >= cacheSize)
+                return false;
+
+            int structBytes = Marshal.SizeOf<Qwen35LayerDecodeArgs>();
+            int convBlock = convDim * qkvDim;
+
+            {
+                float* convBase = (float*)_fdConvScratch;
+                for (int l = 0; l < n; l++)
+                {
+                    var a = default(Qwen35LayerDecodeArgs);
+                    a.StructBytes = structBytes;
+                    a.AttnNormW = (IntPtr)GetFloatPtr(_attnNormW[l]);
+                    a.PostAttnNormW = (IntPtr)GetFloatPtr(_postAttnNormW[l]);
+                    // FFN: dense SwiGLU or MoE
+                    bool isMoe = _isMoeLayer != null && _isMoeLayer[l];
+                    a.IsMoe = isMoe ? 1 : 0;
+                    if (!isMoe)
+                    {
+                        var gu = ResolveW(_ffnGateUpQW[l], _ffnGateUpF32[l]);
+                        var dn = ResolveW(_ffnDownQW[l], _ffnDownF32[l]);
+                        a.GuW = gu.ptr; a.GuType = gu.type; a.GuNe0 = gu.ne0; a.GuNe1 = gu.ne1; a.GuBytes = gu.bytes;
+                        a.DownW = dn.ptr; a.DownType = dn.type; a.DownNe0 = dn.ne0; a.DownNe1 = dn.ne1; a.DownBytes = dn.bytes;
+                        a.FfDense = (int)(gu.ne1 / 2);
+                    }
+                    else
+                    {
+                        var gi = ResolveW(_ffnGateInpQW[l], _ffnGateInpF32[l]);
+                        a.GateInpW = gi.ptr; a.GateInpType = gi.type; a.GateInpNe0 = gi.ne0; a.GateInpNe1 = gi.ne1; a.GateInpBytes = gi.bytes;
+                        var sg = _layerStackedGate[l]; var su = _layerStackedUp[l]; var sd = _layerStackedDown[l];
+                        a.GateExps = sg.Data; a.GateExpsType = sg.GgmlType; a.GateExpsBytes = sg.TotalRawBytes;
+                        a.UpExps = su.Data; a.UpExpsType = su.GgmlType; a.UpExpsBytes = su.TotalRawBytes;
+                        a.DownExps = sd.Data; a.DownExpsType = sd.GgmlType; a.DownExpsBytes = sd.TotalRawBytes;
+                        var shg = ResolveW(_ffnGateShexpQW[l], _ffnGateShexpF32[l]);
+                        var shu = ResolveW(_ffnUpShexpQW[l], _ffnUpShexpF32[l]);
+                        var shd = ResolveW(_ffnDownShexpQW[l], _ffnDownShexpF32[l]);
+                        a.ShexpGateW = shg.ptr; a.ShexpGateType = shg.type; a.ShexpGateNe0 = shg.ne0; a.ShexpGateNe1 = shg.ne1; a.ShexpGateBytes = shg.bytes;
+                        a.ShexpUpW = shu.ptr; a.ShexpUpType = shu.type; a.ShexpUpNe0 = shu.ne0; a.ShexpUpNe1 = shu.ne1; a.ShexpUpBytes = shu.bytes;
+                        a.ShexpDownW = shd.ptr; a.ShexpDownType = shd.type; a.ShexpDownNe0 = shd.ne0; a.ShexpDownNe1 = shd.ne1; a.ShexpDownBytes = shd.bytes;
+                        a.ShexpGateInpW = (IntPtr)GetFloatPtr(_ffnGateInpShexpVec[l]);
+                    }
+
+                    if (!_isRecurrent[l])
+                    {
+                        a.IsRecurrent = 0;
+                        var o = ResolveW(_attnOutputQW[l], _attnOutputF32[l]);
+                        a.OW = o.ptr; a.OType = o.type; a.ONe0 = o.ne0; a.ONe1 = o.ne1; a.OBytes = o.bytes;
+                        if (_attnQkvQW[l] != null || _attnQkvF32[l] != null)
+                        {
+                            var qkv = ResolveW(_attnQkvQW[l], _attnQkvF32[l]);
+                            a.QkvW = qkv.ptr; a.QkvType = qkv.type; a.QkvNe0 = qkv.ne0; a.QkvNe1 = qkv.ne1; a.QkvBytes = qkv.bytes;
+                            a.SeparateQkv = 0;
+                        }
+                        else
+                        {
+                            var q = ResolveW(_attnQQW[l], _attnQF32[l]);
+                            var k = ResolveW(_attnKQW[l], _attnKF32[l]);
+                            var v = ResolveW(_attnVQW[l], _attnVF32[l]);
+                            a.QkvW = q.ptr; a.QkvType = q.type; a.QkvNe0 = q.ne0; a.QkvNe1 = q.ne1; a.QkvBytes = q.bytes;
+                            a.KW = k.ptr; a.KType = k.type; a.KNe0 = k.ne0; a.KNe1 = k.ne1; a.KBytes = k.bytes;
+                            a.VW = v.ptr; a.VType = v.type; a.VNe0 = v.ne0; a.VNe1 = v.ne1; a.VBytes = v.bytes;
+                            a.SeparateQkv = 1;
+                        }
+                        a.QNormW = (IntPtr)GetFloatPtr(_attnQNormW[l]);
+                        a.KNormW = (IntPtr)GetFloatPtr(_attnKNormW[l]);
+                        a.KCache = TensorComputePrimitives.GetStoragePointer(_kvCacheK[l]);
+                        a.VCache = TensorComputePrimitives.GetStoragePointer(_kvCacheV[l]);
+                    }
+                    else
+                    {
+                        a.IsRecurrent = 1;
+                        var gq = ResolveW(_attnQkvRecQW[l], _attnQkvRecF32[l]);
+                        var gz = ResolveW(_attnGateRecQW[l], _attnGateRecF32[l]);
+                        var sb = ResolveW(_ssmBetaQW[l], _ssmBetaF32[l]);
+                        var sa = ResolveW(_ssmAlphaQW[l], _ssmAlphaF32[l]);
+                        var so = ResolveW(_ssmOutQW[l], _ssmOutF32[l]);
+                        a.GdnQkvW = gq.ptr; a.GdnQkvType = gq.type; a.GdnQkvNe0 = gq.ne0; a.GdnQkvNe1 = gq.ne1; a.GdnQkvBytes = gq.bytes;
+                        a.GdnGateW = gz.ptr; a.GdnGateType = gz.type; a.GdnGateNe0 = gz.ne0; a.GdnGateNe1 = gz.ne1; a.GdnGateBytes = gz.bytes;
+                        a.SsmBetaW = sb.ptr; a.SsmBetaType = sb.type; a.SsmBetaNe0 = sb.ne0; a.SsmBetaNe1 = sb.ne1; a.SsmBetaBytes = sb.bytes;
+                        a.SsmAlphaW = sa.ptr; a.SsmAlphaType = sa.type; a.SsmAlphaNe0 = sa.ne0; a.SsmAlphaNe1 = sa.ne1; a.SsmAlphaBytes = sa.bytes;
+                        a.SsmOutW = so.ptr; a.SsmOutType = so.type; a.SsmOutNe0 = so.ne0; a.SsmOutNe1 = so.ne1; a.SsmOutBytes = so.bytes;
+                        a.Conv1dW = (IntPtr)GetFloatPtr(_ssmConv1dW[l]);
+                        a.SsmDtW = (IntPtr)GetFloatPtr(_ssmDtBiasW[l]);
+                        a.SsmAW = (IntPtr)GetFloatPtr(_ssmAW[l]);
+                        a.SsmNormW = (IntPtr)GetFloatPtr(_ssmNormW[l]);
+
+                        // GDN recurrent state is device-resident across decode tokens.
+                        // On (re)seed, convert the host conv ring -> ggml [time, channel]
+                        // layout and force the device cache to re-upload the host state;
+                        // on resident tokens the device buffer is authoritative (no host
+                        // touch, no per-token transfer).
+                        float* conv = convBase + (long)_fdGdnSlot[l] * convBlock;
+                        IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
+                        if (!_fdStateResident)
+                        {
+                            float[] ring = _convState[l];
+                            int w = _convStateWriteIdx[l];
+                            for (int t = 0; t < convDim; t++)
+                            {
+                                int slot = (w + t) % convDim;
+                                int srcBase = slot * qkvDim;
+                                for (int ch = 0; ch < qkvDim; ch++)
+                                    conv[ch * convDim + t] = ring[srcBase + ch];
+                            }
+                            GgmlBasicOps.InvalidateHostBuffer((IntPtr)conv);
+                            GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
+                        }
+                        a.ConvStateIn = (IntPtr)conv;
+                        a.ConvStateOut = (IntPtr)conv;
+                        a.DeltaStateIn = deltaPtr;
+                        a.DeltaStateOut = deltaPtr;
+                    }
+                    _fdLayers[l] = a;
+                }
+
+                // Fold final-norm + lm_head into the graph: output logits directly.
+                var lmh = ResolveW(_lmHeadQW, _lmHeadF32);
+                IntPtr finalNormPtr = (IntPtr)GetFloatPtr(_finalNormW);
+                bool ok2;
+                fixed (float* lp = logitsOut)
+                {
+                    ok2 = GgmlBasicOps.Qwen35ModelDecode(
+                        _fdLayers, n,
+                        (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, position,
+                        Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
+                        headDim, 2, kvCacheType,
+                        _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads,
+                        Config.Eps, Config.RopeBase, 1.0f / Config.RopeScale,
+                        _numExperts, _numExpertsUsed, _expertFfnLength, _sharedExpertFfnLength,
+                        _normTopKProb ? 1 : 0, 1.0f,
+                        (IntPtr)lp, Config.VocabSize,
+                        lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
+                        finalNormPtr);
+                }
+                if (!ok2)
+                {
+                    if (!_fdDiagPrinted)
+                    {
+                        _fdDiagPrinted = true;
+                        Console.Error.WriteLine($"[full-decode] disabled (native returned 0); falling back to per-op decode.");
+                    }
+                    _fdUnsupported = true;   // don't retry a failing kernel every token
+                    return false;
+                }
+
+                // GDN state is now device-resident and was updated in-place; no
+                // host write-back. Mark resident so subsequent tokens skip seeding.
+                _fdStateResident = true;
+            }
+
+            // logitsOut now holds the final logits (final-norm + lm_head folded
+            // into the graph); the caller skips the separate LM head.
+            return true;
         }
 
         /// <summary>

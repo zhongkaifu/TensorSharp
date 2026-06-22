@@ -165,6 +165,7 @@ namespace TensorSharp.Models
         {
             if (!HasMtp)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
+            EnterSpecSession();
 
             Tensor x = MtpForwardCore(new[] { token }, hPrev, pos);
 
@@ -203,6 +204,7 @@ namespace TensorSharp.Models
         {
             if (!HasMtp)
                 throw new InvalidOperationException("Model has no NextN/MTP draft block.");
+            EnterSpecSession();
             Tensor x = MtpForwardCore(tokens, hRows, startPos);
             x.Dispose();
         }
@@ -228,6 +230,7 @@ namespace TensorSharp.Models
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            EnterSpecSession();
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -459,6 +462,7 @@ namespace TensorSharp.Models
         public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
             float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            EnterSpecSession();
             ArgumentNullException.ThrowIfNull(seq);
             if (tokens == null || tokens.Length == 0)
                 throw new ArgumentException("Tokens must not be empty.", nameof(tokens));

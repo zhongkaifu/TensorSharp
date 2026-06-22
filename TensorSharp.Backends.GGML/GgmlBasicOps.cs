@@ -1570,6 +1570,72 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Run the entire Qwen3.5/3.6 hybrid transformer (full-attention +
+        /// GatedDeltaNet recurrent layers + per-layer FFN) as ONE GGML graph per
+        /// decode token. Returns false when the kernel cannot handle the shape so the
+        /// caller falls back to the per-op decode.
+        /// </summary>
+        /// <summary>Drop the persistent Qwen3.5 decode-graph cache (call when the
+        /// GDN state is re-seeded so the next fused decode rebuilds).</summary>
+        public static void Qwen35ResetDecodeCache() => GgmlNative.Qwen35ResetDecodeCache();
+
+        public static bool Qwen35ModelDecode(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int position,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm)
+        {
+            return GgmlNative.Qwen35ModelDecode(
+                layers, numLayers, hidden, hiddenSize, position,
+                numHeads, numKvHeads, headDim, cacheSize,
+                ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale,
+                logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNorm);
+        }
+
+        /// <summary>True token-batched fused decode: N sequences' decode tokens
+        /// (one per sequence) through the whole hybrid transformer in ONE GGML
+        /// graph with PAGED KV. Writes the per-row final pre-output-norm hidden
+        /// state [hidden, nTokens] back into <paramref name="hidden"/>; the caller
+        /// owns output_norm + per-seq LM head. Returns false when the kernel can't
+        /// handle the shape (caller falls back to the op-by-op batched path).</summary>
+        public static void Qwen35ResetBatchedDecodeCache() => GgmlNative.Qwen35ResetBatchedDecodeCache();
+
+        public static bool Qwen35ModelDecodeBatched(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int nTokens, int nSeqs,
+            IntPtr positions, IntPtr slotMapping,
+            IntPtr gatherIdx, IntPtr seqLens, int padKv, int totalSlots,
+            int numHeads, int numKvHeads, int headDim,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale)
+        {
+            return GgmlNative.Qwen35ModelDecodeBatched(
+                layers, numLayers, hidden, hiddenSize, nTokens, nSeqs,
+                positions, slotMapping, gatherIdx, seqLens, padKv, totalSlots,
+                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale);
+        }
+
+        /// <summary>
         /// Run the entire Gemma4 MoE transformer over <paramref name="numTokens"/>
         /// tokens (the MTP verify batch) as ONE GGML graph — the multi-token sibling
         /// of <see cref="Gemma4MoEModelDecode"/>. Reuses the same per-layer descriptor

@@ -209,6 +209,78 @@ public struct Gemma4MoELayerDecodeArgs
     public float LayerOutputScale;
 }
 
+// Descriptor for the Qwen3.5/3.6 full-model decode kernel
+// (TSGgml_Qwen35ModelDecode). Field order/types MUST match the native
+// TSGgmlQwen35LayerDesc struct EXACTLY: 23 pointers, then 27 int64, then 13 int32.
+[StructLayout(LayoutKind.Sequential)]
+public struct Qwen35LayerDecodeArgs
+{
+    // pointers (23)
+    public IntPtr AttnNormW;
+    public IntPtr PostAttnNormW;
+    public IntPtr QkvW;
+    public IntPtr QNormW;
+    public IntPtr KNormW;
+    public IntPtr OW;
+    public IntPtr KCache;
+    public IntPtr VCache;
+    public IntPtr GdnQkvW;
+    public IntPtr GdnGateW;
+    public IntPtr SsmBetaW;
+    public IntPtr SsmAlphaW;
+    public IntPtr Conv1dW;
+    public IntPtr SsmDtW;
+    public IntPtr SsmAW;
+    public IntPtr SsmNormW;
+    public IntPtr SsmOutW;
+    public IntPtr ConvStateIn;
+    public IntPtr DeltaStateIn;
+    public IntPtr ConvStateOut;
+    public IntPtr DeltaStateOut;
+    public IntPtr GuW;
+    public IntPtr DownW;
+    public IntPtr KW;
+    public IntPtr VW;
+    public IntPtr GateInpW;
+    public IntPtr GateExps;
+    public IntPtr UpExps;
+    public IntPtr DownExps;
+    public IntPtr ShexpGateW;
+    public IntPtr ShexpUpW;
+    public IntPtr ShexpDownW;
+    public IntPtr ShexpGateInpW;
+
+    // int64 weight shapes
+    public long QkvNe0, QkvNe1, QkvBytes;
+    public long ONe0, ONe1, OBytes;
+    public long KNe0, KNe1, KBytes;
+    public long VNe0, VNe1, VBytes;
+    public long GdnQkvNe0, GdnQkvNe1, GdnQkvBytes;
+    public long GdnGateNe0, GdnGateNe1, GdnGateBytes;
+    public long SsmBetaNe0, SsmBetaNe1, SsmBetaBytes;
+    public long SsmAlphaNe0, SsmAlphaNe1, SsmAlphaBytes;
+    public long SsmOutNe0, SsmOutNe1, SsmOutBytes;
+    public long GuNe0, GuNe1, GuBytes;
+    public long DownNe0, DownNe1, DownBytes;
+    public long GateInpNe0, GateInpNe1, GateInpBytes;
+    public long GateExpsBytes, UpExpsBytes, DownExpsBytes;
+    public long ShexpGateNe0, ShexpGateNe1, ShexpGateBytes;
+    public long ShexpUpNe0, ShexpUpNe1, ShexpUpBytes;
+    public long ShexpDownNe0, ShexpDownNe1, ShexpDownBytes;
+
+    // int32 scalars
+    public int StructBytes;
+    public int IsRecurrent;
+    public int IsMoe;
+    public int QkvType, OType;
+    public int GdnQkvType, GdnGateType, SsmBetaType, SsmAlphaType, SsmOutType;
+    public int GuType, DownType;
+    public int FfDense;
+    public int SeparateQkv, KType, VType;
+    public int GateInpType, GateExpsType, UpExpsType, DownExpsType;
+    public int ShexpGateType, ShexpUpType, ShexpDownType;
+}
+
 // Descriptor for the fused DiffusionGemma decode-layer kernel
 // (TSGgml_DiffusionDecodeLayer). Field order/types MUST match the native
 // TSGgmlDiffusionDecodeLayerDesc struct EXACTLY.
@@ -1355,6 +1427,100 @@ internal enum GgmlIndexReductionOp
         public static bool Gemma4MoEModelVerify(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int startPos, int numTokens)
         {
             return TSGgml_Gemma4MoEModelVerify(layers, numLayers, hidden, hiddenSize, startPos, numTokens) != 0;
+        }
+
+        // Qwen3.5/3.6 full-model decode: the whole hybrid transformer (full-attention
+        // + GatedDeltaNet recurrent layers + per-layer FFN) as one graph/token.
+        // Returns 0 when it cannot handle the shape so the caller falls back to per-op.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35ModelDecode(
+            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int position,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35ResetDecodeCache();
+
+        public static void Qwen35ResetDecodeCache() => TSGgml_Qwen35ResetDecodeCache();
+
+        // Qwen3.5/3.6 TRUE token-batched fused decode: N sequences' decode tokens
+        // (one per sequence) through the whole hybrid transformer in ONE graph,
+        // with PAGED KV (slot_mapping write + per-seq get_rows gather). Returns 0
+        // when it cannot handle the shape so the caller falls back to op-by-op.
+        // padKv = fixed per-seq gather length (round_up(maxSeqLen, stride)); gatherIdx is
+        // [nSeqs*padKv] (real slots then pad), seqLens [nSeqs] drives the per-seq attn mask.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35ModelDecodeBatched(
+            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int nTokens, int nSeqs,
+            IntPtr positions, IntPtr slotMapping,
+            IntPtr gatherIdx, IntPtr seqLens, int padKv, int totalSlots,
+            int numHeads, int numKvHeads, int headDim,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35ResetBatchedDecodeCache();
+
+        public static void Qwen35ResetBatchedDecodeCache() => TSGgml_Qwen35ResetBatchedDecodeCache();
+
+        public static bool Qwen35ModelDecodeBatched(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int nTokens, int nSeqs,
+            IntPtr positions, IntPtr slotMapping,
+            IntPtr gatherIdx, IntPtr seqLens, int padKv, int totalSlots,
+            int numHeads, int numKvHeads, int headDim,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale)
+        {
+            return TSGgml_Qwen35ModelDecodeBatched(
+                layers, numLayers, hidden, hiddenSize, nTokens, nSeqs,
+                positions, slotMapping, gatherIdx, seqLens, padKv, totalSlots,
+                numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale) != 0;
+        }
+
+        public static bool Qwen35ModelDecode(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int position,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm)
+        {
+            return TSGgml_Qwen35ModelDecode(
+                layers, numLayers, hidden, hiddenSize, position,
+                numHeads, numKvHeads, headDim, cacheSize,
+                ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale,
+                logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNorm) != 0;
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
