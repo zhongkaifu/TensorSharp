@@ -75,6 +75,15 @@ if (APPLE)
 endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    # GgmlOps itself compiles a CUDA source (the on-device diffusion sampler), so it needs the
+    # CUDA language enabled. CMAKE_CUDA_ARCHITECTURES is normally supplied by build-windows.ps1
+    # (detected from the local GPU); fall back to a broad default if the caller did not set it.
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "" FORCE)
+    endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     set(GGML_CUDA_FA ON CACHE BOOL "" FORCE)
     set(GGML_CUDA_FA_ALL_QUANTS OFF CACHE BOOL "" FORCE)
@@ -95,7 +104,7 @@ endif()
 
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml" ggml-build)
 
-add_library(GgmlOps SHARED
+set(TSG_GGMLOPS_SOURCES
     ggml_ops_core.cpp
     ggml_ops_matmul.cpp
     ggml_ops_elementwise.cpp
@@ -109,6 +118,18 @@ add_library(GgmlOps SHARED
     ggml_ops_moe.cpp
     ggml_ops_paged_attention.cpp
 )
+if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
+endif()
+
+add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
+
+if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
+    # Fast intrinsic transcendentals (tanhf/expf) for the diffusion sampler kernel — the accurate
+    # library tanhf is ~100x slower on-device and the sampler only needs FP-reduction-level accuracy.
+    target_compile_options(GgmlOps PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+endif()
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"

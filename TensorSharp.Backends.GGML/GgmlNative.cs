@@ -1378,6 +1378,36 @@ internal enum GgmlIndexReductionOp
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_DiffusionLmHeadSample(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW,
+            IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocab, float eps, float finalLogitSoftcap,
+            float invTemp, IntPtr uHost, int topK,
+            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut,
+            IntPtr topTokensOut, IntPtr topProbsOut);
+
+        /// <summary>Fused DiffusionGemma lm_head + on-device sample (CUDA only): runs output_norm + lm_head
+        /// as one graph producing device logits, then a CUDA kernel computes per canvas position the argmax,
+        /// entropy, multinomial sample (with the pre-drawn <paramref name="uHost"/>), and top-K tokens/weights
+        /// — downloading only the small per-position outputs instead of the full [vocab,C] logits. Returns
+        /// false (caller falls back to <see cref="TryDiffusionLmHead"/> + host sampling) on non-CUDA / failure.</summary>
+        public static bool TryDiffusionLmHeadSample(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocab, float eps, float finalLogitSoftcap,
+            float invTemp, IntPtr uHost, int topK,
+            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut, IntPtr topTokensOut, IntPtr topProbsOut)
+        {
+            int r = TSGgml_DiffusionLmHeadSample(hidden, hiddenSize, canvasLen, outputNormW,
+                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocab, eps, finalLogitSoftcap,
+                invTemp, uHost, topK, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+            if (r == 0 && Environment.GetEnvironmentVariable("DIFFUSION_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[fused-lmhead-sample FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_DiffusionModelDecode(
             [In] DiffusionDecodeLayerArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int canvasLen, int promptLen,

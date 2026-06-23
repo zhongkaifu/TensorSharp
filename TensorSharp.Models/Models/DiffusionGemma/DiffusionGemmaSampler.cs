@@ -150,17 +150,60 @@ namespace TensorSharp.Models
                 Array.Copy(promptTokens, tokens, P);
             }
 
+            // On-device sampling (CUDA): the lm_head kernel returns argmax/entropy/sampled/top-K directly,
+            // so the full [vocab,C] logits never cross PCIe and no host full-vocab CPU sweep runs. Needs the
+            // prompt-KV decode path (its canvas hidden stays on-device for the sampling tail). The per-step
+            // top-K (double-buffered) feeds the NEXT step's self-conditioning, replacing the host logits.
+            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            int K = _model.SelfCondTopK;
+            int[] dArg = null, dSamp = null;
+            int[][] topTok = null; float[][] topPrb = null; int dbuf = 0;
+            if (useDeviceSample)
+            {
+                dArg = new int[C]; dSamp = new int[C];
+                int kk = Math.Max(1, K);
+                topTok = new[] { new int[C * kk], new int[C * kk] };
+                topPrb = new[] { new float[C * kk], new float[C * kk] };
+            }
+
             float prevTempInv = 1f;
             int held = 0;
             bool finished = false;
+            bool stepTime = Environment.GetEnvironmentVariable("DIFFUSION_STEPTIME") == "1";
 
             for (int curStep = S; curStep >= 1 && !finished && !ct.IsCancellationRequested; curStep--)
             {
                 int stepIdx = S - curStep;
                 float t = p.TMin + (p.TMax - p.TMin) * ((float)curStep / S);
                 float tempInv = 1f / t;
-
                 float scUse = stepIdx == 0 ? 0f : 1f;
+
+                if (useDeviceSample)
+                {
+                    // pre-draw step randomness (u then renoise per position) so the rng order matches the
+                    // host sampler; u drives the on-device multinomial, renoise the rejected positions.
+                    for (int pos = 0; pos < C; pos++) { u[pos] = rng.NextFloat(); renoise[pos] = rng.NextInt(vocab); }
+                    int[] scTok = stepIdx == 0 ? null : topTok[1 - dbuf];
+                    float[] scPrb = stepIdx == 0 ? null : topPrb[1 - dbuf];
+                    bool ok = _model.DecodeCanvasSampled(currentCanvas, scTok, scPrb, scUse, tempInv, u, K,
+                        dArg, entropy, dSamp, topTok[dbuf], topPrb[dbuf]);
+                    if (ok)
+                    {
+                        long _sw0 = Stopwatch.GetTimestamp();
+                        finished = DenoiseStepFromDevice(dArg, entropy, dSamp, renoise, p,
+                            currentCanvas, argmaxCanvas, prevArgmax, ref held, order);
+                        if (stepTime)
+                            Console.Error.WriteLine($"[sampler] DenoiseStepFromDevice {(Stopwatch.GetTimestamp() - _sw0) * 1000.0 / Stopwatch.Frequency:F2} ms");
+                        dbuf ^= 1;
+                        prevTempInv = tempInv;
+                        stepCallback?.Invoke(stepIdx, S, (int[])argmaxCanvas.Clone());
+                        continue;
+                    }
+                    // device path rejected the layout: fall back to the host logits path for the rest of the
+                    // block (self-conditioning restarts from the next step, scBuffer null this step).
+                    useDeviceSample = false;
+                }
+
                 float[] logits;
                 if (usePkv)
                 {
@@ -173,8 +216,11 @@ namespace TensorSharp.Models
                 }
 
                 // per-position sampling + accept + renoise + adaptive-stop (shared with the batched path)
+                long _sw1 = Stopwatch.GetTimestamp();
                 finished = DenoiseStep(logits, tempInv, rng, p, currentCanvas, argmaxCanvas, prevArgmax,
                     ref held, entropy, denoiser, order, u, renoise);
+                if (stepTime)
+                    Console.Error.WriteLine($"[sampler] DenoiseStep {(Stopwatch.GetTimestamp() - _sw1) * 1000.0 / Stopwatch.Frequency:F1} ms");
                 prevTempInv = tempInv;
 
                 // hand this step's logits to the next step's self-conditioning (no copy; see scBuffer note)
@@ -274,6 +320,45 @@ namespace TensorSharp.Models
             return held >= p.StabilityThreshold && confident;
         }
 
+        /// <summary>The host half of a denoising step when the per-position argmax/entropy/multinomial sample
+        /// were computed ON-DEVICE (the GPU sampler). Identical accept/renoise/adaptive-stop logic to the back
+        /// half of <see cref="DenoiseStep"/> — only the full-vocab per-position work is gone (done in the
+        /// kernel). <paramref name="argmaxIn"/>/<paramref name="entropyIn"/>/<paramref name="sampledIn"/> are
+        /// the device outputs; <paramref name="renoise"/> the host-drawn fresh tokens for rejected positions.</summary>
+        private bool DenoiseStepFromDevice(int[] argmaxIn, float[] entropyIn, int[] sampledIn, int[] renoise,
+            DiffusionEbParams p, int[] currentCanvas, int[] argmaxCanvas, int[] prevArgmax, ref int held, int[] order)
+        {
+            int C = _canvasLength;
+            Array.Copy(argmaxIn, argmaxCanvas, C);   // emitted best-guess = device argmax
+
+            // accept lowest-entropy positions within the MI bound (sum of strictly-earlier entropies <= bound)
+            for (int i = 0; i < C; i++) order[i] = i;
+            Array.Sort(order, (a, bb) => entropyIn[a].CompareTo(entropyIn[bb]));
+            var accepted = new bool[C];
+            double cumE = 0.0;
+            for (int kk = 0; kk < C; kk++)
+            {
+                int pos = order[kk];
+                cumE += entropyIn[pos];
+                if (cumE - entropyIn[pos] <= p.EntropyBound) accepted[pos] = true;
+            }
+
+            // renoise: accepted -> device multinomial sample, rest -> fresh random; output = argmax canvas
+            float entropySum = 0f;
+            for (int pos = 0; pos < C; pos++)
+            {
+                currentCanvas[pos] = accepted[pos] ? sampledIn[pos] : renoise[pos];
+                entropySum += entropyIn[pos];
+            }
+
+            bool same = true;
+            for (int i = 0; i < C; i++) if (prevArgmax[i] != argmaxCanvas[i]) { same = false; break; }
+            held = same ? held + 1 : 0;
+            bool confident = (entropySum / C) < p.ConfidenceThreshold;
+            Array.Copy(argmaxCanvas, prevArgmax, C);
+            return held >= p.StabilityThreshold && confident;
+        }
+
         // ===================================================================================
         //  Batched (multi-request) generation — the parallel-request throughput path.
         //  The server scheduler keeps a set of in-flight requests as DiffusionSeqRun objects and drives
@@ -313,6 +398,17 @@ namespace TensorSharp.Models
             var unifiedTokens = usePkv ? null : new int[A][];   // per-seq [prefix|canvas] buffer
             var promptLen = usePkv ? null : new int[A];
 
+            // On-device sampling (CUDA, model fits): per-sequence the lm_head kernel returns argmax/entropy/
+            // sampled/top-K directly, so no full [vocab,C] logits cross PCIe. Each sequence keeps its own
+            // double-buffered top-K (for self-conditioning), argmax/sampled, mirroring DenoiseBlock.
+            bool useDeviceSample = usePkv && _model.SupportsDeviceSampling;
+            int K = _model.SelfCondTopK;
+            int[][][] dTopTok = useDeviceSample ? new int[A][][] : null;
+            float[][][] dTopPrb = useDeviceSample ? new float[A][][] : null;
+            int[] dBuf = useDeviceSample ? new int[A] : null;
+            int[][] dArg = useDeviceSample ? new int[A][] : null;
+            int[][] dSamp = useDeviceSample ? new int[A][] : null;
+
             // per-sequence prefill + block init
             for (int a = 0; a < A; a++)
             {
@@ -338,8 +434,17 @@ namespace TensorSharp.Models
                 argmaxCanvas[a] = new int[C];
                 prevArgmax[a] = new int[C];
                 for (int i = 0; i < C; i++) prevArgmax[a][i] = -1;
-                scBuffer[a] = _model.SelfConditioningEnabled ? new float[(long)C * vocab] : null;
+                // device sampling carries SC via the top-K buffers, so the 268 MB host logits buffer is unused
+                scBuffer[a] = (_model.SelfConditioningEnabled && !useDeviceSample) ? new float[(long)C * vocab] : null;
                 prevTempInv[a] = 1f;
+                if (useDeviceSample)
+                {
+                    int kk = Math.Max(1, K);
+                    dTopTok[a] = new[] { new int[C * kk], new int[C * kk] };
+                    dTopPrb[a] = new[] { new float[C * kk], new float[C * kk] };
+                    dArg[a] = new int[C];
+                    dSamp[a] = new int[C];
+                }
             }
 
             // caller-owned per-step scratch (one set; the per-position work is over a single canvas at a time)
@@ -415,6 +520,27 @@ namespace TensorSharp.Models
                         int curStep = S - stepIdx;                  // mirrors single-seq: curStep counts S..1
                         float tempInv = 1f / (run.Params.TMin + (run.Params.TMax - run.Params.TMin) * ((float)curStep / S));
                         float scUse = stepIdx == 0 ? 0f : 1f;
+
+                        if (useDeviceSample)
+                        {
+                            for (int pos = 0; pos < C; pos++) { u[pos] = rng[a].NextFloat(); renoise[pos] = rng[a].NextInt(vocab); }
+                            int[] scTok = stepIdx == 0 ? null : dTopTok[a][1 - dBuf[a]];
+                            float[] scPrb = stepIdx == 0 ? null : dTopPrb[a][1 - dBuf[a]];
+                            bool ok = _model.DecodeCanvasSampledSeq(seqs[a], canvas[a], scTok, scPrb, scUse, tempInv, u, K,
+                                dArg[a], entropy, dSamp[a], dTopTok[a][dBuf[a]], dTopPrb[a][dBuf[a]]);
+                            if (ok)
+                            {
+                                bool seqDone = DenoiseStepFromDevice(dArg[a], entropy, dSamp[a], renoise, run.Params,
+                                    canvas[a], argmaxCanvas[a], prevArgmax[a], ref held[a], order);
+                                dBuf[a] ^= 1;
+                                prevTempInv[a] = tempInv;
+                                run.EmitPreview(stepIdx, S, argmaxCanvas[a]);
+                                if (seqDone) finished[a] = true;
+                                continue;
+                            }
+                            useDeviceSample = false;   // kernel rejected: fall back to the host path for the rest
+                        }
+
                         float[] lg;
                         if (usePkv)
                         {

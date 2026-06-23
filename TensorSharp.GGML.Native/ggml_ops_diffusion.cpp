@@ -939,4 +939,125 @@ TSG_EXPORT int TSGgml_DiffusionLmHead(
     catch (...) { set_last_error("Unknown error in diffusion lm_head."); return 0; }
 }
 
+// ============================================================================
+// Fused DiffusionGemma lm_head + ON-DEVICE SAMPLE (CUDA only): output_norm +
+// lm_head matmul as one GGML graph producing RAW logits [vocab, C] on-device,
+// then a CUDA kernel computes per canvas position the argmax, entropy,
+// multinomial sample, and top-K tokens/weights directly on the device logits.
+// Only C ints/floats (+ C*K) come back instead of the full ~268 MB logits block,
+// and the host's two full-vocab CPU sweeps (sampler + self-conditioning top-K)
+// are eliminated. Returns 0 when not on CUDA / kernel unsupported so the caller
+// falls back to the host TSGgml_DiffusionLmHead + host sampler path.
+// ============================================================================
+#ifdef TSG_GGML_USE_CUDA
+extern "C" bool tsg_cuda_diffusion_sample(
+    const void* logits_dev, int n_vocab, int n_rows, float inv_temp, float softcap,
+    const float* u_host, int K,
+    int* argmax_host, float* entropy_host, int* sampled_host,
+    int* top_tokens_host, float* top_probs_host);
+#endif
+
+TSG_EXPORT int TSGgml_DiffusionLmHeadSample(
+    void* hidden_data, int hidden_size, int canvas_len,
+    void* output_norm_w_data,
+    void* lm_head_w_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    int vocab, float eps, float final_logit_softcap,
+    float inv_temp, const float* u_host, int top_k,
+    int* argmax_out, float* entropy_out, int* sampled_out,
+    int* top_tokens_out, float* top_probs_out)
+{
+#ifndef TSG_GGML_USE_CUDA
+    set_last_error("Diffusion lm_head sample: CUDA not enabled in this build.");
+    return 0;
+#else
+    try
+    {
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != tsg::BACKEND_TYPE_CUDA)
+        {
+            set_last_error("Diffusion lm_head sample: device sampling requires the CUDA backend.");
+            return 0;
+        }
+        if (hidden_data == nullptr || output_norm_w_data == nullptr || lm_head_w_data == nullptr ||
+            u_host == nullptr || argmax_out == nullptr || entropy_out == nullptr || sampled_out == nullptr)
+        {
+            set_last_error("Diffusion lm_head sample: invalid arguments.");
+            return 0;
+        }
+        const int H = hidden_size;
+        const int C = canvas_len;
+
+        PooledContextHandle context;
+        if (!context.init(8 * 1024 * 1024))
+        {
+            set_last_error("Diffusion lm_head sample: failed to acquire ggml context.");
+            return 0;
+        }
+        ggml_context* ctx = context.value;
+
+        ggml_tensor* hidden_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, C);
+        ggml_set_input(hidden_t);
+        ggml_tensor* output_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        ggml_tensor* lm_head_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
+
+        ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden_t, eps), output_norm_w);
+        ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_w, normed);   // [vocab, C] RAW (softcap done in the kernel)
+        ggml_set_output(logits);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, logits);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
+        std::vector<HostBinding> upload_list;
+        auto bind_or_mark = [&](ggml_tensor* tt, void* data, std::size_t bytes, bool cacheable) {
+            if (tt == nullptr || data == nullptr) return;
+            if (cacheable && bytes >= 4096)
+            {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, data, bytes, buf, addr, needs_upload, GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
+                {
+                    if (ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS)
+                    { if (needs_upload) upload_list.push_back({tt, data, bytes}); return; }
+                    invalidate_cached_buffer(data);
+                }
+            }
+            upload_list.push_back({tt, data, bytes});
+        };
+        bind_or_mark(output_norm_w, output_norm_w_data, (std::size_t)H * sizeof(float), true);
+        bind_or_mark(lm_head_w, lm_head_w_data, (std::size_t)lm_head_bytes, true);
+
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc, graph))
+        {
+            if (galloc != nullptr) ggml_gallocr_free(galloc);
+            set_last_error("Diffusion lm_head sample: graph allocation failed.");
+            return 0;
+        }
+
+        host_read_barrier();
+        for (auto& u : upload_list) ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+        ggml_backend_tensor_set(hidden_t, hidden_data, 0, (std::size_t)H * C * sizeof(float));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS) { ggml_gallocr_free(galloc); set_last_error("Diffusion lm_head sample: graph execution failed."); return 0; }
+
+        // The compute is synchronized (ggml_backend_graph_compute syncs the CUDA backend), so the logits
+        // device buffer is ready. Sample on-device directly on logits->data, downloading only the small
+        // per-row outputs. The gallocr buffer must outlive the kernel, so free it AFTER sampling.
+        ggml_backend_synchronize(g_backend);
+        bool ok = tsg_cuda_diffusion_sample(
+            logits->data, vocab, C, inv_temp, final_logit_softcap,
+            u_host, top_k, argmax_out, entropy_out, sampled_out, top_tokens_out, top_probs_out);
+
+        ggml_gallocr_free(galloc);
+        if (!ok) { set_last_error("Diffusion lm_head sample: device sample kernel failed."); return 0; }
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in diffusion lm_head sample."); return 0; }
+#endif
+}
+
 } // extern "C"

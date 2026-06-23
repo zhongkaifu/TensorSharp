@@ -182,6 +182,16 @@ namespace TensorSharp.Models
         // all coexisting in VRAM. Selected automatically by PrepareCudaWeightResidency when the model
         // does not fit; override with DIFFUSION_SEGMENTED_DECODE=1/0.
         private bool _segmentedDecode;
+        // On-device diffusion sampling (CUDA only): the fused lm_head kernel computes argmax + entropy +
+        // multinomial sample + top-K (for self-conditioning) directly on the device logits, so only the
+        // small per-position outputs come back instead of the full [vocab,C] block — eliminating the
+        // ~268 MB device->host logits download AND the host's two full-vocab CPU sweeps (sampler + SC
+        // top-K) per step. The canonical llama.cpp diffusion-sampling.cu + device-SC optimization.
+        // Default ON for GgmlCuda; disable with DIFFUSION_NO_DEVICE_SAMPLE=1. Flips off if the kernel
+        // ever rejects the layout (then the host logits + host sampler path is used).
+        private readonly bool _deviceSampleEnabled = Environment.GetEnvironmentVariable("DIFFUSION_NO_DEVICE_SAMPLE") != "1";
+        private readonly bool _deviceSampleForce = Environment.GetEnvironmentVariable("DIFFUSION_DEVICE_SAMPLE_FORCE") == "1";
+        private bool _deviceSampleOk = true;
         // Reusable host buffer for the fused lm_head logits (268 MB at vocab 256K, C 256). A fresh
         // array per step costs a large-object-heap allocation + zeroing every step; one pooled buffer
         // is safe because each step's logits are fully consumed (sampling + self-conditioning read)
@@ -222,6 +232,30 @@ namespace TensorSharp.Models
             get => _pkvEnabled;
             set => _pkvEnabled = value && _useDeviceGlue;
         }
+
+        /// <summary>Whether the per-step argmax/entropy/multinomial/top-K sampling runs on-device (CUDA),
+        /// returning only the small per-canvas-position outputs instead of the full [vocab,C] logits. Gated
+        /// to the GgmlCuda backend (the sample kernel reads the device logits pointer).
+        ///
+        /// IMPORTANT — only enabled when the model FITS in VRAM (<c>!_segmentedDecode</c>). When the model
+        /// oversubscribes VRAM (segmented decode), two things make the on-device sampler a net loss and the
+        /// host path the better choice: (1) the lm_head's [vocab,C] logits tensor gets paged out of VRAM by
+        /// the Windows/WDDM working-set manager (VRAM is full of weights), so the kernel re-reads it over
+        /// PCIe; (2) the streaming-bound decode keeps the GPU mostly idle, so its SM/memory clock stays at
+        /// its idle state and any device-resident read runs ~15x below peak bandwidth — slower than the
+        /// host's copy-engine readback (which uses the clock-independent copy engine) + the SIMD CPU sampler.
+        /// When the model fits, the logits stay resident, the forward keeps the GPU busy (clock ramped), and
+        /// the kernel is a large win (only C ints/floats cross PCIe instead of ~268 MB). Measured on a
+        /// VRAM-oversubscribed RTX 3080 Laptop: device sampling was ~33% slower, hence the gate. Override
+        /// the residency gate for experiments with DIFFUSION_DEVICE_SAMPLE_FORCE=1.</summary>
+        public bool SupportsDeviceSampling =>
+            _deviceSampleEnabled && _deviceSampleOk && _backend == BackendType.GgmlCuda
+            && _fusedLmHeadTailOk && !_fusedLmHeadTailDisabled
+            && (!_segmentedDecode || _deviceSampleForce);
+
+        /// <summary>The number of top-K tokens the device sampler returns for self-conditioning (0 when SC
+        /// is disabled, so the kernel skips the top-K pass).</summary>
+        public int SelfCondTopK => _scEnabled ? Math.Min(ScTopK, Config.VocabSize) : 0;
 
         public DiffusionGemmaModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
         {
@@ -1164,6 +1198,112 @@ namespace TensorSharp.Models
             if (_stepTime) { long now = Stopwatch.GetTimestamp(); Console.Error.WriteLine($"[decode] {(now - _stepT0) * 1000.0 / Stopwatch.Frequency:F1} ms"); }
 
             return result;
+        }
+
+        // ===================================================================================
+        //  On-device sampled decode (CUDA): run the layers + lm_head, then compute argmax/entropy/
+        //  multinomial/top-K on the device logits in one kernel — only the small per-position outputs
+        //  cross PCIe. Self-conditioning reads the PREVIOUS step's device-computed top-K (no host logits).
+        //  Returns false (caller falls back to the logits path) if any device step is unavailable.
+        // ===================================================================================
+
+        /// <summary>Instance-cached single-canvas decode + on-device sample (prompt-KV path).
+        /// <paramref name="scPrevTopTokens"/>/<paramref name="scPrevTopProbs"/> are the PREVIOUS step's
+        /// device-computed top-K (for self-conditioning; null/scUse=0 on the first step). <paramref name="u"/>
+        /// is the pre-drawn per-position uniform for the multinomial. Fills the caller-owned output arrays.</summary>
+        public unsafe bool DecodeCanvasSampled(int[] canvasTokens,
+            int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv, float[] u, int K,
+            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
+            => DecodeCanvasSampledCore(_promptK, _promptV, _promptLen, canvasTokens, scPrevTopTokens, scPrevTopProbs,
+                scUse, tempInv, u, K, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+
+        /// <summary>Per-sequence single-canvas decode + on-device sample (batched scheduler B==1 fast path).</summary>
+        public unsafe bool DecodeCanvasSampledSeq(DiffusionSeqState seq, int[] canvasTokens,
+            int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv, float[] u, int K,
+            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
+            => DecodeCanvasSampledCore(seq.PromptK, seq.PromptV, seq.PromptLen, canvasTokens, scPrevTopTokens, scPrevTopProbs,
+                scUse, tempInv, u, K, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+
+        private unsafe bool DecodeCanvasSampledCore(Tensor[] pk, Tensor[] pv, int P,
+            int[] canvasTokens, int[] scPrevTopTokens, float[] scPrevTopProbs, float scUse, float tempInv,
+            float[] u, int K, int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
+        {
+            if (!SupportsDeviceSampling) return false;
+            // device sampling needs the fused/segmented layer path (keeps hidden on-device for the tail)
+            if (!(IsGgmlBackend && _fusedDecodeEnabled && _fusedDecodeOk)) return false;
+
+            _stepT0 = Stopwatch.GetTimestamp();
+            _swForward.Start();
+            int C = canvasTokens.Length;
+            int D = Config.HiddenSize;
+            float eps = Config.Eps;
+
+            long ts = Stopwatch.GetTimestamp();
+            Tensor hidden = Embedding(canvasTokens);
+            Ops.Mul(hidden, hidden, MathF.Sqrt(D));
+            if (_scEnabled && scPrevTopTokens != null && scUse != 0f)
+            {
+                long tsc = Stopwatch.GetTimestamp();
+                using var scSignal = ComputeSelfConditioningFromTopK(scPrevTopTokens, scPrevTopProbs, C, K);
+                Ops.Mul(scSignal, scSignal, scUse);
+                Ops.Add(hidden, hidden, scSignal);
+                _tSc += Stopwatch.GetTimestamp() - tsc;
+            }
+            Ops.RMSNorm(hidden, hidden, GetOnes(D), null, eps);
+            _tEmbed += Stopwatch.GetTimestamp() - ts;
+
+            long tLayers0 = Stopwatch.GetTimestamp();
+            bool ok = _segmentedDecode
+                ? TryFusedModelLayersSegmented(hidden, C, P, pk, pv)
+                : TryFusedModelLayers(hidden, C, P, pk, pv);
+            if (!ok) { _fusedDecodeOk = false; hidden.Dispose(); _swForward.Stop(); return false; }
+            long tLayers1 = Stopwatch.GetTimestamp();
+
+            bool sampled = TryFusedLmHeadSampleTail(hidden, C, tempInv, u, K,
+                argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+            hidden.Dispose();
+            _swForward.Stop();
+            if (!sampled) { _deviceSampleOk = false; return false; }
+            if (_stepTime)
+            {
+                long now = Stopwatch.GetTimestamp();
+                double f = 1000.0 / Stopwatch.Frequency;
+                Console.Error.WriteLine($"[decode-sampled] {(now - _stepT0) * f:F1} ms (layers={(tLayers1 - tLayers0) * f:F1} lmhead+sample={(now - tLayers1) * f:F1})");
+            }
+            return true;
+        }
+
+        /// <summary>Fused lm_head + on-device sample tail: output_norm + lm_head produce device logits, then
+        /// the CUDA kernel computes argmax/entropy/multinomial/top-K directly on them. No 268 MB readback.</summary>
+        private unsafe bool TryFusedLmHeadSampleTail(Tensor hidden, int C, float tempInv, float[] u, int K,
+            int[] argmaxOut, float[] entropyOut, int[] sampledOut, int[] topTokensOut, float[] topProbsOut)
+        {
+            try
+            {
+                if (!_quantWeights.TryGetValue("token_embd.weight", out var lmHead)) return false;
+                if (!_weights.ContainsKey("output_norm.weight")) return false;
+                int vocab = Config.VocabSize;
+                bool wantTopK = K > 0 && topTokensOut != null && topProbsOut != null;
+                fixed (float* uPtr = u)
+                fixed (int* amPtr = argmaxOut)
+                fixed (float* enPtr = entropyOut)
+                fixed (int* smPtr = sampledOut)
+                fixed (int* ttPtr = wantTopK ? topTokensOut : null)
+                fixed (float* tpPtr = wantTopK ? topProbsOut : null)
+                {
+                    return GgmlBasicOps.TryDiffusionLmHeadSample(
+                        (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, C,
+                        WPtr("output_norm.weight"),
+                        PinnedOr(lmHead.CacheKey), lmHead.GgmlType, lmHead.Ne0, lmHead.Ne1, lmHead.RawBytes,
+                        vocab, Config.Eps, _finalLogitSoftcap,
+                        tempInv, (IntPtr)uPtr, wantTopK ? K : 0,
+                        (IntPtr)amPtr, (IntPtr)enPtr, (IntPtr)smPtr, (IntPtr)ttPtr, (IntPtr)tpPtr);
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         // ===================================================================================
@@ -2286,6 +2426,17 @@ namespace TensorSharp.Models
                 for (int k = 0; k < K; k++) topProbs[outBase + k] *= inv;
             });
             _tScTopK += Stopwatch.GetTimestamp() - _scT0;
+            return ComputeSelfConditioningFromTopK(topTokens, topProbs, C, K);
+        }
+
+        /// <summary>Self-conditioning soft-embedding from PRECOMPUTED per-position top-K tokens
+        /// (<paramref name="topTokens"/> [C*K]) and their softmax-over-top-K weights
+        /// (<paramref name="topProbs"/> [C*K], already in the previous step's temp_inv space). This is the
+        /// device-sampling path: the kernel returns the top-K, so the host top-K sweep over the full logits
+        /// is skipped. Gathers the C*K embedding rows, weighted-sums them, and applies the gated-GELU MLP.</summary>
+        private unsafe Tensor ComputeSelfConditioningFromTopK(int[] topTokens, float[] topProbs, int C, int K)
+        {
+            int D = Config.HiddenSize;
             long _scT1 = Stopwatch.GetTimestamp();
 
             // gather the C*K selected embedding rows, then per-position weighted sum as a batched matmul:

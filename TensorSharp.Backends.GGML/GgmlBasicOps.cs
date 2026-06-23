@@ -1545,6 +1545,21 @@ namespace TensorSharp.GGML
                 lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, logitsOut, vocab, eps, finalLogitSoftcap);
         }
 
+        /// <summary>Fused DiffusionGemma lm_head + on-device sample (CUDA only). Computes argmax/entropy/
+        /// multinomial sample/top-K on the device logits and returns only the small per-position outputs.
+        /// Returns false (caller falls back to the host lm_head + sampler) on non-CUDA / failure.</summary>
+        public static bool TryDiffusionLmHeadSample(
+            IntPtr hidden, int hiddenSize, int canvasLen,
+            IntPtr outputNormW, IntPtr lmHeadW, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            int vocab, float eps, float finalLogitSoftcap,
+            float invTemp, IntPtr uHost, int topK,
+            IntPtr argmaxOut, IntPtr entropyOut, IntPtr sampledOut, IntPtr topTokensOut, IntPtr topProbsOut)
+        {
+            return GgmlNative.TryDiffusionLmHeadSample(hidden, hiddenSize, canvasLen, outputNormW,
+                lmHeadW, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, vocab, eps, finalLogitSoftcap,
+                invTemp, uHost, topK, argmaxOut, entropyOut, sampledOut, topTokensOut, topProbsOut);
+        }
+
         /// <summary>Fused DiffusionGemma whole-model decode (all layers + lm_head in one graph). Returns
         /// false without throwing when the backend can't run it, so the caller falls back.</summary>
         public static bool TryDiffusionModelDecode(
