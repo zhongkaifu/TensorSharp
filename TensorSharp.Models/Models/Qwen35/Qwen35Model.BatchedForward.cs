@@ -103,6 +103,142 @@ namespace TensorSharp.Models
         // with what ForwardBatch will actually accept.
         public bool SupportsBatchedMultimodal => IsBatchedPathEnabled();
 
+        // ====================================================================
+        // N=1 fast path (BatchExecutor): when only ONE sequence is scheduled,
+        // serve it through the per-seq Forward path (= the fused, CUDA-graph
+        // captured whole-model decode, see TryFullModelDecode) instead of the
+        // op-by-op ForwardBatch. ForwardBatch issues ~10 Ops.* dispatches/layer
+        // x40 layers/token (WDDM-bound, ~5 tok/s); Forward submits ONE captured
+        // graph/token (35B-A3B ~57 tok/s). The executor only enables this fast
+        // path for models that advertise SupportsLinearKVMigration (so a 2nd
+        // concurrent request can move the owner's linear state into paged
+        // storage before ForwardBatch reads it).
+        //
+        // Single-stream (the common interactive case) never triggers migration:
+        // prefill + every decode token run through the linear Forward path and
+        // the batched/paged path is never touched. Migration is only needed when
+        // a SECOND request arrives mid-decode (N=1 -> N=2); we currently decline
+        // it (returns false), so concurrency falls back to the correct (if
+        // serialized) per-seq path rather than the slow op-by-op batched decode.
+        public bool SupportsLinearKVMigration =>
+            _kvCacheK != null && _kvCacheV != null
+            && _convState != null && _deltaStateTensor != null;
+
+        // Migrate the N=1 fast-path owner's linear KV + GDN state into paged
+        // storage so a concurrent (N>=2) step routes the owner through the batched
+        // ForwardBatch (the true token-batched fused decode), i.e. the vLLM-style
+        // continuous-batching path becomes the default for multi-request decode.
+        // Defensive: returns false on any unsupported/edge case so the executor
+        // falls back to the (correct, serialized) per-seq rotation. Default ON so
+        // multi-request decode runs on the vLLM-style batched fused path; set
+        // TS_QWEN35_MIGRATE=0 to force the per-seq fallback.
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
+        {
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_MIGRATE"), "0", StringComparison.Ordinal))
+                return false;
+            try { return MigrateLinearToPaged(owner, blockSize); }
+            catch (Exception ex)
+            {
+                if (string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_MOE_DEBUG"), "1", StringComparison.Ordinal))
+                    Console.Error.WriteLine($"[qwen35-migrate] failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private unsafe bool MigrateLinearToPaged(SequenceState owner, int blockSize)
+        {
+            if (_backend != BackendType.GgmlCuda) return false;
+            if (_kvCacheK == null || _convState == null || _deltaStateTensor == null) return false;
+            int cacheLen = _cacheSeqLen;
+            if (cacheLen <= 0) return false;
+            int numLayers = Config.NumLayers;
+            int numKVHeads = Config.NumKVHeads;
+            int headDim = Config.HeadDim;
+            int kvFlat = numKVHeads * headDim;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+
+            // Owner's logical position -> global paged slot.
+            int numBlocks = owner.BlockTable.NumBlocks;
+            if (numBlocks * blockSize < cacheLen) return false;
+            int maxBlockId = 0;
+            for (int b = 0; b < numBlocks; b++)
+                if (owner.BlockTable.Blocks[b].Id > maxBlockId) maxBlockId = owner.BlockTable.Blocks[b].Id;
+            EnsureQwen35PagedBuffers(maxBlockId + 1, blockSize, numLayers);
+            int ownerSlot = owner.BlockTable.Blocks[0].Id;
+
+            // Drain device-resident GDN state to the host buffers if the fused N=1
+            // decode left it on the device (so we read the LATEST recurrent state).
+            DrainFusedDecodeStateForMigration();
+
+            var kvBuf = new byte[(long)numKVHeads * cacheLen * headDim * 8]; // sized for F64 worst case
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (_isRecurrent[l])
+                {
+                    // --- GDN recurrent state -> owner's per-slot buffers ---
+                    EnsureGdnSlotAllocated(l, ownerSlot);
+                    // conv ring (host _convState[l] is current after the drain).
+                    float[] srcRing = _convState[l];
+                    float[] dstRing = _q35GdnSlotConvBuf[l][ownerSlot];
+                    if (srcRing != null && dstRing != null && srcRing.Length == dstRing.Length)
+                        Array.Copy(srcRing, dstRing, srcRing.Length);
+                    _q35GdnSlotConvWriteIdx[l][ownerSlot] = _convStateWriteIdx[l];
+                    // delta state tensor.
+                    Ops.Copy(_q35GdnSlotSsmTensor[l][ownerSlot], _deltaStateTensor[l]);
+                    _q35GdnSlotInit[l][ownerSlot] = true;
+                }
+                else
+                {
+                    // --- attention KV -> paged pool at the owner's slots ---
+                    if (!CopyAttentionOut(_kvCacheK[l], 0, cacheLen, kvBuf, out int wK)) return false;
+                    ScatterLinearKvToPaged(_kvCacheK[l].ElementType, kvBuf, _q35PagedK[l], owner, blockSize, cacheLen, numKVHeads, headDim);
+                    if (!CopyAttentionOut(_kvCacheV[l], 0, cacheLen, kvBuf, out int wV)) return false;
+                    ScatterLinearKvToPaged(_kvCacheV[l].ElementType, kvBuf, _q35PagedV[l], owner, blockSize, cacheLen, numKVHeads, headDim);
+                }
+            }
+
+            // The batched-fused device pools are seeded from the host paged pool we
+            // just populated; force a re-seed + drop the captured graph.
+            InvalidateBatchedFusedSeed();
+            return true;
+        }
+
+        // Scatter a linear KV layer [numKVHeads, cacheLen, headDim] (cache dtype) into
+        // the F32 paged pool [slot, numKVHeads*headDim] at the owner's slots.
+        private unsafe void ScatterLinearKvToPaged(
+            DType srcType, byte[] srcBytes, float[] pagedDst, SequenceState owner,
+            int blockSize, int cacheLen, int numKVHeads, int headDim)
+        {
+            int kvFlat = numKVHeads * headDim;
+            bool f16 = srcType == DType.Float16;
+            fixed (byte* sp = srcBytes)
+            {
+                for (int p = 0; p < cacheLen; p++)
+                {
+                    int slot = owner.BlockTable.Blocks[p / blockSize].Id * blockSize + (p % blockSize);
+                    long dstBase = (long)slot * kvFlat;
+                    for (int h = 0; h < numKVHeads; h++)
+                    {
+                        long srcRow = ((long)h * cacheLen + p) * headDim;
+                        long dstRow = dstBase + (long)h * headDim;
+                        if (f16)
+                        {
+                            ushort* hp = (ushort*)(sp + srcRow * sizeof(ushort));
+                            for (int d = 0; d < headDim; d++)
+                                pagedDst[dstRow + d] = (float)System.BitConverter.UInt16BitsToHalf(hp[d]);
+                        }
+                        else
+                        {
+                            float* fp = (float*)(sp + srcRow * sizeof(float));
+                            for (int d = 0; d < headDim; d++)
+                                pagedDst[dstRow + d] = fp[d];
+                        }
+                    }
+                }
+            }
+        }
+
         /// <summary>Default ON. The batched paged-attention path supports
         /// every Qwen3.5 layer type (attention, GDN recurrent, MoE) and is
         /// what continuous-batching multi-request workloads need. Set
@@ -287,6 +423,33 @@ namespace TensorSharp.Models
             int ropeDim = _ropeDimCount > 0 ? _ropeDimCount : headDim;
             float ropeBase = Config.RopeBase;
             float ropeFreqScale = 1.0f / Config.RopeScale;
+
+            // ----- TRUE token-batched fused decode (ggml_cuda, all-decode batch) -----
+            // When every scheduled sequence is decoding exactly one token, run the
+            // whole hybrid transformer as ONE batched graph (weights read once,
+            // amortized across the batch) instead of the op-by-op layer loop below.
+            // Declines (returns null) for prefill chunks, multimodal, spec capture,
+            // or any unsupported shape; the op-by-op loop then runs.
+            bool allDecodeBatch = ctx.OverrideFlatTokens == null
+                && ctx.CaptureHiddenAll == null && ctx.CaptureLogitsAll == null
+                && !anyMultimodal && IsBatchedFusedEnabled() && _backend == BackendType.GgmlCuda;
+            if (allDecodeBatch)
+                for (int s = 0; s < numSeqs; s++)
+                    if (ctx.NumScheduledTokens[s] != 1) { allDecodeBatch = false; break; }
+
+            Tensor bfdHidden = allDecodeBatch
+                ? TryRunBatchedFusedDecode(hiddenStates, ctx, numTokens, numSeqs, positions, slotMapping, blockSize, seqLens)
+                : null;
+
+            if (bfdHidden != null)
+            {
+                hiddenStates = bfdHidden; // final pre-output-norm hidden [numTokens, H]
+            }
+            else
+            {
+            // The op-by-op path writes the host paged pool the device pool is
+            // seeded from, so invalidate the seed for the next fused decode.
+            InvalidateBatchedFusedSeed();
 
             // ----- Per-layer loop -----
             for (int layer = 0; layer < numLayers; layer++)
@@ -490,6 +653,7 @@ namespace TensorSharp.Models
 
                 hiddenStates = residual;
             }
+            } // end op-by-op layer loop (bfdHidden == null)
 
             // ----- Final norm + per-sequence LM head -----
             Tensor finalNormed = RMSNormOpQ35(hiddenStates, _finalNormW);

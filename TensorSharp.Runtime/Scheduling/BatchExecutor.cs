@@ -486,10 +486,10 @@ namespace TensorSharp.Runtime.Scheduling
             if (_mtpUnprofitableWarned) return;
             _mtpUnprofitableWarned = true;
             _logger.LogWarning(
-                "MTP speculative decoding was requested (--mtp-spec) but the loaded model " +
-                "cannot run its accelerated multi-token verify/draft kernels on this backend, " +
-                "so speculation would be SLOWER than standard decode. Serving standard decode " +
-                "instead. Use the ggml_cuda backend (--backend ggml_cuda) for the MTP speedup.");
+                "MTP speculative decoding was requested (--mtp-spec) but for the loaded model " +
+                "on this backend the standard decode path is already faster than speculative " +
+                "decode (its multi-token verify/draft runs op-by-op and cannot amortize a cheap, " +
+                "fused/captured decode). Serving the fast standard decode instead — no action needed.");
         }
 
         private static bool IsBatchedN1FastPathEnabled()

@@ -873,10 +873,20 @@ namespace TensorSharp.Models
                     float angleY = gridY[p] * invFreqs[j];
                     float angleX = gridX[p] * invFreqs[j];
 
-                    cosTable[baseIdx + j * 2] = MathF.Cos(angleY);
-                    sinTable[baseIdx + j * 2] = MathF.Sin(angleY);
-                    cosTable[baseIdx + j * 2 + 1] = MathF.Cos(angleX);
-                    sinTable[baseIdx + j * 2 + 1] = MathF.Sin(angleX);
+                    // Qwen3-VL vision M-RoPE uses a BLOCKED frequency layout: the
+                    // first half of the rotary pairs (indices 0..numBands-1) encode
+                    // the row (Y/H) position, the second half (numBands..halfDim-1)
+                    // encode the column (X/W) position. This matches ggml's
+                    // GGML_ROPE_TYPE_VISION (first sections[0] dims use p_t=row, the
+                    // next use p_h=col) and HF/vLLM rot_pos_emb, where
+                    // cos[pos_ids].flatten() concatenates the H-frequency block then
+                    // the W-frequency block. An interleaved [Y0,X0,Y1,X1,...] layout
+                    // rotates the wrong head dimensions and scrambles the spatial
+                    // encoding (coarse gist survives, fine reading/OCR fails).
+                    cosTable[baseIdx + j] = MathF.Cos(angleY);
+                    sinTable[baseIdx + j] = MathF.Sin(angleY);
+                    cosTable[baseIdx + numBands + j] = MathF.Cos(angleX);
+                    sinTable[baseIdx + numBands + j] = MathF.Sin(angleX);
                 }
             }
 

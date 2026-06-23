@@ -6,6 +6,7 @@ using System.Diagnostics;
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 static int EnvInt(string name, int fallback)
 {
@@ -37,6 +38,12 @@ string mode = Environment.GetEnvironmentVariable("TS_BENCH_MODE") ?? "both"; // 
 Console.WriteLine($"[gdn-bench] loading {Path.GetFileName(modelPath)} backend={backend} maxNew={maxNew} draft={maxDraft} mode={mode}");
 using var model = (Qwen35Model)ModelBase.Create(modelPath, backend);
 Console.WriteLine($"[gdn-bench] HasMtp={model.HasMtp}");
+
+if (mode is "concurrent")
+{
+    await RunConcurrent(model, maxNew);
+    return;
+}
 
 string prompt = Environment.GetEnvironmentVariable("TS_MTP_PROMPT") ??
                 "Write a short story about a robot learning to paint. " +
@@ -151,4 +158,85 @@ if (mode is "spec" or "both")
             : $"[gdn-bench] correctness: first divergence at token {diverge}/{n} (FP drift between batched-verify and sequential-decode is expected past near-ties)");
     }
     model.PrintTimingStats();
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent continuous-batching repro. Submits N requests to the
+// InferenceEngine and measures aggregate throughput. Used to reproduce /
+// debug the N>=2 true-batched (ForwardBatch) path on ggml_cuda.
+//   TS_BATCH_N        number of concurrent requests (default 2)
+//   TS_BATCH_TIMEOUT  per-run wall timeout in seconds (default 90)
+// ---------------------------------------------------------------------------
+static async Task RunConcurrent(Qwen35Model model, int maxNew)
+{
+    int n = EnvInt("TS_BATCH_N", 2);
+    int timeoutSec = EnvInt("TS_BATCH_TIMEOUT", 90);
+    int blockSize = 256;
+
+    string[] prompts =
+    {
+        "Q: What is two plus two? Answer in one short sentence.\nA:",
+        "Q: Name three primary colors as a comma separated list.\nA:",
+        "Q: Who wrote the play Hamlet? Answer in one sentence.\nA:",
+        "Q: What is the boiling point of water at sea level in Celsius?\nA:",
+        "Q: Translate 'good morning' into Spanish.\nA:",
+        "Q: What is the capital city of France?\nA:",
+    };
+
+    var cfg = new SchedulerConfig
+    {
+        MaxNumBatchedTokens = 4096,
+        MaxNumRunningSequences = Math.Max(n, 8),
+        MaxPrefillChunkSize = 1024,
+        NumBlocks = 256,
+        BlockSize = blockSize,
+        EnablePrefixCaching = false,
+        DecodeQuantumTokens = blockSize,
+    };
+    using var engine = new InferenceEngine(model, cfg);
+
+    Console.WriteLine($"[gdn-bench] concurrent: N={n} maxNew={maxNew} timeout={timeoutSec}s " +
+        $"TS_QWEN35_BATCHED={Environment.GetEnvironmentVariable("TS_QWEN35_BATCHED")} " +
+        $"N1FAST={Environment.GetEnvironmentVariable("TS_BATCHED_N1_FAST_PATH")}");
+
+    async Task<(int count, bool timedOut)> RunOne(int i)
+    {
+        var promptTokens = model.Tokenizer.Encode(prompts[i % prompts.Length], addSpecial: false).ToArray();
+        var seq = new SequenceState($"req-{i}", promptTokens, maxNew, blockSize, SamplingConfig.Greedy);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSec));
+        var handle = engine.SubmitRequest(seq, cts.Token);
+        int count = 0;
+        bool timedOut = false;
+        var outToks = new List<int>();
+        try
+        {
+            await foreach (var tok in handle.Tokens.ReadAllAsync(cts.Token))
+            { count++; outToks.Add(tok); }
+        }
+        catch (OperationCanceledException) { timedOut = true; }
+        catch { }
+        string text = model.Tokenizer.Decode(outToks).Replace("\n", "\\n");
+        Console.WriteLine($"[gdn-bench]   req-{i} text: \"{(text.Length > 120 ? text.Substring(0, 120) : text)}\"");
+        return (count, timedOut);
+    }
+
+    var sw = Stopwatch.StartNew();
+    var tasks = new List<Task<(int count, bool timedOut)>>();
+    for (int i = 0; i < n; i++) tasks.Add(RunOne(i));
+    var results = await Task.WhenAll(tasks);
+    sw.Stop();
+
+    int totalOut = 0;
+    bool anyTimeout = false;
+    for (int i = 0; i < results.Length; i++)
+    {
+        totalOut += results[i].count;
+        anyTimeout |= results[i].timedOut;
+        Console.WriteLine($"[gdn-bench]   req-{i}: tokens={results[i].count} timedOut={results[i].timedOut}");
+    }
+    double aggTps = totalOut / sw.Elapsed.TotalSeconds;
+    Console.WriteLine($"[gdn-bench] concurrent N={n}: wall={sw.Elapsed.TotalSeconds:F2}s totalOut={totalOut} " +
+        $"aggTps={aggTps:F2} perStream={aggTps / n:F2} anyTimeout={anyTimeout}");
+    if (anyTimeout)
+        Console.WriteLine("[gdn-bench] !!! TIMEOUT/HANG detected — batched path likely deadlocked.");
 }
