@@ -21,6 +21,18 @@ namespace TensorSharp.Models
 {
     internal static class ManagedQuantizedOps
     {
+        // Diagnostic: env-gated wall-time + byte accounting for the managed
+        // quantized matmul (the dominant decode cost). Enabled by
+        // TS_CPU_MATMUL_PROFILE=1; read/reset via the public helpers below.
+        internal static readonly bool MatmulProfileEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CPU_MATMUL_PROFILE"), "1", StringComparison.Ordinal);
+        private static long s_matmulTicks;
+        private static long s_matmulBytes;
+        private static long s_matmulCalls;
+        internal static void ResetMatmulProfile() { s_matmulTicks = 0; s_matmulBytes = 0; s_matmulCalls = 0; }
+        internal static (double ms, double gib, long calls) ReadMatmulProfile() =>
+            (s_matmulTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency, s_matmulBytes / (1024.0 * 1024 * 1024), s_matmulCalls);
+
         private const int QK4_0 = 32;
         private const int QK4_1 = 32;
         private const int QK5_0 = 32;
@@ -281,6 +293,8 @@ namespace TensorSharp.Models
                         }
                     }
 
+                    long profStart = MatmulProfileEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
                     bool useParallel = outDim >= 128 && (long)rowCount * outDim >= 512 && Environment.ProcessorCount > 1;
                     if (useParallel)
                     {
@@ -289,6 +303,13 @@ namespace TensorSharp.Models
                     else
                     {
                         ComputeColumnRange(0, outDim);
+                    }
+
+                    if (MatmulProfileEnabled)
+                    {
+                        System.Threading.Interlocked.Add(ref s_matmulTicks, System.Diagnostics.Stopwatch.GetTimestamp() - profStart);
+                        System.Threading.Interlocked.Add(ref s_matmulBytes, (long)outDim * weightRowBytes);
+                        System.Threading.Interlocked.Increment(ref s_matmulCalls);
                     }
                 }
             }
@@ -967,8 +988,21 @@ namespace TensorSharp.Models
             return maxAbs;
         }
 
+        // A/B knob: TENSORSHARP_CPU_NO_SIMD_Q40=1 forces the scalar Q4_0 dot
+        // (to measure the SIMD speedup / fall back if a SIMD bug is suspected).
+        private static readonly bool s_scalarQ40 =
+            string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_CPU_NO_SIMD_Q40"), "1", StringComparison.Ordinal);
+
         private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
         {
+            if (!s_scalarQ40)
+            {
+                if (Avx512F.IsSupported && Avx512BW.IsSupported)
+                    return VecDotQ4_0Q8_0Avx512(q4, q8, blockCount);
+                if (Avx2.IsSupported)
+                    return VecDotQ4_0Q8_0Avx2(q4, q8, blockCount);
+            }
+
             float sum = 0.0f;
             for (int block = 0; block < blockCount; block++)
             {
@@ -991,6 +1025,89 @@ namespace TensorSharp.Models
             }
 
             return sum;
+        }
+
+        // Unpack a Q4_0 block's 16 packed nibble bytes into 32 signed bytes in the
+        // ggml dequant order [low0..low15, high0..high15] (matching the Q8_0
+        // activation layout qx[0..31]), with the -8 zero-point offset already
+        // applied so the result is the signed weight value.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe Vector256<sbyte> UnpackQ40Nibbles(byte* qs, Vector256<sbyte> offset8)
+        {
+            Vector128<byte> packed = Unsafe.ReadUnaligned<Vector128<byte>>(qs);
+            Vector128<byte> mask = Vector128.Create((byte)0x0F);
+            Vector128<byte> low = Sse2.And(packed, mask);
+            Vector128<byte> high = Sse2.And(Sse2.ShiftRightLogical(packed.AsUInt16(), 4).AsByte(), mask);
+            return Avx2.Subtract(Vector256.Create(low, high).AsSByte(), offset8);
+        }
+
+        private static unsafe float VecDotQ4_0Q8_0Avx512(byte* q4, byte* q8, int blockCount)
+        {
+            // Two independent FMA accumulators break the loop-carried dependency
+            // on `acc` so the int8 widen/madd pipeline isn't stalled on FMA
+            // latency; this lifts the Q4_0 matmul closer to the memory wall.
+            Vector512<float> acc0 = Vector512<float>.Zero;
+            Vector512<float> acc1 = Vector512<float>.Zero;
+            Vector512<short> ones = Vector512.Create((short)1);
+            Vector256<sbyte> offset8 = Vector256.Create((sbyte)8);
+
+            int block = 0;
+            int pairEnd = blockCount & ~1;
+            for (; block < pairEnd; block += 2)
+            {
+                acc0 = AccumQ40BlockAvx512(q4, q8, block, ones, offset8, acc0);
+                acc1 = AccumQ40BlockAvx512(q4, q8, block + 1, ones, offset8, acc1);
+            }
+            if (block < blockCount)
+                acc0 = AccumQ40BlockAvx512(q4, q8, block, ones, offset8, acc0);
+
+            return HorizontalSum(acc0 + acc1);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe Vector512<float> AccumQ40BlockAvx512(
+            byte* q4, byte* q8, int block, Vector512<short> ones, Vector256<sbyte> offset8, Vector512<float> acc)
+        {
+            byte* wb = q4 + block * Q4_0BlockBytes;
+            byte* xb = q8 + block * Q8_0BlockBytes;
+            float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+
+            Vector256<sbyte> qwBytes = UnpackQ40Nibbles(wb + 2, offset8);
+            Vector256<sbyte> qxBytes = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 2);
+            Vector512<short> qw = Avx512BW.ConvertToVector512Int16(qwBytes);
+            Vector512<short> qx = Avx512BW.ConvertToVector512Int16(qxBytes);
+            Vector512<short> products = Avx512BW.MultiplyLow(qw, qx);
+            Vector512<int> pairSums = Avx512BW.MultiplyAddAdjacent(products, ones);
+            Vector512<float> dotParts = Avx512F.ConvertToVector512Single(pairSums);
+            return Avx512F.FusedMultiplyAdd(Vector512.Create(scale), dotParts, acc);
+        }
+
+        private static unsafe float VecDotQ4_0Q8_0Avx2(byte* q4, byte* q8, int blockCount)
+        {
+            Vector256<float> acc = Vector256<float>.Zero;
+            Vector256<short> ones = Vector256.Create((short)1);
+            Vector256<sbyte> offset8 = Vector256.Create((sbyte)8);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                byte* wb = q4 + block * Q4_0BlockBytes;
+                byte* xb = q8 + block * Q8_0BlockBytes;
+                float scale = HalfToSingle(ReadUInt16(wb)) * HalfToSingle(ReadUInt16(xb));
+
+                Vector256<sbyte> qw = UnpackQ40Nibbles(wb + 2, offset8);
+                Vector256<sbyte> qx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb + 2);
+                // signed*signed dot via maddubs(|w|, sign(w)*x): see VecDotQ8_0Q8_0Avx2.
+                Vector256<sbyte> absW = Avx2.Sign(qw, qw);
+                Vector256<sbyte> signedX = Avx2.Sign(qx, qw);
+                Vector256<short> prod = Avx2.MultiplyAddAdjacent(absW.AsByte(), signedX);
+                Vector256<int> pairSums = Avx2.MultiplyAddAdjacent(prod, ones);
+                Vector256<float> dotParts = Avx.ConvertToVector256Single(pairSums);
+                acc = Fma.IsSupported
+                    ? Fma.MultiplyAdd(Vector256.Create(scale), dotParts, acc)
+                    : Avx.Add(acc, Avx.Multiply(Vector256.Create(scale), dotParts));
+            }
+
+            return HorizontalSum(acc);
         }
 
         private static unsafe float VecDotQ4_1Q8_1(byte* q4, byte* q8, int blockCount)

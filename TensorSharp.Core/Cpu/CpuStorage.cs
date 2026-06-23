@@ -136,7 +136,7 @@ namespace TensorSharp.Cpu
                 }
                 else if (ElementType == DType.Float16)
                 {
-                    ((ushort*)buffer.ToPointer())[index] = BitConverter.HalfToUInt16Bits((Half)value);
+                    ((ushort*)buffer.ToPointer())[index] = BitConverter.HalfToUInt16Bits((System.Half)value);
                 }
                 else
                 {

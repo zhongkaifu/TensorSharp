@@ -276,6 +276,53 @@ public class ManagedQuantizedOpsTests
         AssertClose(expected, actual, 0.2f);
     }
 
+    [Theory]
+    [InlineData(256, 5, 1)]
+    [InlineData(256, 5, 3)]
+    [InlineData(1024, 33, 4)]
+    public void TryAddmmQuantizedToFloat32_Q40Path_MatchesDequantReference(int inDim, int outDim, int rows)
+    {
+        // Validates the SIMD (AVX2/AVX-512) Q4_0 x Q8_0 dot against the
+        // dequantize-then-dot reference over the SAME weight bytes.
+        var rng = new Random(1234);
+        byte[] weights = BuildRandomQ40(rng, outDim, inDim);
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => 0.05f * MathF.Sin(i * 0.021f))
+            .ToArray();
+        float[] actual = new float[rows * outDim];
+
+        Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            (int)GgmlTensorType.Q4_0, weights, 0, inDim, outDim,
+            input, 0, inDim, rows, actual, 0, outDim));
+
+        float[] expected = DequantizedMatmul(weights, GgmlTensorType.Q4_0, outDim, inDim, input, rows);
+
+        float maxRef = 0f;
+        for (int i = 0; i < expected.Length; i++) maxRef = MathF.Max(maxRef, MathF.Abs(expected[i]));
+        float tol = 0.02f * maxRef + 1e-3f;   // Q8_0 activation quant noise
+        AssertClose(expected, actual, tol);
+    }
+
+    private static byte[] BuildRandomQ40(Random rng, int outDim, int inDim)
+    {
+        const int blockSize = 32;
+        const int blockBytes = 18; // 2 (f16 scale) + 16 packed nibbles
+        Assert.Equal(0, inDim % blockSize);
+        int blocksPerRow = inDim / blockSize;
+        byte[] raw = new byte[(long)outDim * blocksPerRow * blockBytes];
+        int o = 0;
+        for (int r = 0; r < outDim; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                WriteHalf(raw, o, 0.03f + 0.02f * (float)rng.NextDouble());
+                o += 2;
+                for (int i = 0; i < 16; i++) raw[o++] = (byte)rng.Next(0, 256);
+            }
+        }
+        return raw;
+    }
+
     [Fact]
     public void Benchmark_Q80DirectMatmul_VsDequantizedBlockDot()
     {

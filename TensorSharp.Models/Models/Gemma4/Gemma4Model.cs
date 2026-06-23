@@ -5421,14 +5421,18 @@ namespace TensorSharp.Models
             int groupSize = numHeads / numKVHeads;
             int attendLen = totalSeqLen - attendStart;
 
-            float* scores = stackalloc float[attendLen];
-
-            for (int h = 0; h < numHeads; h++)
+            // Each query head is independent; at long context this serial loop is
+            // the single biggest decode cost on the managed CPU backend, so fan it
+            // out across cores. Pointers are passed as nint (lambdas can't capture
+            // pointer locals) and each head stackallocs its own score scratch.
+            nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
+            void Head(int h)
             {
-                float* qHead = qPtr + h * keyDim;
+                float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
-                float* kHead = kPtr + kvHead * maxSeqLen * keyDim;
-                float* vHead = vPtr + kvHead * maxSeqLen * valDim;
+                float* kHead = (float*)kN + kvHead * maxSeqLen * keyDim;
+                float* vHead = (float*)vN + kvHead * maxSeqLen * valDim;
+                float* scores = stackalloc float[attendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < attendLen; t++)
@@ -5449,12 +5453,26 @@ namespace TensorSharp.Models
                 for (int t = 0; t < attendLen; t++)
                     scores[t] *= invSum;
 
-                float* rHead = rPtr + h * valDim;
+                float* rHead = (float*)rN + h * valDim;
                 VecZero(rHead, valDim);
                 for (int t = 0; t < attendLen; t++)
                     VecScaleAdd(rHead, vHead + (attendStart + t) * valDim, scores[t], valDim);
             }
+
+            if (ShouldParallelizeHeads(numHeads, attendLen))
+                System.Threading.Tasks.Parallel.For(0, numHeads, Head);
+            else
+                for (int h = 0; h < numHeads; h++) Head(h);
         }
+
+        // Decode attention parallelises across query heads only when there is
+        // enough work to amortise the fork/join (long context); short-context
+        // decode is dominated by the matmuls and stays serial. Set
+        // TS_CPU_NO_PAR_ATTN=1 to force the serial path (A/B / correctness).
+        private static readonly bool s_noParallelHeads =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CPU_NO_PAR_ATTN"), "1", StringComparison.Ordinal);
+        private static bool ShouldParallelizeHeads(int numHeads, int attendLen) =>
+            !s_noParallelHeads && numHeads > 1 && attendLen >= 128 && Environment.ProcessorCount > 1;
 
         private unsafe void AttentionDecodeWithWindowF16(Tensor q, Tensor kCache, Tensor vCache,
             Tensor result, int numHeads, int numKVHeads, int keyDim, int valDim,
@@ -5468,14 +5486,14 @@ namespace TensorSharp.Models
             int groupSize = numHeads / numKVHeads;
             int attendLen = totalSeqLen - attendStart;
 
-            float* scores = stackalloc float[attendLen];
-
-            for (int h = 0; h < numHeads; h++)
+            nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
+            void Head(int h)
             {
-                float* qHead = qPtr + h * keyDim;
+                float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
-                ushort* kHead = kPtr + kvHead * maxSeqLen * keyDim;
-                ushort* vHead = vPtr + kvHead * maxSeqLen * valDim;
+                ushort* kHead = (ushort*)kN + kvHead * maxSeqLen * keyDim;
+                ushort* vHead = (ushort*)vN + kvHead * maxSeqLen * valDim;
+                float* scores = stackalloc float[attendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < attendLen; t++)
@@ -5496,11 +5514,16 @@ namespace TensorSharp.Models
                 for (int t = 0; t < attendLen; t++)
                     scores[t] *= invSum;
 
-                float* rHead = rPtr + h * valDim;
+                float* rHead = (float*)rN + h * valDim;
                 VecZero(rHead, valDim);
                 for (int t = 0; t < attendLen; t++)
                     TensorComputePrimitives.ScaleAddF16(rHead, vHead + (attendStart + t) * valDim, scores[t], valDim);
             }
+
+            if (ShouldParallelizeHeads(numHeads, attendLen))
+                System.Threading.Tasks.Parallel.For(0, numHeads, Head);
+            else
+                for (int h = 0; h < numHeads; h++) Head(h);
         }
 
         private unsafe void AttentionDecodeCircular(Tensor q, Tensor kCache, Tensor vCache,
@@ -5520,18 +5543,18 @@ namespace TensorSharp.Models
             float* rPtr = GetFloatPtr(result);
             int groupSize = numHeads / numKVHeads;
 
-            float* scores = stackalloc float[attendLen];
-
             int startLogicalPos = currentPos + 1 - attendLen;
             if (startLogicalPos < 0) startLogicalPos = 0;
             int actualAttendLen = currentPos + 1 - startLogicalPos;
 
-            for (int h = 0; h < numHeads; h++)
+            nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
+            void Head(int h)
             {
-                float* qHead = qPtr + h * keyDim;
+                float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
-                float* kHead = kPtr + kvHead * cacheSize * keyDim;
-                float* vHead = vPtr + kvHead * cacheSize * valDim;
+                float* kHead = (float*)kN + kvHead * cacheSize * keyDim;
+                float* vHead = (float*)vN + kvHead * cacheSize * valDim;
+                float* scores = stackalloc float[actualAttendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < actualAttendLen; t++)
@@ -5554,7 +5577,7 @@ namespace TensorSharp.Models
                 for (int t = 0; t < actualAttendLen; t++)
                     scores[t] *= invSum;
 
-                float* rHead = rPtr + h * valDim;
+                float* rHead = (float*)rN + h * valDim;
                 VecZero(rHead, valDim);
                 for (int t = 0; t < actualAttendLen; t++)
                 {
@@ -5563,6 +5586,11 @@ namespace TensorSharp.Models
                     VecScaleAdd(rHead, vHead + cacheIdx * valDim, scores[t], valDim);
                 }
             }
+
+            if (ShouldParallelizeHeads(numHeads, actualAttendLen))
+                System.Threading.Tasks.Parallel.For(0, numHeads, Head);
+            else
+                for (int h = 0; h < numHeads; h++) Head(h);
         }
 
         private unsafe void AttentionDecodeCircularF16(Tensor q, Tensor kCache, Tensor vCache,
@@ -5575,18 +5603,18 @@ namespace TensorSharp.Models
             float* rPtr = GetFloatPtr(result);
             int groupSize = numHeads / numKVHeads;
 
-            float* scores = stackalloc float[attendLen];
-
             int startLogicalPos = currentPos + 1 - attendLen;
             if (startLogicalPos < 0) startLogicalPos = 0;
             int actualAttendLen = currentPos + 1 - startLogicalPos;
 
-            for (int h = 0; h < numHeads; h++)
+            nint qN = (nint)qPtr, kN = (nint)kPtr, vN = (nint)vPtr, rN = (nint)rPtr;
+            void Head(int h)
             {
-                float* qHead = qPtr + h * keyDim;
+                float* qHead = (float*)qN + h * keyDim;
                 int kvHead = h / groupSize;
-                ushort* kHead = kPtr + kvHead * cacheSize * keyDim;
-                ushort* vHead = vPtr + kvHead * cacheSize * valDim;
+                ushort* kHead = (ushort*)kN + kvHead * cacheSize * keyDim;
+                ushort* vHead = (ushort*)vN + kvHead * cacheSize * valDim;
+                float* scores = stackalloc float[actualAttendLen];
 
                 float maxScore = float.NegativeInfinity;
                 for (int t = 0; t < actualAttendLen; t++)
@@ -5609,7 +5637,7 @@ namespace TensorSharp.Models
                 for (int t = 0; t < actualAttendLen; t++)
                     scores[t] *= invSum;
 
-                float* rHead = rPtr + h * valDim;
+                float* rHead = (float*)rN + h * valDim;
                 VecZero(rHead, valDim);
                 for (int t = 0; t < actualAttendLen; t++)
                 {
@@ -5618,6 +5646,11 @@ namespace TensorSharp.Models
                     TensorComputePrimitives.ScaleAddF16(rHead, vHead + cacheIdx * valDim, scores[t], valDim);
                 }
             }
+
+            if (ShouldParallelizeHeads(numHeads, actualAttendLen))
+                System.Threading.Tasks.Parallel.For(0, numHeads, Head);
+            else
+                for (int h = 0; h < numHeads; h++) Head(h);
         }
 
         /// <summary>
