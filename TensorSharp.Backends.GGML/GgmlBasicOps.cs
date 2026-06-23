@@ -1579,6 +1579,8 @@ namespace TensorSharp.GGML
         /// GDN state is re-seeded so the next fused decode rebuilds).</summary>
         public static void Qwen35ResetDecodeCache() => GgmlNative.Qwen35ResetDecodeCache();
 
+        public static void Qwen35ResetVerifyCache() => GgmlNative.Qwen35ResetVerifyCache();
+
         public static bool Qwen35ModelDecode(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
             IntPtr hidden, int hiddenSize, int position,
@@ -1603,6 +1605,37 @@ namespace TensorSharp.GGML
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm);
+        }
+
+        /// <summary>Fused multi-token VERIFY: the whole hybrid transformer over N
+        /// tokens of one sequence as a single graph. Outputs per-row logits
+        /// [vocab, N] and post-norm hidden [hidden, N] (normedOut), advancing each
+        /// recurrent layer's GDN state from ConvStateIn/DeltaStateIn to
+        /// ConvStateOut/DeltaStateOut. Returns false on an unsupported shape.</summary>
+        public static bool Qwen35ModelVerify(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, IntPtr normedOut)
+        {
+            return GgmlNative.Qwen35ModelVerify(
+                layers, numLayers, hidden, hiddenSize, startPos, numTokens,
+                numHeads, numKvHeads, headDim, cacheSize,
+                ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale,
+                logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNorm, normedOut);
         }
 
         /// <summary>True token-batched fused decode: N sequences' decode tokens

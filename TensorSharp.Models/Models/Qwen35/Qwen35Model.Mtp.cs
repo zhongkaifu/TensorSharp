@@ -241,6 +241,19 @@ namespace TensorSharp.Models
             Tensor hidden = Embedding(tokens);
             _embTicks += Stopwatch.GetTimestamp() - t0;
 
+            // Fast path: run the whole trunk over the N tokens as ONE fused GGML
+            // graph (TSGgml_Qwen35ModelVerify) instead of the op-by-op layer loop.
+            // Writes hAllOut (post-norm hidden) + logitsOut directly; advances KV +
+            // GDN state by N. Env-gated TS_QWEN35_FUSED_VERIFY (default off).
+            if (TryFusedVerifyTrunk(hidden, startPos, seqLen, hAllOut, logitsOut, allLogitsRows))
+            {
+                hidden.Dispose();
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return;
+            }
+
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
                 long tl = Stopwatch.GetTimestamp();
@@ -311,6 +324,37 @@ namespace TensorSharp.Models
             _cacheSeqLen += seqLen;
             _forwardCount++;
             _forwardSw.Stop();
+        }
+
+        private float[] _fvLogitsAllBuf;
+
+        /// <summary>Fused trunk verify fast path for <see cref="SpecForward"/>: the
+        /// kernel always produces all-N logit rows, so route them to logitsOut
+        /// directly when the caller wants all rows, else stage in a reusable buffer
+        /// and copy the last row. Returns false (op-by-op fallback) when disabled or
+        /// the kernel declines the shape.</summary>
+        private bool TryFusedVerifyTrunk(Tensor hidden, int startPos, int seqLen,
+            float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            if (!_fusedVerifyEnabled)
+                return false;
+            int vocab = Config.VocabSize;
+            float[] allLogits;
+            if (allLogitsRows && logitsOut != null && logitsOut.Length >= (long)seqLen * vocab)
+            {
+                allLogits = logitsOut;
+            }
+            else
+            {
+                if (_fvLogitsAllBuf == null || _fvLogitsAllBuf.Length < (long)seqLen * vocab)
+                    _fvLogitsAllBuf = new float[(long)seqLen * vocab];
+                allLogits = _fvLogitsAllBuf;
+            }
+            if (!TryFullModelVerify(hidden, startPos, seqLen, hAllOut, allLogits))
+                return false;
+            if (!allLogitsRows && logitsOut != null)
+                Array.Copy(allLogits, (long)(seqLen - 1) * vocab, logitsOut, 0, vocab);
+            return true;
         }
 
         /// <summary>
@@ -454,10 +498,34 @@ namespace TensorSharp.Models
         private bool[] _mtpSlotInitSnapshot;
         private int _mtpSlotSnapshotSlot = -1;
 
+        /// <summary>
+        /// MTP speculation is only a throughput WIN when the model's STANDARD
+        /// decode is slow enough that drafting + verifying K tokens saves more
+        /// than the speculation machinery costs. On <c>ggml_cuda</c> the standard
+        /// Qwen3.6 decode IS the fused, CUDA-graph-captured whole-model decode
+        /// (<see cref="TryFullModelDecode"/>): one graph replay per token, fully
+        /// device-resident GDN/KV state, zero host orchestration — ~73 tok/s
+        /// (~13.7 ms/token) on 35B-A3B IQ2_XXS, already at the memory-bandwidth
+        /// floor (only ~3B of 35B params are active, so each decode token is cheap).
+        ///
+        /// <c>--mtp-spec</c> is an EXPLICIT operator opt-in, so we honor it whenever
+        /// the model actually has an MTP/NextN head — even on ggml_cuda where the
+        /// captured decode (~73 tok/s) may still beat speculation. (Earlier this gated
+        /// OFF on ggml_cuda because the op-by-op verify made MTP ~34x slower; the
+        /// fused multi-token verify <see cref="TryFullModelVerify"/>,
+        /// <c>TS_QWEN35_FUSED_VERIFY=1</c>, cuts the verify ~20x and is the path that
+        /// makes spec competitive — long context / large drafts.) The user asked that
+        /// the flag be respected regardless, so don't second-guess it here.
+        /// </summary>
+        public bool MtpSpeculationProfitable => HasMtp;
+
         /// <summary>Batched spec trunk needs the GGML batched paged path (the
         /// MLX backend keeps GDN state inside opaque per-slot MLX caches the
-        /// snapshot/restore below cannot capture).</summary>
-        public bool SupportsBatchedSpecTrunk => HasMtp && IsGgmlBackend && IsBatchedPathEnabled();
+        /// snapshot/restore below cannot capture). When the fused multi-token
+        /// verify (<see cref="TryFullModelVerify"/>) is enabled we route spec to the
+        /// LINEAR trunk instead (SpecForward), whose KV/GDN state the fused verify
+        /// reads/writes; the batched paged trunk uses a different (paged) store.</summary>
+        public bool SupportsBatchedSpecTrunk => HasMtp && IsGgmlBackend && IsBatchedPathEnabled() && !_fusedVerifyEnabled;
 
         public void SpecForwardBatched(SequenceState seq, int[] tokens, int startPos,
             float[] hAllOut, float[] logitsOut, bool allLogitsRows)

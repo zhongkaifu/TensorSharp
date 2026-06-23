@@ -1451,6 +1451,11 @@ internal enum GgmlIndexReductionOp
 
         public static void Qwen35ResetDecodeCache() => TSGgml_Qwen35ResetDecodeCache();
 
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Qwen35ResetVerifyCache();
+
+        public static void Qwen35ResetVerifyCache() => TSGgml_Qwen35ResetVerifyCache();
+
         // Qwen3.5/3.6 TRUE token-batched fused decode: N sequences' decode tokens
         // (one per sequence) through the whole hybrid transformer in ONE graph,
         // with PAGED KV (slot_mapping write + per-seq get_rows gather). Returns 0
@@ -1521,6 +1526,53 @@ internal enum GgmlIndexReductionOp
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm) != 0;
+        }
+
+        // Qwen3.5/3.6 fused multi-token VERIFY: the whole hybrid transformer over
+        // N tokens of ONE sequence as a single graph (prefill-style causal attention,
+        // GDN recurrence via gated_delta_net(K=N), batched MoE/dense FFN, folded
+        // final-norm). Outputs per-row logits [vocab, N] AND post-norm hidden
+        // [hidden, N] (normedOut, for the MTP draft head). GDN state advances from
+        // each layer's ConvStateIn/DeltaStateIn to ConvStateOut/DeltaStateOut.
+        // Returns 0 when it cannot handle the shape so the caller falls back to per-op.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35ModelVerify(
+            [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, IntPtr normedOut);
+
+        public static bool Qwen35ModelVerify(
+            Qwen35LayerDecodeArgs[] layers, int numLayers,
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            int numHeads, int numKvHeads, int headDim, int cacheSize,
+            int ropeNDims, int ropeMode, int kvCacheType,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps, float ropeBase, float ropeFreqScale,
+            int numExperts, int numExpertsUsed, int expertFf, int sharedFf,
+            int normTopk, float expertWeightsScale,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, IntPtr normedOut)
+        {
+            return TSGgml_Qwen35ModelVerify(
+                layers, numLayers, hidden, hiddenSize, startPos, numTokens,
+                numHeads, numKvHeads, headDim, cacheSize,
+                ropeNDims, ropeMode, kvCacheType,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads,
+                eps, ropeBase, ropeFreqScale,
+                numExperts, numExpertsUsed, expertFf, sharedFf,
+                normTopk, expertWeightsScale,
+                logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNorm, normedOut) != 0;
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]

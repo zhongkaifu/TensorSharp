@@ -956,6 +956,11 @@ namespace TensorSharp.Models
             }
 
             _kvCacheCapacity = newCapacity;
+            // The KV tensors were reallocated, so any cached fused-decode / fused-verify
+            // graph pins the freed device buffers -> drop them (they rebuild on the next
+            // call against the new buffers).
+            InvalidateFullDecodeState();
+            InvalidateVerifyCache();
             Console.WriteLine($"Expanded Qwen3.5 attention cache to {newCapacity} tokens.");
         }
 
@@ -1000,6 +1005,7 @@ namespace TensorSharp.Models
             }
             _cacheSeqLen = 0;
             InvalidateFullDecodeState();
+            InvalidateVerifyCache();
             _fdSpecSessionActive = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _mlxEvalBoundaryTicks = 0;
