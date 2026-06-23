@@ -2081,6 +2081,23 @@ namespace
             : std::min(cache_size, totalSeqLen);
         const void* sig = layers[0].attn_norm_w;
 
+        // Device-resident GDN state: when the C# caller points each recurrent layer's
+        // conv_state_in and conv_state_out at the SAME buffer (the decode's device-
+        // resident _fdConvScratch slot + _deltaStateTensor), the verify reads/writes the
+        // GDN state IN-PLACE on the device (cacheable COMPUTE binding) instead of
+        // uploading + downloading it every call (~60 MB delta + 3 MB conv). The state
+        // persists across verify/plain steps exactly like the captured decode's; the C#
+        // snapshots it (drain) only before a draft-verify for rollback.
+        bool resident_state = false;
+        for (int l = 0; l < num_layers; l++)
+        {
+            if (layers[l].is_recurrent != 0)
+            {
+                resident_state = (layers[l].conv_state_in == layers[l].conv_state_out) && layers[l].conv_state_in != nullptr;
+                break;
+            }
+        }
+
         // ===== Persist reuse fast-path: upload the per-call inputs + replay =====
         if (fv_persist)
         {
@@ -2105,24 +2122,32 @@ namespace
                 std::vector<ggml_fp16_t> mk;
                 fill_verify_causal_mask(mk, window, N, start_pos, totalSeqLen);
                 ggml_backend_tensor_set(c.mask_t, mk.data(), 0, mk.size() * sizeof(ggml_fp16_t));
-                int gi = 0;
-                for (int l = 0; l < num_layers; l++)
+                // Host mode uploads the per-call GDN state; resident keeps it device-
+                // resident (cacheable, in-place), so no upload/download here.
+                if (!resident_state)
                 {
-                    if (layers[l].is_recurrent == 0) continue;
-                    ggml_backend_tensor_set(c.conv_in[gi], layers[l].conv_state_in, 0, convStateBytes);
-                    ggml_backend_tensor_set(c.delta_in[gi], layers[l].delta_state_in, 0, deltaStateBytes);
-                    gi++;
+                    int gi = 0;
+                    for (int l = 0; l < num_layers; l++)
+                    {
+                        if (layers[l].is_recurrent == 0) continue;
+                        ggml_backend_tensor_set(c.conv_in[gi], layers[l].conv_state_in, 0, convStateBytes);
+                        ggml_backend_tensor_set(c.delta_in[gi], layers[l].delta_state_in, 0, deltaStateBytes);
+                        gi++;
+                    }
                 }
                 auto t_su = std::chrono::high_resolution_clock::now();
                 if (ggml_backend_graph_compute(g_backend, c.graph) != GGML_STATUS_SUCCESS) { c.reset(); break; }
                 auto t_cu = std::chrono::high_resolution_clock::now();
-                gi = 0;
-                for (int l = 0; l < num_layers; l++)
+                if (!resident_state)
                 {
-                    if (layers[l].is_recurrent == 0) continue;
-                    finalize_compute_with_download(c.conv_out[gi], layers[l].conv_state_out, convStateBytes);
-                    finalize_compute_with_download(c.delta_out[gi], layers[l].delta_state_out, deltaStateBytes);
-                    gi++;
+                    int gi = 0;
+                    for (int l = 0; l < num_layers; l++)
+                    {
+                        if (layers[l].is_recurrent == 0) continue;
+                        finalize_compute_with_download(c.conv_out[gi], layers[l].conv_state_out, convStateBytes);
+                        finalize_compute_with_download(c.delta_out[gi], layers[l].delta_state_out, deltaStateBytes);
+                        gi++;
+                    }
                 }
                 if (normed_out != nullptr && c.normed_out != nullptr)
                     finalize_compute_with_download(c.normed_out, normed_out, static_cast<std::size_t>(H) * N * sizeof(float));
@@ -2230,11 +2255,23 @@ namespace
                 t.ssm_out_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(d.ssm_out_type), d.ssm_out_ne0, d.ssm_out_ne1);
                 t.conv_state_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, convDim, conv_dim);
                 t.delta_state_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads);
-                t.conv_state_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, convDim, conv_dim);
-                t.delta_state_out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads);
-                // Per-call GDN state inputs: preserved (set_input) + uploaded each call.
-                ggml_set_input(t.conv_state_in);
-                ggml_set_input(t.delta_state_in);
+                if (resident_state)
+                {
+                    // Resident: conv/delta state lives in a device-resident cacheable
+                    // COMPUTE buffer (bound below); the post-window state is written
+                    // IN-PLACE to conv_state_in / delta_state_in (no separate out tensor,
+                    // no per-call upload/download). Saves the ~60 MB delta out alloc too.
+                    t.conv_state_out = nullptr;
+                    t.delta_state_out = nullptr;
+                }
+                else
+                {
+                    t.conv_state_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, convDim, conv_dim);
+                    t.delta_state_out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_k_dim, head_v_dim, num_v_heads);
+                    // Per-call GDN state inputs: preserved (set_input) + uploaded each call.
+                    ggml_set_input(t.conv_state_in);
+                    ggml_set_input(t.delta_state_in);
+                }
             }
             if (d.is_moe == 0)
             {
@@ -2378,7 +2415,9 @@ namespace
                 ggml_tensor* conv_out = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, t.conv1d_w)); // [conv_dim, N]
                 // new conv state = the last convDim timesteps (rows [N, N+convDim)).
                 ggml_tensor* new_conv = ggml_cont(ctx, ggml_view_2d(ctx, conv_input, convDim, conv_dim, conv_input->nb[1], static_cast<std::size_t>(N) * conv_input->nb[0]));
-                t.conv_state_out = ggml_cpy(ctx, new_conv, t.conv_state_out);
+                // Resident: write the post-window conv state IN-PLACE to conv_state_in
+                // (the device-resident buffer); host mode: to the separate out tensor.
+                t.conv_state_out = ggml_cpy(ctx, new_conv, resident_state ? t.conv_state_in : t.conv_state_out);
 
                 ggml_tensor* q_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, key_dim, N, conv_out->nb[1], 0));
                 ggml_tensor* k_part = ggml_cont(ctx, ggml_view_2d(ctx, conv_out, key_dim, N, conv_out->nb[1], static_cast<std::size_t>(key_dim) * sizeof(float)));
@@ -2411,7 +2450,9 @@ namespace
                     ggml_row_size(gdn->type, head_k_dim * head_v_dim),
                     ggml_row_size(gdn->type, head_k_dim * head_v_dim * num_v_heads),
                     ggml_row_size(gdn->type, value_dim) * static_cast<std::size_t>(N));
-                t.delta_state_out = ggml_cpy(ctx, new_state, t.delta_state_out);
+                // Resident: write the post-window delta state IN-PLACE to delta_state_in
+                // (state4 aliases it); host mode: to the separate out tensor.
+                t.delta_state_out = ggml_cpy(ctx, new_state, resident_state ? state4 : t.delta_state_out);
 
                 // gated RMSNorm with z, per token: rms_norm(out) * ssm_norm * silu(z).
                 ggml_tensor* out_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, gdn_out), head_v_dim, num_v_heads * N);
@@ -2590,8 +2631,18 @@ namespace
                 bind_or_mark(t.ssm_a_w, d.ssm_a_w, static_cast<std::size_t>(num_v_heads) * sizeof(float), true);
                 bind_or_mark(t.ssm_norm_w, d.ssm_norm_w, static_cast<std::size_t>(head_v_dim) * sizeof(float), true);
                 bind_or_mark(t.ssm_out_w, d.ssm_out_w, static_cast<std::size_t>(d.ssm_out_bytes), true);
-                // conv_state_in / delta_state_in are per-call inputs (set_input above):
-                // allocated by alloc_ctx/gallocr, uploaded each call below.
+                if (resident_state)
+                {
+                    // Device-resident GDN state: bind cacheable COMPUTE (keyed by the
+                    // decode's _fdConvScratch / _deltaStateTensor host ptrs) so the
+                    // buffer persists across calls and is updated in-place. The cacheable
+                    // path uploads only when the host key is invalidated (the C# seed);
+                    // subsequent calls cache-hit (no upload).
+                    bind_or_mark(t.conv_state_in, d.conv_state_in, convStateBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                    bind_or_mark(t.delta_state_in, d.delta_state_in, deltaStateBytes, true, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                }
+                // else: conv_state_in / delta_state_in are per-call set_input inputs,
+                // uploaded each call below.
             }
         }
         bind_or_mark(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
@@ -2629,11 +2680,16 @@ namespace
         ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
         ggml_backend_tensor_set(kv_index, kv_index_data.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int64_t));
         ggml_backend_tensor_set(attn_mask, attn_mask_data.data(), 0, attn_mask_data.size() * sizeof(ggml_fp16_t));
-        for (int l = 0; l < num_layers; l++)
+        if (!resident_state)
         {
-            if (layers[l].is_recurrent == 0) continue;
-            ggml_backend_tensor_set(lt[l].conv_state_in, layers[l].conv_state_in, 0, convStateBytes);
-            ggml_backend_tensor_set(lt[l].delta_state_in, layers[l].delta_state_in, 0, deltaStateBytes);
+            // Host mode: upload the per-call GDN state. Resident mode skips this — the
+            // state is device-resident (cacheable), seeded only on invalidation.
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (layers[l].is_recurrent == 0) continue;
+                ggml_backend_tensor_set(lt[l].conv_state_in, layers[l].conv_state_in, 0, convStateBytes);
+                ggml_backend_tensor_set(lt[l].delta_state_in, layers[l].delta_state_in, 0, deltaStateBytes);
+            }
         }
 
         auto t_setup = std::chrono::high_resolution_clock::now();
@@ -2645,15 +2701,19 @@ namespace
         }
         auto t_compute = std::chrono::high_resolution_clock::now();
 
-        // Download the post-window GDN state (per recurrent layer) + outputs.
-        for (int l = 0; l < num_layers; l++)
+        // Download the post-window GDN state (per recurrent layer) + outputs. Resident
+        // mode skips the state download (it stays device-resident, updated in-place).
+        if (!resident_state)
         {
-            const TSGgmlQwen35LayerDesc& d = layers[l];
-            if (d.is_recurrent == 0) continue;
-            if (d.conv_state_out != nullptr)
-                finalize_compute_with_download(lt[l].conv_state_out, d.conv_state_out, convStateBytes);
-            if (d.delta_state_out != nullptr)
-                finalize_compute_with_download(lt[l].delta_state_out, d.delta_state_out, deltaStateBytes);
+            for (int l = 0; l < num_layers; l++)
+            {
+                const TSGgmlQwen35LayerDesc& d = layers[l];
+                if (d.is_recurrent == 0) continue;
+                if (d.conv_state_out != nullptr)
+                    finalize_compute_with_download(lt[l].conv_state_out, d.conv_state_out, convStateBytes);
+                if (d.delta_state_out != nullptr)
+                    finalize_compute_with_download(lt[l].delta_state_out, d.delta_state_out, deltaStateBytes);
+            }
         }
         if (normed_out != nullptr && normed_out_t != nullptr)
             finalize_compute_with_download(normed_out_t, normed_out, static_cast<std::size_t>(H) * N * sizeof(float));

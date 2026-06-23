@@ -841,6 +841,9 @@ namespace TensorSharp.Models
         /// (KV reset / capacity grow), NOT on the per-step spec latch.</summary>
         internal void InvalidateVerifyCache()
         {
+            // The device-resident verify state lives in the same buffers; a KV reset/grow
+            // invalidates it, so re-seed on the next verify.
+            _fvStateResident = false;
             if (_backend == BackendType.GgmlCuda)
                 GgmlBasicOps.Qwen35ResetVerifyCache();
         }
@@ -1116,6 +1119,18 @@ namespace TensorSharp.Models
         private IntPtr _fvConvOut;   // unmanaged, same size (post-window state)
         private bool _fvUnsupported;
 
+        // Device-resident verify GDN state (TS_QWEN35_VERIFY_RESIDENT=1, default OFF):
+        // the verify keeps conv (_fvConvIn) + delta (_deltaStateTensor) device-resident
+        // (cacheable, updated in-place) and does NOT re-upload them every call (only the
+        // first/invalidated seed). It still drains them back to the host AFTER each call
+        // so the snapshot/rollback + any op-by-op fallback see the current state, which
+        // keeps the existing host snapshot path correct (no rollback changes). Net: skips
+        // the ~60 MB delta UPLOAD per call. _fvStateResident latches the seed; reset on
+        // KV reset/grow (InvalidateVerifyCache).
+        private static readonly bool _fvResidentEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_VERIFY_RESIDENT"), "1", StringComparison.Ordinal);
+        private bool _fvStateResident;
+
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut)
         {
             if (!_fusedVerifyEnabled || _fvUnsupported || _backend != BackendType.GgmlCuda)
@@ -1269,23 +1284,30 @@ namespace TensorSharp.Models
                     a.SsmAW = (IntPtr)GetFloatPtr(_ssmAW[l]);
                     a.SsmNormW = (IntPtr)GetFloatPtr(_ssmNormW[l]);
 
-                    // Convert the C# conv ring -> ggml [time, channel] (pre-window state).
                     float* convIn = convInBase + (long)_fvGdnSlot[l] * convBlock;
                     float* convOut = convOutBase + (long)_fvGdnSlot[l] * convBlock;
-                    float[] ring = _convState[l];
-                    int w = _convStateWriteIdx[l];
-                    for (int t = 0; t < convDim; t++)
-                    {
-                        int slot = (w + t) % convDim;
-                        int srcBase = slot * qkvDim;
-                        for (int ch = 0; ch < qkvDim; ch++)
-                            convIn[ch * convDim + t] = ring[srcBase + ch];
-                    }
                     IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
-                    GgmlBasicOps.InvalidateHostBuffer((IntPtr)convIn);
-                    GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
+                    // Resident: the device buffer persists across calls, so only seed
+                    // (convert ring -> ggml + invalidate so the cacheable bind re-uploads)
+                    // on the first call / after an invalidation. Host mode seeds every call.
+                    if (!_fvResidentEnabled || !_fvStateResident)
+                    {
+                        float[] ring = _convState[l];
+                        int w = _convStateWriteIdx[l];
+                        for (int t = 0; t < convDim; t++)
+                        {
+                            int slot = (w + t) % convDim;
+                            int srcBase = slot * qkvDim;
+                            for (int ch = 0; ch < qkvDim; ch++)
+                                convIn[ch * convDim + t] = ring[srcBase + ch];
+                        }
+                        GgmlBasicOps.InvalidateHostBuffer((IntPtr)convIn);
+                        GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
+                    }
                     a.ConvStateIn = (IntPtr)convIn;
-                    a.ConvStateOut = (IntPtr)convOut;
+                    // Resident: conv_in == conv_out signals the native to keep the state
+                    // device-resident (in-place); host mode uses a separate out buffer.
+                    a.ConvStateOut = _fvResidentEnabled ? (IntPtr)convIn : (IntPtr)convOut;
                     a.DeltaStateIn = deltaPtr;
                     a.DeltaStateOut = deltaPtr;   // in-place: overwritten with the post-window state
                 }
@@ -1317,23 +1339,39 @@ namespace TensorSharp.Models
                 return false;
             }
 
-            // Write the post-window GDN state back to the C# representation: conv
-            // ggml [time, channel] -> ring (normalised writeIdx=0); delta was written
-            // in-place to _deltaStateTensor (invalidate so later op-by-op ops re-read).
+            // Write the post-window GDN state back to the C# (host) representation so the
+            // snapshot / rollback / any op-by-op fallback see the current state.
+            //   host mode: the native already downloaded conv_state_out -> _fvConvOut and
+            //              delta in-place to _deltaStateTensor's host mirror.
+            //   resident:  the native kept conv (_fvConvIn) + delta device-resident in
+            //              place and did NOT download them, so drain them here (DtoH) —
+            //              this is the only per-call transfer (the ~60 MB delta UPLOAD is
+            //              skipped). _fvConvIn holds the post-window conv after the drain.
             for (int l = 0; l < n; l++)
             {
                 if (!_isRecurrent[l]) continue;
-                float* convOut = convOutBase + (long)_fvGdnSlot[l] * convBlock;
+                float* convSrc = _fvResidentEnabled
+                    ? convInBase + (long)_fvGdnSlot[l] * convBlock
+                    : convOutBase + (long)_fvGdnSlot[l] * convBlock;
+                IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[l]);
+                if (_fvResidentEnabled)
+                {
+                    GgmlBasicOps.SyncHostBuffer((IntPtr)convSrc, (long)convBlock * sizeof(float));
+                    GgmlBasicOps.SyncHostBuffer(deltaPtr, _deltaStateTensor[l].Storage.ByteLength);
+                    InvalidateTensorDeviceCache(_deltaStateTensor[l]);
+                }
                 float[] ring = _convState[l];
                 for (int t = 0; t < convDim; t++)
                 {
                     int dstBase = t * qkvDim;
                     for (int ch = 0; ch < qkvDim; ch++)
-                        ring[dstBase + ch] = convOut[ch * convDim + t];
+                        ring[dstBase + ch] = convSrc[ch * convDim + t];
                 }
                 _convStateWriteIdx[l] = 0;
-                GgmlBasicOps.InvalidateHostBuffer((IntPtr)GetFloatPtr(_deltaStateTensor[l]));
+                if (!_fvResidentEnabled)
+                    GgmlBasicOps.InvalidateHostBuffer(deltaPtr);
             }
+            _fvStateResident = true;
             return true;
         }
 
