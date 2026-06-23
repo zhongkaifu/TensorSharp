@@ -2062,13 +2062,13 @@ namespace
         }
 
         static const bool fv_timing = std::getenv("TS_Q35_VERIFY_TIMING") != nullptr;
-        // Persistent per-(N,window) graph cache (build amortization + capture). DEFAULT
-        // OFF: reuse currently hits an access-violation (0xC0000005) after a few steps —
-        // the interleaved op-by-op MTP draft/catch-up between verify calls disturbs the
-        // SHARED cacheable weight buffers the cached graph pins (the decode's reuse is
-        // stable only because nothing interleaves with it). Opt-in TS_Q35_VERIFY_PERSIST=1
-        // for debugging; the non-persist path (rebuild each call) is correct + crash-free.
-        static const bool fv_persist = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e != nullptr && e[0] == '1'; }();
+        // Persistent per-(N,window) graph cache (build amortization + CUDA-graph
+        // capture). DEFAULT ON: the earlier reuse access-violation (0xC0000005) was the
+        // 3D N-row set_rows (heads in ne2) faulting on cgraph reuse; replacing it with a
+        // 2D set_rows PER HEAD (llama.cpp's proven KV-write shape) made reuse stable
+        // (validated 252 reuses, no crash). Reuse: setup ~8 ms + compute ~12-20 ms vs
+        // ~61 ms non-persist build. TS_Q35_VERIFY_PERSIST=0 forces the rebuild path.
+        static const bool fv_persist = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e == nullptr || e[0] != '0'; }();
         auto t_start = std::chrono::high_resolution_clock::now();
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
@@ -2256,6 +2256,7 @@ namespace
 
         // --- build the chained graph over N tokens ---
         std::vector<ggml_tensor*> state_writes;
+        std::vector<ggml_tensor*> kv_writes;   // per-head 2D set_rows results (all attn layers)
         ggml_tensor* hidden = hidden_t;
         for (int l = 0; l < num_layers; l++)
         {
@@ -2306,11 +2307,27 @@ namespace
                 ggml_tensor* v_3d_pre = ggml_reshape_4d(ctx, v_3d_raw, head_dim, num_kv_heads, N, 1);
                 ggml_tensor* v_fresh = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, v_3d_pre, 0, 2, 1, 3)), head_dim, N, num_kv_heads);
 
-                // KV write via set_rows: the N write positions are an I64 INPUT
-                // (kv_index), not a baked view offset, so the graph is constant
-                // token-to-token within a window stride (capturable / reusable).
-                t.k_cpy = ggml_set_rows(ctx, t.k_cache_base, k_fresh, kv_index);
-                t.v_cpy = ggml_set_rows(ctx, t.v_cache_base, v_fresh, kv_index);
+                // KV write: a 2D ggml_set_rows PER HEAD — dst [head_dim, cache_size]
+                // (a contiguous ne2 slice of the head-major cache), src [head_dim, N],
+                // idx [N]. This is EXACTLY llama.cpp's proven 2D set_rows shape
+                // (n_embd_gqa == head_dim for one head). The single 3D N-row set_rows
+                // (heads broadcast via ne2) is the untested combo that faults on
+                // cgraph reuse (the decode is fine only because it writes N=1). The
+                // write position is an I64 INPUT (kv_index), keeping the graph constant
+                // within a window stride for reuse/capture.
+                for (int h = 0; h < num_kv_heads; h++)
+                {
+                    ggml_tensor* k_dst_h = ggml_view_2d(ctx, t.k_cache_base, head_dim, cache_size,
+                        t.k_cache_base->nb[1], static_cast<std::size_t>(h) * t.k_cache_base->nb[2]);
+                    ggml_tensor* v_dst_h = ggml_view_2d(ctx, t.v_cache_base, head_dim, cache_size,
+                        t.v_cache_base->nb[1], static_cast<std::size_t>(h) * t.v_cache_base->nb[2]);
+                    ggml_tensor* k_src_h = ggml_view_2d(ctx, k_fresh, head_dim, N,
+                        k_fresh->nb[1], static_cast<std::size_t>(h) * k_fresh->nb[2]);
+                    ggml_tensor* v_src_h = ggml_view_2d(ctx, v_fresh, head_dim, N,
+                        v_fresh->nb[1], static_cast<std::size_t>(h) * v_fresh->nb[2]);
+                    kv_writes.push_back(ggml_set_rows(ctx, k_dst_h, k_src_h, kv_index));
+                    kv_writes.push_back(ggml_set_rows(ctx, v_dst_h, v_src_h, kv_index));
+                }
 
                 // Attend over the fixed window [0, window) (now holds the N fresh rows);
                 // the shared causal mask zeroes valid keys and -inf's the rest.
@@ -2481,16 +2498,12 @@ namespace
         ggml_tensor* logits_cpy = ggml_cpy(ctx, logits, logits_out_t);
         ggml_set_output(logits_cpy);
 
-        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 200 + 1024;
+        // Per-head set_rows adds ~2*num_kv_heads nodes per attention layer, so size
+        // the graph generously to avoid GGML_ASSERT(n_nodes < size).
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (260 + 2 * num_kv_heads) + 1024;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
-        for (int l = 0; l < num_layers; l++)
-        {
-            if (layers[l].is_recurrent == 0)
-            {
-                ggml_build_forward_expand(graph, lt[l].k_cpy);
-                ggml_build_forward_expand(graph, lt[l].v_cpy);
-            }
-        }
+        for (ggml_tensor* w : kv_writes)
+            ggml_build_forward_expand(graph, w);
         for (ggml_tensor* w : state_writes)
         {
             ggml_set_output(w);
