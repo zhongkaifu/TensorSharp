@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using TensorSharp.Cuda.Interop;
 
@@ -152,15 +153,46 @@ namespace TensorSharp.Cuda
         {
             string path = LocatePtxPath();
             if (path == null)
+            {
+                WarnKernelsUnavailable(
+                    "the compiled PTX (tensorsharp_kernels.ptx) could not be located next to the application " +
+                    "or under a 'cuda_kernels' folder in its output directory");
                 return null;
+            }
 
             try
             {
                 return new CudaKernels(CudaModule.LoadFromFile(path));
             }
+            catch (Exception ex)
+            {
+                WarnKernelsUnavailable($"loading the PTX module from '{path}' failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static int kernelWarningEmitted;
+
+        private static void WarnKernelsUnavailable(string reason)
+        {
+            // Without the PTX kernels every PTX-backed op (fill, attention, RoPE, ...)
+            // silently falls back to the slow CPU path, and Float16 caches in
+            // particular used to surface this only as a deep NotSupportedException.
+            // Emit a single, actionable warning so the degraded mode is visible.
+            if (System.Threading.Interlocked.Exchange(ref kernelWarningEmitted, 1) != 0)
+                return;
+
+            try
+            {
+                Console.Error.WriteLine(
+                    "WARNING: TensorSharp CUDA kernels are unavailable because " + reason + ". " +
+                    "The Cuda backend will run PTX-backed ops on a slow CPU fallback. " +
+                    "Build TensorSharp.Backends.Cuda with nvcc on the PATH and ensure " +
+                    "cuda_kernels/tensorsharp_kernels.ptx is copied next to your application.");
+            }
             catch
             {
-                return null;
+                // Diagnostics must never break model initialization.
             }
         }
 
@@ -1470,22 +1502,30 @@ namespace TensorSharp.Cuda
 
         private static string LocatePtxPath()
         {
-            string baseDirectory = AppContext.BaseDirectory;
-            string[] candidates =
+            // Probe the application base directory first, then the directory the
+            // CUDA backend assembly itself was loaded from. When TensorSharp is
+            // consumed from another solution these are usually the same folder,
+            // but they can differ for plugin hosts, single-file publishes, or
+            // shadow-copied assemblies, so checking both avoids the silent CPU
+            // fallback reported when the consuming app lives outside this repo.
+            foreach (string baseDirectory in EnumeratePtxBaseDirectories())
             {
-                Path.Combine(baseDirectory, "cuda_kernels", "tensorsharp_kernels.ptx"),
-                Path.Combine(baseDirectory, "tensorsharp_kernels.ptx"),
-                Path.Combine(baseDirectory, "..", "..", "..", "native", "ptx", "tensorsharp_kernels.ptx"),
-            };
+                string[] candidates =
+                {
+                    Path.Combine(baseDirectory, "cuda_kernels", "tensorsharp_kernels.ptx"),
+                    Path.Combine(baseDirectory, "tensorsharp_kernels.ptx"),
+                    Path.Combine(baseDirectory, "..", "..", "..", "native", "ptx", "tensorsharp_kernels.ptx"),
+                };
 
-            foreach (string candidate in candidates)
-            {
-                string fullPath = Path.GetFullPath(candidate);
-                if (File.Exists(fullPath))
-                    return fullPath;
+                foreach (string candidate in candidates)
+                {
+                    string fullPath = Path.GetFullPath(candidate);
+                    if (File.Exists(fullPath))
+                        return fullPath;
+                }
             }
 
-            DirectoryInfo dir = new DirectoryInfo(baseDirectory);
+            DirectoryInfo dir = new DirectoryInfo(AppContext.BaseDirectory);
             while (dir != null)
             {
                 string sourceTreePath = Path.Combine(dir.FullName, "TensorSharp.Backends.Cuda", "native", "ptx", "tensorsharp_kernels.ptx");
@@ -1500,6 +1540,34 @@ namespace TensorSharp.Cuda
             }
 
             return null;
+        }
+
+        private static IEnumerable<string> EnumeratePtxBaseDirectories()
+        {
+            yield return AppContext.BaseDirectory;
+
+            string assemblyLocation = null;
+            try
+            {
+                assemblyLocation = typeof(CudaKernels).Assembly.Location;
+            }
+            catch
+            {
+                assemblyLocation = null;
+            }
+
+            if (!string.IsNullOrEmpty(assemblyLocation))
+            {
+                string assemblyDir = Path.GetDirectoryName(assemblyLocation);
+                if (!string.IsNullOrEmpty(assemblyDir) &&
+                    !string.Equals(
+                        Path.GetFullPath(assemblyDir),
+                        Path.GetFullPath(AppContext.BaseDirectory),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    yield return assemblyDir;
+                }
+            }
         }
     }
 }

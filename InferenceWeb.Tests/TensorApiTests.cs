@@ -59,4 +59,32 @@ public class TensorApiTests
         alias.Dispose();
         alias.Dispose();
     }
+
+    [Fact]
+    public void Float16ElementAccessRoundTrips()
+    {
+        using Tensor tensor = new Tensor(_allocator, DType.Float16, 2, 2);
+
+        tensor.SetElementAsFloat(2.5f, 0, 0);
+        tensor.SetElementAsFloat(-3f, 1, 1);
+
+        Assert.Equal(2.5f, tensor.GetElementAsFloat(0, 0));
+        Assert.Equal(-3f, tensor.GetElementAsFloat(1, 1));
+    }
+
+    [Fact]
+    public void FillSupportsFloat16Tensors()
+    {
+        using Tensor tensor = new Tensor(_allocator, DType.Float16, 3, 4);
+
+        Ops.Fill(tensor, 0f);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++)
+                Assert.Equal(0f, tensor.GetElementAsFloat(i, j));
+
+        Ops.Fill(tensor, 1.5f);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++)
+                Assert.Equal(1.5f, tensor.GetElementAsFloat(i, j));
+    }
 }
