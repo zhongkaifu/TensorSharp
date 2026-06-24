@@ -148,6 +148,19 @@ namespace TensorSharp.Runtime.Scheduling
             var output = new SchedulerOutput();
             int tokenBudget = _cfg.MaxNumBatchedTokens;
 
+            // When there's at most one sequence in the whole system there is no
+            // concurrent decode to interleave with, so the small prefill chunk
+            // (which exists only for fairness) just forces a long prompt onto the
+            // slow per-op, GPU-syncs-every-op path for every chunk that crosses
+            // the sliding-window boundary. Feed a lone prompt in one big chunk
+            // (bounded by the batched-token budget) like the CLI does, keeping it
+            // on the fused single-graph prefill path. The moment a 2nd request
+            // appears this reverts to small chunks automatically.
+            bool noContention = (_running.Count + _waiting.Count) <= 1;
+            int prefillCap = noContention
+                ? Math.Min(_cfg.SoloPrefillChunkSize, _cfg.MaxNumBatchedTokens)
+                : _cfg.MaxPrefillChunkSize;
+
             // -------------------------------------------------------------- 1. Run existing running set first.
             //    This guarantees decoding sequences make forward progress even
             //    when long-prompt waiters are vying for blocks.
@@ -162,7 +175,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
                 bool isPrefill = promptUncomputed > 0;
                 int want = isPrefill
-                    ? Math.Min(promptUncomputed, _cfg.MaxPrefillChunkSize)
+                    ? Math.Min(promptUncomputed, prefillCap)
                     : 1; // decode step
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
@@ -227,7 +240,7 @@ namespace TensorSharp.Runtime.Scheduling
                     promptUncomputed = 1;
                 }
 
-                int want = Math.Min(promptUncomputed, _cfg.MaxPrefillChunkSize);
+                int want = Math.Min(promptUncomputed, prefillCap);
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
 

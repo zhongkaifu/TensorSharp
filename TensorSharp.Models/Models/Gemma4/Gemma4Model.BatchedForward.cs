@@ -71,6 +71,14 @@ namespace TensorSharp.Models
         {
             int numSeqs = ctx.Sequences.Count;
 
+            // The batched/paged graph (prefill on the server, or multi-seq decode)
+            // grows ggml-cuda's compute scratch pool, which can move the addresses
+            // baked into the persistent CUDA-graph-captured single-token decode
+            // graph. Drop it so the next per-seq fused Forward rebuilds + recaptures
+            // against the current pool state (see Gemma4ResetDecodeCache).
+            if (_backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Gemma4ResetDecodeCache();
+
             // Disable gate. The batched path is now the DEFAULT for Gemma 4
             // (correctness verified against legacy through 42 layers; see
             // Gemma4BatchedForwardTests). Set TS_GEMMA4_BATCHED=0 to opt OUT

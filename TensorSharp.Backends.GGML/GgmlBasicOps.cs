@@ -1594,6 +1594,11 @@ namespace TensorSharp.GGML
         /// GDN state is re-seeded so the next fused decode rebuilds).</summary>
         public static void Qwen35ResetDecodeCache() => GgmlNative.Qwen35ResetDecodeCache();
 
+        /// <summary>Drop the persistent Gemma4 decode-graph cache (call before any
+        /// prefill and on KV reset/grow so the next fused decode rebuilds against
+        /// the current ggml-cuda pool / KV-buffer state).</summary>
+        public static void Gemma4ResetDecodeCache() => GgmlNative.Gemma4ResetDecodeCache();
+
         public static void Qwen35ResetVerifyCache() => GgmlNative.Qwen35ResetVerifyCache();
 
         public static bool Qwen35ModelDecode(

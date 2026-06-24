@@ -38,6 +38,21 @@ namespace TensorSharp.Runtime.Scheduling
         /// or the <c>--prefill-chunk-size</c> CLI flag.</summary>
         public int MaxPrefillChunkSize { get; init; } = 1024;
 
+        /// <summary>Per-step prefill token cap used ONLY when there is no GPU
+        /// contention — i.e. at most one sequence is in the system (running +
+        /// waiting &lt;= 1). The small <see cref="MaxPrefillChunkSize"/> exists
+        /// purely to let concurrent decode requests interleave at the GPU; for a
+        /// lone request it is counter-productive. On GPU backends a chunk that
+        /// crosses the model's sliding-window boundary drops off the fused
+        /// single-graph prefill path onto the per-op path (which syncs the GPU
+        /// after every op on CUDA, where async deferral is Metal-only), so
+        /// splitting a solo prompt into small chunks is several times SLOWER than
+        /// feeding it whole. Matching the CLI (which never sub-divides a solo
+        /// prompt below ~5120 tokens) recovers full prefill throughput. Bounded
+        /// by <see cref="MaxNumBatchedTokens"/> for activation-memory safety.
+        /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.</summary>
+        public int SoloPrefillChunkSize { get; init; } = 8192;
+
         /// <summary>Number of physical KV blocks in the pool. The total KV-cache
         /// budget is <c>NumBlocks * BlockSize</c> tokens. When the model exposes
         /// its preferred block size that value is used here.</summary>
@@ -84,6 +99,7 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxNumBatchedTokens = ReadInt("TS_SCHED_MAX_BATCHED_TOKENS", 4096),
                 MaxNumRunningSequences = ReadInt("TS_SCHED_MAX_RUNNING_SEQS", 16),
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 1024),
+                SoloPrefillChunkSize = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 8192),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),

@@ -719,6 +719,10 @@ namespace TensorSharp.Models
         {
             _cacheSeqLen = 0;
             _kvCacheHostDirty = false;
+            // The persistent fused-decode graph pins the KV-cache device buffers;
+            // a reset/clear invalidates them, so drop the cached graph too.
+            if (_backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Gemma4ResetDecodeCache();
             DisposeSwaPrevWindows();
             if (_kvCacheK == null) return;
             var cleared = new HashSet<int>();
@@ -1618,6 +1622,14 @@ namespace TensorSharp.Models
 
             _forwardSw.Start();
             int seqLen = tokens.Length;
+
+            // A multi-token prefill grows ggml-cuda's compute scratch pool, which
+            // can move the addresses baked into the persistent (CUDA-graph-captured)
+            // decode graph. Drop it so the next fused decode rebuilds + re-captures
+            // against the post-prefill pool state (mirrors Qwen3.5's reseed drop).
+            if (seqLen > 1 && _backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Gemma4ResetDecodeCache();
+
             int startPos = _cacheSeqLen;
             bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
             bool _g4DumpDiag = false; // PrefillWithoutLogits doesn't dump diag

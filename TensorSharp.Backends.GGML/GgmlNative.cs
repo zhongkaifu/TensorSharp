@@ -1482,6 +1482,11 @@ internal enum GgmlIndexReductionOp
         public static void Qwen35ResetDecodeCache() => TSGgml_Qwen35ResetDecodeCache();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4ResetDecodeCache();
+
+        public static void Gemma4ResetDecodeCache() => TSGgml_Gemma4ResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Qwen35ResetVerifyCache();
 
         public static void Qwen35ResetVerifyCache() => TSGgml_Qwen35ResetVerifyCache();

@@ -3878,6 +3878,61 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
 // layer scalars, different head dims per layer type, sliding window, softcap.
 // ============================================================================
 
+namespace
+{
+    // Persistent decode-graph cache for the dense Gemma 4 trunk — the exact
+    // analogue of g_q35dc (see its comment). The whole-model decode graph is
+    // built ONCE with stable tensor addresses (raw ggml ctx + alloc_ctx_tensors)
+    // and reused across tokens, so ggml-cuda's CUDA-graph capture engages (one
+    // captured replay instead of re-launching ~1300 kernels/token, which on WDDM
+    // starves the GPU — measured ~25 tok/s vs ~38 for llama.cpp before this).
+    //
+    // To keep the graph topology byte-identical token-to-token (the requirement
+    // for replay, see ggml_cuda_graph_update_required): the KV write uses
+    // ggml_set_rows (write row = an I64 INPUT, not a baked view offset) and the
+    // attention reads a FIXED padded window [0, window) with an F16 mask INPUT.
+    // The window is padded up to a 256-token stride so it only changes (forcing a
+    // rebuild) every 256 tokens. Global layers grow their window; local (SWA)
+    // layers saturate at the sliding-window size and then read the whole circular
+    // cache flat (attention is permutation-invariant over the KV axis, so the
+    // circular order is irrelevant). PLE / per-layer-input embeddings are an
+    // extra per-token input. Dropped + rebuilt when any layer window grows a
+    // stride, the model instance changes, or the KV-cache buffer is reallocated.
+    constexpr int kG4PersistKvStride = 256;
+
+    struct G4DecodeCache
+    {
+        bool valid = false;
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_cgraph* graph = nullptr;
+        ggml_tensor* hidden_in = nullptr;
+        ggml_tensor* hidden_out = nullptr;
+        ggml_tensor* pos_tensor = nullptr;
+        ggml_tensor* ple_input = nullptr;            // nullable
+        std::vector<ggml_tensor*> kv_index;          // per-layer I64 write row (null for shared)
+        std::vector<ggml_tensor*> attn_mask;         // per-layer F16 padding mask (shared -> donor's)
+        std::vector<int> layer_window;               // per-layer padded window length
+        const void* sig_disc = nullptr;              // model-instance discriminator (attn_norm[0])
+        const void* sig_kcache0 = nullptr;           // first KV buffer ptr (detects realloc/grow)
+        int num_layers = 0;
+        int hidden_size = 0;
+        int ple_dim = 0;
+
+        void reset()
+        {
+            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
+            graph = nullptr; valid = false;
+            hidden_in = hidden_out = pos_tensor = ple_input = nullptr;
+            kv_index.clear(); attn_mask.clear(); layer_window.clear();
+            sig_disc = sig_kcache0 = nullptr;
+            num_layers = hidden_size = ple_dim = 0;
+        }
+    };
+    G4DecodeCache g_g4dc;
+}
+
 TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     float* hidden_data, int hidden_size, int num_layers,
     // Per-layer weight pointers (arrays of size num_layers)
@@ -3969,15 +4024,115 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             info.attendLen = info.isLocal ? std::min(totalSeqLen, sliding_window) : totalSeqLen;
         }
 
-        // Create GGML context
+        // ============================ persist decode ============================
+        // Per-token capturable-graph setup (mirrors Qwen3.5 g_q35dc). Compute each
+        // layer's PADDED attention window, its valid (unmasked) length, and the KV
+        // write row, then either replay the cached graph or fall through to build
+        // a fresh persistent one.
+        static const bool g4_fd_timing = std::getenv("TS_GEMMA4_FD_TIMING") != nullptr;
+        static const bool g4_persist = []{ const char* e = std::getenv("TS_GEMMA4_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
+
+        std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
+        std::vector<int> pvalid(num_layers, 0);           // unmasked length per layer
+        std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
+        bool can_persist = g4_persist;
+        {
+            auto roundup_stride = [](int v){ return ((v + kG4PersistKvStride - 1) / kG4PersistKvStride) * kG4PersistKvStride; };
+            for (int l = 0; l < num_layers; l++)
+            {
+                const int csz = li[l].cacheSize;
+                if (csz <= 0) { can_persist = false; break; }
+                if (li[l].isLocal)
+                {
+                    if (totalSeqLen <= csz) { pwindow[l] = std::min(csz, roundup_stride(totalSeqLen)); pvalid[l] = totalSeqLen; }
+                    else { pwindow[l] = csz; pvalid[l] = csz; }   // saturated: read whole circular cache flat
+                }
+                else
+                {
+                    pwindow[l] = std::min(csz, roundup_stride(totalSeqLen)); pvalid[l] = totalSeqLen;
+                }
+                pwrite[l] = li[l].isLocal ? (position % csz) : position;
+                // A global cache that already overflowed can't be expressed as a
+                // single padded window -> let the legacy per-op path handle it.
+                if (!li[l].isShared && pvalid[l] > pwindow[l]) { can_persist = false; break; }
+            }
+        }
+        const void* g4_sig = attn_norm_arr[0];
+        const void* g4_kc0 = k_cache_arr != nullptr ? k_cache_arr[0] : nullptr;
+
+        // ---- reuse fast-path: replay the captured graph ----
+        if (can_persist && g_g4dc.valid && g_g4dc.graph != nullptr &&
+            g_g4dc.num_layers == num_layers && g_g4dc.hidden_size == hidden_size &&
+            g_g4dc.ple_dim == ple_dim && g_g4dc.sig_disc == g4_sig &&
+            g_g4dc.sig_kcache0 == g4_kc0 && g_g4dc.layer_window == pwindow)
+        {
+            auto t_start = std::chrono::high_resolution_clock::now();
+            host_read_barrier();
+            ggml_backend_tensor_set(g_g4dc.hidden_in, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+            std::int32_t pos_val = position;
+            ggml_backend_tensor_set(g_g4dc.pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            if (g_g4dc.ple_input != nullptr && ple_data != nullptr)
+                ggml_backend_tensor_set(g_g4dc.ple_input, ple_data, 0, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (g_g4dc.kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(g_g4dc.kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (g_g4dc.attn_mask[l] != nullptr && !li[l].isShared)
+                {
+                    std::vector<ggml_fp16_t> md;
+                    fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
+                    ggml_backend_tensor_set(g_g4dc.attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                }
+            }
+            auto t_setup = std::chrono::high_resolution_clock::now();
+            ggml_status st = ggml_backend_graph_compute(g_backend, g_g4dc.graph);
+            if (st != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("Gemma4 model decode: cached graph execution failed.");
+                g_g4dc.reset();
+                return 0;
+            }
+            auto t_compute = std::chrono::high_resolution_clock::now();
+            finalize_compute_with_download(g_g4dc.hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
+            host_read_barrier();
+            if (g4_fd_timing)
+            {
+                auto t_end = std::chrono::high_resolution_clock::now();
+                auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
+                fprintf(stderr, "[g4-fd] REUSE setup=%.2f compute=%.2f download=%.2f total=%.2f ms\n",
+                    ms(t_start, t_setup), ms(t_setup, t_compute), ms(t_compute, t_end), ms(t_start, t_end));
+                fflush(stderr);
+            }
+            clear_last_error();
+            return 1;
+        }
+        if (g4_persist) g_g4dc.reset();   // shape/instance change -> rebuild below
+
+        auto t_build_start = std::chrono::high_resolution_clock::now();
+
+        // Create GGML context. Persist mode uses a raw no_alloc ctx kept alive in
+        // g_g4dc (stable tensor addresses for capture); legacy uses the pool.
         const std::size_t ctx_size = 32 * 1024 * 1024;
         PooledContextHandle context;
-        if (!context.init(ctx_size))
+        ggml_context* ctx = nullptr;
+        if (can_persist)
         {
-            set_last_error("Failed to create ggml context for Gemma4 model decode.");
-            return 0;
+            ggml_init_params ip = { ctx_size, nullptr, /*no_alloc=*/true };
+            ctx = ggml_init(ip);
+            if (ctx == nullptr) { set_last_error("Gemma4 model decode: failed to init persist ggml context."); return 0; }
         }
-        ggml_context* ctx = context.value;
+        else
+        {
+            if (!context.init(ctx_size))
+            {
+                set_last_error("Failed to create ggml context for Gemma4 model decode.");
+                return 0;
+            }
+            ctx = context.value;
+        }
+
+        // Per-layer persist inputs (created in the build loop below; null in legacy).
+        std::vector<ggml_tensor*> layer_kv_index(num_layers, nullptr);
 
         ggml_tensor* current = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -3990,6 +4145,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         ggml_tensor* ple_input = nullptr;
         if (ple_data != nullptr && ple_dim > 0)
             ple_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_layers * ple_dim);
+
+        if (can_persist)
+        {
+            ggml_set_input(current);
+            ggml_set_input(pos_tensor);
+            if (ple_input != nullptr) ggml_set_input(ple_input);
+        }
 
         struct LayerTensors {
             ggml_tensor* attn_norm_w;
@@ -4156,6 +4318,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
                 ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
                 ggml_tensor* v_write = ggml_cont(ctx, v_perm);
+                if (can_persist)
+                {
+                    // KV write via set_rows: the write row is an I64 INPUT, so the
+                    // graph topology is identical token-to-token (capturable). The
+                    // attention reads a FIXED padded window [0, pwindow[l]) with an
+                    // F16 mask INPUT zeroing valid positions and -inf'ing padding.
+                    const int win = pwindow[l];
+                    ggml_tensor* kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+                    ggml_set_input(kv_idx);
+                    layer_kv_index[l] = kv_idx;
+                    lt.k_cpy = ggml_set_rows(ctx, lt.k_cached_t, k_write, kv_idx);
+                    lt.v_cpy = ggml_set_rows(ctx, lt.v_cached_t, v_write, kv_idx);
+                    ggml_tensor* mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, win, 1, 1, 1);
+                    ggml_set_input(mask);
+                    layer_attn_mask[l] = mask;
+                    k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, 0, win, kv_cache_type);
+                    v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, 0, win, kv_cache_type);
+                }
+                else
+                {
                 const int cachePos = info.isLocal ? (position % info.cacheSize) : position;
                 const int activeStart = info.isLocal ? ((totalSeqLen - info.attendLen) % info.cacheSize) : 0;
                 const int attnKvLen = flash_attn_kv_length(info.attendLen, info.cacheSize, info.hd);
@@ -4176,9 +4358,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 }
                 k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
                 v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
+                }
                 if (k_full == nullptr || v_full == nullptr)
                 {
                     set_last_error("Failed to create Gemma4 KV cache views.");
+                    if (can_persist) ggml_free(ctx);
                     return 0;
                 }
                 layer_k_full[l] = k_full;
@@ -4382,7 +4566,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         // host_read_barrier below drains the prior step's GPU work before this
         // graph runs, so reusing the buffer is race-free.
         BufferHandle buffer(nullptr);
-        if (!alloc_ctx_tensors_reuse(ctx))
+        ggml_backend_buffer_t persist_buf = nullptr;
+        if (can_persist)
+        {
+            // STABLE addresses for CUDA-graph capture: every tensor gets its own
+            // slot (no gallocr lifetime packing, whose plan can move addresses).
+            persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (persist_buf == nullptr)
+            {
+                set_last_error("Gemma4 model decode: failed to allocate persist backend buffer.");
+                ggml_free(ctx);
+                return 0;
+            }
+        }
+        else if (!alloc_ctx_tensors_reuse(ctx))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (buffer.value == nullptr)
@@ -4412,16 +4609,64 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_backend_tensor_set(ple_input, ple_data, 0,
                 static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
 
+        if (can_persist)
+        {
+            // Per-layer set_rows write rows + padding masks (the per-token inputs
+            // that the reuse fast-path updates before each replay).
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (layer_kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(layer_kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (!li[l].isShared && layer_attn_mask[l] != nullptr)
+                {
+                    std::vector<ggml_fp16_t> md;
+                    fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
+                    ggml_backend_tensor_set(layer_attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                }
+            }
+        }
+
         // Execute single graph
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
+            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
             return 0;
         }
 
         // Download hidden state (async blit on Metal in async mode)
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
+        if (can_persist) host_read_barrier();
+
+        if (can_persist)
+        {
+            // Keep the ctx/graph/buffer + input handles alive for capture+replay.
+            g_g4dc.ctx = ctx;
+            g_g4dc.buffer = persist_buf;
+            g_g4dc.graph = graph;
+            g_g4dc.hidden_in = current;
+            g_g4dc.hidden_out = hidden_out;
+            g_g4dc.pos_tensor = pos_tensor;
+            g_g4dc.ple_input = ple_input;
+            g_g4dc.kv_index = layer_kv_index;
+            g_g4dc.attn_mask = layer_attn_mask;
+            g_g4dc.layer_window = pwindow;
+            g_g4dc.sig_disc = g4_sig;
+            g_g4dc.sig_kcache0 = g4_kc0;
+            g_g4dc.num_layers = num_layers;
+            g_g4dc.hidden_size = hidden_size;
+            g_g4dc.ple_dim = ple_dim;
+            g_g4dc.valid = true;
+        }
+        if (g4_fd_timing)
+        {
+            auto t_end = std::chrono::high_resolution_clock::now();
+            auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
+            fprintf(stderr, "[g4-fd] BUILD total=%.2f ms (persist=%d upload_list=%zu)\n",
+                ms(t_build_start, t_end), can_persist ? 1 : 0, upload_list.size());
+            fflush(stderr);
+        }
 
         clear_last_error();
         return 1;
@@ -4436,6 +4681,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         set_last_error("Unknown error in Gemma4 model decode.");
         return 0;
     }
+}
+
+// Drop the persistent (CUDA-graph-captured) Gemma4 decode graph. The captured
+// graph pins ggml-cuda's compute-pool scratch addresses and the KV-cache device
+// buffers; a prefill (which grows the pool) or a KV reset/grow can move those,
+// so the C# caller drops the cache before any prefill and on ResetKVCache. The
+// next decode rebuilds + re-captures against the current pool state. No-op when
+// persist mode is off (the cache is never populated).
+TSG_EXPORT void TSGgml_Gemma4ResetDecodeCache()
+{
+    g_g4dc.reset();
 }
 
 // ============================================================================
