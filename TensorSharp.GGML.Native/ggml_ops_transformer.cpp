@@ -3918,6 +3918,8 @@ namespace
         int num_layers = 0;
         int hidden_size = 0;
         int ple_dim = 0;
+        bool folded = false;                         // hidden_out holds logits (final norm + lm_head folded in)
+        int out_count = 0;                           // floats to download (vocab when folded, else hidden)
 
         void reset()
         {
@@ -3928,6 +3930,7 @@ namespace
             kv_index.clear(); attn_mask.clear(); layer_window.clear();
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = ple_dim = 0;
+            folded = false; out_count = 0;
         }
     };
     G4DecodeCache g_g4dc;
@@ -3979,7 +3982,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     // k_arr[l] == nullptr the layer uses the fused attn_qkv weight as before,
     // so existing fully-fused callers are unaffected.
     void** k_arr, int* k_type_arr, std::int64_t* k_ne0_arr, std::int64_t* k_ne1_arr, std::int64_t* k_bytes_arr,
-    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr)
+    void** v_arr, int* v_type_arr, std::int64_t* v_ne0_arr, std::int64_t* v_ne1_arr, std::int64_t* v_bytes_arr,
+    // Folded final-norm + lm_head (nullable). When logits_data / lm_head_data /
+    // final_norm_data are non-null and vocab_size > 0, the graph appends the
+    // output RMSNorm, the lm_head matmul and (when logit_softcap > 0) the
+    // tanh logit softcap, writing logits[vocab] to logits_data so the whole
+    // token — including the 262K-vocab projection — is one captured replay and
+    // the C# caller skips its separate final-norm/lm_head/softcap dispatches.
+    void* logits_data, int vocab_size,
+    const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    const void* final_norm_data, float logit_softcap)
 {
     try
     {
@@ -3987,6 +3999,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             return 0;
 
         const int totalSeqLen = position + 1;
+
+        // Fold final-norm + lm_head into the graph when the caller supplies the
+        // lm_head weight, output-norm weight and a logits output buffer.
+        const bool fold = logits_data != nullptr && lm_head_data != nullptr &&
+                          final_norm_data != nullptr && vocab_size > 0;
 
         // Compute max head dim for context sizing
         int maxHd = 0;
@@ -4064,7 +4081,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         if (can_persist && g_g4dc.valid && g_g4dc.graph != nullptr &&
             g_g4dc.num_layers == num_layers && g_g4dc.hidden_size == hidden_size &&
             g_g4dc.ple_dim == ple_dim && g_g4dc.sig_disc == g4_sig &&
-            g_g4dc.sig_kcache0 == g4_kc0 && g_g4dc.layer_window == pwindow)
+            g_g4dc.sig_kcache0 == g4_kc0 && g_g4dc.layer_window == pwindow &&
+            g_g4dc.folded == fold && g_g4dc.out_count == (fold ? vocab_size : hidden_size))
         {
             auto t_start = std::chrono::high_resolution_clock::now();
             host_read_barrier();
@@ -4093,7 +4111,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
                 return 0;
             }
             auto t_compute = std::chrono::high_resolution_clock::now();
-            finalize_compute_with_download(g_g4dc.hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
+            void* out_data = g_g4dc.folded ? logits_data : hidden_data;
+            finalize_compute_with_download(g_g4dc.hidden_out, out_data, static_cast<std::size_t>(g_g4dc.out_count) * sizeof(float));
             host_read_barrier();
             if (g4_fd_timing)
             {
@@ -4458,9 +4477,35 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             hidden = residual2;
         }
 
-        // Output: copy hidden state
-        ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
-        ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
+        // Output: either the bare hidden state, or — when folding — the final
+        // RMSNorm * output_norm, the lm_head projection and the tanh logit
+        // softcap, so the 262K-vocab logits are part of the captured replay.
+        ggml_tensor* lm_head_t = nullptr;
+        ggml_tensor* final_norm_t = nullptr;
+        ggml_tensor* hidden_out;
+        ggml_tensor* out_hidden;
+        if (fold)
+        {
+            lm_head_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
+            final_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            ggml_tensor* fn = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), final_norm_t);
+            ggml_tensor* fn_2d = ggml_reshape_2d(ctx, fn, hidden_size, 1);
+            ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_t, fn_2d);   // [vocab, 1]
+            if (logit_softcap > 0.0f)
+            {
+                logits = ggml_scale(ctx, logits, 1.0f / logit_softcap);
+                logits = ggml_tanh(ctx, logits);
+                logits = ggml_scale(ctx, logits, logit_softcap);
+            }
+            logits = ggml_reshape_1d(ctx, logits, vocab_size);
+            hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
+            out_hidden = ggml_cpy(ctx, logits, hidden_out);
+        }
+        else
+        {
+            hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
+            out_hidden = ggml_cpy(ctx, hidden, hidden_out);
+        }
         ggml_set_output(out_hidden);
 
         // Build graph: add KV cache writes first to ensure they execute before reads
@@ -4560,6 +4605,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
         }
 
+        if (fold)
+        {
+            bind_or_mark(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
+            bind_or_mark(final_norm_t, const_cast<void*>(final_norm_data), static_cast<std::size_t>(hidden_size) * sizeof(float), true);
+        }
+
         // Allocate backend buffer. Reuse a persistent compute buffer across
         // decode steps instead of allocating a fresh one every token (llama.cpp
         // amortizes this via a persistent graph allocator; we mirror that). The
@@ -4635,8 +4686,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             return 0;
         }
 
-        // Download hidden state (async blit on Metal in async mode)
-        finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
+        // Download hidden state (async blit on Metal in async mode), or the
+        // folded logits[vocab] when the lm_head was folded into the graph.
+        const int g4_out_count = fold ? vocab_size : hidden_size;
+        void* g4_out_data = fold ? logits_data : hidden_data;
+        finalize_compute_with_download(hidden_out, g4_out_data, static_cast<std::size_t>(g4_out_count) * sizeof(float));
         if (can_persist) host_read_barrier();
 
         if (can_persist)
@@ -4657,6 +4711,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             g_g4dc.num_layers = num_layers;
             g_g4dc.hidden_size = hidden_size;
             g_g4dc.ple_dim = ple_dim;
+            g_g4dc.folded = fold;
+            g_g4dc.out_count = g4_out_count;
             g_g4dc.valid = true;
         }
         if (g4_fd_timing)

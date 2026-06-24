@@ -1084,10 +1084,25 @@ namespace TensorSharp.Models
 
             long pLayers = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
 
+            bool decodeFolded = false;
             if (useFusedDecode)
             {
                 long tFused = Stopwatch.GetTimestamp();
-                NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
+                // Fold final-norm + lm_head + softcap into the captured graph for
+                // plain decode (seqLen==1, no vision injection) so the LM head is
+                // part of the single CUDA-graph replay. _logitsBuffer receives the
+                // logits directly; the C# LM-head tail below is then skipped.
+                bool tryFold = seqLen == 1 && exceptPositions == null;
+                if (tryFold)
+                {
+                    if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                        _logitsBuffer = new float[Config.VocabSize];
+                    decodeFolded = NativeGemma4ModelDecode(hidden, startPos, perLayerInputs, _logitsBuffer);
+                }
+                else
+                {
+                    NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
+                }
                 _linearTicks += Stopwatch.GetTimestamp() - tFused;
                 _kvCacheHostDirty = true;
             }
@@ -1221,6 +1236,18 @@ namespace TensorSharp.Models
             if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profLayerTicks, pLayers, hidden);
 
             perLayerInputs?.Dispose();
+
+            if (decodeFolded)
+            {
+                // The fused decode graph folded final-norm + lm_head + softcap and
+                // wrote the logits straight into _logitsBuffer; skip the C# tail.
+                hidden.Dispose();
+                if (s_DecodeProfileEnabled && seqLen == 1) _profDecodeCalls++;
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _forwardSw.Stop();
+                return _logitsBuffer;
+            }
 
             long pFinalNorm = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
 
@@ -2181,7 +2208,20 @@ namespace TensorSharp.Models
                 : "  Gemma4 fused dense-layer graph enabled (MoE layers use hybrid path)");
         }
 
-        private unsafe void NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs)
+        // Default-on gate for folding the final-norm + lm_head (+ logit softcap)
+        // into the captured single-graph decode so the whole token — including the
+        // 262K-vocab projection — is one CUDA-graph replay (no separate per-token
+        // lm_head graph_compute + sync). Disable with TS_GEMMA4_FD_FOLD_LMHEAD=0.
+        private static readonly bool _fdFoldLmHead =
+            Environment.GetEnvironmentVariable("TS_GEMMA4_FD_FOLD_LMHEAD") != "0";
+
+        // Runs the fused full-model decode. When <paramref name="foldLogitsOut"/> is
+        // non-null and the output weight is quantized, the final-norm + lm_head +
+        // softcap are folded into the graph and the resulting logits[vocab] are
+        // written directly into that buffer; the method returns true and the caller
+        // skips its separate LM-head tail. Otherwise it outputs the bare hidden
+        // state (return false) exactly as before.
+        private unsafe bool NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs, float[] foldLogitsOut = null)
         {
             float* hiddenPtr = GetFloatPtr(hidden);
             var a = _decodeArrays;
@@ -2198,30 +2238,85 @@ namespace TensorSharp.Models
                 freqFactorsLen = (int)freqTensor.ElementCount();
             }
 
-            GgmlBasicOps.Gemma4ModelDecode(
-                (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers,
-                a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
-                a.O, a.PostAttnNorm,
-                a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
-                a.KCache, a.VCache,
-                a.HeadDim, a.KvHeads, a.CacheSize, a.IsLocal,
-                a.KvSource,
-                a.RopeBase, a.LayerScalar,
-                a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
-                a.OType, a.ONe0, a.ONe1, a.OBytes,
-                a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
-                a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
-                Config.NumHeads, startPos,
-                Config.Eps, _slidingWindow,
-                freqFactorsPtr, freqFactorsLen,
-                a.RopeNDims,
-                pleDataPtr, _pleDim,
-                a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
-                a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
-                a.PlePostNorm,
-                _kvCacheDtype.GgmlType(),
-                a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
-                a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+            // Resolve the fold inputs: quantized lm_head (tied token_embd, or
+            // output.weight) + F32 output_norm. Folding only engages for a
+            // quantized output weight; an F32-output model keeps the C# tail.
+            bool fold = false;
+            IntPtr lmHeadKey = IntPtr.Zero; int lmHeadType = 0; long lmHeadNe0 = 0, lmHeadNe1 = 0, lmHeadBytes = 0;
+            IntPtr finalNormPtr = IntPtr.Zero;
+            if (foldLogitsOut != null && _fdFoldLmHead
+                && _weights.TryGetValue("output_norm.weight", out var finalNormT)
+                && _quantWeights.TryGetValue(_hasTiedOutput ? "token_embd.weight" : "output.weight", out var lmqw))
+            {
+                lmHeadKey = lmqw.CacheKey;
+                lmHeadType = lmqw.GgmlType;
+                lmHeadNe0 = lmqw.Ne0;
+                lmHeadNe1 = lmqw.Ne1;
+                lmHeadBytes = lmqw.RawBytes;
+                finalNormPtr = (IntPtr)GetFloatPtr(finalNormT);
+                fold = true;
+            }
+
+            if (!fold)
+            {
+                GgmlBasicOps.Gemma4ModelDecode(
+                    (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers,
+                    a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                    a.O, a.PostAttnNorm,
+                    a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                    a.KCache, a.VCache,
+                    a.HeadDim, a.KvHeads, a.CacheSize, a.IsLocal,
+                    a.KvSource,
+                    a.RopeBase, a.LayerScalar,
+                    a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                    a.OType, a.ONe0, a.ONe1, a.OBytes,
+                    a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                    a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                    Config.NumHeads, startPos,
+                    Config.Eps, _slidingWindow,
+                    freqFactorsPtr, freqFactorsLen,
+                    a.RopeNDims,
+                    pleDataPtr, _pleDim,
+                    a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
+                    a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
+                    a.PlePostNorm,
+                    _kvCacheDtype.GgmlType(),
+                    a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                    a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+                return false;
+            }
+
+            fixed (float* logitsPtr = foldLogitsOut)
+            {
+                GgmlBasicOps.Gemma4ModelDecode(
+                    (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers,
+                    a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                    a.O, a.PostAttnNorm,
+                    a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                    a.KCache, a.VCache,
+                    a.HeadDim, a.KvHeads, a.CacheSize, a.IsLocal,
+                    a.KvSource,
+                    a.RopeBase, a.LayerScalar,
+                    a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                    a.OType, a.ONe0, a.ONe1, a.OBytes,
+                    a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                    a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                    Config.NumHeads, startPos,
+                    Config.Eps, _slidingWindow,
+                    freqFactorsPtr, freqFactorsLen,
+                    a.RopeNDims,
+                    pleDataPtr, _pleDim,
+                    a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
+                    a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
+                    a.PlePostNorm,
+                    _kvCacheDtype.GgmlType(),
+                    a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                    a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                    (IntPtr)logitsPtr, Config.VocabSize,
+                    lmHeadKey, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                    finalNormPtr, _finalLogitSoftcap);
+            }
+            return true;
         }
 
         /// <summary>
