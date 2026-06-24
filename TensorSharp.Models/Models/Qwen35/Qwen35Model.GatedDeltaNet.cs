@@ -93,6 +93,19 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("GDN_VERIFY_CHUNKED"), "1",
                 StringComparison.Ordinal);
 
+        // Device-resident fused recurrent-layer prefill (TSGgml_Qwen35RecurrentLayerPrefill):
+        // runs the whole GDN block (input norm + in-proj + ssm_conv + scan + gated
+        // norm + output proj + residual) for one layer over N prompt tokens in ONE
+        // cached ggml graph, eliminating the per-layer host round-trips of the
+        // chunked path (which on WDDM idle the GPU and downclock it on short prompts).
+        // Default ON for ggml_cuda; set TS_QWEN35_FUSED_REC_PREFILL=0 to A/B against
+        // the chunked path. Falls back transparently on any unsupported geometry.
+        private static readonly bool _useFusedRecPrefill =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_FUSED_REC_PREFILL"), "0", StringComparison.Ordinal);
+        private bool _recPrefillUnsupported;
+        private float[] _recPrefillConvIn;  // reusable [convDim * qkvDim] ring->time-major conv state
+        private float[] _recPrefillConvOut; // reusable [convDim * qkvDim] post-window conv state download
+
         // Direct CUDA runs the packed Qwen3.5/Qwen3.6 GDN recurrence on device
         // instead of downloading the packed projection, conv state, and SSM state
         // for the managed per-token loop. Set TS_CUDA_QWEN35_GDN_NATIVE=0 to
@@ -614,6 +627,101 @@ namespace TensorSharp.Models
         /// input/output projections across the whole chunk, then walks the recurrent state
         /// token-by-token in CPU memory.
         /// </summary>
+        /// <summary>
+        /// Device-resident single-graph fused prefill for one GDN (recurrent) layer
+        /// over N>1 prompt tokens. On success <paramref name="hidden"/> is updated
+        /// in place to (hidden + gdn_block_output) — input norm, in-proj, ssm_conv,
+        /// L2-norm/head-tile, ggml_gated_delta_net(K=N), gated RMSNorm, output proj,
+        /// and the residual add all run in ONE cached ggml graph. The post-window
+        /// conv ring and delta state are advanced so the subsequent decode continues
+        /// correctly. Returns false (no state change) when the geometry is
+        /// unsupported, so the caller falls back to the chunked path.
+        /// </summary>
+        private unsafe bool TryFusedRecLayerPrefill(Tensor hidden, int layer, int seqLen)
+        {
+            if (!_useFusedRecPrefill || _recPrefillUnsupported) return false;
+            if (_backend != BackendType.GgmlCuda) return false;
+            if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32) return false;
+            if (hidden.Sizes[0] != seqLen || hidden.Sizes[1] != Config.HiddenSize) return false;
+            if (_headKDim != _headVDim) return false; // gated_delta_net path assumes shared head dim
+
+            QuantizedWeight gq = _attnQkvRecQW[layer];  Tensor gqF = _attnQkvRecF32[layer];
+            QuantizedWeight gz = _attnGateRecQW[layer]; Tensor gzF = _attnGateRecF32[layer];
+            QuantizedWeight sb = _ssmBetaQW[layer];     Tensor sbF = _ssmBetaF32[layer];
+            QuantizedWeight sa = _ssmAlphaQW[layer];    Tensor saF = _ssmAlphaF32[layer];
+            QuantizedWeight so = _ssmOutQW[layer];      Tensor soF = _ssmOutF32[layer];
+            static bool HasW(QuantizedWeight q, Tensor f) => q != null || f != null;
+            if (!HasW(gq, gqF) || !HasW(gz, gzF) || !HasW(sb, sbF) || !HasW(sa, saF) || !HasW(so, soF))
+                return false;
+            if (_attnNormW[layer] == null || _ssmConv1dW[layer] == null || _ssmDtBiasW[layer] == null
+                || _ssmAW[layer] == null || _ssmNormW[layer] == null
+                || _deltaStateTensor[layer] == null || _convState[layer] == null)
+                return false;
+
+            int convDim = _convKernel - 1;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads; // == native conv_dim
+            if (convDim <= 0) return false;
+
+            int need = convDim * qkvDim;
+            if (_recPrefillConvIn == null || _recPrefillConvIn.Length < need) _recPrefillConvIn = new float[need];
+            if (_recPrefillConvOut == null || _recPrefillConvOut.Length < need) _recPrefillConvOut = new float[need];
+
+            // Conv ring -> ggml time-major [convDim, qkvDim] (oldest first). Zeros at startPos==0.
+            float[] ring = _convState[layer];
+            int w = _convStateWriteIdx[layer];
+            for (int t = 0; t < convDim; t++)
+            {
+                int slot = (w + t) % convDim;
+                int srcBase = slot * qkvDim;
+                for (int ch = 0; ch < qkvDim; ch++)
+                    _recPrefillConvIn[ch * convDim + t] = ring[srcBase + ch];
+            }
+
+            var gqr = ResolveW(gq, gqF);
+            var gzr = ResolveW(gz, gzF);
+            var sbr = ResolveW(sb, sbF);
+            var sar = ResolveW(sa, saF);
+            var sor = ResolveW(so, soF);
+
+            bool ok;
+            IntPtr deltaPtr = (IntPtr)GetFloatPtr(_deltaStateTensor[layer]);
+            fixed (float* convInPtr = _recPrefillConvIn)
+            fixed (float* convOutPtr = _recPrefillConvOut)
+            {
+                ok = GgmlBasicOps.Qwen35RecurrentLayerPrefill(
+                    (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, seqLen,
+                    (IntPtr)GetFloatPtr(_attnNormW[layer]),
+                    gqr.ptr, gqr.type, gqr.ne0, gqr.ne1, gqr.bytes,
+                    gzr.ptr, gzr.type, gzr.ne0, gzr.ne1, gzr.bytes,
+                    sbr.ptr, sbr.type, sbr.ne0, sbr.ne1, sbr.bytes,
+                    sar.ptr, sar.type, sar.ne0, sar.ne1, sar.bytes,
+                    sor.ptr, sor.type, sor.ne0, sor.ne1, sor.bytes,
+                    (IntPtr)GetFloatPtr(_ssmConv1dW[layer]),
+                    (IntPtr)GetFloatPtr(_ssmDtBiasW[layer]),
+                    (IntPtr)GetFloatPtr(_ssmAW[layer]),
+                    (IntPtr)GetFloatPtr(_ssmNormW[layer]),
+                    (IntPtr)convInPtr, deltaPtr,
+                    (IntPtr)convOutPtr, deltaPtr,
+                    _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads, Config.Eps);
+            }
+            if (!ok) return false;
+
+            // hidden + delta state were updated on the host; their device caches are stale.
+            InvalidateTensorDeviceCache(hidden);
+            InvalidateTensorDeviceCache(_deltaStateTensor[layer]);
+
+            // Post-window conv state (time-major, oldest first) -> ring with writeIdx=0
+            // so the next forward/decode linearizes it identically.
+            for (int t = 0; t < convDim; t++)
+            {
+                int dstBase = t * qkvDim;
+                for (int ch = 0; ch < qkvDim; ch++)
+                    ring[dstBase + ch] = _recPrefillConvOut[ch * convDim + t];
+            }
+            _convStateWriteIdx[layer] = 0;
+            return true;
+        }
+
         private Tensor RecurrentBlock(Tensor hidden, int layer, int seqLen, int startPos)
         {
             bool isMoeLayer = _isMoeLayer != null && _isMoeLayer[layer];
@@ -758,8 +866,18 @@ namespace TensorSharp.Models
             // ---- Path C: Standard path (no fusion) ----
             if (!canFuseDenseFFN && !canFuseMoeRouter)
             {
-                Tensor attnOut = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen, residual: hidden);
-                if (attnOut != null) { Ops.Add(hidden, hidden, attnOut); attnOut.Dispose(); }
+                // Device-resident fused GDN-block prefill (one graph, no host
+                // round-trips) updates `hidden` += gdn_block in place. Falls back to
+                // the chunked GatedDeltaNet + residual add on any unsupported shape.
+                if (seqLen > 1 && TryFusedRecLayerPrefill(hidden, layer, seqLen))
+                {
+                    // hidden already holds (hidden + gdn_block_output).
+                }
+                else
+                {
+                    Tensor attnOut = GatedDeltaNet(hidden, _attnNormW[layer], layer, seqLen, residual: hidden);
+                    if (attnOut != null) { Ops.Add(hidden, hidden, attnOut); attnOut.Dispose(); }
+                }
             }
 
             long ffnStartC = profilePrefill ? Stopwatch.GetTimestamp() : 0;

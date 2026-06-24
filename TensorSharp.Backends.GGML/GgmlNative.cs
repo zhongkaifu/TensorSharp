@@ -1614,6 +1614,47 @@ internal enum GgmlIndexReductionOp
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35RecurrentLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr gdnQkvW, int gdnQkvType, long gdnQkvNe0, long gdnQkvNe1, long gdnQkvBytes,
+            IntPtr gdnGateW, int gdnGateType, long gdnGateNe0, long gdnGateNe1, long gdnGateBytes,
+            IntPtr ssmBetaW, int ssmBetaType, long ssmBetaNe0, long ssmBetaNe1, long ssmBetaBytes,
+            IntPtr ssmAlphaW, int ssmAlphaType, long ssmAlphaNe0, long ssmAlphaNe1, long ssmAlphaBytes,
+            IntPtr ssmOutW, int ssmOutType, long ssmOutNe0, long ssmOutNe1, long ssmOutBytes,
+            IntPtr conv1dW, IntPtr ssmDtW, IntPtr ssmAW, IntPtr ssmNormW,
+            IntPtr convStateIn, IntPtr deltaStateIn,
+            IntPtr convStateOut, IntPtr deltaStateOut,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps);
+
+        public static bool Qwen35RecurrentLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr gdnQkvW, int gdnQkvType, long gdnQkvNe0, long gdnQkvNe1, long gdnQkvBytes,
+            IntPtr gdnGateW, int gdnGateType, long gdnGateNe0, long gdnGateNe1, long gdnGateBytes,
+            IntPtr ssmBetaW, int ssmBetaType, long ssmBetaNe0, long ssmBetaNe1, long ssmBetaBytes,
+            IntPtr ssmAlphaW, int ssmAlphaType, long ssmAlphaNe0, long ssmAlphaNe1, long ssmAlphaBytes,
+            IntPtr ssmOutW, int ssmOutType, long ssmOutNe0, long ssmOutNe1, long ssmOutBytes,
+            IntPtr conv1dW, IntPtr ssmDtW, IntPtr ssmAW, IntPtr ssmNormW,
+            IntPtr convStateIn, IntPtr deltaStateIn,
+            IntPtr convStateOut, IntPtr deltaStateOut,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps)
+        {
+            return TSGgml_Qwen35RecurrentLayerPrefill(
+                hiddenData, hiddenSize, n, attnNormW,
+                gdnQkvW, gdnQkvType, gdnQkvNe0, gdnQkvNe1, gdnQkvBytes,
+                gdnGateW, gdnGateType, gdnGateNe0, gdnGateNe1, gdnGateBytes,
+                ssmBetaW, ssmBetaType, ssmBetaNe0, ssmBetaNe1, ssmBetaBytes,
+                ssmAlphaW, ssmAlphaType, ssmAlphaNe0, ssmAlphaNe1, ssmAlphaBytes,
+                ssmOutW, ssmOutType, ssmOutNe0, ssmOutNe1, ssmOutBytes,
+                conv1dW, ssmDtW, ssmAW, ssmNormW,
+                convStateIn, deltaStateIn, convStateOut, deltaStateOut,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps) != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GatedDeltaNetChunkedF32(
             GgmlTensorView3D q,
             GgmlTensorView3D k,

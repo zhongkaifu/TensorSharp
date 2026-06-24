@@ -59,6 +59,10 @@ BackendType backend = (Environment.GetEnvironmentVariable("TS_PREFILL_BACKEND") 
 int[] lens = EnvIntList("TS_PREFILL_LENS", new[] { 512, 1024, 2048, 4096 });
 int[] concs = EnvIntList("TS_PREFILL_CONC", new[] { 1, 2, 4 });
 int iters = EnvInt("TS_PREFILL_ITERS", 3);
+// TS_PREFILL_LEGACY_ONLY=1 skips the (slow) correctness, engine and concurrent
+// sections and only times the legacy ForwardRefill path — fast iteration when
+// profiling the pure prefill compute with QWEN35_PREFILL_PROFILE=1.
+bool legacyOnly = string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_LEGACY_ONLY"), "1", StringComparison.Ordinal);
 int blockSize = 256;
 
 Console.WriteLine($"[prefill-bench] loading {Path.GetFileName(modelPath)} backend={backend}");
@@ -146,6 +150,7 @@ _ = await TtftMsAsync(MakePrompt(256, 1), "warm2");
 // Correctness: the batched (fused-FFN) path's first greedy token must match the
 // legacy single-sequence ForwardRefill argmax for the same prompt. Run this on
 // the real model + backend so the fused dense-FFN kernel is validated end-to-end.
+if (!legacyOnly)
 {
     Console.WriteLine();
     Console.WriteLine("==== Correctness (batched fused vs legacy ForwardRefill) ====");
@@ -173,6 +178,8 @@ static int Argmax(float[] v)
     return best;
 }
 
+if (!legacyOnly)
+{
 Console.WriteLine();
 Console.WriteLine("==== Single-sequence prefill (TTFT, engine/batched path = server) ====");
 Console.WriteLine($"{"tokens",8} {"ms",10} {"tok/s",10}");
@@ -183,6 +190,7 @@ foreach (int len in lens)
         samples.Add(await TtftMsAsync(MakePrompt(len, 1000 + it * 7 + len), $"s{len}-{it}"));
     double ms = Median(samples);
     Console.WriteLine($"{len,8} {ms,10:F1} {len / (ms / 1000.0),10:F0}");
+}
 }
 
 // Legacy ForwardRefill path = what the CLI uses for prompt prefill (and the
@@ -211,6 +219,8 @@ foreach (int len in lens)
     Console.WriteLine($"{len,8} {ms,10:F1} {len / (ms / 1000.0),10:F0}");
 }
 
+if (!legacyOnly)
+{
 Console.WriteLine();
 Console.WriteLine("==== Concurrent prefill (1024-token prompts, wall to all-first-token) ====");
 Console.WriteLine($"{"n_seqs",8} {"ms",10} {"tok/s",12}");
@@ -221,6 +231,7 @@ foreach (int n in concs)
         samples.Add(await ConcurrentPrefillMsAsync(n, 1024, 5000 + it * 101 + n));
     double ms = Median(samples);
     Console.WriteLine($"{n,8} {ms,10:F1} {(n * 1024) / (ms / 1000.0),12:F0}");
+}
 }
 
 Console.WriteLine();

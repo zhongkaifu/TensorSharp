@@ -1658,6 +1658,38 @@ namespace TensorSharp.GGML
                 finalNorm, normedOut);
         }
 
+        /// <summary>Device-resident single-graph fused prefill for ONE Qwen3.5/
+        /// Qwen3-Next gated-delta-net layer over N tokens (input norm + in-proj +
+        /// ssm_conv + scan + gated norm + output proj + residual). Writes the
+        /// updated hidden [hidden, N] back into <paramref name="hiddenData"/> and
+        /// the post-window conv / delta state into the *out buffers. Returns false
+        /// on any failure so the caller falls back to the chunked path.</summary>
+        public static bool Qwen35RecurrentLayerPrefill(
+            IntPtr hiddenData, int hiddenSize, int n,
+            IntPtr attnNormW,
+            IntPtr gdnQkvW, int gdnQkvType, long gdnQkvNe0, long gdnQkvNe1, long gdnQkvBytes,
+            IntPtr gdnGateW, int gdnGateType, long gdnGateNe0, long gdnGateNe1, long gdnGateBytes,
+            IntPtr ssmBetaW, int ssmBetaType, long ssmBetaNe0, long ssmBetaNe1, long ssmBetaBytes,
+            IntPtr ssmAlphaW, int ssmAlphaType, long ssmAlphaNe0, long ssmAlphaNe1, long ssmAlphaBytes,
+            IntPtr ssmOutW, int ssmOutType, long ssmOutNe0, long ssmOutNe1, long ssmOutBytes,
+            IntPtr conv1dW, IntPtr ssmDtW, IntPtr ssmAW, IntPtr ssmNormW,
+            IntPtr convStateIn, IntPtr deltaStateIn,
+            IntPtr convStateOut, IntPtr deltaStateOut,
+            int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
+            float eps)
+        {
+            return GgmlNative.Qwen35RecurrentLayerPrefill(
+                hiddenData, hiddenSize, n, attnNormW,
+                gdnQkvW, gdnQkvType, gdnQkvNe0, gdnQkvNe1, gdnQkvBytes,
+                gdnGateW, gdnGateType, gdnGateNe0, gdnGateNe1, gdnGateBytes,
+                ssmBetaW, ssmBetaType, ssmBetaNe0, ssmBetaNe1, ssmBetaBytes,
+                ssmAlphaW, ssmAlphaType, ssmAlphaNe0, ssmAlphaNe1, ssmAlphaBytes,
+                ssmOutW, ssmOutType, ssmOutNe0, ssmOutNe1, ssmOutBytes,
+                conv1dW, ssmDtW, ssmAW, ssmNormW,
+                convStateIn, deltaStateIn, convStateOut, deltaStateOut,
+                convKernel, headKDim, headVDim, numKHeads, numVHeads, eps);
+        }
+
         /// <summary>True token-batched fused decode: N sequences' decode tokens
         /// (one per sequence) through the whole hybrid transformer in ONE GGML
         /// graph with PAGED KV. Writes the per-row final pre-output-norm hidden
