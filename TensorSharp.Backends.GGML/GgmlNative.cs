@@ -578,6 +578,24 @@ internal enum GgmlIndexReductionOp
             float attnScale);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Qwen35VisionEncoderF32(
+            GgmlTensorView2D hidden,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_FusedGemma4VisionBlockF32(
             GgmlTensorView2D hidden, float eps,
             IntPtr ln1W,
@@ -2187,6 +2205,41 @@ internal enum GgmlIndexReductionOp
                 outW, outNe0, outNe1, outBytes, outB, outBDim,
                 cosTable, sinTable, numPatches, numHeads, headDim, halfDim,
                 attnScale), "fused_vision_attention");
+        }
+
+        /// <summary>Whole Qwen3.5/3.6-VL vision encoder (all blocks, one graph).
+        /// Returns false on native failure so the caller can fall back to the
+        /// per-block path.</summary>
+        public static bool Qwen35VisionEncoder(
+            GgmlTensorView2D hidden,
+            int blockCount, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W, IntPtr[] ln1B,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W, IntPtr[] ln2B,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes, int qkvBDim,
+            int outNe0, int outNe1, long outBytes, int outBDim,
+            int upNe0, int upNe1, long upBytes, int upBDim,
+            int downNe0, int downNe1, long downBytes, int downBDim)
+        {
+            int rc = TSGgml_Qwen35VisionEncoderF32(hidden,
+                blockCount, eps, attnScale,
+                numPatches, numHeads, headDim, halfDim,
+                cosTable, sinTable,
+                ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB,
+                lnDim,
+                qkvNe0, qkvNe1, qkvBytes, qkvBDim,
+                outNe0, outNe1, outBytes, outBDim,
+                upNe0, upNe1, upBytes, upBDim,
+                downNe0, downNe1, downBytes, downBDim);
+            if (rc == 0 && Environment.GetEnvironmentVariable("TS_VBENCH_DIAG") == "1")
+                Console.Error.WriteLine($"\n[diag] Qwen35VisionEncoder native FAIL: {GetLastErrorMessage("(no native error)")}");
+            return rc != 0;
         }
 
         public static void FusedGemma4VisionBlock(

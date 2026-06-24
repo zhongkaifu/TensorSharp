@@ -1035,6 +1035,72 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Whole Qwen3.5/3.6-VL vision encoder: runs ALL transformer blocks as a single
+        /// device-resident GGML graph (one sync; residual stays on-device across blocks)
+        /// instead of the per-block fused ops (2 synchronous PCIe-round-tripping dispatches
+        /// each). Weight arrays are indexed by block; all blocks share identical shapes.
+        /// Returns false on any failure so the caller falls back to the per-block path.
+        /// </summary>
+        public static unsafe bool Qwen35VisionEncoder(
+            Tensor hidden, float eps, float attnScale,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable,
+            Tensor[] ln1W, Tensor[] ln1B, Tensor[] qkvW, Tensor[] qkvB,
+            Tensor[] outW, Tensor[] outB, Tensor[] ln2W, Tensor[] ln2B,
+            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB)
+        {
+            if (!HasNativeBufferStorage(hidden))
+                return false;
+            if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
+                return false;
+
+            int blockCount = ln1W.Length;
+            if (blockCount == 0)
+                return false;
+
+            int lnDim = (int)ln1W[0].ElementCount();
+            int qkvNe0 = (int)qkvW[0].Sizes[qkvW[0].DimensionCount - 1];
+            int qkvNe1 = (int)qkvW[0].Sizes[0];
+            long qkvBytes = qkvW[0].ElementCount() * sizeof(float);
+            int qkvBDim = (int)qkvB[0].ElementCount();
+            int outNe0 = (int)outW[0].Sizes[outW[0].DimensionCount - 1];
+            int outNe1 = (int)outW[0].Sizes[0];
+            long outBytes = outW[0].ElementCount() * sizeof(float);
+            int outBDim = (int)outB[0].ElementCount();
+            int upNe0 = (int)upW[0].Sizes[upW[0].DimensionCount - 1];
+            int upNe1 = (int)upW[0].Sizes[0];
+            long upBytes = upW[0].ElementCount() * sizeof(float);
+            int upBDim = (int)upB[0].ElementCount();
+            int downNe0 = (int)downW[0].Sizes[downW[0].DimensionCount - 1];
+            int downNe1 = (int)downW[0].Sizes[0];
+            long downBytes = downW[0].ElementCount() * sizeof(float);
+            int downBDim = (int)downB[0].ElementCount();
+
+            IntPtr[] Ptrs(Tensor[] ws)
+            {
+                var a = new IntPtr[blockCount];
+                for (int i = 0; i < blockCount; i++)
+                    a[i] = GetBufferStart(ws[i]);
+                return a;
+            }
+
+            fixed (float* cosPtr = cosTable, sinPtr = sinTable)
+            {
+                return GgmlNative.Qwen35VisionEncoder(hiddenView,
+                    blockCount, eps, attnScale, numPatches, numHeads, headDim, halfDim,
+                    (IntPtr)cosPtr, (IntPtr)sinPtr,
+                    Ptrs(ln1W), Ptrs(ln1B), Ptrs(qkvW), Ptrs(qkvB),
+                    Ptrs(outW), Ptrs(outB), Ptrs(ln2W), Ptrs(ln2B),
+                    Ptrs(upW), Ptrs(upB), Ptrs(downW), Ptrs(downB),
+                    lnDim,
+                    qkvNe0, qkvNe1, qkvBytes, qkvBDim,
+                    outNe0, outNe1, outBytes, outBDim,
+                    upNe0, upNe1, upBytes, upBDim,
+                    downNe0, downNe1, downBytes, downBDim);
+            }
+        }
+
+        /// <summary>
         /// Fused Gemma-4 SigLIP vision block: the whole EncoderBlock (RMSNorm + QKV +
         /// per-head QK/V RMSNorm + 2D split RoPE + SDPA + out proj + sandwich post-norm
         /// + residual, then RMSNorm + gated QuickGELU MLP + sandwich post-norm +

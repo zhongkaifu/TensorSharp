@@ -169,27 +169,40 @@ namespace TensorSharp.Models
 
             // 5. Encoder blocks
             long blocksStart = Stopwatch.GetTimestamp();
-            for (int i = 0; i < _blockCount; i++)
+            // Fast path: run ALL blocks as one device-resident GGML graph (one
+            // sync, residual kept on-device) instead of 2 synchronous PCIe
+            // round-tripping dispatches per block. Falls back to the per-block
+            // loop on any failure. CPU-allocator path keeps the per-block loop.
+            bool wholeEncoderDone = false;
+            if (_useNativeAttention && s_wholeEncoderFusedEnabled)
             {
-                Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
-                blockOrdered = EncoderBlock(blockOrdered, i, numPatches, headDim, halfDim,
+                wholeEncoderDone = TryWholeEncoderFused(blockOrdered, numPatches, headDim, halfDim,
                     ropeCache.CosTable, ropeCache.SinTable);
-                if (debug && (i == 0 || i == _blockCount - 1))
-                    DumpTensor(blockOrdered, $"After block {i}", numPatches);
-                // Flush MLX's lazy graph at every block boundary. Without this
-                // the [numHeads, numPatches, numPatches] attention-scores
-                // intermediate (~340 MB at 768x768, multiple GB for larger
-                // images) from every previous block stays referenced as a
-                // graph input until the next forced host read in
-                // VisionSelfAttention. Evaluating them all together exceeds
-                // the Metal command-buffer budget and crashes with
-                // kIOGPUCommandBufferCallbackErrorOutOfMemory. AsyncEval kicks
-                // the GPU so block N's intermediates are freed while the host
-                // queues block N+1.
-                MlxFusedOps.TryAsyncEvaluate(blockOrdered);
-                // Yield GpuComputeLock between encoder blocks so concurrent
-                // decode requests on the engine worker stay responsive.
-                _hostModel?.YieldGpuComputeLock();
+            }
+            if (!wholeEncoderDone)
+            {
+                for (int i = 0; i < _blockCount; i++)
+                {
+                    Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
+                    blockOrdered = EncoderBlock(blockOrdered, i, numPatches, headDim, halfDim,
+                        ropeCache.CosTable, ropeCache.SinTable);
+                    if (debug && (i == 0 || i == _blockCount - 1))
+                        DumpTensor(blockOrdered, $"After block {i}", numPatches);
+                    // Flush MLX's lazy graph at every block boundary. Without this
+                    // the [numHeads, numPatches, numPatches] attention-scores
+                    // intermediate (~340 MB at 768x768, multiple GB for larger
+                    // images) from every previous block stays referenced as a
+                    // graph input until the next forced host read in
+                    // VisionSelfAttention. Evaluating them all together exceeds
+                    // the Metal command-buffer budget and crashes with
+                    // kIOGPUCommandBufferCallbackErrorOutOfMemory. AsyncEval kicks
+                    // the GPU so block N's intermediates are freed while the host
+                    // queues block N+1.
+                    MlxFusedOps.TryAsyncEvaluate(blockOrdered);
+                    // Yield GpuComputeLock between encoder blocks so concurrent
+                    // decode requests on the engine worker stay responsive.
+                    _hostModel?.YieldGpuComputeLock();
+                }
             }
             long blocksTicks = Stopwatch.GetTimestamp() - blocksStart;
             Console.WriteLine(" done");
@@ -395,6 +408,64 @@ namespace TensorSharp.Models
             });
 
             return result;
+        }
+
+        // TS_QWEN35_VENC_FUSED=0 forces the per-block path (A/B + safety kill-switch).
+        private static readonly bool s_wholeEncoderFusedEnabled =
+            Environment.GetEnvironmentVariable("TS_QWEN35_VENC_FUSED") != "0";
+
+        /// <summary>
+        /// Run every encoder block as ONE device-resident GGML graph
+        /// (<see cref="GgmlBasicOps.Qwen35VisionEncoder"/>). Collects the per-block
+        /// F32 weights into block-major arrays and dispatches once. Returns false
+        /// (→ caller runs the per-block loop) if any weight is missing or the native
+        /// path declines.
+        /// </summary>
+        private bool TryWholeEncoderFused(Tensor hidden, int numPatches, int headDim, int halfDim,
+            float[] cosTable, float[] sinTable)
+        {
+            int n = _blockCount;
+            var ln1W = new Tensor[n]; var ln1B = new Tensor[n];
+            var qkvW = new Tensor[n]; var qkvB = new Tensor[n];
+            var outW = new Tensor[n]; var outB = new Tensor[n];
+            var ln2W = new Tensor[n]; var ln2B = new Tensor[n];
+            var upW = new Tensor[n]; var upB = new Tensor[n];
+            var downW = new Tensor[n]; var downB = new Tensor[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                string p = _blockPrefixes[i];
+                if (!_weights.TryGetValue($"{p}.ln1.weight", out ln1W[i]) ||
+                    !_weights.TryGetValue($"{p}.ln1.bias", out ln1B[i]) ||
+                    !_weights.TryGetValue($"{p}.attn_qkv.weight", out qkvW[i]) ||
+                    !_weights.TryGetValue($"{p}.attn_qkv.bias", out qkvB[i]) ||
+                    !_weights.TryGetValue($"{p}.attn_out.weight", out outW[i]) ||
+                    !_weights.TryGetValue($"{p}.attn_out.bias", out outB[i]) ||
+                    !_weights.TryGetValue($"{p}.ln2.weight", out ln2W[i]) ||
+                    !_weights.TryGetValue($"{p}.ln2.bias", out ln2B[i]) ||
+                    !_weights.TryGetValue($"{p}.ffn_up.weight", out upW[i]) ||
+                    !_weights.TryGetValue($"{p}.ffn_up.bias", out upB[i]) ||
+                    !_weights.TryGetValue($"{p}.ffn_down.weight", out downW[i]) ||
+                    !_weights.TryGetValue($"{p}.ffn_down.bias", out downB[i]))
+                    return false;
+            }
+
+            float attnScale = 1f / MathF.Sqrt(headDim);
+            try
+            {
+                bool ok = GgmlBasicOps.Qwen35VisionEncoder(hidden, _eps, attnScale,
+                    numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
+                    ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB);
+                if (ok)
+                    _hostModel?.YieldGpuComputeLock();
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                if (Environment.GetEnvironmentVariable("TS_VBENCH_DIAG") == "1")
+                    Console.Error.WriteLine($"\n[diag] WholeEncoderFused FELL BACK: {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
         }
 
         private Tensor EncoderBlock(Tensor hidden, int blockIdx, int numPatches, int headDim,

@@ -920,6 +920,115 @@ int fused_ffn_act_project_quant_f32_impl(
 }
 
 // ============================================================================
+// Shared vision-block subgraph builders.
+//
+// These build the attention / MLP residual subgraph INTO an existing ggml
+// context (no compute, no buffer alloc) and return the new residual-stream
+// tensor (2D, [hidden, rows] in ggml layout). The single-block fused ops below
+// and the whole-encoder fusion (fused_qwen35_vision_encoder_f32_impl) both call
+// these, so the per-block correctness test re-validates the exact math used by
+// the whole-encoder path.
+// ============================================================================
+
+// LN + QKV(+bias) + split + NeoX RoPE(cos/sin tables) + flash-attn + out(+bias) + residual.
+static ggml_tensor* build_vision_attn_subgraph(
+    ggml_context* ctx, ggml_tensor* cur,
+    ggml_tensor* ln_w_t, ggml_tensor* ln_b_t, float eps,
+    ggml_tensor* qkv_w_t, ggml_tensor* qkv_b_t,
+    ggml_tensor* out_w_t, ggml_tensor* out_b_t,
+    ggml_tensor* cos_t, ggml_tensor* sin_t,
+    int rows, int hidden, int num_heads, int head_dim, int half_dim,
+    float attn_scale)
+{
+    const int triple_hidden = 3 * hidden;
+    ggml_tensor* inp = ggml_cont(ctx, cur);
+
+    // LayerNorm
+    ggml_tensor* normed = ggml_norm(ctx, inp, eps);
+    ggml_tensor* ln_scaled = ggml_mul(ctx, normed, ln_w_t);
+    ggml_tensor* ln_out = ggml_add(ctx, ln_scaled, ln_b_t);
+
+    // QKV projection + bias
+    ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
+    ggml_tensor* qkv = ggml_mul_mat(ctx, qkv_w_t, ln_2d);
+    ggml_tensor* qkv_biased = ggml_add(ctx, qkv, ggml_repeat(ctx, ggml_reshape_2d(ctx, qkv_b_t, triple_hidden, 1), qkv));
+
+    // Split Q, K, V
+    std::size_t row_bytes = static_cast<std::size_t>(triple_hidden) * sizeof(float);
+    std::size_t d_bytes = static_cast<std::size_t>(hidden) * sizeof(float);
+    ggml_tensor* q_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 0));
+    ggml_tensor* k_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, d_bytes));
+    ggml_tensor* v_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 2 * d_bytes));
+
+    ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_raw, head_dim, num_heads, rows);
+    ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_raw, head_dim, num_heads, rows);
+    ggml_tensor* cos_3d = ggml_reshape_3d(ctx, cos_t, half_dim, 1, rows);
+    ggml_tensor* sin_3d = ggml_reshape_3d(ctx, sin_t, half_dim, 1, rows);
+
+    std::size_t head_row_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
+    std::size_t half_bytes_local = static_cast<std::size_t>(half_dim) * sizeof(float);
+    auto apply_rope = [&](ggml_tensor* x_3d) -> ggml_tensor* {
+        ggml_tensor* x_lo = ggml_view_3d(ctx, x_3d, half_dim, num_heads, rows,
+            head_row_bytes, head_row_bytes * num_heads, 0);
+        ggml_tensor* x_hi = ggml_view_3d(ctx, x_3d, half_dim, num_heads, rows,
+            head_row_bytes, head_row_bytes * num_heads, half_bytes_local);
+        ggml_tensor* lo_c = ggml_cont(ctx, x_lo);
+        ggml_tensor* hi_c = ggml_cont(ctx, x_hi);
+        ggml_tensor* lo_cos = ggml_mul(ctx, lo_c, cos_3d);
+        ggml_tensor* hi_sin = ggml_mul(ctx, hi_c, sin_3d);
+        ggml_tensor* out_lo = ggml_sub(ctx, lo_cos, hi_sin);
+        ggml_tensor* lo_sin = ggml_mul(ctx, lo_c, sin_3d);
+        ggml_tensor* hi_cos = ggml_mul(ctx, hi_c, cos_3d);
+        ggml_tensor* out_hi = ggml_add(ctx, lo_sin, hi_cos);
+        return ggml_concat(ctx, out_lo, out_hi, 0);
+    };
+
+    ggml_tensor* q_roped = apply_rope(q_3d);
+    ggml_tensor* k_roped = apply_rope(k_3d);
+    ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_raw, head_dim, num_heads, rows);
+
+    ggml_tensor* q_perm = ggml_permute(ctx, q_roped, 0, 2, 1, 3);
+    ggml_tensor* k_perm = ggml_permute(ctx, k_roped, 0, 2, 1, 3);
+    ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
+
+    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_perm, k_perm, v_perm, nullptr, attn_scale, 0.0f, 0.0f);
+    ggml_tensor* attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, attn_out), hidden, rows);
+
+    ggml_tensor* out_proj = ggml_mul_mat(ctx, out_w_t, attn_flat);
+    ggml_tensor* out_biased = ggml_add(ctx, out_proj, ggml_repeat(ctx, ggml_reshape_2d(ctx, out_b_t, hidden, 1), out_proj));
+
+    // Residual add (2D [hidden, rows] — equivalent to the flattened add).
+    return ggml_add(ctx, inp, out_biased);
+}
+
+// LN + up(+bias) + GELU + down(+bias) + residual.
+static ggml_tensor* build_vision_mlp_subgraph(
+    ggml_context* ctx, ggml_tensor* cur,
+    ggml_tensor* ln_w_t, ggml_tensor* ln_b_t, float eps,
+    ggml_tensor* up_w_t, ggml_tensor* up_b_t,
+    ggml_tensor* down_w_t, ggml_tensor* down_b_t,
+    int rows, int hidden, int dff)
+{
+    ggml_tensor* inp = ggml_cont(ctx, cur);
+
+    ggml_tensor* normed = ggml_norm(ctx, inp, eps);
+    ggml_tensor* scaled = ggml_mul(ctx, normed, ln_w_t);
+    ggml_tensor* ln_out = ggml_add(ctx, scaled, ln_b_t);
+
+    ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
+    ggml_tensor* fc1 = ggml_mul_mat(ctx, up_w_t, ln_2d);
+    ggml_tensor* fc1_bias = ggml_add(ctx, fc1, ggml_repeat(ctx, ggml_reshape_2d(ctx, up_b_t, dff, 1), fc1));
+
+    ggml_tensor* fc1_gelu = ggml_gelu(ctx, fc1_bias);
+
+    ggml_tensor* fc1_2d = (rows == 1) ? ggml_reshape_2d(ctx, fc1_gelu, dff, 1) : fc1_gelu;
+    ggml_tensor* fc2 = ggml_mul_mat(ctx, down_w_t, fc1_2d);
+    ggml_tensor* fc2_bias = ggml_add(ctx, fc2, ggml_repeat(ctx, ggml_reshape_2d(ctx, down_b_t, hidden, 1), fc2));
+
+    return ggml_add(ctx, inp, fc2_bias);
+}
+
+// ============================================================================
 // Fused vision encoder block: runs the entire attention sub-block (minus RoPE)
 // and the entire MLP sub-block as ONE Metal graph dispatch instead of ~14
 // separate dispatches. For 27 encoder blocks this eliminates ~350 Metal command
@@ -1020,32 +1129,10 @@ int fused_vision_mlp_f32_impl(
     try_cache_weight(down_w_t, down_w_data, down_bytes,                  down_w_bound, down_w_upload);
     try_cache_weight(down_b_t, down_b_data, down_b_dim * sizeof(float),  down_b_bound, down_b_upload);
 
-    // Build the computation graph.
+    // Build the computation graph (shared with the whole-encoder fusion).
     ggml_context* ctx = context.value;
-    ggml_tensor* inp = ggml_cont(ctx, hidden_binding.tensor);
-
-    // LayerNorm: mean-subtract, variance-normalize, scale+shift
-    ggml_tensor* normed = ggml_norm(ctx, inp, eps);
-    ggml_tensor* scaled = ggml_mul(ctx, normed, ln_w_t);
-    ggml_tensor* ln_out = ggml_add(ctx, scaled, ln_b_t);
-
-    // Up projection: ln_out @ up_w^T + up_bias
-    ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
-    ggml_tensor* fc1 = ggml_mul_mat(ctx, up_w_t, ln_2d);
-    ggml_tensor* fc1_bias = ggml_add(ctx, fc1, ggml_repeat(ctx, ggml_reshape_2d(ctx, up_b_t, dff, 1), fc1));
-
-    // GELU activation
-    ggml_tensor* fc1_gelu = ggml_gelu(ctx, fc1_bias);
-
-    // Down projection: fc1_gelu @ down_w^T + down_bias
-    ggml_tensor* fc1_2d = (rows == 1) ? ggml_reshape_2d(ctx, fc1_gelu, dff, 1) : fc1_gelu;
-    ggml_tensor* fc2 = ggml_mul_mat(ctx, down_w_t, fc1_2d);
-    ggml_tensor* fc2_bias = ggml_add(ctx, fc2, ggml_repeat(ctx, ggml_reshape_2d(ctx, down_b_t, hidden, 1), fc2));
-
-    // Residual add: hidden += fc2_bias
-    ggml_tensor* res_flat = ggml_reshape_1d(ctx, inp, static_cast<int64_t>(rows) * hidden);
-    ggml_tensor* fc2_flat = ggml_reshape_1d(ctx, fc2_bias, static_cast<int64_t>(rows) * hidden);
-    ggml_tensor* added = ggml_add(ctx, res_flat, fc2_flat);
+    ggml_tensor* added = build_vision_mlp_subgraph(ctx, hidden_binding.tensor,
+        ln_w_t, ln_b_t, eps, up_w_t, up_b_t, down_w_t, down_b_t, rows, hidden, dff);
 
     ggml_tensor* output = ggml_cpy(ctx, added, hidden_binding.tensor);
     if (!output)
@@ -1119,7 +1206,6 @@ int fused_vision_attention_f32_impl(
 
     const int rows = hidden_desc.dim0;
     const int hidden = hidden_desc.dim1;
-    const int triple_hidden = 3 * hidden;
 
     const std::size_t ctx_size = 8 * 1024 * 1024;
     PooledContextHandle context;
@@ -1187,82 +1273,10 @@ int fused_vision_attention_f32_impl(
     try_bind(out_w_t, out_w_data, out_bytes,                   b5, u5);
     try_bind(out_b_t, out_b_data, out_b_dim * sizeof(float),   b6, u6);
 
-    // Build graph.
-    ggml_tensor* inp = ggml_cont(ctx, hidden_binding.tensor);
-
-    // LayerNorm
-    ggml_tensor* normed = ggml_norm(ctx, inp, eps);
-    ggml_tensor* ln_scaled = ggml_mul(ctx, normed, ln_w_t);
-    ggml_tensor* ln_out = ggml_add(ctx, ln_scaled, ln_b_t);
-
-    // QKV projection + bias
-    ggml_tensor* ln_2d = (rows == 1) ? ggml_reshape_2d(ctx, ln_out, hidden, 1) : ln_out;
-    ggml_tensor* qkv = ggml_mul_mat(ctx, qkv_w_t, ln_2d);
-    ggml_tensor* qkv_biased = ggml_add(ctx, qkv, ggml_repeat(ctx, ggml_reshape_2d(ctx, qkv_b_t, triple_hidden, 1), qkv));
-
-    // Split Q, K, V: [N, 3*D] -> three [N, D]
-    std::size_t row_bytes = static_cast<std::size_t>(triple_hidden) * sizeof(float);
-    std::size_t d_bytes = static_cast<std::size_t>(hidden) * sizeof(float);
-    ggml_tensor* q_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 0));
-    ggml_tensor* k_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, d_bytes));
-    ggml_tensor* v_raw = ggml_cont(ctx, ggml_view_2d(ctx, qkv_biased, hidden, rows, row_bytes, 2 * d_bytes));
-
-    // Apply RoPE via cos/sin tables: NeoX rotation
-    // Q/K shape: [hidden, N] in GGML = [N, hidden] in row-major
-    // Reshape to [half_dim, 2, num_heads, N] to split lo/hi halves
-    // Actually simpler: reshape to [head_dim, num_heads, N], then split
-    ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_raw, head_dim, num_heads, rows);
-    ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_raw, head_dim, num_heads, rows);
-
-    // cos/sin tables: [cos_sin_elems] -> reshape to [half_dim, 1, N] for broadcasting
-    ggml_tensor* cos_3d = ggml_reshape_3d(ctx, cos_t, half_dim, 1, rows);
-    ggml_tensor* sin_3d = ggml_reshape_3d(ctx, sin_t, half_dim, 1, rows);
-
-    // Split Q into lo/hi halves along dim0 (head_dim -> half_dim + half_dim)
-    std::size_t head_row_bytes = static_cast<std::size_t>(head_dim) * sizeof(float);
-    std::size_t half_bytes_local = static_cast<std::size_t>(half_dim) * sizeof(float);
-
-    auto apply_rope = [&](ggml_tensor* x_3d) -> ggml_tensor* {
-        // x_3d: [head_dim, num_heads, N]
-        ggml_tensor* x_lo = ggml_view_3d(ctx, x_3d, half_dim, num_heads, rows,
-            head_row_bytes, head_row_bytes * num_heads, 0);
-        ggml_tensor* x_hi = ggml_view_3d(ctx, x_3d, half_dim, num_heads, rows,
-            head_row_bytes, head_row_bytes * num_heads, half_bytes_local);
-        ggml_tensor* lo_c = ggml_cont(ctx, x_lo);
-        ggml_tensor* hi_c = ggml_cont(ctx, x_hi);
-        // out_lo = lo * cos - hi * sin
-        ggml_tensor* lo_cos = ggml_mul(ctx, lo_c, cos_3d);
-        ggml_tensor* hi_sin = ggml_mul(ctx, hi_c, sin_3d);
-        ggml_tensor* out_lo = ggml_sub(ctx, lo_cos, hi_sin);
-        // out_hi = lo * sin + hi * cos
-        ggml_tensor* lo_sin = ggml_mul(ctx, lo_c, sin_3d);
-        ggml_tensor* hi_cos = ggml_mul(ctx, hi_c, cos_3d);
-        ggml_tensor* out_hi = ggml_add(ctx, lo_sin, hi_cos);
-        // Concat along dim0: [half_dim, H, N] + [half_dim, H, N] -> [head_dim, H, N]
-        return ggml_concat(ctx, out_lo, out_hi, 0);
-    };
-
-    ggml_tensor* q_roped = apply_rope(q_3d);
-    ggml_tensor* k_roped = apply_rope(k_3d);
-    ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_raw, head_dim, num_heads, rows);
-
-    // SDPA: flash_attn_ext expects Q=[head_dim, N, H], K=[head_dim, N, H_kv], V=[head_dim, N, H_kv]
-    ggml_tensor* q_perm = ggml_permute(ctx, q_roped, 0, 2, 1, 3); // [head_dim, N, H]
-    ggml_tensor* k_perm = ggml_permute(ctx, k_roped, 0, 2, 1, 3);
-    ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
-    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_perm, k_perm, v_perm, nullptr, attn_scale, 0.0f, 0.0f);
-    // attn_out: [head_dim, N, H] -> reshape to [hidden, N] -> [N, hidden]
-    ggml_tensor* attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, attn_out), hidden, rows);
-
-    // Output projection + bias
-    ggml_tensor* out_proj = ggml_mul_mat(ctx, out_w_t, attn_flat);
-    ggml_tensor* out_biased = ggml_add(ctx, out_proj, ggml_repeat(ctx, ggml_reshape_2d(ctx, out_b_t, hidden, 1), out_proj));
-
-    // Residual add
-    ggml_tensor* res_flat = ggml_reshape_1d(ctx, inp, static_cast<int64_t>(rows) * hidden);
-    ggml_tensor* out_flat = ggml_reshape_1d(ctx, out_biased, static_cast<int64_t>(rows) * hidden);
-    ggml_tensor* added = ggml_add(ctx, res_flat, out_flat);
+    // Build graph (shared with the whole-encoder fusion).
+    ggml_tensor* added = build_vision_attn_subgraph(ctx, hidden_binding.tensor,
+        ln_w_t, ln_b_t, eps, qkv_w_t, qkv_b_t, out_w_t, out_b_t, cos_t, sin_t,
+        rows, hidden, num_heads, head_dim, half_dim, attn_scale);
 
     ggml_tensor* output = ggml_cpy(ctx, added, hidden_binding.tensor);
     if (!output)
@@ -2514,6 +2528,207 @@ TSG_EXPORT int TSGgml_FusedVisionAttentionF32(
         cos_table, sin_table, num_patches, num_heads, head_dim, half_dim, attn_scale); }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in fused vision attention."); return 0; }
+}
+
+// ============================================================================
+// Whole vision encoder (Qwen3.5/3.6-VL): ALL transformer blocks as ONE device
+// graph. The per-block fused ops (above) each issue a separate synchronous
+// graph_compute and round-trip the [N, hidden] residual over PCIe; for 27
+// blocks that is 54 dispatches at ~10% GPU utilisation. This runs every block
+// back-to-back in a single graph with the residual kept device-resident
+// (gallocr liveness-reuse bounds the activation peak) and ONE sync at the end.
+//
+// Weight pointer arrays are block-major (index [b]); all blocks share identical
+// shapes. Math is byte-identical to the per-block path (shared subgraph
+// builders), so the per-block correctness checksum re-validates this path.
+// ============================================================================
+static int fused_qwen35_vision_encoder_f32_impl(
+    const TensorView2DDesc& hidden_desc,
+    int block_count, float eps, float attn_scale,
+    int num_patches, int num_heads, int head_dim, int half_dim,
+    const float* cos_table, const float* sin_table,
+    const float* const* ln1_w, const float* const* ln1_b,
+    const float* const* qkv_w, const float* const* qkv_b,
+    const float* const* out_w, const float* const* out_b,
+    const float* const* ln2_w, const float* const* ln2_b,
+    const float* const* up_w,  const float* const* up_b,
+    const float* const* down_w, const float* const* down_b,
+    int ln_dim,
+    int qkv_ne0, int qkv_ne1, std::size_t qkv_bytes, int qkv_b_dim,
+    int out_ne0, int out_ne1, std::size_t out_bytes, int out_b_dim,
+    int up_ne0, int up_ne1, std::size_t up_bytes, int up_b_dim,
+    int down_ne0, int down_ne1, std::size_t down_bytes, int down_b_dim)
+{
+    if (!ensure_backend()) return 0;
+    if (!validate_desc(hidden_desc, "hidden")) return 0;
+    if (block_count <= 0 || block_count > 128) { set_last_error("vision_encoder: bad block_count"); return 0; }
+
+    const int rows = hidden_desc.dim0;     // numPatches
+    const int hidden = hidden_desc.dim1;   // hiddenSize
+    const int dff = up_ne1;                // intermediate_size
+    const std::size_t cos_sin_elems = static_cast<std::size_t>(num_patches) * half_dim;
+
+    // ctx holds only tensor metadata (no_alloc) + the graph node array. ~block_count
+    // blocks x ~42 nodes + ~12 weight leaves ≈ <1 MB even at 128 blocks; 32 MB is the
+    // pool's max slot size.
+    const std::size_t ctx_size = static_cast<std::size_t>(32) * 1024 * 1024;
+    PooledContextHandle context;
+    if (!context.init(ctx_size)) { set_last_error("vision_encoder: ctx init failed."); return 0; }
+    ggml_context* ctx = context.value;
+
+    // Residual-stream binding (zero-copy host-mapped when possible).
+    std::vector<BufferHandle> host_ptr_buffers;
+    bool use_zero_copy = can_map_standard_view(hidden_desc);
+    TensorBinding hidden_binding;
+    if (use_zero_copy)
+    {
+        ggml_backend_buffer_t buf = nullptr;
+        if (!create_binding_from_host_ptr_2d(ctx, g_backend, hidden_desc, hidden_binding, buf))
+        {
+            use_zero_copy = false;
+            hidden_binding = create_standard_binding(ctx, hidden_desc);
+        }
+        else
+            host_ptr_buffers.emplace_back(buf);
+    }
+    else
+        hidden_binding = create_standard_binding(ctx, hidden_desc);
+    if (!hidden_binding.storage) { set_last_error("vision_encoder: hidden bind failed."); return 0; }
+
+    // cos/sin tables: shared across all blocks. Uploaded after gallocr alloc, so
+    // mark as inputs (gallocr never reuses input memory → upload stays valid).
+    ggml_tensor* cos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
+    ggml_tensor* sin_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cos_sin_elems);
+    if (!cos_t || !sin_t) { set_last_error("vision_encoder: cos/sin alloc failed."); return 0; }
+    ggml_set_input(cos_t);
+    ggml_set_input(sin_t);
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
+    std::vector<HostBinding> upload_list;
+    // Cache a weight device-resident (own buffer, persists across encodes); on a
+    // cache miss bind it as a gallocr input leaf and upload after alloc.
+    auto bind_w = [&](ggml_tensor* t, const void* data, std::size_t bytes) {
+        if (t == nullptr || data == nullptr) return;
+        if (bytes >= 4096 && dev != nullptr)
+        {
+            ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool need = false;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, t, const_cast<void*>(data), bytes, buf, addr, need))
+            {
+                if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
+                {
+                    if (need) upload_list.push_back({ t, data, bytes });
+                    return;
+                }
+                invalidate_cached_buffer(const_cast<void*>(data));
+            }
+        }
+        ggml_set_input(t);
+        upload_list.push_back({ t, data, bytes });
+    };
+
+    ggml_tensor* cur = hidden_binding.tensor;
+    for (int b = 0; b < block_count; b++)
+    {
+        ggml_tensor* ln1w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* ln1b_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* qkvw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, qkv_ne0, qkv_ne1);
+        ggml_tensor* qkvb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, qkv_b_dim);
+        ggml_tensor* outw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_ne0, out_ne1);
+        ggml_tensor* outb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_b_dim);
+        ggml_tensor* ln2w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* ln2b_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* upw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, up_ne0, up_ne1);
+        ggml_tensor* upb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, up_b_dim);
+        ggml_tensor* downw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, down_ne0, down_ne1);
+        ggml_tensor* downb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, down_b_dim);
+        if (!ln1w_t || !qkvw_t || !outw_t || !ln2w_t || !upw_t || !downw_t)
+        { set_last_error("vision_encoder: block tensor alloc failed."); return 0; }
+
+        bind_w(ln1w_t, ln1_w[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(ln1b_t, ln1_b[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(qkvw_t, qkv_w[b], qkv_bytes);
+        bind_w(qkvb_t, qkv_b[b], static_cast<std::size_t>(qkv_b_dim) * sizeof(float));
+        bind_w(outw_t, out_w[b], out_bytes);
+        bind_w(outb_t, out_b[b], static_cast<std::size_t>(out_b_dim) * sizeof(float));
+        bind_w(ln2w_t, ln2_w[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(ln2b_t, ln2_b[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(upw_t, up_w[b], up_bytes);
+        bind_w(upb_t, up_b[b], static_cast<std::size_t>(up_b_dim) * sizeof(float));
+        bind_w(downw_t, down_w[b], down_bytes);
+        bind_w(downb_t, down_b[b], static_cast<std::size_t>(down_b_dim) * sizeof(float));
+
+        cur = build_vision_attn_subgraph(ctx, cur, ln1w_t, ln1b_t, eps,
+            qkvw_t, qkvb_t, outw_t, outb_t, cos_t, sin_t,
+            rows, hidden, num_heads, head_dim, half_dim, attn_scale);
+        cur = build_vision_mlp_subgraph(ctx, cur, ln2w_t, ln2b_t, eps,
+            upw_t, upb_t, downw_t, downb_t, rows, hidden, dff);
+    }
+
+    ggml_tensor* output = ggml_cpy(ctx, cur, hidden_binding.tensor);
+    if (!output) { set_last_error("vision_encoder: output cpy failed."); return 0; }
+    ggml_set_output(output);
+
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, static_cast<std::size_t>(block_count) * 200 + 512, false);
+    if (!graph) { set_last_error("vision_encoder: graph creation failed."); return 0; }
+    ggml_build_forward_expand(graph, output);
+
+    // Dedicated gallocr (freed below): liveness-reuse bounds the activation peak
+    // to ~max-concurrent (not the 27-block sum). Freed each encode so the encoder
+    // buffer is not held resident while the language model decodes.
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+    if (galloc == nullptr || !ggml_gallocr_alloc_graph(galloc, graph))
+    {
+        if (galloc != nullptr) ggml_gallocr_free(galloc);
+        set_last_error("vision_encoder: gallocr allocation failed.");
+        return 0;
+    }
+
+    if (!use_zero_copy)
+        upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
+    for (auto& u : upload_list)
+        ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+    ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
+    ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
+
+    ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+    if (status != GGML_STATUS_SUCCESS) { ggml_gallocr_free(galloc); set_last_error("vision_encoder: graph compute failed."); return 0; }
+    finalize_compute(use_zero_copy, hidden_binding.storage, hidden_desc.data, hidden_binding.raw_bytes);
+
+    ggml_gallocr_free(galloc);
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_Qwen35VisionEncoderF32(
+    TensorView2DDesc hidden,
+    int block_count, float eps, float attn_scale,
+    int num_patches, int num_heads, int head_dim, int half_dim,
+    const float* cos_table, const float* sin_table,
+    const float* const* ln1_w, const float* const* ln1_b,
+    const float* const* qkv_w, const float* const* qkv_b,
+    const float* const* out_w, const float* const* out_b,
+    const float* const* ln2_w, const float* const* ln2_b,
+    const float* const* up_w,  const float* const* up_b,
+    const float* const* down_w, const float* const* down_b,
+    int ln_dim,
+    int qkv_ne0, int qkv_ne1, std::int64_t qkv_bytes, int qkv_b_dim,
+    int out_ne0, int out_ne1, std::int64_t out_bytes, int out_b_dim,
+    int up_ne0, int up_ne1, std::int64_t up_bytes, int up_b_dim,
+    int down_ne0, int down_ne1, std::int64_t down_bytes, int down_b_dim)
+{
+    try {
+        return fused_qwen35_vision_encoder_f32_impl(hidden, block_count, eps, attn_scale,
+            num_patches, num_heads, head_dim, half_dim, cos_table, sin_table,
+            ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b,
+            ln_dim,
+            qkv_ne0, qkv_ne1, static_cast<std::size_t>(qkv_bytes), qkv_b_dim,
+            out_ne0, out_ne1, static_cast<std::size_t>(out_bytes), out_b_dim,
+            up_ne0, up_ne1, static_cast<std::size_t>(up_bytes), up_b_dim,
+            down_ne0, down_ne1, static_cast<std::size_t>(down_bytes), down_b_dim);
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in fused vision encoder."); return 0; }
 }
 
 TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32(
