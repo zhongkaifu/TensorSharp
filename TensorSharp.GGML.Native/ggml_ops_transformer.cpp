@@ -4614,12 +4614,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // mask+softmax). One mask per distinct attendLen, shared across layers.
         // mask[qi][ki] = 0 if ki <= (attendLen-N)+qi else -inf — exactly the old
         // ggml_diag_mask_inf(attendLen-N) semantics (SWA low-end is below the window).
-        struct VerifyMask { int attendLen; ggml_tensor* tensor; int dataIdx; };
+        // window == 0 → plain causal (keys [0, threshold]). window > 0 → sliding
+        // window causal: also mask keys older than (threshold - window + 1). The
+        // windowed variant is used for SWA prefill that attends over the FRESH K/V
+        // of all N tokens (start_pos==0, N > sliding window) where the circular
+        // cache can't hold the whole sequence — see the attention block below.
+        struct VerifyMask { int attendLen; int window; ggml_tensor* tensor; int dataIdx; };
         std::vector<VerifyMask> mask_cache;
         std::vector<std::vector<ggml_fp16_t>> mask_data_store;
-        auto get_causal_mask = [&](int attendLen) -> ggml_tensor* {
+        auto get_causal_mask = [&](int attendLen, int window) -> ggml_tensor* {
             for (auto& m : mask_cache)
-                if (m.attendLen == attendLen) return m.tensor;
+                if (m.attendLen == attendLen && m.window == window) return m.tensor;
             ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, attendLen, N);
             std::vector<ggml_fp16_t> data(static_cast<std::size_t>(attendLen) * N);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
@@ -4628,13 +4633,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             for (int qi = 0; qi < N; qi++)
             {
                 const int threshold = nPast + qi;
+                const int low = (window > 0) ? (threshold - window + 1) : 0;
                 ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * attendLen];
                 for (int ki = 0; ki < attendLen; ki++)
-                    row[ki] = (ki > threshold) ? neg_inf : zero_val;
+                    row[ki] = (ki > threshold || (window > 0 && ki < low)) ? neg_inf : zero_val;
             }
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
-            mask_cache.push_back({attendLen, mt, idx});
+            mask_cache.push_back({attendLen, window, mt, idx});
             return mt;
         };
 
@@ -4683,6 +4689,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, num_heads, N]
 
             lt.k_cpy = nullptr; lt.v_cpy = nullptr; lt.k_cpy2 = nullptr; lt.v_cpy2 = nullptr;
+            // Fresh post-norm/RoPE K/V for this chunk, retained so SWA layers whose
+            // sequence exceeds the (circular) window at start_pos==0 can attend over
+            // the whole chunk directly instead of the W-sized cache view.
+            ggml_tensor* k_write = nullptr;
+            ggml_tensor* v_write = nullptr;
             if (!info.isShared)
             {
                 // per-head K norm + V norm (unweighted), then RoPE on K.
@@ -4693,12 +4704,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff,
                     rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, kvHeads, N]
 
-                // Write N new K/V. Global: linear at start_pos. SWA: circular at
-                // start_pos % cacheSize, split into two cpy ops if it wraps the buffer.
-                ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));  // [hd, N, kvHeads]
-                ggml_tensor* v_write = ggml_cont(ctx, ggml_permute(ctx, v_3d, 0, 2, 1, 3));     // [hd, N, kvHeads]
-                const int cacheBase = info.isLocal ? (start_pos % info.cacheSize) : start_pos;
-                const int n1 = (info.isLocal && cacheBase + N > info.cacheSize) ? (info.cacheSize - cacheBase) : N;
+                // Write the K/V into the persistent cache. Global: linear append of
+                // all N at start_pos. SWA (circular, size = window): only the LAST
+                // min(N, cacheSize) positions survive — when N exceeds the window the
+                // earlier positions would be immediately overwritten, so skip them
+                // (writeOffsetInChunk) rather than wrapping the buffer multiple times
+                // (which would overflow the cache view). The remaining run may still
+                // cross the wrap point once, so it splits into up to two cpy ops.
+                k_write = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));  // [hd, N, kvHeads]
+                v_write = ggml_cont(ctx, ggml_permute(ctx, v_3d, 0, 2, 1, 3));     // [hd, N, kvHeads]
+                const int writeOffsetInChunk = (info.isLocal && N > info.cacheSize) ? (N - info.cacheSize) : 0;
+                const int writeLen = N - writeOffsetInChunk;                       // <= cacheSize for SWA
+                const int writeStartLogical = start_pos + writeOffsetInChunk;
+                const int cacheBase = info.isLocal ? (writeStartLogical % info.cacheSize) : writeStartLogical;
+                const int n1 = (info.isLocal && cacheBase + writeLen > info.cacheSize) ? (info.cacheSize - cacheBase) : writeLen;
                 auto writePart = [&](ggml_tensor* cache, ggml_tensor* src, int srcOff, int dstSlot, int cnt) -> ggml_tensor* {
                     ggml_tensor* s = ggml_view_3d(ctx, src, info.hd, cnt, info.kvHeads,
                         src->nb[1], src->nb[2], static_cast<std::size_t>(srcOff) * src->nb[1]);
@@ -4706,21 +4725,45 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                         cache->nb[1], cache->nb[2], static_cast<std::size_t>(dstSlot) * cache->nb[1]);
                     return ggml_cpy(ctx, s, d);
                 };
-                lt.k_cpy = writePart(lt.k_cached_t, k_write, 0, cacheBase, n1);
-                lt.v_cpy = writePart(lt.v_cached_t, v_write, 0, cacheBase, n1);
-                if (n1 < N)
+                lt.k_cpy = writePart(lt.k_cached_t, k_write, writeOffsetInChunk, cacheBase, n1);
+                lt.v_cpy = writePart(lt.v_cached_t, v_write, writeOffsetInChunk, cacheBase, n1);
+                if (n1 < writeLen)
                 {
-                    lt.k_cpy2 = writePart(lt.k_cached_t, k_write, n1, 0, N - n1);
-                    lt.v_cpy2 = writePart(lt.v_cached_t, v_write, n1, 0, N - n1);
+                    lt.k_cpy2 = writePart(lt.k_cached_t, k_write, writeOffsetInChunk + n1, 0, writeLen - n1);
+                    lt.v_cpy2 = writePart(lt.v_cached_t, v_write, writeOffsetInChunk + n1, 0, writeLen - n1);
                 }
             }
 
+            // SWA prefill that overflows the circular window at start_pos==0: the
+            // W-sized cache can't hold all N keys, so attend over the FRESH chunk
+            // K/V (k_write/v_write, all N positions) with a sliding-window causal
+            // mask. Only valid when start_pos==0 (the fresh chunk IS the whole
+            // history) and the layer computed its own K/V (non-shared). The cache
+            // still received the last W positions above for subsequent decode.
+            const bool swaFresh = info.isLocal && !info.isShared && start_pos == 0
+                && totalSeqLen > info.cacheSize && k_write != nullptr;
+
             // Read the attention window. SWA: the last min(totalSeqLen, W) positions
             // (view_kv_cache_window unwraps the circular buffer). Global: [0, total).
-            const int attendLen = info.isLocal ? std::min(totalSeqLen, info.cacheSize) : totalSeqLen;
-            const int activeStart = info.isLocal ? ((totalSeqLen - attendLen) % info.cacheSize) : 0;
-            ggml_tensor* k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+            int attendLen;
+            int maskWindow;
+            ggml_tensor* k_full;
+            ggml_tensor* v_full;
+            if (swaFresh)
+            {
+                attendLen = N;                  // fresh K/V covers [0, N)
+                maskWindow = info.cacheSize;    // sliding window W
+                k_full = k_write;               // [hd, N, kvHeads]
+                v_full = v_write;               // [hd, N, kvHeads]
+            }
+            else
+            {
+                attendLen = info.isLocal ? std::min(totalSeqLen, info.cacheSize) : totalSeqLen;
+                maskWindow = 0;                 // window already enforced by the cache view
+                const int activeStart = info.isLocal ? ((totalSeqLen - attendLen) % info.cacheSize) : 0;
+                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+            }
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Failed to create Gemma4 verify KV cache views.");
@@ -4740,7 +4783,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // silently corrupts the logits (same fix the prefill path applies). CUDA
             // accumulates in F32 by default so this was invisible there.
             ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-            kq = ggml_soft_max_ext(ctx, kq, get_causal_mask(attendLen), 1.0f, 0.0f);
+            kq = ggml_soft_max_ext(ctx, kq, get_causal_mask(attendLen, maskWindow), 1.0f, 0.0f);
             ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [kvLen, hd, kvHeads]
             ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                              // [hd, N, num_heads]
             ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd, num_heads, N]
@@ -4864,8 +4907,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
+        // Allocation strategy. Small N (MTP speculative verify, N<=16) keeps the
+        // bump allocator (alloc_ctx_tensors_reuse: each tensor its own slot, stable
+        // addresses, lowest per-call overhead). Large N (prefill routed through this
+        // kernel) MUST use the gallocr lifetime-packing allocator: the bump
+        // allocator's footprint is the SUM of every layer's N-token intermediates
+        // (~31 GB at N=776 over 48 layers → OOM), whereas gallocr packs by tensor
+        // lifetime so the peak is one layer's working set (~10-20x smaller). The
+        // pre-bound weights / KV caches above already own buffers and are skipped
+        // by both allocators.
+        const bool useGallocr = (N > 16);
         BufferHandle buffer(nullptr);
-        if (!alloc_ctx_tensors_reuse(ctx))
+        if (useGallocr)
+        {
+            if (!alloc_graph_reuse_gallocr(graph))
+            {
+                set_last_error("Failed to allocate backend buffer for Gemma4 model verify (gallocr).");
+                return 0;
+            }
+        }
+        else if (!alloc_ctx_tensors_reuse(ctx))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (buffer.value == nullptr)
