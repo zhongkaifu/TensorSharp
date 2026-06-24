@@ -4127,13 +4127,19 @@ namespace TensorSharp.Models
             int intermediate = (int)gateW.PerExpertNe1;
             int K = _numExpertsUsed;
 
-            // Stacked dims must line up with hidden/intermediate, and all three
-            // projections must share a quant type (mul_mat_id requirement).
+            // Stacked dims must line up with hidden/intermediate. The three
+            // projections do NOT need to share a quant type: MoEFFNPrefill builds
+            // gate_w/up_w/down_w as independent ggml tensors (each with its own
+            // gateType/upType/downType) and runs a separate ggml_mul_mat_id per
+            // projection, so mixed-type "UD"/dynamic quants (e.g. Qwen3.6 UD-IQ2_XXS,
+            // where gate/up are IQ2_XXS but down is IQ2_S) are fully supported. The
+            // old all-types-must-match guard forced every such model onto the
+            // per-expert ExpertLinearForwardAlloc loop, which re-streams every routed
+            // expert's NON-resident quantized weight from host each forward — the
+            // dominant (~18 s/forward, seqLen-independent) prefill cost on ggml_cuda.
             if (gateW.PerExpertNe0 != hiddenSize || upW.PerExpertNe0 != hiddenSize
                 || upW.PerExpertNe1 != intermediate
                 || downW.PerExpertNe0 != intermediate || downW.PerExpertNe1 != hiddenSize)
-                return null;
-            if (gateW.GgmlType != upW.GgmlType || upW.GgmlType != downW.GgmlType)
                 return null;
 
             // Host top-K routing for every token: ids[t*K+u], weights[t*K+u].

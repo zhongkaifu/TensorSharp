@@ -39,11 +39,44 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace tsg;
 
 namespace
 {
+        // --- Optional MoE prefill timing (TS_MOE_TIMING=1) ---
+        // Aggregates per-call cost into three buckets (graph build + intermediate
+        // alloc, weight/input upload, graph compute) plus a streamed-weight-upload
+        // counter, so we can tell whether MoE prefill is alloc-bound, upload-bound
+        // (cache miss → weights re-streamed), or compute-bound. Printed every 200
+        // calls (~5 forwards on a 40-layer model) to stderr.
+        std::atomic<long long> g_moe_alloc_ns{0};
+        std::atomic<long long> g_moe_upload_ns{0};
+        std::atomic<long long> g_moe_compute_ns{0};
+        std::atomic<long long> g_moe_upload_bytes{0};
+        std::atomic<long long> g_moe_weight_uploads{0};
+        std::atomic<long long> g_moe_calls{0};
+
+        std::atomic<long long> g_moe_reuse_fallback{0};
+
+        inline bool moe_timing_enabled()
+        {
+            static const bool s_on = []() {
+                const char* e = std::getenv("TS_MOE_TIMING");
+                return e != nullptr && e[0] == '1';
+            }();
+            return s_on;
+        }
+
+        inline long long moe_now_ns()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
         // Bind a read-only weight tensor to its host data via the cacheable buffer
         // path when possible (so subsequent calls hit the cached backend buffer),
         // otherwise via the host-pointer mapped buffer (zero-copy on Metal /
@@ -695,26 +728,48 @@ namespace
             static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers);
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
-        // weights, biases). ggml_backend_alloc_ctx_tensors will skip
-        // already-allocated tensors and allocate the rest into a single
-        // backend buffer.
-        BufferHandle backend_buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (backend_buffer.value == nullptr)
+        // weights, biases, and all per-graph intermediates) into the persistent,
+        // reused gallocr buffer rather than a FRESH device buffer per call. A
+        // per-call alloc+free of the multi-hundred-MB MoE scratch fragments VRAM
+        // and — on the near-full 16 GB GPU this MoE model runs on — forces the
+        // device-resident expert-weight copies to be evicted and re-streamed every
+        // forward (the 40×/forward alloc churn was the dominant prefill cost).
+        // The reused buffer is grown once to the largest seen graph and kept; it's
+        // shared across ops but prefill is serialized under the GPU compute lock.
+        // Falls back to per-call allocation when the reuse path is unavailable
+        // (TS_GGML_REUSE_COMPUTE_BUF=0 / unsupported backend).
+        const long long t_alloc0 = moe_timing_enabled() ? moe_now_ns() : 0;
+        BufferHandle backend_buffer(nullptr);
+        if (!alloc_graph_reuse_gallocr(graph))
         {
-            set_last_error("MoE prefill: failed to allocate backend buffer for graph tensors.");
-            return 0;
+            g_moe_reuse_fallback.fetch_add(1, std::memory_order_relaxed);
+            backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (backend_buffer.value == nullptr)
+            {
+                set_last_error("MoE prefill: failed to allocate backend buffer for graph tensors.");
+                return 0;
+            }
         }
+        if (moe_timing_enabled())
+            g_moe_alloc_ns.fetch_add(moe_now_ns() - t_alloc0, std::memory_order_relaxed);
 
         // Drain pending GPU work before the upcoming CPU memcpys so we don't
         // race with in-flight zero-copy GPU writes targeting `hidden_in` /
         // `selected_experts` / `routing_weights` from the previous op.
         host_read_barrier();
 
+        const bool moe_timing = moe_timing_enabled();
+        const long long t_up0 = moe_timing ? moe_now_ns() : 0;
         for (const WeightUploadInfo& u : uploads)
         {
             if (u.needs_upload && u.tensor != nullptr && u.host_data != nullptr && u.bytes > 0)
             {
                 ggml_backend_tensor_set(u.tensor, u.host_data, 0, u.bytes);
+                if (moe_timing)
+                {
+                    g_moe_weight_uploads.fetch_add(1, std::memory_order_relaxed);
+                    g_moe_upload_bytes.fetch_add((long long)u.bytes, std::memory_order_relaxed);
+                }
             }
         }
 
@@ -773,6 +828,10 @@ namespace
                 static_cast<std::size_t>(num_experts) * sizeof(float));
         }
 
+        if (moe_timing)
+            g_moe_upload_ns.fetch_add(moe_now_ns() - t_up0, std::memory_order_relaxed);
+
+        const long long t_cmp0 = moe_timing ? moe_now_ns() : 0;
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
@@ -794,6 +853,25 @@ namespace
         else
         {
             finalize_compute_with_download(hidden_out_t, out_buffer_ptr, hidden_bytes);
+        }
+
+        if (moe_timing)
+        {
+            g_moe_compute_ns.fetch_add(moe_now_ns() - t_cmp0, std::memory_order_relaxed);
+            long long calls = g_moe_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (calls % 200 == 0)
+            {
+                fprintf(stderr,
+                    "[moe-timing] calls=%lld alloc=%lldms upload=%lldms compute=%lldms "
+                    "wt_uploads=%lld up_GB=%.2f reuse_fallback=%lld\n",
+                    calls,
+                    g_moe_alloc_ns.load() / 1000000,
+                    g_moe_upload_ns.load() / 1000000,
+                    g_moe_compute_ns.load() / 1000000,
+                    g_moe_weight_uploads.load(),
+                    (double)g_moe_upload_bytes.load() / 1e9,
+                    g_moe_reuse_fallback.load());
+            }
         }
 
         clear_last_error();
