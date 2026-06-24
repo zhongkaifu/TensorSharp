@@ -1962,7 +1962,7 @@ namespace
     struct Q35VerifyCache
     {
         bool valid = false;
-        int n = 0, window = 0, num_layers = 0, out_vocab = 0;
+        int n = 0, window = 0, num_layers = 0, out_vocab = 0, n_logits = 0;
         bool has_normed = false;
         const void* sig = nullptr;
         ggml_context* ctx = nullptr;
@@ -1983,7 +1983,7 @@ namespace
             graph = nullptr; valid = false;
             hidden_t = pos_t = kv_index = mask_t = logits_out = normed_out = nullptr;
             conv_in.clear(); delta_in.clear(); conv_out.clear(); delta_out.clear();
-            n = window = num_layers = out_vocab = 0; has_normed = false; sig = nullptr;
+            n = window = num_layers = out_vocab = n_logits = 0; has_normed = false; sig = nullptr;
         }
     };
     Q35VerifyCache g_q35vc[16];
@@ -2014,7 +2014,7 @@ namespace
         int norm_topk, float expert_weights_scale,
         void* logits_data, int vocab_size,
         const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-        const void* final_norm_data, void* normed_out)
+        const void* final_norm_data, void* normed_out, int n_logit_rows)
     {
         if (!ensure_backend())
             return 0;
@@ -2061,6 +2061,13 @@ namespace
             return 0;
         }
 
+        // Prefill only needs the LAST token's logits (to sample the first decode
+        // token); MTP verify needs all N rows. n_logit_rows in [1, N) computes the
+        // lm_head only over the last n_logit_rows columns of the post-norm hidden,
+        // so a 2048-token prefill writes vocab*1 floats (not vocab*2048 ~ 2 GB) and
+        // skips the lm_head matmul over the first N-1 tokens. <=0 or >=N => all N.
+        const int n_logits = (n_logit_rows > 0 && n_logit_rows < N) ? n_logit_rows : N;
+
         static const bool fv_timing = std::getenv("TS_Q35_VERIFY_TIMING") != nullptr;
         // Persistent per-(N,window) graph cache (build amortization + CUDA-graph
         // capture). DEFAULT ON: the earlier reuse access-violation (0xC0000005) was the
@@ -2068,7 +2075,14 @@ namespace
         // 2D set_rows PER HEAD (llama.cpp's proven KV-write shape) made reuse stable
         // (validated 252 reuses, no crash). Reuse: setup ~8 ms + compute ~12-20 ms vs
         // ~61 ms non-persist build. TS_Q35_VERIFY_PERSIST=0 forces the rebuild path.
-        static const bool fv_persist = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        static const bool fv_persist_cfg = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        // PREFILL (n_logits < N) processes a long prompt one-shot, so it never reuses
+        // the cached graph; force the NON-PERSIST path (pooled ctx + gallocr lifetime-
+        // packing) which reuses activation buffers across the graph. The persist path
+        // gives every intermediate its own slot (no reuse) — for a 40-layer × N-token
+        // graph on the VRAM-tight 35B that thrashes WDDM paging (N=512) or OOMs (N>=1024).
+        // MTP verify (n_logits == N) keeps the persist+capture fast-replay reuse.
+        const bool fv_persist = fv_persist_cfg && (n_logits >= N);
         auto t_start = std::chrono::high_resolution_clock::now();
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
@@ -2105,6 +2119,7 @@ namespace
             {
                 if (!c.valid || c.n != N || c.window != window || c.sig != sig ||
                     c.num_layers != num_layers || c.out_vocab != vocab_size ||
+                    c.n_logits != n_logits ||
                     c.has_normed != (normed_out != nullptr))
                     continue;
                 // llama.cpp pattern (llama-context.cpp): before re-setting the inputs of
@@ -2151,7 +2166,7 @@ namespace
                 }
                 if (normed_out != nullptr && c.normed_out != nullptr)
                     finalize_compute_with_download(c.normed_out, normed_out, static_cast<std::size_t>(H) * N * sizeof(float));
-                finalize_compute_with_download(c.logits_out, logits_data, static_cast<std::size_t>(vocab_size) * N * sizeof(float));
+                finalize_compute_with_download(c.logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
                 host_read_barrier();
                 c.lru = ++g_q35vc_clock;
                 if (fv_timing)
@@ -2534,8 +2549,17 @@ namespace
             normed_cpy = ggml_cpy(ctx, fn, normed_out_t);
             ggml_set_output(normed_cpy);
         }
-        ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_t, fn); // [vocab, N]
-        ggml_tensor* logits_out_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, N);
+        // Prefill (n_logits < N) folds the lm_head over only the LAST n_logits
+        // columns of the post-norm hidden — the trailing token(s) we sample from.
+        ggml_tensor* fn_head_in = fn;                                  // [H, N]
+        if (n_logits < N)
+        {
+            ggml_tensor* fn_last = ggml_view_2d(ctx, fn, H, n_logits, fn->nb[1],
+                static_cast<std::size_t>(N - n_logits) * fn->nb[1]);
+            fn_head_in = ggml_cont(ctx, fn_last);                      // [H, n_logits]
+        }
+        ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_t, fn_head_in); // [vocab, n_logits]
+        ggml_tensor* logits_out_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, vocab_size, n_logits);
         ggml_tensor* logits_cpy = ggml_cpy(ctx, logits, logits_out_t);
         ggml_set_output(logits_cpy);
 
@@ -2717,7 +2741,7 @@ namespace
         }
         if (normed_out != nullptr && normed_out_t != nullptr)
             finalize_compute_with_download(normed_out_t, normed_out, static_cast<std::size_t>(H) * N * sizeof(float));
-        finalize_compute_with_download(logits_out_t, logits_data, static_cast<std::size_t>(vocab_size) * N * sizeof(float));
+        finalize_compute_with_download(logits_out_t, logits_data, static_cast<std::size_t>(vocab_size) * n_logits * sizeof(float));
         host_read_barrier();
 
         if (fv_timing)
@@ -2744,6 +2768,7 @@ namespace
             slot->valid = true;
             slot->n = N; slot->window = window; slot->sig = sig;
             slot->num_layers = num_layers; slot->out_vocab = vocab_size;
+            slot->n_logits = n_logits;
             slot->has_normed = (normed_out != nullptr);
             slot->ctx = ctx; slot->buffer = persist_buf; slot->graph = graph;
             slot->hidden_t = hidden_t; slot->pos_t = pos_tensor;
@@ -2781,7 +2806,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
     int norm_topk, float expert_weights_scale,
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    const void* final_norm_data, void* normed_out)
+    const void* final_norm_data, void* normed_out, int n_logit_rows)
 {
     try
     {
@@ -2795,7 +2820,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
             norm_topk, expert_weights_scale,
             logits_data, vocab_size,
             lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
-            final_norm_data, normed_out);
+            final_norm_data, normed_out, n_logit_rows);
         if (r == 0 && std::getenv("TS_Q35_VERIFY_TIMING") != nullptr)
             fprintf(stderr, "[fv-err] %s\n", g_last_error.c_str());
         return r;

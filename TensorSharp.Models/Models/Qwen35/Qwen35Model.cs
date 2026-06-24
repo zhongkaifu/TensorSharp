@@ -1273,6 +1273,29 @@ namespace TensorSharp.Models
             return 2048;
         }
 
+        // Gates the whole-model fused prefill path (TSGgml_Qwen35ModelVerify, one
+        // GGML graph for all layers). Default on; TS_QWEN35_PREFILL_VERIFY=0 forces
+        // the per-op layer loop for A/B comparison.
+        private static readonly bool _prefillVerifyEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_VERIFY"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Whether a dense (text-only) prefill chunk can run through the fused
+        /// whole-model verify kernel. The kernel computes sequential RoPE positions
+        /// (start_pos..+N) and a pure causal mask, so it is correct only when there
+        /// are no multimodal spans / custom MRoPE positions. Capacity (start_pos +
+        /// seqLen &lt;= cacheSize) and weight/shape support are re-checked inside
+        /// <see cref="TryFullModelVerify"/>, which bails (→ per-op fallback) otherwise.
+        /// </summary>
+        private bool CanUsePrefillVerify(int startPos, int seqLen)
+        {
+            if (!_prefillVerifyEnabled || _fvUnsupported) return false;
+            if (_backend != BackendType.GgmlCuda || seqLen <= 1) return false;
+            if (_visionEmbeddingsList.Count > 0 || _pendingMRoPEPositions != null) return false;
+            if (_headKDim != _headVDim) return false;
+            return true;
+        }
+
         public override float[] ForwardRefill(int[] tokens)
         {
             // Prefill runs the recurrent state on the host; re-seed the fused
@@ -1320,6 +1343,25 @@ namespace TensorSharp.Models
             _embTicks += embEnd - t1;
             if (profilePrefill)
                 _prefillEmbedTicks += embEnd - t1;
+
+            // Whole-model fused prefill chunk (same path as Forward, but the logits
+            // are discarded — this is an interior chunk). KV + GDN state are written
+            // on-device; the next chunk / decode reads the committed state. Carries
+            // across chunks exactly like the per-op loop (the kernel attends over the
+            // full [0, startPos+seqLen) cache and reads the committed GDN ring).
+            if (CanUsePrefillVerify(startPos, seqLen))
+            {
+                if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                    _logitsBuffer = new float[Config.VocabSize];
+                if (TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
+                {
+                    hidden.Dispose();
+                    _cacheSeqLen += seqLen;
+                    InvalidateFullDecodeState();
+                    _forwardSw.Stop();
+                    return;
+                }
+            }
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
@@ -1388,6 +1430,28 @@ namespace TensorSharp.Models
                 _cacheSeqLen += seqLen;
                 _forwardCount++;
                 _pendingMRoPEPositions = null;
+                _forwardSw.Stop();
+                return _logitsBuffer;
+            }
+
+            // Prefill fast path: run the WHOLE hybrid transformer (attention + GDN +
+            // MoE + final-norm + last-token lm_head) for all N prompt tokens as ONE
+            // fused GGML graph (TSGgml_Qwen35ModelVerify with nLogitRows=1), writing
+            // KV + GDN state on-device. This replaces the per-layer dispatch loop
+            // whose host round-trip per op keeps the GPU mostly idle — the dominant
+            // CUDA prefill cost. Mirrors Gemma4's whole-model prefill-verify routing.
+            // Text-only (no multimodal MRoPE); long prompts chunk via ForwardRefill.
+            if (seqLen > 1 && CanUsePrefillVerify(startPos, seqLen)
+                && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
+            {
+                // _logitsBuffer holds the LAST token's logits; KV + GDN state were
+                // committed (host ring) by the kernel. Re-seed the device-resident
+                // fused-decode GDN state next decode (the per-op convention).
+                hidden.Dispose();
+                _cacheSeqLen += seqLen;
+                _forwardCount++;
+                _pendingMRoPEPositions = null;
+                InvalidateFullDecodeState();
                 _forwardSw.Stop();
                 return _logitsBuffer;
             }

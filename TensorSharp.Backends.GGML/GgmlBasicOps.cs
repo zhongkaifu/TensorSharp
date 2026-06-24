@@ -1643,7 +1643,7 @@ namespace TensorSharp.GGML
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut)
+            IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -1655,7 +1655,7 @@ namespace TensorSharp.GGML
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut);
+                finalNorm, normedOut, nLogitRows);
         }
 
         /// <summary>Device-resident single-graph fused prefill for ONE Qwen3.5/

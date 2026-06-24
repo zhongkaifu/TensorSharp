@@ -1249,13 +1249,16 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_VERIFY_RESIDENT"), "1", StringComparison.Ordinal);
         private bool _fvStateResident;
 
-        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut)
+        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1)
         {
             if (!_fusedVerifyEnabled || _fvUnsupported || _backend != BackendType.GgmlCuda)
                 return false;
             if (seqLen < 1 || hidden == null)
                 return false;
-            if (logitsOut == null || logitsOut.Length < (long)Config.VocabSize * seqLen)
+            // Prefill requests logits for only the last nLogitRows tokens; MTP verify
+            // (nLogitRows<=0) needs all seqLen rows. The kernel writes vocab*effLogitRows.
+            int effLogitRows = (nLogitRows > 0 && nLogitRows < seqLen) ? nLogitRows : seqLen;
+            if (logitsOut == null || logitsOut.Length < (long)Config.VocabSize * effLogitRows)
                 return false;
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
                 return false;
@@ -1449,7 +1452,7 @@ namespace TensorSharp.Models
                     _normTopKProb ? 1 : 0, 1.0f,
                     (IntPtr)lp, Config.VocabSize,
                     lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
-                    finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero);
+                    finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows);
             }
             if (!ok2)
             {

@@ -1585,7 +1585,7 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut);
+            IntPtr finalNorm, IntPtr normedOut, int nLogitRows);
 
         public static bool Qwen35ModelVerify(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
@@ -1598,7 +1598,7 @@ internal enum GgmlIndexReductionOp
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut)
+            IntPtr finalNorm, IntPtr normedOut, int nLogitRows)
         {
             return TSGgml_Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -1610,7 +1610,7 @@ internal enum GgmlIndexReductionOp
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut) != 0;
+                finalNorm, normedOut, nLogitRows) != 0;
         }
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
