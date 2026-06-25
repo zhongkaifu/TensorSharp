@@ -82,7 +82,8 @@ namespace TensorSharp.Models.QwenImage
         /// <param name="rope">precomputed interleaved RoPE cos/sin for [txt, img] tokens.</param>
         /// <returns>velocity [imgSeq, 64].</returns>
         public float[] Predict(float[] imgTokens, int imgSeq, float[] textCond, int txtSeq,
-            float timestep01, int[] modulateIndex, DitRope rope)
+            float timestep01, int[] modulateIndex, DitRope rope,
+            int stepIndex = -1, int totalSteps = 0, int cfgBranch = 0, int genTokens = 0)
         {
             // img_in: Linear(64 -> 3072) (+bias)
             using Tensor imgT = HostToTensor(imgTokens, imgSeq, InCh);
@@ -103,22 +104,51 @@ namespace TensorSharp.Models.QwenImage
                 // (one device round-trip per sub-layer instead of ~16 per block).
                 float[] imgHost = TensorToHost(img, (long)imgSeq * Dim); img.Dispose();
                 float[] txtHost = TensorToHost(txt, (long)txtSeq * Dim); txt.Dispose();
-                for (int layer = 0; layer < NumLayers; layer++)
+
+                // First-Block-Cache: when the caller provides a step index and caching is
+                // enabled, run block 0, then either reuse the cached blocks-1..N-1 residual
+                // (skipping 59 blocks) or compute + re-cache them. See QwenImageDiT.Cache.cs.
+                bool cacheActive = CacheEnabled && stepIndex >= 0 && totalSteps > 1;
+                if (!cacheActive)
                 {
-                    string bn = $"transformer_blocks.{layer}";
-                    float[] imgMod = ModParams(temb, $"{bn}.img_mod.1.weight", $"{bn}.img_mod.1.bias");
-                    float[] txtMod = ModParams(temb, $"{bn}.txt_mod.1.weight", $"{bn}.txt_mod.1.bias");
-                    if (FusedBlockOn)
+                    for (int layer = 0; layer < NumLayers; layer++)
+                        RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+                }
+                else
+                {
+                    long imgLen = (long)imgSeq * Dim;
+                    int genLen = (int)Math.Min(imgLen, (long)(genTokens > 0 ? genTokens : imgSeq) * Dim);
+                    var state = _cache[cfgBranch & 1];
+
+                    // hidden (generated region) before block 0, to form the block-0 residual
+                    var imgBeforeGen = new float[genLen];
+                    Array.Copy(imgHost, 0, imgBeforeGen, 0, genLen);
+
+                    RunNativeLayer(0, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+
+                    var firstResidualGen = new float[genLen];
+                    for (int i = 0; i < genLen; i++) firstResidualGen[i] = imgHost[i] - imgBeforeGen[i];
+
+                    if (DecideUseCache(state, stepIndex, firstResidualGen))
                     {
-                        NativeBlock(imgHost, imgSeq, txtHost, txtSeq, imgMod, txtMod, modulateIndex, rope, layer);
+                        // reuse: img_final = img_after_block0 + cached(blocks 1..N-1 residual)
+                        var rem = state.RemainingResidual;
+                        for (long i = 0; i < imgLen; i++) imgHost[i] += rem[i];
+                        _cacheSkipped++;
                     }
                     else
                     {
-                        NativeAttnSubLayer(imgHost, imgSeq, txtHost, txtSeq, imgMod, txtMod, modulateIndex, rope, layer);
-                        NativeMlpSubLayer(imgHost, imgSeq, imgMod, modulateIndex, $"{bn}.img_mlp");
-                        NativeMlpSubLayer(txtHost, txtSeq, txtMod, null, $"{bn}.txt_mlp");
+                        var imgAfter0 = new float[imgLen];
+                        Array.Copy(imgHost, imgAfter0, imgLen);
+                        for (int layer = 1; layer < NumLayers; layer++)
+                            RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+                        var rem = state.RemainingResidual ?? new float[imgLen];
+                        for (long i = 0; i < imgLen; i++) rem[i] = imgHost[i] - imgAfter0[i];
+                        state.RemainingResidual = rem;
+                        _cacheComputed++;
                     }
                 }
+
                 img = HostToTensor(imgHost, imgSeq, Dim);
                 txt = HostToTensor(txtHost, txtSeq, Dim);
             }
@@ -146,6 +176,27 @@ namespace TensorSharp.Models.QwenImage
             outT.Dispose();
             if (DebugOn) { var st = Stat(velocity, velocity.Length); Console.WriteLine($"  [dit] velocity {st}"); }
             return velocity;
+        }
+
+        // Run one block of the native per-block path (the body of the block loop),
+        // updating imgHost/txtHost in place. Factored out so First-Block-Cache can run
+        // block 0 alone, decide, then optionally run the remaining blocks.
+        private void RunNativeLayer(int layer, float[] imgHost, int imgSeq, float[] txtHost, int txtSeq,
+            Tensor temb, int[] modulateIndex, DitRope rope)
+        {
+            string bn = $"transformer_blocks.{layer}";
+            float[] imgMod = ModParams(temb, $"{bn}.img_mod.1.weight", $"{bn}.img_mod.1.bias");
+            float[] txtMod = ModParams(temb, $"{bn}.txt_mod.1.weight", $"{bn}.txt_mod.1.bias");
+            if (FusedBlockOn)
+            {
+                NativeBlock(imgHost, imgSeq, txtHost, txtSeq, imgMod, txtMod, modulateIndex, rope, layer);
+            }
+            else
+            {
+                NativeAttnSubLayer(imgHost, imgSeq, txtHost, txtSeq, imgMod, txtMod, modulateIndex, rope, layer);
+                NativeMlpSubLayer(imgHost, imgSeq, imgMod, modulateIndex, $"{bn}.img_mlp");
+                NativeMlpSubLayer(txtHost, txtSeq, txtMod, null, $"{bn}.txt_mlp");
+            }
         }
 
         // ---- one double-stream block ---------------------------------------

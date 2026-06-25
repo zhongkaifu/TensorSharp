@@ -113,18 +113,21 @@ namespace TensorSharp.Models.QwenImage
             // 6. denoise loop
             var imgTokens = new float[(long)imgSeq * 64];
             Array.Copy(refPacked, 0, imgTokens, (long)seq * 64, (long)seq * 64);  // ref part fixed
+            Dit.ResetCache(sched.Steps);   // First-Block-Cache: fresh state per generation
             for (int step = 0; step < sched.Steps; step++)
             {
                 Array.Copy(latents, 0, imgTokens, 0, (long)seq * 64);             // gen part = current latents
                 float t01 = sched.Sigmas[step];   // FlowMatch: timestep == sigma
-                float[] vel = Dit.Predict(imgTokens, imgSeq, cond, txtSeq, t01, modulateIndex, rope);
+                float[] vel = Dit.Predict(imgTokens, imgSeq, cond, txtSeq, t01, modulateIndex, rope,
+                    stepIndex: step, totalSteps: sched.Steps, cfgBranch: 0, genTokens: seq);
                 // keep only the generated region
                 var v = new float[(long)seq * 64];
                 Array.Copy(vel, 0, v, 0, v.Length);
 
                 if (doCfg)
                 {
-                    float[] velNeg = Dit.Predict(imgTokens, imgSeq, negCond, negTxt, t01, modulateIndex, ropeNeg);
+                    float[] velNeg = Dit.Predict(imgTokens, imgSeq, negCond, negTxt, t01, modulateIndex, ropeNeg,
+                        stepIndex: step, totalSteps: sched.Steps, cfgBranch: 1, genTokens: seq);
                     // true-CFG: comb = neg + scale*(cond-neg), then renorm to cond norm (per token row)
                     TrueCfg(v, velNeg, seq, p.CfgScale);
                 }
@@ -135,6 +138,7 @@ namespace TensorSharp.Models.QwenImage
                     Console.Write($"\r  denoise step {step + 1}/{sched.Steps}   ");
             }
             Console.WriteLine();
+            if (Dit.CacheEnabled) Console.WriteLine($"  [pipe] DiT cache: {Dit.CacheStats()}");
             Phase($"denoise ({sched.Steps} steps)");
 
             // 7. unpack -> denormalize -> VAE decode
