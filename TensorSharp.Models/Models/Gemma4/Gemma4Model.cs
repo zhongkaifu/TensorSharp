@@ -722,7 +722,10 @@ namespace TensorSharp.Models
             // The persistent fused-decode graph pins the KV-cache device buffers;
             // a reset/clear invalidates them, so drop the cached graph too.
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
+            }
             DisposeSwaPrevWindows();
             if (_kvCacheK == null) return;
             var cleared = new HashSet<int>();
@@ -1079,7 +1082,31 @@ namespace TensorSharp.Models
             // layers, activations device-resident) — see CanUseWholeModelPrefillVerify.
             bool useWholeModelPrefill = CanUseWholeModelPrefillVerify(startPos, seqLen, exceptPositions);
 
-            if (!useFusedDecode && !useWholeModelPrefill)
+            // Any multi-token forward (prefill) grows ggml-cuda's compute scratch
+            // pool, which can move the device addresses baked into the persistent
+            // CUDA-graph-captured decode graphs. Drop them so the next fused decode
+            // rebuilds + re-captures against the current pool — otherwise replaying a
+            // stale captured graph HANGS (spins on the host with the GPU idle). This
+            // backstops the resets in PrefillWithoutLogits/ResetKVCache/BatchedForward
+            // for any prefill that reaches Forward directly (e.g. the CLI's single
+            // ForwardRefill, or a multi-turn follow-up prompt).
+            if (seqLen > 1 && _backend == BackendType.GgmlCuda)
+            {
+                GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
+            }
+
+            // The fused MoE whole-model decode (TryFusedMoEModelDecode) writes the KV
+            // cache on-device and keeps the whole token resident, exactly like the
+            // dense useFusedDecode path. Without this predicate the guard below would
+            // fall through and copy the ENTIRE KV cache device->host every decode
+            // token (~360 MB / ~40 ms over PCIe on the 26B-A4B) — which dwarfed the
+            // ~11 ms fused decode and was the real bottleneck (decode stuck ~19 tok/s
+            // even with the captured graph). Skipping it lifts decode toward the
+            // kernel floor.
+            bool useFusedMoEDecode = WillUseFusedMoEModelDecode(seqLen, exceptPositions, perLayerInputs);
+
+            if (!useFusedDecode && !useFusedMoEDecode && !useWholeModelPrefill)
                 EnsureKvCacheHostSynchronized();
 
             long pLayers = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
@@ -1113,20 +1140,22 @@ namespace TensorSharp.Models
                 _kvCacheHostDirty = true;
             }
             else if (seqLen == 1 && exceptPositions == null && perLayerInputs == null
-                     && TryFusedMoEModelDecode(hidden, startPos))
+                     && TryFusedMoEModelDecode(hidden, startPos, EnsureFoldLogitsBuffer(), out decodeFolded))
             {
                 // Whole MoE transformer ran as ONE fused GGML graph (one
-                // dispatch/sync this token instead of one per layer).
-                // _kvCacheHostDirty is set inside TryFusedMoEModelDecode. This
-                // branch is skipped (per-layer loop below runs) when the shape is
-                // unsupported or the model-wide kernel is disabled.
+                // dispatch/sync this token instead of one per layer). When
+                // decodeFolded is true the graph also produced the logits (final
+                // norm + lm_head + softcap folded in) → the C# LM-head tail is
+                // skipped. _kvCacheHostDirty is set inside TryFusedMoEModelDecode.
+                // This branch is skipped (per-layer loop below runs) when the shape
+                // is unsupported or the model-wide kernel is disabled.
             }
             else
             {
-                // If the whole-model prefill kernel was eligible but bailed at
-                // runtime, we skipped the host KV sync above; restore it before
-                // the per-op path reads the cache from host memory.
-                if (useWholeModelPrefill)
+                // If the whole-model prefill kernel OR the fused MoE decode was
+                // eligible but bailed at runtime, we skipped the host KV sync above;
+                // restore it before the per-op path reads the cache from host memory.
+                if (useWholeModelPrefill || useFusedMoEDecode)
                     EnsureKvCacheHostSynchronized();
 
                 // Save donor SWA layer's freshly-computed K/V so KV-shared SWA
@@ -1655,7 +1684,10 @@ namespace TensorSharp.Models
             // decode graph. Drop it so the next fused decode rebuilds + re-captures
             // against the post-prefill pool state (mirrors Qwen3.5's reseed drop).
             if (seqLen > 1 && _backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
+            }
 
             int startPos = _cacheSeqLen;
             bool useFusedDecode = seqLen == 1 && _canUseFusedFullModelDecode;
@@ -2215,6 +2247,15 @@ namespace TensorSharp.Models
         private static readonly bool _fdFoldLmHead =
             Environment.GetEnvironmentVariable("TS_GEMMA4_FD_FOLD_LMHEAD") != "0";
 
+        /// <summary>Lazily (re)allocate the vocab-sized logits buffer the folded
+        /// fused-decode path writes into, and return it.</summary>
+        private float[] EnsureFoldLogitsBuffer()
+        {
+            if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
+                _logitsBuffer = new float[Config.VocabSize];
+            return _logitsBuffer;
+        }
+
         // Runs the fused full-model decode. When <paramref name="foldLogitsOut"/> is
         // non-null and the output weight is quantized, the final-norm + lm_head +
         // softcap are folded into the graph and the resulting logits[vocab] are
@@ -2588,8 +2629,29 @@ namespace TensorSharp.Models
         /// isn't supported (PLE, KV donors, any non-MoE layer, block-quant KV) or a
         /// layer's weights are missing. Permanently disabled if the kernel throws.
         /// Output is numerically identical to the per-layer path (same graph nodes).</summary>
-        private unsafe bool TryFusedMoEModelDecode(Tensor hidden, int startPos)
+        /// <summary>Predict (without running it) whether <see cref="TryFusedMoEModelDecode"/>
+        /// will take the fused on-device whole-model MoE decode path for this step.
+        /// Used by Forward to skip the per-token KV host-sync (the fused path keeps
+        /// the KV cache device-resident). Mirrors the eligibility check inside
+        /// TryFusedMoEModelDecode and primes the same lazily-computed flag.</summary>
+        private bool WillUseFusedMoEModelDecode(int seqLen, HashSet<int> exceptPositions, Tensor perLayerInputs)
         {
+            if (seqLen != 1 || exceptPositions != null || perLayerInputs != null) return false;
+            if (_moeModelDecodeDisabled || !s_MoeModelDecodeEnabled) return false;
+            if (!_moeModelDecodeChecked)
+            {
+                _moeModelDecodeChecked = true;
+                _canUseFusedMoEModelDecode =
+                    IsGgmlBackend && _decodeArrays != null && _moeFusedDecodeEnabled
+                    && _pleDim == 0 && _kvDonorMap.Count == 0
+                    && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
+            }
+            return _canUseFusedMoEModelDecode;
+        }
+
+        private unsafe bool TryFusedMoEModelDecode(Tensor hidden, int startPos, float[] foldLogitsOut, out bool folded)
+        {
+            folded = false;
             if (_moeModelDecodeDisabled || !s_MoeModelDecodeEnabled) return false;
             if (!_moeModelDecodeChecked)
             {
@@ -2617,14 +2679,52 @@ namespace TensorSharp.Models
                 }
             }
 
+            // Resolve the fold inputs (quantized lm_head = tied token_embd / output +
+            // F32 output_norm). Folding the final-norm + lm_head + softcap into the
+            // captured graph is what keeps CUDA-graph capture stable: a separate
+            // per-token C# lm_head dispatch between captured replays forces the
+            // ggml-cuda graph to re-instantiate every token (measured net-NEGATIVE
+            // for MoE). Only engages for a quantized output weight; an F32-output
+            // model keeps the (slower) C# tail.
+            bool doFold = false;
+            IntPtr lmHeadKey = IntPtr.Zero; int lmHeadType = 0; long lmHeadNe0 = 0, lmHeadNe1 = 0, lmHeadBytes = 0;
+            IntPtr finalNormPtr = IntPtr.Zero;
+            if (foldLogitsOut != null && _fdFoldLmHead
+                && _weights.TryGetValue("output_norm.weight", out var finalNormT)
+                && _quantWeights.TryGetValue(_hasTiedOutput ? "token_embd.weight" : "output.weight", out var lmqw))
+            {
+                lmHeadKey = lmqw.CacheKey;
+                lmHeadType = lmqw.GgmlType;
+                lmHeadNe0 = lmqw.Ne0;
+                lmHeadNe1 = lmqw.Ne1;
+                lmHeadBytes = lmqw.RawBytes;
+                finalNormPtr = (IntPtr)GetFloatPtr(finalNormT);
+                doFold = true;
+            }
+
             try
             {
-                GgmlBasicOps.Gemma4MoEModelDecode(_moeModelArgs, n, hiddenPtr, Config.HiddenSize, startPos);
+                if (doFold)
+                {
+                    fixed (float* logitsPtr = foldLogitsOut)
+                    {
+                        GgmlBasicOps.Gemma4MoEModelDecode(_moeModelArgs, n, hiddenPtr, Config.HiddenSize, startPos,
+                            (IntPtr)logitsPtr, Config.VocabSize,
+                            lmHeadKey, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                            finalNormPtr, _finalLogitSoftcap);
+                    }
+                    folded = true;
+                }
+                else
+                {
+                    GgmlBasicOps.Gemma4MoEModelDecode(_moeModelArgs, n, hiddenPtr, Config.HiddenSize, startPos);
+                }
             }
             catch (Exception ex)
             {
                 System.Console.WriteLine($"[gemma4] fused MoE model decode disabled after error: {ex.Message}");
                 _moeModelDecodeDisabled = true;
+                folded = false;
                 return false;
             }
             _kvCacheHostDirty = true;
@@ -2651,6 +2751,13 @@ namespace TensorSharp.Models
                     && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
             }
             if (!_canUseFusedMoEModelDecode) return false;
+
+            // The verify uses gallocr scratch that grows/moves the ggml-cuda compute
+            // pool, which can shift the addresses baked into the persistent
+            // CUDA-graph-captured decode graph. Drop it so the next plain-step decode
+            // rebuilds + re-captures against the post-verify pool state.
+            if (_backend == BackendType.GgmlCuda)
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
 
             int layerCount = Config.NumLayers;
             _moeVerifyArgs ??= new Gemma4MoELayerDecodeArgs[layerCount];

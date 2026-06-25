@@ -1576,11 +1576,26 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4MoEModelDecode(
             [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int position);
+            IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap);
 
         public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position)
         {
-            CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position), nameof(TSGgml_Gemma4MoEModelDecode));
+            CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
+                IntPtr.Zero, 0, IntPtr.Zero, 0, 0, 0, 0, IntPtr.Zero, 0.0f), nameof(TSGgml_Gemma4MoEModelDecode));
+        }
+
+        // Folded variant: appends final-norm + lm_head + softcap so logits[vocab] are
+        // written to <paramref name="logits"/> as part of the captured replay.
+        public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap)
+        {
+            CheckResult(TSGgml_Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap),
+                nameof(TSGgml_Gemma4MoEModelDecode));
         }
 
         // Model-wide MoE multi-token verify: the whole MoE transformer over N tokens
@@ -1623,6 +1638,11 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_Gemma4ResetDecodeCache();
 
         public static void Gemma4ResetDecodeCache() => TSGgml_Gemma4ResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4MoEResetDecodeCache();
+
+        public static void Gemma4MoEResetDecodeCache() => TSGgml_Gemma4MoEResetDecodeCache();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Qwen35ResetVerifyCache();

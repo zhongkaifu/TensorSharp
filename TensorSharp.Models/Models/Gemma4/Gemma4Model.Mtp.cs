@@ -378,7 +378,7 @@ namespace TensorSharp.Models
             {
                 RefreshDecodeArraysKvCache();
                 usedFused = seqLen == 1
-                    ? TryFusedMoEModelDecode(h, startPos)
+                    ? TryFusedMoEModelDecode(h, startPos, null, out _)   // spec wants bare hidden (own norm+lm_head)
                     : TryFusedMoEModelVerify(h, startPos, seqLen);
             }
             if (usedFused)

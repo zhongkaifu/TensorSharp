@@ -6066,10 +6066,75 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
 // The per-layer descriptor array reuses TSGgmlGemma4MoELayerDesc unchanged;
 // `hidden`/`position` are taken from the shared params, the per-desc copies are
 // ignored.
+//
+// PERSIST / CUDA-graph capture (g_g4moe): the exact analogue of the dense
+// g_g4dc. Without it this kernel rebuilds the whole-model graph and re-binds
+// every weight per token, and the position-dependent KV-cache view offset +
+// attention window make the graph topology change token-to-token, so
+// ggml-cuda's CUDA-graph capture never engages — on WDDM the GPU is starved in
+// the per-node scheduling gaps (~16 tok/s, 92% host "Other"). With persist the
+// graph is built ONCE with stable tensor addresses (raw ggml ctx +
+// alloc_ctx_tensors); the KV write uses ggml_set_rows (write row = an I64
+// INPUT) and attention reads a FIXED padded window [0, window) with an F16 mask
+// INPUT, so the topology is identical token-to-token and capture engages. The
+// window is padded up to a 256-token stride so it only changes (forcing a
+// rebuild) every 256 tokens. Dropped + rebuilt when any layer window grows a
+// stride, the model instance changes, or the KV-cache buffer is reallocated
+// (TSGgml_Gemma4MoEResetDecodeCache, called by C# before any prefill / on KV
+// reset). MoE Gemma 4 has no PLE and no KV-donor (shared) layers, so the
+// persist bookkeeping is simpler than the dense path's.
 // ============================================================================
+namespace
+{
+    constexpr int kG4MoePersistKvStride = 256;
+
+    struct G4MoEDecodeCache
+    {
+        bool valid = false;
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_cgraph* graph = nullptr;
+        ggml_tensor* hidden_in = nullptr;
+        ggml_tensor* hidden_out = nullptr;
+        ggml_tensor* pos_tensor = nullptr;
+        std::vector<ggml_tensor*> kv_index;          // per-layer I64 set_rows write row
+        std::vector<ggml_tensor*> attn_mask;         // per-layer F16 padding mask
+        std::vector<int> layer_window;               // per-layer padded window length
+        const void* sig_disc = nullptr;              // model-instance discriminator (attn_norm[0])
+        const void* sig_kcache0 = nullptr;           // first KV buffer ptr (detects realloc/grow)
+        int num_layers = 0;
+        int hidden_size = 0;
+        bool folded = false;                         // hidden_out holds logits (final norm + lm_head folded in)
+        int out_count = 0;                           // floats to download (vocab when folded, else hidden)
+
+        void reset()
+        {
+            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
+            graph = nullptr; valid = false;
+            hidden_in = hidden_out = pos_tensor = nullptr;
+            kv_index.clear(); attn_mask.clear(); layer_window.clear();
+            sig_disc = sig_kcache0 = nullptr;
+            num_layers = hidden_size = 0;
+            folded = false; out_count = 0;
+        }
+    };
+    G4MoEDecodeCache g_g4moe;
+}
+
 TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
     const TSGgmlGemma4MoELayerDesc* layers, int num_layers,
-    void* hidden_data, int hidden_size, int position)
+    void* hidden_data, int hidden_size, int position,
+    // Folded final-norm + lm_head (nullable). When logits_data / lm_head_data /
+    // final_norm_data are non-null and vocab_size > 0, the graph appends the
+    // output RMSNorm, the lm_head matmul and (when logit_softcap > 0) the tanh
+    // logit softcap, writing logits[vocab] to logits_data so the whole token —
+    // including the 256K-vocab projection — is one captured replay (no separate
+    // per-token lm_head graph_compute disturbing the captured graph). The C#
+    // caller then skips its own final-norm/lm_head/softcap dispatches.
+    void* logits_data, int vocab_size,
+    const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
+    const void* final_norm_data, float logit_softcap)
 {
     try
     {
@@ -6100,21 +6165,129 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         const float eps = layers[0].eps;
         const int kvType = layers[0].kv_cache_type;
 
-        // ctx holds only tensor metadata (no_alloc: data is bound externally), so a
-        // pooled 32 MB block (the pool's max, also used by the dense model-wide
-        // decode) holds all ~60 tensors/layer + the graph for 30+ layers with large
-        // headroom (actual use is ~1-2 MB).
+        // Fold final-norm + lm_head into the graph when the caller supplies them.
+        const bool fold = logits_data != nullptr && lm_head_data != nullptr &&
+                          final_norm_data != nullptr && vocab_size > 0;
+        const int out_count = fold ? vocab_size : H;
+
+        // ===== Persist / CUDA-graph capture setup (mirrors dense g_g4dc) =====
+        static const bool g4moe_timing = std::getenv("TS_GEMMA4_FD_TIMING") != nullptr;
+        static const bool g4moe_persist = []{ const char* e = std::getenv("TS_GEMMA4_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
+
+        std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
+        std::vector<int> pvalid(num_layers, 0);           // unmasked (valid) length per layer
+        std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
+        bool can_persist = g4moe_persist;
+        {
+            auto roundup_stride = [](int v){ return ((v + kG4MoePersistKvStride - 1) / kG4MoePersistKvStride) * kG4MoePersistKvStride; };
+            for (int l = 0; l < num_layers; l++)
+            {
+                const int csz = layers[l].cache_size;
+                if (csz <= 0) { can_persist = false; break; }
+                const bool isLocal = layers[l].is_local != 0;
+                if (isLocal)
+                {
+                    if (totalSeqLen <= csz) { pwindow[l] = std::min(csz, roundup_stride(totalSeqLen)); pvalid[l] = totalSeqLen; }
+                    else { pwindow[l] = csz; pvalid[l] = csz; }   // saturated: read whole circular cache flat
+                    pwrite[l] = position % csz;
+                }
+                else
+                {
+                    pwindow[l] = std::min(csz, roundup_stride(totalSeqLen)); pvalid[l] = totalSeqLen;
+                    pwrite[l] = position;
+                    // A global cache that already overflowed can't be expressed as a
+                    // single padded window -> let the legacy per-token path handle it.
+                    if (pvalid[l] > pwindow[l]) { can_persist = false; break; }
+                }
+            }
+        }
+        const void* g4moe_sig = layers[0].attn_norm_w;
+        const void* g4moe_kc0 = layers[0].k_cache;
+
+        // ---- reuse fast-path: replay the captured graph ----
+        if (can_persist && g_g4moe.valid && g_g4moe.graph != nullptr &&
+            g_g4moe.num_layers == num_layers && g_g4moe.hidden_size == H &&
+            g_g4moe.sig_disc == g4moe_sig && g_g4moe.sig_kcache0 == g4moe_kc0 &&
+            g_g4moe.layer_window == pwindow &&
+            g_g4moe.folded == fold && g_g4moe.out_count == out_count)
+        {
+            auto t_start = std::chrono::high_resolution_clock::now();
+            host_read_barrier();
+            ggml_backend_tensor_set(g_g4moe.hidden_in, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+            std::int32_t pos_val = position;
+            ggml_backend_tensor_set(g_g4moe.pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (g_g4moe.kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(g_g4moe.kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (g_g4moe.attn_mask[l] != nullptr)
+                {
+                    std::vector<ggml_fp16_t> md;
+                    fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
+                    ggml_backend_tensor_set(g_g4moe.attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                }
+            }
+            auto t_setup = std::chrono::high_resolution_clock::now();
+            ggml_status st = ggml_backend_graph_compute(g_backend, g_g4moe.graph);
+            if (st != GGML_STATUS_SUCCESS)
+            {
+                set_last_error("Gemma4 MoE model decode: cached graph execution failed.");
+                g_g4moe.reset();
+                return 0;
+            }
+            auto t_compute = std::chrono::high_resolution_clock::now();
+            void* reuse_out = g_g4moe.folded ? logits_data : hidden_data;
+            finalize_compute_with_download(g_g4moe.hidden_out, reuse_out, static_cast<std::size_t>(g_g4moe.out_count) * sizeof(float));
+            host_read_barrier();
+            if (g4moe_timing)
+            {
+                auto t_end = std::chrono::high_resolution_clock::now();
+                auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
+                fprintf(stderr, "[g4moe-fd] REUSE setup=%.2f compute=%.2f download=%.2f total=%.2f ms\n",
+                    ms(t_start, t_setup), ms(t_setup, t_compute), ms(t_compute, t_end), ms(t_start, t_end));
+                fflush(stderr);
+            }
+            return 1;
+        }
+        if (can_persist)
+            g_g4moe.reset();   // window grew a stride / shape change -> rebuild below
+
+        // ctx holds only tensor metadata (no_alloc: data is bound externally). Non-
+        // persist uses a pooled 32 MB block; persist uses a raw ctx kept alive in
+        // g_g4moe for graph reuse + CUDA-graph capture (stable tensor addresses).
         const std::size_t ctx_size = 32 * 1024 * 1024;
         PooledContextHandle context;
-        if (!context.init(ctx_size))
+        ggml_context* ctx = nullptr;
+        if (can_persist)
         {
-            set_last_error("Gemma4 MoE model decode: failed to acquire ggml context.");
-            return 0;
+            ggml_init_params ip = { ctx_size, nullptr, /*no_alloc=*/true };
+            ctx = ggml_init(ip);
+            if (ctx == nullptr)
+            {
+                set_last_error("Gemma4 MoE model decode: failed to init persist ggml context.");
+                return 0;
+            }
         }
-        ggml_context* ctx = context.value;
+        else
+        {
+            if (!context.init(ctx_size))
+            {
+                set_last_error("Gemma4 MoE model decode: failed to acquire ggml context.");
+                return 0;
+            }
+            ctx = context.value;
+        }
+
+        // Per-layer persist inputs (created in the build loop; null in legacy mode).
+        std::vector<ggml_tensor*> layer_kv_index(num_layers, nullptr);
 
         ggml_tensor* hidden_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        if (can_persist)
+        {
+            ggml_set_input(hidden_t);
+            ggml_set_input(pos_tensor);
+        }
 
         // Single shared rope_freqs tensor (same weight across all global layers).
         ggml_tensor* freq_factors_t = nullptr;
@@ -6266,24 +6439,47 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             ggml_tensor* k_write = ggml_cont(ctx, k_rope_perm);
             ggml_tensor* v_write = ggml_cont(ctx, v_perm);
 
-            const int cachePos = isLocal ? (position % cacheSize) : position;
-            const int activeStart = isLocal ? ((totalSeqLen - attendLen) % cacheSize) : 0;
-            const int attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
-            const std::size_t kv_byte_offset = static_cast<std::size_t>(cachePos) * t.k_cached_t->nb[1];
-            ggml_tensor* k_dst = ggml_view_3d(ctx, t.k_cached_t, hd, 1, kvH, t.k_cached_t->nb[1], t.k_cached_t->nb[2], kv_byte_offset);
-            ggml_tensor* v_dst = ggml_view_3d(ctx, t.v_cached_t, hd, 1, kvH, t.v_cached_t->nb[1], t.v_cached_t->nb[2], kv_byte_offset);
-            t.k_cpy = ggml_cpy(ctx, k_write, k_dst);
-            t.v_cpy = ggml_cpy(ctx, v_write, v_dst);
-            if (flash_attn_requires_masked_padding(hd))
+            ggml_tensor* k_full;
+            ggml_tensor* v_full;
+            if (can_persist)
             {
-                t.attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
-                fill_flash_attn_mask(t.attn_mask_data, attnKvLen, attendLen);
+                // KV write via set_rows: the write row is an I64 INPUT, so the graph
+                // topology is identical token-to-token (capturable). Attention reads
+                // a FIXED padded window [0, win) with an F16 mask INPUT zeroing valid
+                // positions and -inf'ing the padding.
+                const int win = pwindow[l];
+                ggml_tensor* kv_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1);
+                ggml_set_input(kv_idx);
+                layer_kv_index[l] = kv_idx;
+                t.k_cpy = ggml_set_rows(ctx, t.k_cached_t, k_write, kv_idx);
+                t.v_cpy = ggml_set_rows(ctx, t.v_cached_t, v_write, kv_idx);
+                t.attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, win, 1, 1, 1);
+                ggml_set_input(t.attn_mask);
+                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, 0, win, kvType);
+                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, 0, win, kvType);
             }
-            ggml_tensor* k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
-            ggml_tensor* v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+            else
+            {
+                const int cachePos = isLocal ? (position % cacheSize) : position;
+                const int activeStart = isLocal ? ((totalSeqLen - attendLen) % cacheSize) : 0;
+                const int attnKvLen = flash_attn_kv_length(attendLen, cacheSize, hd);
+                const std::size_t kv_byte_offset = static_cast<std::size_t>(cachePos) * t.k_cached_t->nb[1];
+                ggml_tensor* k_dst = ggml_view_3d(ctx, t.k_cached_t, hd, 1, kvH, t.k_cached_t->nb[1], t.k_cached_t->nb[2], kv_byte_offset);
+                ggml_tensor* v_dst = ggml_view_3d(ctx, t.v_cached_t, hd, 1, kvH, t.v_cached_t->nb[1], t.v_cached_t->nb[2], kv_byte_offset);
+                t.k_cpy = ggml_cpy(ctx, k_write, k_dst);
+                t.v_cpy = ggml_cpy(ctx, v_write, v_dst);
+                if (flash_attn_requires_masked_padding(hd))
+                {
+                    t.attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attnKvLen, 1, 1, 1);
+                    fill_flash_attn_mask(t.attn_mask_data, attnKvLen, attendLen);
+                }
+                k_full = view_kv_cache_window(ctx, t.k_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+                v_full = view_kv_cache_window(ctx, t.v_cached_t, hd, cacheSize, kvH, activeStart, attnKvLen, kvType);
+            }
             if (k_full == nullptr || v_full == nullptr)
             {
                 set_last_error("Gemma4 MoE model decode: failed to build KV cache views.");
+                if (can_persist) ggml_free(ctx);
                 return 0;
             }
 
@@ -6356,8 +6552,35 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             hidden = result;
         }
 
-        ggml_tensor* hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
-        ggml_tensor* out_cpy = ggml_cpy(ctx, hidden, hidden_out);
+        // Output: either the bare hidden state, or — when folding — the final
+        // RMSNorm * output_norm, the lm_head projection and the tanh logit softcap,
+        // so the 256K-vocab logits are part of the captured replay.
+        ggml_tensor* lm_head_t = nullptr;
+        ggml_tensor* final_norm_t = nullptr;
+        ggml_tensor* hidden_out;
+        ggml_tensor* out_cpy;
+        if (fold)
+        {
+            lm_head_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
+            final_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+            ggml_tensor* fn = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), final_norm_t);
+            ggml_tensor* fn_2d = ggml_reshape_2d(ctx, fn, H, 1);
+            ggml_tensor* logits = ggml_mul_mat(ctx, lm_head_t, fn_2d);   // [vocab, 1]
+            if (logit_softcap > 0.0f)
+            {
+                logits = ggml_scale(ctx, logits, 1.0f / logit_softcap);
+                logits = ggml_tanh(ctx, logits);
+                logits = ggml_scale(ctx, logits, logit_softcap);
+            }
+            logits = ggml_reshape_1d(ctx, logits, vocab_size);
+            hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
+            out_cpy = ggml_cpy(ctx, logits, hidden_out);
+        }
+        else
+        {
+            hidden_out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+            out_cpy = ggml_cpy(ctx, hidden, hidden_out);
+        }
         ggml_set_output(out_cpy);
 
         // KV writes first so they are ordered before the reads (mirrors the dense
@@ -6452,19 +6675,34 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         }
         if (freq_factors_t != nullptr)
             bind_or_mark(freq_factors_t, freq_data, static_cast<std::size_t>(freq_len) * sizeof(float), true);
+        if (fold)
+        {
+            bind_or_mark(lm_head_t, const_cast<void*>(lm_head_data), static_cast<std::size_t>(lm_head_bytes), true);
+            bind_or_mark(final_norm_t, const_cast<void*>(final_norm_data), static_cast<std::size_t>(H) * sizeof(float), true);
+        }
 
-        // Peak-packed gallocr (shared with the MoE verify), NOT the linear
-        // alloc_ctx_tensors_reuse bump allocator. The whole-model decode graph is
-        // ~4000 tensors across all layers; the bump allocator's footprint is the
-        // SUM of every intermediate (~870 MB on the 26B-A4B), which — on top of the
-        // ~16.8 GB resident weights/KV (92% of Metal's ~18 GB working set) and the
-        // verify's own gallocr — exhausts the budget and OOMs. gallocr packs by
-        // tensor LIFETIME (peak, ~10-20x smaller) and the decode reuses the SAME
-        // persistent buffer the verify grew, so the two together cost one peak, not
-        // the sum of both. Falls back to the per-call ctx allocation if gallocr is
-        // unavailable (non-Metal / disabled).
+        // Non-persist (legacy / TS_GEMMA4_FD_PERSIST=0) keeps the peak-packed gallocr
+        // (shared with the MoE verify): the bump allocator's footprint is the SUM of
+        // every intermediate (~870 MB on the 26B-A4B), which on top of the ~16 GB
+        // resident weights/KV would OOM; gallocr packs by tensor LIFETIME (peak).
+        // Persist: stable tensor addresses (every intermediate its own slot) so the
+        // built graph + KV buffers keep fixed addresses for CUDA-graph capture; the
+        // ctx/graph/buffer are kept alive in g_g4moe. The N=1 padded-window decode's
+        // intermediate footprint is small (a few MB), unlike the verify's. Non-
+        // persist keeps the peak-packed gallocr (the original behaviour).
         BufferHandle buffer(nullptr);
-        if (!alloc_graph_reuse_gallocr(graph))
+        ggml_backend_buffer_t persist_buf = nullptr;
+        if (can_persist)
+        {
+            persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (persist_buf == nullptr)
+            {
+                set_last_error("Gemma4 MoE model decode: failed to allocate persist backend buffer.");
+                ggml_free(ctx);
+                return 0;
+            }
+        }
+        else if (!alloc_graph_reuse_gallocr(graph))
         {
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (buffer.value == nullptr)
@@ -6484,19 +6722,58 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, freq_data, 0, static_cast<std::size_t>(freq_len) * sizeof(float));
+        if (can_persist)
+        {
+            // Per-token inputs for the first build (the reuse path updates these).
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (layer_kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(layer_kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (lt[l].attn_mask != nullptr)
+                {
+                    std::vector<ggml_fp16_t> md;
+                    fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
+                    ggml_backend_tensor_set(lt[l].attn_mask, md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                }
+            }
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("Gemma4 MoE model decode: graph execution failed.");
+            if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
             return 0;
         }
 
-        finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(H) * sizeof(float));
+        void* out_data = fold ? logits_data : hidden_data;
+        finalize_compute_with_download(hidden_out, out_data, static_cast<std::size_t>(out_count) * sizeof(float));
         // If we used the per-call fallback buffer (not the persistent gallocr),
         // drain the queued async download before BufferHandle frees it. No-op on
         // the common gallocr path (buffer.value == nullptr).
-        if (buffer.value != nullptr) host_read_barrier();
+        if (buffer.value != nullptr || can_persist) host_read_barrier();
+
+        if (can_persist)
+        {
+            // Keep the ctx/graph/buffer + input handles alive for capture+replay.
+            g_g4moe.ctx = ctx;
+            g_g4moe.buffer = persist_buf;
+            g_g4moe.graph = graph;
+            g_g4moe.hidden_in = hidden_t;
+            g_g4moe.hidden_out = hidden_out;
+            g_g4moe.pos_tensor = pos_tensor;
+            g_g4moe.kv_index = layer_kv_index;
+            g_g4moe.attn_mask.resize(num_layers);
+            for (int l = 0; l < num_layers; l++) g_g4moe.attn_mask[l] = lt[l].attn_mask;
+            g_g4moe.layer_window = pwindow;
+            g_g4moe.sig_disc = g4moe_sig;
+            g_g4moe.sig_kcache0 = g4moe_kc0;
+            g_g4moe.num_layers = num_layers;
+            g_g4moe.hidden_size = H;
+            g_g4moe.folded = fold;
+            g_g4moe.out_count = out_count;
+            g_g4moe.valid = true;
+        }
         clear_last_error();
         return 1;
     }
@@ -6510,6 +6787,17 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         set_last_error("Unknown error in Gemma4 MoE model decode.");
         return 0;
     }
+}
+
+// Drop the persistent (CUDA-graph-captured) Gemma4 MoE decode graph. The captured
+// graph pins ggml-cuda's compute-pool scratch addresses and the KV-cache device
+// buffers; a prefill (which grows the pool) or a KV reset/grow can move those, so
+// the C# caller drops the cache before any prefill and on ResetKVCache. The next
+// decode rebuilds + re-captures against the current pool state. No-op when persist
+// mode is off (the cache is never populated).
+TSG_EXPORT void TSGgml_Gemma4MoEResetDecodeCache()
+{
+    g_g4moe.reset();
 }
 
 // ============================================================================

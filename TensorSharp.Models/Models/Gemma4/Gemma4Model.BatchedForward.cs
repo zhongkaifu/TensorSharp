@@ -77,7 +77,10 @@ namespace TensorSharp.Models
             // graph. Drop it so the next per-seq fused Forward rebuilds + recaptures
             // against the current pool state (see Gemma4ResetDecodeCache).
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4MoEResetDecodeCache();
+            }
 
             // Disable gate. The batched path is now the DEFAULT for Gemma 4
             // (correctness verified against legacy through 42 layers; see

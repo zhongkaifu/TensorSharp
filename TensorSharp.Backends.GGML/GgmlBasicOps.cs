@@ -1681,6 +1681,18 @@ namespace TensorSharp.GGML
             GgmlNative.Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position);
         }
 
+        /// <summary>Folded variant: appends final-norm + lm_head + (tanh) softcap to
+        /// the captured graph, writing logits[vocab] to <paramref name="logits"/> so
+        /// the whole token is one CUDA-graph replay (no separate lm_head dispatch
+        /// disturbing the captured decode graph).</summary>
+        public static void Gemma4MoEModelDecode(Gemma4MoELayerDecodeArgs[] layers, int numLayers, IntPtr hidden, int hiddenSize, int position,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap)
+        {
+            GgmlNative.Gemma4MoEModelDecode(layers, numLayers, hidden, hiddenSize, position,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap);
+        }
+
         /// <summary>
         /// Run the entire Qwen3.5/3.6 hybrid transformer (full-attention +
         /// GatedDeltaNet recurrent layers + per-layer FFN) as ONE GGML graph per
@@ -1695,6 +1707,12 @@ namespace TensorSharp.GGML
         /// prefill and on KV reset/grow so the next fused decode rebuilds against
         /// the current ggml-cuda pool / KV-buffer state).</summary>
         public static void Gemma4ResetDecodeCache() => GgmlNative.Gemma4ResetDecodeCache();
+
+        /// <summary>Drop the persistent Gemma4 MoE whole-model decode-graph cache
+        /// (CUDA-graph-captured). Call before any prefill and on KV reset/grow so the
+        /// next fused MoE decode rebuilds + re-captures against the current
+        /// ggml-cuda pool / KV-buffer state.</summary>
+        public static void Gemma4MoEResetDecodeCache() => GgmlNative.Gemma4MoEResetDecodeCache();
 
         public static void Qwen35ResetVerifyCache() => GgmlNative.Qwen35ResetVerifyCache();
 
