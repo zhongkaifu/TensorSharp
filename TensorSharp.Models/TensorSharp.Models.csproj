@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
+    <InternalsVisibleTo Include="QwenImageEditBench" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />

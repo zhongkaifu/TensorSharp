@@ -25,6 +25,10 @@ namespace TensorSharp.Server.Endpoints
         {
             endpoints.MapPost("/api/upload",
                 (HttpRequest req, WebUiAdapter adapter) => adapter.UploadAsync(req));
+            // Qwen-Image-Edit: prompt + image -> generated (downloadable) image.
+            endpoints.MapPost("/api/image-edit",
+                (HttpRequest req, WebUiAdapter adapter) => adapter.ImageEditAsync(req))
+                .DisableRequestTimeout();
             return endpoints;
         }
     }

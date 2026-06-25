@@ -351,6 +351,85 @@ public struct DiffusionDecodeLayerArgs
     public float DecScale;
 }
 
+// Descriptor for the fused Qwen-Image DiT modulated-MLP kernel
+// (TSGgml_QwenImageModMlp). Field order/types MUST match the native
+// TSGgmlQwenImageModMlpDesc struct EXACTLY.
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImageModMlpArgs
+{
+    public IntPtr X;
+    public IntPtr ScalePlus1;
+    public IntPtr Shift;
+    public IntPtr Gate;
+    public IntPtr Net0W; public int Net0Type; public long Net0Ne0, Net0Ne1, Net0Bytes;
+    public IntPtr Net0B;
+    public IntPtr Net2W; public int Net2Type; public long Net2Ne0, Net2Ne1, Net2Bytes;
+    public IntPtr Net2B;
+    public int StructBytes;
+    public int Dim;
+    public int Ff;
+    public int Seq;
+    public float Eps;
+}
+
+// One projection weight (+ optional bias) for the joint-attention kernel.
+// MUST match native TSGImgAttnW exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct QImgAttnW
+{
+    public IntPtr W;
+    public int Type;
+    public long Ne0, Ne1, Bytes;
+    public IntPtr B;
+}
+
+// Descriptor for the fused Qwen-Image DiT joint-attention sub-layer
+// (TSGgml_QwenImageJointAttn). MUST match native TSGgmlQwenImageJointAttnDesc.
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImageJointAttnArgs
+{
+    public IntPtr Img, Txt;
+    public IntPtr ImgScale1, ImgShift, ImgGate;
+    public IntPtr TxtScale1, TxtShift, TxtGate;
+    public IntPtr ImgCos, ImgSin, TxtCos, TxtSin;
+    public QImgAttnW ToQ, ToK, ToV, ToOut;
+    public QImgAttnW AddQ, AddK, AddV, ToAddOut;
+    public IntPtr NormQ, NormK, NormAq, NormAk;
+    public int StructBytes, Dim, Heads, HeadDim, ImgSeq, TxtSeq;
+    public float Eps;
+}
+
+// Descriptor for a single device 2D convolution (TSGgml_Conv2d), used to move the
+// Qwen-Image VAE conv stack off the CPU. MUST match native TSGgmlConv2dDesc exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct Conv2dArgs
+{
+    public IntPtr Input; public int W, H, C;
+    public IntPtr Weight; public int WType, KW, KH, IC, OC;
+    public long WeightBytes;
+    public IntPtr Bias;
+    public IntPtr Output;
+    public int StrideW, StrideH, PadL, PadR, PadT, PadB;
+    public int StructBytes;
+}
+
+// Descriptor for the whole fused DiT block (attn + both MLP streams in one graph)
+// (TSGgml_QwenImageBlock). MUST match native TSGgmlQwenImageBlockDesc exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImageBlockArgs
+{
+    public IntPtr Img, Txt;
+    public IntPtr IS1a, ISha, IGa, TS1a, TSha, TGa;   // attn modulation (mod index 0)
+    public IntPtr IS1m, IShm, IGm, TS1m, TShm, TGm;   // mlp modulation (mod index 1)
+    public IntPtr ICos, ISin, TCos, TSin;
+    public QImgAttnW ToQ, ToK, ToV, ToOut;
+    public QImgAttnW AddQ, AddK, AddV, ToAddOut;
+    public IntPtr NormQ, NormK, NormAq, NormAk;
+    public QImgAttnW INet0, INet2, TNet0, TNet2;       // mlp weights (+bias in .B)
+    public int StructBytes, Dim, Heads, HeadDim, Ff, ImgSeq, TxtSeq;
+    public float Eps;
+}
+
 internal enum GgmlUnaryOp
 {
     Neg = 1,
@@ -1366,6 +1445,44 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_DiffusionDecodeLayer(in DiffusionDecodeLayerArgs desc);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_QwenImageModMlp(in QwenImageModMlpArgs desc);
+
+        public static bool TryQwenImageModMlp(in QwenImageModMlpArgs desc) => TSGgml_QwenImageModMlp(in desc) != 0;
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_QwenImageJointAttn(in QwenImageJointAttnArgs desc);
+
+        public static bool TryQwenImageJointAttn(in QwenImageJointAttnArgs desc)
+        {
+            int r = TSGgml_QwenImageJointAttn(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[qwen-image-attn FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_QwenImageBlock(in QwenImageBlockArgs desc);
+
+        public static bool TryQwenImageBlock(in QwenImageBlockArgs desc)
+        {
+            int r = TSGgml_QwenImageBlock(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[qwen-image-block FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Conv2d(in Conv2dArgs desc);
+
+        public static bool TryConv2d(in Conv2dArgs desc)
+        {
+            int r = TSGgml_Conv2d(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[conv2d FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
 
         /// <summary>Fused DiffusionGemma decode layer. Returns true on success; false (without throwing)
         /// when the backend can't run it (e.g. flash-attn unsupported) so the caller falls back.</summary>

@@ -895,6 +895,7 @@ let pendingAttachments = [];
 let isGenerating = false;
 let currentAbortController = null;
 let currentLoadedModel = null;
+let currentArchitecture = null;
 let needsCacheReset = false;
 let shouldAutoScroll = true;
 let serverDefaultMaxTokens = 20000;
@@ -958,6 +959,7 @@ function renderEmptyState() {
 
 function legacyStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
+  currentArchitecture = data.architecture || null;
 
   if (!currentLoadedModel) {
     statusBadge.textContent = 'No model configured';
@@ -979,6 +981,7 @@ function legacyStatusBadge(data) {
 
 function updateStatusBadge(data) {
   currentLoadedModel = data.loaded || null;
+  currentArchitecture = data.architecture || null;
 
   if (!currentLoadedModel) {
     statusBadge.textContent = 'No model configured';
@@ -1167,6 +1170,47 @@ async function sendMessage() {
   await requestAssistantResponse();
 }
 
+async function runImageEdit(userMsg, bubbleText, statsDiv, queueDiv) {
+  if (queueDiv) queueDiv.style.display = 'none';
+  bubbleText.textContent = 'Generating edited image… (diffusion can take a while, especially on CPU)';
+  statsDiv.textContent = 'Qwen-Image-Edit';
+  const t0 = performance.now();
+  try {
+    const res = await fetch('/api/image-edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imagePath: userMsg.imagePaths[0], prompt: userMsg.content || '' }),
+      signal: currentAbortController.signal
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      bubbleText.textContent = 'Image edit failed: ' + (data.error || ('HTTP ' + res.status));
+      statsDiv.textContent = 'Failed';
+      return;
+    }
+    bubbleText.innerHTML = '';
+    const img = document.createElement('img');
+    img.src = data.url;
+    img.alt = 'edited image';
+    img.style.maxWidth = '512px';
+    img.style.maxHeight = '512px';
+    img.style.borderRadius = '8px';
+    img.style.display = 'block';
+    bubbleText.appendChild(img);
+    const dl = document.createElement('a');
+    dl.href = data.url;
+    dl.setAttribute('download', '');
+    dl.textContent = '⬇ Download image';
+    dl.style.cssText = 'display:inline-block;margin-top:8px;color:var(--accent);';
+    bubbleText.appendChild(dl);
+    statsDiv.textContent = `Edited ${data.width}×${data.height} · ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+    scrollChatToBottom();
+  } catch (e) {
+    if (e.name === 'AbortError') { bubbleText.textContent = 'Image edit cancelled.'; statsDiv.textContent = ''; }
+    else { bubbleText.textContent = 'Image edit error: ' + e.message; statsDiv.textContent = 'Failed'; }
+  }
+}
+
 async function requestAssistantResponse() {
   if (isGenerating) return;
   if (!currentLoadedModel) return;
@@ -1187,6 +1231,13 @@ async function requestAssistantResponse() {
   try {
     if (!currentSessionId) {
       await createSession();
+    }
+
+    // Qwen-Image-Edit: an attached image + prompt produces a NEW image, not chat text.
+    const _lastUser = chatHistory[chatHistory.length - 1];
+    if (currentArchitecture === 'qwen_image' && _lastUser && _lastUser.imagePaths && _lastUser.imagePaths.length > 0) {
+      await runImageEdit(_lastUser, bubbleText, statsDiv, queueDiv);
+      return;
     }
 
     const reasoningOn = document.getElementById('reasoning-toggle').checked;

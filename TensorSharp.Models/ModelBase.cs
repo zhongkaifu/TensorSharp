@@ -3494,6 +3494,7 @@ namespace TensorSharp.Models
                 "gemma3" => new Gemma3Model(ggufPath, backend),
                 "gemma4" => new Gemma4Model(ggufPath, backend),
                 "diffusion-gemma" or "diffusion_gemma" => new DiffusionGemmaModel(ggufPath, backend),
+                "qwen_image" or "qwen-image" => new QwenImage.QwenImageModel(ggufPath, backend),
                 "gptoss" or "gpt-oss" => new GptOssModel(ggufPath, backend),
                 "nemotron_h" or "nemotron_h_moe" => new NemotronModel(ggufPath, backend),
                 "mistral3" => new Mistral3Model(ggufPath, backend),

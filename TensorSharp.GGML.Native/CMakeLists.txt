@@ -113,6 +113,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_fused.cpp
     ggml_ops_transformer.cpp
     ggml_ops_diffusion.cpp
+    ggml_ops_qwen_image.cpp
     ggml_ops_gated_delta_net.cpp
     ggml_ops_qwen35_recurrent_prefill.cpp
     ggml_ops_mamba2.cpp

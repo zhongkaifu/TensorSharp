@@ -123,6 +123,9 @@ namespace TensorSharp.Cli
             int diffusionSteps = 48;
             int diffusionSeed = 0;
             int diffusionBlocks = 0;   // 0 => derive from --max-tokens and canvas_length
+            // Qwen-Image-Edit knobs.
+            string editPrompt = null;
+            float cfgScale = 4.0f;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -135,6 +138,8 @@ namespace TensorSharp.Cli
                     case "--input-jsonl": inputJsonl = args[++i]; break;
                     case "--output": outputFile = args[++i]; break;
                     case "--image": imagePath = args[++i]; break;
+                    case "--prompt": editPrompt = args[++i]; break;
+                    case "--cfg": cfgScale = float.Parse(args[++i]); break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
@@ -325,6 +330,21 @@ namespace TensorSharp.Cli
                 Path.GetFileName(modelPath), model.Config.Architecture ?? "(unknown)",
                 model.MaxContextLength, model.KvCacheDtype.ToShortString(),
                 modelLoadSw.Elapsed.TotalMilliseconds);
+
+            // Qwen-Image-Edit: prompt + input image -> modified image (no autoregressive path).
+            if (model is TensorSharp.Models.QwenImage.QwenImageModel qwenImageModel)
+            {
+                if (imagePath == null)
+                {
+                    Console.Error.WriteLine("Qwen-Image-Edit requires --image <input.png>. Optionally --prompt, --output, --diffusion-steps, --cfg, --diffusion-seed.");
+                    return;
+                }
+                string prompt = editPrompt
+                    ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : "");
+                string outPath = outputFile ?? "edited.png";
+                RunImageEdit(qwenImageModel, imagePath, prompt, outPath, diffusionSteps, cfgScale, diffusionSeed);
+                return;
+            }
 
             var warmupSw = Stopwatch.StartNew();
             model.WarmUpKernels();
@@ -1065,6 +1085,34 @@ namespace TensorSharp.Cli
             }
 
             return hasAny ? cfg : fallback;
+        }
+
+        static void RunImageEdit(TensorSharp.Models.QwenImage.QwenImageModel model,
+            string imagePath, string prompt, string outputPath, int steps, float cfgScale, int seed)
+        {
+            if (!File.Exists(imagePath))
+            {
+                Console.Error.WriteLine($"Input image not found: {imagePath}");
+                return;
+            }
+            Console.WriteLine($"=== Qwen-Image-Edit ===");
+            Console.WriteLine($"  input  : {imagePath}");
+            Console.WriteLine($"  prompt : {prompt}");
+            Console.WriteLine($"  steps={steps} cfg={cfgScale} seed={seed} -> {outputPath}");
+
+            var input = TensorSharp.Models.QwenImage.ImageIO.Load(imagePath);
+            var p = new TensorSharp.Models.QwenImage.QwenImageParams
+            {
+                Steps = steps,
+                CfgScale = cfgScale,
+                Seed = seed,
+            };
+            var sw = Stopwatch.StartNew();
+            var output = model.EditImage(prompt, input, p);
+            sw.Stop();
+            TensorSharp.Models.QwenImage.ImageIO.SavePng(outputPath, output);
+            Console.WriteLine($"Saved {output.Width}x{output.Height} edited image to {outputPath} " +
+                $"({sw.Elapsed.TotalSeconds:F1}s, {sw.Elapsed.TotalMilliseconds / Math.Max(1, steps):F0} ms/step)");
         }
 
         static void RunDiffusion(DiffusionGemmaModel model, string rawText, string systemPrompt,

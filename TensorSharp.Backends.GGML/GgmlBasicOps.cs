@@ -1601,6 +1601,37 @@ namespace TensorSharp.GGML
             return GgmlNative.TryDiffusionDecodeLayer(in args);
         }
 
+        /// <summary>Fused Qwen-Image DiT modulated-GEGLU-MLP sub-layer (LayerNorm + AdaLN modulate +
+        /// GELU MLP + gated residual) in one on-device ggml graph. The managed QwenImageDiT MLP path
+        /// is the verified correctness reference; this is the Stage 7 native perf path.</summary>
+        public static bool TryQwenImageModMlp(in QwenImageModMlpArgs args)
+        {
+            return GgmlNative.TryQwenImageModMlp(in args);
+        }
+
+        /// <summary>Fused Qwen-Image DiT joint (double-stream) attention sub-layer (norm + AdaLN modulate +
+        /// img/txt q/k/v + QK-RMSnorm + interleaved RoPE + bidirectional joint attention + out-proj +
+        /// gated residual) in one on-device ggml graph. Managed QwenImageDiT is the correctness reference.</summary>
+        public static bool TryQwenImageJointAttn(in QwenImageJointAttnArgs args)
+        {
+            return GgmlNative.TryQwenImageJointAttn(in args);
+        }
+
+        /// <summary>Whole fused Qwen-Image DiT double-stream block (joint attention sub-layer + both img/txt
+        /// modulated-GEGLU MLP sub-layers) in ONE on-device ggml graph. Folds the 3 per-block native calls
+        /// into one dispatch. Managed QwenImageDiT.Block is the verified correctness reference.</summary>
+        public static bool TryQwenImageBlock(in QwenImageBlockArgs args)
+        {
+            return GgmlNative.TryQwenImageBlock(in args);
+        }
+
+        /// <summary>Single 2D convolution on the active GGML device (ggml_conv_2d). Used to move the
+        /// Qwen-Image VAE conv stack off the CPU. Layouts match VaeReferenceMath (no transposes).</summary>
+        public static bool TryConv2d(in Conv2dArgs args)
+        {
+            return GgmlNative.TryConv2d(in args);
+        }
+
         /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.</summary>
         public static bool TryDiffusionLmHead(
             IntPtr hidden, int hiddenSize, int canvasLen,
