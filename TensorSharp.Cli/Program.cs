@@ -126,6 +126,12 @@ namespace TensorSharp.Cli
             // Qwen-Image-Edit knobs.
             string editPrompt = null;
             float cfgScale = 4.0f;
+            // Qwen-Image-Edit companion GGUFs. The qwen_image DiT GGUF (passed via
+            // --model) carries none of these, so the operator can point at them
+            // explicitly instead of relying on a same-directory scan / env vars.
+            string qwenImageVaePath = null;
+            string qwenImageVlPath = null;
+            string qwenImageMmprojPath = null;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -140,6 +146,9 @@ namespace TensorSharp.Cli
                     case "--image": imagePath = args[++i]; break;
                     case "--prompt": editPrompt = args[++i]; break;
                     case "--cfg": cfgScale = float.Parse(args[++i]); break;
+                    case "--qwen-image-vae": qwenImageVaePath = args[++i]; break;
+                    case "--qwen-image-vl": qwenImageVlPath = args[++i]; break;
+                    case "--qwen-image-mmproj": qwenImageMmprojPath = args[++i]; break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
@@ -289,6 +298,8 @@ namespace TensorSharp.Cli
                 "Model file not found: {ModelPath}", modelPath ?? "(none)");
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
+                    "[--prompt <text>] [--cfg F] [--diffusion-steps N] [--diffusion-seed N] " +
+                    "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] " +
                     "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
@@ -315,6 +326,15 @@ namespace TensorSharp.Cli
                 pagedKvEnableOverride, pagedKvBlockSizeOverride,
                 pagedKvRamMbOverride, pagedKvSsdDirOverride, pagedKvSsdMbOverride,
                 pagedKvQuantBitsOverride);
+
+            // Qwen-Image-Edit: let the operator override the companion GGUFs that
+            // QwenImageModel otherwise resolves from a same-directory scan. These
+            // are translated into the env vars QwenImageModel reads (the existing
+            // override mechanism) and validated here so a typo fails fast instead
+            // of silently falling back to the directory scan.
+            ApplyQwenImageCompanionOverride("--qwen-image-vae", "TS_QWEN_IMAGE_VAE", qwenImageVaePath);
+            ApplyQwenImageCompanionOverride("--qwen-image-vl", "TS_QWEN_IMAGE_TE", qwenImageVlPath);
+            ApplyQwenImageCompanionOverride("--qwen-image-mmproj", "TS_QWEN_IMAGE_MMPROJ", qwenImageMmprojPath);
 
             string requestedDtype = KvCacheDtypeConfig.IsExplicitlySet
                 ? KvCacheDtypeConfig.Current.ToShortString()
@@ -2631,6 +2651,24 @@ namespace TensorSharp.Cli
                     string.IsNullOrEmpty(cfg.SsdDirectory) ? "(disabled)" : cfg.SsdDirectory,
                     cfg.MaxSsdBytes / (1024 * 1024), codecLabel);
             }
+        }
+
+        /// <summary>
+        /// Translate a Qwen-Image-Edit companion-model CLI flag into the env var
+        /// QwenImageModel reads (its existing override mechanism). Validates the
+        /// path exists so a typo fails fast at startup rather than silently
+        /// falling back to the same-directory scan and surfacing as a confusing
+        /// "companion not found" later.
+        /// </summary>
+        static void ApplyQwenImageCompanionOverride(string flag, string envVar, string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+            if (!File.Exists(path))
+                throw new FileNotFoundException($"{flag} file not found: {path}", path);
+            Environment.SetEnvironmentVariable(envVar, Path.GetFullPath(path));
+            _log.LogInformation(LogEventIds.HostConfiguration,
+                "Qwen-Image-Edit companion override {Flag} -> {Path}", flag, Path.GetFullPath(path));
         }
 
         private static double Median(double[] values)

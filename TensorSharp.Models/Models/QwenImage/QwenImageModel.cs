@@ -46,6 +46,8 @@ namespace TensorSharp.Models.QwenImage
 
         private GgufFile _vaeGguf;
         private GgufFile _teGguf;
+        private SafetensorsModel _vaeSafetensors;
+        private IFloatTensorStore _vaeWeights;
 
         private readonly string _ditPath;
         /// <summary>The diffusion-transformer GGUF (alias of the base <c>_gguf</c>).</summary>
@@ -57,6 +59,24 @@ namespace TensorSharp.Models.QwenImage
         internal string TePath => _tePath;
         internal string VaePath => _vaePath;
         internal BackendType Backend => _backend;
+
+        internal static bool IsSafetensorsPath(string p) =>
+            p != null && (p.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                       || p.EndsWith(".index.json", StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// The VAE weight source, loaded directly from a <c>.safetensors</c> file (BF16 upcast to F32)
+        /// when the resolved companion is safetensors, or from the converted F32 VAE GGUF otherwise.
+        /// Both yield bit-identical floats.
+        /// </summary>
+        internal IFloatTensorStore VaeWeightSource => _vaeWeights ??= OpenVaeWeightSource();
+
+        private IFloatTensorStore OpenVaeWeightSource()
+        {
+            if (IsSafetensorsPath(_vaePath))
+                return _vaeSafetensors = SafetensorsModel.Open(_vaePath);
+            return new GgufFloatTensorStore(VaeGguf);
+        }
 
         public QwenImageModel(string ggufPath, BackendType backend) : base(ggufPath, backend)
         {
@@ -73,8 +93,7 @@ namespace TensorSharp.Models.QwenImage
             };
 
             string dir = Path.GetDirectoryName(Path.GetFullPath(ggufPath)) ?? ".";
-            _vaePath = ResolveCompanion("TS_QWEN_IMAGE_VAE", dir,
-                "qwen_image_vae.gguf", n => n.Contains("vae") && n.EndsWith(".gguf"));
+            _vaePath = ResolveVaeCompanion(dir);
             _tePath = ResolveCompanion("TS_QWEN_IMAGE_TE", dir,
                 "Qwen2.5-VL-7B-Instruct-UD-IQ2_XXS.gguf",
                 n => (n.Contains("qwen2.5-vl") || n.Contains("qwen2_5_vl")) && !n.Contains("mmproj") && n.EndsWith(".gguf"));
@@ -90,6 +109,33 @@ namespace TensorSharp.Models.QwenImage
                 throw new FileNotFoundException(
                     "Qwen-Image-Edit needs companion VAE + Qwen2.5-VL text-encoder GGUFs. " +
                     "Place them next to the DiT GGUF or set TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE.");
+        }
+
+        /// <summary>
+        /// Resolve the companion VAE, accepting either the original <c>.safetensors</c> (loaded directly)
+        /// or the converted <c>.gguf</c>. Order: env var override (any extension) &gt; preferred filenames
+        /// (gguf then safetensors) &gt; any <c>*vae*</c> file with either extension in the directory.
+        /// </summary>
+        private static string ResolveVaeCompanion(string dir)
+        {
+            string env = Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE");
+            if (!string.IsNullOrWhiteSpace(env) && File.Exists(env)) return env;
+
+            foreach (var preferred in new[] { "qwen_image_vae.gguf", "qwen_image_vae.safetensors", "Qwen_Image-VAE.safetensors" })
+            {
+                string p = Path.Combine(dir, preferred);
+                if (File.Exists(p)) return p;
+            }
+            if (Directory.Exists(dir))
+            {
+                foreach (var f in Directory.EnumerateFiles(dir))
+                {
+                    string n = Path.GetFileName(f).ToLowerInvariant();
+                    if (n.Contains("vae") && (n.EndsWith(".gguf") || n.EndsWith(".safetensors")))
+                        return f;
+                }
+            }
+            return null;
         }
 
         private static string ResolveCompanion(string envVar, string dir, string preferred, Func<string, bool> match)
@@ -144,6 +190,7 @@ namespace TensorSharp.Models.QwenImage
         public override void Dispose()
         {
             _pipeline?.Dispose();
+            _vaeSafetensors?.Dispose();
             _vaeGguf?.Dispose();
             _teGguf?.Dispose();
             base.Dispose();

@@ -41,7 +41,7 @@ namespace TensorSharp.Models.QwenImage
 
         private void EnsureWeights()
         {
-            _w ??= VaeWeights.Load(_model.VaeGguf);
+            _w ??= VaeWeights.Load(_model.VaeWeightSource);
         }
 
         private void DisposeCore()

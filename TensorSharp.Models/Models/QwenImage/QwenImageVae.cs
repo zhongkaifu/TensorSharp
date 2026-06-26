@@ -28,7 +28,8 @@ namespace TensorSharp.Models.QwenImage
     /// <summary>
     /// Qwen-Image VAE (AutoencoderKLQwenImage, a WAN-style 3D causal-conv autoencoder):
     /// encodes an RGB image to a 16-channel latent and decodes a latent back to RGB.
-    /// Weights load by name from the companion VAE GGUF (<see cref="QwenImageModel.VaeGguf"/>).
+    /// Weights load by name from the companion VAE source (<see cref="QwenImageModel.VaeWeightSource"/>),
+    /// which is the original <c>.safetensors</c> file (BF16 upcast to F32) or the converted VAE GGUF.
     /// </summary>
     internal sealed partial class QwenImageVae : IDisposable
     {

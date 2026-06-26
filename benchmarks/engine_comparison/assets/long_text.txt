@@ -1,0 +1,83 @@
+The history of computing stretches back far longer than the silicon chips that
+define the modern era. Long before electricity, human beings devised mechanical
+aids to calculation. The abacus, used across the ancient world, allowed
+merchants to add and subtract large sums with practiced speed. In the
+seventeenth century, Blaise Pascal built a geared adding machine to ease his
+father's tax-collecting work, and Gottfried Wilhelm Leibniz extended the idea
+with a device that could multiply and divide. Leibniz also articulated the
+binary system that would, three centuries later, become the native language of
+every digital computer. These early machines were limited and fragile, but they
+embodied a powerful conviction: that reasoning about numbers could be reduced to
+the disciplined manipulation of physical parts.
+
+The nineteenth century gave the field its most prophetic figure in Charles
+Babbage. Frustrated by the errors that riddled the printed mathematical tables
+of his day, Babbage designed the Difference Engine, a steam-powered calculator
+meant to compute and typeset polynomial values without human mistakes. He never
+finished it, but his ambition only grew. The Analytical Engine, which he
+sketched in increasing detail over decades, anticipated the architecture of the
+modern computer: a "store" for holding numbers, a "mill" for performing
+arithmetic, and a mechanism for reading instructions from punched cards borrowed
+from the Jacquard loom. Ada Lovelace, translating an account of the machine,
+added notes longer than the original article and described how it might be
+programmed to compute Bernoulli numbers. She grasped, more clearly than Babbage
+himself, that such a machine could manipulate not just numbers but any symbols
+governed by rules, including music and language.
+
+The conceptual leap from special-purpose calculators to general-purpose
+computers required a theory of computation. In 1936, Alan Turing proposed an
+abstract device, now called the Turing machine, that could read and write
+symbols on an infinite tape according to a finite table of rules. Turing showed
+that a single "universal" machine could simulate any other, and that some
+problems could never be solved by any mechanical procedure at all. This was both
+a foundation and a boundary: it defined what computation could be while marking
+the limits of what it could achieve. During the Second World War, Turing applied
+these ideas in practice at Bletchley Park, where the electromechanical bombes he
+helped design accelerated the breaking of German Enigma ciphers and shortened
+the conflict.
+
+The war accelerated the move from mechanical and electromechanical machines to
+fully electronic ones. ENIAC, completed in 1945, used some eighteen thousand
+vacuum tubes to perform thousands of additions per second, an astonishing speed
+for its time. But ENIAC was programmed by physically rewiring it, a process that
+could take days. The decisive innovation, captured in John von Neumann's widely
+circulated report, was to store a program in the same memory as the data it
+operated on. The stored-program concept meant that changing a computer's
+behavior was as simple as loading new instructions, transforming the machine
+from a fixed appliance into a flexible instrument. Nearly every computer built
+since has followed this von Neumann architecture.
+
+The invention of the transistor at Bell Labs in 1947 began the long shrinking of
+the computer. Transistors were smaller, cooler, more reliable, and far less
+power-hungry than vacuum tubes. The integrated circuit, which placed many
+transistors on a single sliver of silicon, compounded the effect. Gordon Moore
+observed in 1965 that the number of components on a chip was doubling at a steady
+pace, an empirical trend that became a self-fulfilling industrial roadmap. As
+circuits grew denser, computers grew cheaper and more capable, migrating from
+air-conditioned corporate basements to office desks and eventually to pockets.
+
+Software evolved alongside the hardware. Early programmers wrote in raw machine
+code, then in assembly languages that gave mnemonic names to instructions. The
+arrival of high-level languages such as FORTRAN and COBOL let people express
+algorithms in something closer to mathematics and English, and compilers
+translated those expressions into the machine's own tongue. Operating systems
+emerged to manage the growing complexity of shared machines, scheduling tasks
+and mediating access to memory and devices. The development of time-sharing
+allowed many users to interact with a single computer at once, making the
+machine feel responsive and personal in a way that batch processing never could.
+
+Networking knit individual computers into something larger than the sum of their
+parts. The ARPANET, built in the late 1960s, demonstrated that packet switching
+could route data reliably across unreliable links. The protocols that grew out
+of that work, especially TCP/IP, became the common language of a global network.
+The World Wide Web, layered on top of the internet in the early 1990s, gave
+ordinary people a simple way to publish and retrieve documents, and the network
+effect did the rest. Within a generation, computing shifted from a discipline
+practiced by specialists to an ambient utility woven through daily life.
+
+Seen as a whole, this history is a story of abstraction. Each generation hid the
+messy details of the layer beneath it, so that programmers could think in larger
+and larger units without worrying about the electrons. The machine learning
+systems of today, trained on vast corpora and run across thousands of
+processors, sit atop this towering stack of abstractions, the latest chapter in a
+project that began with beads sliding along a wire.

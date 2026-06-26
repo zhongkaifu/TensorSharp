@@ -41,7 +41,9 @@ namespace TensorSharp.Server.Hosting
                     "No startup model configured. Launch with --model <path.gguf> --backend <type> [--mmproj <path>] [--max-tokens 20000]" +
                     " [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--repeat-penalty F]" +
                     " [--presence-penalty F] [--frequency-penalty F] [--seed N] [--stop <text>]" +
-                    " [--prefill-chunk-size N] to use the Web UI.");
+                    " [--prefill-chunk-size N]" +
+                    " [--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>]" +
+                    " to use the Web UI.");
                 return;
             }
 

@@ -1081,6 +1081,11 @@ namespace TensorSharp.Models
             // Whole-model multi-token prefill (one fused GGML graph for all
             // layers, activations device-resident) — see CanUseWholeModelPrefillVerify.
             bool useWholeModelPrefill = CanUseWholeModelPrefillVerify(startPos, seqLen, exceptPositions);
+            // The all-MoE sibling (e.g. 26B-A4B) routes through the fused MoE verify
+            // kernel; see CanUseWholeModelMoEPrefillVerify. Mutually exclusive with
+            // the dense path above (one is dense-only, the other all-MoE).
+            bool useWholeModelMoEPrefill = !useWholeModelPrefill
+                && CanUseWholeModelMoEPrefillVerify(startPos, seqLen, exceptPositions);
 
             // Any multi-token forward (prefill) grows ggml-cuda's compute scratch
             // pool, which can move the device addresses baked into the persistent
@@ -1106,7 +1111,7 @@ namespace TensorSharp.Models
             // kernel floor.
             bool useFusedMoEDecode = WillUseFusedMoEModelDecode(seqLen, exceptPositions, perLayerInputs);
 
-            if (!useFusedDecode && !useFusedMoEDecode && !useWholeModelPrefill)
+            if (!useFusedDecode && !useFusedMoEDecode && !useWholeModelPrefill && !useWholeModelMoEPrefill)
                 EnsureKvCacheHostSynchronized();
 
             long pLayers = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
@@ -1139,6 +1144,16 @@ namespace TensorSharp.Models
                 // the kernel wrote the KV cache for all seqLen tokens on-device.
                 _kvCacheHostDirty = true;
             }
+            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen))
+            {
+                // All-MoE prefill ran as ONE fused GGML graph over all seqLen tokens
+                // (one dispatch instead of ~20/layer). hidden now holds the
+                // layer-stack output [hiddenSize, seqLen]; the kernel wrote the KV
+                // cache on-device and set _kvCacheHostDirty. The kernel wrote
+                // hidden's host storage via download, so drop any stale cached
+                // device buffer before the final-norm/LM-head tail re-reads it.
+                InvalidateTensorDeviceCache(hidden);
+            }
             else if (seqLen == 1 && exceptPositions == null && perLayerInputs == null
                      && TryFusedMoEModelDecode(hidden, startPos, EnsureFoldLogitsBuffer(), out decodeFolded))
             {
@@ -1155,7 +1170,7 @@ namespace TensorSharp.Models
                 // If the whole-model prefill kernel OR the fused MoE decode was
                 // eligible but bailed at runtime, we skipped the host KV sync above;
                 // restore it before the per-op path reads the cache from host memory.
-                if (useWholeModelPrefill || useFusedMoEDecode)
+                if (useWholeModelPrefill || useWholeModelMoEPrefill || useFusedMoEDecode)
                     EnsureKvCacheHostSynchronized();
 
                 // Save donor SWA layer's freshly-computed K/V so KV-shared SWA
@@ -1738,8 +1753,11 @@ namespace TensorSharp.Models
             // Whole-model multi-token prefill (one fused GGML graph for all
             // layers, activations device-resident) — see CanUseWholeModelPrefillVerify.
             bool useWholeModelPrefill = CanUseWholeModelPrefillVerify(startPos, seqLen, exceptPositions);
+            // All-MoE sibling (e.g. 26B-A4B) — see CanUseWholeModelMoEPrefillVerify.
+            bool useWholeModelMoEPrefill = !useWholeModelPrefill
+                && CanUseWholeModelMoEPrefillVerify(startPos, seqLen, exceptPositions);
 
-            if (!useFusedDecode && !useWholeModelPrefill)
+            if (!useFusedDecode && !useWholeModelPrefill && !useWholeModelMoEPrefill)
                 EnsureKvCacheHostSynchronized();
 
             if (useFusedDecode)
@@ -1755,11 +1773,18 @@ namespace TensorSharp.Models
                 // KV cache for all seqLen tokens on-device. No logits needed here.
                 _kvCacheHostDirty = true;
             }
+            else if (useWholeModelMoEPrefill && TryFusedMoEModelVerify(hidden, startPos, seqLen))
+            {
+                // All-MoE prefill chunk ran as ONE fused GGML graph over all seqLen
+                // tokens. The kernel wrote the KV cache on-device and set
+                // _kvCacheHostDirty. No logits needed here (prefix-only).
+                InvalidateTensorDeviceCache(hidden);
+            }
             else
             {
-                // If the whole-model prefill kernel was eligible but bailed at
+                // If a whole-model prefill kernel was eligible but bailed at
                 // runtime, restore the host KV sync we skipped above.
-                if (useWholeModelPrefill)
+                if (useWholeModelPrefill || useWholeModelMoEPrefill)
                     EnsureKvCacheHostSynchronized();
 
                 bool useFusedLayerPrefill = Environment.GetEnvironmentVariable("TS_FUSED_LAYER_PREFILL") != "0";
@@ -2460,6 +2485,55 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Whether an all-MoE Gemma 4 prefill chunk (e.g. 26B-A4B) can run through
+        /// the fused whole-model multi-token kernel <c>TSGgml_Gemma4MoEModelVerify</c>
+        /// (<see cref="TryFusedMoEModelVerify"/>) — ONE GGML graph for all layers
+        /// (attention + dense FFN + in-graph-routed experts), activations
+        /// device-resident, instead of the per-op dispatch loop whose ~90%-idle GPU
+        /// (a host round-trip per op) is the dominant MoE CUDA prefill cost.
+        ///
+        /// Unlike the dense kernel, the MoE verify has NO swaFresh path: its SWA
+        /// (local) layers read the circular window cache, which is only correct when
+        /// the window has NOT wrapped. So the gate requires the strict no-wrap bound
+        /// <c>startPos + seqLen &lt;= cacheSize[l]</c> for EVERY layer:
+        ///   * Global (linear cache): the cache spans the whole sequence → pure causal.
+        ///   * SWA (local, cacheSize == slidingWindow): no wrap means the circular
+        ///     cache holds every position so far, and because totalSeqLen &lt;= window
+        ///     each query's window covers its whole causal prefix → causal == windowed
+        ///     (the kernel's plain-causal mask is exact).
+        /// Longer prompts / later chunks (totalSeqLen &gt; window) fall back to the
+        /// per-op chunked path. Multimodal spans (exceptPositions) and PLE excluded.
+        /// </summary>
+        private bool CanUseWholeModelMoEPrefillVerify(int startPos, int seqLen, HashSet<int> exceptPositions)
+        {
+            if (!s_wholeModelPrefillEnabled) return false;
+            if (!IsGgmlBackend || seqLen <= 1 || exceptPositions != null) return false;
+            if (_moeModelVerifyDisabled || !s_MoeModelDecodeEnabled) return false;
+            if (_kvCacheDtype.IsBlockQuantized()) return false;
+
+            // Mirror the fused MoE decode eligibility (all-MoE, no PLE, no KV donor,
+            // F32/F16 cache). Primes the lazy flag the verify/decode paths reuse.
+            if (!_moeModelDecodeChecked)
+            {
+                _moeModelDecodeChecked = true;
+                _canUseFusedMoEModelDecode =
+                    IsGgmlBackend && _decodeArrays != null && _moeFusedDecodeEnabled
+                    && _pleDim == 0 && _kvDonorMap.Count == 0
+                    && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
+            }
+            if (!_canUseFusedMoEModelDecode) return false;
+
+            // Strict no-wrap bound (see remarks): every layer's cache must span the
+            // whole sequence so the circular SWA read and the plain-causal mask are
+            // both exact.
+            long totalSeqLen = (long)startPos + seqLen;
+            var a = _decodeArrays;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (totalSeqLen > a.CacheSize[l]) return false;
+            return true;
+        }
+
+        /// <summary>
         /// Decode (seqLen == 1) one entire Gemma 4 MoE transformer block as a
         /// single fused GGML graph: attention (norm → QKV → QK/V-norm → RoPE →
         /// KV-cache write → flash attention → O-proj → post-attn-norm → residual)
@@ -2758,6 +2832,16 @@ namespace TensorSharp.Models
             // rebuilds + re-captures against the post-verify pool state.
             if (_backend == BackendType.GgmlCuda)
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+
+            // The kernel reads/writes the KV cache through the cached _decodeArrays
+            // K/V pointers, which are only repointed on cache growth or an explicit
+            // refresh. The per-sequence fused path (BindSequenceCache / holder swap)
+            // and the engine handoff can leave them pointing at a different active
+            // cache than _kvCacheK currently holds, so refresh before building the
+            // descriptors to guarantee the verify targets the live cache. The MTP
+            // SpecForward already refreshes externally; repeating it here is cheap
+            // and idempotent.
+            RefreshDecodeArraysKvCache();
 
             int layerCount = Config.NumLayers;
             _moeVerifyArgs ??= new Gemma4MoELayerDecodeArgs[layerCount];

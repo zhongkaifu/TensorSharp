@@ -47,6 +47,10 @@ bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchin
 // Translate --mtp-spec / --mtp-draft / --mtp-pmin into the TS_MTP_* env vars
 // read by SchedulerConfig.FromEnvironment when the engine is constructed.
 bool mtpSpecFlagsApplied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(args);
+// Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
+// TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the VAE, Qwen2.5-VL
+// text-encoder, and mmproj GGUFs. Must run before the startup model is loaded.
+bool qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
@@ -111,6 +115,15 @@ if (mtpSpecFlagsApplied)
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} (engages on NextN/MTP draft-head models only)",
         schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens, schedCfg.MtpMinDraftProb);
+}
+
+if (qwenImageFlagsApplied)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Qwen-Image-Edit companions configured via CLI: vae={Vae} vl={Vl} mmproj={Mmproj}",
+        Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE") ?? "(scan)",
+        Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_TE") ?? "(scan)",
+        Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MMPROJ") ?? "(scan)");
 }
 
 StartupBanner.EmitBackendFallback(startupLogger, hostingOptions, configuredBackendInput);

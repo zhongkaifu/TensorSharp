@@ -1,0 +1,117 @@
+{
+  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting.",
+
+  "paths": {
+    "model_root": "C:/Works/models",
+    "results_dir": null,
+    "gemma4_qat_dir": "${model_root}/gemma_mtp/qat",
+    "tensorsharp_server_dll": null,
+    "tensorsharp_port": 5000,
+    "llama_server_exe": "C:/Works/llama.cpp/build-cuda/bin/Release/llama-server.exe",
+    "llama_port": 5001,
+    "vllm_base_url": "http://127.0.0.1:8000",
+    "media": {
+      "image": "C:/Works/test.jpg",
+      "audio": "C:/Works/obama_first_45_secs.mp3",
+      "video": "C:/Works/concert.mp4"
+    }
+  },
+
+  "models": {
+    "gemma4-e4b": {
+      "display": "Gemma 4 E4B it (Q8_0, dense multimodal)",
+      "family": "gemma4",
+      "gguf": {"path": "${model_root}/gemma-4-E4B-it-uncensored-Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_GGUF"},
+      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ"},
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "small",
+      "mtp_supported": true,
+      "mtp_draft": {"path": "${model_root}/gemma-4-E4B-it-assistant.Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_MTP_DRAFT"}
+    },
+    "gemma4-12b": {
+      "display": "Gemma 4 12B it (QAT UD-Q4_K_XL, dense)",
+      "family": "gemma4",
+      "gguf": "${gemma4_qat_dir}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+      "mmproj": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf",
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "small",
+      "mtp_supported": true,
+      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-12B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_12B_MTP_DRAFT"}
+    },
+    "gemma4-26b-a4b": {
+      "display": "Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE)",
+      "family": "gemma4",
+      "gguf": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+      "mmproj": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "large",
+      "mtp_supported": true,
+      "mtp_draft": {"path": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf", "env": "BENCH_GEMMA4_26B_MTP_DRAFT"}
+    },
+    "qwen36-35b-a3b": {
+      "display": "Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)",
+      "family": "qwen36",
+      "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "modalities": ["text", "image"],
+      "size_class": "large",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
+    "diffusiongemma": {
+      "display": "DiffusionGemma 26B-A4B it (Q3_K_M, text-diffusion)",
+      "family": "diffusiongemma",
+      "gguf": "${model_root}/diff-q3/diffusiongemma-26B-A4B-it-Q3_K_M.gguf",
+      "mmproj": null,
+      "modalities": ["text"],
+      "size_class": "medium",
+      "is_diffusion": true,
+      "diffusion_steps": 32,
+      "mtp_supported": false,
+      "mtp_draft": null
+    }
+  },
+
+  "scenarios": {
+    "text_short": {"kind": "text", "description": "Short single-turn text prompt", "max_tokens": 128},
+    "text_long": {"kind": "text", "description": "Long-context single-turn text prompt (~1k tokens in)", "max_tokens": 128},
+    "multi_turn": {"kind": "multi_turn", "description": "3-turn conversation, timed on the final turn", "max_tokens": 128},
+    "function_call": {"kind": "function_call", "description": "Tool/function-calling (get_weather)", "max_tokens": 128},
+    "json_mode": {"kind": "json_mode", "description": "Structured output (response_format json_object)", "max_tokens": 128},
+    "image": {"kind": "image", "description": "Image understanding (test.jpg)", "modality": "image", "max_tokens": 128},
+    "audio": {"kind": "audio", "description": "Audio understanding (~45 s speech)", "modality": "audio", "max_tokens": 128},
+    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 128}
+  },
+
+  "engines": {
+    "tensorsharp": {"display": "TensorSharp", "transport": "server", "backends": ["gpu", "cpu"]},
+    "llamacpp": {"display": "llama.cpp", "transport": "server", "backends": ["gpu", "cpu"]},
+    "vllm": {"display": "vLLM", "transport": "connect", "backends": ["gpu"]}
+  },
+
+  "backends": ["gpu", "cpu"],
+
+  "maps": {
+    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "ggml_cpu"},
+    "llama_ngl": {"gpu": 999, "cpu": 0}
+  },
+
+  "llama": {
+    "context_size": 8192,
+    "extra_args": ["--jinja"]
+  },
+
+  "ready_timeout_s": {"small": 600, "medium": 900, "large": 1200},
+
+  "defaults": {
+    "engines": ["tensorsharp", "llamacpp", "vllm"],
+    "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "diffusiongemma"],
+    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
+    "backends": ["gpu", "cpu"],
+    "mtp_modes": [false],
+    "concurrency": [1],
+    "max_tokens": 128,
+    "warmup": 1,
+    "server_max_tokens": 512
+  }
+}

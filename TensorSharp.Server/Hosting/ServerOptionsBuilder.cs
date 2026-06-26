@@ -304,6 +304,57 @@ namespace TensorSharp.Server.Hosting
         }
 
         /// <summary>
+        /// Translate the Qwen-Image-Edit companion-model flags
+        /// (<c>--qwen-image-vae</c> / <c>--qwen-image-vl</c> /
+        /// <c>--qwen-image-mmproj</c>) into the env vars that
+        /// <c>QwenImageModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
+        /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) — the existing
+        /// override mechanism for the three networks the qwen_image DiT GGUF does
+        /// not itself contain. Each path is validated here so a typo fails fast at
+        /// startup instead of silently falling back to the same-directory scan.
+        /// Must run before the startup model is loaded. Returns true when at least
+        /// one flag was applied so the caller can emit a startup-log line.
+        /// </summary>
+        public static bool ApplyQwenImageCompanionCliFlags(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            bool changed = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (TryReadOption(args, ref i, "--qwen-image-vae", out string vaeOpt))
+                {
+                    SetQwenImageCompanionEnv("--qwen-image-vae", "TS_QWEN_IMAGE_VAE", vaeOpt);
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--qwen-image-vl", out string vlOpt))
+                {
+                    SetQwenImageCompanionEnv("--qwen-image-vl", "TS_QWEN_IMAGE_TE", vlOpt);
+                    changed = true;
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--qwen-image-mmproj", out string mmprojOpt))
+                {
+                    SetQwenImageCompanionEnv("--qwen-image-mmproj", "TS_QWEN_IMAGE_MMPROJ", mmprojOpt);
+                    changed = true;
+                    continue;
+                }
+            }
+            return changed;
+        }
+
+        private static void SetQwenImageCompanionEnv(string flag, string envVar, string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                throw new ArgumentException($"Missing value for option '{flag}'.");
+            if (!File.Exists(path))
+                throw new FileNotFoundException($"{flag} file not found: {path}", path);
+            Environment.SetEnvironmentVariable(envVar, Path.GetFullPath(path));
+        }
+
+        /// <summary>
         /// Bag of nullable sampling overrides captured from the CLI. We track
         /// each field separately (as <see cref="Nullable{T}"/>) so the caller
         /// can distinguish "operator pinned this value" from "operator didn't
@@ -474,6 +525,16 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
+                // Qwen-Image-Edit companion-model flags are consumed by
+                // ApplyQwenImageCompanionCliFlags(args) in a separate earlier
+                // pass. Recognise + skip them here so they don't trip the
+                // unknown-arg trap below.
+                if (TryReadOption(args, ref i, "--qwen-image-vae", out _)
+                    || TryReadOption(args, ref i, "--qwen-image-vl", out _)
+                    || TryReadOption(args, ref i, "--qwen-image-mmproj", out _))
+                {
+                    continue;
+                }
 
                 // Anything else that starts with `--` is an unknown flag and we
                 // refuse to start. Previously these were silently dropped, so a
@@ -513,6 +574,7 @@ namespace TensorSharp.Server.Hosting
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching",
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
+                "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj",
             };
             string best = null;
             int bestDist = int.MaxValue;
