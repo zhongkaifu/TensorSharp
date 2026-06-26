@@ -113,23 +113,47 @@ namespace TensorSharp.Models.QwenImage
             // 6. denoise loop
             var imgTokens = new float[(long)imgSeq * 64];
             Array.Copy(refPacked, 0, imgTokens, (long)seq * 64, (long)seq * 64);  // ref part fixed
+            // CFG-batching (both branches in one captured dispatch) is a large win where the
+            // combined block fits VRAM, but at very large token counts it falls back to a
+            // non-persist path that holds both branches at once and can oversubscribe VRAM.
+            // Gate it to the budget that fits; larger images keep the two-forward path.
+            bool useCfgBatch = doCfg && Dit.UseCfgBatch &&
+                               (imgSeq + Math.Max(txtSeq, negTxt)) <= Dit.CfgBatchMaxTokens;
+            if (doCfg && Dit.UseCfgBatch && !useCfgBatch)
+                Console.WriteLine($"  [pipe] CFG-batch disabled: {imgSeq + Math.Max(txtSeq, negTxt)} tokens > {Dit.CfgBatchMaxTokens} budget (set TS_QWEN_DIT_CFG_BATCH_MAXTOK or a smaller area).");
+
             Dit.ResetCache(sched.Steps);   // First-Block-Cache: fresh state per generation
             for (int step = 0; step < sched.Steps; step++)
             {
                 Array.Copy(latents, 0, imgTokens, 0, (long)seq * 64);             // gen part = current latents
                 float t01 = sched.Sigmas[step];   // FlowMatch: timestep == sigma
-                float[] vel = Dit.Predict(imgTokens, imgSeq, cond, txtSeq, t01, modulateIndex, rope,
-                    stepIndex: step, totalSteps: sched.Steps, cfgBranch: 0, genTokens: seq);
-                // keep only the generated region
                 var v = new float[(long)seq * 64];
-                Array.Copy(vel, 0, v, 0, v.Length);
 
-                if (doCfg)
+                if (useCfgBatch)
                 {
-                    float[] velNeg = Dit.Predict(imgTokens, imgSeq, negCond, negTxt, t01, modulateIndex, ropeNeg,
-                        stepIndex: step, totalSteps: sched.Steps, cfgBranch: 1, genTokens: seq);
-                    // true-CFG: comb = neg + scale*(cond-neg), then renorm to cond norm (per token row)
+                    // CFG-batched: both branches in one launch-amortized fused pass (halves the
+                    // per-block GPU sync + weight upload that starve the launch-bound DiT).
+                    var (vc, vn) = Dit.PredictCfg(imgTokens, imgSeq, cond, txtSeq, rope, negCond, negTxt, ropeNeg,
+                        t01, modulateIndex, step, sched.Steps, seq);
+                    Array.Copy(vc, 0, v, 0, v.Length);
+                    var velNeg = new float[(long)seq * 64];
+                    Array.Copy(vn, 0, velNeg, 0, velNeg.Length);
                     TrueCfg(v, velNeg, seq, p.CfgScale);
+                }
+                else
+                {
+                    float[] vel = Dit.Predict(imgTokens, imgSeq, cond, txtSeq, t01, modulateIndex, rope,
+                        stepIndex: step, totalSteps: sched.Steps, cfgBranch: 0, genTokens: seq);
+                    // keep only the generated region
+                    Array.Copy(vel, 0, v, 0, v.Length);
+
+                    if (doCfg)
+                    {
+                        float[] velNeg = Dit.Predict(imgTokens, imgSeq, negCond, negTxt, t01, modulateIndex, ropeNeg,
+                            stepIndex: step, totalSteps: sched.Steps, cfgBranch: 1, genTokens: seq);
+                        // true-CFG: comb = neg + scale*(cond-neg), then renorm to cond norm (per token row)
+                        TrueCfg(v, velNeg, seq, p.CfgScale);
+                    }
                 }
                 sched.Step(latents, v, step);
                 if (Environment.GetEnvironmentVariable("TS_QIMG_DEBUG") == "1")

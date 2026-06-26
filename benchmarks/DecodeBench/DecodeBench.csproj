@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <Description>Standalone single-sequence decode (tok/s) benchmark for any model — measures the fused N=1 decode path the server's fast path uses (nsys-profilable).</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\TensorSharp.Models\TensorSharp.Models.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Backends.GGML\TensorSharp.Backends.GGML.csproj" />
+    <ProjectReference Include="..\..\TensorSharp.Server\TensorSharp.Server.csproj" />
+  </ItemGroup>
+</Project>

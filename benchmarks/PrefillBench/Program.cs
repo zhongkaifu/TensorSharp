@@ -216,7 +216,15 @@ foreach (int len in lens)
     }
     model.ResetKVCache();
     double ms = Median(samples);
-    Console.WriteLine($"{len,8} {ms,10:F1} {len / (ms / 1000.0),10:F0}");
+    string argmaxNote = "";
+    if (Environment.GetEnvironmentVariable("TS_PREFILL_DUMP_ARGMAX") == "1")
+    {
+        model.ResetKVCache();
+        float[] lg = model.ForwardRefill(MakePrompt(len, 99999));
+        argmaxNote = $"  argmax={Argmax(lg)}";
+        model.ResetKVCache();
+    }
+    Console.WriteLine($"{len,8} {ms,10:F1} {len / (ms / 1000.0),10:F0}{argmaxNote}");
 }
 
 if (!legacyOnly)

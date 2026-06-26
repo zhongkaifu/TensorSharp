@@ -1362,7 +1362,8 @@ internal enum GgmlIndexReductionOp
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr);
+            IntPtr[] plePostNormArr,
+            byte[] isExceptArr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4DraftStep(
@@ -1470,6 +1471,18 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_QwenImageBlock(in desc);
             if (r == 0)
                 Console.Error.WriteLine($"[qwen-image-block FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_QwenImageBlockCfg(in QwenImageBlockArgs condDesc, in QwenImageBlockArgs negDesc);
+
+        // CFG-batched block: both true-CFG branches in one dispatch sharing the weights.
+        public static bool TryQwenImageBlockCfg(in QwenImageBlockArgs condDesc, in QwenImageBlockArgs negDesc)
+        {
+            int r = TSGgml_QwenImageBlockCfg(in condDesc, in negDesc);
+            if (r == 0)
+                Console.Error.WriteLine($"[qwen-image-block-cfg FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;
         }
 
@@ -3213,7 +3226,8 @@ internal enum GgmlIndexReductionOp
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr)
+            IntPtr[] plePostNormArr,
+            byte[] isExceptArr = null)
         {
             int r = TSGgml_Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -3236,7 +3250,8 @@ internal enum GgmlIndexReductionOp
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr);
+                plePostNormArr,
+                isExceptArr);
             if (r == 0 && Environment.GetEnvironmentVariable("TS_GGML_FUSED_DEBUG") == "1")
                 Console.Error.WriteLine($"[gemma4-verify FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;

@@ -739,6 +739,18 @@ QiBlockPersist* qi_block_build(const TSGgmlQwenImageBlockDesc* d)
     t.t_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, tseq);
     t.t_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, tseq);
 
+    // Flash-attention mask (bidirectional all-valid + KV-stride padding). Wiring flash
+    // into the CAPTURED path removes the O(total^2) materialized scores, so capture (and
+    // its launch-overhead elimination) extends to high-resolution token counts instead of
+    // OOMing. The mask is constant per shape, lives in the entry's own buffer (stable
+    // address for capture), and is uploaded ONCE after buffer alloc below.
+    const ggml_fp16_t* maskHost = nullptr; int total_pad = 0;
+    if (qi_flash_enabled())
+    {
+        maskHost = qi_attn_mask_host(iseq + tseq, total_pad);
+        t.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, total_pad, total_pad);
+    }
+
     auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& w, ggml_tensor*& b, int blen) {
         w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
         b = s.b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, blen) : nullptr;
@@ -765,9 +777,36 @@ QiBlockPersist* qi_block_build(const TSGgmlQwenImageBlockDesc* d)
     ggml_build_forward_expand(graph, oi);
     ggml_build_forward_expand(graph, ot);
 
+    // Only build the captured entry if it fits dedicated VRAM with headroom; otherwise bail
+    // to the non-persist path. At high res two single-branch entries (cond/neg txt lengths)
+    // would otherwise oversubscribe VRAM and spill to WDDM shared memory (~5x slower). The
+    // CFG-batched captured path avoids this by sharing one entry across both branches.
+    {
+        std::size_t need = 0;
+        for (ggml_tensor* tt = ggml_get_first_tensor(ctx); tt != nullptr; tt = ggml_get_next_tensor(ctx, tt))
+            need += GGML_PAD(ggml_nbytes(tt), 256);
+        ggml_backend_dev_t mdev = ggml_backend_get_device(g_backend);
+        std::size_t freeb = 0, totalb = 0;
+        if (mdev) ggml_backend_dev_memory(mdev, &freeb, &totalb);
+        if (totalb > 0 && freeb < need + static_cast<std::size_t>(768) * 1024 * 1024)
+        {
+            std::fprintf(stderr, "[qwen-image-block] capture entry needs %zu MiB, free %zu MiB -> non-persist fallback\n",
+                         need >> 20, freeb >> 20);
+            ggml_free(ctx);
+            return nullptr;
+        }
+    }
+
     // Stable addresses for capture: each tensor its own slot (no gallocr packing).
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
     if (buffer == nullptr) { ggml_free(ctx); return nullptr; }
+
+    // Upload the (constant per-shape) flash mask once into its stable slot. The mask is
+    // never touched again by qi_block_run's per-block weight streaming, so the captured
+    // graph replays against valid mask data on every block/step.
+    if (t.mask && maskHost)
+        ggml_backend_tensor_set(t.mask, maskHost, 0,
+                                static_cast<std::size_t>(total_pad) * total_pad * sizeof(ggml_fp16_t));
 
     // Evict a slot (round-robin) and install.
     QiBlockPersist* e = nullptr;
@@ -833,6 +872,248 @@ int qi_block_run(QiBlockPersist* e, const TSGgmlQwenImageBlockDesc* d)
     return 1;
 }
 
+// ----------------------------------------------------------------------------
+// Persistent + CUDA-graph-captured CFG-batched block. Capturing the single-branch
+// block at high res needs TWO entries per quant profile (the cond/neg txt lengths
+// differ), which doubles the capture VRAM and spills to shared memory. Capturing the
+// COMBINED block instead keeps ONE entry per profile (both branches in one graph),
+// halving the entries so it fits, and folds in the CFG-batch win (one dispatch +
+// shared weight upload). This is the high-res launch-bound fix.
+struct QiBlockCfgPersist
+{
+    bool valid = false;
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_cgraph* graph = nullptr;
+    QiBlockTensors w{};            // shared weight leaves
+    QiBlockTensors tc{}, tn{};     // per-branch activations (+ shared weight ptrs)
+    ggml_tensor *ic_out = nullptr, *tc_out = nullptr, *in_out = nullptr, *tn_out = nullptr;
+    int dim = 0, heads = 0, hd = 0, ff = 0, iseq = 0, tseqc = 0, tseqn = 0;
+    int wtype[12] = {0};
+
+    bool matches(const TSGgmlQwenImageBlockDesc* dc, const TSGgmlQwenImageBlockDesc* dn) const
+    {
+        if (!(valid && dim == dc->dim && heads == dc->heads && hd == dc->head_dim &&
+              ff == dc->ff && iseq == dc->img_seq && tseqc == dc->txt_seq && tseqn == dn->txt_seq))
+            return false;
+        const TSGImgAttnW* wv[12] = { &dc->to_q, &dc->to_k, &dc->to_v, &dc->to_out,
+                                      &dc->add_q, &dc->add_k, &dc->add_v, &dc->to_add_out,
+                                      &dc->i_net0, &dc->i_net2, &dc->t_net0, &dc->t_net2 };
+        for (int i = 0; i < 12; i++) if (wtype[i] != wv[i]->type) return false;
+        return true;
+    }
+    void reset()
+    {
+        if (buffer) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        graph = nullptr; valid = false; ic_out = tc_out = in_out = tn_out = nullptr;
+        dim = heads = hd = ff = iseq = tseqc = tseqn = 0;
+    }
+};
+
+constexpr int kQiCfgCacheMax = 8;   // one entry per quant profile (both branches share it)
+QiBlockCfgPersist g_qiCfgBlocks[kQiCfgCacheMax];
+int g_qiCfgRR = 0;
+
+QiBlockCfgPersist* qi_cfg_find(const TSGgmlQwenImageBlockDesc* dc, const TSGgmlQwenImageBlockDesc* dn)
+{
+    for (auto& e : g_qiCfgBlocks) if (e.matches(dc, dn)) return &e;
+    return nullptr;
+}
+
+// Declare the shared weight leaves + the two branches' activations into ctx, build both
+// block subgraphs (sharing the weights), and return the graph + tensor handles. Shared by
+// the captured build (stable addresses) below. Masks are returned for a one-time upload.
+ggml_cgraph* qi_cfg_build_graph(ggml_context* ctx, const TSGgmlQwenImageBlockDesc* dc,
+                                const TSGgmlQwenImageBlockDesc* dn,
+                                QiBlockTensors& w, QiBlockTensors& tc, QiBlockTensors& tn,
+                                ggml_tensor*& ic_out, ggml_tensor*& tc_out,
+                                ggml_tensor*& in_out, ggml_tensor*& tn_out,
+                                const ggml_fp16_t*& maskC, int& tpadC,
+                                const ggml_fp16_t*& maskN, int& tpadN)
+{
+    const int dim = dc->dim, heads = dc->heads, hd = dc->head_dim, ff = dc->ff;
+    const int iseq = dc->img_seq, tseqc = dc->txt_seq, tseqn = dn->txt_seq;
+    const float eps = dc->eps;
+
+    auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& wt, ggml_tensor*& bt, int blen) {
+        wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
+        bt = s.b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, blen) : nullptr;
+    };
+    declW(dc->to_q, w.toQw, w.toQb, dim); declW(dc->to_k, w.toKw, w.toKb, dim);
+    declW(dc->to_v, w.toVw, w.toVb, dim); declW(dc->to_out, w.toOw, w.toOb, dim);
+    declW(dc->add_q, w.aQw, w.aQb, dim); declW(dc->add_k, w.aKw, w.aKb, dim);
+    declW(dc->add_v, w.aVw, w.aVb, dim); declW(dc->to_add_out, w.aOw, w.aOb, dim);
+    w.nQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+    w.nK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+    w.nAQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+    w.nAK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+    declW(dc->i_net0, w.iN0w, w.iN0b, ff);  declW(dc->i_net2, w.iN2w, w.iN2b, dim);
+    declW(dc->t_net0, w.tN0w, w.tN0b, ff);  declW(dc->t_net2, w.tN2w, w.tN2b, dim);
+
+    auto declAct = [&](QiBlockTensors& t, int ts, ggml_tensor*& iout, ggml_tensor*& tout,
+                       const ggml_fp16_t*& mh, int& tp)
+    {
+        t.toQw=w.toQw; t.toQb=w.toQb; t.toKw=w.toKw; t.toKb=w.toKb;
+        t.toVw=w.toVw; t.toVb=w.toVb; t.toOw=w.toOw; t.toOb=w.toOb;
+        t.aQw=w.aQw; t.aQb=w.aQb; t.aKw=w.aKw; t.aKb=w.aKb;
+        t.aVw=w.aVw; t.aVb=w.aVb; t.aOw=w.aOw; t.aOb=w.aOb;
+        t.nQ=w.nQ; t.nK=w.nK; t.nAQ=w.nAQ; t.nAK=w.nAK;
+        t.iN0w=w.iN0w; t.iN0b=w.iN0b; t.iN2w=w.iN2w; t.iN2b=w.iN2b;
+        t.tN0w=w.tN0w; t.tN0b=w.tN0b; t.tN2w=w.tN2w; t.tN2b=w.tN2b;
+        t.img = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.txt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        iout  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        tout  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.i_s1a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.i_sha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.i_ga  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.t_s1a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.t_sha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.t_ga  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.i_s1m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.i_shm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.i_gm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+        t.t_s1m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.t_shm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.t_gm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+        t.i_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+        t.i_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+        t.t_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, ts);
+        t.t_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, ts);
+        mh = nullptr; tp = 0;
+        if (qi_flash_enabled()) { mh = qi_attn_mask_host(iseq + ts, tp); t.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tp, tp); }
+    };
+    declAct(tc, tseqc, ic_out, tc_out, maskC, tpadC);
+    declAct(tn, tseqn, in_out, tn_out, maskN, tpadN);
+
+    auto buildBranch = [&](QiBlockTensors& t, int ts, ggml_tensor* iout, ggml_tensor* tout,
+                           ggml_tensor*& oi, ggml_tensor*& ot)
+    {
+        ggml_tensor *img1, *txt1;
+        qi_build_attn(ctx, t, dim, heads, hd, iseq, ts, eps, img1, txt1);
+        ggml_tensor* img2 = qi_build_mlp(ctx, img1, t.i_s1m, t.i_shm, t.i_gm, t.iN0w, t.iN0b, t.iN2w, t.iN2b, eps);
+        ggml_tensor* txt2 = qi_build_mlp(ctx, txt1, t.t_s1m, t.t_shm, t.t_gm, t.tN0w, t.tN0b, t.tN2w, t.tN2b, eps);
+        oi = ggml_cpy(ctx, img2, iout); ggml_set_output(oi);
+        ot = ggml_cpy(ctx, txt2, tout); ggml_set_output(ot);
+    };
+    ggml_tensor *oic, *otc, *oin, *otn;
+    buildBranch(tc, tseqc, ic_out, tc_out, oic, otc);
+    buildBranch(tn, tseqn, in_out, tn_out, oin, otn);
+
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, 16384, false);
+    ggml_build_forward_expand(graph, oic);
+    ggml_build_forward_expand(graph, otc);
+    ggml_build_forward_expand(graph, oin);
+    ggml_build_forward_expand(graph, otn);
+    return graph;
+}
+
+QiBlockCfgPersist* qi_cfg_build(const TSGgmlQwenImageBlockDesc* dc, const TSGgmlQwenImageBlockDesc* dn)
+{
+    const std::size_t meta = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(16384, false) + (1 << 20);
+    ggml_init_params ip{ meta, nullptr, true };
+    ggml_context* ctx = ggml_init(ip);
+    if (ctx == nullptr) return nullptr;
+
+    QiBlockTensors w{}, tc{}, tn{};
+    ggml_tensor *ic_out, *tc_out, *in_out, *tn_out;
+    const ggml_fp16_t *maskC = nullptr, *maskN = nullptr; int tpadC = 0, tpadN = 0;
+    ggml_cgraph* graph = qi_cfg_build_graph(ctx, dc, dn, w, tc, tn,
+                                            ic_out, tc_out, in_out, tn_out, maskC, tpadC, maskN, tpadN);
+
+    // The captured entry gives every intermediate its own slot (no buffer reuse). Sum the
+    // exact footprint and only build it if it fits dedicated VRAM with headroom — otherwise
+    // bail to the non-persist path (per-call alloc/free, so it always fits), avoiding a WDDM
+    // shared-memory spill that would make the block ~5x SLOWER than the non-captured path.
+    std::size_t need = 0;
+    for (ggml_tensor* tt = ggml_get_first_tensor(ctx); tt != nullptr; tt = ggml_get_next_tensor(ctx, tt))
+        need += GGML_PAD(ggml_nbytes(tt), 256);
+    ggml_backend_dev_t mdev = ggml_backend_get_device(g_backend);
+    std::size_t freeb = 0, totalb = 0;
+    if (mdev) ggml_backend_dev_memory(mdev, &freeb, &totalb);
+    if (totalb > 0 && freeb < need + static_cast<std::size_t>(768) * 1024 * 1024)
+    {
+        std::fprintf(stderr, "[qwen-image-block-cfg] capture entry needs %zu MiB, free %zu MiB -> non-persist fallback\n",
+                     need >> 20, freeb >> 20);
+        ggml_free(ctx);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+    if (buffer == nullptr) { ggml_free(ctx); return nullptr; }
+    if (tc.mask && maskC) ggml_backend_tensor_set(tc.mask, maskC, 0, static_cast<std::size_t>(tpadC) * tpadC * sizeof(ggml_fp16_t));
+    if (tn.mask && maskN) ggml_backend_tensor_set(tn.mask, maskN, 0, static_cast<std::size_t>(tpadN) * tpadN * sizeof(ggml_fp16_t));
+
+    QiBlockCfgPersist* e = nullptr;
+    for (auto& c : g_qiCfgBlocks) if (!c.valid) { e = &c; break; }
+    if (e == nullptr) { e = &g_qiCfgBlocks[g_qiCfgRR]; g_qiCfgRR = (g_qiCfgRR + 1) % kQiCfgCacheMax; e->reset(); }
+    e->ctx = ctx; e->buffer = buffer; e->graph = graph; e->w = w; e->tc = tc; e->tn = tn;
+    e->ic_out = ic_out; e->tc_out = tc_out; e->in_out = in_out; e->tn_out = tn_out;
+    e->dim = dc->dim; e->heads = dc->heads; e->hd = dc->head_dim; e->ff = dc->ff;
+    e->iseq = dc->img_seq; e->tseqc = dc->txt_seq; e->tseqn = dn->txt_seq;
+    const TSGImgAttnW* wv[12] = { &dc->to_q, &dc->to_k, &dc->to_v, &dc->to_out,
+                                  &dc->add_q, &dc->add_k, &dc->add_v, &dc->to_add_out,
+                                  &dc->i_net0, &dc->i_net2, &dc->t_net0, &dc->t_net2 };
+    for (int i = 0; i < 12; i++) e->wtype[i] = wv[i]->type;
+    e->valid = true;
+    return e;
+}
+
+// Upload the shared weights (from dc) + both branches' activations into the captured
+// graph's fixed slots, run (capture-replays after warmup), read all four outputs back.
+int qi_cfg_run(QiBlockCfgPersist* e, const TSGgmlQwenImageBlockDesc* dc, const TSGgmlQwenImageBlockDesc* dn)
+{
+    const int dim = e->dim, hd = e->hd, iseq = e->iseq, tseqc = e->tseqc, tseqn = e->tseqn, ff = e->ff;
+    host_read_barrier();
+    bool ok = true;
+    auto chk = [&](ggml_tensor* tt, const void* dd, std::size_t bytes, const char* nm) {
+        if (!tt || !dd || !ok) return;
+        if (bytes > ggml_nbytes(tt)) {
+            set_last_error(std::string("QwenImageBlockCfg(persist): oob set ") + nm +
+                " bytes=" + std::to_string(bytes) + " cap=" + std::to_string(ggml_nbytes(tt)));
+            ok = false; return;
+        }
+        ggml_backend_tensor_set(tt, dd, 0, bytes);
+    };
+    QiBlockTensors& w = e->w;
+    auto upW = [&](ggml_tensor* wt, ggml_tensor* bt, const TSGImgAttnW& s, int blen, const char* nm) {
+        chk(wt, s.w, static_cast<std::size_t>(s.bytes), nm);
+        if (bt) chk(bt, s.b, static_cast<std::size_t>(blen) * sizeof(float), nm);
+    };
+    upW(w.toQw, w.toQb, dc->to_q, dim, "to_q"); upW(w.toKw, w.toKb, dc->to_k, dim, "to_k");
+    upW(w.toVw, w.toVb, dc->to_v, dim, "to_v"); upW(w.toOw, w.toOb, dc->to_out, dim, "to_out");
+    upW(w.aQw, w.aQb, dc->add_q, dim, "add_q"); upW(w.aKw, w.aKb, dc->add_k, dim, "add_k");
+    upW(w.aVw, w.aVb, dc->add_v, dim, "add_v"); upW(w.aOw, w.aOb, dc->to_add_out, dim, "add_out");
+    upW(w.iN0w, w.iN0b, dc->i_net0, ff, "i_net0"); upW(w.iN2w, w.iN2b, dc->i_net2, dim, "i_net2");
+    upW(w.tN0w, w.tN0b, dc->t_net0, ff, "t_net0"); upW(w.tN2w, w.tN2b, dc->t_net2, dim, "t_net2");
+    auto up1 = [&](ggml_tensor* tt, void* dd, const char* nm) { chk(tt, dd, static_cast<std::size_t>(hd) * sizeof(float), nm); };
+    up1(w.nQ, dc->norm_q, "nQ"); up1(w.nK, dc->norm_k, "nK"); up1(w.nAQ, dc->norm_aq, "nAQ"); up1(w.nAK, dc->norm_ak, "nAK");
+
+    auto setBranch = [&](QiBlockTensors& t, const TSGgmlQwenImageBlockDesc* d, int ts) {
+        auto setF = [&](ggml_tensor* tt, void* dd, int rows, int seq, const char* nm) { chk(tt, dd, static_cast<std::size_t>(rows) * seq * sizeof(float), nm); };
+        setF(t.img, d->img, dim, iseq, "img"); setF(t.txt, d->txt, dim, ts, "txt");
+        setF(t.i_s1a, d->i_s1a, dim, iseq, "i_s1a"); setF(t.i_sha, d->i_sha, dim, iseq, "i_sha"); setF(t.i_ga, d->i_ga, dim, iseq, "i_ga");
+        setF(t.t_s1a, d->t_s1a, dim, ts, "t_s1a"); setF(t.t_sha, d->t_sha, dim, ts, "t_sha"); setF(t.t_ga, d->t_ga, dim, ts, "t_ga");
+        setF(t.i_s1m, d->i_s1m, dim, iseq, "i_s1m"); setF(t.i_shm, d->i_shm, dim, iseq, "i_shm"); setF(t.i_gm, d->i_gm, dim, iseq, "i_gm");
+        setF(t.t_s1m, d->t_s1m, dim, ts, "t_s1m"); setF(t.t_shm, d->t_shm, dim, ts, "t_shm"); setF(t.t_gm, d->t_gm, dim, ts, "t_gm");
+        setF(t.i_cos, d->i_cos, hd, iseq, "i_cos"); setF(t.i_sin, d->i_sin, hd, iseq, "i_sin");
+        setF(t.t_cos, d->t_cos, hd, ts, "t_cos"); setF(t.t_sin, d->t_sin, hd, ts, "t_sin");
+    };
+    setBranch(e->tc, dc, tseqc);
+    setBranch(e->tn, dn, tseqn);
+    if (!ok) return 0;
+
+    if (ggml_backend_graph_compute(g_backend, e->graph) != GGML_STATUS_SUCCESS)
+    { set_last_error("QwenImageBlockCfg(persist): graph compute failed."); return 0; }
+    ggml_backend_synchronize(g_backend);
+    ggml_backend_tensor_get(e->ic_out, dc->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+    ggml_backend_tensor_get(e->tc_out, dc->txt, 0, static_cast<std::size_t>(dim) * tseqc * sizeof(float));
+    ggml_backend_tensor_get(e->in_out, dn->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+    ggml_backend_tensor_get(e->tn_out, dn->txt, 0, static_cast<std::size_t>(dim) * tseqn * sizeof(float));
+    return 1;
+}
+
 } // namespace
 
 // Persist-mode dispatch flag (default ON; TS_QWEN_DIT_CAPTURE=0 forces the
@@ -841,6 +1122,21 @@ static bool qi_block_persist_enabled()
 {
     static const bool on = []{ const char* e = std::getenv("TS_QWEN_DIT_CAPTURE"); return e == nullptr || e[0] != '0'; }();
     return on;
+}
+
+// Max (img+txt) token count eligible for the captured path. With flash-attn (default on)
+// the captured entry is O(total) VRAM, so the historical 768 cap (set for the O(total^2)
+// materialized path) can be lifted to cover high-res edits. With flash OFF the materialized
+// scores return, so keep the conservative 768. Override with TS_QWEN_DIT_CAPTURE_MAXTOK
+// (0 = no cap / always capture).
+static int qi_capture_max_tokens()
+{
+    static const int v = []{
+        const char* e = std::getenv("TS_QWEN_DIT_CAPTURE_MAXTOK");
+        if (e != nullptr) return std::atoi(e);
+        return qi_flash_enabled() ? 4096 : 768;
+    }();
+    return v;
 }
 
 TSG_EXPORT int TSGgml_QwenImageBlock(const TSGgmlQwenImageBlockDesc* d)
@@ -852,12 +1148,20 @@ TSG_EXPORT int TSGgml_QwenImageBlock(const TSGgmlQwenImageBlockDesc* d)
         if (!ensure_backend()) return 0;
 
         // Fast path: persistent + CUDA-graph-captured block. All same-profile blocks
-        // share one cached graph; capture replays it after warmup. The capture cache
-        // gives every intermediate its OWN slot (stable addresses, no buffer reuse), so
-        // a single entry costs ~O(total^2) VRAM (e.g. ~3 GB at 2330 tokens) and several
-        // coexisting profile entries exhaust a 16 GB GPU. So only capture for small
-        // token counts; larger images use the non-persist path below, whose pooled
-        // buffer is allocated and freed per call (one block's scratch live at a time).
+        // share one cached graph; capture replays it after warmup, eliminating the
+        // per-op WDDM launch overhead that starves the launch-bound DiT (~40% GPU idle).
+        // The capture cache gives every intermediate its OWN slot (stable addresses, no
+        // buffer reuse). Historically this cost O(total^2) VRAM (the materialized
+        // [total,total] attention scores) and was capped at 768 tokens. Now that flash-
+        // attention is wired into the captured path (qi_block_build sets t.mask), the
+        // scores are gone and per-entry VRAM grows ~linearly, so capture extends to the
+        // high-resolution regime. Cap is configurable via TS_QWEN_DIT_CAPTURE_MAXTOK
+        // (0 = always capture); default raised when flash is on.
+        // Single-branch capture keeps the conservative 768 cap: at higher res the cond/neg
+        // branches have different txt lengths -> two captured entries per profile, doubling
+        // VRAM. The CFG-batched captured path (TSGgml_QwenImageBlockCfg) is the high-res
+        // capture route (one entry per profile for both branches). The VRAM guard in
+        // qi_block_build still protects this path if a small image is unexpectedly large.
         const int kCaptureMaxTokens = 768;
         if (qi_block_persist_enabled() && (d->img_seq + d->txt_seq) <= kCaptureMaxTokens)
         {
@@ -992,6 +1296,201 @@ TSG_EXPORT int TSGgml_QwenImageBlock(const TSGgmlQwenImageBlockDesc* d)
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("QwenImageBlock: unknown error."); return 0; }
+}
+
+// ----------------------------------------------------------------------------
+// CFG-batched block: run the SAME transformer layer for BOTH true-CFG branches
+// (conditional dc + unconditional dn) in ONE graph that SHARES the identical
+// quantized weight leaves. The DiT denoise is launch-bound (every per-block GPU
+// sync + host round-trip starves the GPU ~40% idle, ~55W/350W); batching the two
+// branches into a single dispatch doubles the work between syncs and HALVES the
+// per-block weight upload + host round-trips, filling the idle GPU. The branches
+// keep independent attention (each over its own [txt,img]) so NO cross-branch
+// masking is needed, and their txt lengths may differ. Non-persist path only
+// (the high-res >768-token regime that skips capture); the C# caller falls back
+// to two single TSGgml_QwenImageBlock calls on failure. Weights are bound from
+// dc only (dc/dn reference the same per-layer GGUF tensors).
+TSG_EXPORT int TSGgml_QwenImageBlockCfg(const TSGgmlQwenImageBlockDesc* dc,
+                                        const TSGgmlQwenImageBlockDesc* dn)
+{
+    try
+    {
+        if (dc == nullptr || dn == nullptr ||
+            dc->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwenImageBlockDesc)) ||
+            dn->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwenImageBlockDesc)))
+        { set_last_error("QwenImageBlockCfg: bad descriptor."); return 0; }
+        if (!ensure_backend()) return 0;
+
+        // Fast path: persistent + CUDA-graph-captured combined block (one entry per quant
+        // profile holds BOTH branches, so it fits VRAM where two separate single-branch
+        // captures would spill). Capture replays after warmup, removing the per-op launch
+        // overhead. Falls through to the non-persist build-every-call path on failure.
+        if (qi_block_persist_enabled())
+        {
+            const int cap = qi_capture_max_tokens();
+            const int totMax = std::max(dc->img_seq + dc->txt_seq, dc->img_seq + dn->txt_seq);
+            if (cap <= 0 || totMax <= cap)
+            {
+                QiBlockCfgPersist* e = qi_cfg_find(dc, dn);
+                if (e == nullptr) e = qi_cfg_build(dc, dn);
+                if (e != nullptr)
+                {
+                    int r = qi_cfg_run(e, dc, dn);
+                    if (r) { clear_last_error(); return 1; }
+                    std::fprintf(stderr, "[qwen-image-block-cfg persist FAIL] %s\n", g_last_error.c_str());
+                    e->reset();
+                }
+            }
+        }
+
+        const int dim = dc->dim, heads = dc->heads, hd = dc->head_dim, ff = dc->ff;
+        const int iseq = dc->img_seq, tseqc = dc->txt_seq, tseqn = dn->txt_seq;
+        const float eps = dc->eps;
+
+        PooledContextHandle context;
+        if (!context.init(32 * 1024 * 1024)) { set_last_error("QwenImageBlockCfg: ctx alloc failed."); return 0; }
+        ggml_context* ctx = context.value;
+
+        // ---- shared weight leaves (declared once, bound from dc) ----
+        QiBlockTensors w{};
+        auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& wt, ggml_tensor*& bt, int blen) {
+            wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
+            bt = s.b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, blen) : nullptr;
+        };
+        declW(dc->to_q, w.toQw, w.toQb, dim); declW(dc->to_k, w.toKw, w.toKb, dim);
+        declW(dc->to_v, w.toVw, w.toVb, dim); declW(dc->to_out, w.toOw, w.toOb, dim);
+        declW(dc->add_q, w.aQw, w.aQb, dim); declW(dc->add_k, w.aKw, w.aKb, dim);
+        declW(dc->add_v, w.aVw, w.aVb, dim); declW(dc->to_add_out, w.aOw, w.aOb, dim);
+        w.nQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        w.nK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        w.nAQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        w.nAK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        declW(dc->i_net0, w.iN0w, w.iN0b, ff);  declW(dc->i_net2, w.iN2w, w.iN2b, dim);
+        declW(dc->t_net0, w.tN0w, w.tN0b, ff);  declW(dc->t_net2, w.tN2w, w.tN2b, dim);
+
+        // ---- per-branch activations (img/txt/mod/rope/mask); reuse shared weight ptrs ----
+        auto declAct = [&](QiBlockTensors& t, int ts, ggml_tensor*& iout, ggml_tensor*& tout,
+                           const ggml_fp16_t*& maskHost, int& tpad)
+        {
+            // share the weight leaves
+            t.toQw=w.toQw; t.toQb=w.toQb; t.toKw=w.toKw; t.toKb=w.toKb;
+            t.toVw=w.toVw; t.toVb=w.toVb; t.toOw=w.toOw; t.toOb=w.toOb;
+            t.aQw=w.aQw; t.aQb=w.aQb; t.aKw=w.aKw; t.aKb=w.aKb;
+            t.aVw=w.aVw; t.aVb=w.aVb; t.aOw=w.aOw; t.aOb=w.aOb;
+            t.nQ=w.nQ; t.nK=w.nK; t.nAQ=w.nAQ; t.nAK=w.nAK;
+            t.iN0w=w.iN0w; t.iN0b=w.iN0b; t.iN2w=w.iN2w; t.iN2b=w.iN2b;
+            t.tN0w=w.tN0w; t.tN0b=w.tN0b; t.tN2w=w.tN2w; t.tN2b=w.tN2b;
+            // own activation slots
+            t.img = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.txt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            iout  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            tout  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.i_s1a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.i_sha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.i_ga  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.t_s1a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.t_sha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.t_ga  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.i_s1m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.i_shm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.i_gm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+            t.t_s1m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.t_shm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.t_gm  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, ts);
+            t.i_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+            t.i_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+            t.t_cos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, ts);
+            t.t_sin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, ts);
+            maskHost = nullptr; tpad = 0;
+            if (qi_flash_enabled())
+            {
+                maskHost = qi_attn_mask_host(iseq + ts, tpad);
+                t.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, tpad, tpad);
+            }
+        };
+
+        QiBlockTensors tc{}, tn{};
+        ggml_tensor *ic_out, *tc_out, *in_out, *tn_out;
+        const ggml_fp16_t *maskC = nullptr, *maskN = nullptr; int tpadC = 0, tpadN = 0;
+        declAct(tc, tseqc, ic_out, tc_out, maskC, tpadC);
+        declAct(tn, tseqn, in_out, tn_out, maskN, tpadN);
+
+        // ---- build both branch subgraphs (shared weight leaves) ----
+        auto buildBranch = [&](QiBlockTensors& t, int ts, ggml_tensor* iout, ggml_tensor* tout,
+                               ggml_tensor*& oi, ggml_tensor*& ot)
+        {
+            ggml_tensor *img1, *txt1;
+            qi_build_attn(ctx, t, dim, heads, hd, iseq, ts, eps, img1, txt1);
+            ggml_tensor* img2 = qi_build_mlp(ctx, img1, t.i_s1m, t.i_shm, t.i_gm, t.iN0w, t.iN0b, t.iN2w, t.iN2b, eps);
+            ggml_tensor* txt2 = qi_build_mlp(ctx, txt1, t.t_s1m, t.t_shm, t.t_gm, t.tN0w, t.tN0b, t.tN2w, t.tN2b, eps);
+            oi = ggml_cpy(ctx, img2, iout); ggml_set_output(oi);
+            ot = ggml_cpy(ctx, txt2, tout); ggml_set_output(ot);
+        };
+        ggml_tensor *oic, *otc, *oin, *otn;
+        buildBranch(tc, tseqc, ic_out, tc_out, oic, otc);
+        buildBranch(tn, tseqn, in_out, tn_out, oin, otn);
+
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, 16384, false);
+        ggml_build_forward_expand(graph, oic);
+        ggml_build_forward_expand(graph, otc);
+        ggml_build_forward_expand(graph, oin);
+        ggml_build_forward_expand(graph, otn);
+
+        // ---- bind shared weights ONCE (cacheable) + collect remaining uploads ----
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HB { ggml_tensor* t; void* d; std::size_t b; };
+        std::vector<HB> uploads;
+        auto bindW = [&](ggml_tensor* wt, ggml_tensor* bt, const TSGImgAttnW& s, int blen) {
+            if (wt && s.w) {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, wt, s.w, static_cast<std::size_t>(s.bytes), buf, addr, needs)
+                    && ggml_backend_tensor_alloc(buf, wt, addr) == GGML_STATUS_SUCCESS) {
+                    if (needs) uploads.push_back({wt, s.w, static_cast<std::size_t>(s.bytes)});
+                } else uploads.push_back({wt, s.w, static_cast<std::size_t>(s.bytes)});
+            }
+            if (bt && s.b) uploads.push_back({bt, s.b, static_cast<std::size_t>(blen) * sizeof(float)});
+        };
+        bindW(w.toQw, w.toQb, dc->to_q, dim); bindW(w.toKw, w.toKb, dc->to_k, dim);
+        bindW(w.toVw, w.toVb, dc->to_v, dim); bindW(w.toOw, w.toOb, dc->to_out, dim);
+        bindW(w.aQw, w.aQb, dc->add_q, dim); bindW(w.aKw, w.aKb, dc->add_k, dim);
+        bindW(w.aVw, w.aVb, dc->add_v, dim); bindW(w.aOw, w.aOb, dc->to_add_out, dim);
+        bindW(w.iN0w, w.iN0b, dc->i_net0, ff); bindW(w.iN2w, w.iN2b, dc->i_net2, dim);
+        bindW(w.tN0w, w.tN0b, dc->t_net0, ff); bindW(w.tN2w, w.tN2b, dc->t_net2, dim);
+        auto bind1 = [&](ggml_tensor* tt, void* dd) { if (tt && dd) uploads.push_back({tt, dd, static_cast<std::size_t>(hd) * sizeof(float)}); };
+        bind1(w.nQ, dc->norm_q); bind1(w.nK, dc->norm_k); bind1(w.nAQ, dc->norm_aq); bind1(w.nAK, dc->norm_ak);
+        if (tc.mask && maskC) uploads.push_back({tc.mask, const_cast<ggml_fp16_t*>(maskC), static_cast<std::size_t>(tpadC) * tpadC * sizeof(ggml_fp16_t)});
+        if (tn.mask && maskN) uploads.push_back({tn.mask, const_cast<ggml_fp16_t*>(maskN), static_cast<std::size_t>(tpadN) * tpadN * sizeof(ggml_fp16_t)});
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr) { set_last_error("QwenImageBlockCfg: buffer alloc failed."); return 0; }
+        host_read_barrier();
+        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+
+        auto setBranch = [&](QiBlockTensors& t, const TSGgmlQwenImageBlockDesc* d, int ts) {
+            auto setF = [&](ggml_tensor* tt, void* dd, int rows, int seq) { ggml_backend_tensor_set(tt, dd, 0, static_cast<std::size_t>(rows) * seq * sizeof(float)); };
+            setF(t.img, d->img, dim, iseq); setF(t.txt, d->txt, dim, ts);
+            setF(t.i_s1a, d->i_s1a, dim, iseq); setF(t.i_sha, d->i_sha, dim, iseq); setF(t.i_ga, d->i_ga, dim, iseq);
+            setF(t.t_s1a, d->t_s1a, dim, ts); setF(t.t_sha, d->t_sha, dim, ts); setF(t.t_ga, d->t_ga, dim, ts);
+            setF(t.i_s1m, d->i_s1m, dim, iseq); setF(t.i_shm, d->i_shm, dim, iseq); setF(t.i_gm, d->i_gm, dim, iseq);
+            setF(t.t_s1m, d->t_s1m, dim, ts); setF(t.t_shm, d->t_shm, dim, ts); setF(t.t_gm, d->t_gm, dim, ts);
+            setF(t.i_cos, d->i_cos, hd, iseq); setF(t.i_sin, d->i_sin, hd, iseq);
+            setF(t.t_cos, d->t_cos, hd, ts); setF(t.t_sin, d->t_sin, hd, ts);
+        };
+        setBranch(tc, dc, tseqc);
+        setBranch(tn, dn, tseqn);
+
+        if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+        { set_last_error("QwenImageBlockCfg: graph compute failed."); return 0; }
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(ic_out, dc->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+        ggml_backend_tensor_get(tc_out, dc->txt, 0, static_cast<std::size_t>(dim) * tseqc * sizeof(float));
+        ggml_backend_tensor_get(in_out, dn->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+        ggml_backend_tensor_get(tn_out, dn->txt, 0, static_cast<std::size_t>(dim) * tseqn * sizeof(float));
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("QwenImageBlockCfg: unknown error."); return 0; }
 }
 
 } // extern "C"

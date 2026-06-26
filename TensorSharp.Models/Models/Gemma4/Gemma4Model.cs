@@ -1138,7 +1138,7 @@ namespace TensorSharp.Models
                 _linearTicks += Stopwatch.GetTimestamp() - tFused;
                 _kvCacheHostDirty = true;
             }
-            else if (useWholeModelPrefill && NativeGemma4ModelVerify(hidden, startPos, seqLen, perLayerInputs))
+            else if (useWholeModelPrefill && NativeGemma4ModelVerify(hidden, startPos, seqLen, perLayerInputs, exceptPositions))
             {
                 // hidden now holds the layer-stack output [hiddenSize, seqLen];
                 // the kernel wrote the KV cache for all seqLen tokens on-device.
@@ -1636,7 +1636,14 @@ namespace TensorSharp.Models
         // Shared by ForwardRefill and the MTP speculative prefill (SpecForward).
         internal int ComputePrefillChunkSize()
         {
-            int prefillChunkSize = Math.Min(2048, Math.Max(_slidingWindow * 2, 1024));
+            // 2048 is the memory-safe ceiling for the full-attention score tensor
+            // (~numHeads × chunk × totalKv × 4B). We floor at it (not window*2) so a
+            // single start_pos==0 chunk covers typical long prompts even on
+            // small-window models (e.g. E-series, window 512) — that first chunk runs
+            // entirely through the fused whole-model verify kernel (one GGML graph),
+            // whereas a smaller chunk would push the remainder into a start_pos>0
+            // chunk that falls back to the per-op path. See CanUseWholeModelPrefillVerify.
+            int prefillChunkSize = 2048;
             string chunkOverride = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(chunkOverride) && int.TryParse(chunkOverride, out int chunkOv) && chunkOv > 0)
                 prefillChunkSize = chunkOv;
@@ -1767,7 +1774,7 @@ namespace TensorSharp.Models
                 _linearTicks += Stopwatch.GetTimestamp() - tFused;
                 _kvCacheHostDirty = true;
             }
-            else if (useWholeModelPrefill && NativeGemma4ModelVerify(hidden, startPos, seqLen, perLayerInputs))
+            else if (useWholeModelPrefill && NativeGemma4ModelVerify(hidden, startPos, seqLen, perLayerInputs, exceptPositions))
             {
                 // hidden now holds the layer-stack output; the kernel wrote the
                 // KV cache for all seqLen tokens on-device. No logits needed here.
@@ -2395,10 +2402,22 @@ namespace TensorSharp.Models
         /// (caller falls back to the per-op path) when the native kernel declines —
         /// e.g. total length exceeds the SWA window so the circular cache has wrapped.
         /// </summary>
-        private unsafe bool NativeGemma4ModelVerify(Tensor hidden, int startPos, int n, Tensor perLayerInputs)
+        private unsafe bool NativeGemma4ModelVerify(Tensor hidden, int startPos, int n, Tensor perLayerInputs,
+            HashSet<int> exceptPositions = null)
         {
             if (_decodeArrays == null) return false;
             var a = _decodeArrays;
+
+            // Multimodal bidirectional-span mask (image/audio soft tokens). Only
+            // valid at startPos==0 (the kernel maps view-index to logical position
+            // directly there); the gate guarantees that. One byte per token.
+            byte[] isExcept = null;
+            if (exceptPositions != null && exceptPositions.Count > 0 && startPos == 0)
+            {
+                isExcept = new byte[n];
+                foreach (int p in exceptPositions)
+                    if (p >= 0 && p < n) isExcept[p] = 1;
+            }
 
             float* hiddenPtr = GetFloatPtr(hidden);
 
@@ -2433,13 +2452,20 @@ namespace TensorSharp.Models
                 pleDataPtr, _pleDim,
                 a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
                 a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
-                a.PlePostNorm);
+                a.PlePostNorm,
+                isExcept);
         }
 
         // Gates the whole-model multi-token prefill path. Default on; set
         // TS_G4_WHOLE_PREFILL=0 to force the per-op chunked path for A/B.
         private static readonly bool s_wholeModelPrefillEnabled =
             Environment.GetEnvironmentVariable("TS_G4_WHOLE_PREFILL") != "0";
+
+        // Route multimodal (image/audio) prefill through the fused whole-model
+        // verify kernel too, using its bidirectional-span mask. Default on; set
+        // TS_G4_MM_PREFILL=0 to keep multimodal on the per-op path for A/B.
+        private static readonly bool s_wholeModelMMPrefillEnabled =
+            Environment.GetEnvironmentVariable("TS_G4_MM_PREFILL") != "0";
 
         /// <summary>
         /// Whether a dense Gemma 4 prefill chunk can run through the fused
@@ -2464,22 +2490,33 @@ namespace TensorSharp.Models
         private bool CanUseWholeModelPrefillVerify(int startPos, int seqLen, HashSet<int> exceptPositions)
         {
             if (!s_wholeModelPrefillEnabled) return false;
-            if (!IsGgmlBackend || seqLen <= 1 || exceptPositions != null) return false;
+            if (!IsGgmlBackend || seqLen <= 1) return false;
+            // Multimodal (image/audio soft tokens): the kernel's bidirectional-span
+            // mask is only valid at startPos==0 (view-index == logical position).
+            // Later-turn multimodal chunks (startPos>0) keep the per-op path.
+            if (exceptPositions != null && (!s_wholeModelMMPrefillEnabled || startPos != 0)) return false;
             if (_decodeArrays == null || !_canUseFusedFullModelDecode) return false; // dense only (no MoE)
             if (_kvCacheDtype.IsBlockQuantized()) return false;
 
             long totalSeqLen = (long)startPos + seqLen;
-            // The kernel's fresh-K/V SWA path is only correct for non-shared layers
-            // at start_pos==0 (the fresh chunk is the whole history). E-series models
-            // with KV-donor layers keep the strict no-wrap bound below.
-            bool swaFreshOk = startPos == 0 && _kvDonorMap.Count == 0;
+            // The kernel's fresh-K/V SWA path attends over the whole chunk's fresh
+            // K/V (a sliding-window mask, correct for any N) at start_pos==0 — for
+            // both non-shared layers (their own K/V) and shared (KV-donor) SWA
+            // layers (the donor's retained fresh K/V). The start_pos==0 restriction
+            // holds because only then is the fresh chunk the entire history; chunked
+            // / multi-turn prefill past the window falls back to the per-op path.
+            bool swaFreshOk = startPos == 0;
             var a = _decodeArrays;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (totalSeqLen <= a.CacheSize[l]) continue;       // no wrap / fits
                 bool isLocal = a.IsLocal[l] != 0;
-                if (isLocal && swaFreshOk) continue;               // handled by kernel swaFresh path
-                return false;                                      // would wrap SWA / overflow global
+                if (!isLocal || !swaFreshOk) return false;         // would overflow global / wrap SWA past chunk
+                // Shared SWA layer: the kernel attends the donor's fresh full K/V,
+                // which only exists when the donor is a non-shared layer (computes
+                // its own K/V). A donor that is itself shared is unsupported here.
+                int src = a.KvSource[l];
+                if (src != l && a.KvSource[src] != src) return false;
             }
             return true;
         }

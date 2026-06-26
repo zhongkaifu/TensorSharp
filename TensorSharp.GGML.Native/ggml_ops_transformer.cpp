@@ -4822,7 +4822,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
     float* ple_data, int ple_dim,
     void** ple_gate_arr, int* ple_gate_type_arr, std::int64_t* ple_gate_ne0_arr, std::int64_t* ple_gate_ne1_arr, std::int64_t* ple_gate_bytes_arr,
     void** ple_proj_arr, int* ple_proj_type_arr, std::int64_t* ple_proj_ne0_arr, std::int64_t* ple_proj_ne1_arr, std::int64_t* ple_proj_bytes_arr,
-    void** ple_post_norm_arr)
+    void** ple_post_norm_arr,
+    // Multimodal bidirectional-span mask, nullable, length N (one byte per token,
+    // 1 = "soft" image/audio token). When set (multimodal prefill, start_pos==0)
+    // the attention mask is causal PLUS bidirectional within the soft-token spans:
+    // a soft-token query may attend forward to a soft-token key. Mirrors the C#
+    // per-op ApplyCausalMask exceptPositions path. Null for text / MTP verify.
+    const unsigned char* is_except_arr)
 {
     try
     {
@@ -4833,6 +4839,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         const int totalSeqLen = start_pos + N;
         if (N <= 1)
             return 0;
+
+        // The bidirectional-span mask maps view-index == logical position only at
+        // start_pos==0 (nPast==0); the C# gate guarantees that for multimodal.
+        const unsigned char* is_except = (start_pos == 0) ? is_except_arr : nullptr;
 
         struct LayerInfo { int hd; int kvHeads; int qDim; int kDim; int cacheSize; bool isLocal; bool isShared; int kvSource; };
         std::vector<LayerInfo> li(num_layers);
@@ -4971,9 +4981,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             {
                 const int threshold = nPast + qi;
                 const int low = (window > 0) ? (threshold - window + 1) : 0;
+                // Bidirectional within soft-token (image/audio) spans: a soft query
+                // also keeps soft keys ahead of it. Window low-bound is not applied
+                // to the bidi branch (mirrors the C# per-op exceptPositions path).
+                const bool q_except = is_except != nullptr && qi < N && is_except[qi] != 0;
                 ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * attendLen];
                 for (int ki = 0; ki < attendLen; ki++)
-                    row[ki] = (ki > threshold || (window > 0 && ki < low)) ? neg_inf : zero_val;
+                {
+                    bool causal = (ki <= threshold) && !(window > 0 && ki < low);
+                    bool bidi = q_except && ki < N && is_except[ki] != 0;
+                    row[ki] = (causal || bidi) ? zero_val : neg_inf;
+                }
             }
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
@@ -4982,6 +5000,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         };
 
         ggml_tensor* hidden = current;
+
+        // Retain each non-shared layer's FRESH full-chunk K/V (all N positions,
+        // post norm/RoPE) so a shared (KV-donor) SWA layer whose sequence exceeds
+        // the circular window at start_pos==0 can attend over the donor's whole
+        // chunk directly — the W-sized cache only kept the last W positions, which
+        // drops keys for the early query rows. Null for shared layers / unused.
+        std::vector<ggml_tensor*> layer_k_full(num_layers, nullptr);
+        std::vector<ggml_tensor*> layer_v_full(num_layers, nullptr);
 
         for (int l = 0; l < num_layers; l++)
         {
@@ -5069,6 +5095,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     lt.k_cpy2 = writePart(lt.k_cached_t, k_write, writeOffsetInChunk + n1, 0, writeLen - n1);
                     lt.v_cpy2 = writePart(lt.v_cached_t, v_write, writeOffsetInChunk + n1, 0, writeLen - n1);
                 }
+                // Publish the fresh full-chunk K/V so shared SWA layers can attend it.
+                layer_k_full[l] = k_write;
+                layer_v_full[l] = v_write;
             }
 
             // SWA prefill that overflows the circular window at start_pos==0: the
@@ -5079,6 +5108,15 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // still received the last W positions above for subsequent decode.
             const bool swaFresh = info.isLocal && !info.isShared && start_pos == 0
                 && totalSeqLen > info.cacheSize && k_write != nullptr;
+
+            // Same overflow case for a SHARED (KV-donor) SWA layer: its donor (a
+            // non-shared SWA layer, processed earlier in this graph) retained its
+            // FRESH full chunk in layer_k_full/v_full. Attend that directly with the
+            // sliding-window mask instead of the donor's W-sized circular cache view
+            // (which lost the early positions). This is what lets E-series models
+            // (KV-donor layers) run prompts > window through the fused kernel.
+            const bool swaFreshShared = info.isLocal && info.isShared && start_pos == 0
+                && totalSeqLen > info.cacheSize && layer_k_full[info.kvSource] != nullptr;
 
             // Read the attention window. SWA: the last min(totalSeqLen, W) positions
             // (view_kv_cache_window unwraps the circular buffer). Global: [0, total).
@@ -5092,6 +5130,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 maskWindow = info.cacheSize;    // sliding window W
                 k_full = k_write;               // [hd, N, kvHeads]
                 v_full = v_write;               // [hd, N, kvHeads]
+            }
+            else if (swaFreshShared)
+            {
+                attendLen = N;                  // donor's fresh K/V covers [0, N)
+                maskWindow = info.cacheSize;    // donor's sliding window W (== this layer's)
+                k_full = layer_k_full[info.kvSource];   // [hd, N, kvHeads]
+                v_full = layer_v_full[info.kvSource];   // [hd, N, kvHeads]
             }
             else
             {

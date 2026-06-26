@@ -1625,6 +1625,15 @@ namespace TensorSharp.GGML
             return GgmlNative.TryQwenImageBlock(in args);
         }
 
+        /// <summary>CFG-batched Qwen-Image DiT block: runs the SAME layer for both true-CFG branches
+        /// (conditional + unconditional) in ONE graph that shares the quantized weight leaves. Halves the
+        /// per-block weight upload + GPU sync/host round-trip vs two single-branch calls (the denoise is
+        /// launch-bound). Each branch keeps independent attention; txt lengths may differ.</summary>
+        public static bool TryQwenImageBlockCfg(in QwenImageBlockArgs condArgs, in QwenImageBlockArgs negArgs)
+        {
+            return GgmlNative.TryQwenImageBlockCfg(in condArgs, in negArgs);
+        }
+
         /// <summary>Single 2D convolution on the active GGML device (ggml_conv_2d). Used to move the
         /// Qwen-Image VAE conv stack off the CPU. Layouts match VaeReferenceMath (no transposes).</summary>
         public static bool TryConv2d(in Conv2dArgs args)
@@ -2451,7 +2460,8 @@ namespace TensorSharp.GGML
             IntPtr pleData, int pleDim,
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
-            IntPtr[] plePostNormArr)
+            IntPtr[] plePostNormArr,
+            byte[] isExceptArr = null)
         {
             return GgmlNative.Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -2474,7 +2484,8 @@ namespace TensorSharp.GGML
                 pleData, pleDim,
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
-                plePostNormArr);
+                plePostNormArr,
+                isExceptArr);
         }
 
         /// <summary>Fused Gemma 4 MTP draft step. Returns false when the native
