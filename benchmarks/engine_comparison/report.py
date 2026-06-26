@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -50,6 +51,15 @@ COL_LABEL = {
     ("llamacpp", "cpu"): "llama.cpp · CPU",
     ("vllm", "gpu"): "vLLM · GPU",
 }
+
+# Performance-ratio comparisons: TensorSharp (numerator) vs a reference engine on
+# the *same* backend, so the columns stay apples-to-apples. A ratio > 1.0×
+# means TensorSharp is faster (for throughput metrics) / lower-latency (TTFT).
+RATIO_PAIRS = [
+    (("tensorsharp", "gpu"), ("llamacpp", "gpu"), "vs llama.cpp · GPU"),
+    (("tensorsharp", "cpu"), ("llamacpp", "cpu"), "vs llama.cpp · CPU"),
+    (("tensorsharp", "gpu"), ("vllm", "gpu"), "vs vLLM · GPU"),
+]
 
 
 def load_all() -> dict:
@@ -108,6 +118,104 @@ def metric_table(scen_map: dict, cols: list, metric: str) -> str:
             cells.append(_cell(col_map.get(c), metric))
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join(rows)
+
+
+def _ok_value(rec, metric: str) -> float:
+    """The metric value only when the cell actually ran; else 0.0."""
+    if not rec or rec.get("status") != "ok":
+        return 0.0
+    return float(rec.get(metric, 0.0) or 0.0)
+
+
+def _ratio_val(ts_rec, ref_rec, metric: str, higher_is_better: bool = True) -> float:
+    """TensorSharp-relative speedup for one cell, or 0.0 if either side is
+    missing/failed/zero. For throughput (higher is better) this is TS/ref; for
+    latency like TTFT (lower is better) it is ref/TS — so a value > 1.0× always
+    means TensorSharp won."""
+    a = _ok_value(ts_rec, metric)
+    b = _ok_value(ref_rec, metric)
+    if a <= 0 or b <= 0:
+        return 0.0
+    return (a / b) if higher_is_better else (b / a)
+
+
+def _fmt_ratio(r: float) -> str:
+    return f"{r:.2f}×" if r > 0 else "—"
+
+
+def _geomean(vals: list) -> float:
+    vals = [v for v in vals if v > 0]
+    if not vals:
+        return 0.0
+    return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+_RATIO_METRICS = (("decode_tps", True), ("prefill_tps", True), ("ttft_ms", False))
+
+
+def _present_ratio_pairs(scen_map: dict) -> list:
+    """Ratio pairs that yield at least one real number for this model — i.e. some
+    scenario where both TensorSharp and the reference actually ran. Drops e.g. an
+    all-`—` vLLM column when that endpoint never produced a comparable cell."""
+    out = []
+    for ts, ref, lbl in RATIO_PAIRS:
+        if any(_ratio_val(col_map.get(ts), col_map.get(ref), m, hib) > 0
+               for col_map in scen_map.values()
+               for m, hib in _RATIO_METRICS):
+            out.append((ts, ref, lbl))
+    return out
+
+
+def ratio_table(scen_map: dict, pairs: list, metric: str,
+                higher_is_better: bool = True) -> str:
+    head = "| Scenario | " + " | ".join(lbl for _, _, lbl in pairs) + " |"
+    sep = "|---|" + "|".join(["---:"] * len(pairs)) + "|"
+    rows = [head, sep]
+    for scenario_id in config.SCENARIOS:
+        if scenario_id not in scen_map:
+            continue
+        col_map = scen_map[scenario_id]
+        cells = [scenario_id]
+        for ts, ref, _ in pairs:
+            cells.append(_fmt_ratio(_ratio_val(
+                col_map.get(ts), col_map.get(ref), metric, higher_is_better)))
+        rows.append("| " + " | ".join(cells) + " |")
+    return "\n".join(rows)
+
+
+def summary_section(data: dict) -> str:
+    """Headline geomean speedup of TensorSharp over each reference engine, per
+    model, across all scenarios both engines ran. Geomean (not mean) so a single
+    runaway scenario can't dominate the per-model number."""
+    lines = ["| Model | Comparison | decode | prefill | TTFT |",
+             "|---|---|---:|---:|---:|"]
+    any_row = False
+    for model_id in config.MODELS:
+        if model_id not in data:
+            continue
+        scen_map = data[model_id]
+        for ts, ref, lbl in _present_ratio_pairs(scen_map):
+            d_ratios, p_ratios, t_ratios = [], [], []
+            for col_map in scen_map.values():
+                d = _ratio_val(col_map.get(ts), col_map.get(ref), "decode_tps")
+                p = _ratio_val(col_map.get(ts), col_map.get(ref), "prefill_tps")
+                t = _ratio_val(col_map.get(ts), col_map.get(ref), "ttft_ms",
+                               higher_is_better=False)
+                if d:
+                    d_ratios.append(d)
+                if p:
+                    p_ratios.append(p)
+                if t:
+                    t_ratios.append(t)
+            dg, pg, tg = _geomean(d_ratios), _geomean(p_ratios), _geomean(t_ratios)
+            if dg <= 0 and pg <= 0 and tg <= 0:
+                continue
+            any_row = True
+            lines.append(f"| {config.MODELS[model_id].display} | {lbl} | "
+                         f"{_fmt_ratio(dg)} | {_fmt_ratio(pg)} | {_fmt_ratio(tg)} |")
+    if not any_row:
+        return "_No overlapping TensorSharp / reference cells to compare._"
+    return "\n".join(lines)
 
 
 def versions_block() -> str:
@@ -264,6 +372,15 @@ def main():
                "MTP on/off and parallel-request scaling are reported in their own sections "
                "below.\n")
 
+    out.append("## Performance ratio — TensorSharp vs reference engines\n")
+    out.append("Geomean of TensorSharp's per-scenario speedup over each reference engine on "
+               "the **same backend**, across every scenario both engines ran (single-stream, "
+               "MTP-off). A value **> 1.0× means TensorSharp is faster** (for decode / prefill "
+               "throughput) or lower-latency (for TTFT); `—` = no overlapping cells. "
+               "Per-scenario ratios are in each model's section below.\n")
+    out.append(summary_section(data))
+    out.append("")
+
     for model_id in config.MODELS:
         if model_id not in data:
             continue
@@ -282,6 +399,20 @@ def main():
         out.append("**Time to first token (ms, lower is better)**\n")
         out.append(metric_table(scen_map, cols, "ttft_ms"))
         out.append("")
+
+        pairs = _present_ratio_pairs(scen_map)
+        if pairs:
+            out.append("**Performance ratio — TensorSharp vs reference "
+                       "(> 1.0× = TensorSharp faster)**\n")
+            out.append("_Decode throughput_\n")
+            out.append(ratio_table(scen_map, pairs, "decode_tps"))
+            out.append("")
+            out.append("_Prefill throughput_\n")
+            out.append(ratio_table(scen_map, pairs, "prefill_tps"))
+            out.append("")
+            out.append("_Time to first token (latency; > 1.0× = TensorSharp lower)_\n")
+            out.append(ratio_table(scen_map, pairs, "ttft_ms", higher_is_better=False))
+            out.append("")
 
     out.append("## MTP / NextN speculative decoding (on vs off)\n")
     out.append("Single-stream decode tok/s with MTP/NextN speculative decoding off vs on "

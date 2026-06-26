@@ -15,6 +15,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Channels;
@@ -222,7 +223,14 @@ namespace TensorSharp.Server
             var handle = engine.SubmitRequest(seq, cancellationToken);
             var generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
-            int prevCharLen = 0;
+            int prevValidLen = 0;
+            // Stop-sequence matching needs the full decoded text; only the rare
+            // request that configures string stop sequences pays for accumulating
+            // it. The common path decodes just the newly-completed bytes per token
+            // (below) instead of re-decoding the whole buffer every step (O(n^2)).
+            bool hasStopSequences = cfg.StopSequences != null && cfg.StopSequences.Count > 0;
+            StringBuilder decodedForStops = hasStopSequences ? new StringBuilder() : null;
+            TokenSampler stopSampler = hasStopSequences ? new TokenSampler(cfg) : null;
             string finishReason = "max_tokens";
             bool wasCancelled = false;
             int kvCacheReusedTokens = 0;
@@ -247,9 +255,19 @@ namespace TensorSharp.Server
                 generatedTokens.Add(nextToken);
                 model.Tokenizer.AppendTokenBytes(nextToken, rawBytes);
                 int validLen = FindValidUtf8Length(rawBytes);
-                string decoded = Encoding.UTF8.GetString(rawBytes.GetRange(0, validLen).ToArray());
-                string piece = prevCharLen < decoded.Length ? decoded.Substring(prevCharLen) : "";
-                prevCharLen = decoded.Length;
+                // Decode only the bytes that completed a UTF-8 boundary since the
+                // last token. The prior valid prefix already ended on a character
+                // boundary, so this byte slice yields exactly the new characters —
+                // identical to substring-ing a full re-decode, but O(new bytes)
+                // rather than O(total bytes) per token (and no whole-buffer copy).
+                string piece = "";
+                if (validLen > prevValidLen)
+                {
+                    ReadOnlySpan<byte> newBytes = CollectionsMarshal.AsSpan(rawBytes)
+                        .Slice(prevValidLen, validLen - prevValidLen);
+                    piece = Encoding.UTF8.GetString(newBytes);
+                    prevValidLen = validLen;
+                }
 
                 if (!firstTokenSampled)
                 {
@@ -258,10 +276,11 @@ namespace TensorSharp.Server
                 }
 
                 bool stopRequested = false;
-                if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                if (hasStopSequences)
                 {
-                    var sampler = new TokenSampler(cfg);
-                    var (_, shouldStop) = sampler.CheckStopSequences(decoded);
+                    if (piece.Length > 0)
+                        decodedForStops.Append(piece);
+                    var (_, shouldStop) = stopSampler.CheckStopSequences(decodedForStops.ToString());
                     if (shouldStop)
                     {
                         stopRequested = true;

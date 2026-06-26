@@ -3958,7 +3958,66 @@ namespace
             folded = false; out_count = 0;
         }
     };
-    G4DecodeCache g_g4dc;
+
+    // Concurrent (N>=2) requests each decode through their OWN KV-cache holder
+    // (Gemma4Model.BindSequenceCache swaps _kvCacheK), so a single shared cache
+    // entry — whose identity key includes sig_kcache0, the holder's layer-0 KV
+    // pointer — is busted on EVERY request switch and rebuilt from scratch,
+    // collapsing aggregate throughput BELOW the single-stream rate. Keep a small
+    // pool keyed by (sig_disc, sig_kcache0) so each in-flight request retains its
+    // own persistent, CUDA-graph-captured decode graph. ggml-cuda already caches a
+    // separate captured cuda graph per distinct cgraph->nodes[0]
+    // (ggml_cuda_graph_get_key), so switching requests is a cheap replay instead
+    // of a full graph rebuild + recapture.
+    //
+    // Address-keying is self-consistent: a captured graph bakes in the KV device
+    // addresses, and the per-call inputs (hidden / pos / kv_index / mask) are
+    // uploaded fresh each replay, so an entry is only ever matched when a LIVE
+    // holder presents its kc0 — a freed-then-reallocated address simply binds the
+    // new live holder's buffers. Entries' own ctx/buffer stay alive until reset or
+    // LRU eviction; ResetKVCache drops them all.
+    constexpr int kG4MaxDecodeCaches = 8;
+    struct G4DecodeCachePool
+    {
+        G4DecodeCache entries[kG4MaxDecodeCaches];
+        std::uint64_t used[kG4MaxDecodeCaches] = {};   // LRU clock per slot
+        std::uint64_t clock = 0;
+
+        // Live entry matching this identity (model instance + KV holder), or null.
+        G4DecodeCache* find(const void* sig, const void* kc0)
+        {
+            for (int i = 0; i < kG4MaxDecodeCaches; i++)
+                if (entries[i].valid && entries[i].sig_disc == sig && entries[i].sig_kcache0 == kc0)
+                { used[i] = ++clock; return &entries[i]; }
+            return nullptr;
+        }
+
+        // A reset slot to (re)build this identity's graph into: reuse its existing
+        // slot if present (shape change -> rebuild in place), else an empty slot,
+        // else evict the least-recently-used.
+        G4DecodeCache& claim(const void* sig, const void* kc0)
+        {
+            for (int i = 0; i < kG4MaxDecodeCaches; i++)
+                if (entries[i].valid && entries[i].sig_disc == sig && entries[i].sig_kcache0 == kc0)
+                { entries[i].reset(); used[i] = ++clock; return entries[i]; }
+            for (int i = 0; i < kG4MaxDecodeCaches; i++)
+                if (!entries[i].valid) { entries[i].reset(); used[i] = ++clock; return entries[i]; }
+            int lru = 0;
+            for (int i = 1; i < kG4MaxDecodeCaches; i++) if (used[i] < used[lru]) lru = i;
+            entries[lru].reset(); used[lru] = ++clock; return entries[lru];
+        }
+
+        // Drop the entry for one identity (a call that cannot persist for it).
+        void drop(const void* sig, const void* kc0)
+        {
+            for (int i = 0; i < kG4MaxDecodeCaches; i++)
+                if (entries[i].valid && entries[i].sig_disc == sig && entries[i].sig_kcache0 == kc0)
+                    entries[i].reset();
+        }
+
+        void reset_all() { for (auto& e : entries) e.reset(); }
+    };
+    G4DecodeCachePool g_g4dc_pool;
 }
 
 TSG_EXPORT int TSGgml_Gemma4ModelDecode(
@@ -4102,42 +4161,46 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         const void* g4_sig = attn_norm_arr[0];
         const void* g4_kc0 = k_cache_arr != nullptr ? k_cache_arr[0] : nullptr;
 
-        // ---- reuse fast-path: replay the captured graph ----
-        if (can_persist && g_g4dc.valid && g_g4dc.graph != nullptr &&
-            g_g4dc.num_layers == num_layers && g_g4dc.hidden_size == hidden_size &&
-            g_g4dc.ple_dim == ple_dim && g_g4dc.sig_disc == g4_sig &&
-            g_g4dc.sig_kcache0 == g4_kc0 && g_g4dc.layer_window == pwindow &&
-            g_g4dc.folded == fold && g_g4dc.out_count == (fold ? vocab_size : hidden_size))
+        // ---- reuse fast-path: replay THIS request's captured graph ----
+        // Look the graph up by (model instance, KV holder). A per-request hit lets
+        // concurrent requests each replay their own captured graph instead of one
+        // shared entry that rebuilds on every switch. find() already matched
+        // sig_disc + sig_kcache0, so only the finer shape fields are checked here.
+        G4DecodeCache* dc = (can_persist && g4_persist) ? g_g4dc_pool.find(g4_sig, g4_kc0) : nullptr;
+        if (dc != nullptr && dc->graph != nullptr &&
+            dc->num_layers == num_layers && dc->hidden_size == hidden_size &&
+            dc->ple_dim == ple_dim && dc->layer_window == pwindow &&
+            dc->folded == fold && dc->out_count == (fold ? vocab_size : hidden_size))
         {
             auto t_start = std::chrono::high_resolution_clock::now();
             host_read_barrier();
-            ggml_backend_tensor_set(g_g4dc.hidden_in, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+            ggml_backend_tensor_set(dc->hidden_in, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
             std::int32_t pos_val = position;
-            ggml_backend_tensor_set(g_g4dc.pos_tensor, &pos_val, 0, sizeof(std::int32_t));
-            if (g_g4dc.ple_input != nullptr && ple_data != nullptr)
-                ggml_backend_tensor_set(g_g4dc.ple_input, ple_data, 0, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
+            ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            if (dc->ple_input != nullptr && ple_data != nullptr)
+                ggml_backend_tensor_set(dc->ple_input, ple_data, 0, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
             for (int l = 0; l < num_layers; l++)
             {
-                if (g_g4dc.kv_index[l] != nullptr)
-                    ggml_backend_tensor_set(g_g4dc.kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
-                if (g_g4dc.attn_mask[l] != nullptr && !li[l].isShared)
+                if (dc->kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(dc->kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (dc->attn_mask[l] != nullptr && !li[l].isShared)
                 {
                     std::vector<ggml_fp16_t> md;
                     fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
-                    ggml_backend_tensor_set(g_g4dc.attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                    ggml_backend_tensor_set(dc->attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
                 }
             }
             auto t_setup = std::chrono::high_resolution_clock::now();
-            ggml_status st = ggml_backend_graph_compute(g_backend, g_g4dc.graph);
+            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
                 set_last_error("Gemma4 model decode: cached graph execution failed.");
-                g_g4dc.reset();
+                dc->reset();
                 return 0;
             }
             auto t_compute = std::chrono::high_resolution_clock::now();
-            void* out_data = g_g4dc.folded ? logits_data : hidden_data;
-            finalize_compute_with_download(g_g4dc.hidden_out, out_data, static_cast<std::size_t>(g_g4dc.out_count) * sizeof(float));
+            void* out_data = dc->folded ? logits_data : hidden_data;
+            finalize_compute_with_download(dc->hidden_out, out_data, static_cast<std::size_t>(dc->out_count) * sizeof(float));
             host_read_barrier();
             if (g4_fd_timing)
             {
@@ -4150,7 +4213,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             clear_last_error();
             return 1;
         }
-        if (g4_persist) g_g4dc.reset();   // shape/instance change -> rebuild below
+        // Miss -> (re)build. Claim this request's slot (reset in place / evict LRU)
+        // for a persistable call; otherwise drop any stale entry for this identity.
+        G4DecodeCache* g4dc = nullptr;
+        if (g4_persist)
+        {
+            if (can_persist) g4dc = &g_g4dc_pool.claim(g4_sig, g4_kc0);
+            else             g_g4dc_pool.drop(g4_sig, g4_kc0);
+        }
 
         auto t_build_start = std::chrono::high_resolution_clock::now();
 
@@ -4718,27 +4788,28 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         finalize_compute_with_download(hidden_out, g4_out_data, static_cast<std::size_t>(g4_out_count) * sizeof(float));
         if (can_persist) host_read_barrier();
 
-        if (can_persist)
+        if (can_persist && g4dc != nullptr)
         {
-            // Keep the ctx/graph/buffer + input handles alive for capture+replay.
-            g_g4dc.ctx = ctx;
-            g_g4dc.buffer = persist_buf;
-            g_g4dc.graph = graph;
-            g_g4dc.hidden_in = current;
-            g_g4dc.hidden_out = hidden_out;
-            g_g4dc.pos_tensor = pos_tensor;
-            g_g4dc.ple_input = ple_input;
-            g_g4dc.kv_index = layer_kv_index;
-            g_g4dc.attn_mask = layer_attn_mask;
-            g_g4dc.layer_window = pwindow;
-            g_g4dc.sig_disc = g4_sig;
-            g_g4dc.sig_kcache0 = g4_kc0;
-            g_g4dc.num_layers = num_layers;
-            g_g4dc.hidden_size = hidden_size;
-            g_g4dc.ple_dim = ple_dim;
-            g_g4dc.folded = fold;
-            g_g4dc.out_count = g4_out_count;
-            g_g4dc.valid = true;
+            // Keep the ctx/graph/buffer + input handles alive for capture+replay,
+            // in this request's own pool slot.
+            g4dc->ctx = ctx;
+            g4dc->buffer = persist_buf;
+            g4dc->graph = graph;
+            g4dc->hidden_in = current;
+            g4dc->hidden_out = hidden_out;
+            g4dc->pos_tensor = pos_tensor;
+            g4dc->ple_input = ple_input;
+            g4dc->kv_index = layer_kv_index;
+            g4dc->attn_mask = layer_attn_mask;
+            g4dc->layer_window = pwindow;
+            g4dc->sig_disc = g4_sig;
+            g4dc->sig_kcache0 = g4_kc0;
+            g4dc->num_layers = num_layers;
+            g4dc->hidden_size = hidden_size;
+            g4dc->ple_dim = ple_dim;
+            g4dc->folded = fold;
+            g4dc->out_count = g4_out_count;
+            g4dc->valid = true;
         }
         if (g4_fd_timing)
         {
@@ -4772,7 +4843,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 // persist mode is off (the cache is never populated).
 TSG_EXPORT void TSGgml_Gemma4ResetDecodeCache()
 {
-    g_g4dc.reset();
+    g_g4dc_pool.reset_all();
 }
 
 // ============================================================================
@@ -6164,7 +6235,42 @@ namespace
             folded = false; out_count = 0;
         }
     };
-    G4MoEDecodeCache g_g4moe;
+
+    // Per-request pool, identical in purpose to g_g4dc_pool (see its comment):
+    // concurrent requests each decode through their own KV holder, so a single
+    // shared entry would rebuild on every switch and collapse N>=2 throughput.
+    // Keyed by (sig_disc, sig_kcache0) so each in-flight request keeps its own
+    // persistent captured graph; ggml-cuda caches a cuda graph per nodes[0].
+    constexpr int kG4MoeMaxDecodeCaches = 8;
+    struct G4MoEDecodeCachePool
+    {
+        G4MoEDecodeCache entries[kG4MoeMaxDecodeCaches];
+        std::uint64_t used[kG4MoeMaxDecodeCaches] = {};
+        std::uint64_t clock = 0;
+
+        G4MoEDecodeCache* find(const void* sig, const void* kc0)
+        {
+            for (int i = 0; i < kG4MoeMaxDecodeCaches; i++)
+                if (entries[i].valid && entries[i].sig_disc == sig && entries[i].sig_kcache0 == kc0)
+                { used[i] = ++clock; return &entries[i]; }
+            return nullptr;
+        }
+
+        G4MoEDecodeCache& claim(const void* sig, const void* kc0)
+        {
+            for (int i = 0; i < kG4MoeMaxDecodeCaches; i++)
+                if (entries[i].valid && entries[i].sig_disc == sig && entries[i].sig_kcache0 == kc0)
+                { entries[i].reset(); used[i] = ++clock; return entries[i]; }
+            for (int i = 0; i < kG4MoeMaxDecodeCaches; i++)
+                if (!entries[i].valid) { entries[i].reset(); used[i] = ++clock; return entries[i]; }
+            int lru = 0;
+            for (int i = 1; i < kG4MoeMaxDecodeCaches; i++) if (used[i] < used[lru]) lru = i;
+            entries[lru].reset(); used[lru] = ++clock; return entries[lru];
+        }
+
+        void reset_all() { for (auto& e : entries) e.reset(); }
+    };
+    G4MoEDecodeCachePool g_g4moe_pool;
 }
 
 TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
@@ -6249,40 +6355,42 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         const void* g4moe_sig = layers[0].attn_norm_w;
         const void* g4moe_kc0 = layers[0].k_cache;
 
-        // ---- reuse fast-path: replay the captured graph ----
-        if (can_persist && g_g4moe.valid && g_g4moe.graph != nullptr &&
-            g_g4moe.num_layers == num_layers && g_g4moe.hidden_size == H &&
-            g_g4moe.sig_disc == g4moe_sig && g_g4moe.sig_kcache0 == g4moe_kc0 &&
-            g_g4moe.layer_window == pwindow &&
-            g_g4moe.folded == fold && g_g4moe.out_count == out_count)
+        // ---- reuse fast-path: replay THIS request's captured graph ----
+        // Per-request lookup (model instance + KV holder); find() already matched
+        // sig_disc + sig_kcache0, so only the finer shape fields are checked here.
+        G4MoEDecodeCache* dc = can_persist ? g_g4moe_pool.find(g4moe_sig, g4moe_kc0) : nullptr;
+        if (dc != nullptr && dc->graph != nullptr &&
+            dc->num_layers == num_layers && dc->hidden_size == H &&
+            dc->layer_window == pwindow &&
+            dc->folded == fold && dc->out_count == out_count)
         {
             auto t_start = std::chrono::high_resolution_clock::now();
             host_read_barrier();
-            ggml_backend_tensor_set(g_g4moe.hidden_in, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+            ggml_backend_tensor_set(dc->hidden_in, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
             std::int32_t pos_val = position;
-            ggml_backend_tensor_set(g_g4moe.pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
             for (int l = 0; l < num_layers; l++)
             {
-                if (g_g4moe.kv_index[l] != nullptr)
-                    ggml_backend_tensor_set(g_g4moe.kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
-                if (g_g4moe.attn_mask[l] != nullptr)
+                if (dc->kv_index[l] != nullptr)
+                    ggml_backend_tensor_set(dc->kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                if (dc->attn_mask[l] != nullptr)
                 {
                     std::vector<ggml_fp16_t> md;
                     fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
-                    ggml_backend_tensor_set(g_g4moe.attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                    ggml_backend_tensor_set(dc->attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
                 }
             }
             auto t_setup = std::chrono::high_resolution_clock::now();
-            ggml_status st = ggml_backend_graph_compute(g_backend, g_g4moe.graph);
+            ggml_status st = ggml_backend_graph_compute(g_backend, dc->graph);
             if (st != GGML_STATUS_SUCCESS)
             {
                 set_last_error("Gemma4 MoE model decode: cached graph execution failed.");
-                g_g4moe.reset();
+                dc->reset();
                 return 0;
             }
             auto t_compute = std::chrono::high_resolution_clock::now();
-            void* reuse_out = g_g4moe.folded ? logits_data : hidden_data;
-            finalize_compute_with_download(g_g4moe.hidden_out, reuse_out, static_cast<std::size_t>(g_g4moe.out_count) * sizeof(float));
+            void* reuse_out = dc->folded ? logits_data : hidden_data;
+            finalize_compute_with_download(dc->hidden_out, reuse_out, static_cast<std::size_t>(dc->out_count) * sizeof(float));
             host_read_barrier();
             if (g4moe_timing)
             {
@@ -6294,8 +6402,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
             return 1;
         }
-        if (can_persist)
-            g_g4moe.reset();   // window grew a stride / shape change -> rebuild below
+        // Miss -> claim this request's slot to (re)build into (when persistable).
+        G4MoEDecodeCache* g4moe = can_persist ? &g_g4moe_pool.claim(g4moe_sig, g4moe_kc0) : nullptr;
 
         // ctx holds only tensor metadata (no_alloc: data is bound externally). Non-
         // persist uses a pooled 32 MB block; persist uses a raw ctx kept alive in
@@ -6798,26 +6906,27 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         // the common gallocr path (buffer.value == nullptr).
         if (buffer.value != nullptr || can_persist) host_read_barrier();
 
-        if (can_persist)
+        if (can_persist && g4moe != nullptr)
         {
-            // Keep the ctx/graph/buffer + input handles alive for capture+replay.
-            g_g4moe.ctx = ctx;
-            g_g4moe.buffer = persist_buf;
-            g_g4moe.graph = graph;
-            g_g4moe.hidden_in = hidden_t;
-            g_g4moe.hidden_out = hidden_out;
-            g_g4moe.pos_tensor = pos_tensor;
-            g_g4moe.kv_index = layer_kv_index;
-            g_g4moe.attn_mask.resize(num_layers);
-            for (int l = 0; l < num_layers; l++) g_g4moe.attn_mask[l] = lt[l].attn_mask;
-            g_g4moe.layer_window = pwindow;
-            g_g4moe.sig_disc = g4moe_sig;
-            g_g4moe.sig_kcache0 = g4moe_kc0;
-            g_g4moe.num_layers = num_layers;
-            g_g4moe.hidden_size = H;
-            g_g4moe.folded = fold;
-            g_g4moe.out_count = out_count;
-            g_g4moe.valid = true;
+            // Keep the ctx/graph/buffer + input handles alive for capture+replay,
+            // in this request's own pool slot.
+            g4moe->ctx = ctx;
+            g4moe->buffer = persist_buf;
+            g4moe->graph = graph;
+            g4moe->hidden_in = hidden_t;
+            g4moe->hidden_out = hidden_out;
+            g4moe->pos_tensor = pos_tensor;
+            g4moe->kv_index = layer_kv_index;
+            g4moe->attn_mask.resize(num_layers);
+            for (int l = 0; l < num_layers; l++) g4moe->attn_mask[l] = lt[l].attn_mask;
+            g4moe->layer_window = pwindow;
+            g4moe->sig_disc = g4moe_sig;
+            g4moe->sig_kcache0 = g4moe_kc0;
+            g4moe->num_layers = num_layers;
+            g4moe->hidden_size = H;
+            g4moe->folded = fold;
+            g4moe->out_count = out_count;
+            g4moe->valid = true;
         }
         clear_last_error();
         return 1;
@@ -6842,7 +6951,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
 // mode is off (the cache is never populated).
 TSG_EXPORT void TSGgml_Gemma4MoEResetDecodeCache()
 {
-    g_g4moe.reset();
+    g_g4moe_pool.reset_all();
 }
 
 // ============================================================================

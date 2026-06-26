@@ -27,6 +27,15 @@ the *streamed* response, independent of any engine's internal timer:
 DiffusionGemma denoises whole blocks (no token stream); it is run non-streaming
 and its `decode_tps` is wall-clock tokens/second.
 
+`report.py` also derives a **performance ratio** of TensorSharp against each
+reference engine on the *same* backend (so the comparison stays apples-to-apples):
+a headline **per-model geomean** table near the top, and a per-scenario ratio
+table (decode / prefill / TTFT) in each model's section. A value **> 1.0× means
+TensorSharp is faster** (decode / prefill throughput) or lower-latency (TTFT). A
+ratio is `—` when either side has no usable (`ok`) cell, and a reference column
+is dropped entirely when that engine produced nothing comparable for the model
+(e.g. an unreachable vLLM endpoint).
+
 ## Files
 
 | File | Role |

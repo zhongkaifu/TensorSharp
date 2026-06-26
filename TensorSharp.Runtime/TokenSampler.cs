@@ -37,17 +37,28 @@ namespace TensorSharp.Runtime
         {
             int vocabSize = logits.Length;
 
-            if (_config.IsGreedy && !HasPenalties() && (generatedTokenIds == null || generatedTokenIds.Count == 0))
-                return Argmax(logits);
+            // Greedy (temperature <= 0) reduces to an argmax over the penalized
+            // logits — top-k / top-p / min-p are never applied on this branch.
+            // Penalties only adjust the handful of distinct already-generated
+            // tokens, so compute it allocation-free: a plain argmax when there is
+            // nothing to penalize, otherwise penalize just those positions in
+            // place, take the argmax, and restore the caller's buffer. This is
+            // bit-identical to the full-vocab copy path below but avoids a
+            // per-token vocab-sized allocation + memcpy (~250k floats per token
+            // at this vocab size — pure waste on the hot decode path).
+            if (_config.Temperature <= 0f)
+            {
+                bool hasHistory = generatedTokenIds != null && generatedTokenIds.Count > 0;
+                if (!HasPenalties() || !hasHistory)
+                    return Argmax(logits);
+                return ArgmaxWithPenaltiesInPlace(logits, generatedTokenIds);
+            }
 
-            // Work on a copy to avoid mutating the caller's buffer
+            // Non-greedy: work on a copy to avoid mutating the caller's buffer.
             float[] scores = new float[vocabSize];
             Array.Copy(logits, scores, vocabSize);
 
             ApplyPenalties(scores, generatedTokenIds);
-
-            if (_config.Temperature <= 0f)
-                return Argmax(scores);
 
             ApplyTemperature(scores, _config.Temperature);
 
@@ -58,6 +69,61 @@ namespace TensorSharp.Runtime
             candidates = ApplyTopP(probs, candidates);
 
             return SampleFromCandidates(probs, candidates);
+        }
+
+        /// <summary>
+        /// Greedy argmax over the penalized logits, applied in place to only the
+        /// distinct already-generated token positions and then restored, so the
+        /// caller's buffer is left unchanged. Produces the exact same index as
+        /// copying the whole vocab and running <see cref="ApplyPenalties"/> +
+        /// <see cref="Argmax"/>, but without the per-token vocab-sized allocation
+        /// and memcpy. Only called when <see cref="HasPenalties"/> and there is
+        /// generation history.
+        /// </summary>
+        private int ArgmaxWithPenaltiesInPlace(float[] logits, IList<int> generatedTokenIds)
+        {
+            // Distinct counts over the history (frequency penalty needs the count;
+            // repetition/presence need presence). Mirrors ApplyPenalties' counting.
+            var counts = new Dictionary<int, int>();
+            foreach (int id in generatedTokenIds)
+            {
+                if (id < 0 || id >= logits.Length)
+                    continue;
+                counts.TryGetValue(id, out int c);
+                counts[id] = c + 1;
+            }
+            if (counts.Count == 0)
+                return Argmax(logits);
+
+            float repPenalty = _config.RepetitionPenalty > 0f ? _config.RepetitionPenalty : 1.0f;
+            float presPenalty = _config.PresencePenalty;
+            float freqPenalty = _config.FrequencyPenalty;
+
+            // Save originals, apply the penalty in place (same arithmetic and order
+            // as ApplyPenalties), argmax, then restore the caller's buffer exactly.
+            var saved = new KeyValuePair<int, float>[counts.Count];
+            int si = 0;
+            foreach (var (tokenId, count) in counts)
+            {
+                float original = logits[tokenId];
+                saved[si++] = new KeyValuePair<int, float>(tokenId, original);
+
+                float v = original;
+                if (repPenalty != 1.0f)
+                    v = v > 0 ? v / repPenalty : v * repPenalty;
+                if (presPenalty != 0f)
+                    v -= presPenalty;
+                if (freqPenalty != 0f)
+                    v -= freqPenalty * count;
+                logits[tokenId] = v;
+            }
+
+            int best = Argmax(logits);
+
+            for (int i = 0; i < saved.Length; i++)
+                logits[saved[i].Key] = saved[i].Value;
+
+            return best;
         }
 
         /// <summary>
