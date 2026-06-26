@@ -450,6 +450,42 @@ namespace TensorSharp.Models
                     return false;
             }
 
+            // VRAM-fit guard. The whole-encoder graph keeps ALL block weights
+            // resident at once AND materializes the O(numPatches^2) attention-score
+            // tensor (numHeads * numPatches^2 floats) inside its gallocr. For a large
+            // image (e.g. 7920 patches -> ~4 GB of scores) this working set can exceed
+            // free device memory; on WDDM the driver then pages it in/out per op and
+            // the single "fused" encode runs ~35x slower than the per-block fallback
+            // (95 s vs 5 s observed on a 16 GB GPU hosting a resident ~12 GB model).
+            // The per-block path (TryWholeEncoderFused -> false) keeps only one block's
+            // weights resident and uses flash attention (no materialized scores), so its
+            // peak is far smaller. Decline the fused path whenever its estimated working
+            // set doesn't comfortably fit, so we stay fast for both small images (fused)
+            // and large images (per-block). Set TS_QWEN35_VENC_FUSED_NOVRAMGUARD=1 to skip.
+            if (Environment.GetEnvironmentVariable("TS_QWEN35_VENC_FUSED_NOVRAMGUARD") != "1"
+                && GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out _) && freeBytes > 0)
+            {
+                static long Bytes(Tensor t) => t == null ? 0L : t.ElementCount() * sizeof(float);
+                long weightBytes = 0;
+                for (int i = 0; i < n; i++)
+                    weightBytes += Bytes(ln1W[i]) + Bytes(ln1B[i]) + Bytes(qkvW[i]) + Bytes(qkvB[i])
+                                 + Bytes(outW[i]) + Bytes(outB[i]) + Bytes(ln2W[i]) + Bytes(ln2B[i])
+                                 + Bytes(upW[i]) + Bytes(upB[i]) + Bytes(downW[i]) + Bytes(downB[i]);
+                long scoreBytes = (long)_numHeads * numPatches * numPatches * sizeof(float);
+                long actBytes = (long)numPatches * _hiddenSize * sizeof(float) * 8L;
+                long workingSet = weightBytes + scoreBytes + actBytes;
+                // Require comfortable headroom (gallocr scratch + fragmentation + room
+                // for the LLM prefill that follows). 0.75 of free was validated to keep
+                // the fused path for small images yet decline it for the thrashing case.
+                if (workingSet > (long)(freeBytes * 0.75))
+                {
+                    if (Environment.GetEnvironmentVariable("TS_VBENCH_DIAG") == "1")
+                        Console.Error.WriteLine(
+                            $"[diag] WholeEncoderFused declined: workingSet={workingSet >> 20}MB > 0.75*free={(long)(freeBytes * 0.75) >> 20}MB (free={freeBytes >> 20}MB); using per-block.");
+                    return false;
+                }
+            }
+
             float attnScale = 1f / MathF.Sqrt(headDim);
             try
             {

@@ -2560,13 +2560,23 @@ namespace TensorSharp.Models
             }
             if (!_canUseFusedMoEModelDecode) return false;
 
-            // Strict no-wrap bound (see remarks): every layer's cache must span the
-            // whole sequence so the circular SWA read and the plain-causal mask are
-            // both exact.
+            // Per-layer no-wrap / swaFresh bound (mirrors the dense gate
+            // CanUseWholeModelPrefillVerify). Global (linear-cache) layers must span the
+            // whole sequence (totalSeqLen <= cacheSize). SWA (local) layers either fit
+            // (no wrap → circular read is exact) OR, at startPos==0, overflow the window
+            // and the kernel attends the FRESH full chunk with a sliding-window mask
+            // (swaFresh) — correct for any N. The MoE gate already requires no KV-donor
+            // layers (_kvDonorMap.Count == 0), so there is no swaFreshShared case. Chunked
+            // / multi-turn SWA overflow (startPos>0) still falls back to the per-op path.
             long totalSeqLen = (long)startPos + seqLen;
+            bool swaFreshOk = startPos == 0;
             var a = _decodeArrays;
             for (int l = 0; l < Config.NumLayers; l++)
-                if (totalSeqLen > a.CacheSize[l]) return false;
+            {
+                if (totalSeqLen <= a.CacheSize[l]) continue;        // fits / no wrap
+                bool isLocal = a.IsLocal[l] != 0;
+                if (!isLocal || !swaFreshOk) return false;          // global overflow / wrapped SWA past chunk
+            }
             return true;
         }
 
