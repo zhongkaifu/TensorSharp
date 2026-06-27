@@ -1339,6 +1339,30 @@ internal enum GgmlIndexReductionOp
             IntPtr finalNormData, float logitSoftcap);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4ModelDecodeBatched(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelVerify(
             IntPtr hiddenData, int hiddenSize, int numLayers, int numTokens,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -1611,6 +1635,36 @@ internal enum GgmlIndexReductionOp
                 nameof(TSGgml_Gemma4MoEModelDecode));
         }
 
+        // TRUE token-batched MoE decode: N concurrent sequences, one token each, in
+        // one captured graph. Reuses the per-layer descriptor array for weights;
+        // KV caches are per-(layer,seq) [layer*nSeqs+seq]; positions per seq.
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_Gemma4MoEModelDecodeBatched(
+            [In] Gemma4MoELayerDecodeArgs[] layers, int numLayers, int nSeqs,
+            IntPtr hidden,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] positions,
+            IntPtr logits, int vocabSize,
+            IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap);
+
+        public static bool Gemma4MoEModelDecodeBatched(Gemma4MoELayerDecodeArgs[] layers, int numLayers, int nSeqs,
+            IntPtr hidden, IntPtr[] kCacheArr, IntPtr[] vCacheArr, int[] positions,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap)
+        {
+            int rc = TSGgml_Gemma4MoEModelDecodeBatched(layers, numLayers, nSeqs, hidden,
+                kCacheArr, vCacheArr, positions, logits, vocabSize,
+                lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap);
+            if (rc == 0 && Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[g4moe-batched-native FAIL] {GetLastErrorMessage("(no native error)")}");
+            return rc != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+        public static void Gemma4ResetMoEBatchedDecodeCache() => TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+
         // Model-wide MoE multi-token verify: the whole MoE transformer over N tokens
         // as one graph. Reuses the same descriptor array as the decode; start_pos +
         // num_tokens are explicit. Returns 0 (false) when the kernel cannot handle
@@ -1651,6 +1705,11 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_Gemma4ResetDecodeCache();
 
         public static void Gemma4ResetDecodeCache() => TSGgml_Gemma4ResetDecodeCache();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_Gemma4ResetBatchedDecodeCache();
+
+        public static void Gemma4ResetBatchedDecodeCache() => TSGgml_Gemma4ResetBatchedDecodeCache();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_Gemma4MoEResetDecodeCache();
@@ -3202,6 +3261,60 @@ internal enum GgmlIndexReductionOp
                 logitsData, vocabSize,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNormData, logitSoftcap), "gemma4_model_decode");
+        }
+
+        /// <summary>True token-batched dense decode: N concurrent sequences, one
+        /// token each, in a single fused graph. Returns false (without throwing)
+        /// when the native kernel declines (e.g. a sequence exceeds the cache
+        /// window) so the caller can fall back to round-robin.</summary>
+        public static bool Gemma4ModelDecodeBatched(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap)
+        {
+            int rc = TSGgml_Gemma4ModelDecodeBatched(
+                hiddenData, hiddenSize, numLayers, nSeqs,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, positions,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitSoftcap);
+            if (rc == 0 && Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_DEBUG") == "1")
+                Console.Error.WriteLine($"[g4-batched-native FAIL] {GetLastErrorMessage("(no native error)")}");
+            return rc != 0;
         }
 
         /// <summary>Fused multi-token verify (the speculative trunk's verify batch).

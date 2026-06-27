@@ -56,6 +56,28 @@ namespace TensorSharp.Runtime.Scheduling
         private int _liveCacheLen;
         private bool _liveCacheValid;
 
+        // ---- Retained fused-cache continuation (cross-request prefix reuse) ----
+        // The per-sequence fused path (concurrent N>=2 decode) keeps each request's
+        // full K/V in its own holder and never writes the shared paged blocks, so a
+        // finished concurrent request leaves nothing in the prefix-cache pool. For a
+        // sliding-window model the pool can't restore a long prefix anyway, so a
+        // multi-turn follow-up would re-prefill the whole conversation (KV reuse 0).
+        // We retain a small LRU of finished fused holders (the model keeps the K/V
+        // alive) keyed by their full token list, and re-adopt one for a later request
+        // whose prompt exactly extends it — the cross-request analogue of the
+        // single-stream live-cache continuation. See ComputeFusedContinuationLcp.
+        private sealed class RetainedFusedCache
+        {
+            public string RequestId;   // model holder key (retained, not active)
+            public int[] Tokens;       // full prompt+output tokens the holder's K/V covers
+        }
+        // Most-recently-retained at the tail; evict from the head.
+        private readonly LinkedList<RetainedFusedCache> _retainedFused = new();
+        // In-flight fused sequences by RequestId, so the release hook can snapshot
+        // a finishing sequence's tokens (the release notification only carries an id).
+        private readonly Dictionary<string, SequenceState> _fusedSeqById =
+            new(StringComparer.Ordinal);
+
         // Re-used scratch buffer for inject/extract. Sized to one full block.
         private byte[] _scratch;
 
@@ -665,6 +687,16 @@ namespace TensorSharp.Runtime.Scheduling
             return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsBatchedFusedDecodeEnabled()
+        {
+            // Default OFF (v1, correctness-first). Set TS_BATCHED_FUSED_DECODE=1 to
+            // route concurrent (N>=2) decode steps through the model's true
+            // token-batched fused decode (one graph for all N) instead of the
+            // round-robin per-seq forwards.
+            string raw = Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_DECODE");
+            return raw == "1" || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool ShouldUsePerSeqFused(IBatchedPagedModel fused, SchedulerOutput output)
         {
             int count = output.ScheduledWork.Count;
@@ -721,10 +753,62 @@ namespace TensorSharp.Runtime.Scheduling
             // speculative context tracks.
             _mtpCtx = null;
 
+            // ---- TRUE token-batched decode fast path (opt-in) ----
+            // When every scheduled item is a decode step (n>=2) and the model
+            // supports it, decode all N tokens in ONE fused graph (weights loaded
+            // once) instead of N serial per-seq forwards. Falls through to the
+            // round-robin loop below when the model declines this batch.
+            if (IsBatchedFusedDecodeEnabled() && n >= 2)
+            {
+                bool allDecode = true;
+                foreach (var work in output.ScheduledWork)
+                    if (work.IsPrefill) { allDecode = false; break; }
+                if (allDecode)
+                {
+                    var reqIds = new string[n];
+                    var btokens = new int[n];
+                    var bpositions = new int[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        var seq = output.ScheduledWork[i].Sequence;
+                        // Peek-sample (deterministic for greedy); do NOT append yet
+                        // so the round-robin fallback re-samples cleanly.
+                        btokens[i] = SampleFromLogits(seq);
+                        bpositions[i] = seq.NumComputedTokens;
+                        reqIds[i] = seq.RequestId;
+                    }
+                    var outLogits = new float[n][];
+                    if (fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits))
+                    {
+                        for (int i = 0; i < n; i++)
+                        {
+                            var seq = output.ScheduledWork[i].Sequence;
+                            seq.AppendOutputToken(btokens[i]);
+                            seq.LastLogits = outLogits[i];
+                            seq.AdvanceComputedTokens(1);
+                            if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
+                            results.Add(new SequenceStepResult
+                            {
+                                Sequence = seq,
+                                TokensForwarded = 1,
+                                SampledToken = btokens[i],
+                                IsPrefill = false,
+                                FullBlocksCaptured = 0,
+                            });
+                        }
+                        return results;
+                    }
+                    // else: not appended — fall through to the round-robin loop.
+                }
+            }
+
             foreach (var work in output.ScheduledWork)
             {
                 var seq = work.Sequence;
                 int prevComputed = seq.NumComputedTokens;
+                // Track this fused sequence so a clean finish can retain its holder
+                // for cross-request prefix reuse (see TryRetainReleasedFusedCache).
+                NoteFusedSequence(seq);
                 try
                 {
                     bool freshCache = fused.BindSequenceCache(seq.RequestId);
@@ -1365,6 +1449,175 @@ namespace TensorSharp.Runtime.Scheduling
             return true;
         }
 
+        private static bool IsRetainedFusedCacheEnabled()
+        {
+            // Default ON. Kill-switch for A/B or to cap VRAM use. The retained
+            // holders pin one full KV cache each (same size as a concurrent
+            // request's holder), so the budget below bounds the extra VRAM.
+            string raw = Environment.GetEnvironmentVariable("TS_RETAINED_FUSED_CACHE");
+            if (string.IsNullOrEmpty(raw)) return true;
+            return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static int RetainedFusedCacheBudget()
+        {
+            // How many finished fused holders to keep alive for cross-request
+            // prefix reuse. Each pins a full per-request KV cache, so keep it
+            // small (VRAM). Tune with TS_RETAINED_FUSED_CACHE_MAX.
+            string raw = Environment.GetEnvironmentVariable("TS_RETAINED_FUSED_CACHE_MAX");
+            if (!string.IsNullOrEmpty(raw) && int.TryParse(raw, out int n) && n >= 0)
+                return n;
+            return 4;
+        }
+
+        /// <summary>True when the loaded model serves concurrent decode through
+        /// per-request fused holders AND caps pooled prefix reuse (sliding-window /
+        /// circular cache). Only such models need retained-fused continuation — an
+        /// uncapped pure-attention model already reuses the full prefix through the
+        /// shared pool. This targets Gemma 4 (the reported repro). Qwen 3.5/3.6 is
+        /// deliberately excluded for now: it reports MaxReusablePrefixTokens=int.MaxValue
+        /// (uncapped), and its recurrent GatedDeltaNet state can't be reconstructed
+        /// from the pool either, so enabling it would need its own correctness pass on
+        /// GDN-state reuse — a follow-up, not part of this fix.</summary>
+        private bool ModelUsesRetainableFusedCache()
+            => IsRetainedFusedCacheEnabled()
+            && _model is IBatchedPagedModel f
+            && f.SupportsPerSequenceFusedForward
+            && _model.MaxReusablePrefixTokens != int.MaxValue;
+
+        /// <summary>Longest retained fused-holder token run that is an EXACT prefix
+        /// of <paramref name="seq"/>'s prompt, or 0 when no retained holder applies.
+        /// The matched holder's K/V is the full circular cache from the finished
+        /// request, so continuing from it reuses the entire conversation prefix (past
+        /// the sliding-window cap) with no corruption — the cross-request analogue of
+        /// <see cref="ComputeLiveContinuationLcp"/>. Invoked by the scheduler at
+        /// admission (same worker thread as the executor).</summary>
+        public int ComputeFusedContinuationLcp(SequenceState seq)
+        {
+            if (seq == null || _retainedFused.Count == 0) return 0;
+            if (!ModelUsesRetainableFusedCache()) return 0;
+            var match = FindRetainedFusedMatch(seq);
+            return match?.Tokens.Length ?? 0;
+        }
+
+        /// <summary>Adopt a retained fused holder for <paramref name="seq"/>: re-key
+        /// the model's retained K/V to this request (so its first fused
+        /// <c>BindSequenceCache</c> continues from it), reserve placeholder blocks for
+        /// accounting, and mark the reused prefix. Returns false (caller falls back to
+        /// the pooled path) when the holder can't be reserved or re-keyed. Invoked by
+        /// the scheduler at admission.</summary>
+        public bool TryAdoptFusedContinuation(SequenceState seq, int lcp)
+        {
+            if (seq == null || lcp <= 0) return false;
+            if (seq.BlockTable.NumBlocks != 0) return false;
+            if (_model is not IBatchedPagedModel fused) return false;
+
+            var match = FindRetainedFusedMatch(seq);
+            if (match == null || match.Tokens.Length != lcp) return false;
+
+            int neededBlocks = (lcp + _blockSize - 1) / _blockSize;
+            var blocks = _pool.AllocateNew(neededBlocks);
+            if (blocks == null)
+                return false; // pool pressure -> let the caller use the capped pool path
+
+            if (!fused.TryRebindRetainedCache(match.RequestId, seq.RequestId))
+            {
+                _pool.Free(blocks);
+                return false;
+            }
+
+            for (int i = 0; i < blocks.Length; i++)
+                seq.BlockTable.AppendBlock(blocks[i]);
+
+            seq.SetComputedTokensForPrefixAdoption(lcp);
+            seq.PrefixCacheReusedTokens = lcp;
+            // The rebound holder is now this request's active fused cache; the
+            // fused path's BindSequenceCache finds it (fresh==false) and continues
+            // from it without injecting from the (empty) reserved blocks.
+            _retainedFused.Remove(match);
+            return true;
+        }
+
+        /// <summary>Find the retained fused holder whose token run is an exact prefix
+        /// of <paramref name="seq"/>'s prompt and leaves at least one new suffix token
+        /// to forward. Prefers the longest match.</summary>
+        private RetainedFusedCache FindRetainedFusedMatch(SequenceState seq)
+        {
+            RetainedFusedCache best = null;
+            foreach (var entry in _retainedFused)
+            {
+                int len = entry.Tokens.Length;
+                // NB: no `len <= cap` skip. The fused path writes nothing to the shared
+                // pool, so a retained holder is the ONLY reuse source for a concurrent
+                // conversation — even one shorter than the sliding window.
+                if (seq.PromptTokens.Count <= len) continue;    // no new suffix to forward
+                if (best != null && len <= best.Tokens.Length) continue;
+                bool prefix = true;
+                for (int i = 0; i < len; i++)
+                {
+                    if (seq.PromptTokens[i] != entry.Tokens[i]) { prefix = false; break; }
+                }
+                if (prefix) best = entry;
+            }
+            return best;
+        }
+
+        /// <summary>Track an in-flight fused sequence so the release hook can snapshot
+        /// its tokens. Called from the fused per-seq path for every scheduled seq.</summary>
+        private void NoteFusedSequence(SequenceState seq)
+        {
+            if (ModelUsesRetainableFusedCache())
+                _fusedSeqById[seq.RequestId] = seq;
+        }
+
+        /// <summary>Called by the engine when a sequence leaves the scheduler, BEFORE
+        /// the model's <see cref="IBatchedPagedModel.OnSequenceReleased"/>. When the
+        /// sequence finished cleanly on the fused path, retain its holder (the full
+        /// circular K/V) for cross-request prefix reuse instead of letting the model
+        /// dispose it. Returns true when the holder was retained (so the subsequent
+        /// model release no-ops for it).</summary>
+        public bool TryRetainReleasedFusedCache(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId)) return false;
+            if (!_fusedSeqById.TryGetValue(requestId, out var seq))
+                return false;
+            _fusedSeqById.Remove(requestId);
+
+            if (!ModelUsesRetainableFusedCache()) return false;
+            if (_model is not IBatchedPagedModel fused) return false;
+            // Only retain clean finishes; aborted/errored sequences may hold
+            // partial/inconsistent K/V, and preempted ones resume on their own.
+            if (seq.Status != SequenceStatus.FinishedStopped
+                && seq.Status != SequenceStatus.FinishedLengthCapped)
+                return false;
+
+            // Snapshot exactly the tokens whose K/V is resident in the holder
+            // (NumComputedTokens == the model's _cacheSeqLen at finish), so a later
+            // continuation's reused-prefix length matches the holder's cache extent
+            // exactly. (At a clean finish this equals NumTotalTokens; clamp defends
+            // against a speculative tail that advanced computed past the token list.)
+            int len = Math.Min(seq.NumComputedTokens, seq.NumTotalTokens);
+            // Retain any non-trivial fused conversation: the fused path contributes
+            // nothing to the shared pool, so retention is the only cross-request reuse
+            // source for it (not just the >window case). The LRU budget bounds VRAM.
+            if (len < _blockSize) return false;
+            if (!fused.RetainSequenceCache(requestId)) return false;
+
+            var tokens = new int[len];
+            for (int i = 0; i < len; i++) tokens[i] = seq.TokenAt(i);
+            _retainedFused.AddLast(new RetainedFusedCache { RequestId = requestId, Tokens = tokens });
+
+            // Evict oldest holders beyond the budget (frees their VRAM).
+            int budget = RetainedFusedCacheBudget();
+            while (_retainedFused.Count > budget)
+            {
+                var victim = _retainedFused.First.Value;
+                _retainedFused.RemoveFirst();
+                fused.DiscardRetainedCache(victim.RequestId);
+            }
+            return true;
+        }
+
         /// <summary>Ensure the model's K/V state belongs to <paramref name="seq"/>.
         /// If a different sequence is the current owner, extract its state into
         /// its blocks, reset the model, and inject this sequence's state from
@@ -1606,6 +1859,13 @@ namespace TensorSharp.Runtime.Scheduling
             _liveCacheLen = 0;
             _liveCacheValid = false;
             _mtpCtx = null;
+            if (_model is IBatchedPagedModel fused)
+            {
+                foreach (var entry in _retainedFused)
+                    fused.DiscardRetainedCache(entry.RequestId);
+            }
+            _retainedFused.Clear();
+            _fusedSeqById.Clear();
             _model.ResetKVCache();
         }
     }
@@ -1738,6 +1998,54 @@ namespace TensorSharp.Runtime.Scheduling
         /// path before and must stay on it — its tail K/V isn't reconstructable
         /// from paged storage).</summary>
         bool HasFusedSequenceCache(string requestId) => false;
+
+        // ---- Retained fused-cache continuation (cross-request prefix reuse) ----
+        //
+        // The per-sequence fused path keeps each concurrent request's full K/V in
+        // its own holder and never writes the shared paged block storage, so it
+        // contributes nothing to the prefix-cache pool. For a sliding-window model
+        // the pool can't restore a long prefix anyway (only the live circular cache
+        // can), so a multi-turn follow-up ("请继续") that arrives while/after other
+        // requests ran concurrently would re-prefill the whole conversation from
+        // scratch (KV-reuse ratio 0). To fix that, the executor RETAINS a finished
+        // fused request's holder and re-adopts it for a later request whose prompt
+        // exactly extends the retained tokens — the cross-request analogue of the
+        // single-stream live-cache continuation. The model side just keeps the
+        // holder alive and lets it be re-keyed.
+
+        /// <summary>Move <paramref name="requestId"/>'s per-request fused holder out
+        /// of the active set into a retained set so a later request can re-adopt it
+        /// (see <see cref="TryRebindRetainedCache"/>) instead of disposing it. The
+        /// executor calls this when a fused sequence finishes cleanly, before
+        /// <see cref="OnSequenceReleased"/> (which then no-ops for the holder).
+        /// Returns true when a holder was retained. Default false (no retention).</summary>
+        bool RetainSequenceCache(string requestId) => false;
+
+        /// <summary>Re-key a retained holder from <paramref name="retainedRequestId"/>
+        /// to <paramref name="newRequestId"/>, making it that request's active fused
+        /// cache (it becomes the cache the next <see cref="BindSequenceCache"/> finds,
+        /// so the new request continues from the retained K/V with no re-prefill).
+        /// Returns false when no retained holder exists for the id. Default false.</summary>
+        bool TryRebindRetainedCache(string retainedRequestId, string newRequestId) => false;
+
+        /// <summary>Dispose a retained holder (LRU eviction / shutdown) and free its
+        /// buffers. Default no-op.</summary>
+        void DiscardRetainedCache(string requestId) { }
+
+        /// <summary>TRUE token-batched decode: decode ONE token for each of N
+        /// concurrent sequences in a single fused graph (one compute buffer,
+        /// weights loaded once) instead of N serial per-sequence forwards. This
+        /// raises the round-robin ~1x concurrency ceiling toward llama.cpp's ~Nx
+        /// (decode is memory-bandwidth bound, so batching amortises the weight
+        /// loads). <paramref name="requestIds"/>/<paramref name="tokens"/>/
+        /// <paramref name="positions"/> are parallel arrays of length N: sequence i
+        /// decodes <paramref name="tokens"/>[i] at <paramref name="positions"/>[i]
+        /// against its own per-request KV holder. On success writes each sequence's
+        /// logits into <paramref name="outLogits"/>[i] and returns true; returns
+        /// false when the model can't batch this step (caller falls back to the
+        /// per-sequence round-robin loop). Default false (opt-in).</summary>
+        bool TryForwardBatchedFusedDecode(
+            IReadOnlyList<string> requestIds, int[] tokens, int[] positions, float[][] outLogits) => false;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

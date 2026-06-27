@@ -29,6 +29,7 @@
 // follows a multi-sequence (fused) episode.
 using System;
 using System.Collections.Generic;
+using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
@@ -47,6 +48,11 @@ namespace TensorSharp.Models
 
         // Per-request fused-decode cache holders, keyed by RequestId.
         private Dictionary<string, Gemma4KvCacheHolder> _fusedHolders;
+        // Holders of FINISHED fused requests kept alive for cross-request prefix
+        // reuse (multi-turn "请继续"). Keyed by the original RequestId. The executor
+        // bounds the count and re-keys one into _fusedHolders via
+        // TryRebindRetainedCache when a new request's prompt extends it.
+        private Dictionary<string, Gemma4KvCacheHolder> _retainedFusedHolders;
         // RequestId whose holder is currently checked out into the active
         // _kvCacheK/_kvCacheV fields, or null when the primary cache is active.
         private string _activeFusedKey;
@@ -109,6 +115,17 @@ namespace TensorSharp.Models
         {
             AllocateKvCacheArrays(_initialGlobalCacheLength,
                 out var k, out var v, out var sizes, out _);
+            // The token-batched fused-decode kernel reads a FIXED 256-padded
+            // attention window over each holder's cache; positions beyond the
+            // written length are masked (-inf) but must still be finite, so zero
+            // the freshly-allocated caches (AllocateKvCacheArrays skips zeroing on
+            // GgmlCuda/Mlx). Garbage (NaN/Inf) there otherwise poisons the softmax.
+            var zeroed = new HashSet<Tensor>();
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (k[l] != null && zeroed.Add(k[l])) Ops.Fill(k[l], 0f);
+                if (v[l] != null && zeroed.Add(v[l])) Ops.Fill(v[l], 0f);
+            }
             return new Gemma4KvCacheHolder
             {
                 K = k,
@@ -242,6 +259,85 @@ namespace TensorSharp.Models
 
             _fusedHolders.Remove(requestId);
             DisposeHolder(holder);
+
+            // A captured token-batched decode graph binds this request's KV buffers;
+            // now that they're freed, drop all captured batched graphs so a stale
+            // entry can't replay against freed memory. They rebuild on next decode.
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+            }
+        }
+
+        /// <summary>Move a FINISHED request's holder out of the active set into the
+        /// retained set (keeping its full circular K/V alive) so a later request can
+        /// continue from it (see <see cref="TryRebindRetainedCache"/>). Called by the
+        /// executor before <see cref="OnSequenceReleased"/>, which then no-ops for the
+        /// (already-moved) holder so its buffers are NOT freed. Returns true when a
+        /// holder was retained.</summary>
+        public bool RetainSequenceCache(string requestId)
+        {
+            if (_fusedHolders == null || string.IsNullOrEmpty(requestId))
+                return false;
+            if (!_fusedHolders.TryGetValue(requestId, out var holder))
+                return false;
+
+            if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
+            {
+                // The finishing holder is currently checked out into the model
+                // fields. Re-snapshot to capture the (possibly grown) live arrays,
+                // then reinstate the primary cache so the active fields don't dangle.
+                holder = SnapshotActiveCache();
+                _activeFusedKey = null;
+                if (_primaryHolder != null)
+                {
+                    LoadCacheHolder(_primaryHolder);
+                    _primaryHolder = null;
+                }
+            }
+
+            _fusedHolders.Remove(requestId);
+            _retainedFusedHolders ??= new Dictionary<string, Gemma4KvCacheHolder>(StringComparer.Ordinal);
+            _retainedFusedHolders[requestId] = holder;
+            return true;
+        }
+
+        /// <summary>Re-key a retained holder from <paramref name="retainedRequestId"/>
+        /// to <paramref name="newRequestId"/> and put it back in the active set, so the
+        /// next <see cref="BindSequenceCache"/> for the new request loads it
+        /// (fresh==false → no prefix re-inject) and continues from the retained K/V.
+        /// Returns false when no retained holder exists for the id.</summary>
+        public bool TryRebindRetainedCache(string retainedRequestId, string newRequestId)
+        {
+            if (_retainedFusedHolders == null
+                || string.IsNullOrEmpty(retainedRequestId)
+                || string.IsNullOrEmpty(newRequestId))
+                return false;
+            if (!_retainedFusedHolders.TryGetValue(retainedRequestId, out var holder))
+                return false;
+
+            _retainedFusedHolders.Remove(retainedRequestId);
+            _fusedHolders ??= new Dictionary<string, Gemma4KvCacheHolder>(StringComparer.Ordinal);
+            _fusedHolders[newRequestId] = holder;
+            return true;
+        }
+
+        /// <summary>Dispose a retained holder (LRU eviction / shutdown) and free its
+        /// KV buffers. Mirrors the free path in <see cref="OnSequenceReleased"/>.</summary>
+        public void DiscardRetainedCache(string requestId)
+        {
+            if (_retainedFusedHolders == null || string.IsNullOrEmpty(requestId))
+                return;
+            if (!_retainedFusedHolders.TryGetValue(requestId, out var holder))
+                return;
+            _retainedFusedHolders.Remove(requestId);
+            DisposeHolder(holder);
+            if (IsGgmlBackend)
+            {
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+            }
         }
 
         private void DisposeHolder(Gemma4KvCacheHolder holder)
@@ -274,6 +370,13 @@ namespace TensorSharp.Models
                 }
                 _fusedHolders.Clear();
                 _fusedHolders = null;
+            }
+            if (_retainedFusedHolders != null)
+            {
+                foreach (var kv in _retainedFusedHolders)
+                    DisposeHolder(kv.Value);
+                _retainedFusedHolders.Clear();
+                _retainedFusedHolders = null;
             }
             if (_primaryHolder != null)
             {

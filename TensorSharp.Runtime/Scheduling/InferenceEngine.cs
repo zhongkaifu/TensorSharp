@@ -63,6 +63,11 @@ namespace TensorSharp.Runtime.Scheduling
             _scheduler.AttachLiveCacheContinuation(
                 _executor.ComputeLiveContinuationLcp,
                 _executor.TryAdoptLiveCache);
+            // Cross-request prefix reuse for concurrent (per-seq fused) decode:
+            // re-adopt a finished request's retained KV holder for a follow-up turn.
+            _scheduler.AttachFusedCacheContinuation(
+                _executor.ComputeFusedContinuationLcp,
+                _executor.TryAdoptFusedContinuation);
 
             _worker = new Thread(WorkerLoop)
             {
@@ -303,6 +308,19 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (string.IsNullOrEmpty(requestId)) return;
             if (seen != null && !seen.Add(requestId)) return;
+
+            try
+            {
+                // Give the executor first refusal: a fused sequence that finished
+                // cleanly has its per-request KV holder RETAINED (re-keyed out of the
+                // active set) for cross-request prefix reuse, so the model release
+                // below no-ops for it instead of disposing the still-useful K/V.
+                _executor.TryRetainReleasedFusedCache(requestId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Fused-cache retention failed for sequence {RequestId}", requestId);
+            }
 
             try
             {

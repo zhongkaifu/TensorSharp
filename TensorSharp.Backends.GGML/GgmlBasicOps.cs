@@ -1703,6 +1703,17 @@ namespace TensorSharp.GGML
                 logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap);
         }
 
+        /// <summary>True token-batched MoE decode (N concurrent sequences in one
+        /// captured graph). Returns false when the native kernel declines.</summary>
+        public static bool Gemma4MoEModelDecodeBatched(Gemma4MoELayerDecodeArgs[] layers, int numLayers, int nSeqs,
+            IntPtr hidden, IntPtr[] kCacheArr, IntPtr[] vCacheArr, int[] positions,
+            IntPtr logits, int vocabSize, IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNorm, float logitSoftcap)
+            => GgmlNative.Gemma4MoEModelDecodeBatched(layers, numLayers, nSeqs, hidden, kCacheArr, vCacheArr, positions,
+                logits, vocabSize, lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes, finalNorm, logitSoftcap);
+
+        public static void Gemma4ResetMoEBatchedDecodeCache() => GgmlNative.Gemma4ResetMoEBatchedDecodeCache();
+
         /// <summary>
         /// Run the entire Qwen3.5/3.6 hybrid transformer (full-attention +
         /// GatedDeltaNet recurrent layers + per-layer FFN) as ONE GGML graph per
@@ -1717,6 +1728,8 @@ namespace TensorSharp.GGML
         /// prefill and on KV reset/grow so the next fused decode rebuilds against
         /// the current ggml-cuda pool / KV-buffer state).</summary>
         public static void Gemma4ResetDecodeCache() => GgmlNative.Gemma4ResetDecodeCache();
+
+        public static void Gemma4ResetBatchedDecodeCache() => GgmlNative.Gemma4ResetBatchedDecodeCache();
 
         /// <summary>Drop the persistent Gemma4 MoE whole-model decode-graph cache
         /// (CUDA-graph-captured). Call before any prefill and on KV reset/grow so the
@@ -2430,6 +2443,56 @@ namespace TensorSharp.GGML
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
                 plePostNormArr, kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitSoftcap);
+        }
+
+        /// <summary>True token-batched dense decode (N concurrent sequences in one
+        /// fused graph). Returns false when the native kernel declines (sequence
+        /// exceeds the cache window) so the caller falls back to round-robin.</summary>
+        public static bool Gemma4ModelDecodeBatched(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap)
+        {
+            return GgmlNative.Gemma4ModelDecodeBatched(
+                hiddenData, hiddenSize, numLayers, nSeqs,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, positions,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                kvCacheType,
                 kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 logitsData, vocabSize,

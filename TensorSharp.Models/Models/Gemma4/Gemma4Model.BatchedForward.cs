@@ -79,7 +79,9 @@ namespace TensorSharp.Models
             if (_backend == BackendType.GgmlCuda)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
             }
 
             // Disable gate. The batched path is now the DEFAULT for Gemma 4

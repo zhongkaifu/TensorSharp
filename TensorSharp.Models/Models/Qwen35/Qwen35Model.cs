@@ -291,6 +291,9 @@ namespace TensorSharp.Models
         private Tensor[] _kvCacheV;
         private MlxFusedOps.AttentionKvCache[] _mlxAttentionCache;
         private int _kvCacheCapacity;
+        // Initial KV capacity captured at InitCaches; fresh per-request fused-cache
+        // holders (see Qwen35Model.PerSeqCache) allocate at this size and grow.
+        private int _initialKvCacheCapacity;
 
         // GatedDeltaNet recurrent state, dimensions and projection weights live in
         // Qwen35Model.GatedDeltaNet.cs (also a partial of this class).
@@ -885,6 +888,7 @@ namespace TensorSharp.Models
         {
             _maxContextLength = maxSeqLen;
             _kvCacheCapacity = initialSeqLen;
+            _initialKvCacheCapacity = initialSeqLen;
             int numLayers = TotalLayerCount;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
@@ -5093,6 +5097,11 @@ namespace TensorSharp.Models
             foreach (var (visionEmbeddings, _) in _visionEmbeddingsList)
                 visionEmbeddings?.Dispose();
             _visionEmbeddingsList.Clear();
+
+            // Free per-request fused-decode holders (concurrent N>=2 decode); the
+            // active holder shares _kvCacheK / _deltaStateTensor / _fdConvScratch,
+            // freed by the teardown below.
+            DisposeAllFusedHolders();
 
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();

@@ -47,6 +47,16 @@ namespace TensorSharp.Runtime.Scheduling
         private Func<SequenceState, int> _liveContinuationLcp;
         private Func<SequenceState, int, bool> _liveContinuationAdopt;
 
+        // Retained fused-cache continuation hooks (wired by the engine to the
+        // executor). Cross-request analogue of the live-cache hooks above: they
+        // re-adopt a FINISHED concurrent request's retained per-request KV holder
+        // for a new request whose prompt exactly extends it. Unlike live-cache
+        // continuation (one shared cache, sole-sequence only), each retained holder
+        // is independent, so multiple concurrent admissions can each continue from
+        // their own holder. Null when unwired.
+        private Func<SequenceState, int> _fusedContinuationLcp;
+        private Func<SequenceState, int, bool> _fusedContinuationAdopt;
+
         private readonly LinkedList<SequenceState> _waiting = new();
         private readonly Dictionary<string, LinkedListNode<SequenceState>> _waitingIndex = new();
 
@@ -82,6 +92,16 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _liveContinuationLcp = computeLcp;
             _liveContinuationAdopt = adopt;
+        }
+
+        /// <summary>Wire the retained fused-cache continuation hooks (see the fields).
+        /// Called once by the engine after the executor is constructed.</summary>
+        public void AttachFusedCacheContinuation(
+            Func<SequenceState, int> computeLcp,
+            Func<SequenceState, int, bool> adopt)
+        {
+            _fusedContinuationLcp = computeLcp;
+            _fusedContinuationAdopt = adopt;
         }
 
         public int WaitingCount => _waiting.Count;
@@ -209,6 +229,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // brand-new sequences; preempted ones already had their blocks
                 // freed and need a fresh re-prefill, no shortcut).
                 bool plannedLiveContinuation = false;
+                bool plannedFusedContinuation = false;
                 if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
                 {
                     // Live-cache continuation: when this is the SOLE sequence about to
@@ -228,7 +249,25 @@ namespace TensorSharp.Runtime.Scheduling
                             plannedLiveContinuation = true;
                     }
 
-                    if (!plannedLiveContinuation)
+                    // Retained fused-cache continuation: a finished concurrent
+                    // request's full circular KV is kept alive; if this prompt extends
+                    // it exactly, continue from that retained holder (reusing the whole
+                    // conversation prefix past the pooled window cap). Each retained
+                    // holder is independent — no shared live cache to clobber — so this
+                    // is NOT gated to the sole-sequence case and doesn't block
+                    // co-admitting other sequences this step. This is the path that
+                    // gives multi-turn "请继续" follow-ups their prefix reuse back after
+                    // a concurrent (per-seq fused) round left nothing in the pool.
+                    if (!plannedLiveContinuation
+                        && _fusedContinuationLcp != null
+                        && _fusedContinuationAdopt != null)
+                    {
+                        int flcp = _fusedContinuationLcp(seq);
+                        if (flcp > 0 && _fusedContinuationAdopt(seq, flcp))
+                            plannedFusedContinuation = true;
+                    }
+
+                    if (!plannedLiveContinuation && !plannedFusedContinuation)
                         AdoptPrefixBlocksCapped(seq);
                 }
 

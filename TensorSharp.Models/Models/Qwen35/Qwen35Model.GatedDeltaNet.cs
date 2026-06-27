@@ -1043,7 +1043,11 @@ namespace TensorSharp.Models
                 _fdGdnSlot = new int[n];
                 for (int l = 0; l < n; l++)
                     _fdGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
-                _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
+                // The conv scratch is per-request-cache state (the per-seq fused
+                // path swaps _fdConvScratch via the holder); only allocate the
+                // primary/default one here if a holder hasn't already bound one.
+                if (_fdConvScratch == IntPtr.Zero)
+                    _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
                 _fdLayers = new Qwen35LayerDecodeArgs[n];
             }
 

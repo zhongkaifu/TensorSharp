@@ -35,6 +35,13 @@ public class EngineParallelInferenceTests
             // The "-assistant" variant ships under the same prefix; exclude it.
             ExcludePatterns: new[] { "assistant" },
             MmprojPatterns: new[] { "gemma-4-mmproj" }),
+        // The user-reported repro runs the 12B QAT build on ggml_cuda. Matches the
+        // exact files from the bug report; set TS_TEST_MODEL_DIR to their folder and
+        // TS_TEST_BACKEND=ggml_cuda to exercise the concurrent fused-decode path.
+        ["gemma4-12b"] = new ModelManifest(
+            ModelPatterns: new[] { "gemma-4-12B-it-qat", "gemma-4-12B-it" },
+            ExcludePatterns: new[] { "mmproj", "MTP", "assistant" },
+            MmprojPatterns: new[] { "gemma-4-12B-mmproj" }),
         ["qwen36"] = new ModelManifest(
             // 27B (dense) before 35B-A3B (MoE) - the dense build runs faster
             // on CPU/Metal and is what the user requested first.
@@ -111,6 +118,15 @@ public class EngineParallelInferenceTests
     // (~10-20% for long histories); post-fix the per-seq extract/inject use
     // modular SWA addressing so the whole history is reusable.
     [Fact] public Task Gemma4_SwaPrefixCacheReuseAcrossLongTurn() => RunSwaPrefixReuseRepro("gemma4");
+    // Direct repro for the user-reported "KV cache reuse ratio is 0 after a
+    // concurrent round" bug. Two conversations run in PARALLEL (so they take the
+    // per-sequence FUSED concurrent-decode path, which keeps each request's K/V in
+    // its own holder and writes nothing to the shared prefix pool), then two
+    // "请继续" follow-ups run in parallel. Pre-fix: the follow-ups found an empty
+    // pool (and live-cache continuation is single-stream only) so reuse == 0 and
+    // each re-prefilled the whole conversation. Post-fix: the finished holders are
+    // retained and re-adopted, so the follow-ups reuse the whole prefix.
+    [Fact] public Task Gemma4_ConcurrentSwaPrefixReuseAcrossTurns() => RunConcurrentSwaPrefixReuseRepro("gemma4-12b");
     [Fact] public Task Qwen36_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("qwen36");
     [Fact] public Task Nemotron3_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("nemotron3");
 
@@ -368,6 +384,88 @@ public class EngineParallelInferenceTests
                 $"turn3 output looks degenerate: {Truncate(t3.OutputText, 200)}");
             Assert.True(t2Pct >= 70.0, $"turn2 reuse {t2Pct:F1}% too low (expected ≥70% after SWA fix)");
             Assert.True(t3Pct >= 70.0, $"turn3 reuse {t3Pct:F1}% too low (expected ≥70% after SWA fix)");
+        }
+    }
+
+    private async Task RunConcurrentSwaPrefixReuseRepro(string key)
+    {
+        if (!TryLoad(key, out var ctx)) return;
+        using (ctx)
+        {
+            var sampling = SamplingConfig.Greedy;
+            // Round-1 generation must exceed Gemma 4's SWA window (512) for the bug to
+            // bite; keep that as the default but allow a smaller value for a quick
+            // end-to-end smoke (TS_REPRO_ROUND1_TOKENS / TS_REPRO_ROUND2_TOKENS).
+            int round1Tokens = EnvInt("TS_REPRO_ROUND1_TOKENS", 600);
+            int round2Tokens = EnvInt("TS_REPRO_ROUND2_TOKENS", 200);
+
+            // ---- Round 1: two distinct conversations, IN PARALLEL. ----
+            // Long generation (> Gemma 4's 512-token SWA window) so the only path
+            // that can reuse the prefix later is live/retained continuation, not the
+            // window-capped pool. Running both at once forces the per-seq fused path.
+            var histA1 = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍最终幻想7" },
+            };
+            var histB1 = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍时间简史" },
+            };
+            var sw1 = Stopwatch.StartNew();
+            var t1Task = SubmitWithHistoryCapturingTokens(ctx, histA1, maxNewTokens: round1Tokens, "A1", sampling);
+            var t1bTask = SubmitWithHistoryCapturingTokens(ctx, histB1, maxNewTokens: round1Tokens, "B1", sampling);
+            await Task.WhenAll(t1Task, t1bTask);
+            sw1.Stop();
+            var (a1, a1Tokens) = t1Task.Result;
+            var (b1, b1Tokens) = t1bTask.Result;
+            _output.WriteLine($"[{key}] round1 parallel: A prompt={a1.PromptTokenCount} out={a1.OutputTokenCount} | " +
+                $"B prompt={b1.PromptTokenCount} out={b1.OutputTokenCount} | wall={sw1.Elapsed.TotalMilliseconds:F0}ms");
+
+            // ---- Round 2: two "请继续" follow-ups, IN PARALLEL. ----
+            var histA2 = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍最终幻想7" },
+                new ChatMessage { Role = "assistant", Content = a1.OutputText, RawOutputTokens = a1Tokens },
+                new ChatMessage { Role = "user", Content = "请继续" },
+            };
+            var histB2 = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = "请详细介绍时间简史" },
+                new ChatMessage { Role = "assistant", Content = b1.OutputText, RawOutputTokens = b1Tokens },
+                new ChatMessage { Role = "user", Content = "请继续" },
+            };
+            var sw2 = Stopwatch.StartNew();
+            var t2Task = SubmitWithHistoryCapturingTokens(ctx, histA2, maxNewTokens: round2Tokens, "A2", sampling);
+            var t2bTask = SubmitWithHistoryCapturingTokens(ctx, histB2, maxNewTokens: round2Tokens, "B2", sampling);
+            await Task.WhenAll(t2Task, t2bTask);
+            sw2.Stop();
+            var (a2, _) = t2Task.Result;
+            var (b2, _) = t2bTask.Result;
+
+            double a2Pct = 100.0 * a2.PrefixCacheReusedTokens / a2.PromptTokenCount;
+            double b2Pct = 100.0 * b2.PrefixCacheReusedTokens / b2.PromptTokenCount;
+            _output.WriteLine($"[{key}] round2 parallel follow-ups: " +
+                $"A reused={a2.PrefixCacheReusedTokens}/{a2.PromptTokenCount} ({a2Pct:F1}%) | " +
+                $"B reused={b2.PrefixCacheReusedTokens}/{b2.PromptTokenCount} ({b2Pct:F1}%) | " +
+                $"wall={sw2.Elapsed.TotalMilliseconds:F0}ms");
+            _output.WriteLine($"[{key}] A2 sample: {Truncate(a2.OutputText, 160)}");
+            _output.WriteLine($"[{key}] B2 sample: {Truncate(b2.OutputText, 160)}");
+
+            // Output must stay coherent (a corrupt KV continuation degenerates into
+            // long immediate repeats).
+            Assert.True(LongestImmediateRepeat(a2.OutputText ?? string.Empty) < 20,
+                $"A2 output looks degenerate: {Truncate(a2.OutputText, 200)}");
+            Assert.True(LongestImmediateRepeat(b2.OutputText ?? string.Empty) < 20,
+                $"B2 output looks degenerate: {Truncate(b2.OutputText, 200)}");
+
+            // The core regression assertion: reuse is no longer 0 for parallel
+            // follow-ups. Both should reuse nearly the whole conversation prefix.
+            Assert.True(a2.PrefixCacheReusedTokens > 0,
+                "A2 KV-cache reuse is 0 (the reported bug) — retained-fused continuation didn't engage.");
+            Assert.True(b2.PrefixCacheReusedTokens > 0,
+                "B2 KV-cache reuse is 0 (the reported bug) — retained-fused continuation didn't engage.");
+            Assert.True(a2Pct >= 70.0, $"A2 reuse {a2Pct:F1}% too low (expected ≥70% after the fix)");
+            Assert.True(b2Pct >= 70.0, $"B2 reuse {b2Pct:F1}% too low (expected ≥70% after the fix)");
         }
     }
 
@@ -675,6 +773,12 @@ public class EngineParallelInferenceTests
             enableThinking: false);
     }
 
+    private static int EnvInt(string name, int fallback)
+    {
+        string v = Environment.GetEnvironmentVariable(name);
+        return !string.IsNullOrEmpty(v) && int.TryParse(v, out int n) && n > 0 ? n : fallback;
+    }
+
     private static string Truncate(string s, int maxLen)
     {
         if (string.IsNullOrEmpty(s)) return string.Empty;
@@ -791,11 +895,7 @@ public class EngineParallelInferenceTests
 
         public EngineContext(string modelPath, string mmprojPath)
         {
-            // Prefer the platform-appropriate GGML variant; fall back to CPU.
-            BackendType backend = OperatingSystem.IsMacOS()
-                ? BackendType.GgmlMetal
-                : BackendType.GgmlCpu;
-            Model = TensorSharp.Models.ModelBase.Create(modelPath, backend);
+            Model = TensorSharp.Models.ModelBase.Create(modelPath, ResolveBackend());
             if (!string.IsNullOrEmpty(mmprojPath) && File.Exists(mmprojPath))
             {
                 Model.MultimodalInjector.LoadProjectors(mmprojPath);
@@ -814,6 +914,24 @@ public class EngineParallelInferenceTests
                 DecodeQuantumTokens = BlockSize,
             };
             Engine = new InferenceEngine(Model, cfg, NullLogger.Instance);
+        }
+
+        // Default to the platform GGML variant, but let TS_TEST_BACKEND override
+        // (e.g. ggml_cuda) so the parallel/repro tests can exercise the per-sequence
+        // fused concurrent-decode path on a CUDA box like the bug report's setup.
+        private static BackendType ResolveBackend()
+        {
+            string b = Environment.GetEnvironmentVariable("TS_TEST_BACKEND");
+            if (!string.IsNullOrEmpty(b))
+            {
+                if (b.Equals("ggml_cuda", StringComparison.OrdinalIgnoreCase) || b.Equals("cuda", StringComparison.OrdinalIgnoreCase))
+                    return BackendType.GgmlCuda;
+                if (b.Equals("ggml_metal", StringComparison.OrdinalIgnoreCase) || b.Equals("metal", StringComparison.OrdinalIgnoreCase))
+                    return BackendType.GgmlMetal;
+                if (b.Equals("ggml_cpu", StringComparison.OrdinalIgnoreCase) || b.Equals("cpu", StringComparison.OrdinalIgnoreCase))
+                    return BackendType.GgmlCpu;
+            }
+            return OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
         }
 
         public void Dispose()

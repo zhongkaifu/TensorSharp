@@ -37,12 +37,14 @@ int[] MakePrompt(int n, int salt){ var t=new int[n]; for(int i=0;i<n;i++)t[i]=po
 
 var cfg = new SchedulerConfig {
     MaxNumBatchedTokens = 8192, MaxNumRunningSequences = 16, MaxPrefillChunkSize = 2048,
-    SoloPrefillChunkSize = 8192, NumBlocks = 1024, BlockSize = blockSize,
+    SoloPrefillChunkSize = 8192, NumBlocks = EnvInt("TS_SCHED_NUM_BLOCKS", 1024), BlockSize = blockSize,
     EnablePrefixCaching = false, DecodeQuantumTokens = blockSize,
 };
 using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
 
-int Salt(int id, int n) => 1000 + id*131;  // prompt depends only on request id (stable across N)
+// TS_CONC_SAME_PROMPT=1 makes every sequence use the SAME prompt (isolates
+// column-index bugs in batched decode: all columns must then be identical).
+int Salt(int id, int n) => Environment.GetEnvironmentVariable("TS_CONC_SAME_PROMPT") == "1" ? 1000 : 1000 + id*131;
 
 async Task<(int count, double firstMs, double lastMs, List<int> toks)> RunOne(int id, int salt, Stopwatch wall)
 {
@@ -95,10 +97,19 @@ foreach (int n in concs)
     {
         var expect = solo[i]; var got = outs[i];
         int cmp = Math.Min(expect.Count, got.Count);
-        bool ok = expect.Count==got.Count;
-        for (int k=0;k<cmp && ok;k++) ok = expect[k]==got[k];
-        if (!ok) { mism++; Console.WriteLine($"      N={n} req {i}: MISMATCH (solo {expect.Count} toks vs conc {got.Count}); first diff shown"); }
+        int firstDiff = -1;
+        for (int k=0;k<cmp;k++) if (expect[k]!=got[k]) { firstDiff=k; break; }
+        bool ok = expect.Count==got.Count && firstDiff<0;
+        if (!ok) { mism++; string d = firstDiff<0?"len-only":$"@{firstDiff} solo={expect[firstDiff]} conc={got[firstDiff]} (of {cmp})"; Console.WriteLine($"      N={n} req {i}: MISMATCH (solo {expect.Count} vs conc {got.Count}) firstDiff {d}"); }
     }
     Console.WriteLine($"      N={n}: correctness {n-mism}/{n} requests match solo greedy output {(mism==0?"OK":"*** FAIL ***")}");
+    if (mism > 0 && Environment.GetEnvironmentVariable("TS_CONC_DUMP_TEXT") == "1")
+        for (int i = 0; i < n; i++)
+        {
+            string soloTxt = model.Tokenizer.Decode(solo[i]).Replace("\n", "\\n");
+            string concTxt = model.Tokenizer.Decode(outs[i]).Replace("\n", "\\n");
+            Console.WriteLine($"      [req {i}] solo: {soloTxt.Substring(0, Math.Min(160, soloTxt.Length))}");
+            Console.WriteLine($"      [req {i}] conc: {concTxt.Substring(0, Math.Min(160, concTxt.Length))}");
+        }
 }
 Console.WriteLine("[conc-bench] done.");

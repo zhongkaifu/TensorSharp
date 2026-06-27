@@ -724,7 +724,9 @@ namespace TensorSharp.Models
             if (_backend == BackendType.GgmlCuda)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
             }
             DisposeSwaPrevWindows();
             if (_kvCacheK == null) return;
@@ -1098,7 +1100,9 @@ namespace TensorSharp.Models
             if (seqLen > 1 && _backend == BackendType.GgmlCuda)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
             }
 
             // The fused MoE whole-model decode (TryFusedMoEModelDecode) writes the KV
@@ -1708,7 +1712,9 @@ namespace TensorSharp.Models
             if (seqLen > 1 && _backend == BackendType.GgmlCuda)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
             }
 
             int startPos = _cacheSeqLen;
@@ -2389,6 +2395,225 @@ namespace TensorSharp.Models
                     lmHeadKey, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                     finalNormPtr, _finalLogitSoftcap);
             }
+            return true;
+        }
+
+        /// <summary>
+        /// TRUE token-batched dense decode: decode one token for each of N
+        /// concurrent sequences in ONE fused graph (one compute buffer, weights
+        /// loaded once) via <see cref="GgmlBasicOps.Gemma4ModelDecodeBatched"/>.
+        /// Each sequence decodes through its own per-request KV holder. Returns
+        /// false (caller falls back to the round-robin per-seq path) when any v1
+        /// precondition fails: dense fused-decode eligible, no PLE, no KV-donor,
+        /// folded quantized lm_head available, all holders present + uniform cache
+        /// sizes, and the no-wrap regime (every position+1 <= every cache size).
+        /// On success writes each sequence's logits into <paramref name="outLogits"/>
+        /// and advances its holder length.
+        /// </summary>
+        private static readonly bool s_batchedFusedDebug =
+            Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_DEBUG") == "1";
+        private static readonly bool s_batchedFusedTiming =
+            Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_TIMING") == "1";
+        private bool _batchedFusedLoggedOnce;
+        // Per-phase timing accumulators (TS_BATCHED_FUSED_TIMING=1).
+        private double _btKcacheMs, _btEmbedMs, _btNativeMs, _btDistMs; private int _btCalls;
+        private void BatchedDbg(string msg)
+        {
+            if (!s_batchedFusedDebug) return;
+            if (_batchedFusedLoggedOnce && !msg.StartsWith("FAIL")) return;
+            Console.Error.WriteLine($"[g4-batched] {msg}");
+        }
+
+        public unsafe bool TryForwardBatchedFusedDecode(
+            IReadOnlyList<string> requestIds, int[] tokens, int[] positions, float[][] outLogits)
+        {
+            // ---- gates (any failure => round-robin fallback) ----
+            if (!IsGgmlBackend) { BatchedDbg("FAIL gate not-ggml"); return false; }
+            if (_decodeArrays == null || _fusedHolders == null) { BatchedDbg($"FAIL gate decodeArrays={_decodeArrays!=null} holders={_fusedHolders!=null}"); return false; }
+            if (_pleDim != 0 || _kvDonorMap.Count != 0) { BatchedDbg($"FAIL gate pleDim={_pleDim} donors={_kvDonorMap.Count}"); return false; }
+
+            // MoE vs dense: an all-MoE model (e.g. 26B-A4B) routes through the MoE
+            // batched kernel; otherwise the dense one. Prime the lazy MoE flag.
+            bool isMoE = _numExperts > 0;
+            if (isMoE)
+            {
+                if (!_moeModelDecodeChecked)
+                {
+                    _moeModelDecodeChecked = true;
+                    _canUseFusedMoEModelDecode =
+                        IsGgmlBackend && _decodeArrays != null && _moeFusedDecodeEnabled
+                        && _pleDim == 0 && _kvDonorMap.Count == 0
+                        && !_kvCacheDtype.IsBlockQuantized() && AllLayersMoE();
+                }
+                if (!_canUseFusedMoEModelDecode) { BatchedDbg("FAIL gate MoE not fusable"); return false; }
+                // The MoE batched-decode kernel (TSGgml_Gemma4MoEModelDecodeBatched)
+                // is functionally CORRECT (coherent output; it diverges from the
+                // single-stream greedy reference only via benign batched-vs-single FP
+                // differences that flip a discrete MoE-router expert pick — inherent
+                // to batched MoE decode, as in llama.cpp). The blocker is PERFORMANCE
+                // on a 16GB card: the 26B (13.5GB) + resident experts leave no room
+                // for N KV holders + batched activations + the capture buffer, so it
+                // VRAM-thrashes (16016/16384) and is NOT faster than round-robin
+                // (own-slot persist ~22, eager ~46 vs round-robin ~49 tok/s). A
+                // VRAM-frugal packed gallocr was tried (ran FAST, ~99 t/s = 2x
+                // round-robin) but produced GARBAGE under this fork's CUDA-graph
+                // capture — gallocr slot-reuse is incompatible with the captured
+                // graph (own-slot works because it never reuses). So capture-safe =
+                // own-slot = too big for the 26B on 16GB. Would help only with more
+                // VRAM headroom or a unified-KV redesign.
+                // OFF by default (round-robin is correct + faster here); opt in with
+                // TS_BATCHED_FUSED_MOE=1 (e.g. on a higher-VRAM GPU).
+                if (Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_MOE") != "1")
+                { BatchedDbg("MoE batched gated off (TS_BATCHED_FUSED_MOE!=1)"); return false; }
+            }
+            else if (!_canUseFusedFullModelDecode) { BatchedDbg($"FAIL gate fusedFull={_canUseFusedFullModelDecode}"); return false; }
+
+            int N = requestIds.Count;
+            if (N < 2 || tokens.Length != N || positions.Length != N) { BatchedDbg($"FAIL gate N={N}"); return false; }
+
+            // Folded quantized lm_head (this kernel requires the fold).
+            if (!_fdFoldLmHead) { BatchedDbg("FAIL gate fdFoldLmHead=false"); return false; }
+            if (!_weights.TryGetValue("output_norm.weight", out var finalNormT)) { BatchedDbg("FAIL gate no output_norm"); return false; }
+            if (!_quantWeights.TryGetValue(_hasTiedOutput ? "token_embd.weight" : "output.weight", out var lmqw))
+                { BatchedDbg("FAIL gate no quant lm_head"); return false; }
+
+            int numLayers = Config.NumLayers;
+            var holders = new Gemma4KvCacheHolder[N];
+            for (int s = 0; s < N; s++)
+                if (!_fusedHolders.TryGetValue(requestIds[s], out holders[s]) || holders[s].K == null)
+                    return false;
+
+            // Uniform cache sizes + no-wrap gate. Use holders[0].Sizes as the
+            // per-layer cache size passed to the kernel.
+            var cacheSize = holders[0].Sizes;
+            for (int s = 0; s < N; s++)
+            {
+                var hz = holders[s].Sizes;
+                for (int l = 0; l < numLayers; l++)
+                {
+                    if (hz[l] != cacheSize[l]) { BatchedDbg($"FAIL gate non-uniform cache seq{s} l{l} {hz[l]}!={cacheSize[l]}"); return false; }
+                    if (positions[s] + 1 > cacheSize[l]) { BatchedDbg($"FAIL gate wrap seq{s} pos{positions[s]} l{l} csz{cacheSize[l]}"); return false; }
+                }
+            }
+
+            // Check in any holder still bound to the active fields so its SeqLen is
+            // current and the active cache won't alias a holder we read directly.
+            RestorePrimaryCache();
+
+            var a = _decodeArrays;
+
+            // Canonicalise the sequence order by RequestId so the native persist
+            // pool key (the SET of per-request KV caches) is STABLE across steps
+            // regardless of scheduler ordering — required for CUDA-graph capture
+            // hits. We build everything in sorted order and un-permute the logits.
+            var order = new int[N];
+            for (int s = 0; s < N; s++) order[s] = s;
+            Array.Sort(order, (x, y) => string.CompareOrdinal(requestIds[x], requestIds[y]));
+            var posSorted = new int[N];
+            var tokSorted = new int[N];
+            for (int s = 0; s < N; s++) { posSorted[s] = positions[order[s]]; tokSorted[s] = tokens[order[s]]; }
+
+            var _bsw = s_batchedFusedTiming ? Stopwatch.StartNew() : null;
+
+            // Per-(layer,seq) KV cache device pointers: [layer * N + seq], canonical order.
+            var kCache = new IntPtr[numLayers * N];
+            var vCache = new IntPtr[numLayers * N];
+            for (int l = 0; l < numLayers; l++)
+                for (int s = 0; s < N; s++)
+                {
+                    var h = holders[order[s]];
+                    kCache[l * N + s] = TensorComputePrimitives.GetStoragePointer(h.K[l]);
+                    vCache[l * N + s] = TensorComputePrimitives.GetStoragePointer(h.V[l]);
+                }
+            if (_bsw != null) { _btKcacheMs += _bsw.Elapsed.TotalMilliseconds; _bsw.Restart(); }
+
+            IntPtr freqFactorsPtr = IntPtr.Zero;
+            int freqFactorsLen = 0;
+            if (_weights.TryGetValue("rope_freqs.weight", out var freqTensor))
+            {
+                freqFactorsPtr = (IntPtr)GetFloatPtr(freqTensor);
+                freqFactorsLen = (int)freqTensor.ElementCount();
+            }
+
+            // Embed all N decode tokens -> hidden [hidden_size, N] (column s = seq s, canonical order).
+            Tensor hidden = Embedding(tokSorted);
+            ScaleEmbedding(hidden);
+            float* hiddenPtr = GetFloatPtr(hidden);
+
+            int vocab = Config.VocabSize;
+            float[] logitsBuf = new float[(long)vocab * N];
+            IntPtr finalNormPtr = (IntPtr)GetFloatPtr(finalNormT);
+            if (_bsw != null) { _btEmbedMs += _bsw.Elapsed.TotalMilliseconds; _bsw.Restart(); }
+
+            // MoE: build/refresh the per-layer descriptor array (weights; the
+            // desc's hidden/k_cache/position fields are ignored by the batched
+            // kernel, which uses the explicit hidden + per-seq KV + positions).
+            if (isMoE)
+            {
+                _moeModelArgs ??= new Gemma4MoELayerDecodeArgs[numLayers];
+                for (int l = 0; l < numLayers; l++)
+                    if (!TryBuildMoELayerArgs(l, (IntPtr)hiddenPtr, 0, out _moeModelArgs[l]))
+                    { BatchedDbg($"FAIL MoE layer args l={l}"); return false; }
+            }
+
+            bool ok;
+            fixed (float* lp = logitsBuf)
+            {
+                if (isMoE)
+                {
+                    ok = GgmlBasicOps.Gemma4MoEModelDecodeBatched(
+                        _moeModelArgs, numLayers, N, (IntPtr)hiddenPtr,
+                        kCache, vCache, posSorted,
+                        (IntPtr)lp, vocab,
+                        lmqw.CacheKey, lmqw.GgmlType, lmqw.Ne0, lmqw.Ne1, lmqw.RawBytes,
+                        finalNormPtr, _finalLogitSoftcap);
+                }
+                else
+                {
+                    ok = GgmlBasicOps.Gemma4ModelDecodeBatched(
+                        (IntPtr)hiddenPtr, Config.HiddenSize, numLayers, N,
+                        a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                        a.O, a.PostAttnNorm,
+                        a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                        kCache, vCache,
+                        a.HeadDim, a.KvHeads, cacheSize, a.IsLocal,
+                        a.RopeBase, a.LayerScalar,
+                        a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                        a.OType, a.ONe0, a.ONe1, a.OBytes,
+                        a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                        a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                        Config.NumHeads, posSorted,
+                        Config.Eps, _slidingWindow,
+                        freqFactorsPtr, freqFactorsLen,
+                        a.RopeNDims,
+                        _kvCacheDtype.GgmlType(),
+                        a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                        a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                        (IntPtr)lp, vocab,
+                        lmqw.CacheKey, lmqw.GgmlType, lmqw.Ne0, lmqw.Ne1, lmqw.RawBytes,
+                        finalNormPtr, _finalLogitSoftcap);
+                }
+            }
+
+            if (!ok) { BatchedDbg("FAIL native kernel declined"); return false; }
+            if (_bsw != null) { _btNativeMs += _bsw.Elapsed.TotalMilliseconds; _bsw.Restart(); }
+
+            // Distribute per-seq logits (un-permute) and advance each holder.
+            for (int s = 0; s < N; s++)
+            {
+                var dst = new float[vocab];
+                Array.Copy(logitsBuf, (long)s * vocab, dst, 0, vocab);
+                outLogits[order[s]] = dst;
+                holders[order[s]].SeqLen = posSorted[s] + 1;
+            }
+            if (_bsw != null)
+            {
+                _btDistMs += _bsw.Elapsed.TotalMilliseconds;
+                if (++_btCalls % 64 == 0)
+                    Console.Error.WriteLine($"[g4-batched-timing] N={N} avg ms/call over {_btCalls}: kcache={_btKcacheMs/_btCalls:F3} embed={_btEmbedMs/_btCalls:F3} native={_btNativeMs/_btCalls:F3} dist={_btDistMs/_btCalls:F3}");
+            }
+            BatchedDbg($"OK batched decode N={N} pos0={posSorted[0]}");
+            _batchedFusedLoggedOnce = true;
             return true;
         }
 
