@@ -4136,7 +4136,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
         std::vector<int> pvalid(num_layers, 0);           // unmasked length per layer
         std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
-        bool can_persist = g4_persist;
+        // Persist (capturable-graph) decode writes the KV cache with ggml_set_rows
+        // (write row = an I64 INPUT). On the Metal backend ggml_set_rows over a
+        // gallocr-allocated graph hands a null-context buffer to
+        // ggml_metal_op_set_rows -> ggml_metal_buffer_get_id (EXC_BAD_ACCESS at
+        // 0x14, SIGSEGV). Persist's only benefit is CUDA-graph capture, so gate it
+        // to CUDA; Metal falls through to the proven ggml_cpy path below, which
+        // STILL folds the LM head and keeps the KV cache device-resident.
+        bool can_persist = g4_persist && g_backend_type == BACKEND_TYPE_CUDA;
         {
             auto roundup_stride = [](int v){ return ((v + kG4PersistKvStride - 1) / kG4PersistKvStride) * kG4PersistKvStride; };
             for (int l = 0; l < num_layers; l++)
@@ -6328,7 +6335,11 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         std::vector<int> pwindow(num_layers, 0);          // padded window length per layer
         std::vector<int> pvalid(num_layers, 0);           // unmasked (valid) length per layer
         std::vector<std::int64_t> pwrite(num_layers, 0);  // set_rows write row per layer
-        bool can_persist = g4moe_persist;
+        // CUDA-gate persist: ggml_set_rows segfaults on Metal (null-context buffer
+        // in ggml_metal_op_set_rows). Metal falls through to the ggml_cpy path,
+        // which still folds the LM head and keeps the KV cache device-resident.
+        // See the dense TSGgml_Gemma4ModelDecode for the full rationale.
+        bool can_persist = g4moe_persist && g_backend_type == BACKEND_TYPE_CUDA;
         {
             auto roundup_stride = [](int v){ return ((v + kG4MoePersistKvStride - 1) / kG4MoePersistKvStride) * kG4MoePersistKvStride; };
             for (int l = 0; l < num_layers; l++)

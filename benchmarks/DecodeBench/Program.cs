@@ -42,9 +42,11 @@ string modelPath = Environment.GetEnvironmentVariable("TS_DECODE_MODEL")
 BackendType backend = (Environment.GetEnvironmentVariable("TS_DECODE_BACKEND") ?? "ggml_cuda").ToLowerInvariant() switch
 {
     "ggml_cuda" => BackendType.GgmlCuda,
+    "ggml_metal" => BackendType.GgmlMetal,
     "ggml_cpu" => BackendType.GgmlCpu,
     "cpu" => BackendType.Cpu,
     "cuda" => BackendType.Cuda,
+    "mlx" => BackendType.Mlx,
     _ => BackendType.GgmlCuda,
 };
 int prefillLen = EnvInt("TS_DECODE_PREFILL", 64);
