@@ -55,6 +55,7 @@ internal static class Program
         var backend = (Environment.GetEnvironmentVariable("TS_QWEN_BACKEND") ?? "ggml_cpu") switch
         {
             "ggml_cuda" => BackendType.GgmlCuda,
+            "ggml_metal" => BackendType.GgmlMetal,
             "cuda" => BackendType.Cuda,
             _ => BackendType.GgmlCpu,
         };
@@ -202,11 +203,20 @@ internal static class Program
         var shapes = new (int f, int h, int w)[] { (1, 4, 4), (1, 4, 4) };
         int imgSeq = 16 + 16, txtSeq = 16;
         var rope = TensorSharp.Models.QwenImage.DitRope.Build(shapes, txtSeq);
-        var enc = new TensorSharp.Models.QwenImage.QwenImageDiT(dit, BackendType.GgmlCpu);
+        var backend = (Environment.GetEnvironmentVariable("TS_QWEN_BACKEND") ?? "ggml_cpu") switch
+        {
+            "ggml_cuda" => BackendType.GgmlCuda,
+            "ggml_metal" => BackendType.GgmlMetal,
+            "cuda" => BackendType.Cuda,
+            _ => BackendType.GgmlCpu,
+        };
+        Console.WriteLine($"[dit-block-verify] backend={backend}");
+        float amp = float.TryParse(Environment.GetEnvironmentVariable("TS_QIBENCH_AMP"), out var a) ? a : 1f;
+        var enc = new TensorSharp.Models.QwenImage.QwenImageDiT(dit, backend);
         try
         {
             var rng = new Random(3);
-            float[] img = Rand(rng, imgSeq * dim, 1f), txt = Rand(rng, txtSeq * dim, 1f);
+            float[] img = Rand(rng, imgSeq * dim, amp), txt = Rand(rng, txtSeq * dim, amp);
             float[] imgMod = Rand(rng, 2 * 18432, 0.1f), txtMod = Rand(rng, 2 * 18432, 0.1f);
             var modIndex = new int[imgSeq];
             for (int i = imgSeq / 2; i < imgSeq; i++) modIndex[i] = 1;

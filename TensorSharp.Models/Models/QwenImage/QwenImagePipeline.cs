@@ -165,6 +165,15 @@ namespace TensorSharp.Models.QwenImage
             if (Dit.CacheEnabled) Console.WriteLine($"  [pipe] DiT cache: {Dit.CacheStats()}");
             Phase($"denoise ({sched.Steps} steps)");
 
+            // The DiT denoise loop packed every block into the persistent reuse gallocr
+            // (the liveness-packing scratch). At high resolution that buffer holds a few GB
+            // that is dead weight through the final VAE decode and would compete with the
+            // decode's large im2col scratch for the working set (the 19 GB Metal budget at
+            // 1 MP, or VRAM on CUDA). Hand it back now; the VAE decode (and the next Edit's
+            // denoise) re-creates the gallocr on demand.
+            if (_model.Backend is BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlCpu)
+                GgmlBasicOps.ReleaseReuseComputeBuffers();
+
             // 7. unpack -> denormalize -> VAE decode
             float[] outLatent = Unpack(latents, Hl, Wl);
             DenormalizeLatent(outLatent, Hl, Wl);
@@ -291,6 +300,24 @@ namespace TensorSharp.Models.QwenImage
         // GGML CUDA backend; a no-op elsewhere or when the request already fits.
         private long ClampAreaToVram(long requestedArea)
         {
+            // Metal: the default never clamped here, so a 1 MP request ran the full 60-block
+            // Q4_K_M DiT at imgSeq~8112 for 30 steps x 2 CFG (~tens of minutes) — the "stuck"
+            // the user hit. The gallocr scratch fix makes 1 MP fit memory-wise, but it is still
+            // slow, so default to a faster area on Metal (overridable via TS_QWEN_IMAGE_MAX_AREA
+            // or explicit --width/--height, which bypasses this clamp entirely).
+            if (_model.Backend == BackendType.GgmlMetal)
+            {
+                long cap = 512L * 1024;   // ~0.5 MP: good quality/speed balance on a 19 GB M4 Pro
+                var env = Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MAX_AREA");
+                if (env != null && long.TryParse(env, out var e) && e > 0) cap = e;
+                if (requestedArea > cap)
+                {
+                    Console.WriteLine($"  [pipe] target area {requestedArea} clamped to {cap} px on Metal " +
+                                      "(set --width/--height or TS_QWEN_IMAGE_MAX_AREA to override).");
+                    return cap;
+                }
+                return requestedArea;
+            }
             if (_model.Backend != BackendType.GgmlCuda) return requestedArea;
             if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out _, out long total) || total <= 0) return requestedArea;
 

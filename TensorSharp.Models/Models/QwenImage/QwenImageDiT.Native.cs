@@ -38,8 +38,14 @@ namespace TensorSharp.Models.QwenImage
         // upload + sync. Validated bit-exact vs the single-branch path and faster (captured-
         // combined ~1.9x denoise; non-persist combined ~1.1x), with a safe VRAM fallback, so
         // default-on. TS_QWEN_DIT_CFG_BATCH=0 forces the two-separate-forwards path.
+        // CFG-batching's real win is the CUDA persist/CUDA-graph-capture path (replays the
+        // combined block, ~1.9x). On Metal the non-persist combined block runs both branches
+        // serially in one (gallocr-packed) graph and measured ~2x SLOWER than two separate
+        // single-block forwards (each already launch-amortized + stable via the reuse gallocr),
+        // so restrict CFG-batching to CUDA. Metal/CPU use the two-forward path.
         internal bool UseCfgBatch =>
-            NativeBlockOn && Environment.GetEnvironmentVariable("TS_QWEN_DIT_CFG_BATCH") != "0";
+            NativeBlockOn && _backend == BackendType.GgmlCuda &&
+            Environment.GetEnvironmentVariable("TS_QWEN_DIT_CFG_BATCH") != "0";
 
         // CFG-batching only helps up to the token count where the captured-combined block fits
         // device VRAM. Above it, the combined kernel falls to the non-persist path, which holds

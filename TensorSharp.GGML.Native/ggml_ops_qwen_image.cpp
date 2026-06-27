@@ -116,7 +116,17 @@ TSG_EXPORT int TSGgml_Conv2d(const TSGgmlConv2dDesc* d)
 
         if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
         { set_last_error("Conv2d: graph compute failed."); return 0; }
-        finalize_compute_with_download(out, d->output, static_cast<std::size_t>(OW) * OH * OC * sizeof(float));
+        // Synchronous readback. The VAE runs this conv as a long C# chain (each conv's
+        // output is the next conv's input), so the result MUST be on the host before this
+        // returns. The async finalize_compute_with_download path only QUEUES a non-blocking
+        // ggml_backend_tensor_get_async on Metal async mode and marks pending; the C# caller
+        // reads d->output immediately (no host_read_barrier between native calls), so every
+        // VAE conv layer consumed STALE/uninitialized data — cascading into the garbled/gray
+        // decode that was long misdiagnosed as Q2_K quantization. CUDA/CPU were unaffected
+        // (finalize takes the synchronous branch off Metal-async). Match the attn/fused-block
+        // kernels and drain synchronously here.
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(out, d->output, 0, static_cast<std::size_t>(OW) * OH * OC * sizeof(float));
         clear_last_error();
         return 1;
     }
@@ -237,7 +247,13 @@ TSG_EXPORT int TSGgml_QwenImageModMlp(const TSGgmlQwenImageModMlpDesc* d)
             set_last_error("QwenImageModMlp: graph compute failed.");
             return 0;
         }
-        finalize_compute_with_download(out_t, d->x, actBytes);
+        // Synchronous readback (matches TSGgml_QwenImageJointAttn / TSGgml_QwenImageBlock).
+        // The async finalize_compute_with_download path returns stale data on Metal async mode:
+        // it queues a non-blocking ggml_backend_tensor_get_async + marks pending, but the C#
+        // caller reads the host buffer immediately (no host_read_barrier between), so the 3-call
+        // MLP sub-layer saw uninitialized/stale output (cosine ~0.12 vs the managed reference).
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(out_t, d->x, 0, actBytes);
         clear_last_error();
         return 1;
     }
@@ -1273,8 +1289,30 @@ TSG_EXPORT int TSGgml_QwenImageBlock(const TSGgmlQwenImageBlockDesc* d)
             uploads.push_back({t.mask, const_cast<ggml_fp16_t*>(maskHost), mbytes});
         }
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (buffer.value == nullptr) { set_last_error("QwenImageBlock: buffer alloc failed."); return 0; }
+        // Pack the per-block intermediates with a liveness-reusing graph allocator
+        // (ggml_gallocr) instead of giving every tensor its own slot
+        // (ggml_backend_alloc_ctx_tensors). At 1MP the per-slot scratch reaches ~8.6 GB
+        // (no reuse); gallocr packs it to ~1-2 GB, which is what lets the Q4_K_M DiT
+        // (13 GB weights) fit a 19 GB Metal working set at high resolution. Every leaf we
+        // fill from the host (the img/txt streams, the modulation arrays, the rope tables,
+        // and the flash mask) MUST be flagged INPUT so gallocr never reuses its slot for an
+        // intermediate; the pre-bound cacheable weights already own buffers and are skipped.
+        // Falls back to per-tensor allocation when the reuse path is unavailable.
+        auto markIn = [](ggml_tensor* x) { if (x) ggml_set_input(x); };
+        markIn(t.img); markIn(t.txt);
+        markIn(t.i_s1a); markIn(t.i_sha); markIn(t.i_ga);
+        markIn(t.t_s1a); markIn(t.t_sha); markIn(t.t_ga);
+        markIn(t.i_s1m); markIn(t.i_shm); markIn(t.i_gm);
+        markIn(t.t_s1m); markIn(t.t_shm); markIn(t.t_gm);
+        markIn(t.i_cos); markIn(t.i_sin); markIn(t.t_cos); markIn(t.t_sin);
+        markIn(t.mask);
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_graph_reuse_gallocr(graph))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) { set_last_error("QwenImageBlock: buffer alloc failed."); return 0; }
+        }
         host_read_barrier();
         for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
         auto setF = [&](ggml_tensor* tt, void* dd, int rows, int seq) { ggml_backend_tensor_set(tt, dd, 0, static_cast<std::size_t>(rows) * seq * sizeof(float)); };
@@ -1461,8 +1499,32 @@ TSG_EXPORT int TSGgml_QwenImageBlockCfg(const TSGgmlQwenImageBlockDesc* dc,
         if (tc.mask && maskC) uploads.push_back({tc.mask, const_cast<ggml_fp16_t*>(maskC), static_cast<std::size_t>(tpadC) * tpadC * sizeof(ggml_fp16_t)});
         if (tn.mask && maskN) uploads.push_back({tn.mask, const_cast<ggml_fp16_t*>(maskN), static_cast<std::size_t>(tpadN) * tpadN * sizeof(ggml_fp16_t)});
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
-        if (buffer.value == nullptr) { set_last_error("QwenImageBlockCfg: buffer alloc failed."); return 0; }
+        // Liveness-packing allocator (gallocr): pack BOTH branches' intermediates by
+        // liveness instead of one slot each. The two branches feed independent outputs,
+        // so branch C's scratch is freed before branch N's peak — gallocr reclaims it,
+        // roughly halving the combined-block scratch vs the per-tensor allocator. This is
+        // what makes CFG-batching viable at high token counts (the budget that gates it can
+        // rise once the combined block no longer doubles VRAM). Every host-filled leaf in
+        // BOTH branches is flagged INPUT; the shared, pre-bound cacheable weights are skipped.
+        auto markActIn = [](QiBlockTensors& t) {
+            auto markIn = [](ggml_tensor* x) { if (x) ggml_set_input(x); };
+            markIn(t.img); markIn(t.txt);
+            markIn(t.i_s1a); markIn(t.i_sha); markIn(t.i_ga);
+            markIn(t.t_s1a); markIn(t.t_sha); markIn(t.t_ga);
+            markIn(t.i_s1m); markIn(t.i_shm); markIn(t.i_gm);
+            markIn(t.t_s1m); markIn(t.t_shm); markIn(t.t_gm);
+            markIn(t.i_cos); markIn(t.i_sin); markIn(t.t_cos); markIn(t.t_sin);
+            markIn(t.mask);
+        };
+        markActIn(tc);
+        markActIn(tn);
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_graph_reuse_gallocr(graph))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) { set_last_error("QwenImageBlockCfg: buffer alloc failed."); return 0; }
+        }
         host_read_barrier();
         for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
 

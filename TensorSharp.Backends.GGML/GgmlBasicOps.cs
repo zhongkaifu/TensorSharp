@@ -1332,6 +1332,7 @@ namespace TensorSharp.GGML
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
         public static void ClearHostBufferCache() => GgmlNative.ClearHostBufferCache();
         public static void Shutdown() => GgmlNative.Shutdown();
+        public static void ReleaseReuseComputeBuffers() => GgmlNative.ReleaseReuseComputeBuffers();
         public static void InvalidateHostBuffer(IntPtr ptr) => GgmlNative.InvalidateHostBuffer(ptr);
         public static long DeviceCopyCacheResidentBytes() => GgmlNative.DeviceCopyCacheResidentBytes();
         public static bool TryGetBackendMemory(out long freeBytes, out long totalBytes) => GgmlNative.TryGetBackendMemory(out freeBytes, out totalBytes);

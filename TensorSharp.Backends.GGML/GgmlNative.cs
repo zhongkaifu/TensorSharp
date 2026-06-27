@@ -1949,6 +1949,9 @@ internal enum GgmlIndexReductionOp
         private static extern void TSGgml_Shutdown();
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern void TSGgml_ReleaseReuseComputeBuffers();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern void TSGgml_InvalidateHostBuffer(IntPtr ptr);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
@@ -3446,6 +3449,15 @@ internal enum GgmlIndexReductionOp
         public static void Shutdown()
         {
             TSGgml_Shutdown();
+        }
+
+        /// <summary>
+        /// Free the reusable per-graph compute buffer + gallocr without tearing down the
+        /// backend. Used to hand the DiT denoise scratch back before a memory-heavy VAE decode.
+        /// </summary>
+        public static void ReleaseReuseComputeBuffers()
+        {
+            TSGgml_ReleaseReuseComputeBuffers();
         }
 
         public static void InvalidateHostBuffer(IntPtr ptr)

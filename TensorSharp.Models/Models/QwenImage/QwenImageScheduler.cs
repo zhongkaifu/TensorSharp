@@ -43,9 +43,13 @@ namespace TensorSharp.Models.QwenImage
             return (float)(em / (em + Math.Pow(1.0 / t - 1.0, sigma)));
         }
 
-        // calculate_shift(seq_len, base_seq=256, max_seq=4096, base_shift=0.5, max_shift=1.15)
+        // calculate_shift(seq_len, base_seq=256, max_seq=8192, base_shift=0.5, max_shift=0.9).
+        // NOTE: these are the QWEN-IMAGE FlowMatchEulerDiscreteScheduler constants (max_image_seq_len=8192,
+        // max_shift=0.9), NOT the FLUX defaults (4096 / 1.15). diffusers' shared scheduler *signature*
+        // defaults to the FLUX values, but the Qwen-Image scheduler_config overrides them — using the FLUX
+        // constants makes mu (and every sigma) too large, mildly over-noising the whole trajectory.
         private static float CalculateShift(int imageSeqLen,
-            int baseSeq = 256, int maxSeq = 4096, double baseShift = 0.5, double maxShift = 1.15)
+            int baseSeq = 256, int maxSeq = 8192, double baseShift = 0.5, double maxShift = 0.9)
         {
             double m = (maxShift - baseShift) / (maxSeq - baseSeq);
             double b = baseShift - m * baseSeq;

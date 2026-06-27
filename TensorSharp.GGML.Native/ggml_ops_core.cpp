@@ -1724,6 +1724,18 @@ TSG_EXPORT void TSGgml_Shutdown()
     g_pending_gpu_work.store(false, std::memory_order_release);
 }
 
+// Release the reusable per-graph compute buffer + gallocr WITHOUT tearing down the
+// backend. The Qwen-Image denoise loop packs every DiT block into the persistent reuse
+// gallocr; at high resolution that buffer grows to a few GB and would otherwise stay
+// resident through the final VAE decode, competing with its im2col scratch for the
+// (19 GB) Metal working set. The pipeline calls this after the denoise loop, before
+// Vae.Decode, to hand that scratch back; the next graph re-creates the gallocr on demand.
+TSG_EXPORT void TSGgml_ReleaseReuseComputeBuffers()
+{
+    free_reuse_compute_buffer();
+    free_reuse_gallocr();
+}
+
 // Mark a host data pointer as eligible for the MoE expert offload LRU.
 // Once registered, subsequent cache lookups for that pointer update an LRU,
 // and cache misses that grow the resident byte total beyond the configured
