@@ -3188,18 +3188,40 @@ namespace TensorSharp.Models
             Forward(new[] { safeToken });
             ResetKVCache();
 
-            if (_backend == BackendType.Mlx)
+            // Prime the MULTI-TOKEN prefill path. The 1-token Forward above only
+            // warms the decode-shaped graph; on CUDA/GGML a real prompt takes the
+            // fused whole-model prefill ("verify") graph + flash-attention kernels,
+            // whose first build/capture and gallocr reservation otherwise lands on
+            // the first real request and inflates its TTFT by ~50-110 ms (measured
+            // on Gemma 4 E4B: first long prompt 906 ms cold -> 796 ms warm). Short
+            // prompts ("Hello", the typical discarded warmup) skip the fused path,
+            // so prime it with a longer dummy prompt here. Previously this ran for
+            // MLX only. Guarded so a model that dislikes a dummy refill can never
+            // block startup; disable entirely via TS_PREFILL_WARMUP=0.
+            if (!string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP"), "0", StringComparison.Ordinal))
             {
-                int warmupLength = 32;
+                // MLX stays conservative (short prompt); CUDA/GGML use a longer one
+                // to reach the fused-verify prefill path that short prompts bypass.
+                int warmupLength = _backend == BackendType.Mlx ? 32 : 1024;
                 if (MaxContextLength > 0)
                     warmupLength = Math.Min(warmupLength, Math.Max(2, MaxContextLength / 4));
 
                 int[] warmupPrompt = new int[warmupLength];
                 Array.Fill(warmupPrompt, safeToken);
 
-                ForwardRefill(warmupPrompt);
-                Forward(new[] { safeToken });
-                ResetKVCache();
+                try
+                {
+                    ForwardRefill(warmupPrompt);
+                    Forward(new[] { safeToken });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  Prefill warmup skipped: {ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    ResetKVCache();
+                }
             }
 
             WarmUpMultimodalKernels();
