@@ -1,9 +1,58 @@
-﻿using System.Text.Json;
+﻿using System.Text;
+using System.Text.Json;
+using TensorSharp.Server.StreamingWriters;
 
 namespace InferenceWeb.Tests;
 
 public class StructuredOutputTests
 {
+    // Stream a model output in many small fragments through the json_object
+    // streaming filter and return the concatenation actually sent to the client.
+    private static string FeedInChunks(string modelOutput, int chunkSize = 3)
+    {
+        var filter = new StreamingJsonObjectFilter();
+        var sb = new StringBuilder();
+        for (int i = 0; i < modelOutput.Length; i += chunkSize)
+            sb.Append(filter.Feed(modelOutput.Substring(i, System.Math.Min(chunkSize, modelOutput.Length - i))));
+        return sb.ToString();
+    }
+
+    [Fact]
+    public void StreamingJsonFilterStripsCodeFencesAndTrailingTags()
+    {
+        // Exactly the messy shape observed live (markdown fence + a leaked
+        // Gemma channel tag after the object).
+        string raw = "```json\n{\n  \"name\": \"Mars\",\n  \"diameter_km\": 6779,\n  \"has_moons\": true\n}\n```<channel|>";
+        string streamed = FeedInChunks(raw);
+
+        using var doc = JsonDocument.Parse(streamed); // must be valid JSON
+        Assert.Equal("Mars", doc.RootElement.GetProperty("name").GetString());
+        Assert.DoesNotContain("```", streamed, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("channel", streamed, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StreamingJsonFilterKeepsBracesInsideStrings()
+    {
+        string raw = "prefix {\"text\": \"a } b { c\", \"n\": 1} trailing";
+        string streamed = FeedInChunks(raw, chunkSize: 1);
+
+        using var doc = JsonDocument.Parse(streamed);
+        Assert.Equal("a } b { c", doc.RootElement.GetProperty("text").GetString());
+        Assert.Equal("""{"text": "a } b { c", "n": 1}""", streamed);
+    }
+
+    [Fact]
+    public void StreamingJsonFilterStopsAtFirstBalancedObject()
+    {
+        var filter = new StreamingJsonObjectFilter();
+        string emitted = filter.Feed("{\"a\":1}{\"b\":2}");
+        Assert.Equal("""{"a":1}""", emitted);
+        Assert.True(filter.Done);
+        Assert.Equal("", filter.Feed("more text")); // nothing after close
+    }
+
+
     [Fact]
     public void Qwen35NoThinkingTemplateKeepsPriorAnswerAsNextTurnPrefix()
     {

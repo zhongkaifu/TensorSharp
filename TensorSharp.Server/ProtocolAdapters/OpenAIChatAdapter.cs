@@ -180,6 +180,13 @@ namespace TensorSharp.Server.ProtocolAdapters
             return true;
         }
 
+        // Escape hatch to force the legacy "buffer the entire structured response
+        // before sending" behavior (e.g. if a downstream client depends on a
+        // single normalized json_object chunk). Off by default so json_object
+        // streams incrementally.
+        private static bool ForceStructuredStreamBuffer() =>
+            string.Equals(Environment.GetEnvironmentVariable("TS_STRUCTURED_STREAM_BUFFER"), "1", StringComparison.Ordinal);
+
         // ---- Streaming -------------------------------------------------------
 
         private async Task StreamCompletionAsync(
@@ -194,8 +201,17 @@ namespace TensorSharp.Server.ProtocolAdapters
             StructuredOutputFormat responseFormat,
             QueueTicket ticket)
         {
-            bool structuredStream = responseFormat != null;
-            if (!structuredStream)
+            // Only the strict json_schema path must buffer the whole response so it
+            // can be schema-normalized before anything is sent to the client. Plain
+            // json_object streams incrementally like a normal completion (this is
+            // what OpenAI does too) so its time-to-first-token reflects prefill
+            // latency instead of the full decode. TS_STRUCTURED_STREAM_BUFFER=1
+            // restores the legacy buffer-everything behavior for both kinds.
+            bool bufferForStructured = responseFormat != null
+                && (responseFormat.Kind == StructuredOutputKind.JsonSchema
+                    || ForceStructuredStreamBuffer());
+
+            if (!bufferForStructured)
             {
                 SseWriter.ApplyHeaders(ctx.Response);
 
@@ -215,7 +231,7 @@ namespace TensorSharp.Server.ProtocolAdapters
             if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                     _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
             {
-                if (structuredStream)
+                if (bufferForStructured)
                 {
                     ctx.Response.StatusCode = 404;
                     await ctx.Response.WriteAsJsonAsync(new { error = new { message = loadError, type = "invalid_request_error" } });
@@ -232,16 +248,23 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             bool useStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
                 || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
-            bool bufferForStructured = structuredStream;
             var buffer = bufferForStructured ? new StringBuilder() : null;
 
             IOutputParser parser = null;
-            List<ToolCall> collectedToolCalls = null;
+            bool sawToolCall = false;
             if (useStreamParser && !bufferForStructured)
             {
                 parser = OutputParserFactory.Create(_svc.Architecture);
                 parser.Init(openaiThink, openaiTools);
             }
+
+            // json_object streams incrementally: strip code fences / leading prose /
+            // stray tags and keep only the balanced JSON object, matching the clean
+            // shape the buffered non-streaming path emits. (json_schema still buffers
+            // and schema-normalizes via bufferForStructured.)
+            var jsonObjectFilter = (!bufferForStructured && responseFormat != null
+                && responseFormat.Kind == StructuredOutputKind.JsonObject)
+                ? new StreamingJsonObjectFilter() : null;
 
             await foreach (var (piece, done, promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)
                 in _svc.ChatStreamWithMetricsAsync(inferenceMessages, maxTokens, ctx.RequestAborted, samplingConfig,
@@ -258,20 +281,38 @@ namespace TensorSharp.Server.ProtocolAdapters
                     if (parser != null)
                     {
                         var parsed = parser.Add(piece, false);
-                        if (parsed.ToolCalls != null)
-                            collectedToolCalls = parsed.ToolCalls;
+                        if (parsed.ToolCalls != null && parsed.ToolCalls.Count > 0)
+                        {
+                            sawToolCall = true;
+                            await SseWriter.WriteEventAsync(ctx.Response,
+                                OpenAIResponseFactory.ToolCallsChunk(requestId, _svc.LoadedModelName, parsed.ToolCalls),
+                                ctx.RequestAborted);
+                        }
                         string emitContent = parsed.Content ?? "";
                         if (emitContent.Length == 0 && string.IsNullOrEmpty(parsed.Thinking))
                             continue;
                         string chunkContent = emitContent.Length > 0 ? emitContent : null;
+                        if (jsonObjectFilter != null && chunkContent != null)
+                        {
+                            chunkContent = jsonObjectFilter.Feed(chunkContent);
+                            if (chunkContent.Length == 0)
+                                continue;
+                        }
                         await SseWriter.WriteEventAsync(ctx.Response,
                             OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, chunkContent),
                             ctx.RequestAborted);
                         continue;
                     }
 
+                    string passthrough = piece;
+                    if (jsonObjectFilter != null)
+                    {
+                        passthrough = jsonObjectFilter.Feed(piece);
+                        if (passthrough.Length == 0)
+                            continue;
+                    }
                     await SseWriter.WriteEventAsync(ctx.Response,
-                        OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, piece),
+                        OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, passthrough),
                         ctx.RequestAborted);
                     continue;
                 }
@@ -288,17 +329,26 @@ namespace TensorSharp.Server.ProtocolAdapters
                 if (parser != null)
                 {
                     var finalParsed = parser.Add("", true);
-                    if (finalParsed.ToolCalls != null)
-                        collectedToolCalls = finalParsed.ToolCalls;
-
-                    if (!string.IsNullOrEmpty(finalParsed.Content))
+                    if (finalParsed.ToolCalls != null && finalParsed.ToolCalls.Count > 0)
                     {
+                        sawToolCall = true;
                         await SseWriter.WriteEventAsync(ctx.Response,
-                            OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, finalParsed.Content),
+                            OpenAIResponseFactory.ToolCallsChunk(requestId, _svc.LoadedModelName, finalParsed.ToolCalls),
                             ctx.RequestAborted);
                     }
 
-                    string finReason = (collectedToolCalls != null && collectedToolCalls.Count > 0) ? "tool_calls" : "stop";
+                    if (!string.IsNullOrEmpty(finalParsed.Content))
+                    {
+                        string finalContent = jsonObjectFilter != null
+                            ? jsonObjectFilter.Feed(finalParsed.Content)
+                            : finalParsed.Content;
+                        if (!string.IsNullOrEmpty(finalContent))
+                            await SseWriter.WriteEventAsync(ctx.Response,
+                                OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, finalContent),
+                                ctx.RequestAborted);
+                    }
+
+                    string finReason = sawToolCall ? "tool_calls" : "stop";
                     await SseWriter.WriteEventAsync(ctx.Response,
                         OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, finReason, promptTokens, evalTokens, kvReusedTokens),
                         ctx.RequestAborted);

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>概览与架构 — TensorSharp 维基</title>
+  <meta name="description" content="TensorSharp 是什么、本地推理的商业价值，以及分层架构如何协同工作。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="overview">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 概览与架构</div>
+  <h1>概览与架构</h1>
+  <p class="lede">TensorSharp 是面向 GGUF 模型的原生 .NET 大模型推理引擎 —— 既支持自回归大模型，也支持 DiffusionGemma 式的文本扩散模型。它提供控制台应用、基于 Web 的聊天机器人，以及兼容 Ollama / OpenAI 的 HTTP API。</p>
+
+  <h2 id="what">它到底是什么 —— 通俗讲解</h2>
+  <p><strong>大语言模型（LLM）</strong>是一种预测文本的神经网络。要使用它，你需要一个<strong>推理引擎</strong>：负责加载模型权重、运行数学运算，把你的提示词变成回复的软件。TensorSharp 就是这样一个引擎，用现代 C# / .NET 10 编写，专注于本地大模型生态广泛使用的 <a href="glossary_zh-cn.html#terms">GGUF</a> 模型格式。</p>
+  <p>它用同一套二进制为你提供三种使用模型的方式：</p>
+  <ul>
+    <li><strong>命令行</strong> —— 运行一条提示词、一张图片、一批问题，或一次基准测试。→ <a href="cli_zh-cn.html">CLI</a></li>
+    <li><strong>服务器</strong> —— 浏览器聊天机器人，外加模仿 Ollama 与 OpenAI 的 REST 接口。→ <a href="server_zh-cn.html">服务器</a></li>
+    <li><strong>库</strong> —— 引用 NuGet 包，从你自己的 .NET 代码调用引擎。→ <a href="code-api_zh-cn.html">C# 库</a></li>
+  </ul>
+
+  <h2 id="business">商业价值</h2>
+  <p>对评估本地推理的决策者而言，核心权衡是用<em>运行自己的硬件</em>换取<em>掌控力与成本</em>。</p>
+  <div class="card-grid">
+    <div class="card"><div class="ic">🔒</div><h3>数据隐私与合规</h3><p>提示词与文档永不离开你的基础设施 —— 适合受监管、私有部署或离网环境。</p></div>
+    <div class="card"><div class="ic">💸</div><h3>成本可预测</h3><p>没有按 token 计费的 API。容量受限于你本就已预算的硬件。</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>无供应商锁定</h3><p>来自 Hugging Face 的开放 GGUF 模型，以及现有工具已支持的 OpenAI / Ollama 兼容接口。</p></div>
+    <div class="card"><div class="ic">🏗️</div><h3>.NET 原生集成</h3><p>将推理嵌入现有 C# 服务，而非桥接到外部运行时。</p></div>
+    <div class="card"><div class="ic">📈</div><h3>单机即可扩展</h3><p>连续批处理用单个托管模型服务大量并发用户。</p></div>
+    <div class="card"><div class="ic">🔁</div><h3>轻松迁移</h3><p>把现有 OpenAI SDK 代码指向 <code>http://localhost:5000/v1</code>，应用无需改动。</p></div>
+  </div>
+
+  <h2 id="architecture">架构</h2>
+  <p>TensorSharp 是一个分层系统。每一层都是可独立发布的 NuGet 包，因此使用者只依赖自己需要的部分。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>层</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TensorSharp.Core</strong></td><td>核心 <code>Tensor</code> 类型、存储抽象、设备抽象，以及可扩展的运算注册表（<code>Ops</code>）。CPU 实现使用 <code>System.Numerics.Vectors</code> 做 SIMD。</td></tr>
+      <tr><td><strong>TensorSharp.Runtime</strong></td><td>GGUF 解析、分词器（SentencePiece / BPE）、聊天模板渲染、采样、输出解析、分页 KV 缓存，以及连续批处理的调度器 / 引擎。</td></tr>
+      <tr><td><strong>TensorSharp.Models</strong></td><td><code>ModelBase</code> 以及具体架构与多模态编码器。模型通过 <code>ModelBase.Create()</code> 加载，会从 GGUF 元数据自动识别架构。</td></tr>
+      <tr><td><strong>TensorSharp.Backends.GGML</strong></td><td>通过原生 C++ 桥接（<code>libGgmlOps</code>）链接 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> 实现加速运算 —— macOS 上用 Metal，Windows/Linux 上用 CUDA，以及原生 CPU。</td></tr>
+      <tr><td><strong>TensorSharp.Backends.Cuda</strong></td><td>直接 CUDA 路径：CUDA Driver API、cuBLAS GEMM，以及热点运算的 PTX 内核，并带 CPU 回退。</td></tr>
+      <tr><td><strong>TensorSharp.Backends.MLX</strong></td><td>Apple Silicon 的 MLX 路径，封装 <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a>，提供量化、融合与编译内核。</td></tr>
+      <tr><td><strong>TensorSharp.Server</strong></td><td>HTTP / 应用层：兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理，以及每模型的连续批处理引擎宿主。</td></tr>
+      <tr><td><strong>TensorSharp.Cli</strong></td><td>控制台宿主，用于本地提示词、多模态实验、提示词检查、JSONL 批处理工作流、交互式 REPL 与基准测试。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">💡</div><p>对于任何尚未实现的运算，每个后端都会<strong>回退到 CPU</strong>，因此在所有后端上输出都保持正确 —— 你牺牲的只是速度，绝不是正确性。</p></div>
+
+  <h2 id="flow">一次请求如何流转</h2>
+  <ol>
+    <li><strong>加载</strong> —— <code>ModelBase.Create(path, backend)</code> 读取 GGUF 元数据、选择架构，并把量化权重映射到所选后端。</li>
+    <li><strong>渲染</strong> —— 提示词（以及任何系统消息、图像、音频、工具）经由架构的聊天模板和分词器转成 token。</li>
+    <li><strong>Prefill（预填充）</strong> —— 提示词 token 在一次批量前向中处理，填充 KV 缓存。</li>
+    <li><strong>Decode（解码）</strong> —— 逐 token 生成（可借助<a href="advanced_zh-cn.html#mtp">推测解码</a>一次生成多个），按你的设置采样并流式返回。</li>
+    <li><strong>服务</strong> —— 在服务器中，<a href="advanced_zh-cn.html#continuous-batching">连续批处理引擎</a>将多个请求交错运行于同一模型之上，并在它们之间共享 KV 缓存前缀。</li>
+  </ol>
+
+  <h2 id="structure">项目结构</h2>
+  <p>仓库按上述分层组织。最有用的入口：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>路径</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td><code>TensorSharp.Core/</code></td><td>张量库、运算、内存、设备抽象、CPU SIMD / 量化内核。</td></tr>
+      <tr><td><code>TensorSharp.Runtime/</code></td><td>GGUF、分词器、模板、采样；<code>Paged/</code> KV 原语与 <code>Scheduling/</code> 推理引擎 + MTP 核心。</td></tr>
+      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>每个架构一个文件夹（Gemma3/4、Qwen3/35、GptOss、Nemotron、Mistral3、DiffusionGemma），各含一个 legacy 与一个批量前向。</td></tr>
+      <tr><td><code>TensorSharp.GGML.Native/</code></td><td>到 ggml 的原生 C++ 桥接（matmul、融合 transformer 内核、分页注意力、MoE、Mamba2、GatedDeltaNet、扩散）。</td></tr>
+      <tr><td><code>TensorSharp.Server/</code></td><td>ASP.NET Core 服务器：程序引导、模型服务、推理引擎宿主、聊天流水线、遥测。</td></tr>
+      <tr><td><code>docs/</code></td><td>各模型架构卡、分页注意力深入解析、环境变量矩阵、基准矩阵。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="status">当前状态与能力</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>领域</th><th>状态</th></tr></thead>
+    <tbody>
+      <tr><td>模型家族</td><td>Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（<code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code>）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。</td></tr>
+      <tr><td>推理宿主</td><td>CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 式 API、OpenAI Chat Completions 式 API。</td></tr>
+      <tr><td>后端</td><td>纯 C# CPU、直接 CUDA/cuBLAS（<code>cuda</code>）、MLX Metal（<code>mlx</code>）、GGML CPU、GGML Metal、GGML CUDA。</td></tr>
+      <tr><td>多模态</td><td>Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3 与 Nemotron-H Omni 图像输入。</td></tr>
+      <tr><td>连续批处理</td><td>vLLM 式分页 KV 缓存、块哈希前缀共享、迭代级调度器（默认开启；可用 <code>--no-continuous-batching</code> 关闭）。</td></tr>
+      <tr><td>推测解码</td><td>Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；默认关闭，通过 <code>--mtp-spec</code> 启用。</td></tr>
+      <tr><td>可观测性</td><td>结构化的逐轮日志、队列状态，以及跨 Web UI、Ollama 与 OpenAI 响应形态的 KV 缓存复用指标。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="content-footer">
+    <a href="index_zh-cn.html">← 首页</a>
+    <a href="features_zh-cn.html">下一篇：功能特性 →</a>
+  </div>
+</main>
+</body>
+</html>

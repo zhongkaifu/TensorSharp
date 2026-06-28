@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>高级功能 — TensorSharp 维基</title>
+  <meta name="description" content="连续批处理、分页注意力、MTP/NextN 推测解码、DiffusionGemma，以及 TensorSharp 背后的性能与内存优化。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="advanced">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 高级功能</div>
+  <h1>高级功能</h1>
+  <p class="lede">让 TensorSharp 既快又可扩展的系统：带分页 KV 缓存的连续批处理、推测解码、文本扩散，以及底层的内核级与内存级优化。</p>
+
+  <h2 id="continuous-batching">连续批处理与分页 KV 缓存</h2>
+  <p>服务器的 <code>InferenceEngine</code> 是一个 vLLM 式连续批处理引擎，默认开启。它不再一次只运行一个请求，而是以单个 decode 步的粒度将多个请求交错运行。</p>
+  <ul>
+    <li><strong>分页 KV 池</strong> —— KV 缓存被划分为取自共享池的定长块，因此内存按块分配，而非按最坏情况的序列长度分配。</li>
+    <li><strong>块哈希前缀共享</strong> —— 每个完整块都做内容哈希；相同前缀（系统提示、共享上下文）在并发与顺序请求间共享，而非重新计算。</li>
+    <li><strong>迭代级调度器</strong> —— 在批中接纳与抢占序列，并在实现 <code>IBatchedPagedModel</code> 的模型上把它们打包进一次前向。</li>
+    <li><strong>可选 SSD 层</strong> —— 对于很大的 KV 工作集，冷块可溢出到 SSD 层。</li>
+  </ul>
+  <p>尚未实现批量路径的模型仍运行在引擎隔离的逐序列 KV 交换回退之上。用 <a href="server_zh-cn.html#tunables"><code>TS_SCHED_*</code></a> 变量调参，或用 <code>--no-continuous-batching</code> 完全禁用。</p>
+
+  <h3 id="paged-kv">原生分页注意力</h3>
+  <p>原生内核 <code>TSGgml_PagedAttentionForward</code>（以及面向 GPT OSS 的 <code>WithSinks</code> 变体）在 C++ 中从分页缓冲收集 K/V，为每个序列构建一个小的 GGML 图，并分派 <code>ggml_flash_attn_ext</code> —— 与单序列路径所用相同的融合 Metal/CUDA 闪存注意力内核。在长上下文 Ministral-3-14B 负载（4×约 800 token）上，它比 legacy 逐序列 GGML 路径快约 21%。</p>
+  <p>批量前向（Mistral 3、Gemma 4、GPT OSS、带 GatedDeltaNet 循环状态池的 Qwen 3.5/3.6，以及带 Mamba2 循环状态池的 Nemotron-H）把 N 个序列打包进一次 <code>ForwardBatch</code> 调用，每层一次批量线性投影 matmul，并配以分页 K/V 散写。Gemma 4 达到约 1.5–1.6× legacy 吞吐；Nemotron-H Mamba2 批量在 Apple M4 Pro 上 batch=3 时达到约 3.95×。</p>
+  <div class="callout note"><div class="ic">📖</div><p>完整深入解析：仓库中的 <code>docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md</code>。</p></div>
+
+  <h2 id="mtp">MTP / NextN 推测解码</h2>
+  <p>部分架构自带一个<strong>多 token 预测（MTP / NextN）草稿头</strong>，让服务器可为单序列（非并发）运行<em>无损</em>推测解码。草稿廉价地提出若干未来 token，主干在一次批量前向中验证全部，被接受的 token 一步提交。</p>
+  <div class="callout tip"><div class="ic">🎯</div><p>由于请求自身的采样器 —— 温度、top-k/p 与全部惩罚 —— <em>同时</em>驱动草稿与验证，输出<strong>与标准解码完全一致</strong>。推测只改变产生相同 token 所需的前向次数。</p></div>
+  <p>它默认关闭。在服务器上用 <code>--mtp-spec</code>（环境变量 <code>TS_MTP_SPEC=1</code>）启用：</p>
+  <pre data-lang="bash"><code># Qwen 3.6 —— NextN 块内嵌在主干 GGUF 中，无需额外文件
+./TensorSharp.Server --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft 8 --mtp-pmin 0.75
+
+# Gemma 4 —— 加载与目标匹配的独立 gemma4-assistant 草稿 GGUF
+./TensorSharp.Server --model gemma-4-12B-it-Q4_K_M.gguf --backend ggml_cuda \
+    --mtp-spec --mtp-draft-model gemma-4-12B-assistant-Q8_0.gguf</code></pre>
+  <h4>两种草稿头形态</h4>
+  <ul>
+    <li><strong>Qwen 3.6（内嵌 NextN）</strong> —— GGUF 携带一个额外解码块以及 NextN 投影/归一化张量。无需独立文件；<code>--mtp-draft-model</code> 会被忽略。GatedDeltaNet 主干状态会被快照，以便部分被拒绝的验证批可回滚。</li>
+    <li><strong>Gemma 4（独立 <code>gemma4-assistant</code> GGUF）</strong> —— 一个 EAGLE 式循环草稿器，用 <code>--mtp-draft-model</code> 加载。它自身不持有 K/V：每个草稿层都查询目标模型已有的逐层 KV 缓存。草稿的隐藏维度必须与目标一致（把 12B 目标与其 12B 草稿配对）。不匹配或不完整的草稿会在<strong>启动时立即失败</strong>并给出修复提示。</li>
+  </ul>
+  <h4>何处有收益</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>后端</th><th>Qwen 3.6</th><th>Gemma 4</th></tr></thead>
+    <tbody>
+      <tr><td>GGML CUDA / GGML Metal</td><td class="yes">✅ 融合验证 + 草稿内核</td><td class="yes">✅ 融合验证 + 草稿内核</td></tr>
+      <tr><td>直接 CUDA（<code>cuda</code>，纯 C#）</td><td class="yes">✅ GPU 常驻逐 op 验证/草稿</td><td class="yes">✅ GPU 常驻逐 op 验证/草稿</td></tr>
+      <tr><td>CPU / GGML CPU / MLX</td><td class="no">标准解码</td><td class="no">标准解码</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>调参：<code>--mtp-draft</code>（默认 8）限定每步草拟的 token 数；<code>--mtp-pmin</code>（默认 0.75）是保留某 token 所需的草稿头最低置信度。Gemma 4 的 A/B 开关是 <code>TS_GMTP_*</code> 环境变量。</p>
+
+  <h2 id="diffusion">DiffusionGemma 文本扩散</h2>
+  <p>DiffusionGemma 与自回归模型本质不同：它不逐 token 调用 <code>Forward()</code>。相反，它在 Gemma-4 衍生的 MoE 主干上，对定长画布做块式 <strong>EntropyBound 去噪</strong> —— 整个答案是被迭代精炼，而非从左到右写出。</p>
+  <ul>
+    <li><strong>CLI</strong> —— <code>--diffusion-steps</code>（每块去噪步数）、<code>--diffusion-seed</code> 与 <code>--diffusion-blocks</code>。</li>
+    <li><strong>Web UI</strong> —— 流式发送整条消息的 <code>replace</code> 事件，让你实时观看答案去噪，并通过 <code>DiffusionBatchScheduler</code> 在块边界批处理并发扩散请求。</li>
+    <li><strong>优化</strong> —— 在 GPU 后端上，<code>[prompt | canvas]</code> 的提示侧每块预取一次并跨步复用；GGML 后端使用融合的整模型扩散 decode 加上融合的 lm-head 尾部。</li>
+  </ul>
+
+  <h2 id="perf">性能优化</h2>
+  <p>这是跨架构的概要；<code>docs/models/</code> 中每个模型卡都会以确切分派的 GGML 图逐一讲解相同内核。</p>
+  <ul>
+    <li><strong>融合 GPU decode</strong>（Gemma 4）—— 所有 transformer 层在一次 GGML 图分派中完成，把每 token 的 CPU↔GPU 往返从数百次降到一次（相对逐 op 分派约 2.6×）。</li>
+    <li><strong>融合 GPU prefill</strong>（Gemma 4）—— 在 prefill 期间，dense 层每层一次分派完成整块（归一化、QKV、RoPE、注意力、FFN、残差）。</li>
+    <li><strong>分块 prefill</strong>（Gemma 4）—— 长提示被切成有界块，避免滑动窗口层产生 O(n²) 的注意力分数张量。</li>
+    <li><strong>融合 Qwen 3.5/3.6 注意力与 FFN</strong> —— 单图融合注意力层 decode、融合 prefill 注意力、融合 out-proj + FFN，以及融合视觉编码器块（约 15 op → 2）。</li>
+    <li><strong>原生量化计算</strong> —— Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4 直接用于 matmul 而不展开为 FP32；批量 <code>AddmmQuantBatch</code> 在一次分派中处理多个子权重 matmul。</li>
+    <li><strong>批量 GPU MoE</strong> —— 所有被选专家（加上可选的共享专家与残差相加）在每个 MoE 层折叠为一次 GGML 图分派。</li>
+    <li><strong>KV 缓存前缀复用</strong> —— 多轮对话复用最长匹配 token 前缀；滑动窗口模型按窗口大小回退截断。</li>
+    <li><strong>内核预热</strong> —— CLI 与服务器都在启动时运行一次很小的前向，以预编译 GPU 内核并预热内存池，避免冷启动延迟。</li>
+  </ul>
+
+  <h2 id="memory">内存优化</h2>
+  <ul>
+    <li><strong>零拷贝文件映射权重</strong> —— GGUF 被内存映射，量化张量直接绑定进原生运算，去掉了大致使常驻内存翻倍的逐张量拷贝。例如 <code>Qwen3.5-35B-A3B-IQ2_XXS</code>（约 10 GB GGUF）在 Metal 下峰值约 7 GB，而非约 17 GB。</li>
+    <li><strong>最佳匹配内存池</strong>，带有界保留（块上限 64 MB，池上限 32 块），让长时间运行中工作集保持紧凑。</li>
+    <li><strong>带可选 SSD 溢出的分页 KV 块池</strong> —— RAM 上限、LRU 淘汰，并跨会话做内容哈希前缀复用。</li>
+    <li><strong>KV 块编解码器</strong> —— 通过 <code>--paged-kv-quant-bits</code> 用 <code>TurboQuantKvCodec</code>（Q4 / Q8）做可选的原地压缩，以很小的精度代价换取每块占用减半 / 减至四分之一。</li>
+  </ul>
+
+  <div class="content-footer">
+    <a href="code-api_zh-cn.html">← C# 库</a>
+    <a href="benchmarks_zh-cn.html">下一篇：基准测试 →</a>
+  </div>
+</main>
+</body>
+</html>

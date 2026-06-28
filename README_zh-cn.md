@@ -76,7 +76,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 ## 亮点功能
 
-- **与 llama.cpp 同台竞技** —— 纯 .NET 引擎，在相同 GGUF 文件、相同 GPU 上与手工优化的 C++ `llama.cpp` 正面较量。在 Gemma 4 26B-A4B MoE 上，decode、prefill **与**首 token 延迟（TTFT）同时领先；多轮对话（prefill/TTFT 最高 **2.1×**）、函数调用 decode（最高 **2.07×**）、多模态延迟（图像 TTFT 低 **3.25×**）进一步拉开差距。→ [对比 llama.cpp 的同台评测](#对比-llamacpp-的同台评测引擎对比)
+- **prefill 与首 token 延迟快于 llama.cpp** —— 纯 .NET 引擎，在相同 GGUF 文件、相同 GPU 上*全面*超越手工优化的 C++ `llama.cpp` 的 prefill（几何平均 **1.18×–1.88×**），同时 decode 保持持平。Gemma 4 26B-A4B MoE 领跑，达 **1.88× prefill / 1.69× TTFT**；结构化输出（JSON）prefill 高达 **5.89×**，多轮对话首 token 最高早 **1.93×**。→ [对比 llama.cpp 的同台评测](#对比-llamacpp-的同台评测引擎对比)
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列 decode：Qwen 3.6（NextN 块内嵌在主干 GGUF 中）与 Gemma 4（独立的 `gemma4-assistant` 草稿 GGUF）。草稿头每步提议若干 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动。通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。→ [投机解码](#mtp--nextn-投机解码)
 - **DiffusionGemma 文本扩散** —— 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪生成，提供 CLI 扩散参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
@@ -1152,24 +1152,25 @@ TensorSharp 采用分层系统结构：
 
 ### 对比 llama.cpp 的同台评测（引擎对比）
 
-纯 .NET 引擎与手工优化的 C++ `llama.cpp` 正面较量：**相同的 GGUF 文件、相同的 NVIDIA RTX 3080 Laptop GPU（16 GB）、统一的 OpenAI `/v1/chat/completions` 接口**，覆盖文本 / 图像 / 音频 / 视频 / 多轮 / 函数调用 / 结构化输出等场景。下表为 **在相同 GGML CUDA 后端上，TensorSharp 相对 llama.cpp 的几何平均加速比**（单流、贪心采样、关闭 MTP）。**> 1.0× 表示 TensorSharp 更快**（decode / prefill）或延迟更低（TTFT）。每个场景的完整表格见 [`docs/engine_comparison_report.md`](docs/engine_comparison_report.md)。
+纯 .NET 引擎与手工优化的 C++ `llama.cpp` 正面较量：**相同的 GGUF 文件、相同的 NVIDIA RTX 3080 Laptop GPU（16 GB）、统一的 OpenAI `/v1/chat/completions` 接口**，覆盖文本、多轮、结构化输出（JSON）等场景。下表为 **在相同 GGML CUDA 后端上，TensorSharp 相对 llama.cpp 的几何平均加速比**（单流、贪心采样、关闭 MTP）。**> 1.0× 表示 TensorSharp 更快**（decode / prefill）或延迟更低（TTFT）。每个场景的完整表格见 [`docs/engine_comparison_report.md`](docs/engine_comparison_report.md)。
 
 | 模型 | decode | prefill | TTFT |
 |---|---:|---:|---:|
-| Gemma 4 26B-A4B it（QAT UD-Q4_K_XL，**MoE**） | **1.11×** | **1.32×** | **1.22×** |
-| Gemma 4 12B it（QAT UD-Q4_K_XL，dense） | **1.02×** | 0.49× | 0.81× |
-| Gemma 4 E4B it（Q8_0，dense 多模态） | 0.88× | 0.51× | 0.89× |
-| Qwen 3.6 35B-A3B（UD-IQ2_XXS，MoE） | 0.62× | 0.62× | 0.60× |
+| Gemma 4 26B-A4B it（QAT UD-Q4_K_XL，**MoE**） | 0.92× | **1.88×** | **1.69×** |
+| Gemma 4 12B it（QAT UD-Q4_K_XL，dense） | 0.93× | **1.23×** | **1.10×** |
+| Gemma 4 E4B it（Q8_0，dense 多模态） | 0.95× | **1.21×** | **1.07×** |
+| Qwen 3.6 35B-A3B（UD-IQ2_XXS，MoE） | 0.94× | **1.18×** | 0.95× |
 
 TensorSharp 明显领先的地方：
 
-- **MoE 旗舰全面领先。** 在 Gemma 4 26B-A4B 上，常驻捕获式 CUDA 图 MoE decode 加上基于 verify 的整模型 prefill，使 TensorSharp 在 decode **、** prefill **、**首 token 延迟上*同时*快于 llama.cpp——是全面胜出，而非此消彼长。
-- **多轮对话——真正的聊天机器人负载。** 基于内容哈希的分页 KV 前缀复用让后续轮次更快返回：26B-A4B 上 prefill / TTFT 为 **2.08× / 2.14×**，12B 上为 **1.66× / 1.70×**。
-- **函数调用 decode 最高 2.07×** —— 26B-A4B 上 170.9 vs 82.7 tok/s（12B 上 1.69× / 77.2 vs 45.6 tok/s）。
-- **多模态首 token 延迟。** 26B-A4B 图像 TTFT **低 3.25×（3.8 s vs 12.4 s）**；dense 模型音频 TTFT **低约 6×**（E4B 140 ms vs 828 ms；12B 203 ms vs 1266 ms）。
-- **稳健性** —— 参考引擎在 26B-A4B 音频场景报错退出，TensorSharp 顺利完成。
+- **prefill 全模型领先。** TensorSharp 在所有受测模型上的 prefill 都快于 llama.cpp——几何平均从 **1.18×（Qwen 3.6）到 1.88×（26B-A4B MoE）**，得益于基于 verify 的整模型 prefill 以及融合的 FFN / attention 内核。首 token 延迟随之下降，四个模型中有三个更低（MoE 旗舰最高 **1.69×**）。
+- **MoE 旗舰领跑。** 在 Gemma 4 26B-A4B 上，常驻捕获式 CUDA 图 MoE decode 加上基于 verify 的整模型 prefill，带来 **1.88× prefill / 1.69× TTFT** 的几何平均加速，同时 decode 持平——这些胜势叠加在有竞争力的 token 生成之上。
+- **结构化输出（JSON 模式）尤为亮眼。** 受约束的 JSON prefill 在 26B-A4B 上快 **5.89×**（354.7 vs 60.2 tok/s），首 token 早 **3.34×**（234 ms vs 781 ms）；12B prefill 为 **1.89×**，E4B 为 **1.52×**。JSON 模式下 decode 甚至在 E4B（**1.10×**）与 Qwen 3.6（**1.07×**）上也领先。
+- **多轮对话——真正的聊天机器人负载。** 基于内容哈希的分页 KV 前缀复用让后续轮次更快返回：26B-A4B 上 prefill / TTFT 为 **1.87× / 1.93×**，12B 上为 **1.55× / 1.60×**。
+- **短提示首 token 响应迅速。** E4B 处理短提示时首 token 早 **1.75×**（125 ms vs 219 ms），prefill 快 **1.62×**；Qwen 3.6 短提示 prefill 快 **1.59×**（123.2 vs 77.4 tok/s）。
+- **Qwen 3.6 IQ2_XXS 现已具备竞争力。** 这一激进量化的 35B-A3B MoE 达到近乎持平的 decode（0.94×）与 prefill 领先（1.18×）——已从昔日的短板中恢复。
 
-Dense 模型 decode 基本持平（约 0.88–1.02×）；IQ2_XXS 的 Qwen 3.6 路径与少数 prefill cell 仍是正在优化的目标，而非最终结果。胜负各项的完整数据见[完整报告](docs/engine_comparison_report.md)。
+decode 在 dense 与 MoE 模型上均基本持平（0.92–0.95×），因此 prefill、TTFT 与结构化输出上的胜势是叠加在有竞争力的 token 生成之上。剩余低于 1.0× 的项——主要是长上下文 dense prefill——仍是正在优化的目标，而非最终结果。胜负各项的完整数据见[完整报告](docs/engine_comparison_report.md)。
 
 ### 跨引擎推理矩阵
 

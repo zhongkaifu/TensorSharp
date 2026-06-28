@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>支持的模型 — TensorSharp 维基</title>
+  <meta name="description" content="支持的模型架构、GGUF 下载，以及各家族的多模态、思考与工具调用能力。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="models">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 支持的模型</div>
+  <h1>支持的模型</h1>
+  <p class="lede">TensorSharp 加载 GGUF 格式的模型，并从文件的 <code>general.architecture</code> 元数据自动识别架构。选择适合你硬件的量化（低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>）。</p>
+
+  <h2 id="table">支持的架构</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>架构</th><th>GGUF 架构键</th><th>示例模型</th><th>多模态</th><th>思考</th><th>工具</th><th>MTP 推测</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Gemma 4</strong></td><td><code>gemma4</code></td><td>gemma-4-E4B、31B、26B-A4B (MoE)</td><td>图像、视频、音频</td><td class="yes">是</td><td class="yes">是</td><td class="yes">是（独立草稿）</td></tr>
+      <tr><td><strong>Gemma 3</strong></td><td><code>gemma3</code></td><td>gemma-3-4b</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen 3</strong></td><td><code>qwen3</code></td><td>Qwen3-4B</td><td>仅文本</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen 3.5 / 3.6</strong></td><td><code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code></td><td>Qwen3.5-9B、Qwen3.5/3.6-35B-A3B (MoE)</td><td>图像</td><td class="yes">是</td><td class="yes">是</td><td class="yes">3.6 支持（内嵌 NextN）</td></tr>
+      <tr><td><strong>GPT OSS</strong></td><td><code>gptoss</code>、<code>gpt-oss</code></td><td>gpt-oss-20b (MoE)</td><td>仅文本</td><td class="yes">是（始终）</td><td class="yes">是</td><td class="no">—</td></tr>
+      <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>、<code>nemotron_h_moe</code></td><td>Nemotron-H-8B、47B、Nemotron 3 Nano Omni</td><td>图像（Omni）</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
+      <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
+      <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>、<code>diffusion_gemma</code></td><td>diffusion-gemma 文本扩散 GGUF</td><td>仅文本</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="page-foot-note">各模型的详细架构卡（前向图、组件、参数，以及 TensorSharp 如何优化 prefill/decode）位于仓库的 <code>docs/models/</code> 下。</p>
+
+  <h2 id="downloads">模型下载（GGUF）</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>架构</th><th>模型</th><th>下载</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4</td><td>gemma-4-E4B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-31B-it</td><td><a href="https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-31B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 4</td><td>gemma-4-26B-A4B-it (MoE)</td><td><a href="https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-26B-A4B-it-GGUF</a></td></tr>
+      <tr><td>Gemma 3</td><td>gemma-3-4b-it</td><td><a href="https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf" target="_blank" rel="noopener">google/gemma-3-4b-it-qat-q4_0-gguf</a></td></tr>
+      <tr><td>Qwen 3</td><td>Qwen3-4B</td><td><a href="https://huggingface.co/Qwen/Qwen3-4B-GGUF" target="_blank" rel="noopener">Qwen/Qwen3-4B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-9B</td><td><a href="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.5-9B-GGUF</a></td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>Qwen3.5-35B-A3B (MoE)</td><td><a href="https://huggingface.co/ggml-org/Qwen3.5-35B-A3B-GGUF" target="_blank" rel="noopener">ggml-org/Qwen3.5-35B-A3B-GGUF</a></td></tr>
+      <tr><td>GPT OSS</td><td>gpt-oss-20b (MoE)</td><td><a href="https://huggingface.co/ggml-org/gpt-oss-20b-GGUF" target="_blank" rel="noopener">ggml-org/gpt-oss-20b-GGUF</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-8B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-8B-…</a></td></tr>
+      <tr><td>Nemotron-H</td><td>Nemotron-H-47B-Reasoning-128K</td><td><a href="https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF" target="_blank" rel="noopener">bartowski/nvidia_Nemotron-H-47B-…</a></td></tr>
+      <tr><td>Mistral 3</td><td>Mistral-Small-3.1-24B-Instruct</td><td><a href="https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF" target="_blank" rel="noopener">bartowski/Mistral-Small-3.1-24B-…</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">🧩</div><p>多模态模型需要<strong>投影器（mmproj）</strong>文件。Gemma 4 / Gemma 3 / Qwen 3.5 / Mistral 3 的投影器随上面的仓库一起或在旁提供；把投影器放在模型旁并使用可识别的名称即可自动加载，或用 <code>--mmproj</code> 显式传入。</p></div>
+
+  <h2 id="multimodal">多模态支持</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>家族</th><th>输入</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4</td><td>图像 · 视频 · 音频</td><td>图像 PNG/JPEG/HEIC；视频 MP4（经 OpenCV 以 1 fps 采样）；音频 WAV 16 kHz 单声道 / MP3 / OGG。投影器：<code>gemma-4-mmproj-F16.gguf</code>。</td></tr>
+      <tr><td>Gemma 3</td><td>图像</td><td>PNG / JPEG / HEIC。投影器：<code>mmproj-gemma3-4b-f16.gguf</code>。</td></tr>
+      <tr><td>Qwen 3.5 / 3.6</td><td>图像</td><td>动态分辨率视觉编码器。投影器：<code>Qwen3.5-mmproj-F16.gguf</code>。</td></tr>
+      <tr><td>Mistral 3</td><td>图像</td><td>Pixtral 视觉编码器。投影器：<code>mistral3-mmproj.gguf</code>。</td></tr>
+      <tr><td>Nemotron-H (Omni)</td><td>图像</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送图像/音频/视频。</p>
+
+  <h2 id="thinking">思考 / 推理模式</h2>
+  <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
+  <ul>
+    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
+    <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
+    <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
+  </ul>
+  <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>
+
+  <h2 id="toolcalling">工具调用 / 函数调用</h2>
+  <p>模型可以调用用户自定义工具，并参与多轮工具调用对话。将工具定义为 JSON，通过 <code>--tools</code>（CLI）或 <code>tools</code> 参数（API）传入。每个架构使用各自的线格式，但输出解析器都会将调用提取为结构化 <code>tool_calls</code>：</p>
+  <ul>
+    <li><strong>Qwen 3 / Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
+    <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>
+  </ul>
+  <p>完整的请求/响应示例与续接循环见 <a href="http-api_zh-cn.html#tools">通过 HTTP 进行工具调用</a>。</p>
+
+  <div class="content-footer">
+    <a href="backends_zh-cn.html">← 计算后端</a>
+    <a href="cli_zh-cn.html">下一篇：命令行 →</a>
+  </div>
+</main>
+</body>
+</html>

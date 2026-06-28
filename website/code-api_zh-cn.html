@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>C# 库 / 代码 — TensorSharp 维基</title>
+  <meta name="description" content="将 TensorSharp 嵌入你的 .NET 应用：NuGet 包、用 ModelBase.Create 加载模型、解码循环与 SamplingConfig。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="code-api">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › C# 库 / 代码</div>
+  <h1>从 C# 使用 TensorSharp</h1>
+  <p class="lede">TensorSharp 是一个真正的 .NET 库，而不仅是一个二进制。引用 NuGet 包，直接从你自己的代码驱动推理 —— 当你想在现有服务内进行推理、又不想经过 HTTP 跳转时非常有用。</p>
+
+  <h2 id="packages">NuGet 包</h2>
+  <p>仓库按包边界拆分，使用者只依赖自己需要的层。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>包</th><th>命名空间</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>TensorSharp.Core</code></td><td><code>TensorSharp</code></td><td>张量原语、运算、分配器、存储、设备抽象。</td></tr>
+      <tr><td><code>TensorSharp.Runtime</code></td><td><code>TensorSharp.Runtime</code></td><td>GGUF 解析、分词器、提示词渲染、采样、分页 KV 缓存、连续批处理调度器。</td></tr>
+      <tr><td><code>TensorSharp.Models</code></td><td><code>TensorSharp.Models</code></td><td><code>ModelBase</code>、架构实现、多模态编码器、批量/分页前向。</td></tr>
+      <tr><td><code>TensorSharp.Backends.GGML</code></td><td><code>TensorSharp.GGML</code></td><td>GGML 支撑的执行与原生互操作。</td></tr>
+      <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>直接 CUDA 分配器、存储、cuBLAS GEMM、PTX 内核、量化 CUDA 运算。</td></tr>
+      <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple Silicon MLX 后端（mlx-c / Metal）。</td></tr>
+      <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core 服务器、OpenAI/Ollama 适配器、推理引擎宿主、Web UI。</td></tr>
+      <tr><td><code>TensorSharp.Cli</code></td><td><code>TensorSharp.Cli</code></td><td>控制台宿主与调试 / 批处理工具。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>对于典型的嵌入场景，你引用 <code>TensorSharp.Models</code>（它会拉入 <code>Core</code> + <code>Runtime</code>）以及面向你硬件的后端包（如 <code>TensorSharp.Backends.GGML</code>）。</p>
+  <pre data-lang="bash"><code>dotnet add package TensorSharp.Models
+dotnet add package TensorSharp.Backends.GGML</code></pre>
+  <div class="callout note"><div class="ic">📦</div><p>NuGet 包是<strong>仅托管</strong>的 —— 原生 GGML/CUDA/MLX 库并未内嵌。请先构建它们一次（见<a href="backends_zh-cn.html#native-build">后端</a>）或使用自包含平台二进制，并确保运行时能找到原生库。</p></div>
+
+  <h2 id="quickstart">最小示例 —— 加载、生成、解码</h2>
+  <p>每个模型都以相同方式加载：<code>ModelBase.Create()</code> 读取 GGUF 元数据并实例化正确的架构。从这里开始你做分词、运行前向、采样并解码。</p>
+  <pre data-lang="csharp"><code>using System;
+using System.Collections.Generic;
+using System.Linq;
+using TensorSharp.Models;
+using TensorSharp.Runtime;
+
+// 1. 加载任意 GGUF 模型 —— 架构从元数据自动识别。
+using var model = ModelBase.Create("Qwen3-4B-Q8_0.gguf", BackendType.GgmlCuda);
+
+// 2. 配置采样（默认值与 Ollama 一致：temp 0.8、top_k 40、top_p 0.9）。
+var sampling = new SamplingConfig { Temperature = 0.7f, TopP = 0.9f, TopK = 40 };
+
+// 3. 对提示词分词。
+var tokens = model.Tokenizer
+    .Encode("Explain mixture-of-experts in one sentence.", addSpecial: true)
+    .ToList();
+var generated = new List&lt;int&gt;();
+
+// 4. 自回归解码循环。
+for (int step = 0; step &lt; 200; step++)
+{
+    float[] logits = model.Forward(tokens.ToArray());     // 下一个 token 的 logits
+    int next = model.Sample(logits, sampling, generated); // 应用惩罚 + 采样
+    if (model.Tokenizer.IsEos(next)) break;
+    generated.Add(next);
+    tokens.Add(next);
+}
+
+// 5. 反分词得到结果。
+Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
+  <p>要做贪心/确定性解码，请调用 <code>model.SampleGreedy(logits)</code> 而非 <code>Sample</code>。</p>
+
+  <h3>冒烟测试变体</h3>
+  <p>一次性健全性检查：加载模型、运行一次前向，并打印 top token：</p>
+  <pre data-lang="csharp"><code>using var model = ModelBase.Create(modelPath, backend);
+var tokenIds = model.Tokenizer.Encode("Hello", addSpecial: true);
+float[] logits = model.Forward(tokenIds.ToArray());
+
+int topToken = model.SampleGreedy(logits);
+Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, topToken={topToken}");</code></pre>
+
+  <h2 id="sampling">SamplingConfig</h2>
+  <p>采样旋钮与 CLI 参数及 API 选项一一对应。默认值与 Ollama 一致。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>属性</th><th>类型</th><th>默认</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>Temperature</code></td><td>float</td><td>0.8</td><td>随机性；0 = 贪心/确定性。</td></tr>
+      <tr><td><code>TopK</code></td><td>int</td><td>40</td><td>限制为概率最高的 K 个 token；0 = 禁用。</td></tr>
+      <tr><td><code>TopP</code></td><td>float</td><td>0.9</td><td>核采样；1.0 = 禁用。</td></tr>
+      <tr><td><code>MinP</code></td><td>float</td><td>0</td><td>相对最大值的最小概率阈值。</td></tr>
+      <tr><td><code>RepetitionPenalty</code></td><td>float</td><td>1.1</td><td>乘性惩罚；&gt;1 抑制重复。</td></tr>
+      <tr><td><code>PresencePenalty</code></td><td>float</td><td>0</td><td>对已出现 token 的加性惩罚。</td></tr>
+      <tr><td><code>FrequencyPenalty</code></td><td>float</td><td>0</td><td>与 token 频率成比例的加性惩罚。</td></tr>
+      <tr><td><code>Seed</code></td><td>int</td><td>-1</td><td>可复现采样；-1 = 基于时间。</td></tr>
+      <tr><td><code>StopSequences</code></td><td>List&lt;string&gt;</td><td>null</td><td>产生其中任一字符串时停止。</td></tr>
+      <tr><td><code>MaxTokens</code></td><td>int</td><td>0</td><td>最大生成 token 数；0 = 使用调用方默认。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="namespaces">关键类型与接口</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>类型</th><th>角色</th></tr></thead>
+    <tbody>
+      <tr><td><code>ModelBase</code></td><td>每个架构的抽象基类。<code>Create(path, backend)</code>、<code>Forward(int[])</code>、<code>Sample(...)</code>、<code>SampleGreedy(...)</code>，外加 <code>Config</code> 与 <code>Tokenizer</code>。</td></tr>
+      <tr><td><code>BackendType</code></td><td>枚举：<code>Cpu</code>、<code>GgmlCpu</code>、<code>GgmlMetal</code>、<code>GgmlCuda</code>、<code>Cuda</code>、<code>Mlx</code>。</td></tr>
+      <tr><td><code>SamplingConfig</code></td><td>采样配置（见上表）。</td></tr>
+      <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>、<code>Decode(ids)</code>、<code>IsEos(id)</code>、<code>EosTokenIds</code>（BPE 与 SentencePiece 实现）。</td></tr>
+      <tr><td><code>ModelConfig</code></td><td>架构元数据：<code>VocabSize</code>、上下文长度等。</td></tr>
+      <tr><td><code>IBatchedPagedModel</code></td><td>可选的批量/分页前向（<code>ForwardBatch</code>），多数架构为连续批处理而实现。</td></tr>
+      <tr><td><code>InferenceEngine</code></td><td>支撑服务器连续批处理的 worker 线程调度器 + 分页块池（在 <code>TensorSharp.Runtime.Scheduling</code> 中）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>其他值得了解的运行时契约：<code>IModelArchitecture</code>、<code>IPromptRenderer</code>、<code>IOutputProtocolParser</code>、<code>IMultimodalInjector</code>、<code>IKvBlockCodec</code>（带内置 <code>TurboQuantKvCodec</code>）以及 <code>IKVCachePolicy</code>。</p>
+
+  <div class="callout tip"><div class="ic">💡</div><p>对多数应用而言，最简单的集成是运行 <a href="server_zh-cn.html">TensorSharp.Server</a> 并通过<a href="http-api_zh-cn.html">兼容 OpenAI 的 API</a> 调用它 —— 你的应用进程保持干净，并免费获得连续批处理。当你需要进程内控制或自定义解码时，再使用库 API。</p></div>
+
+  <div class="content-footer">
+    <a href="http-api_zh-cn.html">← HTTP API</a>
+    <a href="advanced_zh-cn.html">下一篇：高级功能 →</a>
+  </div>
+</main>
+</body>
+</html>

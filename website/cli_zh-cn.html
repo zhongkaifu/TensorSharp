@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>命令行 (CLI) — TensorSharp 维基</title>
+  <meta name="description" content="运行 TensorSharp.Cli：文本/图像/音频/视频推理、思考、工具、采样、批处理 JSONL、交互式 REPL 与基准测试。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="cli">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 命令行 (CLI)</div>
+  <h1>命令行 (CLI)</h1>
+  <p class="lede"><code>TensorSharp.Cli</code> 是用于本地提示词、多模态实验、提示词检查、JSONL 批处理工作流、交互式 REPL 与内置基准测试的控制台宿主。构建后二进制位于 <code>TensorSharp.Cli/bin/...</code>。</p>
+
+  <h2 id="examples">示例</h2>
+  <pre data-lang="bash"><code>cd TensorSharp.Cli/bin
+
+# 文本推理（macOS）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_metal
+
+# Windows/Linux + NVIDIA GPU 上的文本推理
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_cuda
+
+# 交互式逐轮聊天（REPL），带 KV 缓存复用与斜杠命令
+./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal --interactive
+./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal -i \
+    --system "You are a terse assistant." --temperature 0.7 --top-p 0.9 --think</code></pre>
+
+  <h3>多模态</h3>
+  <pre data-lang="bash"><code># 图像推理（Gemma 3/4、Qwen 3.5-family）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --image photo.png --backend ggml_metal
+
+# 视频推理（Gemma 4）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --video clip.mp4 --backend ggml_metal
+
+# 音频推理（Gemma 4）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --audio speech.wav --backend ggml_metal</code></pre>
+
+  <h3>推理、工具与采样</h3>
+  <pre data-lang="bash"><code># 思考 / 推理模式
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --backend ggml_metal --think
+
+# 工具调用
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --backend ggml_metal \
+    --tools tools.json
+
+# 带采样参数
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --backend ggml_metal \
+    --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42</code></pre>
+
+  <h3 id="diffusion">DiffusionGemma 与检查</h3>
+  <pre data-lang="bash"><code># DiffusionGemma 文本扩散生成
+./TensorSharp.Cli --model &lt;diffusion-gemma.gguf&gt; --input prompt.txt --backend ggml_metal \
+    --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
+
+# 检查渲染后的提示词与分词，但不运行推理
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --dump-prompt</code></pre>
+
+  <h3 id="jsonl">批处理与基准测试</h3>
+  <pre data-lang="bash"><code># 批处理（JSONL）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input-jsonl requests.jsonl \
+    --output results.txt --backend ggml_metal
+
+# 带 KV 缓存复用的多轮对话模拟（与 Web UI 行为一致）
+./TensorSharp.Cli --model &lt;model.gguf&gt; --multi-turn-jsonl chat.jsonl \
+    --backend ggml_metal --max-tokens 200
+
+# 吞吐基准：best-of-N 的 prefill 与 decode 计时
+./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal \
+    --benchmark --bench-prefill 256 --bench-decode 128 --bench-runs 3</code></pre>
+  <p>JSONL 格式为每行一个 JSON 对象：</p>
+  <pre data-lang="json"><code>{"id": "q1", "messages": [{"role": "user", "content": "What is 2+3?"}], "max_tokens": 50}
+{"id": "q2", "messages": [{"role": "user", "content": "Write a haiku."}], "max_tokens": 100, "temperature": 0.8}</code></pre>
+
+  <h2 id="options">命令行选项</h2>
+  <h4>输入 / 输出</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF 模型文件路径（必需）。</td></tr>
+      <tr><td><code>--input &lt;path&gt;</code></td><td>包含用户提示词的文本文件。</td></tr>
+      <tr><td><code>--input-jsonl &lt;path&gt;</code></td><td>含批量请求的 JSONL 文件（每行一个 JSON）。</td></tr>
+      <tr><td><code>--multi-turn-jsonl &lt;path&gt;</code></td><td>用于带 KV 缓存复用的多轮对话模拟的 JSONL 文件。</td></tr>
+      <tr><td><code>--output &lt;path&gt;</code></td><td>将生成文本写入此文件。</td></tr>
+      <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>用于视觉 / 视频 / 音频推理的媒体文件。</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF 文件路径（放在模型旁则自动检测）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>运行时</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认：100）。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>计算后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code> 或 <code>q8_0</code>。</td></tr>
+      <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL（见下文）。</td></tr>
+      <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。</td></tr>
+      <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
+      <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
+      <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出（不生成）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>采样</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--temperature &lt;f&gt;</code></td><td>采样温度（0 = 贪心）。</td></tr>
+      <tr><td><code>--top-k &lt;N&gt;</code></td><td>Top-K 过滤（0 = 禁用）。</td></tr>
+      <tr><td><code>--top-p &lt;f&gt;</code></td><td>核采样阈值（1.0 = 禁用）。</td></tr>
+      <tr><td><code>--min-p &lt;f&gt;</code></td><td>最小概率过滤（0 = 禁用）。</td></tr>
+      <tr><td><code>--repeat-penalty &lt;f&gt;</code></td><td>重复惩罚（1.0 = 无）。</td></tr>
+      <tr><td><code>--presence-penalty &lt;f&gt;</code> / <code>--frequency-penalty &lt;f&gt;</code></td><td>存在 / 频率惩罚（0 = 禁用）。</td></tr>
+      <tr><td><code>--seed &lt;N&gt;</code></td><td>随机种子（-1 = 非确定性）。</td></tr>
+      <tr><td><code>--stop &lt;string&gt;</code></td><td>停止序列（可重复）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>DiffusionGemma、基准测试与日志</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>选项</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--diffusion-steps &lt;N&gt;</code></td><td>DiffusionGemma 每块去噪步数（默认：48）。</td></tr>
+      <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma 确定性采样器种子（默认：0）。</td></tr>
+      <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>块自回归画布数量（<code>0</code> 由 <code>--max-tokens</code> 推导）。</td></tr>
+      <tr><td><code>--benchmark</code></td><td>运行合成的 prefill/decode 吞吐基准。</td></tr>
+      <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>合成的 prefill 长度、decode 长度与运行次数。</td></tr>
+      <tr><td><code>--bench-kvcache</code> / <code>--bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准（带缓存 vs 强制重置）。</td></tr>
+      <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>计时前丢弃的前向次数（默认：0）。</td></tr>
+      <tr><td><code>--log-level &lt;lvl&gt;</code></td><td><code>trace</code>、<code>debug</code>、<code>info</code>、<code>warning</code>、<code>error</code>、<code>critical</code>、<code>off</code>。</td></tr>
+      <tr><td><code>--log-dir &lt;path&gt;</code> / <code>--log-file &lt;0|1&gt;</code> / <code>--log-console &lt;0|1&gt;</code></td><td>JSON 行文件日志的目录与开关。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="page-foot-note">完整参考（含 <code>--test</code>、<code>--test-templates</code> 与分块 prefill 正确性检查）见 <a href="api-reference_zh-cn.html#cli-flags">API 参考</a> 页。</p>
+
+  <h2 id="repl">交互式 REPL 命令</h2>
+  <p>用 <code>--interactive</code> / <code>-i</code> 启动。任何不以 <code>/</code> 开头的内容都是一轮用户输入；输入 <code>/help</code> 查看列表。提示头显示当前模型、后端、架构、上下文长度、投影器、对话深度与待发送附件。生成时按 <kbd>Ctrl+C</kbd> 中断；在提示符处按则退出。</p>
+  <h4>对话</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>命令</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>/help</code>、<code>/?</code></td><td>显示所有交互命令。</td></tr>
+      <tr><td><code>/exit</code>、<code>/quit</code></td><td>离开会话。</td></tr>
+      <tr><td><code>/reset</code>、<code>/new</code></td><td>清空对话历史与 KV 缓存。</td></tr>
+      <tr><td><code>/history</code> · <code>/save &lt;file&gt;</code></td><td>打印 / 追加记录。</td></tr>
+      <tr><td><code>/system &lt;text&gt;</code></td><td>设置系统提示（重置 KV 缓存）。</td></tr>
+      <tr><td><code>/think on|off</code> · <code>/multiline on|off</code></td><td>切换推理模式 / 多行输入。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>模型与运行时</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>命令</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>/info</code>、<code>/status</code></td><td>显示已加载模型、后端、架构、上下文/词表大小、投影器、深度。</td></tr>
+      <tr><td><code>/model &lt;path&gt;</code></td><td>在当前后端上加载另一个 <code>.gguf</code>（重置会话）。</td></tr>
+      <tr><td><code>/backend &lt;name&gt;</code></td><td>在另一后端上重新加载当前模型。</td></tr>
+      <tr><td><code>/mmproj &lt;path&gt;</code></td><td>加载或替换多模态投影器。别名：<code>/projector</code>。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>采样（实时）与上传（下一轮）</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>命令</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>/sampling</code>、<code>/show</code></td><td>打印当前采样配置。</td></tr>
+      <tr><td><code>/max</code> · <code>/temp</code> · <code>/topk</code> · <code>/topp</code> · <code>/minp</code></td><td>设置回复长度 / 温度 / top-k / top-p / min-p。</td></tr>
+      <tr><td><code>/repeat</code> · <code>/presence</code> · <code>/frequency</code> · <code>/seed</code></td><td>设置惩罚与随机种子。</td></tr>
+      <tr><td><code>/stop &lt;text&gt;</code> · <code>/clearstop</code></td><td>添加 / 清除停止序列。</td></tr>
+      <tr><td><code>/image &lt;path&gt;</code> · <code>/audio</code> · <code>/video</code> · <code>/text</code></td><td>为下一轮附加媒体或内联一个文本文件。</td></tr>
+      <tr><td><code>/clearattach</code></td><td>丢弃待发送附件而不发送一轮。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="content-footer">
+    <a href="models_zh-cn.html">← 支持的模型</a>
+    <a href="server_zh-cn.html">下一篇：服务器与 Web UI →</a>
+  </div>
+</main>
+</body>
+</html>

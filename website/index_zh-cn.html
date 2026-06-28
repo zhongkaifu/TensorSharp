@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TensorSharp 维基 — 面向 .NET 的本地 GGUF 大模型推理</title>
+  <meta name="description" content="TensorSharp 是面向 GGUF 模型的原生 .NET 大模型推理引擎：命令行工具、Web 聊天服务器，以及兼容 Ollama / OpenAI 的 HTTP API。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="index">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+
+  <section class="hero">
+    <div>
+      <span class="pill">⚡ C# · .NET 10 · GGUF · GPU 加速</span>
+      <h1>TensorSharp</h1>
+      <p class="lede">一个<strong>面向 GGUF 模型的原生 .NET 大模型推理引擎</strong> —— 提供命令行工具、浏览器聊天服务器，以及用于程序化访问的<strong>兼容 Ollama 与 OpenAI 的 API</strong>。</p>
+      <div class="btn-row">
+        <a class="btn" href="getting-started_zh-cn.html">开始使用 →</a>
+        <a class="btn secondary" href="overview_zh-cn.html">TensorSharp 是什么？</a>
+        <a class="btn secondary" href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+    <div class="hero-art" aria-hidden="true">
+      <div><span class="c-cm"># 一次性生成</span></div>
+      <div>./TensorSharp.Cli \</div>
+      <div>&nbsp;&nbsp;--model <span class="c-st">gemma-4-E4B-it-Q8_0.gguf</span> \</div>
+      <div>&nbsp;&nbsp;--input prompt.txt \</div>
+      <div>&nbsp;&nbsp;--backend <span class="c-ac">ggml_cuda</span></div>
+      <div>&nbsp;</div>
+      <div><span class="c-cm"># 或启动兼容 OpenAI 的 API 服务</span></div>
+      <div>./TensorSharp.Server \</div>
+      <div>&nbsp;&nbsp;--model <span class="c-st">model.gguf</span> --backend <span class="c-ac">ggml_metal</span></div>
+      <div><span class="c-cm"># → http://localhost:5000</span></div>
+    </div>
+  </section>
+
+  <p>一切都运行在<strong>你自己的硬件</strong>上：你的笔记本、工作站或服务器。数据不离开本机，没有按 token 计费，同一套引擎既能完成快速的命令行测试，也能支撑团队内部共享的聊天机器人和生产环境的 REST 接口。本维基是完整指南 —— 从下方选择一个起点，或按 <kbd>/</kbd> 进行搜索。</p>
+
+  <h2 id="explore">浏览维基</h2>
+  <div class="card-grid">
+    <a class="card" href="getting-started_zh-cn.html"><div class="ic">🚀</div><h3>快速开始</h3><p>环境要求、构建、下载模型，并流式输出你的第一个回复。</p></a>
+    <a class="card" href="cli_zh-cn.html"><div class="ic">⌨️</div><h3>命令行</h3><p>从 CLI 运行提示词、图像、音频、批处理与基准测试。</p></a>
+    <a class="card" href="server_zh-cn.html"><div class="ic">🌐</div><h3>服务器与 Web UI</h3><p>在本机托管浏览器聊天机器人和 HTTP 接口。</p></a>
+    <a class="card" href="http-api_zh-cn.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>用 curl、Python 或任意 Ollama / OpenAI 客户端调用它。</p></a>
+    <a class="card" href="code-api_zh-cn.html"><div class="ic">🧩</div><h3>C# 库</h3><p>将引擎直接嵌入你的 .NET 应用。</p></a>
+    <a class="card" href="api-reference_zh-cn.html"><div class="ic">📚</div><h3>API 参考</h3><p>可搜索的参数、环境变量、端点与类型表。</p></a>
+    <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>支持的架构、下载、多模态与推理能力。</p></a>
+    <a class="card" href="glossary_zh-cn.html"><div class="ic">📖</div><h3>术语表与 FAQ</h3><p>初识大模型？这里有通俗的定义和常见问题。</p></a>
+  </div>
+
+  <h2 id="quickstart">约 30 秒快速开始</h2>
+  <p>装好 <a href="getting-started_zh-cn.html#prerequisites">.NET 10 SDK</a> 后，只需四条命令即可得到流式回复（模型下载时间另计）。</p>
+  <ol class="steps">
+    <li>
+      <h3>克隆并构建</h3>
+      <p>首次构建时会自动编译原生 GGML 库。</p>
+      <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release</code></pre>
+    </li>
+    <li>
+      <h3>下载模型</h3>
+      <p>一个轻量、经过充分测试的起点是 Hugging Face 上的 <strong>Gemma-4-E4B (Q8_0)</strong>。更多见<a href="models_zh-cn.html#downloads">模型下载</a>。</p>
+    </li>
+    <li>
+      <h3>运行它</h3>
+      <p>根据你的硬件选择 <a href="backends_zh-cn.html#table"><code>--backend</code></a>。</p>
+      <pre data-lang="bash"><code>echo "用一句话解释专家混合（MoE）。" > prompt.txt
+
+# macOS（Apple Silicon）
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal
+
+# Windows / Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda</code></pre>
+    </li>
+    <li>
+      <h3>想要 UI + API？</h3>
+      <p>启动服务器并打开浏览器聊天 —— 它同时提供兼容性接口。</p>
+      <pre data-lang="bash"><code>./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
+# 打开 http://localhost:5000</code></pre>
+    </li>
+  </ol>
+
+  <h2 id="why">为什么选择 TensorSharp？</h2>
+  <div class="card-grid">
+    <div class="card"><div class="ic">🔒</div><h3>默认私有</h3><p>推理在你的硬件上进行。提示词、文档和图像永不离开本机。</p></div>
+    <div class="card"><div class="ic">💸</div><h3>没有按 token 账单</h3><p>硬件允许多少就跑多少 —— 成本可预测，没有计量 API。</p></div>
+    <div class="card"><div class="ic">🔁</div><h3>即插即用兼容</h3><p>支持 Ollama 与 OpenAI 协议，现有工具与 SDK 直接可用。</p></div>
+    <div class="card"><div class="ic">🖥️</div><h3>随处可运行</h3><p>NVIDIA (CUDA)、Apple Silicon (Metal/MLX) 或纯 CPU —— 均带自动回退。</p></div>
+    <div class="card"><div class="ic">🧠</div><h3>现代模型支持</h3><p>Gemma、Qwen、GPT-OSS、Nemotron-H、Mistral，外加视觉、音频、推理与工具调用。</p></div>
+    <div class="card"><div class="ic">⚙️</div><h3>用 .NET 构建</h3><p>原生 C# 引擎，可嵌入你的应用，而不只是一个黑盒二进制。</p></div>
+    <a class="card" href="benchmarks_zh-cn.html#head-to-head"><div class="ic">🏁</div><h3>对比 llama.cpp 的基准</h3><p>在相同 GGUF 文件与相同 GPU 上，它在每个模型上的 prefill 都快于 C++ 引擎（几何平均 1.18×–1.88×）—— Gemma 4 26B-A4B MoE 领跑，达 1.88× prefill / 1.69× TTFT。</p></a>
+  </div>
+
+  <h2 id="audience">这是为谁准备的？</h2>
+  <p>TensorSharp 面向各类访客。下面是每类人最快的上手路径。</p>
+  <div class="audience">
+    <div class="a"><h4>初学者与学生</h4><p>先看<a href="glossary_zh-cn.html">术语表与 FAQ</a>，再看<a href="getting-started_zh-cn.html">快速开始</a>。</p></div>
+    <div class="a"><h4>开发者</h4><p>直达 <a href="http-api_zh-cn.html">HTTP API</a>、<a href="code-api_zh-cn.html">C# 库</a> 与 <a href="api-reference_zh-cn.html">API 参考</a>。</p></div>
+    <div class="a"><h4>资深 / 首席工程师</h4><p>阅读<a href="advanced_zh-cn.html">高级功能</a> —— 分页 KV、连续批处理、推测解码。</p></div>
+    <div class="a"><h4>管理者、CTO 与 CEO</h4><p>查看<a href="overview_zh-cn.html#business">商业价值</a>与<a href="overview_zh-cn.html#status">能力矩阵</a>。</p></div>
+    <div class="a"><h4>销售与市场</h4><p>使用<a href="features_zh-cn.html">功能目录</a>与<a href="benchmarks_zh-cn.html">基准测试</a>做定位。</p></div>
+    <div class="a"><h4>研究者与教授</h4><p>探索<a href="models_zh-cn.html">模型架构</a>与<a href="benchmarks_zh-cn.html#cross-engine">跨引擎矩阵</a>。</p></div>
+  </div>
+
+  <div class="content-footer">
+    <span>欢迎来到 TensorSharp 维基。</span>
+    <a href="overview_zh-cn.html">下一篇：概览与架构 →</a>
+  </div>
+
+</main>
+</body>
+</html>

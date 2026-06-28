@@ -76,7 +76,7 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 
 ## Highlights
 
-- **Competitive with llama.cpp** — a pure-.NET engine that matches or beats the hand-tuned C++ `llama.cpp` on identical GGUF files and the same GPU. On the Gemma 4 26B-A4B MoE it wins decode, prefill, **and** time-to-first-token simultaneously, and multi-turn chat (up to **2.1×** prefill/TTFT), function-call decode (up to **2.07×**), and multimodal latency (image TTFT **3.25×** lower) pull further ahead. → [Head-to-head vs llama.cpp](#head-to-head-vs-llamacpp-engine-comparison)
+- **Faster prefill & time-to-first-token than llama.cpp** — a pure-.NET engine that *out-prefills* the hand-tuned C++ `llama.cpp` on **every** tested model, on identical GGUF files and the same GPU (prefill geomean **1.18×–1.88×**), with decode held at parity. The Gemma 4 26B-A4B MoE leads at **1.88× prefill / 1.69× TTFT**; structured-output (JSON) prefill hits **5.89×** and multi-turn chat lands first tokens **up to 1.93× sooner**. → [Head-to-head vs llama.cpp](#head-to-head-vs-llamacpp-engine-comparison)
 - **Continuous batching & paged KV cache** — vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
 - **MTP / NextN speculative decoding** — multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (NextN block embedded in the trunk GGUF) and Gemma 4 (separate `gemma4-assistant` draft GGUF). The draft proposes several tokens per step and the trunk verifies them in one batched forward, with the request's own sampler driving both. Opt in with `--mtp-spec` (+ `--mtp-draft-model` for Gemma 4). → [Speculative decoding](#mtp--nextn-speculative-decoding)
 - **DiffusionGemma text diffusion** — block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI generation flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
@@ -1175,24 +1175,25 @@ the fused path engages.
 
 ### Head-to-head vs llama.cpp (engine comparison)
 
-A pure-.NET engine going toe-to-toe with the hand-tuned C++ `llama.cpp` on **identical GGUF files, the same NVIDIA RTX 3080 Laptop GPU (16 GB), and one uniform OpenAI `/v1/chat/completions` surface** — across text / image / audio / video / multi-turn / function-call / structured-output scenarios. The numbers below are the **geomean speedup of TensorSharp over llama.cpp on the same GGML CUDA backend** (single-stream, greedy, MTP off). **> 1.0× means TensorSharp is faster** (decode / prefill) or lower-latency (TTFT). The full per-scenario tables are in [`docs/engine_comparison_report.md`](docs/engine_comparison_report.md).
+A pure-.NET engine going toe-to-toe with the hand-tuned C++ `llama.cpp` on **identical GGUF files, the same NVIDIA RTX 3080 Laptop GPU (16 GB), and one uniform OpenAI `/v1/chat/completions` surface** — across text, multi-turn, and structured-output (JSON) scenarios. The numbers below are the **geomean speedup of TensorSharp over llama.cpp on the same GGML CUDA backend** (single-stream, greedy, MTP off). **> 1.0× means TensorSharp is faster** (decode / prefill) or lower-latency (TTFT). The full per-scenario tables are in [`docs/engine_comparison_report.md`](docs/engine_comparison_report.md).
 
 | Model | decode | prefill | TTFT |
 |---|---:|---:|---:|
-| Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, **MoE**) | **1.11×** | **1.32×** | **1.22×** |
-| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | **1.02×** | 0.49× | 0.81× |
-| Gemma 4 E4B it (Q8_0, dense multimodal) | 0.88× | 0.51× | 0.89× |
-| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | 0.62× | 0.62× | 0.60× |
+| Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, **MoE**) | 0.92× | **1.88×** | **1.69×** |
+| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | 0.93× | **1.23×** | **1.10×** |
+| Gemma 4 E4B it (Q8_0, dense multimodal) | 0.95× | **1.21×** | **1.07×** |
+| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | 0.94× | **1.18×** | 0.95× |
 
 Where TensorSharp pulls clearly ahead:
 
-- **The MoE flagship wins on every axis.** On Gemma 4 26B-A4B the persistent captured-CUDA-graph MoE decode plus the verify-based whole-model prefill make TensorSharp faster than llama.cpp at decode **and** prefill **and** time-to-first-token *simultaneously* — a clean sweep, not a tradeoff.
-- **Multi-turn chat — the real chatbot workload.** Content-hashed paged-KV prefix reuse makes follow-up turns land far sooner: prefill / TTFT of **2.08× / 2.14×** on 26B-A4B and **1.66× / 1.70×** on 12B versus llama.cpp.
-- **Function-call decode up to 2.07×** — 170.9 vs 82.7 tok/s on 26B-A4B (and 1.69× / 77.2 vs 45.6 tok/s on 12B).
-- **Multimodal time-to-first-token.** Image TTFT on 26B-A4B is **3.25× lower (3.8 s vs 12.4 s)**, and audio TTFT is **~6× lower** on the dense models (140 ms vs 828 ms on E4B; 203 ms vs 1266 ms on 12B).
-- **Robustness** — TensorSharp completed the 26B-A4B audio scenario that the reference engine errored out on.
+- **Prefill wins on every model.** TensorSharp out-prefills llama.cpp across the board — geomean **1.18× (Qwen 3.6) → 1.88× (26B-A4B MoE)** — on the strength of verify-based whole-model prefill plus fused FFN / attention kernels. Time-to-first-token follows, dropping on three of four models (up to **1.69×** lower on the MoE flagship).
+- **The MoE flagship leads.** On Gemma 4 26B-A4B the persistent captured-CUDA-graph MoE decode plus verify-based whole-model prefill deliver **1.88× prefill / 1.69× TTFT** geomean with decode at parity — wins stacked on top of competitive token generation.
+- **Structured output (JSON mode) is a standout.** Constrained-JSON prefill runs **5.89×** faster on 26B-A4B (354.7 vs 60.2 tok/s) with first token **3.34× sooner** (234 ms vs 781 ms); 12B prefill is **1.89×** and E4B **1.52×**. JSON-mode decode even wins on E4B (**1.10×**) and Qwen 3.6 (**1.07×**).
+- **Multi-turn chat — the real chatbot workload.** Content-hashed paged-KV prefix reuse makes follow-up turns land far sooner: prefill / TTFT of **1.87× / 1.93×** on 26B-A4B and **1.55× / 1.60×** on 12B versus llama.cpp.
+- **Snappy first token on short prompts.** E4B returns a short prompt's first token **1.75× sooner** (125 ms vs 219 ms) and prefills it **1.62×** faster; Qwen 3.6 prefills short prompts **1.59×** faster (123.2 vs 77.4 tok/s).
+- **Qwen 3.6 IQ2_XXS is competitive now.** The aggressively quantized 35B-A3B MoE reaches near-parity decode (0.94×) and a prefill win (1.18×) — recovered from being the weak spot it once was.
 
-Dense-model decode is at parity (≈0.88–1.02×); the IQ2_XXS Qwen 3.6 path and a handful of prefill cells are active optimization targets rather than finished results. Every cell — wins and gaps alike — is in the [full report](docs/engine_comparison_report.md).
+Decode sits at parity across both dense and MoE models (0.92–0.95×), so the prefill, TTFT, and structured-output wins come on top of competitive token generation. The remaining sub-1.0× cells — chiefly long-context dense prefill — are active optimization targets rather than finished results. Every cell, wins and gaps alike, is in the [full report](docs/engine_comparison_report.md).
 
 ### Cross-engine inference matrix
 

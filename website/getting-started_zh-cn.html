@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>快速开始 — TensorSharp 维基</title>
+  <meta name="description" content="安装环境依赖、构建 TensorSharp、下载 GGUF 模型，并在 CLI 或服务器上运行你的第一次推理。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="getting-started">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 快速开始</div>
+  <h1>快速开始</h1>
+  <p class="lede">从一台空机器到流式回复。原生 GGML 库会在首次构建时自动编译，因此唯一需要手动安装的是 .NET SDK（如需加速，再加上 GPU 工具链）。</p>
+
+  <h2 id="prerequisites">1 · 环境要求</h2>
+  <ul>
+    <li><a href="https://dotnet.microsoft.com/download/dotnet/10.0" target="_blank" rel="noopener"><strong>.NET 10 SDK</strong></a> —— 必需。</li>
+    <li><strong><code>git</code> + 网络访问</strong> —— 首次构建时，原生构建会把 ggml 源码从 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">github.com/ggml-org/ggml</a> 克隆到 <code>ExternalProjects/ggml/</code>。设置 <code>TENSORSHARP_GGML_NO_UPDATE=1</code> 可在离线重建时跳过网络更新。</li>
+    <li><strong>一个 GGUF 模型文件</strong> —— 例如来自 <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>。见<a href="models_zh-cn.html#downloads">模型下载</a>。</li>
+  </ul>
+  <h4>各平台工具链（仅 GPU 加速需要）</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>平台</th><th>用于</th><th>安装</th></tr></thead>
+    <tbody>
+      <tr><td><strong>macOS</strong>（Metal）</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ 与 Xcode 命令行工具。MLX 还会额外构建 <code>libmlxc</code>。</td></tr>
+      <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、Visual Studio 2022 C++ 构建工具、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
+      <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
+      <tr><td>任意（仅 CPU）</td><td><code>cpu</code> / <code>ggml_cpu</code></td><td>除 .NET SDK 外无需任何东西。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="build">2 · 构建</h2>
+  <p>克隆并构建整个解决方案。首次构建还会编译原生 GGML 桥接（可能需要一段时间，尤其是 CUDA —— 后续构建很快）。</p>
+  <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
+cd TensorSharp
+dotnet build TensorSharp.slnx -c Release</code></pre>
+  <p>或只构建其中一个应用：</p>
+  <pre data-lang="bash"><code># 控制台应用
+dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
+
+# Web 应用
+dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre>
+  <p>CLI 二进制位于 <code>TensorSharp.Cli/bin/...</code>，服务器位于 <code>TensorSharp.Server/bin/...</code>。如需启用 CUDA 的原生构建、手动原生构建或 MLX，见<a href="backends_zh-cn.html#native-build">构建原生库</a>。</p>
+  <div class="callout tip"><div class="ic">📦</div><p>不想从源码构建？<strong>Release Binaries</strong> 工作流会发布自包含归档（Windows/Linux CPU 与 CUDA、macOS arm64），其中已捆绑 .NET 10 运行时与原生库 —— 无需另行安装即可运行。见<a href="backends_zh-cn.html#native-build">后端</a>。</p></div>
+
+  <h2 id="download">3 · 下载模型</h2>
+  <p>TensorSharp 加载 <a href="glossary_zh-cn.html#terms">GGUF</a> 格式的模型。一个轻量、经过充分测试的起点是 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> 中的 <strong>Gemma-4-E4B (Q8_0)</strong>。选择适合你硬件的量化 —— 低内存用 <code>Q4_K_M</code>，更高质量用 <code>Q8_0</code>。完整列表见<a href="models_zh-cn.html#downloads">模型</a>页。</p>
+  <div class="callout note"><div class="ic">🧩</div><p>对于多模态模型，还需下载匹配的<strong>投影器</strong>（mmproj）文件。如果把它放在模型旁并使用可识别的名称（如 <code>gemma-4-mmproj-F16.gguf</code>），会被自动检测。</p></div>
+
+  <h2 id="first-run">4 · 首次运行</h2>
+  <p>根据你的硬件选择 <a href="backends_zh-cn.html#table"><code>--backend</code></a>。每个后端都产生正确输出；它们只在速度上不同。</p>
+
+  <h3>方式 A —— 一次性生成（CLI）</h3>
+  <pre data-lang="bash"><code>echo "用一句话解释专家混合（MoE）。" > prompt.txt
+
+# macOS（Apple Silicon）
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_metal
+
+# Windows / Linux + NVIDIA
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda
+
+# 可移植 / 调试（无 GPU）
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu</code></pre>
+
+  <h3>方式 B —— 交互式聊天（REPL）</h3>
+  <pre data-lang="bash"><code>./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf -i --backend ggml_metal</code></pre>
+  <p>逐轮输入消息；用 <a href="cli_zh-cn.html#repl">斜杠命令</a>（如 <code>/reset</code>、<code>/think on</code> 或 <code>/image photo.png</code>）控制会话。</p>
+
+  <h3>方式 C —— 浏览器 UI + HTTP API（服务器）</h3>
+  <pre data-lang="bash"><code>./TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
+# 打开 http://localhost:5000</code></pre>
+  <p>它在同一端口上同时提供聊天 UI <em>与</em><a href="http-api_zh-cn.html">兼容 Ollama 和 OpenAI</a> 的端点。</p>
+
+  <h2 id="next">下一步去哪</h2>
+  <div class="card-grid">
+    <a class="card" href="backends_zh-cn.html"><div class="ic">🖥️</div><h3>选择后端</h3><p>把 <code>--backend</code> 匹配到你的硬件。</p></a>
+    <a class="card" href="cli_zh-cn.html"><div class="ic">⌨️</div><h3>CLI 参考</h3><p>所有参数、REPL 与批处理工作流。</p></a>
+    <a class="card" href="http-api_zh-cn.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>用 curl、Python 或 SDK 调用服务器。</p></a>
+    <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>支持哪些模型，以及在哪里下载。</p></a>
+  </div>
+
+  <div class="content-footer">
+    <a href="features_zh-cn.html">← 功能特性</a>
+    <a href="backends_zh-cn.html">下一篇：计算后端 →</a>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>术语表与 FAQ — TensorSharp 维基</title>
+  <meta name="description" content="大模型与 TensorSharp 术语的通俗定义，外加面向初学者与决策者的常见问题解答。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="glossary">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 术语表与 FAQ</div>
+  <h1>术语表与 FAQ</h1>
+  <p class="lede">初识本地大模型？从这里开始。先是本维基所用术语的通俗定义，随后是大家最常问的问题。</p>
+
+  <h2 id="terms">术语表</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>术语</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LLM</strong>（大语言模型）</td><td>一种被训练来预测文本的神经网络。你给它一个提示词；它产生续写。</td></tr>
+      <tr><td><strong>推理（Inference）</strong></td><td>运行一个已训练的模型来得到答案（与<em>训练</em>相对，训练是创建模型）。TensorSharp 是一个推理引擎。</td></tr>
+      <tr><td><strong>GGUF</strong></td><td>一种把模型权重与元数据打包在一起的单文件模型格式。TensorSharp 加载 GGUF 文件，通常从 Hugging Face 下载。</td></tr>
+      <tr><td><strong>量化（Quantization）</strong></td><td>把模型权重压缩到更少位数（如 <code>Q4_K_M</code> ≈ 4 位，<code>Q8_0</code> ≈ 8 位），让模型占用更少内存、运行更快，代价是少量质量损失。</td></tr>
+      <tr><td><strong>Token</strong></td><td>模型读写的单位 —— 大致是一个词片。“每秒 token 数”衡量速度；“上下文长度”是一次能容纳多少 token。</td></tr>
+      <tr><td><strong>分词器（Tokenizer）</strong></td><td>在文本与 token 之间互转。TensorSharp 自带 SentencePiece 与 BPE 分词器。</td></tr>
+      <tr><td><strong>Prefill vs decode</strong></td><td><em>Prefill</em> 一次性处理你的整个提示词；<em>decode</em> 逐 token 生成回复。两者性能特征不同。</td></tr>
+      <tr><td><strong>KV 缓存</strong></td><td>存储较早 token 的注意力“键与值”，使模型不必重算。它让长上下文与多轮对话更高效。→ <a href="advanced_zh-cn.html#paged-kv">分页 KV</a></td></tr>
+      <tr><td><strong>TTFT</strong></td><td>“首 token 时间” —— 答案开始流式输出前需多久。KV 缓存复用会在后续轮次降低它。</td></tr>
+      <tr><td><strong>后端（Backend）</strong></td><td>运行数学运算的硬件路径：CPU、NVIDIA GPU（CUDA）或 Apple Silicon GPU（Metal/MLX）。→ <a href="backends_zh-cn.html">后端</a></td></tr>
+      <tr><td><strong>MoE</strong>（专家混合）</td><td>一种把每个 token 路由到少数几个专门子网络（“专家”）而非整张网络的模型，以更低的每 token 计算获得更大容量。</td></tr>
+      <tr><td><strong>多模态（Multimodal）</strong></td><td>能接收文本以外的输入 —— 图像、音频或视频。→ <a href="models_zh-cn.html#multimodal">多模态</a></td></tr>
+      <tr><td><strong>思考 / 推理</strong></td><td>模型在最终答案前产生隐藏的逐步推理；TensorSharp 将两者分离。→ <a href="models_zh-cn.html#thinking">思考模式</a></td></tr>
+      <tr><td><strong>工具 / 函数调用</strong></td><td>模型可请求你的应用运行一个函数（如 “get_weather”）并使用结果。→ <a href="models_zh-cn.html#toolcalling">工具调用</a></td></tr>
+      <tr><td><strong>连续批处理</strong></td><td>在单个托管模型上交错运行多个用户的请求，从而同时服务多人，而非一次一个。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></td></tr>
+      <tr><td><strong>推测解码</strong></td><td>一个小“草稿”头猜测若干 token；主模型一次性验证它们 —— 输出更快、结果一致。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
+      <tr><td><strong>投影器（mmproj）</strong></td><td>一个配套文件，让多模态模型能理解图像/音频。把它放在模型旁，或传入 <code>--mmproj</code>。</td></tr>
+      <tr><td><strong>采样（Sampling）</strong></td><td>如何从模型的概率中选取下一个 token。<em>温度</em>、<em>top-p</em> 与 <em>top-k</em> 控制创造性与确定性的平衡。→ <a href="http-api_zh-cn.html#sampling">采样</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="faq">常见问题</h2>
+
+  <h3>我需要 GPU 吗？</h3>
+  <p>不需要。TensorSharp 可在普通 CPU 上运行（<code>--backend cpu</code> 或更快的 <code>ggml_cpu</code>）。GPU —— NVIDIA（CUDA）或 Apple Silicon（Metal/MLX）—— 会让生成显著更快，尤其是更大的模型。见<a href="backends_zh-cn.html">后端</a>。</p>
+
+  <h3>我该从哪个模型开始？</h3>
+  <p><strong>Gemma-4-E4B (Q8_0)</strong> 是一个轻量、经过充分测试的起点。要更低内存，选 <code>Q4_K_M</code> 量化；要更高质量，选更大的模型或 <code>Q8_0</code>。见<a href="models_zh-cn.html#downloads">模型下载</a>。</p>
+
+  <h3>我的数据私密吗？</h3>
+  <p>是的 —— 推理完全在你的机器上进行。提示词、文档与图像不会发送到任何外部服务。这正是各组织选择本地推理的主要原因。见<a href="overview_zh-cn.html#business">商业价值</a>。</p>
+
+  <h3>我能继续用现有的 OpenAI / Ollama 代码吗？</h3>
+  <p>可以。服务器同时支持两种线格式。把 OpenAI 客户端指向 <code>http://localhost:5000/v1</code>（任意 API key），或把 Ollama 客户端指向 <code>http://localhost:5000/api/…</code>。见 <a href="http-api_zh-cn.html">HTTP API</a>。</p>
+
+  <h3>我如何同时服务多个用户？</h3>
+  <p>运行 <a href="server_zh-cn.html">TensorSharp.Server</a>。它的连续批处理引擎将并发请求交错运行于一个托管模型之上，并在它们之间共享公共提示前缀，从而保持高吞吐。见<a href="advanced_zh-cn.html#continuous-batching">连续批处理</a>。</p>
+
+  <h3>我如何让它更快？</h3>
+  <ul>
+    <li>使用 GPU 后端（<code>ggml_cuda</code> 或 <code>ggml_metal</code>）。</li>
+    <li>选更小或量化更激进的模型。</li>
+    <li>在受支持的模型上，用 <code>--mtp-spec</code> 启用<a href="advanced_zh-cn.html#mtp">推测解码</a>。</li>
+    <li>复用会话，让 <a href="advanced_zh-cn.html#continuous-batching">KV 缓存前缀</a>在轮次间延续。</li>
+  </ul>
+
+  <h3>成本如何？</h3>
+  <p>没有按 token 计费 —— 你在自己掌控的硬件上运行开放模型。成本是硬件以及运行它的电费。见<a href="overview_zh-cn.html#business">商业价值</a>。</p>
+
+  <h3>支持哪些平台？</h3>
+  <p>Windows、Linux 与 macOS（Apple Silicon），基于 .NET 10。已为 Windows/Linux（CPU 与 CUDA）与 macOS arm64 发布预构建的自包含二进制。见<a href="getting-started_zh-cn.html">快速开始</a>与<a href="backends_zh-cn.html#binaries">平台二进制</a>。</p>
+
+  <h3>它的许可证是什么？</h3>
+  <p>TensorSharp 由 Zhongkai Fu 编写，并按仓库 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/LICENSE" target="_blank" rel="noopener">LICENSE</a> 文件中的许可证（BSD-3-Clause）分发。你下载的每个模型都有其发布者各自的独立许可证 —— 请查看 Hugging Face 上的模型卡。</p>
+
+  <h3>我在哪里反馈问题或贡献？</h3>
+  <p>在 <a href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub 仓库</a>。</p>
+
+  <div class="content-footer">
+    <a href="api-reference_zh-cn.html">← API 参考</a>
+    <a href="index_zh-cn.html">返回首页 →</a>
+  </div>
+</main>
+</body>
+</html>

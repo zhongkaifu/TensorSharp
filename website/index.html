@@ -95,7 +95,7 @@ dotnet build TensorSharp.slnx -c Release</code></pre>
     <div class="card"><div class="ic">🖥️</div><h3>Runs anywhere</h3><p>NVIDIA (CUDA), Apple Silicon (Metal/MLX), or pure CPU — with automatic fallbacks.</p></div>
     <div class="card"><div class="ic">🧠</div><h3>Modern model support</h3><p>Gemma, Qwen, GPT-OSS, Nemotron-H, Mistral, plus vision, audio, reasoning &amp; tools.</p></div>
     <div class="card"><div class="ic">⚙️</div><h3>Built in .NET</h3><p>A native C# engine you can embed in your apps, not just a black-box binary.</p></div>
-    <a class="card" href="benchmarks.html#head-to-head"><div class="ic">🏁</div><h3>Benchmarked vs llama.cpp</h3><p>On identical GGUF files and the same GPU it matches or beats the C++ engine — the Gemma 4 26B-A4B MoE wins decode, prefill &amp; TTFT at once.</p></a>
+    <a class="card" href="benchmarks.html#head-to-head"><div class="ic">🏁</div><h3>Benchmarked vs llama.cpp</h3><p>On identical GGUF files and the same GPU it out-prefills the C++ engine on every model (geomean 1.18×–1.88×) — the Gemma 4 26B-A4B MoE leads at 1.88× prefill / 1.69× TTFT.</p></a>
   </div>
 
   <h2 id="audience">Who is this for?</h2>

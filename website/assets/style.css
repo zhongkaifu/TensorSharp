@@ -98,6 +98,8 @@ kbd {
 }
 .icon-btn:hover { border-color: var(--border-strong); color: var(--text); }
 .icon-btn svg { width: 18px; height: 18px; }
+.lang-btn { width: auto; min-width: 38px; padding: 0 10px; font-size: .82rem; font-weight: 600; letter-spacing: .02em; text-decoration: none; }
+.lang-btn:hover { text-decoration: none; }
 #menu-toggle { display: none; }
 
 /* ---------- Layout ---------- */

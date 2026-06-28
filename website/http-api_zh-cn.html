@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP API (Ollama / OpenAI) — TensorSharp 维基</title>
+  <meta name="description" content="通过 HTTP 调用 TensorSharp.Server：兼容 Ollama 与 OpenAI 的端点、Web UI SSE 协议、采样、工具、结构化输出与 Python 客户端。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="http-api">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › HTTP API</div>
+  <h1>HTTP API (Ollama / OpenAI)</h1>
+  <p class="lede"><code>TensorSharp.Server</code> 暴露三种 API 风格以及若干工具端点，全部在 <code>http://localhost:5000</code> 上。现有 Ollama 与 OpenAI 客户端无需改动即可使用 —— 只要把它们指向本地基址。</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>风格</th><th>端点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>兼容 Ollama</strong></td><td><code>/api/generate</code>、<code>/api/chat/ollama</code>、<code>/api/tags</code>、<code>/api/show</code></td></tr>
+      <tr><td><strong>兼容 OpenAI</strong></td><td><code>/v1/chat/completions</code>、<code>/v1/models</code></td></tr>
+      <tr><td><strong>Web UI (SSE)</strong></td><td><code>/api/chat</code>、<code>/api/sessions</code>、<code>/api/models</code>、<code>/api/upload</code></td></tr>
+      <tr><td><strong>工具端点</strong></td><td><code>/api/version</code>、<code>/api/queue/status</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout note"><div class="ic">📌</div><p>请求必须指明托管的 GGUF 文件（或其基名）。服务器托管由 <code>--model</code> 选定的一个模型；见<a href="server_zh-cn.html">服务器与 Web UI</a>。</p></div>
+
+  <h2 id="ollama">1 · 兼容 Ollama 的 API</h2>
+
+  <h3>列出与查看模型</h3>
+  <pre data-lang="bash"><code>curl http://localhost:5000/api/tags
+
+curl -X POST http://localhost:5000/api/show \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen3-4B-Q8_0.gguf"}'</code></pre>
+
+  <h3>生成（非流式）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "prompt": "What is 1+1?",
+    "stream": false,
+    "options": { "num_predict": 50, "temperature": 0.7, "top_p": 0.9 }
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "model": "Qwen3-4B-Q8_0.gguf",
+  "response": "1+1 equals 2.",
+  "done": true,
+  "done_reason": "stop",
+  "prompt_eval_count": 15,
+  "eval_count": 10,
+  "prompt_cache_hit_tokens": 0,
+  "prompt_cache_hit_ratio": 0.0
+}</code></pre>
+  <p><code>prompt_cache_hit_tokens</code> 报告有多少提示 token 直接由上一轮的 KV 缓存提供。<code>/api/generate</code> 总会重置会话，因此它始终为 <code>0</code>；当提示前缀与之前某轮匹配时，<code>/api/chat/ollama</code> 上它会非零。</p>
+
+  <h3>生成（流式）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-4B-Q8_0.gguf", "prompt": "Tell me a joke.", "stream": true, "options": {"num_predict": 100} }'</code></pre>
+  <p>每行是一个 JSON 对象（换行分隔的 JSON）；最后的 <code>"done": true</code> 块携带计时与缓存字段。</p>
+
+  <h3>聊天（多轮）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "stream": false,
+    "options": {"num_predict": 100}
+  }'</code></pre>
+
+  <h3>带图像生成（多模态）</h3>
+  <p>图像以 base64 编码字节放在 <code>images</code> 数组中发送：</p>
+  <pre data-lang="bash"><code>IMG_B64=$(base64 < photo.png)
+curl -X POST http://localhost:5000/api/generate \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemma-4-E4B-it-Q8_0.gguf\",
+    \"prompt\": \"What is in this image?\",
+    \"images\": [\"$IMG_B64\"],
+    \"stream\": false,
+    \"options\": {\"num_predict\": 200}
+  }"</code></pre>
+
+  <h3>带思考模式的聊天</h3>
+  <p>具备思考能力的模型接受 <code>"think": true</code>，并把思维链拆分到 <code>message.thinking</code>：</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/api/chat/ollama \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Solve 17 * 23 step by step."}],
+    "think": true, "stream": false, "options": {"num_predict": 200}
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "message": {
+    "role": "assistant",
+    "content": "17 * 23 = 391.",
+    "thinking": "17 * 20 = 340. 17 * 3 = 51. 340 + 51 = 391."
+  },
+  "done": true, "done_reason": "stop"
+}</code></pre>
+
+  <h2 id="openai">2 · 兼容 OpenAI 的 API</h2>
+
+  <h3>Chat Completions（非流式）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is 2+3?"}
+    ],
+    "max_tokens": 50, "temperature": 0.7
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "id": "chatcmpl-abc123...",
+  "object": "chat.completion",
+  "model": "Qwen3-4B-Q8_0.gguf",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "2 + 3 = 5."},
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28,
+    "prompt_tokens_details": { "cached_tokens": 0 }
+  }
+}</code></pre>
+  <p><code>usage.prompt_tokens_details.cached_tokens</code> 遵循 OpenAI 的 KV 缓存命中扩展 —— 在共享前缀的后续轮次中它会逼近 <code>prompt_tokens</code>。</p>
+
+  <h3>Chat Completions（流式）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "Qwen3-4B-Q8_0.gguf", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50, "stream": true }'</code></pre>
+  <p>每个块是一个 <code>object: "chat.completion.chunk"</code> 的 SSE <code>data:</code> 帧；流以 <code>data: [DONE]</code> 结束。</p>
+
+  <h3>图像输入（OpenAI 格式）</h3>
+  <pre data-lang="bash"><code>IMG_B64=$(base64 < photo.png)
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemma-4-E4B-it-Q8_0.gguf\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"What is in this image?\"},
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$IMG_B64\"}}
+      ]
+    }],
+    \"max_tokens\": 200
+  }"</code></pre>
+
+  <h2 id="tools">3 · 通过 HTTP 进行工具调用</h2>
+  <p>发送一个 <code>tools</code> 数组；服务器会检测该架构的线格式并返回结构化的 <code>tool_calls</code>。</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city":  {"type": "string"},
+            "units": {"type": "string", "enum": ["c", "f"]}
+          },
+          "required": ["city"]
+        }
+      }
+    }],
+    "max_tokens": 200
+  }'</code></pre>
+  <pre data-lang="json"><code>{
+  "choices": [{
+    "message": {
+      "role": "assistant", "content": null,
+      "tool_calls": [{
+        "id": "call_abc123", "type": "function",
+        "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\",\"units\":\"c\"}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}</code></pre>
+  <p>续接循环：把助手的 <code>tool_calls</code> 与一条携带函数结果的 <code>{"role": "tool", "tool_call_id": "...", "content": "..."}</code> 消息追加进去，再次调用该端点。（Ollama 端点使用同样的流程，配以一条 <code>role: "tool"</code> 消息。）</p>
+
+  <h2 id="structured">4 · 结构化输出（JSON schema）</h2>
+  <p>OpenAI 的 <code>response_format</code> 接受 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。服务器会注入严格的 JSON 指令，并在返回前校验输出。</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "messages": [
+      {"role": "system", "content": "You are a concise extraction assistant."},
+      {"role": "user", "content": "Extract the city and country from: Paris, France."}
+    ],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "location_extraction", "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "country": { "type": "string" },
+            "confidence": { "type": ["string", "null"] }
+          },
+          "required": ["city", "country", "confidence"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 120
+  }'</code></pre>
+  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与 <code>tools</code> 或 <code>think</code> 同时使用。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
+
+  <h2 id="webui-sse">5 · Web UI SSE 协议（<code>/api/chat</code>）</h2>
+  <p>这是内置聊天 UI 所用的协议；外部 UI 也可接入同一端点。每个事件都是一个 JSON 对象，以单个 <code>data: …</code> SSE 帧传递。</p>
+  <pre data-lang="bash"><code># 创建 / 销毁会话（仅 Web UI 流程）
+curl -X POST http://localhost:5000/api/sessions          # {"sessionId":"a3b1c2..."}
+curl -X DELETE http://localhost:5000/api/sessions/a3b1c2...
+
+# 流式聊天
+curl -N -X POST http://localhost:5000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{ "messages": [{"role": "user", "content": "Hi"}], "maxTokens": 50, "sessionId": null, "newChat": false, "think": false, "tools": [] }'</code></pre>
+  <p>复用相同的 <code>sessionId</code> 会在下一轮把之前的助手 token 拼接进 KV 缓存前缀。终止帧会报告复用情况：</p>
+  <pre data-lang="text"><code>data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}</code></pre>
+  <p>事件字段包括 <code>token</code>（内容）、<code>thinking</code>（推理块）、<code>tool_calls</code>、<code>replace</code>/<code>diffusionStep</code>（DiffusionGemma 预览）以及终止的 <code>done</code> 摘要。</p>
+
+  <h2 id="sampling">6 · 采样参数</h2>
+  <h4>Ollama 风格（在 <code>options</code> 对象内）</h4>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>参数</th><th>类型</th><th>默认</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_predict</code></td><td>int</td><td>200</td><td>最大生成 token 数</td></tr>
+      <tr><td><code>temperature</code></td><td>float</td><td>0</td><td>采样温度（0 = 贪心）</td></tr>
+      <tr><td><code>top_k</code></td><td>int</td><td>0</td><td>Top-K 过滤（0 = 禁用）</td></tr>
+      <tr><td><code>top_p</code></td><td>float</td><td>1.0</td><td>核采样阈值</td></tr>
+      <tr><td><code>min_p</code></td><td>float</td><td>0</td><td>最小概率过滤</td></tr>
+      <tr><td><code>repeat_penalty</code></td><td>float</td><td>1.0</td><td>重复惩罚</td></tr>
+      <tr><td><code>presence_penalty</code> / <code>frequency_penalty</code></td><td>float</td><td>0</td><td>存在 / 频率惩罚</td></tr>
+      <tr><td><code>seed</code></td><td>int</td><td>-1</td><td>随机种子（-1 = 随机）</td></tr>
+      <tr><td><code>stop</code></td><td>array</td><td>null</td><td>停止序列</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h4>OpenAI 风格（顶层）</h4>
+  <p><code>max_tokens</code>、<code>temperature</code>、<code>top_p</code>、<code>presence_penalty</code>、<code>frequency_penalty</code>、<code>seed</code>、<code>stop</code>，以及 <code>response_format</code>（<code>text</code> / <code>json_object</code> / <code>json_schema</code>）。</p>
+
+  <h2 id="python">7 · Python 客户端示例</h2>
+  <h4>使用 <code>requests</code>（Ollama 风格）</h4>
+  <pre data-lang="python"><code>import requests
+
+resp = requests.post("http://localhost:5000/api/generate", json={
+    "model": "Qwen3-4B-Q8_0.gguf",
+    "prompt": "What is machine learning?",
+    "stream": False,
+    "options": {"num_predict": 100, "temperature": 0.7}
+})
+print(resp.json()["response"])</code></pre>
+
+  <h4>使用 <code>openai</code> SDK</h4>
+  <pre data-lang="python"><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="Qwen3-4B-Q8_0.gguf",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+3?"}
+    ],
+    max_tokens=50, temperature=0.7
+)
+print(response.choices[0].message.content)</code></pre>
+
+  <h4>用 <code>openai</code> SDK 做流式</h4>
+  <pre data-lang="python"><code>stream = client.chat.completions.create(
+    model="Qwen3-4B-Q8_0.gguf",
+    messages=[{"role": "user", "content": "Tell me about Python."}],
+    max_tokens=200, stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()</code></pre>
+
+  <div class="content-footer">
+    <a href="server_zh-cn.html">← 服务器与 Web UI</a>
+    <a href="code-api_zh-cn.html">下一篇：C# 库 →</a>
+  </div>
+</main>
+</body>
+</html>

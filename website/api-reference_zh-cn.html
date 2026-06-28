@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API 参考 — TensorSharp 维基</title>
+  <meta name="description" content="可搜索的参考：CLI 参数、服务器参数、环境变量、HTTP 端点、采样参数、C# 公共 API 与 REPL 命令。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <style>
+    .ref-filter { position: sticky; top: calc(var(--topbar-h) + 0px); z-index: 10; background: var(--bg);
+      padding: 10px 0 14px; margin-bottom: 6px; }
+    .ref-filter input { width: 100%; padding: 11px 14px; border: 1px solid var(--border-strong);
+      border-radius: 9px; font-size: .95rem; background: var(--surface); color: var(--text); }
+    .ref-filter .hint { font-size: .78rem; color: var(--text-muted); margin-top: 6px; }
+    tr.ref-hide { display: none; }
+    .ref-section.ref-empty { display: none; }
+    .ref-count { font-size: .8rem; color: var(--text-muted); }
+  </style>
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="api-reference">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › API 参考</div>
+  <h1>API 参考</h1>
+  <p class="lede">所有参数、变量、端点与公共类型集于一处。在输入框中键入即可即时过滤下方全部表格 —— 或按 <kbd>/</kbd> 进行全站搜索。</p>
+
+  <div class="ref-filter">
+    <input type="text" id="ref-input" placeholder="过滤参考 —— 例如 temperature、mtp、/v1、BackendType、ggml_cuda…" autocomplete="off" spellcheck="false" aria-label="过滤参考">
+    <div class="hint"><span class="ref-count" id="ref-count"></span> · 匹配的行会在所有区块中实时高亮。</div>
+  </div>
+
+  <h2 id="cli-flags">CLI 参数 —— <code>TensorSharp.Cli</code></h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>参数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF 模型文件路径（必需）。</td></tr>
+      <tr><td><code>--input &lt;path&gt;</code></td><td>包含用户提示词的文本文件。</td></tr>
+      <tr><td><code>--input-jsonl &lt;path&gt;</code></td><td>含批量请求的 JSONL 文件（每行一个 JSON）。</td></tr>
+      <tr><td><code>--multi-turn-jsonl &lt;path&gt;</code></td><td>带 KV 缓存复用的多轮对话模拟 JSONL。</td></tr>
+      <tr><td><code>--output &lt;path&gt;</code></td><td>将生成文本写入此文件。</td></tr>
+      <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>用于视觉 / 视频 / 音频推理的媒体。</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF（放在模型旁则自动检测）。</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认 100）。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>。</td></tr>
+      <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL。</td></tr>
+      <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>设定系统提示。</td></tr>
+      <tr><td><code>--think</code></td><td>启用思考 / 推理模式。</td></tr>
+      <tr><td><code>--tools &lt;path&gt;</code></td><td>含工具 / 函数定义的 JSON 文件。</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>采样控制。</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty</code></td><td>惩罚（1.0 / 0 = 关闭）。</td></tr>
+      <tr><td><code>--seed &lt;N&gt;</code> / <code>--stop &lt;string&gt;</code></td><td>随机种子（-1 = 随机） / 停止序列（可重复）。</td></tr>
+      <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出。</td></tr>
+      <tr><td><code>--diffusion-steps / --diffusion-seed / --diffusion-blocks &lt;N&gt;</code></td><td>DiffusionGemma 生成控制。</td></tr>
+      <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>合成吞吐基准。</td></tr>
+      <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>
+      <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>计时前丢弃的前向次数（默认 0）。</td></tr>
+      <tr><td><code>--test / --test-templates &lt;dir&gt;</code></td><td>内置分词器/模板测试；对照 GGUF Jinja2 校验模板。</td></tr>
+      <tr><td><code>--log-level / --log-dir / --log-file / --log-console</code></td><td>日志级别、目录，以及文件/控制台开关。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="server-flags">服务器参数 —— <code>TensorSharp.Server</code></h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>参数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>--model &lt;path&gt;</code></td><td>要托管的 GGUF 文件（推理必需）。</td></tr>
+      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF；<code>none</code> 可禁用。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>默认计算后端。</td></tr>
+      <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>请求未指定时的默认生成上限（默认 20000）。</td></tr>
+      <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>默认采样值。</td></tr>
+      <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>默认惩罚与随机种子。</td></tr>
+      <tr><td><code>--stop &lt;string&gt;</code></td><td>默认停止序列（可重复）；逐请求会替换该列表。</td></tr>
+      <tr><td><code>--continuous-batching / --no-continuous-batching</code></td><td>启用（默认） / 禁用迭代级分页批处理。别名 <code>--paged-batching</code>。</td></tr>
+      <tr><td><code>--mtp-spec / --no-mtp-spec</code></td><td>启用 / 禁用 NextN/MTP 推测解码（默认关闭）。</td></tr>
+      <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>每个推测步草拟的最大 token 数（默认 8）。</td></tr>
+      <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>保留某 token 所需的草稿头最低置信度（默认 0.75）。</td></tr>
+      <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>独立的 MTP 草稿 GGUF（Gemma 4 <code>gemma4-assistant</code>）。</td></tr>
+      <tr><td><code>--paged-kv* / --paged-kv-quant-bits</code></td><td>遗留的独立分页 KV 参数（KV 状态现由引擎管理）。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="env-vars">环境变量</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>变量</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>BACKEND</code></td><td>默认后端（macOS 上为 <code>ggml_metal</code>，其他平台为 <code>ggml_cpu</code>）。</td></tr>
+      <tr><td><code>MAX_TOKENS</code></td><td>默认最大生成长度（20000）。</td></tr>
+      <tr><td><code>MAX_TEXT_FILE_CHARS</code></td><td>纯文本上传的字符上限（8000）。</td></tr>
+      <tr><td><code>VIDEO_SAMPLE_FPS / VIDEO_MAX_FRAMES</code></td><td>视频抽帧速率 / 上限。</td></tr>
+      <tr><td><code>TENSORSHARP_TEMPERATURE / _TOP_K / _TOP_P / _MIN_P</code></td><td>默认采样值。</td></tr>
+      <tr><td><code>TENSORSHARP_REPEAT_PENALTY / _PRESENCE_PENALTY / _FREQUENCY_PENALTY / _SEED</code></td><td>默认惩罚与随机种子。</td></tr>
+      <tr><td><code>TENSORSHARP_LOG_LEVEL / _LOG_DIR / _LOG_FILE</code></td><td>日志级别、目录、文件开关（CLI + 服务器）。</td></tr>
+      <tr><td><code>DIFFUSION_STEPS / DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma 每块步数 / 最大批处理请求数。</td></tr>
+      <tr><td><code>TS_SCHED_DISABLE_BATCHED</code></td><td><code>1</code> 强制逐序列 KV 交换（= <code>--no-continuous-batching</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>每步 token 预算（4096）。</td></tr>
+      <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>最大在飞序列数（16）。</td></tr>
+      <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>每步最大 prefill token 数（1024）。</td></tr>
+      <tr><td><code>TS_SCHED_NUM_BLOCKS / TS_SCHED_BLOCK_SIZE</code></td><td>引擎块池大小（256） / 每块 token 数（256）。</td></tr>
+      <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用块哈希前缀共享。</td></tr>
+      <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED</code></td><td><code>0</code> 强制某家族走逐序列路径（如 <code>TS_GEMMA4_BATCHED</code>、<code>TS_QWEN35_BATCHED</code>）。</td></tr>
+      <tr><td><code>TS_MTP_SPEC / TS_MTP_DRAFT / TS_MTP_PMIN / TS_MTP_DRAFT_MODEL</code></td><td>MTP 推测解码旋钮（对应 <code>--mtp-*</code> 参数）。</td></tr>
+      <tr><td><code>TS_GMTP_NO_FUSED / TS_GMTP_NO_FAST_ROLLBACK / TS_GMTP_BATCHED_TRUNK</code></td><td>Gemma 4 MTP 草稿路径 A/B 开关。</td></tr>
+      <tr><td><code>TS_MLX_* </code></td><td>MLX 后端调参：流水线 decode、mlock GGUF、融合 KV 写、批量 MoE decode、内存上限。</td></tr>
+      <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>覆盖 <code>libmlxc</code> 的搜索路径。</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>在原生构建时跳过 / 固定 ggml 源码克隆。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="endpoints">HTTP 端点</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>方法与路径</th><th>风格</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/generate</code></td><td>Ollama</td><td>单提示补全（流式或非流式）。</td></tr>
+      <tr><td><code>POST /api/chat/ollama</code></td><td>Ollama</td><td>多轮对话，可选 think / tools / images。</td></tr>
+      <tr><td><code>GET /api/tags</code></td><td>Ollama</td><td>列出托管模型。</td></tr>
+      <tr><td><code>POST /api/show</code></td><td>Ollama</td><td>模型信息。</td></tr>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI</td><td>Chat Completions（流式、工具、response_format）。</td></tr>
+      <tr><td><code>GET /v1/models</code></td><td>OpenAI</td><td>列出模型。</td></tr>
+      <tr><td><code>POST /api/chat</code></td><td>Web UI</td><td>带会话 + KV 复用字段的 SSE 聊天流。</td></tr>
+      <tr><td><code>POST /api/sessions</code> · <code>DELETE /api/sessions/{id}</code></td><td>Web UI</td><td>创建 / 销毁每标签页会话。</td></tr>
+      <tr><td><code>POST /api/upload</code></td><td>Web UI</td><td>上传图像 / 音频 / 视频 / 文本文件。</td></tr>
+      <tr><td><code>GET /api/models</code></td><td>Web UI</td><td>托管模型、支持的后端、默认值。</td></tr>
+      <tr><td><code>POST /api/models/load</code></td><td>Web UI</td><td>重新加载托管模型。</td></tr>
+      <tr><td><code>GET /api/version</code> · <code>GET /api/queue/status</code></td><td>工具</td><td>服务器版本 / 遗留队列快照。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="sampling-params">采样参数</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>Ollama（<code>options</code>）</th><th>OpenAI（顶层）</th><th>默认</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_predict</code></td><td><code>max_tokens</code></td><td>200</td><td>最大生成 token 数。</td></tr>
+      <tr><td><code>temperature</code></td><td><code>temperature</code></td><td>0</td><td>采样温度（0 = 贪心）。</td></tr>
+      <tr><td><code>top_k</code></td><td>—</td><td>0</td><td>Top-K 过滤（0 = 禁用）。</td></tr>
+      <tr><td><code>top_p</code></td><td><code>top_p</code></td><td>1.0</td><td>核采样阈值。</td></tr>
+      <tr><td><code>min_p</code></td><td>—</td><td>0</td><td>最小概率过滤。</td></tr>
+      <tr><td><code>repeat_penalty</code></td><td>—</td><td>1.0</td><td>重复惩罚。</td></tr>
+      <tr><td><code>presence_penalty / frequency_penalty</code></td><td><code>presence_penalty / frequency_penalty</code></td><td>0</td><td>存在 / 频率惩罚。</td></tr>
+      <tr><td><code>seed</code></td><td><code>seed</code></td><td>-1</td><td>随机种子（-1 = 随机）。</td></tr>
+      <tr><td><code>stop</code></td><td><code>stop</code></td><td>null</td><td>停止序列。</td></tr>
+      <tr><td>—</td><td><code>response_format</code></td><td>null</td><td><code>text</code>、<code>json_object</code> 或 <code>json_schema</code>。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="csharp">C# 公共 API</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>成员</th><th>签名 / 取值</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>ModelBase.Create</code></td><td><code>static ModelBase Create(string ggufPath, BackendType backend)</code></td><td>从 GGUF 元数据自动识别架构。</td></tr>
+      <tr><td><code>ModelBase.Forward</code></td><td><code>float[] Forward(int[] tokens)</code></td><td>返回下一 token 的 logits（长度 = 词表大小）。</td></tr>
+      <tr><td><code>ModelBase.Sample</code></td><td><code>int Sample(float[] logits, SamplingConfig config, IList&lt;int&gt; generated = null)</code></td><td>应用惩罚 + 采样。</td></tr>
+      <tr><td><code>ModelBase.SampleGreedy</code></td><td><code>int SampleGreedy(float[] logits)</code></td><td>确定性 argmax。</td></tr>
+      <tr><td><code>ModelBase.Config</code> / <code>.Tokenizer</code></td><td><code>ModelConfig</code> / <code>ITokenizer</code></td><td><code>Config.VocabSize</code>、上下文长度等。</td></tr>
+      <tr><td><code>BackendType</code></td><td><code>Cpu, GgmlCpu, GgmlMetal, GgmlCuda, Cuda, Mlx</code></td><td>后端选择枚举。</td></tr>
+      <tr><td><code>ITokenizer.Encode</code></td><td><code>Encode(string text, bool addSpecial)</code></td><td>文本 → token id。</td></tr>
+      <tr><td><code>ITokenizer.Decode</code></td><td><code>string Decode(List&lt;int&gt; ids)</code></td><td>token id → 文本。</td></tr>
+      <tr><td><code>ITokenizer.IsEos</code> / <code>.EosTokenIds</code></td><td><code>bool IsEos(int id)</code> / <code>int[] EosTokenIds</code></td><td>序列结束检测。</td></tr>
+      <tr><td><code>SamplingConfig</code></td><td>Temperature、TopK、TopP、MinP、惩罚、Seed、StopSequences、MaxTokens</td><td>见 <a href="code-api_zh-cn.html#sampling">C# 库</a>。</td></tr>
+      <tr><td><code>IBatchedPagedModel.ForwardBatch</code></td><td>批量/分页前向</td><td>多数架构为连续批处理而实现。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2 id="repl-commands">REPL 命令</h2>
+  <div class="ref-section table-scroll">
+  <table class="ref-table">
+    <thead><tr><th>命令</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>/help</code>、<code>/?</code></td><td>显示所有交互命令。</td></tr>
+      <tr><td><code>/exit</code>、<code>/quit</code></td><td>离开会话。</td></tr>
+      <tr><td><code>/reset</code>、<code>/new</code></td><td>清空对话历史与 KV 缓存。</td></tr>
+      <tr><td><code>/history</code> · <code>/save &lt;file&gt;</code></td><td>打印 / 追加记录。</td></tr>
+      <tr><td><code>/system &lt;text&gt;</code></td><td>设置系统提示（重置 KV 缓存）。</td></tr>
+      <tr><td><code>/think on|off</code> · <code>/multiline on|off</code></td><td>切换推理模式 / 多行输入。</td></tr>
+      <tr><td><code>/info</code>、<code>/status</code></td><td>显示模型、后端、架构、上下文/词表、投影器、深度。</td></tr>
+      <tr><td><code>/model &lt;path&gt;</code> · <code>/backend &lt;name&gt;</code> · <code>/mmproj &lt;path&gt;</code></td><td>热切换模型、后端或投影器。</td></tr>
+      <tr><td><code>/sampling</code>、<code>/show</code></td><td>打印当前采样配置。</td></tr>
+      <tr><td><code>/max · /temp · /topk · /topp · /minp</code></td><td>设置回复长度 / 温度 / top-k / top-p / min-p。</td></tr>
+      <tr><td><code>/repeat · /presence · /frequency · /seed</code></td><td>设置惩罚与随机种子。</td></tr>
+      <tr><td><code>/stop &lt;text&gt;</code> · <code>/clearstop</code></td><td>添加 / 清除停止序列。</td></tr>
+      <tr><td><code>/image · /audio · /video · /text &lt;path&gt;</code> · <code>/clearattach</code></td><td>为下一轮附加媒体 / 文本；丢弃待发送附件。</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="content-footer">
+    <a href="benchmarks_zh-cn.html">← 基准测试</a>
+    <a href="glossary_zh-cn.html">下一篇：术语表与 FAQ →</a>
+  </div>
+</main>
+
+<script>
+(function () {
+  function init() {
+    var input = document.getElementById("ref-input");
+    var count = document.getElementById("ref-count");
+    if (!input) return;
+    var sections = Array.prototype.slice.call(document.querySelectorAll(".ref-section"));
+    var rows = Array.prototype.slice.call(document.querySelectorAll(".ref-table tbody tr"));
+    function apply() {
+      var q = input.value.trim().toLowerCase();
+      var shown = 0;
+      rows.forEach(function (r) {
+        var match = !q || r.textContent.toLowerCase().indexOf(q) >= 0;
+        r.classList.toggle("ref-hide", !match);
+        if (match) shown++;
+      });
+      sections.forEach(function (s) {
+        var any = s.querySelectorAll("tbody tr:not(.ref-hide)").length > 0;
+        s.classList.toggle("ref-empty", !any);
+        var h = s.previousElementSibling;
+        if (h && h.tagName === "H2") h.style.display = any ? "" : "none";
+      });
+      count.textContent = q ? (shown + " 行匹配") : (rows.length + " 条目");
+    }
+    input.addEventListener("input", apply);
+    apply();
+  }
+  if (document.readyState !== "loading") init();
+  else document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>

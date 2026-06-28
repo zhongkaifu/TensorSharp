@@ -830,8 +830,8 @@ print()
 注意事项：
 
 - `response_format.type = "json_schema"` 当前不能与 `tools` 或 `think` 同时使用。
-- 流式结构化输出请求会先在服务端缓存并校验，再以 chunk 形式发出。
-- 非法 schema 返回 HTTP `400`；模型输出未能通过校验则返回 HTTP `422`。
+- 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。设置 `TS_STRUCTURED_STREAM_BUFFER=1` 可对两者强制使用旧的“全部缓存”行为。非流式请求始终归一化。
+- 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。
 
 ---
 

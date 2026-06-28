@@ -19,13 +19,13 @@
   <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware, plus the test harness that guards correctness.</p>
 
   <h2 id="head-to-head">Head-to-head: TensorSharp vs llama.cpp</h2>
-  <p>A <strong>pure-.NET engine going toe-to-toe with the hand-tuned C++ <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, same GGML CUDA backend, and one uniform OpenAI <code>/v1/chat/completions</code> surface across text / image / audio / video / multi-turn / function-call / structured-output scenarios. The full per-scenario report (including a connect-only vLLM endpoint) lives in <code>docs/engine_comparison_report.md</code>.</p>
+  <p>A <strong>pure-.NET engine going toe-to-toe with the hand-tuned C++ <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, same GGML CUDA backend, and one uniform OpenAI <code>/v1/chat/completions</code> surface across text, multi-turn, and structured-output (JSON) scenarios. The full per-scenario report (including a connect-only vLLM endpoint) lives in <code>docs/engine_comparison_report.md</code>.</p>
 
   <div class="card-grid">
-    <div class="card"><div class="ic">🏆</div><h3>MoE wins on every axis</h3><p>On Gemma 4 <strong>26B-A4B</strong>, TensorSharp is faster than llama.cpp at <strong>decode (1.11×), prefill (1.32×), and TTFT (1.22×)</strong> at the same time — a clean sweep.</p></div>
-    <div class="card"><div class="ic">💬</div><h3>Multi-turn chat up to 2.1×</h3><p>Content-hashed paged-KV prefix reuse lands follow-up turns sooner: prefill / TTFT of <strong>2.08× / 2.14×</strong> (26B-A4B) and <strong>1.66× / 1.70×</strong> (12B).</p></div>
-    <div class="card"><div class="ic">🛠️</div><h3>Function-call decode 2.07×</h3><p><strong>170.9 vs 82.7 tok/s</strong> on 26B-A4B (and 1.69× on 12B) — structured tool-call generation streams roughly twice as fast.</p></div>
-    <div class="card"><div class="ic">🖼️</div><h3>Image TTFT 3.25× lower</h3><p>First token on a 26B-A4B image prompt in <strong>3.8 s vs 12.4 s</strong>; audio TTFT is <strong>~6× lower</strong> on the dense models.</p></div>
+    <div class="card"><div class="ic">🚀</div><h3>Faster prefill on every model</h3><p>TensorSharp out-prefills llama.cpp across the board — geomean <strong>1.18× → 1.88×</strong> — with decode held at parity.</p></div>
+    <div class="card"><div class="ic">🏆</div><h3>MoE flagship leads</h3><p>On Gemma 4 <strong>26B-A4B</strong>, <strong>1.88× prefill</strong> and <strong>1.69× lower TTFT</strong> geomean, while decode stays competitive.</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>Structured output 5.89×</h3><p>Constrained-JSON prefill is <strong>5.89×</strong> faster on 26B-A4B (354.7 vs 60.2 tok/s) with first token <strong>3.34× sooner</strong>.</p></div>
+    <div class="card"><div class="ic">💬</div><h3>Multi-turn chat up to 1.9×</h3><p>Content-hashed paged-KV prefix reuse lands follow-up turns sooner: prefill / TTFT of <strong>1.87× / 1.93×</strong> (26B-A4B).</p></div>
   </div>
 
   <p>Geomean speedup of TensorSharp over llama.cpp on the <strong>same backend</strong> (single-stream, greedy, MTP off). <strong>&gt; 1.0× means TensorSharp is faster</strong> (decode / prefill) or lower-latency (TTFT):</p>
@@ -33,14 +33,14 @@
   <table>
     <thead><tr><th>Model</th><th>decode</th><th>prefill</th><th>TTFT</th></tr></thead>
     <tbody>
-      <tr><td>Gemma 4 26B-A4B it (UD-Q4_K_XL, <strong>MoE</strong>)</td><td><span class="yes">1.11×</span></td><td><span class="yes">1.32×</span></td><td><span class="yes">1.22×</span></td></tr>
-      <tr><td>Gemma 4 12B it (UD-Q4_K_XL, dense)</td><td><span class="yes">1.02×</span></td><td>0.49×</td><td>0.81×</td></tr>
-      <tr><td>Gemma 4 E4B it (Q8_0, dense multimodal)</td><td>0.88×</td><td>0.51×</td><td>0.89×</td></tr>
-      <tr><td>Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)</td><td>0.62×</td><td>0.62×</td><td>0.60×</td></tr>
+      <tr><td>Gemma 4 26B-A4B it (UD-Q4_K_XL, <strong>MoE</strong>)</td><td>0.92×</td><td><span class="yes">1.88×</span></td><td><span class="yes">1.69×</span></td></tr>
+      <tr><td>Gemma 4 12B it (UD-Q4_K_XL, dense)</td><td>0.93×</td><td><span class="yes">1.23×</span></td><td><span class="yes">1.10×</span></td></tr>
+      <tr><td>Gemma 4 E4B it (Q8_0, dense multimodal)</td><td>0.95×</td><td><span class="yes">1.21×</span></td><td><span class="yes">1.07×</span></td></tr>
+      <tr><td>Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)</td><td>0.94×</td><td><span class="yes">1.18×</span></td><td>0.95×</td></tr>
     </tbody>
   </table>
   </div>
-  <p>The headline wins come from TensorSharp's architecture-specific fast paths: a persistent captured-CUDA-graph MoE decode, a verify-based whole-model prefill, and the vLLM-style <a href="advanced.html#continuous-batching">paged KV cache with cross-request prefix sharing</a> that makes multi-turn conversations land sooner. On the robustness front, TensorSharp also completed the 26B-A4B audio scenario that the reference engine errored out on. Dense-model decode is at parity (≈0.88–1.02×); the IQ2_XXS Qwen 3.6 path and a few prefill cells are active optimization targets — every cell, wins and gaps alike, is published in the report.</p>
+  <p>The headline wins come from TensorSharp's architecture-specific fast paths: a verify-based whole-model prefill with fused FFN / attention kernels, a persistent captured-CUDA-graph MoE decode, and the vLLM-style <a href="advanced.html#continuous-batching">paged KV cache with cross-request prefix sharing</a> that makes multi-turn conversations land sooner. JSON-mode decode even wins outright on E4B (1.10×) and Qwen 3.6 (1.07×), and the once-weak IQ2_XXS Qwen 3.6 path is now competitive (0.94× decode, 1.18× prefill). Decode sits at parity across dense and MoE (0.92–0.95×), so these prefill / TTFT / structured-output wins come on top of competitive token generation; the few remaining sub-1.0× cells — chiefly long-context dense prefill — are active optimization targets, and every cell, wins and gaps alike, is published in the report.</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>An honest comparison shows the gaps as well as the wins. These figures are one machine (RTX 3080 Laptop, GGML CUDA, single-stream); your hardware, model, and quantization will shift them. Run the built-in benchmark and the engine-comparison harness on your own box for the numbers that matter to you.</p></div>
 

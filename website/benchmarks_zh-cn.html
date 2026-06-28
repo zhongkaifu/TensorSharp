@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>基准测试 — TensorSharp 维基</title>
+  <meta name="description" content="TensorSharp 的基准测试结果、对比 llama.cpp 与 Ollama 的跨引擎推理矩阵，以及测试框架如何运作。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="benchmarks">
+<a class="skip" href="#content">跳到正文</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 基准测试</div>
+  <h1>基准测试</h1>
+  <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比，以及守护正确性的测试框架。</p>
+
+  <h2 id="head-to-head">同台对比：TensorSharp vs llama.cpp</h2>
+  <p>一个<strong>纯 .NET 引擎与手工优化的 C++ <code>llama.cpp</code> 正面较量</strong> —— 相同的 GGUF 文件、相同的 <strong>NVIDIA RTX 3080 Laptop GPU（16 GB）</strong>、相同的 GGML CUDA 后端，以及统一的 OpenAI <code>/v1/chat/completions</code> 接口，覆盖文本、多轮、结构化输出（JSON）等场景。完整的逐场景报告（含一个仅连接的 vLLM 端点）见仓库中的 <code>docs/engine_comparison_report.md</code>。</p>
+
+  <div class="card-grid">
+    <div class="card"><div class="ic">🚀</div><h3>每个模型 prefill 更快</h3><p>TensorSharp 在所有模型上的 prefill 都快于 llama.cpp —— 几何平均 <strong>1.18× → 1.88×</strong>，同时 decode 持平。</p></div>
+    <div class="card"><div class="ic">🏆</div><h3>MoE 旗舰领跑</h3><p>在 Gemma 4 <strong>26B-A4B</strong> 上，几何平均 <strong>1.88× prefill</strong> 与 <strong>1.69× 更低 TTFT</strong>，同时 decode 保持竞争力。</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>结构化输出 5.89×</h3><p>26B-A4B 上受约束的 JSON prefill 快 <strong>5.89×</strong>（354.7 vs 60.2 tok/s），首 token 早 <strong>3.34×</strong>。</p></div>
+    <div class="card"><div class="ic">💬</div><h3>多轮对话最高 1.9×</h3><p>基于内容哈希的分页 KV 前缀复用让后续轮次更快返回：26B-A4B 上 prefill / TTFT 为 <strong>1.87× / 1.93×</strong>。</p></div>
+  </div>
+
+  <p>下表为 TensorSharp 相对 llama.cpp 在<strong>相同后端</strong>上的几何平均加速比（单流、贪心采样、关闭 MTP）。<strong>&gt; 1.0× 表示 TensorSharp 更快</strong>（decode / prefill）或延迟更低（TTFT）：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>模型</th><th>decode</th><th>prefill</th><th>TTFT</th></tr></thead>
+    <tbody>
+      <tr><td>Gemma 4 26B-A4B it (UD-Q4_K_XL, <strong>MoE</strong>)</td><td>0.92×</td><td><span class="yes">1.88×</span></td><td><span class="yes">1.69×</span></td></tr>
+      <tr><td>Gemma 4 12B it (UD-Q4_K_XL, dense)</td><td>0.93×</td><td><span class="yes">1.23×</span></td><td><span class="yes">1.10×</span></td></tr>
+      <tr><td>Gemma 4 E4B it (Q8_0, dense 多模态)</td><td>0.95×</td><td><span class="yes">1.21×</span></td><td><span class="yes">1.07×</span></td></tr>
+      <tr><td>Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)</td><td>0.94×</td><td><span class="yes">1.18×</span></td><td>0.95×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>这些领先来自 TensorSharp 的架构专属快路径：基于 verify 的整模型 prefill（配以融合的 FFN / attention 内核）、常驻捕获式 CUDA 图 MoE decode，以及让多轮对话更快返回的 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。JSON 模式下 decode 甚至在 E4B（1.10×）与 Qwen 3.6（1.07×）上完胜，曾经孱弱的 IQ2_XXS Qwen 3.6 路径如今也具备竞争力（0.94× decode、1.18× prefill）。decode 在 dense 与 MoE 上均基本持平（0.92–0.95×），因此这些 prefill / TTFT / 结构化输出上的胜势是叠加在有竞争力的 token 生成之上；剩余少数低于 1.0× 的项——主要是长上下文 dense prefill——仍是正在优化的目标，胜负各项的完整数据均已发布在报告中。</p>
+
+  <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、GGML CUDA、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
+
+  <h2 id="cross-engine">跨引擎推理矩阵</h2>
+  <p>若要在相同磁盘 GGUF 文件上对 <strong>TensorSharp vs llama.cpp vs Ollama</strong> 做苹果对苹果的对比（当前覆盖 Gemma 4 E4B Q8_0，包含文本 / 合成 prefill / 图像 / 音频 / 视频任务，并对 <code>f32</code>、<code>f16</code>、<code>q8_0</code> 三种 KV 缓存 dtype 做扫描），见仓库中的 <code>docs/inference_benchmark_matrix.md</code>。驱动脚本位于 <code>benchmarks/inference_matrix/scripts/</code>；运行矩阵后，每格原始 JSON 会写入 <code>benchmarks/inference_matrix/results/</code>。</p>
+
+  <h2 id="testing">测试</h2>
+  <h3>单元测试（xUnit）</h3>
+  <p><code>InferenceWeb.Tests</code> 测试无需运行服务器的进程内行为：托管量化运算、直接 CUDA 与 MLX 后端内核（在硬件可用时）、分页 KV 调度、批量执行器正确性、各模型批量前向与 legacy 路径的一致性、MTP / NextN 推测解码正确性、DiffusionGemma 探针、编解码器往返、提示词渲染，以及服务器 CLI 选项构建器。</p>
+  <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>
+
+  <h3>服务器集成测试</h3>
+  <p><code>TensorSharp.Server/testdata/</code> 中的集成测试覆盖全部三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思考模式、工具调用、结构化输出、队列状态兼容、并发请求与中止支持。架构相关功能会自动检测，并在当前模型不支持时跳过。</p>
+  <pre data-lang="bash"><code># 先启动 TensorSharp.Server，然后运行：
+python3 TensorSharp.Server/testdata/test_multiturn.py
+# 或
+bash TensorSharp.Server/testdata/test_multiturn.sh</code></pre>
+
+  <h3>推理矩阵运行器</h3>
+  <p><code>TensorSharp.TestMatrix</code> 是更广泛的、由 CLI 驱动的长时段 模型 × 后端 × 功能 × 环境变量 覆盖框架。它发现 GGUF 文件、过滤不可用后端与不支持的提示类型、运行基线加环境变量扫描的各个 cell、为每个 cell 写一份 JSON 结果、生成聚合 Markdown 报告，并与各主机基线对比。</p>
+  <pre data-lang="bash"><code>dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
+dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run</code></pre>
+
+  <div class="callout note"><div class="ic">📊</div><p>基准数字高度依赖硬件、模型、量化与 KV 缓存 dtype。请把上面的数字当作单台机器上可复现的参考点，而非普适保证 —— 在你自己的硬件上运行内置基准，得到对你真正有意义的数字。</p></div>
+
+  <div class="content-footer">
+    <a href="advanced_zh-cn.html">← 高级功能</a>
+    <a href="api-reference_zh-cn.html">下一篇：API 参考 →</a>
+  </div>
+</main>
+</body>
+</html>

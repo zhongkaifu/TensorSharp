@@ -3381,6 +3381,12 @@ extern "C" __global__ void ts_quant_matmul_q8_0_mma_f32(
     int out_dim,
     int rows)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
+    // int8 tensor-core (wmma m16n16k16) MMA requires sm_72+. For older targets
+    // (e.g. the compute_61 fallback when GPU arch detection is unavailable),
+    // nvcuda::wmma is not declared, so compile an empty stub: the symbol still
+    // exists for module.GetFunction, and the host only ever launches this kernel
+    // when the opt-in TS_CUDA_Q8_MMA path runs on tensor-core hardware.
     using namespace nvcuda;
     int n0 = blockIdx.x * TS_MMA_TILE;
     int m0 = blockIdx.y * TS_MMA_TILE;
@@ -3461,6 +3467,9 @@ extern "C" __global__ void ts_quant_matmul_q8_0_mma_f32(
         if (m0 + m < rows && n0 + n < out_dim)
             output[(size_t)(m0 + m) * out_dim + (n0 + n)] = smem_facc[i];
     }
+#else
+    (void)weights; (void)xq; (void)output; (void)in_dim; (void)out_dim; (void)rows;
+#endif
 }
 
 extern "C" __global__ void ts_quant_get_rows_f32(

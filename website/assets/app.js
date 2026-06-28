@@ -1,36 +1,62 @@
-/* TensorSharp Wiki — shared chrome, navigation, search, and UI behaviour. */
+/* TensorSharp Wiki — shared chrome, navigation, search, and UI behaviour. Bilingual (EN / 中文). */
 (function () {
   "use strict";
 
-  // ---- Navigation model (single source of truth) ----
+  // ---- Navigation model (single source of truth, bilingual) ----
   var NAV = [
-    { group: "Introduction", items: [
-      { page: "index",        href: "index.html",           label: "Home" },
-      { page: "overview",     href: "overview.html",         label: "Overview & Architecture" },
-      { page: "features",     href: "features.html",         label: "Features" },
+    { group: { en: "Introduction", zh: "简介" }, items: [
+      { page: "index",    label: { en: "Home", zh: "首页" } },
+      { page: "overview", label: { en: "Overview & Architecture", zh: "概览与架构" } },
+      { page: "features", label: { en: "Features", zh: "功能特性" } },
     ]},
-    { group: "Get started", items: [
-      { page: "getting-started", href: "getting-started.html", label: "Getting Started" },
-      { page: "backends",     href: "backends.html",         label: "Compute Backends" },
-      { page: "models",       href: "models.html",           label: "Supported Models" },
+    { group: { en: "Get started", zh: "快速上手" }, items: [
+      { page: "getting-started", label: { en: "Getting Started", zh: "快速开始" } },
+      { page: "backends", label: { en: "Compute Backends", zh: "计算后端" } },
+      { page: "models",   label: { en: "Supported Models", zh: "支持的模型" } },
     ]},
-    { group: "Run it", items: [
-      { page: "cli",          href: "cli.html",              label: "Command Line (CLI)" },
-      { page: "server",       href: "server.html",           label: "Server & Web UI" },
+    { group: { en: "Run it", zh: "运行" }, items: [
+      { page: "cli",    label: { en: "Command Line (CLI)", zh: "命令行 (CLI)" } },
+      { page: "server", label: { en: "Server & Web UI", zh: "服务器与 Web UI" } },
     ]},
-    { group: "Integrate", items: [
-      { page: "http-api",     href: "http-api.html",         label: "HTTP API (Ollama / OpenAI)" },
-      { page: "code-api",     href: "code-api.html",         label: "C# Library / Code" },
+    { group: { en: "Integrate", zh: "集成" }, items: [
+      { page: "http-api", label: { en: "HTTP API (Ollama / OpenAI)", zh: "HTTP API (Ollama / OpenAI)" } },
+      { page: "code-api", label: { en: "C# Library / Code", zh: "C# 库 / 代码" } },
     ]},
-    { group: "Deep dive", items: [
-      { page: "advanced",     href: "advanced.html",         label: "Advanced Features" },
-      { page: "benchmarks",   href: "benchmarks.html",       label: "Benchmarks & Testing" },
+    { group: { en: "Deep dive", zh: "深入了解" }, items: [
+      { page: "advanced",   label: { en: "Advanced Features", zh: "高级功能" } },
+      { page: "benchmarks", label: { en: "Benchmarks & Testing", zh: "基准测试" } },
     ]},
-    { group: "Reference", items: [
-      { page: "api-reference", href: "api-reference.html",   label: "API Reference" },
-      { page: "glossary",     href: "glossary.html",         label: "Glossary & FAQ" },
+    { group: { en: "Reference", zh: "参考" }, items: [
+      { page: "api-reference", label: { en: "API Reference", zh: "API 参考" } },
+      { page: "glossary",      label: { en: "Glossary & FAQ", zh: "术语表与 FAQ" } },
     ]},
   ];
+
+  // ---- UI strings (bilingual) ----
+  var STRINGS = {
+    en: {
+      wikiTag: "Wiki",
+      searchTrigger: "Search the wiki…",
+      searchPlaceholder: "Search pages, commands, flags, API…",
+      footOpen: "open", footNav: "navigate", footClose: "close",
+      onThisPage: "On this page",
+      copy: "Copy", copied: "Copied!",
+      menu: "Menu", theme: "Toggle theme", search: "Search", github: "GitHub",
+      switchLabel: "中文", switchAria: "切换到中文 (Switch to Chinese)",
+      noMatches: function (q) { return "No matches for “" + q + "”."; },
+    },
+    zh: {
+      wikiTag: "维基",
+      searchTrigger: "搜索维基…",
+      searchPlaceholder: "搜索页面、命令、参数、API…",
+      footOpen: "打开", footNav: "切换", footClose: "关闭",
+      onThisPage: "本页目录",
+      copy: "复制", copied: "已复制！",
+      menu: "菜单", theme: "切换主题", search: "搜索", github: "GitHub",
+      switchLabel: "EN", switchAria: "Switch to English (切换到英文)",
+      noMatches: function (q) { return "未找到 “" + q + "” 的匹配结果。"; },
+    },
+  };
 
   var REPO = "https://github.com/zhongkaifu/TensorSharp";
 
@@ -53,6 +79,25 @@
     return (document.body.getAttribute("data-page") || "index").trim();
   }
 
+  // ---- Language ----
+  function currentLang() {
+    var l = (document.documentElement.getAttribute("lang") || "en").toLowerCase();
+    return l.indexOf("zh") === 0 ? "zh" : "en";
+  }
+  function strings() { return STRINGS[currentLang()]; }
+  function hrefFor(page, lang) {
+    return page + (lang === "zh" ? "_zh-cn" : "") + ".html";
+  }
+  function otherLangHref() {
+    var other = currentLang() === "zh" ? "en" : "zh";
+    return hrefFor(currentPage(), other) + (location.hash || "");
+  }
+  // Rewrite an English (search-index) URL to the current language.
+  function localizeUrl(u) {
+    if (currentLang() !== "zh" || !u || u.indexOf("_zh-cn") >= 0) return u;
+    return u.replace(/^([^#?]+)\.html/, "$1_zh-cn.html");
+  }
+
   // ---- Theme ----
   function applyTheme(t) {
     document.documentElement.classList.toggle("dark", t === "dark");
@@ -67,20 +112,23 @@
 
   // ---- Build top bar ----
   function buildTopbar() {
+    var S = strings(), lang = currentLang();
     var bar = el("header", { class: "topbar" });
-    bar.appendChild(el("button", { id: "menu-toggle", class: "icon-btn", "aria-label": "Menu" }, ICONS.menu));
-    var brand = el("a", { class: "brand", href: "index.html" });
-    brand.innerHTML = '<img src="assets/logo.svg" alt=""><span>TensorSharp</span><span class="tag">Wiki</span>';
+    bar.appendChild(el("button", { id: "menu-toggle", class: "icon-btn", "aria-label": S.menu }, ICONS.menu));
+    var brand = el("a", { class: "brand", href: hrefFor("index", lang) });
+    brand.innerHTML = '<img src="assets/logo.svg" alt=""><span>TensorSharp</span><span class="tag">' + S.wikiTag + '</span>';
     bar.appendChild(brand);
     bar.appendChild(el("div", { class: "spacer" }));
 
     var actions = el("div", { class: "topbar-actions" });
-    var trig = el("button", { class: "search-trigger", id: "search-trigger", "aria-label": "Search" });
-    trig.innerHTML = ICONS.search + '<span class="lbl">Search the wiki…</span><kbd>/</kbd>';
+    var trig = el("button", { class: "search-trigger", id: "search-trigger", "aria-label": S.search });
+    trig.innerHTML = ICONS.search + '<span class="lbl">' + S.searchTrigger + '</span><kbd>/</kbd>';
     actions.appendChild(trig);
-    var theme = el("button", { class: "icon-btn", id: "theme-toggle", "aria-label": "Toggle theme" });
+    var langBtn = el("a", { class: "icon-btn lang-btn", href: otherLangHref(), "aria-label": S.switchAria, title: S.switchAria }, S.switchLabel);
+    actions.appendChild(langBtn);
+    var theme = el("button", { class: "icon-btn", id: "theme-toggle", "aria-label": S.theme });
     actions.appendChild(theme);
-    var gh = el("a", { class: "icon-btn", href: REPO, target: "_blank", rel: "noopener", "aria-label": "GitHub" }, ICONS.github);
+    var gh = el("a", { class: "icon-btn", href: REPO, target: "_blank", rel: "noopener", "aria-label": S.github }, ICONS.github);
     actions.appendChild(gh);
     bar.appendChild(actions);
     document.body.insertBefore(bar, document.body.firstChild);
@@ -97,13 +145,13 @@
     var main = document.querySelector("main.content");
     var layout = el("div", { class: "layout" });
     var sidebar = el("aside", { class: "sidebar", id: "sidebar" });
-    var cur = currentPage();
+    var cur = currentPage(), lang = currentLang();
 
     NAV.forEach(function (g) {
       var grp = el("div", { class: "nav-group" });
-      grp.appendChild(el("h4", null, g.group));
+      grp.appendChild(el("h4", null, g.group[lang]));
       g.items.forEach(function (it) {
-        var a = el("a", { href: it.href }, it.label);
+        var a = el("a", { href: hrefFor(it.page, lang) }, it.label[lang]);
         if (it.page === cur) a.className = "active";
         grp.appendChild(a);
       });
@@ -128,7 +176,7 @@
     var toc = document.getElementById("toc");
     var heads = document.querySelectorAll("main.content h2[id], main.content h3[id]");
     if (heads.length < 2) { toc.style.display = "none"; return; }
-    toc.appendChild(el("h5", null, "On this page"));
+    toc.appendChild(el("h5", null, strings().onThisPage));
     heads.forEach(function (h) {
       var a = el("a", { href: "#" + h.id, class: h.tagName === "H3" ? "lvl-3" : "lvl-2" }, h.textContent);
       a.dataset.target = h.id;
@@ -150,19 +198,20 @@
 
   // ---- Copy buttons + language labels on code blocks ----
   function enhanceCode() {
+    var S = strings();
     document.querySelectorAll("main.content pre").forEach(function (pre) {
       var wrap = el("div", { class: "code-wrap" });
       pre.parentNode.insertBefore(wrap, pre);
       wrap.appendChild(pre);
       var lang = pre.getAttribute("data-lang");
       if (lang) wrap.appendChild(el("span", { class: "code-lang" }, lang));
-      var btn = el("button", { class: "copy-btn", type: "button" }, "Copy");
+      var btn = el("button", { class: "copy-btn", type: "button" }, S.copy);
       wrap.appendChild(btn);
       btn.addEventListener("click", function () {
-        var text = pre.innerText.replace(/\n?Copy$/, "");
+        var text = pre.innerText;
         navigator.clipboard.writeText(text).then(function () {
-          btn.textContent = "Copied!"; btn.classList.add("copied");
-          setTimeout(function () { btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1600);
+          btn.textContent = S.copied; btn.classList.add("copied");
+          setTimeout(function () { btn.textContent = S.copy; btn.classList.remove("copied"); }, 1600);
         });
       });
     });
@@ -172,13 +221,14 @@
   var overlay, input, results, selIndex = -1, curResults = [];
 
   function buildSearch() {
+    var S = strings();
     overlay = el("div", { id: "search-overlay" });
     var box = el("div", { class: "search-box" });
-    input = el("input", { type: "text", placeholder: "Search pages, commands, flags, API…", "aria-label": "Search", autocomplete: "off", spellcheck: "false" });
+    input = el("input", { type: "text", placeholder: S.searchPlaceholder, "aria-label": S.search, autocomplete: "off", spellcheck: "false" });
     results = el("div", { class: "search-results" });
     box.appendChild(input);
     box.appendChild(results);
-    box.appendChild(el("div", { class: "search-foot" }, "<span><kbd>enter</kbd> open</span><span><kbd>up</kbd> <kbd>down</kbd> navigate</span><span><kbd>esc</kbd> close</span>"));
+    box.appendChild(el("div", { class: "search-foot" }, "<span><kbd>enter</kbd> " + S.footOpen + "</span><span><kbd>↑</kbd> <kbd>↓</kbd> " + S.footNav + "</span><span><kbd>esc</kbd> " + S.footClose + "</span>"));
     overlay.appendChild(box);
     document.body.appendChild(overlay);
 
@@ -195,9 +245,14 @@
   function openSearch() { overlay.classList.add("open"); input.value = ""; input.focus(); runSearch(); }
   function closeSearch() { overlay.classList.remove("open"); }
 
+  function searchIndex() {
+    if (currentLang() === "zh" && window.SEARCH_INDEX_ZH) return window.SEARCH_INDEX_ZH;
+    return window.SEARCH_INDEX || [];
+  }
+
   function runSearch() {
     var q = input.value.trim().toLowerCase();
-    var data = window.SEARCH_INDEX || [];
+    var data = searchIndex();
     selIndex = -1;
     if (!q) {
       curResults = data.slice(0, 8);
@@ -233,11 +288,11 @@
   function renderResults(q) {
     results.innerHTML = "";
     if (!curResults.length) {
-      results.appendChild(el("div", { class: "search-empty" }, "No matches for “" + esc(q) + "”."));
+      results.appendChild(el("div", { class: "search-empty" }, strings().noMatches(esc(q))));
       return;
     }
     curResults.forEach(function (d, i) {
-      var a = el("a", { href: d.u });
+      var a = el("a", { href: localizeUrl(d.u) });
       a.innerHTML = '<div class="r-page">' + esc(d.p) + '</div><div class="r-title">' + hl(d.t, q) + '</div><div class="r-snip">' + hl(d.s, q) + '</div>';
       a.addEventListener("mouseenter", function () { select(i); });
       results.appendChild(a);
@@ -245,7 +300,7 @@
   }
   function move(dir) { if (!curResults.length) return; select((selIndex + dir + curResults.length) % curResults.length); var sel = results.children[selIndex]; if (sel) sel.scrollIntoView({ block: "nearest" }); }
   function select(i) { selIndex = i; Array.prototype.forEach.call(results.children, function (c, j) { c.classList.toggle("sel", j === i); }); }
-  function openSel() { var i = selIndex < 0 ? 0 : selIndex; if (curResults[i]) window.location.href = curResults[i].u; }
+  function openSel() { var i = selIndex < 0 ? 0 : selIndex; if (curResults[i]) window.location.href = localizeUrl(curResults[i].u); }
 
   // ---- Global keys ----
   function globalKeys() {

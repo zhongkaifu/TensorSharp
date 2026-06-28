@@ -1,0 +1,6 @@
+# Shell scripts must use LF line endings so they run under bash/dash on
+# Linux, WSL, and macOS even when the repo is checked out or edited on
+# Windows. CRLF here breaks `set -euo pipefail` (read as `pipefail\r`) and
+# corrupts every other line, which silently broke the GGML native build and
+# the CUDA arch-detection fallback.
+*.sh text eol=lf

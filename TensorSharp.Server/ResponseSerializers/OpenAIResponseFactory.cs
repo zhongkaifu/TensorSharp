@@ -77,6 +77,26 @@ namespace TensorSharp.Server.ResponseSerializers
             },
         };
 
+        public static object ToolCallsChunk(
+            string requestId,
+            string model,
+            IReadOnlyList<ToolCall> toolCalls) => new
+        {
+            id = requestId,
+            @object = ChunkObject,
+            created = UnixNow(),
+            model,
+            choices = new[]
+            {
+                new
+                {
+                    index = 0,
+                    delta = new { role = (string)null, content = (string)null, tool_calls = BuildStreamingToolCalls(toolCalls) },
+                    finish_reason = (string)null,
+                },
+            },
+        };
+
         public static object EndChunk(
             string requestId,
             string model,
@@ -176,6 +196,23 @@ namespace TensorSharp.Server.ResponseSerializers
 
             return toolCalls.Select(tc => (object)new
             {
+                id = $"call_{Guid.NewGuid():N}".Substring(0, 24),
+                type = "function",
+                function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
+            }).ToArray();
+        }
+
+        // Streaming tool-call deltas carry an explicit `index` (the field OpenAI
+        // SDKs use to stitch fragments of the same call together) which the
+        // non-streaming message shape above omits.
+        private static IReadOnlyList<object> BuildStreamingToolCalls(IReadOnlyList<ToolCall> toolCalls)
+        {
+            if (toolCalls == null || toolCalls.Count == 0)
+                return null;
+
+            return toolCalls.Select(tc => (object)new
+            {
+                index = tc.Index,
                 id = $"call_{Guid.NewGuid():N}".Substring(0, 24),
                 type = "function",
                 function = new { name = tc.Name, arguments = JsonSerializer.Serialize(tc.Arguments) },
