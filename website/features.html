@@ -52,6 +52,7 @@
 
   <h2 id="performance">Performance &amp; scale</h2>
   <ul>
+    <li><strong>Competitive with llama.cpp</strong> — head-to-head on identical GGUF files and the same GPU, this pure-.NET engine matches or beats the hand-tuned C++ <code>llama.cpp</code>: the Gemma 4 26B-A4B MoE wins decode, prefill, and TTFT at once, with multi-turn chat up to 2.1×, function-call decode up to 2.07×, and image TTFT 3.25× lower. → <a href="benchmarks.html#head-to-head">Head-to-head benchmarks</a></li>
     <li><strong>GPU-accelerated</strong> — GGML Metal (macOS), GGML CUDA (Windows/Linux + NVIDIA), a direct CUDA/cuBLAS backend, and an MLX backend for Apple Silicon — all with CPU fallbacks. → <a href="backends.html">Backends</a></li>
     <li><strong>Continuous batching &amp; paged KV cache</strong> — block-paged KV pool with block-hash prefix sharing, an iteration-level scheduler that admits/preempts sequences mid-batch, optional SSD-backed tier, and a native fused paged-attention kernel. → <a href="advanced.html#continuous-batching">Deep dive</a></li>
     <li><strong>Batched / parallel inference</strong> — N sequences packed into a single forward pass with paged K/V scatter (Mistral 3, Gemma 4, GPT OSS, Qwen 3 / 3.5 / 3.6, Nemotron-H).</li>

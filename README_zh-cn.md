@@ -76,6 +76,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 ## 亮点功能
 
+- **与 llama.cpp 同台竞技** —— 纯 .NET 引擎，在相同 GGUF 文件、相同 GPU 上与手工优化的 C++ `llama.cpp` 正面较量。在 Gemma 4 26B-A4B MoE 上，decode、prefill **与**首 token 延迟（TTFT）同时领先；多轮对话（prefill/TTFT 最高 **2.1×**）、函数调用 decode（最高 **2.07×**）、多模态延迟（图像 TTFT 低 **3.25×**）进一步拉开差距。→ [对比 llama.cpp 的同台评测](#对比-llamacpp-的同台评测引擎对比)
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列 decode：Qwen 3.6（NextN 块内嵌在主干 GGUF 中）与 Gemma 4（独立的 `gemma4-assistant` 草稿 GGUF）。草稿头每步提议若干 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动。通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。→ [投机解码](#mtp--nextn-投机解码)
 - **DiffusionGemma 文本扩散** —— 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪生成，提供 CLI 扩散参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
@@ -1149,25 +1150,26 @@ TensorSharp 采用分层系统结构：
 
 ## 性能数据
 
-### 内部回归基线
+### 对比 llama.cpp 的同台评测（引擎对比）
 
-在 `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`（磁盘约 10 GB；256 个路由专家，每 token 激活 8 个；12 个全注意力层 + 30 个 GatedDeltaNet 循环层）上，Apple M4 Pro（24 GB 统一内存）的参考结果：
+纯 .NET 引擎与手工优化的 C++ `llama.cpp` 正面较量：**相同的 GGUF 文件、相同的 NVIDIA RTX 3080 Laptop GPU（16 GB）、统一的 OpenAI `/v1/chat/completions` 接口**，覆盖文本 / 图像 / 音频 / 视频 / 多轮 / 函数调用 / 结构化输出等场景。下表为 **在相同 GGML CUDA 后端上，TensorSharp 相对 llama.cpp 的几何平均加速比**（单流、贪心采样、关闭 MTP）。**> 1.0× 表示 TensorSharp 更快**（decode / prefill）或延迟更低（TTFT）。每个场景的完整表格见 [`docs/engine_comparison_report.md`](docs/engine_comparison_report.md)。
 
-| 指标 | 优化前（`v1` 基线） | 优化后（当前分支） | 变化 |
-|---|---|---|---|
-| 进程峰值内存占用 | ~17 GB | **~8 GB** | **-52%** |
-| TensorSharp.Server 加载后常驻内存 | ~20 GB | **~8 GB** | **-60%** |
-| Decode 吞吐（warm，prefill 256 / decode 64，M4 Pro） | ~3.8 tok/s | **~10.8 tok/s** | **+2.85x** |
-| Decode 延迟（warm，prefill 256 / decode 64，M4 Pro） | ~264 ms/token | **~92 ms/token** | **-65%** |
+| 模型 | decode | prefill | TTFT |
+|---|---:|---:|---:|
+| Gemma 4 26B-A4B it（QAT UD-Q4_K_XL，**MoE**） | **1.11×** | **1.32×** | **1.22×** |
+| Gemma 4 12B it（QAT UD-Q4_K_XL，dense） | **1.02×** | 0.49× | 0.81× |
+| Gemma 4 E4B it（Q8_0，dense 多模态） | 0.88× | 0.51× | 0.89× |
+| Qwen 3.6 35B-A3B（UD-IQ2_XXS，MoE） | 0.62× | 0.62× | 0.60× |
 
-复现命令：
+TensorSharp 明显领先的地方：
 
-```bash
-./TensorSharp.Cli --model Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf --backend ggml_metal \
-    --benchmark --bench-prefill 256 --bench-decode 64 --bench-runs 3
-```
+- **MoE 旗舰全面领先。** 在 Gemma 4 26B-A4B 上，常驻捕获式 CUDA 图 MoE decode 加上基于 verify 的整模型 prefill，使 TensorSharp 在 decode **、** prefill **、**首 token 延迟上*同时*快于 llama.cpp——是全面胜出，而非此消彼长。
+- **多轮对话——真正的聊天机器人负载。** 基于内容哈希的分页 KV 前缀复用让后续轮次更快返回：26B-A4B 上 prefill / TTFT 为 **2.08× / 2.14×**，12B 上为 **1.66× / 1.70×**。
+- **函数调用 decode 最高 2.07×** —— 26B-A4B 上 170.9 vs 82.7 tok/s（12B 上 1.69× / 77.2 vs 45.6 tok/s）。
+- **多模态首 token 延迟。** 26B-A4B 图像 TTFT **低 3.25×（3.8 s vs 12.4 s）**；dense 模型音频 TTFT **低约 6×**（E4B 140 ms vs 828 ms；12B 203 ms vs 1266 ms）。
+- **稳健性** —— 参考引擎在 26B-A4B 音频场景报错退出，TensorSharp 顺利完成。
 
-内存节省主要来自不再把 GGUF 模型文件复制到独立的原生堆缓冲区（现在文件是以 mmap 方式零拷贝绑定到 Metal command buffer 中）。Decode 吞吐量提升在很大程度上也是消除约 10 GB 重复工作集的副效应——这部分重复占用此前会在仅有 24 GB 或更少物理内存的机器上触发系统级内存压力。
+Dense 模型 decode 基本持平（约 0.88–1.02×）；IQ2_XXS 的 Qwen 3.6 路径与少数 prefill cell 仍是正在优化的目标，而非最终结果。胜负各项的完整数据见[完整报告](docs/engine_comparison_report.md)。
 
 ### 跨引擎推理矩阵
 

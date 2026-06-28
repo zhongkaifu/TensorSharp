@@ -64,7 +64,8 @@ window.SEARCH_INDEX = [
   { t: "Memory optimizations", p: "Advanced", u: "advanced.html#memory", s: "Zero-copy mmap weights, best-fit pool, SSD KV spillover, KV codecs.", k: "memory mmap footprint ram" },
   { t: "DiffusionGemma text diffusion", p: "Advanced", u: "advanced.html#diffusion", s: "Block-wise EntropyBound denoising over a Gemma-4 MoE backbone.", k: "diffusion denoising text generation" },
 
-  { t: "Benchmarks", p: "Benchmarks", u: "benchmarks.html#baseline", s: "Internal regression baseline and the cross-engine inference matrix.", k: "performance numbers throughput tokens per second" },
+  { t: "Head-to-head vs llama.cpp", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Pure-.NET TensorSharp matches or beats llama.cpp on the same GGUF + GPU: 26B-A4B MoE wins decode/prefill/TTFT; multi-turn up to 2.1×; function-call decode 2.07×; image TTFT 3.25× lower.", k: "llama.cpp comparison faster speedup geomean moe multi-turn function call image audio ttft vs versus" },
+  { t: "Benchmarks", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Head-to-head vs llama.cpp and the cross-engine inference matrix.", k: "performance numbers throughput tokens per second" },
   { t: "Cross-engine matrix", p: "Benchmarks", u: "benchmarks.html#cross-engine", s: "Compare TensorSharp vs llama.cpp and Ollama on the same GGUF files.", k: "llama.cpp ollama comparison" },
   { t: "Testing", p: "Benchmarks", u: "benchmarks.html#testing", s: "xUnit unit tests, server integration tests, and the inference matrix runner.", k: "tests xunit integration ci" },
 
