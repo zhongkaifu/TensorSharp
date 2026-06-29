@@ -105,14 +105,29 @@ namespace TensorSharp.Models.QwenImage
                 float[] imgHost = TensorToHost(img, (long)imgSeq * Dim); img.Dispose();
                 float[] txtHost = TensorToHost(txt, (long)txtSeq * Dim); txt.Dispose();
 
-                // First-Block-Cache: when the caller provides a step index and caching is
-                // enabled, run block 0, then either reuse the cached blocks-1..N-1 residual
-                // (skipping 59 blocks) or compute + re-cache them. See QwenImageDiT.Cache.cs.
+                // Whole-model fast path: run the blocks in ONE resident-weight graph (in-graph
+                // modulation, single dispatch + sync instead of ~180 per-block CPU<->GPU syncs).
+                // Integrated WITH the First-Block-Cache: on a cache-active step, block 0 is run
+                // per-block (for the residual decision), then blocks 1..N-1 go through this kernel
+                // (or are skipped on a cache hit). RunBlocks dispatches the per-layer work.
                 bool cacheActive = CacheEnabled && stepIndex >= 0 && totalSteps > 1;
+                // Run blocks [start, NumLayers) — whole-model graph when enabled, else per-block.
+                void RunBlocks(int start)
+                {
+                    if (WholeModelOn)
+                    {
+                        var swW = TimingOn ? System.Diagnostics.Stopwatch.StartNew() : null;
+                        bool ok = TryWholeBlocks(imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope, start, NumLayers - start);
+                        if (swW != null) { swW.Stop(); Console.WriteLine($"  [dit-timing] whole-model {NumLayers - start}-block graph imgSeq={imgSeq} txtSeq={txtSeq}: {swW.Elapsed.TotalMilliseconds:F0}ms"); }
+                        if (ok) return;
+                    }
+                    for (int layer = start; layer < NumLayers; layer++)
+                        RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+                }
+
                 if (!cacheActive)
                 {
-                    for (int layer = 0; layer < NumLayers; layer++)
-                        RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+                    RunBlocks(0);
                 }
                 else
                 {
@@ -140,8 +155,7 @@ namespace TensorSharp.Models.QwenImage
                     {
                         var imgAfter0 = new float[imgLen];
                         Array.Copy(imgHost, imgAfter0, imgLen);
-                        for (int layer = 1; layer < NumLayers; layer++)
-                            RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
+                        RunBlocks(1);   // blocks 1..N-1 (whole-model graph when enabled)
                         var rem = state.RemainingResidual ?? new float[imgLen];
                         for (long i = 0; i < imgLen; i++) rem[i] = imgHost[i] - imgAfter0[i];
                         state.RemainingResidual = rem;

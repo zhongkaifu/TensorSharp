@@ -29,6 +29,10 @@ namespace TensorSharp.Server.Endpoints
             endpoints.MapPost("/api/image-edit",
                 (HttpRequest req, WebUiAdapter adapter) => adapter.ImageEditAsync(req))
                 .DisableRequestTimeout();
+            // Streaming variant: SSE with live denoising previews (used by the Web UI).
+            endpoints.MapPost("/api/image-edit/stream",
+                (HttpContext ctx, WebUiAdapter adapter) => adapter.ImageEditStreamAsync(ctx))
+                .DisableRequestTimeout();
             return endpoints;
         }
     }

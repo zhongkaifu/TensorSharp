@@ -1635,6 +1635,16 @@ namespace TensorSharp.GGML
             return GgmlNative.TryQwenImageBlockCfg(in condArgs, in negArgs);
         }
 
+        /// <summary>Whole 60-block Qwen-Image DiT forward in ONE resident-weight ggml graph. Weights are
+        /// bound resident (cached by their stable GGUF pointer, uploaded once) and the AdaLN modulation is
+        /// computed in-graph from temb, so a denoise step uploads only the small img/txt/rope inputs and
+        /// does a single compute + sync — eliminating the ~180 per-block CPU&lt;-&gt;GPU syncs of the per-block
+        /// path. Managed QwenImageDiT.Block is the verified correctness reference.</summary>
+        public static bool TryQwenImageForward(in QwenImageForwardArgs args)
+        {
+            return GgmlNative.TryQwenImageForward(in args);
+        }
+
         /// <summary>Single 2D convolution on the active GGML device (ggml_conv_2d). Used to move the
         /// Qwen-Image VAE conv stack off the CPU. Layouts match VaeReferenceMath (no transposes).</summary>
         public static bool TryConv2d(in Conv2dArgs args)

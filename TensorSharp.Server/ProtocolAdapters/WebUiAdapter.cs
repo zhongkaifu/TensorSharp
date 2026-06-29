@@ -14,6 +14,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -380,6 +382,156 @@ namespace TensorSharp.Server.ProtocolAdapters
             logger.LogInformation(LogEventIds.UploadReceived,
                 "Image edit done: {W}x{H} -> {Url} ({Sec:F1}s)", w, h, url, sw.Elapsed.TotalSeconds);
             return Results.Json(new { ok = true, url, width = w, height = h, elapsedSeconds = sw.Elapsed.TotalSeconds });
+        }
+
+        // A live denoising frame surfaced from the edit worker to the SSE writer: a progress tick
+        // (Png == null) or a decoded preview image; the terminal frame carries the final result.
+        private sealed class EditFrame
+        {
+            public int Step, Total, Width, Height;
+            public byte[] Png;        // preview PNG bytes (null = progress-only tick)
+            public bool Final;        // true on the terminal frame
+            public string Url;        // final image URL (Final only)
+            public double Seconds;    // total elapsed (Final only)
+            public string Error;      // set if the edit threw
+        }
+
+        /// <summary>
+        /// <c>POST /api/image-edit/stream</c> — same JSON body as <see cref="ImageEditAsync"/> but
+        /// streams Server-Sent Events so the Web UI can show live denoising progress: a
+        /// <c>{ preview, step, total, image? }</c> event per step (with a decoded snapshot on
+        /// throttled steps) and a final <c>{ done, url, width, height, elapsedSeconds }</c>. This
+        /// keeps the user informed that the (slow) diffusion is progressing instead of looking stuck.
+        /// </summary>
+        public async Task ImageEditStreamAsync(HttpContext ctx)
+        {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
+            SseWriter.ApplyHeaders(ctx.Response);
+            var ct = ctx.RequestAborted;
+
+            if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel editModel)
+            {
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "The loaded model is not a Qwen-Image-Edit model." }, ct);
+                return;
+            }
+
+            // Parse the Web UI JSON body (mirrors the JSON branch of ImageEditAsync).
+            string prompt; int steps; float cfg; long seed; long targetArea = 0; byte[] imageBytes;
+            try
+            {
+                var body = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ct);
+                var root = body.RootElement;
+                string imagePath = root.TryGetProperty("imagePath", out var ip) ? ip.GetString() : null;
+                prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
+                steps = root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si) ? si : 28;
+                cfg = root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv) ? cv : 4.0f;
+                seed = root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv) ? sv : 0;
+                if (root.TryGetProperty("targetArea", out var ta) && ta.TryGetInt64(out long tav) && tav > 0)
+                    targetArea = tav;
+                string full = imagePath == null ? null : Path.GetFullPath(imagePath);
+                string uploadRoot = Path.GetFullPath(_options.UploadDirectory);
+                if (full == null || !full.StartsWith(uploadRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(full))
+                {
+                    await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "imagePath must reference a previously uploaded file." }, ct);
+                    return;
+                }
+                imageBytes = await File.ReadAllBytesAsync(full, ct);
+            }
+            catch (Exception ex)
+            {
+                await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = "Bad request: " + ex.Message }, ct);
+                return;
+            }
+
+            string outName = $"edit-{Guid.NewGuid():N}.png";
+            string outPath = Path.Combine(_options.UploadDirectory, outName);
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "Image edit (stream): prompt='{Prompt}' steps={Steps} cfg={Cfg} bytes={Bytes}", prompt, steps, cfg, imageBytes.Length);
+
+            // The edit worker pushes frames into this channel; the SSE loop drains it. The callback
+            // never blocks on the network (unbounded TryWrite) so it can't stall the denoise.
+            var channel = Channel.CreateUnbounded<EditFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+            int previewCount = Math.Clamp(steps - 1, 0, 8);
+
+            var editTask = Task.Run(() =>
+            {
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    // The model is not thread-safe; serialize edit requests (shared with ImageEditAsync).
+                    lock (_imageEditLock)
+                    {
+                        var input = TensorSharp.Models.QwenImage.ImageIO.Decode(imageBytes);
+                        var p = new TensorSharp.Models.QwenImage.QwenImageParams
+                        {
+                            Steps = steps,
+                            CfgScale = cfg,
+                            Seed = seed,
+                            PreviewCount = previewCount,
+                            OnStep = (step, total, preview) =>
+                            {
+                                if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
+                                byte[] png = preview != null ? TensorSharp.Models.QwenImage.ImageIO.EncodePng(preview) : null;
+                                channel.Writer.TryWrite(new EditFrame
+                                {
+                                    Step = step, Total = total, Png = png,
+                                    Width = preview?.Width ?? 0, Height = preview?.Height ?? 0,
+                                });
+                            },
+                        };
+                        if (targetArea > 0) p.TargetArea = targetArea;
+                        var output = editModel.EditImage(prompt, input, p);
+                        TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
+                        channel.Writer.TryWrite(new EditFrame
+                        {
+                            Final = true, Url = BuildUploadUrl(outName),
+                            Width = output.Width, Height = output.Height, Seconds = sw.Elapsed.TotalSeconds,
+                        });
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    channel.Writer.TryWrite(new EditFrame { Final = true, Error = "cancelled" });
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(LogEventIds.ChatFailed, ex, "Image edit (stream) failed");
+                    channel.Writer.TryWrite(new EditFrame { Final = true, Error = ex.Message });
+                }
+                finally { channel.Writer.Complete(); }
+            }, CancellationToken.None);
+
+            try
+            {
+                await foreach (var f in channel.Reader.ReadAllAsync(ct))
+                {
+                    if (f.Final)
+                    {
+                        if (f.Error == "cancelled") break;
+                        if (f.Error != null)
+                            await SseWriter.WriteEventAsync(ctx.Response, new { done = true, error = f.Error }, ct);
+                        else
+                            await SseWriter.WriteEventAsync(ctx.Response,
+                                new { done = true, url = f.Url, width = f.Width, height = f.Height, elapsedSeconds = f.Seconds }, ct);
+                        logger.LogInformation(LogEventIds.UploadReceived,
+                            "Image edit (stream) done: {W}x{H} -> {Url} ({Sec:F1}s)", f.Width, f.Height, f.Url, f.Seconds);
+                    }
+                    else
+                    {
+                        string image = f.Png != null ? "data:image/png;base64," + Convert.ToBase64String(f.Png) : null;
+                        await SseWriter.WriteEventAsync(ctx.Response,
+                            new { imageEdit = true, step = f.Step, total = f.Total, image, width = f.Width, height = f.Height }, ct);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Client disconnected; the worker observes ct via OnStep and unwinds.
+            }
+
+            // Drain the worker so its lock/VRAM is released before the next request (it finishes
+            // promptly once cancellation is seen). Swallow — any error was already streamed.
+            try { await editTask; } catch { /* already reported */ }
         }
 
         private static string BuildUploadUrl(string fileName)

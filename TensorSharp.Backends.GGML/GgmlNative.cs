@@ -430,6 +430,31 @@ public struct QwenImageBlockArgs
     public float Eps;
 }
 
+// Per-block weight set for the whole-DiT forward (TSGgml_QwenImageForward).
+// MUST match native TSGImgBlockW exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct QImgBlockW
+{
+    public QImgAttnW ImgMod, TxtMod;                   // [dim, 6*dim] (+bias)
+    public QImgAttnW ToQ, ToK, ToV, ToOut;
+    public QImgAttnW AddQ, AddK, AddV, ToAddOut;
+    public IntPtr NormQ, NormK, NormAq, NormAk;        // [head_dim] f32
+    public QImgAttnW INet0, INet2, TNet0, TNet2;       // mlp (+bias in .B)
+}
+
+// Descriptor for the 60-block DiT body in one resident-weight graph
+// (TSGgml_QwenImageForward). Img/Txt are the post-prelude residual streams (in/out),
+// so the C# img_in/txt_in/norm_out/proj_out stay shared with the per-block path.
+// MUST match native TSGgmlQwenImageForwardDesc exactly.
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImageForwardArgs
+{
+    public IntPtr Img, Txt, Temb, ImgCos, ImgSin, TxtCos, TxtSin, ModulateIndex;
+    public IntPtr Blocks;                              // -> QImgBlockW[NumLayers]
+    public int StructBytes, Dim, Heads, HeadDim, Ff, ImgSeq, TxtSeq, NumLayers;
+    public float Eps;
+}
+
 internal enum GgmlUnaryOp
 {
     Neg = 1,
@@ -1507,6 +1532,18 @@ internal enum GgmlIndexReductionOp
             int r = TSGgml_QwenImageBlockCfg(in condDesc, in negDesc);
             if (r == 0)
                 Console.Error.WriteLine($"[qwen-image-block-cfg FAIL] {GetLastErrorMessage("(no native error)")}");
+            return r != 0;
+        }
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_QwenImageForward(in QwenImageForwardArgs desc);
+
+        // Whole 60-block DiT forward in one resident-weight graph (in-graph modulation).
+        public static bool TryQwenImageForward(in QwenImageForwardArgs desc)
+        {
+            int r = TSGgml_QwenImageForward(in desc);
+            if (r == 0)
+                Console.Error.WriteLine($"[qwen-image-forward FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;
         }
 

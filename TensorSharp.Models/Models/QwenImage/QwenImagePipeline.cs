@@ -160,6 +160,24 @@ namespace TensorSharp.Models.QwenImage
                     Console.WriteLine($"  [pipe] step {step + 1}/{sched.Steps} sigma={t01:F3} vel {QwenImageDiT.Stat(v, v.Length)} | latent {QwenImageDiT.Stat(latents, latents.Length)}");
                 else
                     Console.Write($"\r  denoise step {step + 1}/{sched.Steps}   ");
+
+                // Live progress: a tick every step (so the UI never looks stuck) plus a decoded
+                // preview of the current latent on evenly-spaced steps. Previews are decoded at
+                // reduced resolution (cheap vs the full final decode, and keeps VRAM in budget
+                // while the DiT weights are still resident). The final step is skipped here — the
+                // caller renders the full-resolution result below.
+                if (p.OnStep != null)
+                {
+                    int interval = p.PreviewCount > 0 ? Math.Max(1, sched.Steps / p.PreviewCount) : 0;
+                    bool emit = interval > 0 && step < sched.Steps - 1 && (step + 1) % interval == 0;
+                    RgbImage preview = null;
+                    if (emit)
+                    {
+                        try { preview = DecodePreview(latents, Hl, Wl); }
+                        catch (Exception ex) { Console.WriteLine($"  [pipe] preview decode skipped: {ex.Message}"); }
+                    }
+                    p.OnStep(step + 1, sched.Steps, preview);
+                }
             }
             Console.WriteLine();
             if (Dit.CacheEnabled) Console.WriteLine($"  [pipe] DiT cache: {Dit.CacheStats()}");
@@ -180,6 +198,45 @@ namespace TensorSharp.Models.QwenImage
             RgbImage result = Vae.Decode(new VaeLatent(C, Hl, Wl, outLatent));
             Phase("VAE decode");
             return result;
+        }
+
+        // Decode a low-resolution RGB preview of the current (partially denoised) latent for live
+        // UI feedback. The latent is spatially average-pooled before the VAE decode so the preview
+        // costs a fraction of the full decode (and its conv/im2col scratch stays small enough to fit
+        // alongside the still-resident DiT weights). `packed` is the evolving [seq,64] latent.
+        private RgbImage DecodePreview(float[] packed, int Hl, int Wl)
+        {
+            float[] lat = Unpack(packed, Hl, Wl);          // [C, Hl, Wl]
+            DenormalizeLatent(lat, Hl, Wl);
+            // Pool so the largest latent dim is ~48 (=> ~384 px preview), capping cost at any output
+            // resolution; never below a 2x2 grid (the VAE conv stack needs a few cells).
+            int f = Math.Max(1, (Math.Max(Hl, Wl) + 47) / 48);
+            if (f > 1 && Hl / f >= 2 && Wl / f >= 2)
+            {
+                float[] small = DownsampleLatent(lat, Hl, Wl, f, out int Hs, out int Ws);
+                return Vae.Decode(new VaeLatent(C, Hs, Ws, small));
+            }
+            return Vae.Decode(new VaeLatent(C, Hl, Wl, lat));
+        }
+
+        // Average-pool each latent channel by an integer factor (drops a partial trailing row/col).
+        private static float[] DownsampleLatent(float[] lat, int H, int W, int f, out int Ho, out int Wo)
+        {
+            Ho = H / f; Wo = W / f;
+            int hw = H * W, hwo = Ho * Wo;
+            var outp = new float[(long)C * hwo];
+            float inv = 1f / (f * f);
+            for (int c = 0; c < C; c++)
+                for (int hi = 0; hi < Ho; hi++)
+                    for (int wi = 0; wi < Wo; wi++)
+                    {
+                        float sum = 0f;
+                        for (int dh = 0; dh < f; dh++)
+                            for (int dw = 0; dw < f; dw++)
+                                sum += lat[(long)c * hw + (hi * f + dh) * W + (wi * f + dw)];
+                        outp[(long)c * hwo + hi * Wo + wi] = sum * inv;
+                    }
+            return outp;
         }
 
         private float[] EncodePrompt(string prompt, out int condSeq)
