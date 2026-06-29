@@ -6309,6 +6309,21 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // to the bidi branch (mirrors the C# per-op exceptPositions path).
                 const bool q_except = is_except != nullptr && qi < N && is_except[qi] != 0;
                 ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
+                if (!q_except)
+                {
+                    // Fast path (no multimodal bidi): the unmasked (zero) keys form a
+                    // single contiguous band [lo, hi]: lo = sliding-window low bound,
+                    // hi = min(causal threshold, last real key). Fill it analytically
+                    // instead of a per-element branch + fp16 convert over [0, kvLen)
+                    // — this host loop is O(N*kvLen) and at multi-thousand-token
+                    // prefill it blocks the GPU (the [N,N] mask reaches 134M entries).
+                    const int lo = (low > 0) ? low : 0;
+                    const int hi = std::min(threshold, validLen - 1);
+                    std::fill(row, row + kvLen, neg_inf);
+                    if (hi >= lo && lo < kvLen)
+                        std::fill(row + lo, row + std::min(hi + 1, kvLen), zero_val);
+                    continue;
+                }
                 for (int ki = 0; ki < kvLen; ki++)
                 {
                     bool causal = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
@@ -6319,6 +6334,45 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
             mask_cache.push_back({kvLen, validLen, window, mt, idx});
+            return mt;
+        };
+
+        // Tiled sliding-window attention (mirrors llama.cpp's iSWA windowed KV):
+        // a SWA prefill that overflows the window (start_pos==0, N > window) attends
+        // the FRESH chunk's full N keys with a sliding-window mask, but ggml flash
+        // only skips the causal-FUTURE region (flash_attn_mask_to_KV_max), not the
+        // sliding-window PAST, so a single full-N flash iterates [0, qpos] per query
+        // and wastes ~93% of its work at long prefill (local flash was ~10% of
+        // prefill GPU time). Instead split the N queries into tiles of TS_G4_SWA_TILE
+        // (default 1024, a multiple of the 512 window so each tile's key slice stays
+        // FATTN_KQ_STRIDE-aligned -> keeps the fast GQA flash kernel). Each query
+        // tile attends only its window slice [tileStart-W, tileEnd) of the fresh K/V.
+        // Bidi multimodal spans (is_except) need forward attention past a query tile
+        // -> the caller falls back to the full-N flash there.
+        static const bool swa_tiled = []{ const char* e = std::getenv("TS_G4_SWA_TILED"); return e == nullptr || e[0] != '0'; }();
+        static const int swa_tile = []{ const char* e = std::getenv("TS_G4_SWA_TILE"); int v = e ? std::atoi(e) : 0; return (v >= 256) ? v : 1024; }();
+        struct TileMask { int kLen; int qLen; int qStart; int kStart; int window; ggml_tensor* tensor; int dataIdx; };
+        std::vector<TileMask> tile_mask_cache;
+        auto get_window_tile_mask = [&](int kLen, int qLen, int qStart, int kStart, int window) -> ggml_tensor* {
+            for (auto& m : tile_mask_cache)
+                if (m.kLen == kLen && m.qLen == qLen && m.qStart == qStart && m.kStart == kStart && m.window == window) return m.tensor;
+            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kLen, qLen);
+            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kLen) * qLen);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int qi = 0; qi < qLen; qi++)
+            {
+                const int gQ = qStart + qi;
+                // keep global key gK in (gQ - window, gQ]  ->  ki in [gQ-window+1-kStart, gQ-kStart]
+                int lo = gQ - window + 1 - kStart; if (lo < 0) lo = 0;
+                int hi = gQ - kStart; if (hi > kLen - 1) hi = kLen - 1;
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kLen];
+                std::fill(row, row + kLen, neg_inf);
+                if (hi >= lo) std::fill(row + lo, row + hi + 1, zero_val);
+            }
+            const int idx = static_cast<int>(mask_data_store.size());
+            mask_data_store.push_back(std::move(data));
+            tile_mask_cache.push_back({kLen, qLen, qStart, kStart, window, mt, idx});
             return mt;
         };
 
@@ -6496,16 +6550,57 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // (kvLen=attnKvLen, validLen=attendLen, window=maskWindow) encodes causal
             // + sliding-window + flash-padding + multimodal-bidi semantics.
             ggml_tensor* q_t = ggml_permute(ctx, q_rope, 0, 2, 1, 3);                   // [hd, N, num_heads]
-            ggml_tensor* fa_mask = get_causal_mask(attnKvLen, attendLen, maskWindow);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_t, k_full, v_full, fa_mask, 1.0f, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
-            if (!backend_supports_op(attn_out))
+            ggml_tensor* attn_out;
+            // SWA window overflow (swaFresh/swaFreshShared) attends the fresh chunk's
+            // N keys with a window mask (maskWindow>0). Tile the queries so each tile
+            // only reads its window slice instead of the full N (see comment above).
+            // Not applied to global / circular-cache reads (maskWindow==0), the rare
+            // multimodal-bidi case (handled by the full-N mask), or tiny N.
+            // Only tile when there are >= 3 tiles (N > 2*tile): below that the full-N
+            // flash's wasted (masked) work is small and the per-tile launch + concat
+            // overhead would erase the win.
+            const bool use_tiled = swa_tiled && maskWindow > 0 && is_except == nullptr
+                && N > 2 * swa_tile && attendLen == N && attnKvLen == N;
+            if (use_tiled)
             {
-                // No supported flash kernel for this shape (e.g. an exotic head_dim):
-                // fall back to the per-op verify rather than the numerically-fragile
-                // manual chain.
-                set_last_error("Gemma4 model verify: flash attention unsupported for this shape; use per-op path.");
-                return 0;
+                ggml_tensor* acc = nullptr;
+                for (int qs = 0; qs < N; qs += swa_tile)
+                {
+                    const int qe = (qs + swa_tile < N) ? (qs + swa_tile) : N;
+                    const int qLen = qe - qs;
+                    const int ks = (qs > maskWindow) ? (qs - maskWindow) : 0;
+                    const int kLen = qe - ks;
+                    ggml_tensor* q_tile = ggml_view_3d(ctx, q_t, info.hd, qLen, num_heads,
+                        q_t->nb[1], q_t->nb[2], static_cast<std::size_t>(qs) * q_t->nb[1]);
+                    ggml_tensor* k_tile = ggml_view_3d(ctx, k_full, info.hd, kLen, info.kvHeads,
+                        k_full->nb[1], k_full->nb[2], static_cast<std::size_t>(ks) * k_full->nb[1]);
+                    ggml_tensor* v_tile = ggml_view_3d(ctx, v_full, info.hd, kLen, info.kvHeads,
+                        v_full->nb[1], v_full->nb[2], static_cast<std::size_t>(ks) * v_full->nb[1]);
+                    ggml_tensor* m_tile = get_window_tile_mask(kLen, qLen, qs, ks, maskWindow);
+                    ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_tile, k_tile, v_tile, m_tile, 1.0f, 0.0f, 0.0f);
+                    ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                    if (qs == 0 && !backend_supports_op(fa))
+                    {
+                        set_last_error("Gemma4 model verify: tiled flash attention unsupported for this shape; use per-op path.");
+                        return 0;
+                    }
+                    acc = (acc == nullptr) ? fa : ggml_concat(ctx, acc, fa, 2);          // along the query (N) dim
+                }
+                attn_out = acc;                                                          // [hd, num_heads, N]
+            }
+            else
+            {
+                ggml_tensor* fa_mask = get_causal_mask(attnKvLen, attendLen, maskWindow);
+                attn_out = ggml_flash_attn_ext(ctx, q_t, k_full, v_full, fa_mask, 1.0f, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+                if (!backend_supports_op(attn_out))
+                {
+                    // No supported flash kernel for this shape (e.g. an exotic head_dim):
+                    // fall back to the per-op verify rather than the numerically-fragile
+                    // manual chain.
+                    set_last_error("Gemma4 model verify: flash attention unsupported for this shape; use per-op path.");
+                    return 0;
+                }
             }
             // flash_attn_ext returns [hd, num_heads, N, 1] — each column holds all
             // heads contiguously, exactly what the O projection wants.
@@ -6519,11 +6614,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // FFN: norm -> gate_up -> gelu*up -> down -> post_ffn norm -> residual
             ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), lt.ffn_norm_w);
             ggml_tensor* gu = ggml_mul_mat(ctx, lt.gu_w, ffn_normed);                   // [2*ff, N]
-            std::int64_t ff = gu_ne1_arr[l] / 2;
-            ggml_tensor* gate = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, N, gu->nb[1], 0));
-            ggml_tensor* up = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, N, gu->nb[1],
-                static_cast<std::size_t>(ff) * sizeof(float)));
-            ggml_tensor* ffn_hidden = ggml_mul(ctx, ggml_gelu(ctx, gate), up);          // [ff, N]
+            // Fused GeGLU: gelu(gate) * up computed directly on the contiguous
+            // [2*ff, N] tensor (gate = first half, up = second half -> non-swapped
+            // ggml_geglu). Avoids two full [ff, N] ggml_cont materializations plus
+            // the separate gelu/mul ops (cpy_scalar F32->F32 was ~14% of prefill
+            // GPU time). Bit-identical: ggml_vec_geglu / op_gelu use the same tanh
+            // gelu as the old ggml_gelu. Mirrors llama.cpp build_ffn (LLM_FFN_GELU).
+            ggml_tensor* ffn_hidden = ggml_geglu(ctx, gu);                              // [ff, N]
             ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, ffn_hidden);               // [hidden, N]
             ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down, eps), lt.post_ffn_norm_w);
             ggml_tensor* residual2 = ggml_add(ctx, residual1, post_ffn);
@@ -6553,7 +6650,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
         ggml_set_output(out_hidden);
 
-        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 192 + 512;
+        // Tiled SWA attention adds ~8 nodes (flash + concat + views + mask) per query
+        // tile per local layer; budget for it so the graph never overflows.
+        const int swa_tiles = (swa_tiled && N > swa_tile) ? ((N + swa_tile - 1) / swa_tile) : 1;
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (192 + static_cast<std::size_t>(swa_tiles) * 8) + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         for (int l = 0; l < num_layers; l++)
         {
@@ -6674,6 +6774,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
 
         for (auto& m : mask_cache)
+            ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
+                mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
+        for (auto& m : tile_mask_cache)
             ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
                 mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
 
@@ -8355,11 +8458,14 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                 const int threshold = nPast + qi;
                 const int low = (window > 0) ? (threshold - window + 1) : 0;
                 ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
-                for (int ki = 0; ki < kvLen; ki++)
-                {
-                    bool keep = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
-                    row[ki] = keep ? zero_val : neg_inf;
-                }
+                // Unmasked keys form a single contiguous band [lo, hi]; fill it
+                // analytically rather than a per-element branch over [0, kvLen)
+                // (the host loop blocks the GPU at long prefill — see dense verify).
+                const int lo = (low > 0) ? low : 0;
+                const int hi = std::min(threshold, validLen - 1);
+                std::fill(row, row + kvLen, neg_inf);
+                if (hi >= lo && lo < kvLen)
+                    std::fill(row + lo, row + std::min(hi + 1, kvLen), zero_val);
             }
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
@@ -8516,9 +8622,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             // ===== Dense shared FFN (N tokens) =====
             ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.ffn_norm_w);  // [H, N]
             ggml_tensor* gu = ggml_mul_mat(ctx, t.gu_w, ffn_normed);                    // [2*ffDense, N]
-            ggml_tensor* dense_gate = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, N, gu->nb[1], 0));
-            ggml_tensor* dense_up = ggml_cont(ctx, ggml_view_2d(ctx, gu, ffDense, N, gu->nb[1], static_cast<std::size_t>(ffDense) * sizeof(float)));
-            ggml_tensor* dense_h = ggml_mul(ctx, ggml_gelu(ctx, dense_gate), dense_up); // [ffDense, N]
+            // Fused GeGLU (gate = first half, up = second half) — avoids two full
+            // [ffDense, N] ggml_cont copies + separate gelu/mul (matches the MoE
+            // expert path below, which already uses ggml_geglu_split).
+            ggml_tensor* dense_h = ggml_geglu(ctx, gu);                                 // [ffDense, N]
             ggml_tensor* dense_down = ggml_mul_mat(ctx, t.down_w, dense_h);             // [H, N]
             ggml_tensor* mlp = ggml_mul(ctx, ggml_rms_norm(ctx, dense_down, eps), t.post_ffw_norm_1_w);
 
