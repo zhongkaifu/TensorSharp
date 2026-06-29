@@ -87,6 +87,24 @@ namespace
         std::fill_n(mask.begin(), clamped_valid, static_cast<ggml_fp16_t>(0));
     }
 
+    // Upload one captured-decode INPUT tensor without a per-copy stream sync.
+    // On CUDA the copy is queued on the backend stream (ordered ahead of the graph
+    // replay that reads it; the post-compute download syncs the stream), so we drop
+    // the redundant cudaStreamSynchronize that the synchronous setter issues per
+    // call — meaningful when a decode token refreshes ~2*num_layers small inputs.
+    // CUDA pageable host->device async is host-synchronous w.r.t. the source, so a
+    // caller's transient buffer (e.g. a per-layer mask vector) is safe to free right
+    // after this returns. Non-CUDA backends fall back to the synchronous setter.
+    inline void decode_input_set_async(ggml_tensor* tensor, const void* data, std::size_t bytes)
+    {
+        if (tensor == nullptr || data == nullptr || bytes == 0)
+            return;
+        if (g_backend_type == BACKEND_TYPE_CUDA)
+            ggml_backend_tensor_set_async(g_backend, tensor, data, 0, bytes);
+        else
+            ggml_backend_tensor_set(tensor, data, 0, bytes);
+    }
+
     ggml_tensor* view_kv_cache_window(
         ggml_context* ctx,
         ggml_tensor* cache,
@@ -4259,20 +4277,28 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         {
             auto t_start = std::chrono::high_resolution_clock::now();
             host_read_barrier();
-            ggml_backend_tensor_set(dc->hidden_in, hidden_data, 0, static_cast<std::size_t>(hidden_size) * sizeof(float));
+            // Per-token input refresh. These ~N*2 small host->device copies feed the
+            // captured graph's INPUT tensors; they are not graph nodes. Issue them
+            // ASYNC on the backend stream so they queue (stream-ordered) ahead of the
+            // graph replay below instead of each blocking on its own stream sync —
+            // the replay and the trailing finalize_compute_with_download() sync make
+            // the data visible at the right points. (CUDA pageable H2D async is
+            // host-synchronous w.r.t. the source, so the per-iteration mask buffer is
+            // safe to free immediately.) Removes ~N redundant per-copy syncs/token.
+            decode_input_set_async(dc->hidden_in, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
             std::int32_t pos_val = position;
-            ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            decode_input_set_async(dc->pos_tensor, &pos_val, sizeof(std::int32_t));
             if (dc->ple_input != nullptr && ple_data != nullptr)
-                ggml_backend_tensor_set(dc->ple_input, ple_data, 0, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
+                decode_input_set_async(dc->ple_input, ple_data, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
             for (int l = 0; l < num_layers; l++)
             {
                 if (dc->kv_index[l] != nullptr)
-                    ggml_backend_tensor_set(dc->kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                    decode_input_set_async(dc->kv_index[l], &pwrite[l], sizeof(std::int64_t));
                 if (dc->attn_mask[l] != nullptr && !li[l].isShared)
                 {
                     std::vector<ggml_fp16_t> md;
                     fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
-                    ggml_backend_tensor_set(dc->attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                    decode_input_set_async(dc->attn_mask[l], md.data(), md.size() * sizeof(ggml_fp16_t));
                 }
             }
             auto t_setup = std::chrono::high_resolution_clock::now();
@@ -7672,18 +7698,21 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
         {
             auto t_start = std::chrono::high_resolution_clock::now();
             host_read_barrier();
-            ggml_backend_tensor_set(dc->hidden_in, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
+            // Async per-token input refresh (stream-ordered ahead of the captured
+            // replay below); see the dense TSGgml_Gemma4ModelDecode reuse path for
+            // the full rationale. Removes ~N redundant per-copy stream syncs/token.
+            decode_input_set_async(dc->hidden_in, hidden_data, static_cast<std::size_t>(H) * sizeof(float));
             std::int32_t pos_val = position;
-            ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
+            decode_input_set_async(dc->pos_tensor, &pos_val, sizeof(std::int32_t));
             for (int l = 0; l < num_layers; l++)
             {
                 if (dc->kv_index[l] != nullptr)
-                    ggml_backend_tensor_set(dc->kv_index[l], &pwrite[l], 0, sizeof(std::int64_t));
+                    decode_input_set_async(dc->kv_index[l], &pwrite[l], sizeof(std::int64_t));
                 if (dc->attn_mask[l] != nullptr)
                 {
                     std::vector<ggml_fp16_t> md;
                     fill_flash_attn_mask(md, pwindow[l], pvalid[l]);
-                    ggml_backend_tensor_set(dc->attn_mask[l], md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+                    decode_input_set_async(dc->attn_mask[l], md.data(), md.size() * sizeof(ggml_fp16_t));
                 }
             }
             auto t_setup = std::chrono::high_resolution_clock::now();
@@ -8311,6 +8340,18 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         const float eps = layers[0].eps;
         const int kvType = layers[0].kv_cache_type;
 
+        // Tile the MoE expert FFN over the token dim to bound the gallocr peak.
+        // The expert intermediates are [*, nUsed, N] — nUsed(=8)x the per-token
+        // width — so at long prefill they dominate VRAM and spill into shared
+        // memory on a near-full GPU (the 26B-A4B leaves ~800 MB free on a 16 GB
+        // card). The experts are token-independent (router/sel/weights are per
+        // token), so processing the token dim in tiles and letting the lifetime
+        // gallocr REUSE one tile's intermediate buffer across tiles bounds the
+        // peak to moeTile tokens instead of N — mirroring llama.cpp's n_ubatch.
+        // Default 1024; env TS_G4_MOE_FFN_TILE overrides (set huge to disable).
+        static const int moe_ffn_tile_env = []{ const char* e = std::getenv("TS_G4_MOE_FFN_TILE"); int v = e ? std::atoi(e) : 0; return v > 0 ? v : 1024; }();
+        const int moeTile = (moe_ffn_tile_env < N) ? moe_ffn_tile_env : N;
+
         for (int l = 0; l < num_layers; l++)
         {
             if (layers[l].is_shared != 0)
@@ -8653,22 +8694,40 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             }
             ggml_tensor* w_final = ggml_reshape_3d(ctx, w_2d, 1, nUsed, N);
 
-            // ===== MoE experts (N tokens) =====
+            // ===== MoE experts (N tokens), tiled over the token dim =====
+            // Token-independent: each token's selected experts/weights are fixed
+            // by the router above, so we can process the token dim in tiles of
+            // moeTile. The lifetime gallocr reuses each tile's [*, nUsed, T]
+            // intermediates, so the peak is bounded to moeTile tokens. Byte-
+            // identical to the untiled path (which it IS when moeTile >= N).
             ggml_tensor* moe_in = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.pre_ffw_norm_2_w);  // [H, N]
             ggml_tensor* moe_in_3d = ggml_reshape_3d(ctx, moe_in, H, 1, N);
-            ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, moe_in_3d, sel);   // [2*ffMoe, nUsed, N]
-            ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-            ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
-            ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);             // [ffMoe, nUsed, N]
-            ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel);  // [H, nUsed, N]
-            ggml_tensor* weighted = ggml_mul(ctx, moe_down, w_final);                   // [H, nUsed, N]
-
-            // aggregate over the nUsed dim → [H, N] (strided view per used-expert slot)
-            ggml_tensor* moe_out = ggml_view_2d(ctx, weighted, H, N, weighted->nb[2], 0);
-            for (int u = 1; u < nUsed; ++u)
+            ggml_tensor* moe_out = nullptr;
+            for (int t0 = 0; t0 < N; t0 += moeTile)
             {
-                ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, N, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
-                moe_out = ggml_add(ctx, moe_out, view_u);
+                const int T = (N - t0 < moeTile) ? (N - t0) : moeTile;
+                ggml_tensor* in_t = ggml_view_3d(ctx, moe_in_3d, H, 1, T,
+                    moe_in_3d->nb[1], moe_in_3d->nb[2], static_cast<std::size_t>(t0) * moe_in_3d->nb[2]);
+                ggml_tensor* sel_t = ggml_view_2d(ctx, sel, nUsed, T, sel->nb[1],
+                    static_cast<std::size_t>(t0) * sel->nb[1]);
+                ggml_tensor* wfin_t = ggml_view_3d(ctx, w_final, 1, nUsed, T,
+                    w_final->nb[1], w_final->nb[2], static_cast<std::size_t>(t0) * w_final->nb[2]);
+
+                ggml_tensor* gate_up = ggml_mul_mat_id(ctx, t.gate_up_exps_t, in_t, sel_t);   // [2*ffMoe, nUsed, T]
+                ggml_tensor* moe_gate = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                ggml_tensor* moe_up = ggml_view_3d(ctx, gate_up, ffMoe, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], static_cast<std::size_t>(ffMoe) * gate_up->nb[0]);
+                ggml_tensor* moe_act = ggml_geglu_split(ctx, moe_gate, moe_up);               // [ffMoe, nUsed, T]
+                ggml_tensor* moe_down = ggml_mul_mat_id(ctx, t.down_exps_t, moe_act, sel_t);  // [H, nUsed, T]
+                ggml_tensor* weighted = ggml_mul(ctx, moe_down, wfin_t);                      // [H, nUsed, T]
+
+                // aggregate over the nUsed dim → [H, T] (strided view per used-expert slot)
+                ggml_tensor* out_t = ggml_view_2d(ctx, weighted, H, T, weighted->nb[2], 0);
+                for (int u = 1; u < nUsed; ++u)
+                {
+                    ggml_tensor* view_u = ggml_view_2d(ctx, weighted, H, T, weighted->nb[2], static_cast<std::size_t>(u) * weighted->nb[1]);
+                    out_t = ggml_add(ctx, out_t, view_u);
+                }
+                moe_out = (moe_out == nullptr) ? out_t : ggml_concat(ctx, moe_out, out_t, 1);  // [H, t0+T]
             }
             ggml_tensor* moe_normed = ggml_mul(ctx, ggml_rms_norm(ctx, moe_out, eps), t.post_ffw_norm_2_w);
             mlp = ggml_add(ctx, mlp, moe_normed);
@@ -8686,7 +8745,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
         ggml_tensor* out_cpy = ggml_cpy(ctx, hidden, hidden_out);
         ggml_set_output(out_cpy);
 
-        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * 256 + 512;
+        // Each MoE FFN token-tile adds ~25 view/op nodes (+ a concat); budget for
+        // the tiled experts on top of the ~256 nodes the rest of the layer uses.
+        const int tilesPerLayer = (N + moeTile - 1) / moeTile;
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (256 + static_cast<std::size_t>(tilesPerLayer) * 32) + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         for (int l = 0; l < num_layers; l++)
         {

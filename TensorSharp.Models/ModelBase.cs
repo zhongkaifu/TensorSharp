@@ -3214,7 +3214,16 @@ namespace TensorSharp.Models
             {
                 // MLX stays conservative (short prompt); CUDA/GGML use a longer one
                 // to reach the fused-verify prefill path that short prompts bypass.
+                // TS_PREFILL_WARMUP_LEN overrides (e.g. to pre-size the prefill
+                // gallocr on roomy GPUs); a larger value does NOT reliably help a
+                // near-full GPU because the legacy ForwardRefill warmup graph sizes
+                // the reused gallocr differently than the engine prefill graph.
                 int warmupLength = _backend == BackendType.Mlx ? 32 : 1024;
+                {
+                    string wl = Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP_LEN");
+                    if (!string.IsNullOrEmpty(wl) && int.TryParse(wl, out int wlv) && wlv >= 2)
+                        warmupLength = wlv;
+                }
                 if (MaxContextLength > 0)
                     warmupLength = Math.Min(warmupLength, Math.Max(2, MaxContextLength / 4));
 
