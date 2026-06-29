@@ -3,8 +3,8 @@
 Automated, repeatable benchmark that compares **TensorSharp**, **llama.cpp** and
 **vLLM** on the *same* GGUF files, the *same* host, through one uniform OpenAI
 `/v1/chat/completions` surface — across **text, image, audio, video,
-single-turn, multi-turn, function-call and structured-output** scenarios on
-**GPU and CPU** backends.
+single-turn, multi-turn, function-call, structured-output and long-prompt
+prefill** scenarios on **GPU and CPU** backends.
 
 Model families under test: **Gemma 4** (`gemma4-e4b` dense multimodal Q8_0 from
 `models/`, plus `gemma4-12b` dense + `gemma4-26b-a4b` MoE, both QAT UD-Q4_K_XL
@@ -46,7 +46,8 @@ is dropped entirely when that engine produced nothing comparable for the model
 | `scenarios.py` | per-scenario, engine-aware request builders |
 | `run_matrix.py` | orchestrator — launches one server per `(engine, backend, model)`, runs scenarios, writes per-cell JSON |
 | `report.py` | aggregates `results/*.json` → `docs/engine_comparison_report.md` + `results/results.csv` |
-| `assets/` | long-context prompt, `tools/weather.json` |
+| `assets/` | long-context prompt (`long_text.txt`), prefill corpus (`prefill_corpus.txt`), `tools/weather.json` |
+| `benchmark_config_prefill.json` | **prefill-only** variant — the same long-prompt sweep (2k/4k/8k/16k tokens) but with the multimodal / diffusion scenarios and models stripped out, for a focused prefill run; select with `--config` |
 
 ## Configuration
 
@@ -140,6 +141,59 @@ relocate the whole set with `BENCH_GEMMA4_QAT_DIR`); the E4B draft defaults to
 **MTP on-vs-off** table with the
 per-cell speedup (a value `< 1.0×` means speculation cost more than it saved —
 expected where the fused full-model decode path is already fastest).
+
+### Prefill (prompt-processing) benchmark (`prefill_2k` / `4k` / `8k` / `16k`)
+
+The plain text scenarios' longest prompt (`text_long`) is only ~1.2k tokens, where
+time-to-first-token is dominated by **fixed per-request overhead** (HTTP,
+scheduling, cold-graph launch, first-token sampling) rather than prefill compute —
+so `prefill_tps` there understates and noisily estimates true prompt-processing
+throughput. The `prefill_<N>` scenarios drive the prompt to controlled lengths long
+enough for the per-token prefill cost to separate cleanly from that fixed overhead.
+
+These scenarios are part of the **main `benchmark_config.json`** matrix and run by
+default (the no-flag run includes the 2k/4k/8k/16k sweep). For a *focused* prefill
+run — just the sweep, with the multimodal / diffusion scenarios and models stripped
+out and results written to a separate `results_prefill/` — use the dedicated
+**`benchmark_config_prefill.json`**:
+
+```bash
+# Just the prefill sweep, default matrix (selecting the scenarios from the main config)
+python run_matrix.py --scenarios prefill_2k,prefill_4k,prefill_8k,prefill_16k
+
+# Focused prefill-only run (TensorSharp vs llama.cpp, GPU, separate results dir)
+python run_matrix.py --config benchmark_config_prefill.json
+
+# One length, one model
+python run_matrix.py --config benchmark_config_prefill.json \
+    --models gemma4-12b --scenarios prefill_8k
+
+# Report it (writes into results_prefill/ per the config's results_dir)
+python report.py --config benchmark_config_prefill.json
+```
+
+How it works:
+
+- Scenarios `prefill_2k` / `prefill_4k` / `prefill_8k` / `prefill_16k` slice
+  `assets/prefill_corpus.txt` to a target **token** budget (the id names the
+  target; `scenarios._prefill` converts it to a character budget at
+  ~4.6 chars/token, tiling the corpus when a target exceeds it). The label is
+  nominal — `prefill_tps = prompt_tokens / ttft` always uses each engine's own
+  reported `prompt_tokens`, so tokenizer differences across engines are handled
+  exactly.
+- Each length gets a **unique position-0 header** (`[prefill-benchmark target=N …]`)
+  so a longer prompt cannot hit the server's prompt/prefix cache off a shorter one
+  run earlier on the same server (which would report a near-zero TTFT and a wildly
+  inflated `prefill_tps`).
+- `max_tokens` is tiny (8) — only the prefill phase / TTFT matters here. The main
+  config sets `llama.context_size` to 24576 so the 16k prompt fits with headroom,
+  and `run_matrix.py` additionally **auto-raises** llama.cpp's context at run time
+  to fit whatever prefill lengths are selected (`max_prefill * 1.3 + 128`), so you
+  never have to hand-tune it for the standard sweep.
+
+Add lengths by naming them: `--scenarios prefill_1k,prefill_32k` works without a
+config edit (`prefill_<N>` / `prefill_<N>k` is parsed generically); the driver
+auto-raises llama.cpp's context to fit, so no `llama.context_size` edit is needed.
 
 ### Parallel requests (`--concurrency 1,4,8`)
 

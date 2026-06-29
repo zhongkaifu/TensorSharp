@@ -1,5 +1,5 @@
 {
-  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting.",
+  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected. For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
 
   "paths": {
     "model_root": "C:/Works/models",
@@ -58,6 +58,16 @@
       "mtp_supported": true,
       "mtp_draft": null
     },
+    "qwen36-35b-a3b-q4": {
+      "display": "Qwen 3.6 35B-A3B (UD-Q4_K_M, MoE)",
+      "family": "qwen36",
+      "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "modalities": ["text", "image"],
+      "size_class": "large",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
     "diffusiongemma": {
       "display": "DiffusionGemma 26B-A4B it (Q3_K_M, text-diffusion)",
       "family": "diffusiongemma",
@@ -80,7 +90,12 @@
     "json_mode": {"kind": "json_mode", "description": "Structured output (response_format json_object)", "max_tokens": 128},
     "image": {"kind": "image", "description": "Image understanding (test.jpg)", "modality": "image", "max_tokens": 128},
     "audio": {"kind": "audio", "description": "Audio understanding (~45 s speech)", "modality": "audio", "max_tokens": 128},
-    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 128}
+    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 128},
+
+    "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_4k": {"kind": "text", "description": "Prefill throughput @ ~4k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_8k": {"kind": "text", "description": "Prefill throughput @ ~8k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8}
   },
 
   "engines": {
@@ -97,7 +112,7 @@
   },
 
   "llama": {
-    "context_size": 8192,
+    "context_size": 24576,
     "extra_args": ["--jinja"]
   },
 
@@ -105,8 +120,8 @@
 
   "defaults": {
     "engines": ["tensorsharp", "llamacpp", "vllm"],
-    "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "diffusiongemma"],
-    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
+    "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "qwen36-35b-a3b-q4", "diffusiongemma"],
+    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video", "prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k"],
     "backends": ["gpu", "cpu"],
     "mtp_modes": [false],
     "concurrency": [1],

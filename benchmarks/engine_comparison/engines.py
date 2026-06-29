@@ -85,6 +85,16 @@ def run_openai_chat(base_url: str, model_name: str, messages: list, *,
         body["response_format"] = response_format
     if stream:
         body["stream_options"] = {"include_usage": True}
+        # Ask the server to attach its own generation timer to the stream
+        # (llama.cpp + TensorSharp both honor this). The client-side window
+        # `t_last - t_first` over a handful of tokens is NOT a reliable decode
+        # rate: some servers batch several tokens into one SSE frame and flush
+        # them in a burst, compressing the measured window and inflating the
+        # client rate (e.g. ~64 t/s reported for a true ~40 t/s at max_tokens=8).
+        # The server timer measures actual compute and is burst-immune, so we
+        # prefer it for decode_tps when present (see `_run_streaming`). Unknown
+        # to an engine that ignores it; harmless.
+        body["timings_per_token"] = True
 
     if not stream:
         return _run_blocking(url, body, timeout_s)
@@ -135,6 +145,7 @@ def _run_streaming(url: str, body: dict, timeout_s: float) -> dict:
     tool_names: list[str] = []
     finish_reason = ""
     usage = {}
+    srv_timings: dict = {}        # engine-reported generation timer (burst-immune)
 
     with requests.post(url, json=body, stream=True,
                        timeout=(30, timeout_s)) as resp:
@@ -153,6 +164,8 @@ def _run_streaming(url: str, body: dict, timeout_s: float) -> dict:
                 continue
             if chunk.get("usage"):
                 usage = chunk["usage"]
+            if chunk.get("timings"):
+                srv_timings = chunk["timings"]
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -194,6 +207,16 @@ def _run_streaming(url: str, body: dict, timeout_s: float) -> dict:
     decode_window = (t_last - t_first) if (t_first and t_last and t_last > t_first) else 0.0
     decode_tps = ((completion - 1) / decode_window) if (decode_window > 0 and completion > 1) else 0.0
     prefill_tps = (prompt / (ttft_ms / 1000.0)) if (ttft_ms > 0 and prompt) else 0.0
+
+    # Prefer the engine's own decode timer (burst-immune) over the streamed-chunk
+    # window. `predicted_per_second` is generation-phase tok/s as measured inside
+    # the server, independent of how the SSE frames were batched/flushed on the
+    # wire. This removes the client-side measurement artifact that otherwise makes
+    # a burst-flushing server look ~1.5-2x faster than its true compute at small
+    # max_tokens. Falls back to the streamed estimate when no timer is reported.
+    pps = srv_timings.get("predicted_per_second") if srv_timings else None
+    if pps and pps > 0:
+        decode_tps = float(pps)
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,

@@ -1,0 +1,93 @@
+{
+  "_comment": "Dedicated PREFILL (prompt-processing) benchmark config. Runs only the long-prompt prefill sweep so prefill_tps (= prompt_tokens / ttft) is measured on prompts long enough that fixed per-request overhead no longer dominates. Select it with: python run_matrix.py --config benchmark_config_prefill.json  (and report.py --config benchmark_config_prefill.json). Everything is self-contained, same as benchmark_config.json; only the scenario set, the llama context size, max-tokens, and the defaults differ. The prompt text is sliced from assets/prefill_corpus.txt by scenarios._prefill; the scenario id (prefill_2k / prefill_4k / ...) names the target token count.",
+
+  "paths": {
+    "model_root": "C:/Works/models",
+    "results_dir": "${here}/results_prefill",
+    "gemma4_qat_dir": "${model_root}/gemma_mtp/qat",
+    "tensorsharp_server_dll": null,
+    "tensorsharp_port": 5000,
+    "llama_server_exe": "C:/Works/llama.cpp/build-cuda/bin/Release/llama-server.exe",
+    "llama_port": 5001,
+    "vllm_base_url": "http://127.0.0.1:8000",
+    "media": {
+      "image": "C:/Works/test.jpg",
+      "audio": "C:/Works/obama_first_45_secs.mp3",
+      "video": "C:/Works/concert.mp4"
+    }
+  },
+
+  "models": {
+    "gemma4-e4b": {
+      "display": "Gemma 4 E4B it (Q8_0, dense multimodal)",
+      "family": "gemma4",
+      "gguf": {"path": "${model_root}/gemma-4-E4B-it-uncensored-Q8_0.gguf", "env": "BENCH_GEMMA4_E4B_GGUF"},
+      "mmproj": {"path": "${model_root}/gemma-4-E4B-mmproj-F16.gguf", "env": "BENCH_GEMMA4_E4B_MMPROJ"},
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "small"
+    },
+    "gemma4-12b": {
+      "display": "Gemma 4 12B it (QAT UD-Q4_K_XL, dense)",
+      "family": "gemma4",
+      "gguf": "${gemma4_qat_dir}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+      "mmproj": "${gemma4_qat_dir}/gemma-4-12B-mmproj-BF16.gguf",
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "small"
+    },
+    "gemma4-26b-a4b": {
+      "display": "Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE)",
+      "family": "gemma4",
+      "gguf": "${gemma4_qat_dir}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+      "mmproj": "${gemma4_qat_dir}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+      "modalities": ["text", "image", "audio", "video"],
+      "size_class": "large"
+    },
+    "qwen36-35b-a3b": {
+      "display": "Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)",
+      "family": "qwen36",
+      "gguf": "${model_root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+      "mmproj": "${model_root}/Qwen3.6-35B-A3B-mmproj-F16.gguf",
+      "modalities": ["text", "image"],
+      "size_class": "large"
+    }
+  },
+
+  "scenarios": {
+    "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens", "max_tokens": 8},
+    "prefill_4k": {"kind": "text", "description": "Prefill throughput @ ~4k prompt tokens", "max_tokens": 8},
+    "prefill_8k": {"kind": "text", "description": "Prefill throughput @ ~8k prompt tokens", "max_tokens": 8},
+    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens", "max_tokens": 8}
+  },
+
+  "engines": {
+    "tensorsharp": {"display": "TensorSharp", "transport": "server", "backends": ["gpu", "cpu"]},
+    "llamacpp": {"display": "llama.cpp", "transport": "server", "backends": ["gpu", "cpu"]},
+    "vllm": {"display": "vLLM", "transport": "connect", "backends": ["gpu"]}
+  },
+
+  "backends": ["gpu", "cpu"],
+
+  "maps": {
+    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "ggml_cpu"},
+    "llama_ngl": {"gpu": 999, "cpu": 0}
+  },
+
+  "llama": {
+    "context_size": 24576,
+    "extra_args": ["--jinja"]
+  },
+
+  "ready_timeout_s": {"small": 600, "medium": 900, "large": 1200},
+
+  "defaults": {
+    "engines": ["tensorsharp", "llamacpp"],
+    "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b"],
+    "scenarios": ["prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k"],
+    "backends": ["gpu"],
+    "mtp_modes": [false],
+    "concurrency": [1],
+    "max_tokens": 8,
+    "warmup": 1,
+    "server_max_tokens": 32
+  }
+}

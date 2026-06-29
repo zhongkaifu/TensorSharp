@@ -492,9 +492,7 @@ threshold is 5 × 10⁻³ absolute / 5 × 10⁻² relative). This is the expecte
 FP32 noise floor for accumulating 256–2048 token-step multiplications across
 30 layers under different summation orders (Metal MM accumulation vs. scalar
 CPU). Top sampled tokens match exactly between the two paths at all three
-lengths. The full per-prefill-length JSON is generated at
-`benchmarks/inference_matrix/results/qwen35__gdn_chunked.json`, reproducible via
-[`benchmarks/inference_matrix/scripts/run_qwen35_gdn_bench.py`](../../benchmarks/inference_matrix/scripts/run_qwen35_gdn_bench.py).
+lengths.
 
 ## 9. Decode optimization
 

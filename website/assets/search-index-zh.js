@@ -65,9 +65,8 @@ window.SEARCH_INDEX_ZH = [
   { t: "DiffusionGemma 文本扩散", p: "高级", u: "advanced.html#diffusion", s: "在 Gemma-4 MoE 主干上的块式 EntropyBound 去噪。", k: "diffusion 扩散 去噪 文本生成" },
 
   { t: "同台对比 vs llama.cpp", p: "基准测试", u: "benchmarks.html#head-to-head", s: "纯 .NET 的 TensorSharp 在每个模型上的 prefill 都快于 llama.cpp（几何平均 1.18×–1.88×），相同 GGUF + GPU 下 decode 持平：26B-A4B MoE 领跑，达 1.88× prefill / 1.69× TTFT；结构化输出 prefill 5.89×；多轮最高 1.93×。", k: "llama.cpp 对比 更快 加速 几何平均 moe prefill ttft 多轮 json 结构化输出 decode 持平 vs versus" },
-  { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "对比 llama.cpp 的同台评测与跨引擎推理矩阵。", k: "performance 性能 数字 吞吐 每秒 token" },
-  { t: "跨引擎矩阵", p: "基准测试", u: "benchmarks.html#cross-engine", s: "在相同 GGUF 文件上对比 TensorSharp vs llama.cpp 与 Ollama。", k: "llama.cpp ollama 对比" },
-  { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试、服务器集成测试与推理矩阵运行器。", k: "tests 测试 xunit 集成 ci" },
+  { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "在相同 GGUF 文件与硬件上对比 llama.cpp 的同台评测。", k: "performance 性能 数字 吞吐 每秒 token" },
+  { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试与服务器集成测试。", k: "tests 测试 xunit 集成 ci" },
 
   { t: "CLI 参数参考", p: "API 参考", u: "api-reference.html#cli-flags", s: "TensorSharp.Cli 命令行选项完整表。", k: "reference 参考 参数 cli 选项 表" },
   { t: "服务器参数参考", p: "API 参考", u: "api-reference.html#server-flags", s: "TensorSharp.Server 命令行选项完整表。", k: "reference 参考 参数 服务器 选项 表" },

@@ -63,6 +63,11 @@ int iters = EnvInt("TS_PREFILL_ITERS", 3);
 // sections and only times the legacy ForwardRefill path — fast iteration when
 // profiling the pure prefill compute with QWEN35_PREFILL_PROFILE=1.
 bool legacyOnly = string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_LEGACY_ONLY"), "1", StringComparison.Ordinal);
+// TS_PREFILL_ENGINE_ONLY=1 keeps only the engine/batched single-sequence section
+// (the server prefill path) and skips correctness, the legacy ForwardRefill
+// section and concurrent — clean isolation for nsys profiling of the fused
+// verify prefill graph.
+bool engineOnly = string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_ENGINE_ONLY"), "1", StringComparison.Ordinal);
 int blockSize = 256;
 
 Console.WriteLine($"[prefill-bench] loading {Path.GetFileName(modelPath)} backend={backend}");
@@ -150,7 +155,7 @@ _ = await TtftMsAsync(MakePrompt(256, 1), "warm2");
 // Correctness: the batched (fused-FFN) path's first greedy token must match the
 // legacy single-sequence ForwardRefill argmax for the same prompt. Run this on
 // the real model + backend so the fused dense-FFN kernel is validated end-to-end.
-if (!legacyOnly)
+if (!legacyOnly && !engineOnly)
 {
     Console.WriteLine();
     Console.WriteLine("==== Correctness (batched fused vs legacy ForwardRefill) ====");
@@ -196,6 +201,8 @@ foreach (int len in lens)
 // Legacy ForwardRefill path = what the CLI uses for prompt prefill (and the
 // server's per-sequence fallback). Times the model call directly, bypassing the
 // engine, so the legacy-path FFN fusion is measured on its own.
+if (!engineOnly)
+{
 Console.WriteLine();
 Console.WriteLine("==== Single-sequence prefill (legacy ForwardRefill = CLI path) ====");
 Console.WriteLine($"{"tokens",8} {"ms",10} {"tok/s",10}");
@@ -226,8 +233,9 @@ foreach (int len in lens)
     }
     Console.WriteLine($"{len,8} {ms,10:F1} {len / (ms / 1000.0),10:F0}{argmaxNote}");
 }
+} // !engineOnly (legacy section)
 
-if (!legacyOnly)
+if (!legacyOnly && !engineOnly)
 {
 Console.WriteLine();
 Console.WriteLine("==== Concurrent prefill (1024-token prompts, wall to all-first-token) ====");

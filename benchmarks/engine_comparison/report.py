@@ -105,13 +105,21 @@ def _present_columns(data: dict) -> list:
     return [c for c in COLUMNS if c in seen]
 
 
+def _scenario_rows(scen_map: dict) -> list:
+    """Scenario ids to render, in a stable order: declared scenarios first (in
+    registry order), then any extra ids present in the data (e.g. on-the-fly
+    `prefill_*` scenarios run against a config that did not declare them)."""
+    declared = list(config.SCENARIOS.keys())   # real declared keys only
+    ordered = [s for s in declared if s in scen_map]
+    extra = sorted(s for s in scen_map if s not in declared)
+    return ordered + extra
+
+
 def metric_table(scen_map: dict, cols: list, metric: str) -> str:
     head = "| Scenario | " + " | ".join(COL_LABEL[c] for c in cols) + " |"
     sep = "|---|" + "|".join(["---:"] * len(cols)) + "|"
     rows = [head, sep]
-    for scenario_id in config.SCENARIOS:
-        if scenario_id not in scen_map:
-            continue
+    for scenario_id in _scenario_rows(scen_map):
         col_map = scen_map[scenario_id]
         cells = [scenario_id]
         for c in cols:
@@ -171,9 +179,7 @@ def ratio_table(scen_map: dict, pairs: list, metric: str,
     head = "| Scenario | " + " | ".join(lbl for _, _, lbl in pairs) + " |"
     sep = "|---|" + "|".join(["---:"] * len(pairs)) + "|"
     rows = [head, sep]
-    for scenario_id in config.SCENARIOS:
-        if scenario_id not in scen_map:
-            continue
+    for scenario_id in _scenario_rows(scen_map):
         col_map = scen_map[scenario_id]
         cells = [scenario_id]
         for ts, ref, _ in pairs:

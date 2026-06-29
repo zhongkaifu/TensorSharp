@@ -100,7 +100,6 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | [HTTP API](#http-api) | 使用 Ollama 兼容、OpenAI 兼容或 Web UI SSE 端点 |
 | [按模型架构卡片](docs/models/README_zh-cn.md) | 阅读单个架构的端到端文档（来源、前向计算图、组件、参数，以及 TensorSharp 如何实现并优化 prefill 与 decode） |
 | [分页注意力 & 连续批处理](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md) | 了解 vLLM 风格的分页 KV 缓存、前缀共享与迭代级调度器 |
-| [推理基准矩阵](docs/inference_benchmark_matrix_zh-cn.md) | 在文本 / 多模态负载与 KV cache dtype 上对比 TensorSharp、llama.cpp 与 Ollama |
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 查看高影响运行时开关会影响哪些模型、后端与提示类型 |
 | [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |
 | [服务端 API 示例](TensorSharp.Server/API_EXAMPLES_zh-cn.md) | 复制完整的 curl 与 Python 示例 |
@@ -267,10 +266,8 @@ TensorSharp/
 ├── docs/                        # 开发者参考文档
 │   ├── models/                  # 按模型架构卡片（每个模型一份 .md，中英双语）
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # 分页 KV 缓存、前缀共享、调度器、按模型批处理状态
-│   ├── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
-│   └── inference_benchmark_matrix.md  # 跨引擎吞吐矩阵（TensorSharp vs llama.cpp vs Ollama）
+│   └── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
 ├── benchmarks/                  # 可重现的基准脚本
-│   └── inference_matrix/        # 驱动脚本、modelfiles、prompts、每格原始 JSON 结果
 └── ExternalProjects/            # ggml/ 在构建时从 github.com/ggml-org/ggml 克隆（不纳入版本控制）
 ```
 
@@ -504,7 +501,7 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
-| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16` 或 `q8_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；详见 [`docs/inference_benchmark_matrix_zh-cn.md`](docs/inference_benchmark_matrix_zh-cn.md)。 |
+| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16` 或 `q8_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
@@ -1171,10 +1168,6 @@ TensorSharp 明显领先的地方：
 - **Qwen 3.6 IQ2_XXS 现已具备竞争力。** 这一激进量化的 35B-A3B MoE 达到近乎持平的 decode（0.94×）与 prefill 领先（1.18×）——已从昔日的短板中恢复。
 
 decode 在 dense 与 MoE 模型上均基本持平（0.92–0.95×），因此 prefill、TTFT 与结构化输出上的胜势是叠加在有竞争力的 token 生成之上。剩余低于 1.0× 的项——主要是长上下文 dense prefill——仍是正在优化的目标，而非最终结果。胜负各项的完整数据见[完整报告](docs/engine_comparison_report.md)。
-
-### 跨引擎推理矩阵
-
-在相同磁盘 GGUF 文件上对 TensorSharp、llama.cpp 与 Ollama 做苹果对苹果的对比（当前覆盖 Gemma 4 E4B Q8_0，包含文本 / 合成 prefill / 图像 / 音频 / 视频任务，并对 `f32`、`f16`、`q8_0` 三种 KV cache dtype 做扫描），见 [`docs/inference_benchmark_matrix_zh-cn.md`](docs/inference_benchmark_matrix_zh-cn.md)。驱动脚本位于 `benchmarks/inference_matrix/scripts/`；运行矩阵后，每格原始 JSON 会生成到 `benchmarks/inference_matrix/results/`。
 
 ## 测试
 

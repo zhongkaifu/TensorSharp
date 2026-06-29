@@ -100,7 +100,6 @@ Everything below is detailed reference. New here? The five sections above are al
 | [HTTP APIs](#http-apis) | Use the Ollama-compatible, OpenAI-compatible, or Web UI SSE endpoints |
 | [Per-model architecture cards](docs/models/README.md) | Read end-to-end documentation of one architecture (origin, forward graph, components, parameters, and how TensorSharp implements / optimizes prefill and decode) |
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | Understand the vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
-| [Inference benchmark matrix](docs/inference_benchmark_matrix.md) | Compare TensorSharp against llama.cpp and Ollama across text / multimodal workloads, with KV-cache dtype sweeps |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | See which high-impact runtime flags affect which models, backends, and prompt types |
 | [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |
 | [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Copy complete curl and Python examples for the server surface |
@@ -267,10 +266,8 @@ TensorSharp/
 ├── docs/                        # Developer reference
 │   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # Paged KV cache, prefix sharing, scheduler, per-model batched-forward status
-│   ├── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
-│   └── inference_benchmark_matrix.md  # Cross-engine throughput matrix (TensorSharp vs llama.cpp vs Ollama)
+│   └── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
 ├── benchmarks/                  # Reproducible benchmark harnesses
-│   └── inference_matrix/        # Driver scripts, modelfiles, prompts, and per-cell raw JSON results
 └── ExternalProjects/            # ggml/ is cloned from github.com/ggml-org/ggml at build time (not committed)
 ```
 
@@ -518,7 +515,7 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
-| `--kv-cache-dtype <type>` | KV cache precision: `f32` (default), `f16`, or `q8_0`. Quantized / half-precision KV caches reduce memory at the cost of small numerical drift; benchmarks live in [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). |
+| `--kv-cache-dtype <type>` | KV cache precision: `f32` (default), `f16`, or `q8_0`. Quantized / half-precision KV caches reduce memory at the cost of small numerical drift. |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
@@ -1194,10 +1191,6 @@ Where TensorSharp pulls clearly ahead:
 - **Qwen 3.6 IQ2_XXS is competitive now.** The aggressively quantized 35B-A3B MoE reaches near-parity decode (0.94×) and a prefill win (1.18×) — recovered from being the weak spot it once was.
 
 Decode sits at parity across both dense and MoE models (0.92–0.95×), so the prefill, TTFT, and structured-output wins come on top of competitive token generation. The remaining sub-1.0× cells — chiefly long-context dense prefill — are active optimization targets rather than finished results. Every cell, wins and gaps alike, is in the [full report](docs/engine_comparison_report.md).
-
-### Cross-engine inference matrix
-
-For an apples-to-apples comparison of TensorSharp, llama.cpp, and Ollama on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic prefill / image / audio / video tasks and KV-cache dtype sweeps for `f32`, `f16`, and `q8_0`), see [`docs/inference_benchmark_matrix.md`](docs/inference_benchmark_matrix.md). The driver scripts are in `benchmarks/inference_matrix/scripts/`; per-cell raw JSON outputs are generated under `benchmarks/inference_matrix/results/` when you run the matrix.
 
 ## Testing
 

@@ -1,0 +1,155 @@
+The history of computing stretches back far longer than the silicon chips that
+define the modern era, and to understand where machine intelligence is heading it
+helps to remember how slowly, and how stubbornly, the idea of mechanical
+calculation took shape. Long before electricity, human beings devised mechanical
+aids to reckoning. The abacus, used across the ancient world from Mesopotamia to
+the markets of China, let merchants add and subtract large sums with practiced
+speed, encoding quantity as the position of beads on a rod. In the seventeenth
+century Blaise Pascal built a geared adding machine to ease his father's
+tax-collecting work, and Gottfried Wilhelm Leibniz extended the idea with a
+stepped-drum device that could multiply and divide. Leibniz also articulated the
+binary system that would, three full centuries later, become the native language
+of every digital computer ever built. He dreamed of a calculus of reasoning, a
+universal symbolic language in which disputes could be settled by computation
+rather than rhetoric, and although the dream outran the engineering of his age,
+the ambition never entirely went away.
+
+The nineteenth century brought the first machine that deserves to be called a
+computer in something like the modern sense. Charles Babbage, frustrated by the
+errors that crept into the printed mathematical tables on which navigation and
+engineering depended, designed the Difference Engine to compute and typeset
+polynomial tables automatically. He then conceived a far more ambitious successor,
+the Analytical Engine, which separated a "store" for numbers from a "mill" that
+operated on them, and which was to be programmed with punched cards borrowed from
+the Jacquard loom. Ada Lovelace, translating an Italian account of the machine,
+appended notes longer than the original paper in which she described how the
+engine might be made to weave algebraic patterns, and famously observed that it
+could in principle manipulate symbols of any kind, not merely numbers. The
+machine was never finished, defeated by the tolerances of Victorian metalwork and
+the limits of Babbage's funding and temper, but the conceptual architecture
+survived to be rediscovered a hundred years later.
+
+The decisive theoretical leap came in 1936, when a young Alan Turing, addressing a
+narrow problem in mathematical logic posed by David Hilbert, invented an abstract
+machine of startling generality. Turing imagined a device that reads and writes
+symbols on an infinite tape according to a finite table of rules, and showed that
+a single such machine, suitably programmed, could imitate any other. This
+universal machine drew a sharp line between what is computable and what is not,
+proving that some well-posed questions can never be answered by any mechanical
+procedure whatsoever. The same year Alonzo Church reached an equivalent
+conclusion by a completely different route, through the lambda calculus, and the
+agreement of the two approaches gave rise to the thesis that anything effectively
+calculable can be computed by a Turing machine. That thesis, never proved but
+never refuted, remains the bedrock on which the entire discipline rests, and it is
+the reason a chatbot, a spreadsheet, and a flight-control system are in a deep
+sense the same kind of object running different programs.
+
+War accelerated everything. The need to break enemy ciphers and to compute
+artillery firing tables turned theory into wiring with extraordinary speed. At
+Bletchley Park, Turing and his colleagues built electromechanical and then
+electronic machines to attack German codes, and in the United States the ENIAC,
+a room-sized assembly of some eighteen thousand vacuum tubes, was wired to compute
+trajectories. Reprogramming the ENIAC meant physically replugging cables and
+flipping switches, a process that could take days, and it was this very
+awkwardness that motivated the next great idea. In a 1945 report drafted from the
+work of the ENIAC team, John von Neumann set out an architecture in which the
+program itself is stored in the same memory as the data it manipulates. The
+stored-program concept meant a computer could be re-tasked in seconds rather than
+days, could modify its own instructions, and could be built once and used for an
+unbounded variety of purposes. Almost every machine since has been, in essence, a
+von Neumann machine, and the few that depart from the pattern do so deliberately
+and at the margins.
+
+The transistor, invented at Bell Labs in 1947, replaced the hot, fragile, power-
+hungry vacuum tube with a sliver of semiconductor, and the integrated circuit a
+decade later placed many transistors on a single chip. From these inventions flowed
+the most consequential empirical regularity in the history of technology. In 1965
+Gordon Moore observed that the number of transistors that could be economically
+placed on a chip was doubling roughly every two years, and that exponential, which
+came to bear his name, held for half a century through relentless and ferociously
+expensive engineering. Each doubling made computers cheaper, faster, and smaller,
+and each generation of cheaper computers found new uses that funded the next
+generation. The mainframe gave way to the minicomputer, the minicomputer to the
+microprocessor, and the microprocessor put a general-purpose computer first on
+every desk and then in every pocket. What had been a scarce resource guarded by
+white-coated operators became an ambient utility, as unremarkable and as essential
+as electric light.
+
+Software evolved in step with the hardware, climbing a ladder of abstraction that
+let programmers think in ever larger units. The earliest machines were programmed
+in raw numeric codes, then in assembly languages that gave mnemonic names to those
+codes, and then in high-level languages such as Fortran, Lisp, and COBOL that let
+a programmer write something closer to mathematics or to English and leave a
+compiler to translate it down to the metal. Each layer of abstraction hid the one
+beneath it, trading a little efficiency for an enormous gain in human productivity,
+and the pattern repeated all the way up: operating systems hid the hardware,
+libraries hid the operating system, frameworks hid the libraries, and eventually
+entire applications were assembled from components whose inner workings their
+authors never examined. The discipline of computer science grew up around the
+problem of managing this complexity, developing data structures, algorithms, type
+systems, and proofs of correctness so that programs of millions of lines could be
+built by teams of people who could never hold the whole thing in a single mind.
+
+The network changed the meaning of a computer as profoundly as the stored program
+had. The ARPANET, funded in the late nineteen-sixties to connect a handful of
+research institutions, pioneered packet switching, the idea of chopping every
+message into small independently routed parcels that find their own way across a
+mesh of links and are reassembled at the destination. This design was robust in a
+way that circuit switching could never be, since there was no single path to sever
+and no central exchange to fail. Out of the ARPANET grew the Internet, knit
+together by the TCP/IP protocols that let heterogeneous networks interoperate as
+though they were one, and on top of that substrate Tim Berners-Lee layered the
+World Wide Web, a system of addressable documents linked to one another by simple
+references. Suddenly a computer was not a box on a desk but a window onto a global
+fabric of information and other people, and the economic and social consequences of
+that shift are still working themselves out, reshaping commerce, politics, friendship,
+and the very idea of a public square.
+
+The most recent chapter, and the one whose ending no one can yet see, is the rise of
+machine learning. For decades the dominant approach to artificial intelligence was
+to encode human knowledge as explicit rules, an approach that worked in narrow,
+well-bounded domains and shattered against the messiness of the real world. The
+alternative, statistical and connectionist, was to build systems that learn their
+behavior from data rather than receiving it from a programmer. Artificial neural
+networks, loosely inspired by the brain, adjust the strengths of connections among
+simple units so as to reduce the error of their predictions, and the algorithm of
+backpropagation provides an efficient way to apportion blame for a mistake across
+millions of those connections. For a long time the approach was starved of the two
+things it needed most, data and computation, and it languished at the margins of the
+field. The arrival of vast datasets scraped from the digitized world, and of
+graphics processors whose thousands of arithmetic units turned out to be ideally
+suited to the dense linear algebra of neural networks, removed both bottlenecks at
+once, and the field was transformed almost overnight.
+
+The transformer architecture, introduced in 2017, proved to be the catalyst for the
+present era. Earlier networks for processing sequences read their input one element
+at a time, which made them slow to train and forgetful over long distances. The
+transformer replaced that sequential reading with a mechanism called attention, in
+which every position in a sequence can directly consult every other position and
+decide how much weight to give it. Because these comparisons can all be performed at
+once, the architecture maps beautifully onto parallel hardware and scales to data and
+model sizes that earlier designs could never have reached. Trained on enormous
+quantities of text to predict the next token in a sequence, transformer language
+models acquired, as an apparent side effect of that simple objective, a startling
+breadth of competence: they translate, summarize, write code, answer questions, and
+carry on conversations, and their abilities improve smoothly and predictably as they
+are made larger and fed more data. The empirical scaling laws that describe this
+improvement have become a kind of compass for the whole industry.
+
+Inference in such a model divides naturally into two phases whose costs differ
+sharply, and understanding the difference is the whole reason a benchmark like this
+one separates them. In the first phase, often called prefill or prompt processing,
+the model ingests the entire prompt at once and computes a representation of it; this
+phase is richly parallel and compute-bound, since every token in the prompt can be
+processed simultaneously and the arithmetic units of the accelerator can be kept
+busy. In the second phase, called decoding or generation, the model emits one token
+at a time, each new token depending on all the tokens before it, and this phase is
+typically memory-bound, limited not by arithmetic but by the bandwidth required to
+stream the model's weights and its growing cache of attention keys and values out of
+memory for every single step. A serving system lives or dies by how well it handles
+both regimes, overlapping the compute-heavy prefill of one request with the
+memory-heavy decoding of another, batching where it can, and caching aggressively so
+that a shared prefix is never processed twice. Measuring the two phases honestly, on
+prompts long enough that fixed overheads no longer dominate, is the only way to know
+where an engine truly spends its time, and it is the reason the prompts that follow
+are deliberately, almost stubbornly, long.

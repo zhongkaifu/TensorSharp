@@ -178,6 +178,16 @@ namespace TensorSharp.Models
         // verify-kernel issue degrades to the per-op verify without killing decode.
         private bool _moeModelVerifyDisabled;
         private Gemma4MoELayerDecodeArgs[] _moeVerifyArgs;
+        // Max tokens per native MoE verify call (ubatch). The whole-prompt verify graph's
+        // O(N) working set spills VRAM on the near-full 26B GPU past ~3k tokens, so
+        // TryFusedMoEModelVerify sub-chunks long prompts into <= this many tokens (each a
+        // separate bounded graph; start_pos>0 chunks use the kernel's swaPrev/global paths).
+        // 1024 keeps each verify graph's gallocr ~1 GB (the expert FFN [*,8,M] + the
+        // wide global qDim dominate; 2048 peaked ~1.3 GB and partially spilled with the
+        // 1.2 GB mmproj resident). At 1024: 4k prefill 2170 t/s, 8k 1413 (~llama).
+        // TS_G4_MOE_VERIFY_CHUNK overrides.
+        private static readonly int _moeVerifySubChunk =
+            int.TryParse(Environment.GetEnvironmentVariable("TS_G4_MOE_VERIFY_CHUNK"), out int v) && v > 0 ? v : 1024;
         private bool _kvCacheHostDirty;
         private Gemma4DecodeArrays _decodeArrays;
 
@@ -2794,13 +2804,16 @@ namespace TensorSharp.Models
             // layers (_kvDonorMap.Count == 0), so there is no swaFreshShared case. Chunked
             // / multi-turn SWA overflow (startPos>0) still falls back to the per-op path.
             long totalSeqLen = (long)startPos + seqLen;
-            bool swaFreshOk = startPos == 0;
             var a = _decodeArrays;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (totalSeqLen <= a.CacheSize[l]) continue;        // fits / no wrap
                 bool isLocal = a.IsLocal[l] != 0;
-                if (!isLocal || !swaFreshOk) return false;          // global overflow / wrapped SWA past chunk
+                // Global (linear-cache) overflow can't be served. SWA (local) overflow is
+                // served by the kernel at start_pos==0 (swaFresh) AND start_pos>0 (swaPrev,
+                // gathers the previous window from the rolling cache) — see
+                // TryFusedMoEModelVerify (which sub-chunks long prompts into bounded calls).
+                if (!isLocal) return false;
             }
             return true;
         }
@@ -3127,18 +3140,40 @@ namespace TensorSharp.Models
                 }
             }
 
-            bool ok;
-            try
+            // Process the prompt in bounded sub-chunks (ubatches). The whole-prompt
+            // verify graph's O(N) intermediates (residual stream + per-layer FFN/expert
+            // tensors) sum to ~2.4 GB at N=8192 and spill into WDDM shared memory on the
+            // near-full 26B GPU (14.2 GB resident) — the 4k/8k prefill cliff. Splitting
+            // into <= _moeVerifySubChunk-token calls keeps each graph's gallocr peak
+            // small (~0.8 GB at 2048) and reused across calls, mirroring llama.cpp's
+            // n_ubatch. Sub-chunks at start_pos>0 attend prior keys via the cache
+            // (global, linear) / the in-kernel prev-window gather (SWA, swaPrev), so the
+            // result is byte-identical to one big call. The hidden buffer is [n, H]
+            // row-major, so sub-chunk t starts at hidden + off*H floats.
+            int subMax = _moeVerifySubChunk;
+            int H = Config.HiddenSize;
+            for (int off = 0; off < n; )
             {
-                ok = GgmlBasicOps.Gemma4MoEModelVerify(_moeVerifyArgs, layerCount, hiddenPtr, Config.HiddenSize, startPos, n);
+                int sub = Math.Min(subMax, n - off);
+                IntPtr subHidden = hiddenPtr + (nint)off * H * sizeof(float);
+                bool ok;
+                try
+                {
+                    ok = GgmlBasicOps.Gemma4MoEModelVerify(_moeVerifyArgs, layerCount, subHidden, H, startPos + off, sub);
+                }
+                catch (Exception ex)
+                {
+                    System.Console.WriteLine($"[gemma4] fused MoE model verify disabled after error: {ex.Message}");
+                    _moeModelVerifyDisabled = true;
+                    return false;
+                }
+                // A mid-prompt decline (e.g. unsupported flash geometry) is deterministic
+                // per layer geometry, so it fails on the first sub-chunk before any cache
+                // write; if it ever declines later the per-op fallback re-processes the
+                // whole chunk from startPos (idempotent cache rewrite), so this is safe.
+                if (!ok) return false;
+                off += sub;
             }
-            catch (Exception ex)
-            {
-                System.Console.WriteLine($"[gemma4] fused MoE model verify disabled after error: {ex.Message}");
-                _moeModelVerifyDisabled = true;
-                return false;
-            }
-            if (!ok) return false;   // kernel declined (e.g. global cache too small): per-op fallback
             _kvCacheHostDirty = true;
             return true;
         }

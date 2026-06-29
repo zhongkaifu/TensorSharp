@@ -219,7 +219,46 @@ def _build_scenarios(cfg: dict) -> dict:
     return out
 
 
-SCENARIOS: dict = _build_scenarios(_CFG)
+def synth_scenario(sid: str) -> Optional[ScenarioSpec]:
+    """Synthesize a ScenarioSpec for a generic `prefill_<N>` / `prefill_<N>k` id
+    (the long-prompt prefill dataset, e.g. `prefill_8k`, `prefill_512`). These do
+    not need to be declared in a config's `scenarios` block, so they work against
+    any config file. Returns None for anything that is not a prefill id."""
+    if not isinstance(sid, str) or not sid.startswith("prefill_"):
+        return None
+    suffix = sid.split("prefill_", 1)[-1].strip().lower()
+    try:
+        target = (int(round(float(suffix[:-1]) * 1024))
+                  if suffix.endswith("k") else int(suffix))
+    except ValueError:
+        return None
+    if target <= 0:
+        return None
+    return ScenarioSpec(
+        short_id=sid,
+        kind="text",
+        description=f"Prefill throughput @ ~{target} prompt tokens",
+        modality=None,
+        max_tokens=8,            # prefill is timed by TTFT; barely decode
+    )
+
+
+class _ScenarioRegistry(dict):
+    """Scenario registry that also resolves on-the-fly `prefill_<N>` ids so the
+    prefill dataset can be requested against any config without being declared in
+    it. Iteration / `.keys()` still yield only the declared scenarios."""
+
+    def __missing__(self, key):
+        spec = synth_scenario(key)
+        if spec is None:
+            raise KeyError(key)
+        return spec
+
+    def __contains__(self, key):
+        return super().__contains__(key) or synth_scenario(key) is not None
+
+
+SCENARIOS: dict = _ScenarioRegistry(_build_scenarios(_CFG))
 
 
 # ---------------------------------------------------------------------------

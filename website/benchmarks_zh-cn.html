@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>基准测试 — TensorSharp 维基</title>
-  <meta name="description" content="TensorSharp 的基准测试结果、对比 llama.cpp 与 Ollama 的跨引擎推理矩阵，以及测试框架如何运作。">
+  <meta name="description" content="TensorSharp 对比 llama.cpp 的基准测试结果，以及测试框架如何运作。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -43,9 +43,6 @@
   <p>这些领先来自 TensorSharp 的架构专属快路径：基于 verify 的整模型 prefill（配以融合的 FFN / attention 内核）、常驻捕获式 CUDA 图 MoE decode，以及让多轮对话更快返回的 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。JSON 模式下 decode 甚至在 E4B（1.10×）与 Qwen 3.6（1.07×）上完胜，曾经孱弱的 IQ2_XXS Qwen 3.6 路径如今也具备竞争力（0.94× decode、1.18× prefill）。decode 在 dense 与 MoE 上均基本持平（0.92–0.95×），因此这些 prefill / TTFT / 结构化输出上的胜势是叠加在有竞争力的 token 生成之上；剩余少数低于 1.0× 的项——主要是长上下文 dense prefill——仍是正在优化的目标，胜负各项的完整数据均已发布在报告中。</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、GGML CUDA、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
-
-  <h2 id="cross-engine">跨引擎推理矩阵</h2>
-  <p>若要在相同磁盘 GGUF 文件上对 <strong>TensorSharp vs llama.cpp vs Ollama</strong> 做苹果对苹果的对比（当前覆盖 Gemma 4 E4B Q8_0，包含文本 / 合成 prefill / 图像 / 音频 / 视频任务，并对 <code>f32</code>、<code>f16</code>、<code>q8_0</code> 三种 KV 缓存 dtype 做扫描），见仓库中的 <code>docs/inference_benchmark_matrix.md</code>。驱动脚本位于 <code>benchmarks/inference_matrix/scripts/</code>；运行矩阵后，每格原始 JSON 会写入 <code>benchmarks/inference_matrix/results/</code>。</p>
 
   <h2 id="testing">测试</h2>
   <h3>单元测试（xUnit）</h3>

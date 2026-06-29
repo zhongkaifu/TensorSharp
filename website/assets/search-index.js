@@ -65,9 +65,8 @@ window.SEARCH_INDEX = [
   { t: "DiffusionGemma text diffusion", p: "Advanced", u: "advanced.html#diffusion", s: "Block-wise EntropyBound denoising over a Gemma-4 MoE backbone.", k: "diffusion denoising text generation" },
 
   { t: "Head-to-head vs llama.cpp", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Pure-.NET TensorSharp out-prefills llama.cpp on every model (geomean 1.18×–1.88×) with decode at parity on the same GGUF + GPU: 26B-A4B MoE leads at 1.88× prefill / 1.69× TTFT; structured-output prefill 5.89×; multi-turn up to 1.93×.", k: "llama.cpp comparison faster speedup geomean moe prefill ttft multi-turn json structured output decode parity vs versus" },
-  { t: "Benchmarks", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Head-to-head vs llama.cpp and the cross-engine inference matrix.", k: "performance numbers throughput tokens per second" },
-  { t: "Cross-engine matrix", p: "Benchmarks", u: "benchmarks.html#cross-engine", s: "Compare TensorSharp vs llama.cpp and Ollama on the same GGUF files.", k: "llama.cpp ollama comparison" },
-  { t: "Testing", p: "Benchmarks", u: "benchmarks.html#testing", s: "xUnit unit tests, server integration tests, and the inference matrix runner.", k: "tests xunit integration ci" },
+  { t: "Benchmarks", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Head-to-head vs llama.cpp on the same GGUF files and hardware.", k: "performance numbers throughput tokens per second" },
+  { t: "Testing", p: "Benchmarks", u: "benchmarks.html#testing", s: "xUnit unit tests and server integration tests.", k: "tests xunit integration ci" },
 
   { t: "CLI flags reference", p: "API Reference", u: "api-reference.html#cli-flags", s: "Complete table of TensorSharp.Cli command-line options.", k: "reference flags cli options table" },
   { t: "Server flags reference", p: "API Reference", u: "api-reference.html#server-flags", s: "Complete table of TensorSharp.Server command-line options.", k: "reference flags server options table" },

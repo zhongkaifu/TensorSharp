@@ -78,6 +78,58 @@ def _text_long(engine, model):
          "content": doc + "\n\nSummarize the passage above in two sentences."}]}
 
 
+# ---------------------------------------------------------------------------
+# Prefill (prompt-processing) dataset
+# ---------------------------------------------------------------------------
+# Dedicated long-prompt scenarios used to measure prefill throughput accurately.
+# `text_long` tops out near ~1.2k tokens, where time-to-first-token is dominated
+# by fixed per-request overhead (HTTP, scheduling, cold-graph launch, first-token
+# sampling) rather than prefill compute. These scenarios drive the prompt to
+# several thousand / tens-of-thousands of tokens at controlled lengths so the
+# per-token prefill cost separates cleanly from that fixed overhead.
+#
+# Length is controlled by slicing `prefill_corpus.txt` to a target character
+# budget; the *reported* `prompt_tokens` (from each engine's own tokenizer) is
+# what `prefill_tps = prompt_tokens / ttft` actually uses, so this approximation
+# only needs to land each scenario in the right ballpark, not hit an exact count.
+_PREFILL_CHARS_PER_TOKEN = 4.6   # ~English prose under these models' tokenizers
+
+
+def _parse_prefill_target(scenario_id: str) -> int:
+    """`prefill_4k` / `prefill_4096` / `prefill_512` -> target token count."""
+    suffix = scenario_id.split("prefill_", 1)[-1].strip().lower()
+    if suffix.endswith("k"):
+        return int(round(float(suffix[:-1]) * 1024))
+    return int(suffix)
+
+
+def _prefill(target_tokens: int, engine, model):
+    corpus = _read_asset("prefill_corpus.txt",
+                         "The quick brown fox jumps over the lazy dog. " * 400)
+    target_chars = int(target_tokens * _PREFILL_CHARS_PER_TOKEN)
+
+    # Tile the corpus (with a numbered separator, so adjacent blocks are not
+    # byte-identical) until it is long enough, then truncate to the budget.
+    body = corpus
+    section = 2
+    while len(body) < target_chars:
+        body += f"\n\n--- continued (part {section}) ---\n\n{corpus}"
+        section += 1
+    body = body[:target_chars].rstrip()
+
+    # A unique-per-length header at position 0 so the longer prompts cannot hit
+    # the server's prompt/prefix cache off the shorter ones (which would report a
+    # near-zero TTFT and a wildly inflated prefill_tps). The differing token
+    # count busts any shared-prefix match within the first few tokens.
+    header = (f"[prefill-benchmark target={target_tokens} tokens] The following is a "
+              f"long technical document, provided so the system can be timed while it "
+              f"processes the prompt.\n\n")
+    instruction = ("\n\nIn one sentence, state the single most important theme of the "
+                   "document above.")
+    return {"messages": [
+        {"role": "user", "content": header + body + instruction}]}
+
+
 def _multi_turn(engine, model):
     return {"messages": [
         {"role": "user", "content": "I'm planning a trip to Japan. My budget is $3000."},
@@ -166,8 +218,11 @@ _BUILDERS = {
 
 
 def build_request(scenario_id: str, engine: str, model: config.ModelSpec) -> dict:
-    builder = _BUILDERS[scenario_id]
-    req = builder(engine, model)
+    if scenario_id.startswith("prefill_"):
+        req = _prefill(_parse_prefill_target(scenario_id), engine, model)
+    else:
+        builder = _BUILDERS[scenario_id]
+        req = builder(engine, model)
     req.setdefault("tools", None)
     req.setdefault("response_format", None)
     req.setdefault("checker", None)

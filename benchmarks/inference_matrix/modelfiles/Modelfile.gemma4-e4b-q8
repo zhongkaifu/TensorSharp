@@ -1,6 +1,0 @@
-FROM /Users/ZhongkaiFu/work/model/gemma-4-E4B-it-Q8_0.gguf
-TEMPLATE {{ .Prompt }}
-RENDERER gemma4
-PARSER gemma4
-PARAMETER temperature 0
-PARAMETER num_ctx 4096

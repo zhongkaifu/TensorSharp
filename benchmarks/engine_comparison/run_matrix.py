@@ -200,6 +200,19 @@ def _csv(s: str) -> list:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
+def _prefill_target(scenario_id: str) -> int:
+    """Target prompt-token count for a `prefill_<N>` / `prefill_<N>k` scenario, or
+    0 for any non-prefill scenario."""
+    if not scenario_id.startswith("prefill_"):
+        return 0
+    suffix = scenario_id.split("prefill_", 1)[-1].strip().lower()
+    try:
+        return (int(round(float(suffix[:-1]) * 1024))
+                if suffix.endswith("k") else int(suffix))
+    except ValueError:
+        return 0
+
+
 def main():
     # Every default below comes from the config file (selected via --config /
     # BENCH_CONFIG); a command-line flag, when given, overrides that default.
@@ -239,6 +252,18 @@ def main():
     concurrency_levels = _parse_concurrency(args.concurrency) if args.concurrency else list(config.DEFAULT_CONCURRENCY)
     max_tokens = args.max_tokens if args.max_tokens is not None else config.DEFAULT_MAX_TOKENS
     warmup = args.warmup if args.warmup is not None else config.DEFAULT_WARMUP
+
+    # Long-prompt prefill scenarios (`prefill_<N>`) need llama.cpp's context to be
+    # big enough to hold the prompt (TensorSharp sizes its context dynamically).
+    # If any selected prefill target exceeds the configured `-c`, raise it for this
+    # run, padded for tokenizer variance + chat template.
+    max_prefill = max((_prefill_target(s) for s in scenario_ids), default=0)
+    if max_prefill:
+        needed = int(max_prefill * 1.3) + 128
+        if needed > config.LLAMA_CONTEXT_SIZE:
+            print(f"note: raising llama.cpp context_size {config.LLAMA_CONTEXT_SIZE} -> "
+                  f"{needed} to fit prefill scenarios (max ~{max_prefill} prompt tokens)")
+            config.LLAMA_CONTEXT_SIZE = needed
 
     results_dir = Path(args.results) if args.results else config.RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)

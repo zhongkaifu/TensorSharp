@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Benchmarks & Testing — TensorSharp Wiki</title>
-  <meta name="description" content="TensorSharp benchmark results, the cross-engine inference matrix vs llama.cpp and Ollama, and how the test harness works.">
+  <meta name="description" content="TensorSharp benchmark results vs llama.cpp, and how the test harness works.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -43,9 +43,6 @@
   <p>The headline wins come from TensorSharp's architecture-specific fast paths: a verify-based whole-model prefill with fused FFN / attention kernels, a persistent captured-CUDA-graph MoE decode, and the vLLM-style <a href="advanced.html#continuous-batching">paged KV cache with cross-request prefix sharing</a> that makes multi-turn conversations land sooner. JSON-mode decode even wins outright on E4B (1.10×) and Qwen 3.6 (1.07×), and the once-weak IQ2_XXS Qwen 3.6 path is now competitive (0.94× decode, 1.18× prefill). Decode sits at parity across dense and MoE (0.92–0.95×), so these prefill / TTFT / structured-output wins come on top of competitive token generation; the few remaining sub-1.0× cells — chiefly long-context dense prefill — are active optimization targets, and every cell, wins and gaps alike, is published in the report.</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>An honest comparison shows the gaps as well as the wins. These figures are one machine (RTX 3080 Laptop, GGML CUDA, single-stream); your hardware, model, and quantization will shift them. Run the built-in benchmark and the engine-comparison harness on your own box for the numbers that matter to you.</p></div>
-
-  <h2 id="cross-engine">Cross-engine inference matrix</h2>
-  <p>For an apples-to-apples comparison of <strong>TensorSharp vs llama.cpp vs Ollama</strong> on the same on-disk GGUF files (Gemma 4 E4B Q8_0 today, with text / synthetic-prefill / image / audio / video tasks and KV-cache dtype sweeps for <code>f32</code>, <code>f16</code>, and <code>q8_0</code>), see <code>docs/inference_benchmark_matrix.md</code> in the repository. The driver scripts live in <code>benchmarks/inference_matrix/scripts/</code>; per-cell raw JSON outputs are written under <code>benchmarks/inference_matrix/results/</code> when you run the matrix.</p>
 
   <h2 id="testing">Testing</h2>
   <h3>Unit tests (xUnit)</h3>
