@@ -288,11 +288,23 @@ namespace TensorSharp.Server.ProtocolAdapters
                                 OpenAIResponseFactory.ToolCallsChunk(requestId, _svc.LoadedModelName, parsed.ToolCalls),
                                 ctx.RequestAborted);
                         }
+                        // Stream the model's reasoning ("analysis"/thinking channel)
+                        // as incremental reasoning_content deltas so the first token
+                        // reaches the client right after prefill. Previously this was
+                        // parsed then dropped (a null-content chunk), which buffered
+                        // the whole reasoning block and inflated TTFT to the full
+                        // reasoning-decode time for reasoning-first models (gpt-oss).
+                        if (!string.IsNullOrEmpty(parsed.Thinking))
+                        {
+                            await SseWriter.WriteEventAsync(ctx.Response,
+                                OpenAIResponseFactory.ReasoningContentChunk(requestId, _svc.LoadedModelName, parsed.Thinking),
+                                ctx.RequestAborted);
+                        }
                         string emitContent = parsed.Content ?? "";
-                        if (emitContent.Length == 0 && string.IsNullOrEmpty(parsed.Thinking))
+                        if (emitContent.Length == 0)
                             continue;
-                        string chunkContent = emitContent.Length > 0 ? emitContent : null;
-                        if (jsonObjectFilter != null && chunkContent != null)
+                        string chunkContent = emitContent;
+                        if (jsonObjectFilter != null)
                         {
                             chunkContent = jsonObjectFilter.Feed(chunkContent);
                             if (chunkContent.Length == 0)
@@ -336,6 +348,11 @@ namespace TensorSharp.Server.ProtocolAdapters
                             OpenAIResponseFactory.ToolCallsChunk(requestId, _svc.LoadedModelName, finalParsed.ToolCalls),
                             ctx.RequestAborted);
                     }
+
+                    if (!string.IsNullOrEmpty(finalParsed.Thinking))
+                        await SseWriter.WriteEventAsync(ctx.Response,
+                            OpenAIResponseFactory.ReasoningContentChunk(requestId, _svc.LoadedModelName, finalParsed.Thinking),
+                            ctx.RequestAborted);
 
                     if (!string.IsNullOrEmpty(finalParsed.Content))
                     {

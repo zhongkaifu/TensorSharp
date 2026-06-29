@@ -640,7 +640,14 @@ namespace TensorSharp.Models
         private unsafe bool TryFusedRecLayerPrefill(Tensor hidden, int layer, int seqLen)
         {
             if (!_useFusedRecPrefill || _recPrefillUnsupported) return false;
-            if (_backend != BackendType.GgmlCuda) return false;
+            // ggml_cuda AND ggml_metal: the native kernel is backend-agnostic
+            // (ggml_ssm_conv + ggml_gated_delta_net + ggml_cpy, NO ggml_set_rows)
+            // and allocates a dedicated per-graph buffer (ggml_backend_alloc_ctx_tensors,
+            // not the shared reuse gallocr), so it avoids the in-place recurrent-state
+            // mis-aliasing trap. On Metal this replaces the chunked path's per-GDN-layer
+            // HOST round-trip (Conv1D + SiLU + packing on the CPU, then upload
+            // Q/K/V/Z/alpha/beta) with one device-resident graph per layer.
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal) return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32) return false;
             if (hidden.Sizes[0] != seqLen || hidden.Sizes[1] != Config.HiddenSize) return false;
             if (_headKDim != _headVDim) return false; // gated_delta_net path assumes shared head dim
@@ -994,7 +1001,14 @@ namespace TensorSharp.Models
             // Fold final-norm + lm_head into the graph requires both present.
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
                 return false;
-            if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive || _backend != BackendType.GgmlCuda)
+            // The whole-model single-graph decode now runs on BOTH ggml_cuda (with a
+            // persistent CUDA-graph-captured replay) AND ggml_metal (non-persist: cpy
+            // KV write + reused gallocr; the native kernel forces non-persist when the
+            // backend is Metal). On Metal this collapses the ~145 op-by-op graph_compute
+            // submits/token (the dispatch-overhead ceiling, ~6.9 tok/s) into ONE graph,
+            // with the GDN recurrence + MoE top-K routing fully in-graph (no host drain).
+            if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive
+                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal))
                 return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
                 || hidden.ElementType != DType.Float32)
@@ -1255,6 +1269,14 @@ namespace TensorSharp.Models
 
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1)
         {
+            // CUDA-only: the whole-model verify graph uses ggml_set_rows KV writes +
+            // a persistent reuse gallocr. On Metal a cpy-based non-persist variant
+            // hit a VRAM wall (fresh alloc OOMs the 40-layer MoE graph) AND a
+            // gallocr "tensor buffer not set" assert (the lifetime-packing does not
+            // compose with the cpy-into-cacheable-cache write) — see the deferred
+            // OPT-1 design notes. Metal prefill instead uses the per-GDN-layer
+            // device-resident fused prefill (TryFusedRecLayerPrefill, now enabled
+            // on Metal) plus op-by-op attention.
             if (!_fusedVerifyEnabled || _fvUnsupported || _backend != BackendType.GgmlCuda)
                 return false;
             if (seqLen < 1 || hidden == null)

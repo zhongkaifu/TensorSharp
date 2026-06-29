@@ -1262,7 +1262,15 @@ namespace
 
         static const bool fd_timing = std::getenv("TS_QWEN35_FD_TIMING") != nullptr;
         // Persistent capturable decode graph: default ON; TS_QWEN35_FD_PERSIST=0 disables.
-        static const bool persist = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        // Persist mode uses ggml_set_rows (KV write) + a CUDA-graph-captured replay,
+        // both of which are CUDA-only — set_rows SEGFAULTs in ggml_metal_op_set_rows
+        // and there is no Metal graph capture. So gate persist to CUDA; Metal runs
+        // the whole-model decode through the NON-persist path (cpy KV write + reused
+        // gallocr, every op — incl. ggml_gated_delta_net / ssm_conv / top_k — has a
+        // Metal kernel in ggml v0.15.3). Exact analogue of the dense Gemma4 decode's
+        // `can_persist = g4_persist && g_backend_type == BACKEND_TYPE_CUDA`.
+        static const bool persist_cfg = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        const bool persist = persist_cfg && g_backend_type == BACKEND_TYPE_CUDA;
         // Persist mode pads the attention window to a fixed stride so the graph is
         // identical token-to-token (CUDA-graph capture); the F16 mask zeroes valid
         // positions and -inf's the padding. Non-persist keeps the exact window.
@@ -1857,8 +1865,18 @@ namespace
                 return 0;
             }
         }
-        else if (!alloc_graph_reuse_gallocr(graph))
+        else
         {
+            // Non-persist (Metal): the whole-model GDN decode graph must NOT use the
+            // shared reuse gallocr. Its lifetime-packing mis-aliases this graph's
+            // intermediates across the gated_delta_net + in-place recurrent-state
+            // ggml_cpy chain, so the packed scratch retains the PREVIOUS token's
+            // activations and they leak into the current token — producing coherent
+            // but interleaved-garbage output (two tokens' continuations merged word
+            // by word). A fresh per-call backend buffer fixes it; the decode graph's
+            // scratch is small so the alloc costs only ~4 ms/token (still ~5x faster
+            // than the op-by-op path). The dense Gemma4 decode is unaffected (it has
+            // no in-place recurrent state) and keeps the reuse gallocr.
             buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
             if (buffer.value == nullptr)
             {

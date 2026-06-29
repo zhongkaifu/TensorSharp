@@ -66,6 +66,46 @@ namespace TensorSharp.Models
             return 1;
         }
 
+        // Decode (seqLen == 1) reuses the fused on-device attention-layer kernel
+        // (TSGgml_GptOssAttentionLayerPrefill) instead of the legacy per-op path
+        // whose attention runs on the host CPU (KV-cache pull + CPU softmax per
+        // layer). The fused kernel collapses RMSNorm + QKV + RoPE + KV append +
+        // masked softmax-with-sinks + attention + O-proj + residual into ONE GGML
+        // graph dispatch with GPU flash-attention — the biggest gpt-oss decode
+        // lever, since Metal decode is dispatch-overhead bound. It re-uploads the
+        // KV prefix [0,startPos) per call, so it is gated by context length to
+        // keep that O(context) upload cheap relative to the compute it saves;
+        // longer contexts fall back to the proven host path. Both knobs are
+        // env-tunable (TS_GPTOSS_FUSED_DECODE=0 disables; TS_GPTOSS_FUSED_DECODE_MAX_CTX).
+        private static readonly bool FusedDecodeAttnEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_GPTOSS_FUSED_DECODE"), "0", StringComparison.Ordinal);
+        private static readonly int FusedDecodeAttnMaxContext = ResolveFusedDecodeMaxContext();
+        private static int ResolveFusedDecodeMaxContext()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_GPTOSS_FUSED_DECODE_MAX_CTX");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 4096;
+        }
+
+        // Maximum seqLen the fused on-device attention-layer kernel
+        // (TSGgml_GptOssAttentionLayerPrefill) is dispatched at. Above this,
+        // Forward() chunks the prompt into <=this-many-token sub-batches so the
+        // attention always runs on the fused path. The legacy per-op fallback
+        // builds an O(seqLen^2) host scores tensor per layer (e.g. a 1253-token
+        // prompt = ~200 MB/layer x 24 layers) which is both ~8x slower than the
+        // fused kernel AND saturates the Metal working set on Apple Silicon,
+        // triggering kIOGPUCommandBufferCallbackErrorOutOfMemory. Tunable via
+        // TS_GPTOSS_FUSED_ATTN_MAX_SEQ for A/B testing.
+        private static readonly int FusedAttnMaxSeqLen = ResolveFusedAttnMaxSeqLen();
+        private static int ResolveFusedAttnMaxSeqLen()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_GPTOSS_FUSED_ATTN_MAX_SEQ");
+            if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
+                return v;
+            return 256;
+        }
+
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
         private int _numExperts;
@@ -658,7 +698,11 @@ namespace TensorSharp.Models
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
-            return 2048;
+            // Default to the fused-attention cap: every chunk then runs on the
+            // fast fused on-device kernel. A larger chunk (the old 2048) fell off
+            // the fused path (cap 256) onto the per-op host-attention path, which
+            // is ~8x slower and OOMs the Metal command buffer (see Forward).
+            return FusedAttnMaxSeqLen;
         }
 
         public override float[] ForwardRefill(int[] tokens)
@@ -714,6 +758,39 @@ namespace TensorSharp.Models
         }
 
         public override float[] Forward(int[] tokens)
+        {
+            // Long prompts (seqLen > the fused-attention cap) are chunked so the
+            // attention always runs on the fused on-device kernel rather than the
+            // per-op host path that builds an O(seqLen^2) scores tensor per layer
+            // (8x slower + Metal OOM, see FusedAttnMaxSeqLen). The server's
+            // scheduler hands whole prompt chunks (up to SoloPrefillChunkSize ~=
+            // 4096) straight to Forward, so the cap MUST be enforced here, not
+            // only in ForwardRefill. Chunked prefill is mathematically identical
+            // to a single pass (causal attention + KV cache), so the returned
+            // last-token logits are unchanged. Decode (seqLen == 1) and short
+            // prompts (<= cap) skip the loop and run a single pass.
+            if (tokens != null && tokens.Length > FusedAttnMaxSeqLen && IsGgmlBackend)
+            {
+                int cap = FusedAttnMaxSeqLen;
+                int total = tokens.Length;
+                int pos = 0;
+                // All but the final (<= cap) chunk only append KV; the last chunk
+                // produces the logits for the prompt's final token.
+                while (total - pos > cap)
+                {
+                    var chunk = new int[cap];
+                    Array.Copy(tokens, pos, chunk, 0, cap);
+                    PrefillWithoutLogits(chunk);
+                    pos += cap;
+                }
+                var lastChunk = new int[total - pos];
+                Array.Copy(tokens, pos, lastChunk, 0, total - pos);
+                return ForwardSingle(lastChunk);
+            }
+            return ForwardSingle(tokens);
+        }
+
+        private float[] ForwardSingle(int[] tokens)
         {
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -793,10 +870,17 @@ namespace TensorSharp.Models
             // via ggml-pool) and remains the default for those. A future
             // wave will rework per-call buffer reuse (e.g. via ggml_gallocr)
             // to lift this cap.
-            const int FusedAttnMaxSeqLen = 256;
+            // FusedAttnMaxSeqLen is now a class field (see top of class) so
+            // Forward() can chunk long prompts to the same cap.
             bool fusedAttnApplied = false;
-            if (seqLen > 1 && seqLen <= FusedAttnMaxSeqLen && IsGgmlBackend
-                && TryFusedAttnLayerPrefill(hidden, layer, wn, seqLen, startPos))
+            // Prefill: fuse 1 < seqLen <= 256. Decode (seqLen == 1): fuse too,
+            // gated by context length (the kernel re-uploads the KV prefix per
+            // call) and an env kill-switch — see FusedDecodeAttnEnabled above.
+            bool tryFused = IsGgmlBackend &&
+                ((seqLen > 1 && seqLen <= FusedAttnMaxSeqLen) ||
+                 (seqLen == 1 && FusedDecodeAttnEnabled
+                    && (startPos + seqLen) <= FusedDecodeAttnMaxContext));
+            if (tryFused && TryFusedAttnLayerPrefill(hidden, layer, wn, seqLen, startPos))
             {
                 fusedAttnApplied = true;
             }

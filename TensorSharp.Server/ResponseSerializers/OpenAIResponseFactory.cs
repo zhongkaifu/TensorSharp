@@ -60,6 +60,29 @@ namespace TensorSharp.Server.ResponseSerializers
             },
         };
 
+        // Streaming delta carrying reasoning (the model's "analysis"/thinking
+        // channel) as `reasoning_content` — the field OpenAI reasoning models and
+        // llama.cpp (--jinja) use. Emitting these incrementally (rather than
+        // buffering the whole analysis block) means the client's first streamed
+        // token fires right after prefill, so time-to-first-token reflects real
+        // prefill latency instead of the full reasoning decode.
+        public static object ReasoningContentChunk(string requestId, string model, string reasoningChunk) => new
+        {
+            id = requestId,
+            @object = ChunkObject,
+            created = UnixNow(),
+            model,
+            choices = new[]
+            {
+                new
+                {
+                    index = 0,
+                    delta = new { role = (string)null, content = (string)null, reasoning_content = reasoningChunk },
+                    finish_reason = (string)null,
+                },
+            },
+        };
+
         public static object StructuredContentChunk(string requestId, string model, string normalizedContent) => new
         {
             id = requestId,

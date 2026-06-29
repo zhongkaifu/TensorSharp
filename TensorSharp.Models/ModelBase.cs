@@ -541,6 +541,18 @@ namespace TensorSharp.Models
                 {
                     BackendType.Mlx => Math.Min(gpuDefault, 2048),
                     BackendType.Cuda => Math.Min(gpuDefault, 2048),
+                    // GgmlMetal: cap the up-front KV allocation too. On Apple
+                    // Silicon the GPU working set is small (e.g. ~19 GB) and a
+                    // big model (gpt-oss 20B Q8_0 ≈ 12 GB) plus a full 8192-token
+                    // KV cache (≈6.4 GB) sits right at the limit. Once memory is
+                    // that tight the OS continually purges wired buffers, so the
+                    // residency-set keep-alive thread must constantly re-request
+                    // residency for every buffer — holding the device residency
+                    // lock that every per-op buffer alloc/free contends on, which
+                    // collapses long-context decode to seconds/token (GPU idle).
+                    // A smaller initial allocation (the cache still grows on
+                    // demand) keeps headroom so residency stays cheap.
+                    BackendType.GgmlMetal => Math.Min(gpuDefault, 2048),
                     _ => gpuDefault,
                 };
                 return Math.Min(requestedContextLength, effectiveDefault);

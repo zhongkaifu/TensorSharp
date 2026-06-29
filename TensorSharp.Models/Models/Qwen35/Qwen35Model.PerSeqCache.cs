@@ -72,11 +72,33 @@ namespace TensorSharp.Models
         /// <summary>The per-sequence fused forward is the path the engine
         /// dispatches for concurrent (N&gt;=2) requests: each request decodes
         /// through its own KV + GDN holder (swapped in with a cheap reference
-        /// flip) instead of the broken/slow batched paged path. Wired up for
-        /// ggml_cuda where the whole-model fused decode (TryFullModelDecode) is
-        /// available.</summary>
+        /// flip) instead of the broken/slow batched paged path.
+        ///
+        /// ggml_cuda: each request decodes through the fast whole-model fused
+        /// single-graph decode (<see cref="TryFullModelDecode"/>), so the path
+        /// also requires that decode to be available (full-decode on, not
+        /// latched unsupported).
+        ///
+        /// ggml_metal: the whole-model fused decode is CUDA-only
+        /// (<see cref="TryFullModelDecode"/> returns false on Metal), so each
+        /// request decodes through the op-by-op <see cref="Forward"/> — the SAME
+        /// path the single-stream (N==1) case already uses correctly on Metal —
+        /// against its own KV + GDN holder. Routing concurrent requests here is
+        /// what keeps them running together (each scheduled sequence gets a
+        /// Forward per step) AND keeps each request's recurrent/attention state
+        /// isolated in its own holder. Without it, Metal had no per-seq fused
+        /// path: concurrent requests fell back to <c>ExecuteStepPerSequence</c>,
+        /// which serializes them (at most one Forward per step) and corrupts
+        /// output via the byte-level cross-sequence KV/GDN swap in
+        /// EnsureOwnership. The op-by-op Forward touches only the model fields
+        /// the holder swaps (<c>_kvCacheK/V</c>, <c>_convState</c>,
+        /// <c>_convStateWriteIdx</c>, <c>_deltaStateTensor</c>), with no
+        /// CUDA-graph-captured device addresses to go stale across the swap, so
+        /// it is correct per-request on Metal.</summary>
         public bool SupportsPerSequenceFusedForward =>
-            _backend == BackendType.GgmlCuda && _fullDecodeEnabled && !_fdUnsupported && !_fdSpecSessionActive;
+            !_fdSpecSessionActive
+            && ((_backend == BackendType.GgmlCuda && _fullDecodeEnabled && !_fdUnsupported)
+                || _backend == BackendType.GgmlMetal);
 
         public bool HasFusedSequenceCache(string requestId)
             => requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
