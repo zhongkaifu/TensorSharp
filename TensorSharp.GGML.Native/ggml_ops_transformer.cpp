@@ -6258,27 +6258,30 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
-        // Additive causal masks for soft_max_ext (the Metal backend has no
-        // DIAG_MASK_INF op; soft_max_ext is portable across Metal/CUDA and fuses
-        // mask+softmax). One mask per distinct attendLen, shared across layers.
-        // mask[qi][ki] = 0 if ki <= (attendLen-N)+qi else -inf — exactly the old
-        // ggml_diag_mask_inf(attendLen-N) semantics (SWA low-end is below the window).
-        // window == 0 → plain causal (keys [0, threshold]). window > 0 → sliding
-        // window causal: also mask keys older than (threshold - window + 1). The
-        // windowed variant is used for SWA prefill that attends over the FRESH K/V
-        // of all N tokens (start_pos==0, N > sliding window) where the circular
-        // cache can't hold the whole sequence — see the attention block below.
-        struct VerifyMask { int attendLen; int window; ggml_tensor* tensor; int dataIdx; };
+        // Additive causal masks for ggml_flash_attn_ext. Attention runs through
+        // flash_attn_ext (not a manual mul_mat + soft_max chain): flash is O(seq)
+        // memory — it never materializes the [attendLen, N, heads] score tensor that
+        // reached multiple GB at multi-thousand-token prefill (forcing a one-time
+        // multi-GB gallocr growth on the first long prompt, the dominant cold-start
+        // cost) — and is the proven path on Metal AND CUDA (mirrors the MoE verify
+        // and the decode path; the manual chain is numerically fragile at head_dim
+        // 256/512). One mask per distinct (kvLen, validLen, window), shared across
+        // layers. mask[qi][ki] = 0 iff ki < validLen (real, not flash padding) AND
+        // ki <= (validLen-N)+qi (causal) AND (window==0 || ki > threshold-window)
+        // (sliding-window low bound). The windowed variant (window>0) serves SWA
+        // prefill that attends the FRESH K/V of all N tokens (start_pos==0, N >
+        // sliding window); window==0 covers the circular-cache read and global.
+        struct VerifyMask { int kvLen; int validLen; int window; ggml_tensor* tensor; int dataIdx; };
         std::vector<VerifyMask> mask_cache;
         std::vector<std::vector<ggml_fp16_t>> mask_data_store;
-        auto get_causal_mask = [&](int attendLen, int window) -> ggml_tensor* {
+        auto get_causal_mask = [&](int kvLen, int validLen, int window) -> ggml_tensor* {
             for (auto& m : mask_cache)
-                if (m.attendLen == attendLen && m.window == window) return m.tensor;
-            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, attendLen, N);
-            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(attendLen) * N);
+                if (m.kvLen == kvLen && m.validLen == validLen && m.window == window) return m.tensor;
+            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvLen, N);
+            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * N);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
-            const int nPast = attendLen - N;
+            const int nPast = validLen - N;
             for (int qi = 0; qi < N; qi++)
             {
                 const int threshold = nPast + qi;
@@ -6287,17 +6290,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // also keeps soft keys ahead of it. Window low-bound is not applied
                 // to the bidi branch (mirrors the C# per-op exceptPositions path).
                 const bool q_except = is_except != nullptr && qi < N && is_except[qi] != 0;
-                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * attendLen];
-                for (int ki = 0; ki < attendLen; ki++)
+                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
+                for (int ki = 0; ki < kvLen; ki++)
                 {
-                    bool causal = (ki <= threshold) && !(window > 0 && ki < low);
+                    bool causal = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
                     bool bidi = q_except && ki < N && is_except[ki] != 0;
                     row[ki] = (causal || bidi) ? zero_val : neg_inf;
                 }
             }
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
-            mask_cache.push_back({attendLen, window, mt, idx});
+            mask_cache.push_back({kvLen, validLen, window, mt, idx});
             return mt;
         };
 
@@ -6420,33 +6423,50 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             const bool swaFreshShared = info.isLocal && info.isShared && start_pos == 0
                 && totalSeqLen > info.cacheSize && layer_k_full[info.kvSource] != nullptr;
 
-            // Read the attention window. SWA: the last min(totalSeqLen, W) positions
-            // (view_kv_cache_window unwraps the circular buffer). Global: [0, total).
+            // Read the attention window. SWA overflow (swaFresh/swaFreshShared):
+            // attend the FRESH full chunk [0, N) with a sliding-window mask. Else:
+            // SWA reads the last min(total, W) circular-cache positions; global reads
+            // [0, total) (flash-padded for head_dim 512). Attention runs through
+            // ggml_flash_attn_ext below (O(seq) memory, no materialized score tensor).
             int attendLen;
+            int attnKvLen;
             int maskWindow;
             ggml_tensor* k_full;
             ggml_tensor* v_full;
-            if (swaFresh)
+            if (swaFresh || swaFreshShared)
             {
+                ggml_tensor* k_fresh = swaFresh ? k_write : layer_k_full[info.kvSource];  // [hd, N, kvHeads]
+                ggml_tensor* v_fresh = swaFresh ? v_write : layer_v_full[info.kvSource];  // [hd, N, kvHeads]
                 attendLen = N;                  // fresh K/V covers [0, N)
+                attnKvLen = N;                  // local head_dim 256 needs no flash padding
                 maskWindow = info.cacheSize;    // sliding window W
-                k_full = k_write;               // [hd, N, kvHeads]
-                v_full = v_write;               // [hd, N, kvHeads]
-            }
-            else if (swaFreshShared)
-            {
-                attendLen = N;                  // donor's fresh K/V covers [0, N)
-                maskWindow = info.cacheSize;    // donor's sliding window W (== this layer's)
-                k_full = layer_k_full[info.kvSource];   // [hd, N, kvHeads]
-                v_full = layer_v_full[info.kvSource];   // [hd, N, kvHeads]
+                // flash_attn_ext needs K/V in the cache dtype; convert the fresh F32
+                // chunk when the cache is F16 (no-op when F32).
+                if (kv_cache_type == GGML_TYPE_F32)
+                {
+                    k_full = k_fresh;
+                    v_full = v_fresh;
+                }
+                else
+                {
+                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, N, info.kvHeads);
+                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, N, info.kvHeads);
+                    k_full = ggml_cpy(ctx, k_fresh, kf);
+                    v_full = ggml_cpy(ctx, v_fresh, vf);
+                }
             }
             else
             {
                 attendLen = info.isLocal ? std::min(totalSeqLen, info.cacheSize) : totalSeqLen;
-                maskWindow = 0;                 // window already enforced by the cache view
                 const int activeStart = info.isLocal ? ((totalSeqLen - attendLen) % info.cacheSize) : 0;
-                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
-                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attendLen, kv_cache_type);
+                // Flash attention reads a (possibly padded) KV window; padding slots
+                // beyond attendLen are masked out. Padding only applies to global
+                // (linear, activeStart==0, head_dim 512) layers — local SWA layers
+                // (head_dim 256) need no padding, so wrap-around is never padded.
+                attnKvLen = flash_attn_kv_length(attendLen, info.cacheSize, info.hd);
+                maskWindow = 0;                 // window already enforced by the cache view
+                k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
+                v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
             }
             if (k_full == nullptr || v_full == nullptr)
             {
@@ -6454,24 +6474,24 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 return 0;
             }
 
-            // Manual masked attention (Gemma scale = 1.0). The window view holds
-            // chronological positions [totalSeqLen-attendLen, totalSeqLen); query
-            // row i (logical pos start_pos+i) keeps keys with view-index
-            // j <= (attendLen-N)+i (causal; the SWA low-end is below the window so
-            // needs no masking). n_past = attendLen-N covers both within- and
-            // beyond-window cases (== start_pos when attendLen==totalSeqLen).
-            ggml_tensor* q_t = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));  // [hd, N, num_heads]
-            ggml_tensor* kq = ggml_mul_mat(ctx, k_full, q_t);                          // [attendLen, N, num_heads]
-            // Keep the K*Q scores in F32: at head_dim 256 (SWA) / 512 (global) the
-            // Metal kernel's default F16 accumulator overflows for multi-token Q and
-            // silently corrupts the logits (same fix the prefill path applies). CUDA
-            // accumulates in F32 by default so this was invisible there.
-            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-            kq = ggml_soft_max_ext(ctx, kq, get_causal_mask(attendLen, maskWindow), 1.0f, 0.0f);
-            ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));   // [kvLen, hd, kvHeads]
-            ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq);                              // [hd, N, num_heads]
-            ggml_tensor* attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));     // [hd, num_heads, N]
-            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn, info.qDim, N);
+            // Flash attention (Gemma scale = 1.0). q_t [hd, N, num_heads]; the mask
+            // (kvLen=attnKvLen, validLen=attendLen, window=maskWindow) encodes causal
+            // + sliding-window + flash-padding + multimodal-bidi semantics.
+            ggml_tensor* q_t = ggml_permute(ctx, q_rope, 0, 2, 1, 3);                   // [hd, N, num_heads]
+            ggml_tensor* fa_mask = get_causal_mask(attnKvLen, attendLen, maskWindow);
+            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_t, k_full, v_full, fa_mask, 1.0f, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+            if (!backend_supports_op(attn_out))
+            {
+                // No supported flash kernel for this shape (e.g. an exotic head_dim):
+                // fall back to the per-op verify rather than the numerically-fragile
+                // manual chain.
+                set_last_error("Gemma4 model verify: flash attention unsupported for this shape; use per-op path.");
+                return 0;
+            }
+            // flash_attn_ext returns [hd, num_heads, N, 1] — each column holds all
+            // heads contiguously, exactly what the O projection wants.
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, N);
 
             // O projection -> post-attn norm -> residual
             ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);                  // [hidden, N]

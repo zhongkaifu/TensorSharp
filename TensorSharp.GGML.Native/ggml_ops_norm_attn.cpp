@@ -2182,6 +2182,21 @@ namespace
         return enabled;
     }
 
+    // The non-cached (large-kvLen) prefill path streams K/V through
+    // ggml_flash_attn_ext instead of materializing the [kvLen, seqLen, numHeads]
+    // scores + softmax tensors. That O(N^2) materialization OOMs on long prompts
+    // (a 32K-token global window alone needs multiple GB just for scores+probs)
+    // and is also the slower, numerically-fragile path for multi-token Q. Flash
+    // is on by default; TS_PREFILL_ATTN_FLASH=0 reverts to the materialized graph.
+    inline bool prefill_attn_flash_enabled()
+    {
+        static const bool enabled = []{
+            const char* e = std::getenv("TS_PREFILL_ATTN_FLASH");
+            return !(e != nullptr && std::strcmp(e, "0") == 0);
+        }();
+        return enabled;
+    }
+
     inline std::uint32_t prefill_float_bits(float v)
     {
         std::uint32_t b;
@@ -2446,6 +2461,135 @@ namespace
         clear_last_error();
         return 1;
     }
+
+    // Flash-attention prefill: same contract as the materialized scores path in
+    // the F16KV / F32 exports below, but runs ggml_flash_attn_ext, which streams
+    // the K/V tiles instead of materializing the [kvLen, seqLen, numHeads] score
+    // and softmax intermediates. Those O(N^2) buffers are what OOMs on long
+    // prompts (a single 32K-token global window needs GBs for scores+probs) and
+    // are the slower, F16-accumulator-fragile path for multi-token Q. Flash keeps
+    // the attention working set to O(N) and matches the dense/MoE verify prefill.
+    //
+    // q_data: F32 head-first [numHeads, seqLen, headDim] == GGML [headDim, seqLen, numHeads].
+    // k/v_data: [numKVHeads, kvStride, headDim] F16 or F32; leading kvLen rows read per head.
+    // out_data: F32 flat [seqLen, numHeads*headDim] == GGML [numHeads*headDim, seqLen].
+    // GQA (numHeads % numKVHeads == 0) is handled in-kernel. Returns 1 on success,
+    // 0 on hard failure, -1 when the backend has no flash kernel for this shape
+    // (caller falls back to the materialized graph).
+    int fused_prefill_attn_flash(
+        const void* q_data, const void* k_data, const void* v_data, float* out_data,
+        int num_heads, int num_kv_heads, int head_dim,
+        int seq_len, int kv_len, int kv_stride,
+        int mask_start_pos, int sliding_window, float scale, bool kv_f16)
+    {
+        if (!ensure_backend()) return 0;
+
+        const std::size_t ctx_size = 4 * 1024 * 1024;
+        PooledContextHandle context;
+        if (!context.init(ctx_size))
+        {
+            set_last_error("Failed to create ggml context for flash prefill attention.");
+            return 0;
+        }
+        auto* ctx = context.value;
+
+        const ggml_type kv_type = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        // flash_attn_ext wants q=[headDim, seqLen, numHeads], k/v=[headDim, kvLen,
+        // numKVHeads] — exactly the head-first layout, so no permutes are needed.
+        ggml_tensor* q_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, seq_len, num_heads);
+        ggml_tensor* k_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, kv_len, num_kv_heads);
+        ggml_tensor* v_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, kv_len, num_kv_heads);
+        ggml_tensor* mask_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, seq_len);
+        ggml_tensor* attn_result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, num_heads * head_dim, seq_len);
+        if (q_in == nullptr || k_in == nullptr || v_in == nullptr ||
+            mask_tensor == nullptr || attn_result == nullptr)
+        {
+            set_last_error("Failed to create ggml tensors for flash prefill attention.");
+            return 0;
+        }
+
+        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_tensor, scale, 0.0f, 0.0f);
+        if (attn_out == nullptr) { set_last_error("Failed flash_attn_ext node."); return 0; }
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        if (!backend_supports_op(attn_out))
+            return -1; // no flash kernel for this geometry; let the caller fall back
+
+        // flash_attn_ext returns [headDim, numHeads, seqLen, 1] — contiguous, with
+        // headDim innermost then head index, exactly the flat [numHeads*headDim, seqLen] output.
+        ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, num_heads * head_dim, seq_len);
+        ggml_tensor* output = ggml_cpy(ctx, attn_flat, attn_result);
+        if (output == nullptr) { set_last_error("Failed flash output cpy node."); return 0; }
+        ggml_set_output(output);
+
+        ggml_cgraph* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (buffer.value == nullptr)
+        {
+            set_last_error("Failed to allocate backend buffer for flash prefill attention.");
+            return 0;
+        }
+
+        host_read_barrier();
+        ggml_backend_tensor_set(q_in, q_data, 0,
+            static_cast<std::size_t>(num_heads) * seq_len * head_dim * sizeof(float));
+
+        // Upload the leading kvLen rows of each head from the [numKVHeads, kvStride,
+        // headDim] cache. Contiguous single upload when the cache is exactly sized.
+        const std::size_t kv_elem = kv_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+        const std::size_t dstHeadElems = static_cast<std::size_t>(kv_len) * head_dim;
+        if (kv_stride == kv_len)
+        {
+            const std::size_t bytes = static_cast<std::size_t>(num_kv_heads) * dstHeadElems * kv_elem;
+            ggml_backend_tensor_set(k_in, k_data, 0, bytes);
+            ggml_backend_tensor_set(v_in, v_data, 0, bytes);
+        }
+        else
+        {
+            const auto* kb = static_cast<const unsigned char*>(k_data);
+            const auto* vb = static_cast<const unsigned char*>(v_data);
+            const std::size_t srcHeadElems = static_cast<std::size_t>(kv_stride) * head_dim;
+            const std::size_t headBytes = dstHeadElems * kv_elem;
+            for (int h = 0; h < num_kv_heads; ++h)
+            {
+                const std::size_t srcOff = static_cast<std::size_t>(h) * srcHeadElems * kv_elem;
+                const std::size_t dstOff = static_cast<std::size_t>(h) * dstHeadElems * kv_elem;
+                ggml_backend_tensor_set(k_in, kb + srcOff, dstOff, headBytes);
+                ggml_backend_tensor_set(v_in, vb + srcOff, dstOff, headBytes);
+            }
+        }
+
+        // Causal (+ optional sliding-window) additive mask: row q attends key k iff
+        // winStart <= k <= mask_start_pos + q.
+        g_prefill_mask_scratch.assign(static_cast<std::size_t>(kv_len) * seq_len, ggml_fp32_to_fp16(0.0f));
+        {
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            for (int q_idx = 0; q_idx < seq_len; q_idx++)
+            {
+                int threshold = mask_start_pos + q_idx;
+                int winStart = (sliding_window > 0) ? std::max(0, threshold - sliding_window + 1) : 0;
+                ggml_fp16_t* row = &g_prefill_mask_scratch[static_cast<std::size_t>(q_idx) * kv_len];
+                for (int kv_idx = 0; kv_idx < kv_len; kv_idx++)
+                    row[kv_idx] = (kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
+            }
+        }
+        ggml_backend_tensor_set(mask_tensor, g_prefill_mask_scratch.data(), 0,
+                                 g_prefill_mask_scratch.size() * sizeof(ggml_fp16_t));
+
+        ggml_status status = ggml_backend_graph_compute(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS)
+        {
+            set_last_error("ggml graph compute failed for flash prefill attention.");
+            return 0;
+        }
+
+        finalize_compute_with_download(attn_result, out_data,
+            static_cast<std::size_t>(num_heads) * seq_len * head_dim * sizeof(float));
+        clear_last_error();
+        return 1;
+    }
 } // anonymous namespace
 
 // ============================================================================
@@ -2488,6 +2632,18 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
                 q_data, k_data, v_data, out_data,
                 numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvLen,
                 maskStartPos, slidingWindow, scale, /*kv_f16*/ false);
+        }
+
+        // Large-kvLen head-first path: flash attention streams K/V instead of
+        // materializing the O(N^2) scores+softmax that OOMs on long prompts. The
+        // flat (inputFormat==1) layout stays on the materialized graph below.
+        if (inputFormat == 0 && prefill_attn_flash_enabled())
+        {
+            int fr = fused_prefill_attn_flash(
+                q_data, k_data, v_data, out_data,
+                numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvLen,
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ false);
+            if (fr >= 0) return fr;
         }
 
         const std::size_t ctx_size = 4 * 1024 * 1024;
@@ -2706,6 +2862,18 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
                 q_data, k_data, v_data, out_data,
                 numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvCacheLen,
                 maskStartPos, slidingWindow, scale, /*kv_f16*/ true);
+        }
+
+        // Large-kvLen path: flash attention streams K/V instead of materializing
+        // the O(N^2) scores+softmax that OOMs on long prompts. Falls through to the
+        // materialized graph below only if the backend has no flash kernel here.
+        if (prefill_attn_flash_enabled())
+        {
+            int fr = fused_prefill_attn_flash(
+                q_data, k_data, v_data, out_data,
+                numHeads, numKVHeads, headDim, seqLen, kvLen, /*kv_stride*/ kvCacheLen,
+                maskStartPos, slidingWindow, scale, /*kv_f16*/ true);
+            if (fr >= 0) return fr;
         }
 
         const std::size_t ctx_size = 4 * 1024 * 1024;

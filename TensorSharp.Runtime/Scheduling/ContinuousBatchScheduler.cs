@@ -161,25 +161,61 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>
+        /// Per-step prefill chunk cap for one sequence. A FRESH solo prefill
+        /// (start_pos==0, no contention) runs its whole chunk through the fused
+        /// single-graph flash-verify path — the model grows its cache to fit — so
+        /// feed it big (<see cref="SchedulerConfig.SoloPrefillChunkSize"/>). A
+        /// start_pos&gt;0 chunk (the tail of a prompt longer than the fused-prefill
+        /// capacity, or a prefix-cache-adopted start) can only run on the per-op
+        /// path, whose materialized attention-score tensor scales with the chunk
+        /// length — keep those small (<see cref="SchedulerConfig.MaxPrefillChunkSize"/>)
+        /// so the tail can never blow up into a multi-GB score tensor. Any
+        /// contention also uses the small fair chunk so concurrent decode can
+        /// interleave.
+        /// </summary>
+        private int PrefillCapFor(SequenceState seq, bool noContention)
+        {
+            return (noContention && seq.NumComputedTokens == 0)
+                ? _cfg.SoloPrefillChunkSize
+                : _cfg.MaxPrefillChunkSize;
+        }
+
+        /// <summary>
         /// Decide the work for the next forward pass.
         /// </summary>
         public SchedulerOutput Schedule()
         {
             var output = new SchedulerOutput();
-            int tokenBudget = _cfg.MaxNumBatchedTokens;
 
             // When there's at most one sequence in the whole system there is no
             // concurrent decode to interleave with, so the small prefill chunk
             // (which exists only for fairness) just forces a long prompt onto the
-            // slow per-op, GPU-syncs-every-op path for every chunk that crosses
-            // the sliding-window boundary. Feed a lone prompt in one big chunk
-            // (bounded by the batched-token budget) like the CLI does, keeping it
-            // on the fused single-graph prefill path. The moment a 2nd request
-            // appears this reverts to small chunks automatically.
+            // slow per-op path. Feed a lone prompt's FRESH (start_pos==0) chunk in
+            // one big piece (bounded by SoloPrefillChunkSize) so it runs as ONE
+            // fused single-graph prefill — the model grows its cache to fit and
+            // routes the whole chunk through the flash verify kernel. The moment a
+            // 2nd request appears this reverts to small chunks (see PrefillCapFor).
+            //
+            // CRITICAL: the big chunk only helps at start_pos==0. A prompt LONGER
+            // than the fused-prefill capacity spills its tail into start_pos>0
+            // chunks that can ONLY run on the per-op path, whose materialized score
+            // tensor grows with the chunk size (an 8k tail chunk = a multi-GB score
+            // tensor, minutes of compute). So tail chunks (start_pos>0) stay small
+            // at MaxPrefillChunkSize regardless of contention — bounding that score
+            // tensor. PrefillCapFor encodes both rules.
             bool noContention = (_running.Count + _waiting.Count) <= 1;
-            int prefillCap = noContention
-                ? Math.Min(_cfg.SoloPrefillChunkSize, _cfg.MaxNumBatchedTokens)
-                : _cfg.MaxPrefillChunkSize;
+
+            // Per-step token budget. MaxNumBatchedTokens caps the COMBINED work of
+            // all sequences in a step — an activation-memory bound that matters when
+            // batching concurrent requests. A lone prompt has no concurrent
+            // activations to share that budget with, and its fused whole-model
+            // prefill graph is O(seq) memory (flash attention, last-token-only
+            // logits), so let the solo fresh chunk reach SoloPrefillChunkSize.
+            // Without this lift the budget would re-chunk the prompt at
+            // MaxNumBatchedTokens and push the remainder onto the slow per-op path.
+            int tokenBudget = noContention
+                ? Math.Max(_cfg.MaxNumBatchedTokens, _cfg.SoloPrefillChunkSize)
+                : _cfg.MaxNumBatchedTokens;
 
             // -------------------------------------------------------------- 1. Run existing running set first.
             //    This guarantees decoding sequences make forward progress even
@@ -195,7 +231,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
                 bool isPrefill = promptUncomputed > 0;
                 int want = isPrefill
-                    ? Math.Min(promptUncomputed, prefillCap)
+                    ? Math.Min(promptUncomputed, PrefillCapFor(seq, noContention))
                     : 1; // decode step
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
@@ -279,7 +315,7 @@ namespace TensorSharp.Runtime.Scheduling
                     promptUncomputed = 1;
                 }
 
-                int want = Math.Min(promptUncomputed, prefillCap);
+                int want = Math.Min(promptUncomputed, PrefillCapFor(seq, noContention));
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
 

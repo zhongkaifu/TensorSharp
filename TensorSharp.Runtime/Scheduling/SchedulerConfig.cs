@@ -48,8 +48,18 @@ namespace TensorSharp.Runtime.Scheduling
         /// after every op on CUDA, where async deferral is Metal-only), so
         /// splitting a solo prompt into small chunks is several times SLOWER than
         /// feeding it whole. Matching the CLI (which never sub-divides a solo
-        /// prompt below ~5120 tokens) recovers full prefill throughput. Bounded
-        /// by <see cref="MaxNumBatchedTokens"/> for activation-memory safety.
+        /// prompt below ~5120 tokens) recovers full prefill throughput.
+        ///
+        /// This caps only the FRESH (start_pos==0) chunk, which the model runs as
+        /// ONE fused flash-verify graph (O(seq) memory). A prompt longer than this
+        /// has its TAIL processed in small per-op chunks (<see cref="MaxPrefillChunkSize"/>),
+        /// so a big value only raises the size of the prompt that gets the fully-
+        /// fused fast path — not the per-op score tensor (which the tail bounds).
+        /// The ceiling is GPU memory: the fused verify graph's activations scale
+        /// with the chunk, so an over-large fresh chunk OOMs the graph and falls
+        /// back to the slow per-op path for the WHOLE chunk. 8192 keeps a 12B dense
+        /// model's whole-chunk verify comfortably within a 16 GB card while covering
+        /// the common long-prompt case in one fused pass; raise it on bigger GPUs.
         /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.</summary>
         public int SoloPrefillChunkSize { get; init; } = 8192;
 
