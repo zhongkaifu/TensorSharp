@@ -107,7 +107,7 @@
   "backends": ["gpu", "cpu"],
 
   "maps": {
-    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "ggml_cpu"},
+    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "cpu"},
     "llama_ngl": {"gpu": 999, "cpu": 0}
   },
 
@@ -121,7 +121,7 @@
   "defaults": {
     "engines": ["tensorsharp", "llamacpp", "vllm"],
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "qwen36-35b-a3b-q4", "diffusiongemma"],
-    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video", "prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k"],
+    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video", "prefill_2k", "prefill_4k", "prefill_8k"],
     "backends": ["gpu", "cpu"],
     "mtp_modes": [false],
     "concurrency": [1],

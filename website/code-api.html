@@ -83,6 +83,70 @@ float[] logits = model.Forward(tokenIds.ToArray());
 int topToken = model.SampleGreedy(logits);
 Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, topToken={topToken}");</code></pre>
 
+  <h2 id="diffusion">DiffusionGemma — text diffusion</h2>
+  <p>DiffusionGemma is a <strong>block text-diffusion</strong> model, not an autoregressive one. <code>ModelBase.Create()</code> still loads it (the GGUF architecture is <code>diffusion-gemma</code> / <code>diffusion_gemma</code>) and returns a <code>DiffusionGemmaModel</code>, but its <code>Forward(int[])</code> intentionally throws — generation runs through <code>DiffusionGemmaSampler</code>, which iteratively denoises fixed-length <em>canvas</em> blocks over a <code>[prompt | canvas]</code> sequence. See the <a href="models.html#table">DiffusionGemma model card</a> for the architecture.</p>
+  <pre data-lang="csharp"><code>using TensorSharp.Models;
+using TensorSharp.Models.DiffusionGemma;
+using TensorSharp.Runtime;
+
+// Load a diffusion-gemma GGUF — the architecture is auto-detected.
+using var model = (DiffusionGemmaModel)ModelBase.Create("diffusion-gemma.gguf", BackendType.GgmlCuda);
+
+// Render the prompt with the model's chat template, then tokenize.
+var messages = new List&lt;ChatMessage&gt; { new() { Role = "user", Content = "Write a haiku about winter." } };
+string rendered = PromptRenderer.Render(model.Config.ChatTemplate, messages,
+    addGenerationPrompt: true, architecture: model.Config.Architecture);
+int[] promptTokens = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
+
+// Configure the EntropyBound denoising sampler.
+var p = new DiffusionEbParams
+{
+    MaxDenoisingSteps = 48,   // refinement steps per canvas block
+    Seed = 0,                 // deterministic
+    MaxBlocks = 1,            // block-autoregressive canvas blocks
+};
+
+var sampler = new DiffusionGemmaSampler(model);
+
+// Generate. The optional callback fires after every denoising step with
+// (blockIndex, step, totalSteps, previewTokens) — useful for a live UI.
+List&lt;int&gt; generated = sampler.Generate(promptTokens, p,
+    (block, step, total, preview) =&gt; Console.Write($"\rblock {block + 1} step {step + 1}/{total}   "));
+
+Console.WriteLine();
+Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
+  <p>Key parameters on <code>DiffusionEbParams</code>: <code>MaxDenoisingSteps</code> (48), <code>TMin</code>/<code>TMax</code> temperature schedule (0.4 / 0.8), <code>EntropyBound</code> (0.1), <code>StabilityThreshold</code> / <code>ConfidenceThreshold</code> early-stop, <code>Seed</code>, and <code>MaxBlocks</code>. <code>model.CanvasLength</code> reports the per-block canvas size.</p>
+  <div class="callout note"><div class="ic">🌫️</div><p>On GPU backends the prompt K/V is cached once per block and reused across denoising steps; GGML backends default to a fused whole-model decode plus a fused lm-head tail. Tunables (<code>DIFFUSION_STEPS</code>, <code>DIFFUSION_NO_SC</code>, …) are in the <a href="advanced.html">Advanced</a> page.</p></div>
+
+  <h2 id="imageedit">Qwen-Image-Edit — image editing</h2>
+  <p>Qwen-Image-Edit takes a <strong>prompt + an input image</strong> and returns an edited image. The loaded <code>qwen_image</code> GGUF is only the MMDiT diffusion transformer; the model also pulls in two companion GGUFs resolved next to the DiT file (or via the <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> environment variables): the Qwen-Image VAE and the Qwen2.5-VL-7B text encoder. Like DiffusionGemma it is <em>not</em> an autoregressive text model — the autoregressive entry points throw and editing is driven through <code>EditImage()</code>.</p>
+  <pre data-lang="csharp"><code>using TensorSharp.Models;
+using TensorSharp.Models.QwenImage;
+using TensorSharp.Runtime;
+
+// Load the MMDiT GGUF (architecture = qwen_image). The VAE + Qwen2.5-VL
+// companions are resolved from the same directory (or the TS_QWEN_IMAGE_* env vars).
+using var model = (QwenImageModel)ModelBase.Create("qwen-image-edit-DiT-Q4_K_M.gguf", BackendType.GgmlCuda);
+
+// Load the input image (PNG/JPEG decoded to an RgbImage).
+RgbImage input = ImageIO.Load("input.png");
+
+var p = new QwenImageParams
+{
+    Steps = 30,               // FlowMatch-Euler denoising steps
+    CfgScale = 4.0f,          // true-CFG guidance; <= 1 disables the negative pass
+    NegativePrompt = " ",     // used only when CfgScale > 1
+    Seed = 0,
+    TargetArea = 1024 * 1024, // ~1 MP; aspect follows the input (dims snapped to /16)
+    // Width = 0, Height = 0, // pin an explicit output size to bypass the VRAM clamp
+};
+
+RgbImage output = model.EditImage("Make the sky a dramatic sunset.", input, p);
+ImageIO.SavePng("edited.png", output);
+Console.WriteLine($"Saved {output.Width}x{output.Height} edited image.");</code></pre>
+  <p>For a live UI, set <code>p.OnStep = (step, total, preview) =&gt; { … }</code> and <code>p.PreviewCount</code> to receive decoded RGB snapshots of the partially denoised latent on throttled steps. <code>RgbImage</code> exposes <code>Width</code>, <code>Height</code>, and a planar/interleaved <code>Pixels</code> buffer; <code>ImageIO</code> provides <code>Load</code>, <code>Decode(byte[])</code>, <code>EncodePng</code>, <code>SavePng</code>, and resize helpers.</p>
+  <div class="callout warn"><div class="ic">🖼️</div><p>Image editing is compute-heavy: each denoise step runs the full 60-block MMDiT (twice when CFG is on). Use a CUDA or Metal GGML backend for practical full-quality edits; the pipeline auto-clamps the target area to the device VRAM budget unless you pin <code>Width</code>/<code>Height</code>. See the <a href="models.html#table">model card</a> for the companion-GGUF layout.</p></div>
+
   <h2 id="sampling">SamplingConfig</h2>
   <p>The sampling knobs map one-to-one to the CLI flags and API options. Defaults match Ollama.</p>
   <div class="table-scroll">
@@ -114,6 +178,8 @@ Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, top
       <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>, <code>Decode(ids)</code>, <code>IsEos(id)</code>, <code>EosTokenIds</code> (BPE &amp; SentencePiece implementations).</td></tr>
       <tr><td><code>ModelConfig</code></td><td>Architecture metadata: <code>VocabSize</code>, context length, and more.</td></tr>
       <tr><td><code>IBatchedPagedModel</code></td><td>Optional batched/paged forward (<code>ForwardBatch</code>) implemented by most architectures for continuous batching.</td></tr>
+      <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>Text-diffusion model and its EntropyBound denoising sampler (<code>Generate(promptTokens, DiffusionEbParams, …)</code>). <code>Forward()</code> is unsupported.</td></tr>
+      <tr><td><code>QwenImageModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-Edit image editor. <code>EditImage(prompt, RgbImage, QwenImageParams)</code> returns the modified <code>RgbImage</code>; <code>ImageIO</code> loads/saves PNG.</td></tr>
       <tr><td><code>InferenceEngine</code></td><td>Worker-thread scheduler + paged block pool that powers the server's continuous batching (in <code>TensorSharp.Runtime.Scheduling</code>).</td></tr>
     </tbody>
   </table>

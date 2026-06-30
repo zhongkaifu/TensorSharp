@@ -26,6 +26,9 @@ namespace TensorSharp.Models.QwenImage
             2.8184f,1.4541f,2.3275f,2.6558f,1.2196f,1.7708f,2.6052f,2.0743f,
             3.2687f,2.1526f,2.8652f,1.5579f,1.6382f,1.1253f,2.8251f,1.916f };
         private const int C = QwenImageModel.VaeLatentChannels; // 16
+        // Qwen-Image's native training/inference resolution (diffusers/sd.cpp size the edit to
+        // ~1 MP). The VRAM area clamp targets this as the high-quality ceiling.
+        private const long QwenImageNativeArea = 1024L * 1024;
 
         private readonly QwenImageModel _model;
         private QwenImageVae _vae;
@@ -394,14 +397,21 @@ namespace TensorSharp.Models.QwenImage
             long maxArea;
             if (nativeFlash)
             {
-                // Flash removes the DiT scores, but the GPU VAE conv's im2col scratch grows
-                // with the output area (it peaked ~15.9 GB encoding a full 1 MP image on 16 GB)
-                // and is the real high-res limit. Keep a conservative linear budget so the
-                // default never oversubscribes VRAM (push higher with explicit --width/--height).
-                const long reserve = 6L * 1024 * 1024 * 1024;
-                const long perToken = 1700L * 1024;             // ~1.7 MB/token (VAE im2col-dominated)
-                long maxT = Math.Max(256, (budget - reserve) / perToken);
-                maxArea = (maxT - 400) * 128;
+                // The VAE conv im2col is now band-tiled (VaeReferenceMath.TryGpuConv2dMaybeTiled —
+                // bounded), and the DiT runs O(n) flash attention, so memory-wise the full native
+                // 1 MP fits 16 GB. The remaining limit is SPEED: above the captured-path ceiling
+                // (~0.5 MP on 16 GB; the captured graph must materialize 2*T^2*heads*4 bytes of
+                // attention scores, since flash breaks under CUDA-graph capture) each forward runs
+                // the slower non-persistent flash path (~3 s -> ~20 s/forward toward 1 MP). So pick
+                // a default a notch above that ceiling: enough resolution to fix the soft/abnormal
+                // faces the old ~0.55 MP clamp produced, without paying the full 1 MP denoise cost.
+                // The formula is VRAM-scaled and lands ~0.65 MP on 16 GB; explicit --width/--height
+                // bypasses it for full 1 MP (best faces, slower).
+                const long ditReserve = 8L * 1024 * 1024 * 1024;       // resident DiT weights + working set
+                const int heads = QwenImageModel.DitNumHeads;          // 24
+                long scoresBudget = Math.Max(512L * 1024 * 1024, budget - ditReserve);
+                double maxT = Math.Sqrt(scoresBudget / (8.0 * heads));
+                maxArea = Math.Min((long)Math.Max(256, maxT - 400) * 128, QwenImageNativeArea);
             }
             else
             {

@@ -303,6 +303,72 @@ public class ManagedQuantizedOpsTests
         AssertClose(expected, actual, tol);
     }
 
+    [Theory]
+    [InlineData(GgmlTensorType.Q4_K, 256, 1, 1)]
+    [InlineData(GgmlTensorType.Q4_K, 256, 7, 1)]
+    [InlineData(GgmlTensorType.Q4_K, 512, 5, 3)]
+    [InlineData(GgmlTensorType.Q4_K, 1024, 33, 4)]
+    [InlineData(GgmlTensorType.Q5_K, 256, 1, 1)]
+    [InlineData(GgmlTensorType.Q5_K, 512, 5, 3)]
+    [InlineData(GgmlTensorType.Q5_K, 1024, 33, 4)]
+    [InlineData(GgmlTensorType.Q6_K, 256, 1, 1)]
+    [InlineData(GgmlTensorType.Q6_K, 512, 5, 3)]
+    [InlineData(GgmlTensorType.Q6_K, 1024, 33, 4)]
+    public void TryAddmmQuantizedToFloat32_KQuantSimd_MatchesDequantReference(
+        GgmlTensorType type, int inDim, int outDim, int rows)
+    {
+        // Validates the SIMD K-quant dots (VecDotQ{4,5,6}_KQ8_K) against the
+        // dequantize-then-dot reference over the SAME random weight bytes.
+        var rng = new Random(20260629 + (int)type * 7 + inDim);
+        byte[] weights = BuildRandomKQuant(rng, type, outDim, inDim);
+        float[] input = Enumerable.Range(0, rows * inDim)
+            .Select(i => 0.07f * MathF.Sin(i * 0.013f + (int)type))
+            .ToArray();
+        float[] actual = new float[rows * outDim];
+
+        Assert.True(ManagedQuantizedOps.TryAddmmQuantizedToFloat32(
+            (int)type, weights, 0, inDim, outDim,
+            input, 0, inDim, rows, actual, 0, outDim));
+
+        float[] expected = DequantizedMatmul(weights, type, outDim, inDim, input, rows);
+
+        float maxRef = 0f;
+        for (int i = 0; i < expected.Length; i++) maxRef = MathF.Max(maxRef, MathF.Abs(expected[i]));
+        float tol = 0.02f * maxRef + 1e-3f;   // Q8_K activation quant noise
+        AssertClose(expected, actual, tol);
+    }
+
+    private static byte[] BuildRandomKQuant(Random rng, GgmlTensorType type, int outDim, int inDim)
+    {
+        Assert.Equal(0, inDim % 256);
+        int blockBytes = (int)GgufFile.GetTypeSize(type);
+        int sbPerRow = inDim / 256;
+        byte[] raw = new byte[(long)outDim * sbPerRow * blockBytes];
+        int o = 0;
+        for (int r = 0; r < outDim; r++)
+        {
+            for (int b = 0; b < sbPerRow; b++)
+            {
+                int sb = o;
+                switch (type)
+                {
+                    case GgmlTensorType.Q4_K:
+                    case GgmlTensorType.Q5_K:
+                        WriteHalf(raw, sb, 0.02f + 0.03f * (float)rng.NextDouble());      // d
+                        WriteHalf(raw, sb + 2, 0.01f + 0.02f * (float)rng.NextDouble());  // dmin
+                        for (int i = 0; i < blockBytes - 4; i++) raw[sb + 4 + i] = (byte)rng.Next(0, 256);
+                        break;
+                    case GgmlTensorType.Q6_K:
+                        for (int i = 0; i < blockBytes - 2; i++) raw[sb + i] = (byte)rng.Next(0, 256);
+                        WriteHalf(raw, sb + blockBytes - 2, 0.01f + 0.02f * (float)rng.NextDouble()); // d
+                        break;
+                }
+                o += blockBytes;
+            }
+        }
+        return raw;
+    }
+
     private static byte[] BuildRandomQ40(Random rng, int outDim, int inDim)
     {
         const int blockSize = 32;

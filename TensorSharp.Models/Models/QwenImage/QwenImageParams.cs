@@ -17,8 +17,14 @@ namespace TensorSharp.Models.QwenImage
         /// <summary>Number of denoising (FlowMatch Euler) steps.</summary>
         public int Steps { get; set; } = 30;
 
-        /// <summary>True-CFG guidance scale; &lt;= 1 disables the negative pass (single forward/step).</summary>
-        public float CfgScale { get; set; } = 4.0f;
+        /// <summary>
+        /// True-CFG guidance scale; &lt;= 1 disables the negative pass (single forward/step).
+        /// Default 2.5 follows the Qwen-Image-Edit-2511 recommendation (matches stable-diffusion.cpp):
+        /// 4.0 over-guides ("CFG burn") — it distorts faces/fine detail and over-saturates color.
+        /// 2.5 preserves face structure while still applying the edit; raise toward 3.5-4 for a
+        /// stronger stylization at the cost of face fidelity.
+        /// </summary>
+        public float CfgScale { get; set; } = 2.5f;
 
         /// <summary>Negative prompt for the true-CFG pass (empty = unconditional).</summary>
         public string NegativePrompt { get; set; } = " ";

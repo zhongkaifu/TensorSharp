@@ -1649,8 +1649,17 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 #endif
 }
 
+// Defined in ggml_ops_qwen_image.cpp; drops the persistent whole-model graphs whose
+// resident weights live in the caches cleared below.
+extern "C" void TSGgml_QwenImageResetForwardCache();
+
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
+    // Drop any persistent whole-model graphs first: they bind weights resident by
+    // GGUF pointer (shared via these caches), so freeing the caches below would leave
+    // their captured graphs pointing at freed device memory.
+    TSGgml_QwenImageResetForwardCache();
+
     {
         std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
         for (auto& [ptr, cached] : g_preloaded_buffer_cache)

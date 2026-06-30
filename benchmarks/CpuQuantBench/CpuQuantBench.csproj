@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>CpuQuantBench</AssemblyName>
+    <Description>Microbenchmark for the pure-C# managed quantized matmul (ManagedQuantizedOps): per-quant GB/s + correctness vs the dequantize-then-dot reference. A/B the SIMD kernels with TENSORSHARP_CPU_NO_SIMD_KQUANT / TENSORSHARP_CPU_NO_SIMD_Q40.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\TensorSharp.Models\TensorSharp.Models.csproj" />
+  </ItemGroup>
+</Project>

@@ -83,6 +83,70 @@ float[] logits = model.Forward(tokenIds.ToArray());
 int topToken = model.SampleGreedy(logits);
 Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, topToken={topToken}");</code></pre>
 
+  <h2 id="diffusion">DiffusionGemma — 文本扩散</h2>
+  <p>DiffusionGemma 是<strong>块文本扩散</strong>模型，而非自回归模型。<code>ModelBase.Create()</code> 仍可加载它（GGUF 架构为 <code>diffusion-gemma</code> / <code>diffusion_gemma</code>）并返回 <code>DiffusionGemmaModel</code>，但其 <code>Forward(int[])</code> 会故意抛出异常——生成需通过 <code>DiffusionGemmaSampler</code>，它在 <code>[prompt | canvas]</code> 序列上对定长的 <em>canvas</em> 块迭代去噪。架构详见 <a href="models.html#table">DiffusionGemma 模型卡</a>。</p>
+  <pre data-lang="csharp"><code>using TensorSharp.Models;
+using TensorSharp.Models.DiffusionGemma;
+using TensorSharp.Runtime;
+
+// 加载 diffusion-gemma GGUF——架构会自动检测。
+using var model = (DiffusionGemmaModel)ModelBase.Create("diffusion-gemma.gguf", BackendType.GgmlCuda);
+
+// 用模型的聊天模板渲染 prompt，然后分词。
+var messages = new List&lt;ChatMessage&gt; { new() { Role = "user", Content = "Write a haiku about winter." } };
+string rendered = PromptRenderer.Render(model.Config.ChatTemplate, messages,
+    addGenerationPrompt: true, architecture: model.Config.Architecture);
+int[] promptTokens = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
+
+// 配置 EntropyBound 去噪采样器。
+var p = new DiffusionEbParams
+{
+    MaxDenoisingSteps = 48,   // 每个 canvas 块的精化步数
+    Seed = 0,                 // 确定性
+    MaxBlocks = 1,            // 块自回归的 canvas 块数
+};
+
+var sampler = new DiffusionGemmaSampler(model);
+
+// 生成。可选回调在每个去噪步后触发，参数为
+// (blockIndex, step, totalSteps, previewTokens)——适合做实时 UI。
+List&lt;int&gt; generated = sampler.Generate(promptTokens, p,
+    (block, step, total, preview) =&gt; Console.Write($"\rblock {block + 1} step {step + 1}/{total}   "));
+
+Console.WriteLine();
+Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
+  <p><code>DiffusionEbParams</code> 的关键参数：<code>MaxDenoisingSteps</code>（48）、<code>TMin</code>/<code>TMax</code> 温度调度（0.4 / 0.8）、<code>EntropyBound</code>（0.1）、<code>StabilityThreshold</code> / <code>ConfidenceThreshold</code> 早停、<code>Seed</code> 与 <code>MaxBlocks</code>。<code>model.CanvasLength</code> 给出每块的 canvas 大小。</p>
+  <div class="callout note"><div class="ic">🌫️</div><p>在 GPU 后端上，prompt 的 K/V 每块缓存一次并在各去噪步间复用；GGML 后端默认使用融合的整模型解码加融合 lm-head 尾。调优开关（<code>DIFFUSION_STEPS</code>、<code>DIFFUSION_NO_SC</code> 等）见<a href="advanced.html">高级</a>页。</p></div>
+
+  <h2 id="imageedit">Qwen-Image-Edit — 图像编辑</h2>
+  <p>Qwen-Image-Edit 接收<strong>提示词 + 一张输入图像</strong>并返回编辑后的图像。所加载的 <code>qwen_image</code> GGUF 仅是 MMDiT 扩散 Transformer；模型还会拉入两个伴随 GGUF（在 DiT 文件同目录解析，或通过 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 环境变量指定）：Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。与 DiffusionGemma 一样，它<em>不是</em>自回归文本模型——自回归入口会抛异常，编辑通过 <code>EditImage()</code> 驱动。</p>
+  <pre data-lang="csharp"><code>using TensorSharp.Models;
+using TensorSharp.Models.QwenImage;
+using TensorSharp.Runtime;
+
+// 加载 MMDiT GGUF（架构 = qwen_image）。VAE + Qwen2.5-VL
+// 伴随文件从同一目录解析（或用 TS_QWEN_IMAGE_* 环境变量）。
+using var model = (QwenImageModel)ModelBase.Create("qwen-image-edit-DiT-Q4_K_M.gguf", BackendType.GgmlCuda);
+
+// 加载输入图像（PNG/JPEG 解码为 RgbImage）。
+RgbImage input = ImageIO.Load("input.png");
+
+var p = new QwenImageParams
+{
+    Steps = 30,               // FlowMatch-Euler 去噪步数
+    CfgScale = 4.0f,          // true-CFG 引导；<= 1 关闭负向分支
+    NegativePrompt = " ",     // 仅当 CfgScale > 1 时使用
+    Seed = 0,
+    TargetArea = 1024 * 1024, // ~1 MP；纵横比随输入（尺寸对齐到 /16）
+    // Width = 0, Height = 0, // 指定显式输出尺寸可绕过 VRAM 钳制
+};
+
+RgbImage output = model.EditImage("Make the sky a dramatic sunset.", input, p);
+ImageIO.SavePng("edited.png", output);
+Console.WriteLine($"Saved {output.Width}x{output.Height} edited image.");</code></pre>
+  <p>若要做实时 UI，设置 <code>p.OnStep = (step, total, preview) =&gt; { … }</code> 与 <code>p.PreviewCount</code>，即可在节流的步上收到部分去噪潜变量解码出的 RGB 预览。<code>RgbImage</code> 暴露 <code>Width</code>、<code>Height</code> 与平面/交错的 <code>Pixels</code> 缓冲；<code>ImageIO</code> 提供 <code>Load</code>、<code>Decode(byte[])</code>、<code>EncodePng</code>、<code>SavePng</code> 及缩放辅助。</p>
+  <div class="callout warn"><div class="ic">🖼️</div><p>图像编辑计算量大：每个去噪步都要跑完整的 60 块 MMDiT（开启 CFG 时跑两遍）。请使用 CUDA 或 Metal 的 GGML 后端做实用的全质量编辑；除非你固定 <code>Width</code>/<code>Height</code>，否则流水线会按设备 VRAM 预算自动钳制目标面积。伴随 GGUF 布局见<a href="models.html#table">模型卡</a>。</p></div>
+
   <h2 id="sampling">SamplingConfig</h2>
   <p>采样旋钮与 CLI 参数及 API 选项一一对应。默认值与 Ollama 一致。</p>
   <div class="table-scroll">
@@ -114,6 +178,8 @@ Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, top
       <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>、<code>Decode(ids)</code>、<code>IsEos(id)</code>、<code>EosTokenIds</code>（BPE 与 SentencePiece 实现）。</td></tr>
       <tr><td><code>ModelConfig</code></td><td>架构元数据：<code>VocabSize</code>、上下文长度等。</td></tr>
       <tr><td><code>IBatchedPagedModel</code></td><td>可选的批量/分页前向（<code>ForwardBatch</code>），多数架构为连续批处理而实现。</td></tr>
+      <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>文本扩散模型及其 EntropyBound 去噪采样器（<code>Generate(promptTokens, DiffusionEbParams, …)</code>）。<code>Forward()</code> 不受支持。</td></tr>
+      <tr><td><code>QwenImageModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-Edit 图像编辑器。<code>EditImage(prompt, RgbImage, QwenImageParams)</code> 返回修改后的 <code>RgbImage</code>；<code>ImageIO</code> 负责 PNG 加载/保存。</td></tr>
       <tr><td><code>InferenceEngine</code></td><td>支撑服务器连续批处理的 worker 线程调度器 + 分页块池（在 <code>TensorSharp.Runtime.Scheduling</code> 中）。</td></tr>
     </tbody>
   </table>

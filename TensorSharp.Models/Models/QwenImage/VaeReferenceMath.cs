@@ -83,7 +83,7 @@ namespace TensorSharp.Models.QwenImage
             int Hp = H + padT + padB, Wp = W + padL + padR;
             int Ho = (Hp - KH) / strideH + 1, Wo = (Wp - KW) / strideW + 1;
 
-            if (UseGpuConv && TryGpuConv2d(x, weight, OC, IC, KH, KW, bias,
+            if (UseGpuConv && TryGpuConv2dMaybeTiled(x, weight, OC, IC, KH, KW, bias,
                     strideH, strideW, padT, padB, padL, padR, Ho, Wo, out Feature gpu))
                 return gpu;
 
@@ -123,6 +123,127 @@ namespace TensorSharp.Models.QwenImage
                 }
             });
             return outp;
+        }
+
+        // im2col scratch budget (bytes). ggml_conv_2d materializes an F16 im2col tensor of
+        // ~IC*KH*KW * OH * OW * 2 bytes; at high resolution that is several GB and either
+        // spills into WDDM shared VRAM (≈3x slower VAE) or OOMs. When the estimate exceeds
+        // this budget the conv is split into horizontal output bands (below). Override with
+        // TS_QWEN_VAE_CONV_TILE_BYTES.
+        private static long Im2colBudgetBytes()
+        {
+            var env = Environment.GetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES");
+            if (env != null && long.TryParse(env, out var b) && b > 0) return b;
+            return 1024L * 1024 * 1024;   // 1 GiB
+        }
+
+        // Run the device conv whole when its im2col fits the budget; otherwise split the
+        // output into horizontal bands. Each band re-runs the SAME conv on a vertical slice
+        // of the input (manually zero-padded so the device op runs with pad 0), so the result
+        // is bit-identical to the un-tiled conv — only the transient im2col is bounded. The
+        // surrounding group-norm / feature maps are never split, so there are NO tile seams
+        // (unlike whole-VAE tiling).
+        private static bool TryGpuConv2dMaybeTiled(Feature x, float[] weight, int OC, int IC, int KH, int KW,
+            float[] bias, int strideH, int strideW, int padT, int padB, int padL, int padR,
+            int Ho, int Wo, out Feature result)
+        {
+            long im2col = (long)IC * KH * KW * Ho * Wo * 2;
+            long budget = Im2colBudgetBytes();
+            if (im2col <= budget)
+                return TryGpuConv2d(x, weight, OC, IC, KH, KW, bias, strideH, strideW,
+                    padT, padB, padL, padR, Ho, Wo, out result);
+
+            long perRow = Math.Max(1, (long)IC * KH * KW * Wo * 2);
+            int bandHo = (int)Math.Max(1, budget / perRow);
+            int H = x.H;
+            var outp = new Feature(OC, Ho, Wo);
+            for (int oy0 = 0; oy0 < Ho; oy0 += bandHo)
+            {
+                int oy1 = Math.Min(Ho, oy0 + bandHo);
+                int rows = oy1 - oy0;
+                int ir0 = oy0 * strideH - padT;             // first input row (in unpadded coords) the band reads
+                int ir1 = (oy1 - 1) * strideH - padT + KH;  // one past the last (exclusive)
+                int realStart = Math.Max(0, ir0), realEnd = Math.Min(H, ir1);
+                int bandPadT = realStart - ir0;             // missing top rows (global zero padding), >= 0
+                int bandPadB = ir1 - realEnd;               // missing bottom rows, >= 0
+                // Manually pad the band on all sides (vertical band pad + horizontal conv pad)
+                // so the device conv runs with pad 0 and emits exactly [OC, rows, Wo].
+                Feature band = PadBand(x, realStart, realEnd, bandPadT, bandPadB, padL, padR);
+                if (!TryGpuConv2d(band, weight, OC, IC, KH, KW, bias, strideH, strideW,
+                        0, 0, 0, 0, rows, Wo, out Feature ob))
+                { result = null; return false; }
+                for (int oc = 0; oc < OC; oc++)
+                    Array.Copy(ob.D, (long)oc * rows * Wo, outp.D, ((long)oc * Ho + oy0) * Wo, (long)rows * Wo);
+            }
+            result = outp;
+            return true;
+        }
+
+        // Vertical slice rows [r0,r1) of x, zero-padded by (padTop,padBot) rows and (padL,padR)
+        // columns, into a fresh [C, padTop+(r1-r0)+padBot, padL+W+padR] feature (zeros elsewhere).
+        private static Feature PadBand(Feature x, int r0, int r1, int padTop, int padBot, int padL, int padR)
+        {
+            int C = x.C, H = x.H, W = x.W, srcRows = r1 - r0;
+            int oh = padTop + srcRows + padBot, ow = padL + W + padR;
+            var d = new float[(long)C * oh * ow];
+            for (int c = 0; c < C; c++)
+                for (int ry = 0; ry < srcRows; ry++)
+                    Array.Copy(x.D, ((long)c * H + (r0 + ry)) * W,
+                               d, ((long)c * oh + (padTop + ry)) * ow + padL, W);
+            return new Feature(C, oh, ow, d);
+        }
+
+        private static double RelL2(float[] a, float[] b)
+        {
+            int n = Math.Min(a.Length, b.Length); double num = 0, den = 0;
+            for (int i = 0; i < n; i++) { double d = a[i] - b[i]; num += d * d; den += (double)a[i] * a[i]; }
+            return Math.Sqrt(num / Math.Max(den, 1e-12));
+        }
+
+        // Self-test: band-tiled conv must equal the un-tiled conv (bit-identical apart from
+        // ggml's shape-dependent float reduction order). Runs several (stride, pad, 1x1) cases
+        // and returns the worst relative-L2 error across them. Requires a GGML backend + UseGpuConv.
+        internal static double ConvTileSelfTest()
+        {
+            bool savedGpu = UseGpuConv; UseGpuConv = true;
+            string savedEnv = Environment.GetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES");
+            double worst = 0;
+            try
+            {
+                var rng = new Random(1234);
+                (int IC, int OC, int KH, int KW, int sH, int sW, int pT, int pB, int pL, int pR, int H, int W)[] cases =
+                {
+                    (8, 6, 3, 3, 1, 1, 1, 1, 1, 1, 37, 41),   // standard pad-1 stride-1
+                    (8, 6, 3, 3, 2, 2, 0, 1, 0, 1, 38, 40),   // downsample: asym pad, stride 2
+                    (8, 6, 1, 1, 1, 1, 0, 0, 0, 0, 37, 41),   // 1x1
+                    (4, 5, 3, 3, 1, 1, 1, 1, 1, 1, 9, 64),    // wide, few rows
+                };
+                foreach (var t in cases)
+                {
+                    var x = new Feature(t.IC, t.H, t.W);
+                    for (int i = 0; i < x.D.Length; i++) x.D[i] = (float)(rng.NextDouble() * 2 - 1);
+                    var w = new float[(long)t.OC * t.IC * t.KH * t.KW];
+                    for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
+                    var b = new float[t.OC];
+                    for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
+
+                    Environment.SetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES", "999999999999");
+                    var full = Conv2d(x, w, t.OC, t.IC, t.KH, t.KW, b, t.sH, t.sW, t.pT, t.pB, t.pL, t.pR);
+                    Environment.SetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES", "256");   // ~1 row/band
+                    var tiled = Conv2d(x, w, t.OC, t.IC, t.KH, t.KW, b, t.sH, t.sW, t.pT, t.pB, t.pL, t.pR);
+
+                    if (full.D.Length != tiled.D.Length) { worst = 1e9; continue; }
+                    double rel = RelL2(full.D, tiled.D);
+                    Console.WriteLine($"  conv-tile case IC{t.IC} OC{t.OC} {t.KH}x{t.KW} s{t.sH} pad({t.pT},{t.pB},{t.pL},{t.pR}) {t.H}x{t.W}: tiled-vs-full relL2={rel:E3} (out {full.C}x{full.H}x{full.W})");
+                    worst = Math.Max(worst, rel);
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("TS_QWEN_VAE_CONV_TILE_BYTES", savedEnv);
+                UseGpuConv = savedGpu;
+            }
+            return worst;
         }
 
         // Device convolution via TSGgml_Conv2d. C# Feature [C,H,W] == ggml [W,H,C];

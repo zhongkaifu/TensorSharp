@@ -31,6 +31,7 @@
       <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>、<code>nemotron_h_moe</code></td><td>Nemotron-H-8B、47B、Nemotron 3 Nano Omni</td><td>图像（Omni）</td><td class="yes">是</td><td class="yes">是</td><td class="no">—</td></tr>
       <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>图像</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>、<code>diffusion_gemma</code></td><td>diffusion-gemma 文本扩散 GGUF</td><td>仅文本</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen-Image-Edit</strong></td><td><code>qwen_image</code></td><td>qwen-image-edit MMDiT（+ VAE 与 Qwen2.5-VL 伴随文件）</td><td>图像编辑（图像+文本 → 图像）</td><td class="no">否</td><td class="no">否</td><td class="no">—</td></tr>
     </tbody>
   </table>
   </div>
@@ -71,6 +72,15 @@
   </table>
   </div>
   <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送图像/音频/视频。</p>
+
+  <h2 id="imageedit">图像编辑（Qwen-Image-Edit）</h2>
+  <p>Qwen-Image-Edit 接收<strong>提示词 + 一张输入图像</strong>并返回编辑后的图像——这是与上面文本 LLM 不同的输出模态。所加载的 <code>qwen_image</code> GGUF 仅是 MMDiT（多模态扩散 Transformer）；TensorSharp 会在其旁解析两个伴随 GGUF：</p>
+  <ul>
+    <li><strong>Qwen-Image VAE</strong> —— 图像 ↔ 16 通道潜变量（原始 <code>.safetensors</code> 也可用）。</li>
+    <li><strong>Qwen2.5-VL-7B 文本编码器</strong> —— 提示词 → 3584 维条件，外加可选的 <code>mmproj</code> 视觉塔以实现图像接地编辑。</li>
+  </ul>
+  <p>将伴随文件放在 DiT GGUF 旁，或用 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 指定（CLI：<code>--qwen-image-vae</code> / <code>--qwen-image-vl</code> / <code>--qwen-image-mmproj</code>）。流水线对参考图做 VAE 编码、构建条件、运行带参考潜变量拼接的 FlowMatch-Euler true-CFG 去噪循环，再 VAE 解码回像素。整个 60 块 DiT 前向被 CUDA 图捕获，flash 注意力默认开启；除非固定宽/高，否则目标面积按设备 VRAM 预算自动钳制。</p>
+  <p>可从 <a href="cli_zh-cn.html#imageedit">CLI</a>（<code>--image</code> + <code>--prompt</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 图像编辑流程（含实时去噪预览），或在进程内从 <a href="code-api_zh-cn.html#imageedit">C# 通过 <code>QwenImageModel.EditImage()</code></a> 运行。完整细节见仓库的 <code>docs/models/qwenimage_zh-cn.md</code> 卡片。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>
   <p>具备思考能力的模型（Qwen 3、Qwen 3.5/3.6、Gemma 4、GPT OSS、Nemotron-H）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>

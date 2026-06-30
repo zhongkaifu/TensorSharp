@@ -56,6 +56,14 @@
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.2 --seed 42</code></pre>
 
+  <h3 id="imageedit">Image editing (Qwen-Image-Edit)</h3>
+  <pre data-lang="bash"><code># Prompt + input image -> edited image. The VAE + Qwen2.5-VL text-encoder
+# companions are resolved next to the DiT GGUF (or pass --qwen-image-vae /
+# --qwen-image-vl / --qwen-image-mmproj).
+./TensorSharp.Cli --model &lt;qwen-image-edit-DiT.gguf&gt; --image input.png \
+    --prompt "Make the sky a dramatic sunset." --output edited.png \
+    --backend ggml_cuda --diffusion-steps 30 --cfg 4.0 --diffusion-seed 0</code></pre>
+
   <h3 id="diffusion">DiffusionGemma &amp; inspection</h3>
   <pre data-lang="bash"><code># DiffusionGemma text-diffusion generation
 ./TensorSharp.Cli --model &lt;diffusion-gemma.gguf&gt; --input prompt.txt --backend ggml_metal \
@@ -136,6 +144,9 @@
       <tr><td><code>--diffusion-steps &lt;N&gt;</code></td><td>DiffusionGemma denoising steps per block (default: 48).</td></tr>
       <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma deterministic sampler seed (default: 0).</td></tr>
       <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>Block-autoregressive canvas count (<code>0</code> derives it from <code>--max-tokens</code>).</td></tr>
+      <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-Edit: input image, edit instruction, and output PNG (default <code>edited.png</code>). Reuses <code>--diffusion-steps</code> / <code>--diffusion-seed</code>.</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG guidance scale (default: 4.0; <code>&lt;= 1</code> disables the negative pass).</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-Edit companion GGUFs (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
       <tr><td><code>--benchmark</code></td><td>Run a synthetic prefill/decode throughput benchmark.</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>Synthetic prefill length, decode length, and run count.</td></tr>
       <tr><td><code>--bench-kvcache</code> / <code>--bench-kv-turns &lt;N&gt;</code></td><td>Multi-turn KV-cache reuse benchmark (with-cache vs forced-reset).</td></tr>

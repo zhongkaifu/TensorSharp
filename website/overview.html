@@ -74,7 +74,7 @@
     <tbody>
       <tr><td><code>TensorSharp.Core/</code></td><td>Tensor library, ops, memory, device abstraction, CPU SIMD/quantized kernels.</td></tr>
       <tr><td><code>TensorSharp.Runtime/</code></td><td>GGUF, tokenizers, templates, sampling; <code>Paged/</code> KV primitives and <code>Scheduling/</code> the inference engine + MTP core.</td></tr>
-      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>One folder per architecture (Gemma3/4, Qwen3/35, GptOss, Nemotron, Mistral3, DiffusionGemma), each with a legacy and a batched forward.</td></tr>
+      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>One folder per architecture (Gemma3/4, Qwen3/35, GptOss, Nemotron, Mistral3, DiffusionGemma, QwenImage), each with a legacy and a batched forward.</td></tr>
       <tr><td><code>TensorSharp.GGML.Native/</code></td><td>The native C++ bridge to ggml (matmul, fused transformer kernels, paged attention, MoE, Mamba2, GatedDeltaNet, diffusion).</td></tr>
       <tr><td><code>TensorSharp.Server/</code></td><td>ASP.NET Core server: program bootstrap, model service, inference-engine host, chat pipeline, telemetry.</td></tr>
       <tr><td><code>docs/</code></td><td>Per-model architecture cards, paged-attention deep dive, env-var matrix, benchmark matrix.</td></tr>
@@ -87,7 +87,7 @@
   <table>
     <thead><tr><th>Area</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td>Model families</td><td>Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3.</td></tr>
+      <tr><td>Model families</td><td>Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3, and Qwen-Image-Edit (<code>qwen_image</code> image editing).</td></tr>
       <tr><td>Inference hosts</td><td>CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API.</td></tr>
       <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA.</td></tr>
       <tr><td>Multimodal</td><td>Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input.</td></tr>

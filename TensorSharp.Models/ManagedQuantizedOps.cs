@@ -993,6 +993,16 @@ namespace TensorSharp.Models
         private static readonly bool s_scalarQ40 =
             string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_CPU_NO_SIMD_Q40"), "1", StringComparison.Ordinal);
 
+        // A/B knob: TENSORSHARP_CPU_NO_SIMD_KQUANT=1 forces the scalar K-quant
+        // dots (Q4_K/Q5_K/Q6_K) so the SIMD speedup can be measured and a
+        // suspected SIMD bug bypassed without rebuilding.
+        private static readonly bool s_scalarKQuant =
+            string.Equals(Environment.GetEnvironmentVariable("TENSORSHARP_CPU_NO_SIMD_KQUANT"), "1", StringComparison.Ordinal);
+
+        // Diagnostic: lets benchmarks confirm which K-quant dot path is live.
+        internal static bool ScalarKQuantForced => s_scalarKQuant;
+        internal static bool Avx2Available => Avx2.IsSupported;
+
         private static unsafe float VecDotQ4_0Q8_0(byte* q4, byte* q8, int blockCount)
         {
             if (!s_scalarQ40)
@@ -1294,6 +1304,69 @@ namespace TensorSharp.Models
 
         private static unsafe float VecDotQ4_KQ8_K(byte* q4k, byte* q8k, int superBlockCount)
         {
+            if (!s_scalarKQuant && Avx2.IsSupported)
+                return VecDotQ4_KQ8_KAvx2(q4k, q8k, superBlockCount);
+
+            return VecDotQ4_KQ8_KScalar(q4k, q8k, superBlockCount);
+        }
+
+        // AVX2 Q4_K x Q8_K. The 8 sub-block dots are kept scaled in vector lanes
+        // (maddubs to int16, then madd against the broadcast 6-bit scale) so the
+        // whole super-block needs a single horizontal sum. The K-quant min term
+        // (dmin * sum_j min_j * q8_bsum_j) is folded into a scalar correction off
+        // the Q8_K bsums — the same factoring llama.cpp uses.
+        private static unsafe float VecDotQ4_KQ8_KAvx2(byte* q4k, byte* q8k, int superBlockCount)
+        {
+            Vector256<float> acc = Vector256<float>.Zero;
+            Vector256<byte> loMask = Vector256.Create((byte)0x0F);
+            float minTotal = 0.0f;
+            byte* scBuf = stackalloc byte[8];
+            byte* mnBuf = stackalloc byte[8];
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                float d4 = HalfToSingle(ReadUInt16(q4k));
+                float dmin = HalfToSingle(ReadUInt16(q4k + 2));
+                UnpackQ4Q5Scales(q4k + 4, scBuf, mnBuf);
+                byte* qs = q4k + 16;
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                Vector256<int> sumi = Vector256<int>.Zero;
+                for (int p = 0; p < 4; p++)
+                {
+                    Vector256<byte> q4bits = Unsafe.ReadUnaligned<Vector256<byte>>(qs + p * 32);
+                    Vector256<byte> low = Avx2.And(q4bits, loMask);
+                    Vector256<byte> high = Avx2.And(Avx2.ShiftRightLogical(q4bits.AsUInt16(), 4).AsByte(), loMask);
+                    Vector256<sbyte> q8lo = Unsafe.ReadUnaligned<Vector256<sbyte>>((byte*)(q8Values + (2 * p) * 32));
+                    Vector256<sbyte> q8hi = Unsafe.ReadUnaligned<Vector256<sbyte>>((byte*)(q8Values + (2 * p + 1) * 32));
+                    Vector256<short> p16lo = Avx2.MultiplyAddAdjacent(low, q8lo);
+                    Vector256<short> p16hi = Avx2.MultiplyAddAdjacent(high, q8hi);
+                    sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(p16lo, Vector256.Create((short)scBuf[2 * p])));
+                    sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(p16hi, Vector256.Create((short)scBuf[2 * p + 1])));
+                }
+
+                int msum = 0;
+                for (int j = 0; j < 8; j++)
+                    msum += mnBuf[j] * (bsums[2 * j] + bsums[2 * j + 1]);
+                minTotal += d8 * dmin * msum;
+
+                float scale = d4 * d8;
+                Vector256<float> prod = Avx.ConvertToVector256Single(sumi);
+                acc = Fma.IsSupported
+                    ? Fma.MultiplyAdd(Vector256.Create(scale), prod, acc)
+                    : Avx.Add(acc, Avx.Multiply(Vector256.Create(scale), prod));
+
+                q4k += Q4_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return HorizontalSum(acc) - minTotal;
+        }
+
+        private static unsafe float VecDotQ4_KQ8_KScalar(byte* q4k, byte* q8k, int superBlockCount)
+        {
             float sum = 0.0f;
             byte* scBuf = stackalloc byte[8];
             byte* mnBuf = stackalloc byte[8];
@@ -1333,6 +1406,79 @@ namespace TensorSharp.Models
         }
 
         private static unsafe float VecDotQ5_KQ8_K(byte* q5k, byte* q8k, int superBlockCount)
+        {
+            if (!s_scalarKQuant && Avx2.IsSupported)
+                return VecDotQ5_KQ8_KAvx2(q5k, q8k, superBlockCount);
+
+            return VecDotQ5_KQ8_KScalar(q5k, q8k, superBlockCount);
+        }
+
+        // AVX2 Q5_K x Q8_K. Same lane-scaled accumulation as Q4_K, with the 5th
+        // bit pulled from qh: for sub-block j the high bit is qh[i] bit j, so the
+        // low/high nibble of each qs byte (sub-blocks 2p / 2p+1) gets bit 2p / 2p+1
+        // of qh added at weight 16 before the maddubs.
+        private static unsafe float VecDotQ5_KQ8_KAvx2(byte* q5k, byte* q8k, int superBlockCount)
+        {
+            Vector256<float> acc = Vector256<float>.Zero;
+            Vector256<byte> loMask = Vector256.Create((byte)0x0F);
+            Vector256<byte> oneByte = Vector256.Create((byte)1);
+            float minTotal = 0.0f;
+            byte* scBuf = stackalloc byte[8];
+            byte* mnBuf = stackalloc byte[8];
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                float d5 = HalfToSingle(ReadUInt16(q5k));
+                float dmin = HalfToSingle(ReadUInt16(q5k + 2));
+                UnpackQ4Q5Scales(q5k + 4, scBuf, mnBuf);
+                byte* qh = q5k + 16;
+                byte* qs = q5k + 48;
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                Vector256<byte> qhbits = Unsafe.ReadUnaligned<Vector256<byte>>(qh);
+
+                Vector256<int> sumi = Vector256<int>.Zero;
+                for (int p = 0; p < 4; p++)
+                {
+                    Vector256<byte> q4bits = Unsafe.ReadUnaligned<Vector256<byte>>(qs + p * 32);
+                    Vector256<byte> low = Avx2.And(q4bits, loMask);
+                    Vector256<byte> high = Avx2.And(Avx2.ShiftRightLogical(q4bits.AsUInt16(), 4).AsByte(), loMask);
+
+                    // bit (2p) and (2p+1) of each qh byte -> 0/1, shifted to weight 16.
+                    Vector256<byte> hbitLo = Avx2.And(Avx2.ShiftRightLogical(qhbits.AsUInt16(), (byte)(2 * p)).AsByte(), oneByte);
+                    Vector256<byte> hbitHi = Avx2.And(Avx2.ShiftRightLogical(qhbits.AsUInt16(), (byte)(2 * p + 1)).AsByte(), oneByte);
+                    low = Avx2.Add(low, Avx2.ShiftLeftLogical(hbitLo.AsUInt16(), 4).AsByte());
+                    high = Avx2.Add(high, Avx2.ShiftLeftLogical(hbitHi.AsUInt16(), 4).AsByte());
+
+                    Vector256<sbyte> q8lo = Unsafe.ReadUnaligned<Vector256<sbyte>>((byte*)(q8Values + (2 * p) * 32));
+                    Vector256<sbyte> q8hi = Unsafe.ReadUnaligned<Vector256<sbyte>>((byte*)(q8Values + (2 * p + 1) * 32));
+                    Vector256<short> p16lo = Avx2.MultiplyAddAdjacent(low, q8lo);
+                    Vector256<short> p16hi = Avx2.MultiplyAddAdjacent(high, q8hi);
+                    sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(p16lo, Vector256.Create((short)scBuf[2 * p])));
+                    sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(p16hi, Vector256.Create((short)scBuf[2 * p + 1])));
+                }
+
+                int msum = 0;
+                for (int j = 0; j < 8; j++)
+                    msum += mnBuf[j] * (bsums[2 * j] + bsums[2 * j + 1]);
+                minTotal += d8 * dmin * msum;
+
+                float scale = d5 * d8;
+                Vector256<float> prod = Avx.ConvertToVector256Single(sumi);
+                acc = Fma.IsSupported
+                    ? Fma.MultiplyAdd(Vector256.Create(scale), prod, acc)
+                    : Avx.Add(acc, Avx.Multiply(Vector256.Create(scale), prod));
+
+                q5k += Q5_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return HorizontalSum(acc) - minTotal;
+        }
+
+        private static unsafe float VecDotQ5_KQ8_KScalar(byte* q5k, byte* q8k, int superBlockCount)
         {
             float sum = 0.0f;
             byte* scBuf = stackalloc byte[8];
@@ -1375,6 +1521,144 @@ namespace TensorSharp.Models
         }
 
         private static unsafe float VecDotQ6_KQ8_K(byte* q6k, byte* q8k, int superBlockCount)
+        {
+            if (!s_scalarKQuant)
+            {
+                if (Avx2.IsSupported)
+                    return VecDotQ6_KQ8_KAvx2(q6k, q8k, superBlockCount);
+                if (Ssse3.IsSupported)
+                    return VecDotQ6_KQ8_KSse(q6k, q8k, superBlockCount);
+            }
+
+            return VecDotQ6_KQ8_KScalar(q6k, q8k, superBlockCount);
+        }
+
+        // AVX2 Q6_K x Q8_K. Consecutive sub-block pairs (2m, 2m+1) read
+        // contiguous 32-byte ql / qh / q8 spans (only their qh offset differs),
+        // so each pair is one 256-bit maddubs over the unsigned 0..63
+        // reconstruction; the two halves carry the two sub-blocks' int8 scales in
+        // the low/high 128-bit lanes of the madd multiplier. The -32 zero-point
+        // is a scalar correction off the Q8_K per-16 bsums (see the SSE variant).
+        private static unsafe float VecDotQ6_KQ8_KAvx2(byte* q6k, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            Vector256<byte> loMask = Vector256.Create((byte)0x0F);
+            Vector256<byte> hi2Mask = Vector256.Create((byte)0x03);
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                byte* ql = q6k;
+                byte* qh = q6k + QK_K / 2;
+                sbyte* scales = (sbyte*)(q6k + QK_K / 2 + QK_K / 4);
+                float d6 = HalfToSingle(ReadUInt16((byte*)(scales + QK_K / 16)));
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                Vector256<int> sumi = Vector256<int>.Zero;
+                for (int pair = 0; pair < 8; pair++)
+                {
+                    int half = pair / 4;
+                    int pm = pair % 4;
+                    int qlOff = half * 64 + (pm % 2) * 32;
+                    bool isUpper = pm >= 2;
+                    int qhOff = half * 32;
+                    int qhShift = pm * 2;
+
+                    Vector256<byte> ql32 = Unsafe.ReadUnaligned<Vector256<byte>>(ql + qlOff);
+                    Vector256<byte> lo4 = isUpper
+                        ? Avx2.And(Avx2.ShiftRightLogical(ql32.AsUInt16(), 4).AsByte(), loMask)
+                        : Avx2.And(ql32, loMask);
+
+                    Vector256<byte> qh32 = Unsafe.ReadUnaligned<Vector256<byte>>(qh + qhOff);
+                    Vector256<byte> hi2 = Avx2.And(Avx2.ShiftRightLogical(qh32.AsUInt16(), (byte)qhShift).AsByte(), hi2Mask);
+                    Vector256<byte> qval = Avx2.Add(lo4, Avx2.ShiftLeftLogical(hi2.AsUInt16(), 4).AsByte());
+
+                    Vector256<sbyte> q8v = Unsafe.ReadUnaligned<Vector256<sbyte>>((byte*)(q8Values + pair * 32));
+                    Vector256<short> p16 = Avx2.MultiplyAddAdjacent(qval, q8v);
+
+                    // Low 128-bit lanes weight sub-block 2*pair, high lanes 2*pair+1.
+                    Vector256<short> scaleVec = Vector256.Create(
+                        Vector128.Create((short)scales[2 * pair]),
+                        Vector128.Create((short)scales[2 * pair + 1]));
+                    sumi = Avx2.Add(sumi, Avx2.MultiplyAddAdjacent(p16, scaleVec));
+                }
+
+                int corr = 0;
+                for (int sub = 0; sub < 16; sub++)
+                    corr += scales[sub] * bsums[sub];
+
+                float scaleBase = d6 * d8;
+                sum += scaleBase * (HorizontalSum128(Sse2.Add(sumi.GetLower(), sumi.GetUpper())) - 32 * corr);
+
+                q6k += Q6_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return sum;
+        }
+
+        // SSSE3 Q6_K x Q8_K. Q6_K has 16 sub-blocks of 16 elements with per-16
+        // int8 scales. The inner 16-element dot is done with one 128-bit maddubs
+        // on the unsigned 0..63 reconstruction (low nibble | high 2 bits << 4),
+        // kept scaled in lanes (madd against the broadcast scale). The Q6_K -32
+        // zero-point becomes a scalar correction off the Q8_K per-16 bsums:
+        //   sum_sub scale_sub*(q6-32)*q8 = sum_sub scale_sub*q6unsigned*q8 - 32*sum_sub scale_sub*bsum_sub.
+        private static unsafe float VecDotQ6_KQ8_KSse(byte* q6k, byte* q8k, int superBlockCount)
+        {
+            float sum = 0.0f;
+            Vector128<byte> loMask = Vector128.Create((byte)0x0F);
+            Vector128<byte> hi2Mask = Vector128.Create((byte)0x03);
+
+            for (int block = 0; block < superBlockCount; block++)
+            {
+                byte* ql = q6k;
+                byte* qh = q6k + QK_K / 2;
+                sbyte* scales = (sbyte*)(q6k + QK_K / 2 + QK_K / 4);
+                float d6 = HalfToSingle(ReadUInt16((byte*)(scales + QK_K / 16)));
+                float d8 = ReadSingle(q8k);
+                sbyte* q8Values = (sbyte*)(q8k + 4);
+                short* bsums = (short*)(q8k + 4 + QK_K);
+
+                Vector128<int> sumi = Vector128<int>.Zero;
+                int corr = 0;
+                for (int sub = 0; sub < 16; sub++)
+                {
+                    int half = sub / 8;
+                    int sh = sub % 8;
+                    int qlOffset = half * 64 + (sh % 4) * 16;
+                    bool isUpper = sh >= 4;
+                    int qhOffset = half * 32 + (sh % 2) * 16;
+                    int qhShift = (sh / 2) * 2;
+                    int s = scales[sub];
+
+                    Vector128<byte> qlBytes = Unsafe.ReadUnaligned<Vector128<byte>>(ql + qlOffset);
+                    Vector128<byte> lo4 = isUpper
+                        ? Sse2.And(Sse2.ShiftRightLogical(qlBytes.AsUInt16(), 4).AsByte(), loMask)
+                        : Sse2.And(qlBytes, loMask);
+
+                    Vector128<byte> qhBytes = Unsafe.ReadUnaligned<Vector128<byte>>(qh + qhOffset);
+                    Vector128<byte> hi2 = Sse2.And(Sse2.ShiftRightLogical(qhBytes.AsUInt16(), (byte)qhShift).AsByte(), hi2Mask);
+                    Vector128<byte> qval = Sse2.Add(lo4, Sse2.ShiftLeftLogical(hi2.AsUInt16(), 4).AsByte());
+
+                    Vector128<sbyte> q8v = Unsafe.ReadUnaligned<Vector128<sbyte>>((byte*)(q8Values + sub * 16));
+                    Vector128<short> p16 = Ssse3.MultiplyAddAdjacent(qval, q8v);
+                    sumi = Sse2.Add(sumi, Sse2.MultiplyAddAdjacent(p16, Vector128.Create((short)s)));
+
+                    corr += s * bsums[sub];
+                }
+
+                float scaleBase = d6 * d8;
+                sum += scaleBase * (HorizontalSum128(sumi) - 32 * corr);
+
+                q6k += Q6_KBlockBytes;
+                q8k += Q8_KBlockBytes;
+            }
+
+            return sum;
+        }
+
+        private static unsafe float VecDotQ6_KQ8_KScalar(byte* q6k, byte* q8k, int superBlockCount)
         {
             float sum = 0.0f;
 
@@ -1501,6 +1785,14 @@ namespace TensorSharp.Models
             for (int i = 0; i < 16; i++)
                 sum += tmp[i];
             return sum;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int HorizontalSum128(Vector128<int> v)
+        {
+            Vector128<int> hi = Sse2.Add(v, Sse2.Shuffle(v, 0x4E)); // [2,3,0,1]
+            hi = Sse2.Add(hi, Sse2.Shuffle(hi, 0xB1));               // [1,0,3,2]
+            return hi.ToScalar();
         }
 
         private static unsafe float HorizontalMax(Vector512<float> v)

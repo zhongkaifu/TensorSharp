@@ -73,6 +73,7 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3.md](docs/models/mistral3.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3.md](docs/models/gemma3.md) |
 | DiffusionGemma | diffusion-gemma GGUFs | — / — / — | — | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
+| Qwen-Image-Edit | qwen-image-edit GGUFs (MMDiT + VAE + Qwen2.5-VL) | 🖼️ image→image | — | — | [qwenimage.md](docs/models/qwenimage.md) |
 
 ## Highlights
 
@@ -80,6 +81,7 @@ These architectures are implemented and exercised by the test/benchmark matrix. 
 - **Continuous batching & paged KV cache** — vLLM-style paged KV pool with block-hash prefix sharing and an iteration-level scheduler, on by default in the server. → [deep dive](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)
 - **MTP / NextN speculative decoding** — multi-token-prediction draft heads accelerate solo decode on Qwen 3.6 (NextN block embedded in the trunk GGUF) and Gemma 4 (separate `gemma4-assistant` draft GGUF). The draft proposes several tokens per step and the trunk verifies them in one batched forward, with the request's own sampler driving both. Opt in with `--mtp-spec` (+ `--mtp-draft-model` for Gemma 4). → [Speculative decoding](#mtp--nextn-speculative-decoding)
 - **DiffusionGemma text diffusion** — block-wise EntropyBound denoising over a Gemma-4-derived MoE backbone, with CLI generation flags and a Web UI denoising preview stream. → [DiffusionGemma card](docs/models/diffusiongemma.md)
+- **Qwen-Image-Edit image editing** — prompt + input image → edited image, driving the 60-block MMDiT diffusion transformer with a Qwen-Image VAE and a Qwen2.5-VL-7B text encoder. CUDA-graph-captured whole-DiT forward, FlowMatch-Euler true-CFG denoise, and live denoising previews in the Web UI. → [Qwen-Image-Edit card](docs/models/qwenimage.md)
 - **Multimodal** — image / video / audio inputs (Gemma 4); image inputs for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → [Multimodal Support](#multimodal-support)
 - **Tool calling / function calling** — multi-turn tool calls across all three API styles, with architecture-agnostic output parsing. → [Tool Calling](#tool-calling--function-calling)
 - **Thinking / reasoning mode** — structured chain-of-thought for Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, and Nemotron-H. → [Thinking Mode](#thinking--reasoning-mode)
@@ -109,8 +111,8 @@ Everything below is detailed reference. New here? The five sections above are al
 
 | Area | Status |
 |---|---|
-| Model families | Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3 |
-| Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. DiffusionGemma currently uses the CLI diffusion run mode and Web UI denoising stream. |
+| Model families | Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3. Image editing via Qwen-Image-Edit (`qwen_image` MMDiT). |
+| Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. DiffusionGemma currently uses the CLI diffusion run mode and Web UI denoising stream; Qwen-Image-Edit runs via the CLI image-edit mode and the Web UI image-edit flow. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
@@ -121,7 +123,7 @@ Everything below is detailed reference. New here? The five sections above are al
 
 ## Features
 
-- **Multi-architecture support** -- Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3
+- **Multi-architecture support** -- Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, and Qwen-Image-Edit (image editing)
 - **Multimodal inference** -- image, video, and audio inputs (Gemma 4); images for Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
@@ -138,6 +140,7 @@ Everything below is detailed reference. New here? The five sections above are al
 - **Batch processing** -- JSONL input support in the console application, plus a built-in inference benchmark for prefill/decode throughput
 - **Streaming** -- token-by-token output via SSE (web) or stdout (console), with abort/stop support for in-flight generations
 - **Text-diffusion generation** -- DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive `Forward()`. The CLI exposes `--diffusion-steps`, `--diffusion-seed`, and `--diffusion-blocks`; the Web UI streams whole-message `replace` events for live denoising previews and batches concurrent diffusion requests through `DiffusionBatchScheduler`.
+- **Image editing (Qwen-Image-Edit)** -- a prompt plus an input image produces an edited image. The loaded `qwen_image` GGUF is the MMDiT diffusion transformer; TensorSharp resolves two companion GGUFs alongside it — the Qwen-Image VAE (image ↔ 16-channel latent) and the Qwen2.5-VL-7B text encoder (prompt → 3584-dim conditioning, optional vision grounding via an `mmproj`). The pipeline VAE-encodes the reference, builds text (and optional image) conditioning, runs a FlowMatch-Euler true-CFG denoise loop with reference-latent concatenation, then VAE-decodes back to pixels. The whole 60-block DiT forward is CUDA-graph-captured (`TSGgml_QwenImageForward`), flash-attention is on by default, and the target area is auto-clamped to the device VRAM budget. Driven from C# via `QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams)`, from the CLI image-edit mode (`--image`, `--prompt`, `--cfg`, `--diffusion-steps`, `--diffusion-seed`), and from the Web UI with live denoising previews. → [Qwen-Image-Edit card](docs/models/qwenimage.md)
 - **Hybrid SSM-Transformer** -- Nemotron-H mixes Mamba2 SSM layers, attention-only layers, and MoE FFN layers in a single model. The Mamba2 step has both a per-sequence native kernel and a batched native kernel (`TSGgml_NemotronMamba2BatchedStepF32`, NEON SIMD + GCD parallelism) used by the batched path.
 - **Hybrid Attention-Recurrent** -- Qwen 3.5/3.6-family models mix full-attention layers with GatedDeltaNet recurrent layers; the batched path keeps recurrent running state in a per-slot recurrent-state pool
 - **Mixture of Experts** -- Gemma 4 MoE variants (e.g. gemma-4-26B-A4B), GPT OSS MoE (e.g. gpt-oss-20b), Qwen 3.5/3.6-family MoE (`qwen35moe` / `qwen3next` variants such as Qwen3.5-35B-A3B), and Nemotron-H MoE FFN layers
@@ -159,6 +162,7 @@ Everything below is detailed reference. New here? The five sections above are al
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B, Nemotron-H-47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni (image) | Image (Omni) | Yes | Yes | — | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
 | DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Text only | No | No | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
+| Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUFs (+ VAE & Qwen2.5-VL companions) | Image edit (image+text → image) | No | No | — | [qwenimage.md](docs/models/qwenimage.md) |
 
 See the [per-model architecture cards](docs/models/README.md) for end-to-end documentation of each architecture (origin, forward graph, components, parameters, weight naming, and how TensorSharp implements / optimizes prefill and decode).
 
@@ -182,6 +186,7 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | Mistral 3 | mistral3-mmproj (Pixtral vision projector) | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | DiffusionGemma | diffusion-gemma text-diffusion GGUFs | Use GGUF files whose `general.architecture` is `diffusion-gemma` or `diffusion_gemma` |
+| Qwen-Image-Edit | Qwen-Image-Edit MMDiT (`qwen_image`) | DiT GGUF whose `general.architecture` is `qwen_image`, plus a Qwen-Image VAE and a Qwen2.5-VL-7B text-encoder GGUF in the same directory (or via `TS_QWEN_IMAGE_VAE` / `TS_QWEN_IMAGE_TE` / `TS_QWEN_IMAGE_MMPROJ`). The VAE may be the original `.safetensors`. |
 
 ## Compute Backends
 
@@ -210,7 +215,7 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # Content-addressed block hash for prefix-cache sharing
 │   └── Logging/                 # JSON-line file logger + per-turn telemetry
 ├── TensorSharp.Models/          # Model architectures and multimodal encoders/injectors
-│   ├── Models/<Family>/         # One folder per architecture (DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35)
+│   ├── Models/<Family>/         # One folder per architecture (DiffusionGemma, Gemma3, Gemma4, GptOss, Mistral3, Nemotron, Qwen3, Qwen35, QwenImage)
 │   │   ├── <Family>Model.cs                # Legacy per-sequence ModelBase implementation
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch — batched/paged path (Mistral3, Gemma4, GptOss, Qwen35, Nemotron, Qwen3)
 │   ├── Paged/                   # Tensor-side paged-attention helpers (TensorPagedAttention)
@@ -232,6 +237,7 @@ TensorSharp/
 │   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 kernels (per-seq + batched SIMD)
 │   ├── ggml_ops_paged_attention.cpp       # Paged-attention native kernel (drives ggml_flash_attn_ext + sinks variant)
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma fused decode-layer / whole-model / lm-head kernels
+│   ├── ggml_ops_qwen_image.cpp            # Qwen-Image-Edit MMDiT whole-model forward (CUDA-graph-captured) + CFG-batched kernels
 │   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
 │   └── tests/                              # Native unit + smoke tests
 ├── TensorSharp.Server/          # Web chatbot + API server (ASP.NET Core)
@@ -464,6 +470,13 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <diffusion-gemma.gguf> --input prompt.txt --backend ggml_metal \
     --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
 
+# Qwen-Image-Edit image editing (prompt + input image -> edited image)
+# The VAE + Qwen2.5-VL text-encoder companions are resolved next to the DiT GGUF
+# (or set --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj).
+./TensorSharp.Cli --model <qwen-image-edit-DiT.gguf> --image input.png \
+    --prompt "Make the sky a dramatic sunset." --output edited.png \
+    --backend ggml_cuda --diffusion-steps 30 --cfg 4.0 --diffusion-seed 0
+
 # Thinking / reasoning mode
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -545,6 +558,13 @@ cd TensorSharp.Cli/bin
 | `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48) |
 | `--diffusion-seed <N>` | DiffusionGemma deterministic sampler seed (default: 0) |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
+| `--image <path>` | Input image for Qwen-Image-Edit (also the image input for multimodal chat). Required to trigger image-edit mode on a `qwen_image` DiT GGUF. |
+| `--prompt <text>` | Qwen-Image-Edit edit instruction (falls back to `--input` file contents if omitted). |
+| `--output <path>` | Qwen-Image-Edit output PNG path (default: `edited.png`). |
+| `--cfg <F>` | Qwen-Image-Edit true-CFG guidance scale (default: 4.0; `<= 1` disables the negative pass). Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. |
+| `--qwen-image-vae <path>` | Override the resolved Qwen-Image VAE companion (`.gguf` or `.safetensors`). |
+| `--qwen-image-vl <path>` | Override the resolved Qwen2.5-VL-7B text-encoder GGUF. |
+| `--qwen-image-mmproj <path>` | Override the resolved Qwen2.5-VL mmproj (vision grounding) GGUF. |
 | `--test` | Run built-in tokenizer + Qwen3 chat-template + ollama-comparison tests |
 | `--test-templates <dir>` | Validate hardcoded chat templates against GGUF Jinja2 templates for every *.gguf in `<dir>` |
 | `--log-level <lvl>` | Console + file logger level: `trace`, `debug`, `info`, `warning`, `error`, `critical`, `off` |
@@ -1113,7 +1133,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), the `IKvBlockCodec` interface plus the `TurboQuantKvCodec` Q4/Q8 implementation, and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, `IKVCachePolicy`, and `IBackendExecutionPlan`.
 
-3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, DiffusionGemma, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
+3. **TensorSharp.Models** implements `ModelBase` plus the concrete architectures and multimodal helpers (Gemma 3/4, DiffusionGemma, Qwen 3/3.5, GPT OSS, Nemotron-H, Mistral 3, Qwen-Image-Edit). Autoregressive architectures ship the legacy per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-Edit (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws and image editing runs through `EditImage()`, which orchestrates the MMDiT diffusion transformer, the Qwen-Image VAE, and the Qwen2.5-VL text encoder. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata.
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 

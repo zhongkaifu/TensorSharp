@@ -33,7 +33,8 @@ public class CpuDecodeProfileBench
         int ctx = int.TryParse(Environment.GetEnvironmentVariable("TS_CPU_CTX"), out int c) ? c : 0;
         string prompt = Environment.GetEnvironmentVariable("TS_CPU_PROMPT") ?? "请详细介绍最终幻想7";
 
-        _out.WriteLine($"cores={Environment.ProcessorCount} model={Path.GetFileName(path)}");
+        _out.WriteLine($"cores={Environment.ProcessorCount} model={Path.GetFileName(path)} " +
+            $"scalarKQuant={ManagedQuantizedOps.ScalarKQuantForced} avx2={ManagedQuantizedOps.Avx2Available}");
         using var model = ModelBase.Create(path, BackendType.Cpu);
         int[] tokens = model.Tokenizer.Encode(prompt, addSpecial: true).ToArray();
         if (ctx > tokens.Length)

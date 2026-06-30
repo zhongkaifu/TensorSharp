@@ -74,7 +74,7 @@
     <tbody>
       <tr><td><code>TensorSharp.Core/</code></td><td>张量库、运算、内存、设备抽象、CPU SIMD / 量化内核。</td></tr>
       <tr><td><code>TensorSharp.Runtime/</code></td><td>GGUF、分词器、模板、采样；<code>Paged/</code> KV 原语与 <code>Scheduling/</code> 推理引擎 + MTP 核心。</td></tr>
-      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>每个架构一个文件夹（Gemma3/4、Qwen3/35、GptOss、Nemotron、Mistral3、DiffusionGemma），各含一个 legacy 与一个批量前向。</td></tr>
+      <tr><td><code>TensorSharp.Models/Models/&lt;Family&gt;/</code></td><td>每个架构一个文件夹（Gemma3/4、Qwen3/35、GptOss、Nemotron、Mistral3、DiffusionGemma、QwenImage），各含一个 legacy 与一个批量前向。</td></tr>
       <tr><td><code>TensorSharp.GGML.Native/</code></td><td>到 ggml 的原生 C++ 桥接（matmul、融合 transformer 内核、分页注意力、MoE、Mamba2、GatedDeltaNet、扩散）。</td></tr>
       <tr><td><code>TensorSharp.Server/</code></td><td>ASP.NET Core 服务器：程序引导、模型服务、推理引擎宿主、聊天流水线、遥测。</td></tr>
       <tr><td><code>docs/</code></td><td>各模型架构卡、分页注意力深入解析、环境变量矩阵、基准矩阵。</td></tr>
@@ -87,7 +87,7 @@
   <table>
     <thead><tr><th>领域</th><th>状态</th></tr></thead>
     <tbody>
-      <tr><td>模型家族</td><td>Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（<code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code>）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。</td></tr>
+      <tr><td>模型家族</td><td>Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（<code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code>）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3，以及 Qwen-Image-Edit（<code>qwen_image</code> 图像编辑）。</td></tr>
       <tr><td>推理宿主</td><td>CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 式 API、OpenAI Chat Completions 式 API。</td></tr>
       <tr><td>后端</td><td>纯 C# CPU、直接 CUDA/cuBLAS（<code>cuda</code>）、MLX Metal（<code>mlx</code>）、GGML CPU、GGML Metal、GGML CUDA。</td></tr>
       <tr><td>多模态</td><td>Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3 与 Nemotron-H Omni 图像输入。</td></tr>

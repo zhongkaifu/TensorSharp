@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -1701,7 +1702,337 @@ void qi_full_block(ggml_context* ctx, const QiFullBlockW& w, ggml_tensor* silu_t
     txt = qi_build_mlp_raw(ctx, txt, tScM, tShM, tGM, w.tN0w, w.tN0b, w.tN2w, w.tN2b, eps);
 }
 
+// ----------------------------------------------------------------------------
+// Persistent + CUDA-graph-captured whole-DiT forward.
+//
+// Measured (RTX 3080 Laptop, Q2_K, imgSeq=1944): the non-persistent whole-model
+// graph runs at ~40% GPU util / ~65 W (of 350 W) — LAUNCH-BOUND. ggml-cuda only
+// captures a graph it sees twice with stable node addresses (key = nodes[0]); the
+// old path rebuilt a fresh ctx+graph every forward, so capture never engaged and
+// the GPU starved between the ~12 000 individually-submitted ops.
+//
+// Fix: keep ONE graph per (iseq,tseq) shape alive — resident weights bound ONCE
+// (cached by GGUF ptr, never re-uploaded), intermediates in a DEDICATED gallocr
+// (liveness-packed, so VRAM stays O(n) AND the addresses are stable for capture).
+// Per forward only the small img/txt/temb/rope inputs are uploaded, then one
+// graph_compute (ggml-cuda replays the captured 60-block graph) + one sync. This
+// removes the per-op launch overhead AND the per-block weight re-upload that the
+// per-block captured path still pays (~4.4 GB/forward).
+//
+// Bundle of per-call input/output handles + one-time weight uploads for a built graph.
+struct QiFwdGraph
+{
+    ggml_cgraph* graph = nullptr;
+    ggml_tensor *imgIn = nullptr, *txtIn = nullptr, *imgOut = nullptr, *txtOut = nullptr;
+    ggml_tensor *temb = nullptr, *iCos = nullptr, *iSin = nullptr, *tCos = nullptr, *tSin = nullptr;
+    ggml_tensor *modIdx = nullptr, *mask = nullptr;
+    const ggml_fp16_t* maskHost = nullptr; int total_pad = 0;
+    struct HB { ggml_tensor* t; void* d; std::size_t b; };
+    std::vector<HB> uploads;   // weights / small leaves uploaded ONCE (not per forward)
+};
+
+// Build the whole 60-block forward graph into `ctx`. Resident weights are bound by
+// GGUF pointer (try_get_cacheable_tensor_buffer); leaves too small/uncacheable are
+// marked input and queued in g.uploads for a one-time upload. Per-call inputs + the
+// mask are marked input here; the caller uploads them. Returns false on failure.
+bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, QiFwdGraph& g)
+{
+    const int dim = d->dim, heads = d->heads, hd = d->head_dim, ff = d->ff;
+    const int iseq = d->img_seq, tseq = d->txt_seq, nl = d->num_layers;
+    const int total = iseq + tseq;
+    const float eps = d->eps;
+
+    g.imgIn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+    g.txtIn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, tseq);
+    g.imgOut = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, iseq);
+    g.txtOut = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, tseq);
+    g.temb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, 2);
+    g.iCos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+    g.iSin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, iseq);
+    g.tCos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, tseq);
+    g.tSin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, tseq);
+    g.modIdx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, iseq);
+
+    // NB: the captured graph deliberately uses the MATERIALIZED attention path (mask
+    // left null -> qi_attention takes the scores+softmax branch). ggml-cuda's large-batch
+    // flash-attn (Q->ne[1] >= 1024, our 60-block prefill geometry) runs the parallel_blocks/
+    // stream_k kernel, which pool-allocs scratch (dst_tmp/KV_max) whose addresses are baked
+    // at capture time but churn across replays -> NaN from the 2nd captured forward on (LLM
+    // decode never hits this, being single-token). Materialized attention has no per-call
+    // scratch and replays correctly. The scores are gallocr-reused across the 60 blocks so
+    // peak VRAM stays ~one block's [total,total] (953 MB @1944 tok, ~4.4 GB @full-res clamp).
+    (void)total;
+
+    auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& wt, ggml_tensor*& bt, int blen) {
+        wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
+        bt = s.b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, blen) : nullptr;
+    };
+    std::vector<QiFullBlockW> bw(nl);
+    for (int l = 0; l < nl; l++)
+    {
+        const TSGImgBlockW& s = d->blocks[l];
+        QiFullBlockW& b = bw[l];
+        declW(s.img_mod, b.imgModW, b.imgModB, 6 * dim);
+        declW(s.txt_mod, b.txtModW, b.txtModB, 6 * dim);
+        declW(s.to_q, b.toQw, b.toQb, dim); declW(s.to_k, b.toKw, b.toKb, dim);
+        declW(s.to_v, b.toVw, b.toVb, dim); declW(s.to_out, b.toOw, b.toOb, dim);
+        declW(s.add_q, b.aQw, b.aQb, dim); declW(s.add_k, b.aKw, b.aKb, dim);
+        declW(s.add_v, b.aVw, b.aVb, dim); declW(s.to_add_out, b.aOw, b.aOb, dim);
+        b.nQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        b.nK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        b.nAQ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        b.nAK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
+        declW(s.i_net0, b.iN0w, b.iN0b, ff); declW(s.i_net2, b.iN2w, b.iN2b, dim);
+        declW(s.t_net0, b.tN0w, b.tN0b, ff); declW(s.t_net2, b.tN2w, b.tN2b, dim);
+    }
+
+    ggml_tensor* silu_temb = ggml_silu(ctx, g.temb);
+    ggml_tensor* img = g.imgIn;
+    ggml_tensor* txt = g.txtIn;
+    for (int l = 0; l < nl; l++)
+        qi_full_block(ctx, bw[l], silu_temb, g.modIdx, g.iCos, g.iSin, g.tCos, g.tSin, g.mask,
+                      dim, heads, hd, iseq, tseq, eps, img, txt);
+    ggml_tensor* oi = ggml_cpy(ctx, img, g.imgOut); ggml_set_output(oi);
+    ggml_tensor* ot = ggml_cpy(ctx, txt, g.txtOut); ggml_set_output(ot);
+
+    const std::size_t nodes = static_cast<std::size_t>(nl) * 384 + 2048;
+    g.graph = ggml_new_graph_custom(ctx, nodes, false);
+    if (g.graph == nullptr) return false;
+    ggml_build_forward_expand(g.graph, oi);
+    ggml_build_forward_expand(g.graph, ot);
+
+    // Bind weights resident (cached by stable GGUF ptr); fall back to gallocr input slot.
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    auto bind = [&](ggml_tensor* tt, void* dd, std::size_t bytes) {
+        if (!tt || !dd) return;
+        if (bytes >= 4096) {
+            ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
+            if (try_get_cacheable_tensor_buffer(g_backend, dev, tt, dd, bytes, buf, addr, needs)
+                && ggml_backend_tensor_alloc(buf, tt, addr) == GGML_STATUS_SUCCESS) {
+                if (needs) g.uploads.push_back({tt, dd, bytes});
+                return;
+            }
+            invalidate_cached_buffer(dd);
+        }
+        ggml_set_input(tt);
+        g.uploads.push_back({tt, dd, bytes});
+    };
+    auto bindW = [&](ggml_tensor* wt, ggml_tensor* bt, const TSGImgAttnW& s, int blen) {
+        if (wt && s.w) bind(wt, s.w, static_cast<std::size_t>(s.bytes));
+        if (bt && s.b) bind(bt, s.b, static_cast<std::size_t>(blen) * sizeof(float));
+    };
+    auto bind1 = [&](ggml_tensor* tt, void* dd, int len) { bind(tt, dd, static_cast<std::size_t>(len) * sizeof(float)); };
+    for (int l = 0; l < nl; l++)
+    {
+        const TSGImgBlockW& s = d->blocks[l];
+        QiFullBlockW& b = bw[l];
+        bindW(b.imgModW, b.imgModB, s.img_mod, 6 * dim);
+        bindW(b.txtModW, b.txtModB, s.txt_mod, 6 * dim);
+        bindW(b.toQw, b.toQb, s.to_q, dim); bindW(b.toKw, b.toKb, s.to_k, dim);
+        bindW(b.toVw, b.toVb, s.to_v, dim); bindW(b.toOw, b.toOb, s.to_out, dim);
+        bindW(b.aQw, b.aQb, s.add_q, dim); bindW(b.aKw, b.aKb, s.add_k, dim);
+        bindW(b.aVw, b.aVb, s.add_v, dim); bindW(b.aOw, b.aOb, s.to_add_out, dim);
+        bind1(b.nQ, s.norm_q, hd); bind1(b.nK, s.norm_k, hd);
+        bind1(b.nAQ, s.norm_aq, hd); bind1(b.nAK, s.norm_ak, hd);
+        bindW(b.iN0w, b.iN0b, s.i_net0, ff); bindW(b.iN2w, b.iN2b, s.i_net2, dim);
+        bindW(b.tN0w, b.tN0b, s.t_net0, ff); bindW(b.tN2w, b.tN2b, s.t_net2, dim);
+    }
+
+    auto markIn = [](ggml_tensor* x) { if (x) ggml_set_input(x); };
+    markIn(g.imgIn); markIn(g.txtIn); markIn(g.temb);
+    markIn(g.iCos); markIn(g.iSin); markIn(g.tCos); markIn(g.tSin);
+    markIn(g.modIdx); markIn(g.mask);
+    return true;
+}
+
+// One persistent, captured whole-model entry for a fixed (iseq,tseq) shape.
+struct QiForwardPersist
+{
+    bool valid = false;
+    ggml_context* ctx = nullptr;
+    ggml_gallocr_t galloc = nullptr;     // dedicated: stable intermediate addresses for capture
+    QiFwdGraph g{};
+    int dim = 0, heads = 0, hd = 0, ff = 0, iseq = 0, tseq = 0, nl = 0;
+    const void* wkey = nullptr;          // first block's to_q ptr — detects a model/cache reload
+
+    bool matches(const TSGgmlQwenImageForwardDesc* d) const
+    {
+        return valid && dim == d->dim && heads == d->heads && hd == d->head_dim &&
+               ff == d->ff && iseq == d->img_seq && tseq == d->txt_seq && nl == d->num_layers &&
+               wkey == d->blocks[0].to_q.w;
+    }
+    void reset()
+    {
+        if (galloc) { ggml_gallocr_free(galloc); galloc = nullptr; }
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        g = QiFwdGraph{}; valid = false;
+        dim = heads = hd = ff = iseq = tseq = nl = 0; wkey = nullptr;
+    }
+};
+
+constexpr int kQiFwdCacheMax = 4;   // ~2 shapes (cond/neg) per resolution; headroom for a resize
+QiForwardPersist g_qiForward[kQiFwdCacheMax];
+int g_qiFwdRR = 0;
+
+QiForwardPersist* qi_fwd_find(const TSGgmlQwenImageForwardDesc* d)
+{
+    for (auto& e : g_qiForward) if (e.matches(d)) return &e;
+    return nullptr;
+}
+
+bool qi_whole_capture_enabled()
+{
+    // Default-on for CUDA (the launch-bound backend). The dedicated gallocr keeps VRAM
+    // O(n) so it scales with resolution; TS_QWEN_DIT_WHOLE_CAPTURE=0 reverts to the
+    // rebuild-every-forward path.
+    static const int s = []() {
+        const char* e = std::getenv("TS_QWEN_DIT_WHOLE_CAPTURE");
+        return (e && e[0] == '0') ? 0 : 1;
+    }();
+    if (s == 0 || g_backend == nullptr) return false;
+    const char* name = ggml_backend_name(g_backend);
+    return name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
+}
+
+// The captured whole-model graph uses the MATERIALIZED attention path (flash breaks under
+// CUDA-graph capture), so its dedicated gallocr must hold the [total,total] QK scores + probs
+// reused across the 60 blocks: 2 * total^2 * heads * 4 bytes (empirically ~4.4 GB at 4808
+// tok) PLUS the per-block activations + resident weights + the still-resident VAE. At higher
+// resolution this won't fit; attempting the capture anyway grabs the device, the spill-guard
+// bails, and the freed-but-fragmented VRAM can even break the non-persistent fallback
+// (all-NaN at ~1 MP). The exact ceiling is hard to predict (depends on quant, VAE residency,
+// driver overhead), so rather than estimate, we remember the shapes whose capture build
+// actually bailed and never retry them — the first forward attempts once, bails, and records;
+// every later forward of that shape skips straight to the non-persistent FLASH path (O(n)
+// attention, correct at any resolution). This removes the per-forward alloc/bail/free waste.
+struct QiFwdTooBig { int iseq, tseq, nl; const void* wkey; };
+std::vector<QiFwdTooBig> g_qiFwdTooBig;
+
+bool qi_fwd_too_big(const TSGgmlQwenImageForwardDesc* d)
+{
+    for (const auto& e : g_qiFwdTooBig)
+        if (e.iseq == d->img_seq && e.tseq == d->txt_seq && e.nl == d->num_layers && e.wkey == d->blocks[0].to_q.w)
+            return true;
+    return false;
+}
+
+void qi_fwd_mark_too_big(const TSGgmlQwenImageForwardDesc* d)
+{
+    if (!qi_fwd_too_big(d))
+        g_qiFwdTooBig.push_back({ d->img_seq, d->txt_seq, d->num_layers, d->blocks[0].to_q.w });
+}
+
+// Build a persistent entry for d's shape: dedicated gallocr (stable addresses), one-time
+// weight + mask upload. Returns nullptr on failure (caller falls back to the rebuild path).
+QiForwardPersist* qi_fwd_build_persist(const TSGgmlQwenImageForwardDesc* d)
+{
+    const int nl = d->num_layers;
+    const std::size_t nodes = static_cast<std::size_t>(nl) * 384 + 2048;
+    const std::size_t meta = ggml_tensor_overhead() * (nodes + 1024)
+                             + ggml_graph_overhead_custom(nodes, false) + (8u << 20);
+    ggml_init_params ip{ meta, nullptr, true };
+    ggml_context* ctx = ggml_init(ip);
+    if (ctx == nullptr) return nullptr;
+
+    QiFwdGraph g;
+    if (!qi_fwd_build_graph(ctx, d, g)) { ggml_free(ctx); return nullptr; }
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+    if (galloc == nullptr) { ggml_free(ctx); return nullptr; }
+    if (!ggml_gallocr_alloc_graph(galloc, g.graph)) { ggml_gallocr_free(galloc); ggml_free(ctx); return nullptr; }
+
+    // Spill guard: weights are already resident; the gallocr just committed the
+    // intermediates (materialized scores dominate at high res). If free VRAM is now into
+    // WDDM-shared-memory territory, the captured replay would thrash — drop the entry and
+    // let the caller fall back to the non-persistent flash path (O(n) attention memory).
+    {
+        ggml_backend_dev_t mdev = ggml_backend_get_device(g_backend);
+        std::size_t freeb = 0, totalb = 0;
+        if (mdev) ggml_backend_dev_memory(mdev, &freeb, &totalb);
+        if (totalb > 0 && freeb < static_cast<std::size_t>(512) * 1024 * 1024)
+        {
+            std::fprintf(stderr, "[qwen-image] whole-model capture: free VRAM %zu MiB after alloc -> non-persist flash fallback (this shape won't be retried)\n", freeb >> 20);
+            qi_fwd_mark_too_big(d);   // remember: skip the capture attempt for this shape from now on
+            ggml_gallocr_free(galloc); ggml_free(ctx); return nullptr;
+        }
+    }
+
+    // One-time uploads: resident-cache-miss weights + small input-slot leaves + the mask.
+    host_read_barrier();
+    for (auto& u : g.uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+    if (g.mask && g.maskHost)
+        ggml_backend_tensor_set(g.mask, g.maskHost, 0, static_cast<std::size_t>(g.total_pad) * g.total_pad * sizeof(ggml_fp16_t));
+
+    QiForwardPersist* e = nullptr;
+    for (auto& c : g_qiForward) if (!c.valid) { e = &c; break; }
+    if (e == nullptr) { e = &g_qiForward[g_qiFwdRR]; g_qiFwdRR = (g_qiFwdRR + 1) % kQiFwdCacheMax; e->reset(); }
+    e->ctx = ctx; e->galloc = galloc; e->g = g;
+    e->dim = d->dim; e->heads = d->heads; e->hd = d->head_dim; e->ff = d->ff;
+    e->iseq = d->img_seq; e->tseq = d->txt_seq; e->nl = nl; e->wkey = d->blocks[0].to_q.w;
+    e->valid = true;
+    return e;
+}
+
+// Upload per-call inputs, run (ggml-cuda captures on the 2nd call, replays after), read outputs.
+int qi_fwd_run(QiForwardPersist* e, const TSGgmlQwenImageForwardDesc* d)
+{
+    const int dim = e->dim, hd = e->hd, iseq = e->iseq, tseq = e->tseq;
+    QiFwdGraph& g = e->g;
+
+    // Re-plan the gallocr each forward (ggml's canonical pattern): for an unchanged graph it
+    // reuses the same buffer (not regrown, so addresses stay stable and the CUDA-graph capture
+    // holds) and re-derives the buffer-reuse tensor data pointers.
+    if (e->galloc != nullptr && !ggml_gallocr_alloc_graph(e->galloc, g.graph))
+    { set_last_error("QwenImageForward: gallocr realloc failed."); return 0; }
+
+    // The graph reads an intermediate buffer slot before it is fully written (benign with a
+    // fresh allocation, which reads as zero, but on a reused gallocr buffer that slot holds the
+    // previous forward's data -> a resolution-dependent wrong result). Zero the gallocr buffer
+    // each forward (cheap memset, not part of the captured graph) so the read sees zero like a
+    // fresh allocation does. The clear also zeroes the small input-slot leaves living in this
+    // buffer (the per-head norm weights), so re-upload those; the multi-GB resident weights are
+    // in a SEPARATE cacheable buffer the clear never touches, so they are not re-uploaded.
+    if (e->galloc != nullptr && g.imgOut && g.imgOut->buffer)
+    {
+        ggml_backend_buffer_t gb = g.imgOut->buffer;
+        ggml_backend_buffer_clear(gb, 0);
+        host_read_barrier();
+        for (auto& u : g.uploads)
+            if (u.t->buffer == gb) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+        if (g.mask && g.maskHost && g.mask->buffer == gb)
+            ggml_backend_tensor_set(g.mask, g.maskHost, 0, static_cast<std::size_t>(g.total_pad) * g.total_pad * sizeof(ggml_fp16_t));
+    }
+
+    host_read_barrier();
+    ggml_backend_tensor_set(g.imgIn, d->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+    ggml_backend_tensor_set(g.txtIn, d->txt, 0, static_cast<std::size_t>(dim) * tseq * sizeof(float));
+    ggml_backend_tensor_set(g.temb, d->temb, 0, static_cast<std::size_t>(dim) * 2 * sizeof(float));
+    ggml_backend_tensor_set(g.iCos, d->img_cos, 0, static_cast<std::size_t>(hd) * iseq * sizeof(float));
+    ggml_backend_tensor_set(g.iSin, d->img_sin, 0, static_cast<std::size_t>(hd) * iseq * sizeof(float));
+    ggml_backend_tensor_set(g.tCos, d->txt_cos, 0, static_cast<std::size_t>(hd) * tseq * sizeof(float));
+    ggml_backend_tensor_set(g.tSin, d->txt_sin, 0, static_cast<std::size_t>(hd) * tseq * sizeof(float));
+    ggml_backend_tensor_set(g.modIdx, d->modulate_index, 0, static_cast<std::size_t>(iseq) * sizeof(std::int32_t));
+
+    if (ggml_backend_graph_compute(g_backend, g.graph) != GGML_STATUS_SUCCESS)
+    { set_last_error("QwenImageForward: graph compute failed."); return 0; }
+    ggml_backend_synchronize(g_backend);
+    ggml_backend_tensor_get(g.imgOut, d->img, 0, static_cast<std::size_t>(dim) * iseq * sizeof(float));
+    ggml_backend_tensor_get(g.txtOut, d->txt, 0, static_cast<std::size_t>(dim) * tseq * sizeof(float));
+    clear_last_error();
+    return 1;
+}
+
 } // namespace
+
+// Reset the persistent whole-model entries. Called when the host buffer cache is cleared
+// (the entries reference resident-by-pointer weights that the clear frees), so the next
+// forward rebuilds against fresh resident addresses instead of dangling ones.
+TSG_EXPORT void TSGgml_QwenImageResetForwardCache()
+{
+    for (auto& e : g_qiForward) e.reset();
+    g_qiFwdRR = 0;
+    g_qiFwdTooBig.clear();   // weights may reload at new addresses; re-allow capture attempts
+}
 
 TSG_EXPORT int TSGgml_QwenImageForward(const TSGgmlQwenImageForwardDesc* d)
 {
@@ -1710,6 +2041,18 @@ TSG_EXPORT int TSGgml_QwenImageForward(const TSGgmlQwenImageForwardDesc* d)
         if (d == nullptr || d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwenImageForwardDesc)))
         { set_last_error("QwenImageForward: bad descriptor."); return 0; }
         if (!ensure_backend()) return 0;
+
+        // Fast path: persistent + CUDA-graph-captured whole-model graph. ggml-cuda
+        // captures the 60-block graph after 2 calls (key = nodes[0]) and replays it,
+        // removing the per-op launch overhead that leaves the GPU ~60% idle. The entry
+        // keeps weights resident (uploaded once) so a forward only uploads img/txt/rope.
+        if (qi_whole_capture_enabled() && (qi_fwd_find(d) != nullptr || !qi_fwd_too_big(d)))
+        {
+            QiForwardPersist* e = qi_fwd_find(d);
+            if (e == nullptr) e = qi_fwd_build_persist(d);
+            if (e != nullptr) return qi_fwd_run(e, d);
+            // build failed (e.g. VRAM): fall through to the rebuild-every-forward path.
+        }
 
         const int dim = d->dim, heads = d->heads, hd = d->head_dim, ff = d->ff;
         const int iseq = d->img_seq, tseq = d->txt_seq, nl = d->num_layers;

@@ -125,7 +125,7 @@ namespace TensorSharp.Cli
             int diffusionBlocks = 0;   // 0 => derive from --max-tokens and canvas_length
             // Qwen-Image-Edit knobs.
             string editPrompt = null;
-            float cfgScale = 4.0f;
+            float cfgScale = 2.5f;   // Qwen-Image-Edit-2511 recommendation; 4.0 over-guides (distorts faces)
             // Qwen-Image-Edit companion GGUFs. The qwen_image DiT GGUF (passed via
             // --model) carries none of these, so the operator can point at them
             // explicitly instead of relying on a same-directory scan / env vars.

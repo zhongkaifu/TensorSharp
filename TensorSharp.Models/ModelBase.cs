@@ -3212,13 +3212,20 @@ namespace TensorSharp.Models
             // block startup; disable entirely via TS_PREFILL_WARMUP=0.
             if (!string.Equals(Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP"), "0", StringComparison.Ordinal))
             {
-                // MLX stays conservative (short prompt); CUDA/GGML use a longer one
-                // to reach the fused-verify prefill path that short prompts bypass.
+                // MLX and the managed CPU backend stay conservative (short prompt);
+                // CUDA/GGML use a longer one to reach the fused-verify prefill path
+                // that short prompts bypass. The long warmup only pays off where a
+                // first real prompt builds/captures a fused whole-model prefill graph
+                // and reserves a gallocr (CUDA/GGML) -- the managed CPU backend has
+                // none of that, so a 1024-token prefill there is pure cost: tens of
+                // seconds of GEMM plus large O(N^2) activation/KV first-touch paging
+                // that makes `--backend cpu` look hung at startup for no benefit.
                 // TS_PREFILL_WARMUP_LEN overrides (e.g. to pre-size the prefill
                 // gallocr on roomy GPUs); a larger value does NOT reliably help a
                 // near-full GPU because the legacy ForwardRefill warmup graph sizes
                 // the reused gallocr differently than the engine prefill graph.
-                int warmupLength = _backend == BackendType.Mlx ? 32 : 1024;
+                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu;
+                int warmupLength = conservativeWarmup ? 32 : 1024;
                 {
                     string wl = Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP_LEN");
                     if (!string.IsNullOrEmpty(wl) && int.TryParse(wl, out int wlv) && wlv >= 2)

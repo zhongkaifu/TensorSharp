@@ -31,6 +31,7 @@
       <tr><td><strong>Nemotron-H</strong></td><td><code>nemotron_h</code>, <code>nemotron_h_moe</code></td><td>Nemotron-H-8B, 47B, Nemotron 3 Nano Omni</td><td>Image (Omni)</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
       <tr><td><strong>Mistral 3</strong></td><td><code>mistral3</code></td><td>Mistral-Small-3.1-24B-Instruct</td><td>Image</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
       <tr><td><strong>DiffusionGemma</strong></td><td><code>diffusion-gemma</code>, <code>diffusion_gemma</code></td><td>diffusion-gemma text-diffusion GGUFs</td><td>Text only</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
+      <tr><td><strong>Qwen-Image-Edit</strong></td><td><code>qwen_image</code></td><td>qwen-image-edit MMDiT (+ VAE &amp; Qwen2.5-VL companions)</td><td>Image edit (image+text → image)</td><td class="no">No</td><td class="no">No</td><td class="no">—</td></tr>
     </tbody>
   </table>
   </div>
@@ -71,6 +72,15 @@
   </table>
   </div>
   <p>Send images/audio/video via the <a href="cli.html#examples">CLI</a> (<code>--image</code>, <code>--video</code>, <code>--audio</code>), the <a href="server.html#webui">Web UI</a> uploads, or the <a href="http-api.html">HTTP API</a> (base64 <code>images</code> array for Ollama, <code>image_url</code> data URI for OpenAI).</p>
+
+  <h2 id="imageedit">Image editing (Qwen-Image-Edit)</h2>
+  <p>Qwen-Image-Edit takes a <strong>prompt + an input image</strong> and returns an edited image — a different output modality from the text LLMs above. The loaded <code>qwen_image</code> GGUF is only the MMDiT (multimodal diffusion transformer); TensorSharp resolves two companion GGUFs alongside it:</p>
+  <ul>
+    <li><strong>Qwen-Image VAE</strong> — image ↔ 16-channel latent (the original <code>.safetensors</code> works too).</li>
+    <li><strong>Qwen2.5-VL-7B text encoder</strong> — prompt → 3584-dim conditioning, with an optional <code>mmproj</code> vision tower for image-grounded edits.</li>
+  </ul>
+  <p>Place the companions next to the DiT GGUF, or point at them with <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> (CLI: <code>--qwen-image-vae</code> / <code>--qwen-image-vl</code> / <code>--qwen-image-mmproj</code>). The pipeline VAE-encodes the reference, builds the conditioning, runs a FlowMatch-Euler true-CFG denoise loop (reference-latent concatenation), then VAE-decodes back to pixels. The whole 60-block DiT forward is CUDA-graph-captured and flash attention is on by default; the target area auto-clamps to the device VRAM budget unless you pin a width/height.</p>
+  <p>Run it from the <a href="cli.html#imageedit">CLI</a> (<code>--image</code> + <code>--prompt</code>), the <a href="server.html#webui">Web UI</a> image-edit flow (with live denoising previews), or in-process from <a href="code-api.html#imageedit">C# via <code>QwenImageModel.EditImage()</code></a>. Full details are in the repository's <code>docs/models/qwenimage.md</code> card.</p>
 
   <h2 id="thinking">Thinking / reasoning mode</h2>
   <p>Thinking-capable models (Qwen 3, Qwen 3.5/3.6, Gemma 4, GPT OSS, Nemotron-H) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>

@@ -26,9 +26,10 @@ window.SEARCH_INDEX_ZH = [
   { t: "纯 C# CPU 后端", p: "后端", u: "backends.html#cpu", s: "--backend cpu —— 可移植、无原生依赖；ggml_cpu 提供原生 CPU 内核。", k: "可移植 调试 无 gpu" },
   { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh 与 CUDA 架构检测。", k: "compile 编译 native cmake cuda arch" },
 
-  { t: "支持的模型", p: "模型", u: "models.html#table", s: "Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma。", k: "architectures 架构 家族 gemma qwen gptoss nemotron mistral" },
+  { t: "支持的模型", p: "模型", u: "models.html#table", s: "Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Qwen-Image-Edit。", k: "architectures 架构 家族 gemma qwen gptoss nemotron mistral 图像 编辑" },
   { t: "模型下载（GGUF）", p: "模型", u: "models.html#downloads", s: "每个受支持架构的 Hugging Face 链接。", k: "huggingface 权重 下载" },
   { t: "多模态：图像、视频、音频", p: "模型", u: "models.html#multimodal", s: "Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像。", k: "vision 视觉 图像 音频 视频 mmproj 投影器" },
+  { t: "图像编辑（Qwen-Image-Edit）", p: "模型", u: "models.html#imageedit", s: "提示词 + 输入图像 -> 编辑后的图像，经 qwen_image MMDiT、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。", k: "qwen 图像 编辑 mmdit 扩散 vae flowmatch cfg 图片 照片" },
   { t: "思考 / 推理模式", p: "模型", u: "models.html#thinking", s: "Qwen、Gemma 4、GPT OSS、Nemotron-H 带 think 标签的结构化思维链。", k: "reasoning 推理 思维链 think cot" },
   { t: "工具调用 / 函数调用", p: "模型", u: "models.html#toolcalling", s: "模型调用用户自定义工具；跨三种 API 风格的多轮。", k: "functions 函数 工具 agent 智能体" },
 
@@ -37,6 +38,7 @@ window.SEARCH_INDEX_ZH = [
   { t: "交互式 REPL 命令", p: "CLI", u: "cli.html#repl", s: "斜杠命令：/reset、/system、/think、/model、/backend、/image、/temp。", k: "chat repl 交互 斜杠命令" },
   { t: "批处理（JSONL）", p: "CLI", u: "cli.html#jsonl", s: "用 --input-jsonl 从 JSONL 文件运行大量提示词。", k: "batch 批处理 jsonl 多轮" },
   { t: "DiffusionGemma 生成", p: "CLI", u: "cli.html#diffusion", s: "--diffusion-steps、--diffusion-seed、--diffusion-blocks 文本扩散。", k: "diffusion 扩散 去噪 entropybound" },
+  { t: "图像编辑（CLI）", p: "CLI", u: "cli.html#imageedit", s: "Qwen-Image-Edit：--image、--prompt、--output、--cfg、--diffusion-steps；伴随文件覆盖 --qwen-image-vae/-vl/-mmproj。", k: "qwen 图像 编辑 cli 命令 图片 照片 cfg" },
 
   { t: "启动服务器", p: "服务器", u: "server.html#start", s: "./TensorSharp.Server --model model.gguf --backend ggml_metal —— 提供 http://localhost:5000。", k: "web 服务器 托管 运行 端口" },
   { t: "服务器选项", p: "服务器", u: "server.html#options", s: "--model、--mmproj、--backend、--max-tokens、默认采样、批处理参数。", k: "flags 参数 选项" },
@@ -54,6 +56,8 @@ window.SEARCH_INDEX_ZH = [
 
   { t: "从 C# 使用 TensorSharp", p: "C# 库", u: "code-api.html#quickstart", s: "ModelBase.Create、Tokenizer.Encode、Forward、Sample —— 代码中的解码循环。", k: "library 库 代码 嵌入 nuget dotnet api" },
   { t: "NuGet 包", p: "C# 库", u: "code-api.html#packages", s: "TensorSharp.Core、.Runtime、.Models、.Backends.*、.Server、.Cli。", k: "nuget 包 依赖 命名空间" },
+  { t: "从 C# 使用 DiffusionGemma", p: "C# 库", u: "code-api.html#diffusion", s: "DiffusionGemmaModel + DiffusionGemmaSampler.Generate，配 DiffusionEbParams；Forward() 不支持。", k: "diffusion 扩散 文本 去噪 采样器 entropybound csharp 代码" },
+  { t: "从 C# 使用 Qwen-Image-Edit", p: "C# 库", u: "code-api.html#imageedit", s: "QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams)；ImageIO 加载/保存 PNG。", k: "图像 编辑 qwen editimage rgbimage imageio 扩散 csharp 代码" },
   { t: "SamplingConfig", p: "C# 库", u: "code-api.html#sampling", s: "Temperature、TopK、TopP、MinP、惩罚、Seed、StopSequences、MaxTokens。", k: "采样 配置 类 属性" },
   { t: "公共命名空间", p: "C# 库", u: "code-api.html#namespaces", s: "TensorSharp、TensorSharp.Runtime、TensorSharp.Models 与后端命名空间。", k: "namespace 命名空间 类型 api" },
 

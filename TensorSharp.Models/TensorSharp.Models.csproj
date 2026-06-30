@@ -11,6 +11,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
     <InternalsVisibleTo Include="QwenImageEditBench" />
+    <InternalsVisibleTo Include="CpuQuantBench" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />

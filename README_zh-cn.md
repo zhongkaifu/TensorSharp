@@ -73,6 +73,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3](docs/models/mistral3_zh-cn.md) |
 | Gemma 3 | [gemma-3-4b-it](https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf) | ✅ / — / — | — | — | [gemma3](docs/models/gemma3_zh-cn.md) |
 | DiffusionGemma | diffusion-gemma GGUF | — / — / — | — | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
+| Qwen-Image-Edit | qwen-image-edit GGUF（MMDiT + VAE + Qwen2.5-VL） | 🖼️ 图像→图像 | — | — | [qwenimage](docs/models/qwenimage_zh-cn.md) |
 
 ## 亮点功能
 
@@ -80,6 +81,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 池，支持基于内容哈希的前缀共享与迭代级调度器，服务端默认启用。→ [深入文档](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列 decode：Qwen 3.6（NextN 块内嵌在主干 GGUF 中）与 Gemma 4（独立的 `gemma4-assistant` 草稿 GGUF）。草稿头每步提议若干 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动。通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。→ [投机解码](#mtp--nextn-投机解码)
 - **DiffusionGemma 文本扩散** —— 基于 Gemma-4 派生 MoE backbone 的分块 EntropyBound 去噪生成，提供 CLI 扩散参数与 Web UI 实时去噪预览。→ [DiffusionGemma 卡片](docs/models/diffusiongemma_zh-cn.md)
+- **Qwen-Image-Edit 图像编辑** —— 提示词 + 输入图像 → 编辑后的图像，驱动 60 块 MMDiT 扩散 Transformer，配以 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器。CUDA 图捕获的整 DiT 前向、FlowMatch-Euler true-CFG 去噪，以及 Web UI 实时去噪预览。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
 - **多模态** —— 图像 / 视频 / 音频输入（Gemma 4）；图像输入（Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni）。→ [多模态支持](#多模态支持)
 - **工具调用 / 函数调用** —— 三种 API 风格均支持多轮工具调用，输出解析与架构无关。→ [工具调用](#工具调用--函数调用)
 - **思维链 / 推理模式** —— Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H 支持结构化思维链。→ [思维链模式](#思维链--推理模式)
@@ -109,8 +111,8 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 | 范围 | 状态 |
 |---|---|
-| 模型家族 | Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3 |
-| 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。DiffusionGemma 当前走 CLI 扩散运行模式与 Web UI 去噪流。 |
+| 模型家族 | Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。图像编辑通过 Qwen-Image-Edit（`qwen_image` MMDiT）。 |
+| 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。DiffusionGemma 当前走 CLI 扩散运行模式与 Web UI 去噪流；Qwen-Image-Edit 走 CLI 图像编辑模式与 Web UI 图像编辑流程。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA |
 | 多模态 | Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像输入 |
 | 连续批处理 | vLLM 风格的分页 KV 缓存、跨请求基于内容哈希的前缀共享、迭代级调度器（默认启用，可通过 `--no-continuous-batching` 关闭） |
@@ -121,7 +123,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 
 ## 功能特性
 
-- **多架构支持** —— Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3
+- **多架构支持** —— Gemma 4、Gemma 3、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family、GPT OSS、Nemotron-H、Mistral 3，以及 Qwen-Image-Edit（图像编辑）
 - **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Gemma 3 / Qwen 3.5-family / Mistral 3 / Nemotron-H Omni）
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
@@ -138,6 +140,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **批处理** —— 控制台应用支持 JSONL 输入，并内置用于测量 prefill / decode 吞吐的推理基准
 - **流式输出** —— 按 token 输出（Web 通过 SSE，控制台通过 stdout），并支持中断/停止正在生成的请求
 - **文本扩散生成** —— DiffusionGemma 使用 EntropyBound 迭代去噪采样器，而不是自回归 `Forward()`。CLI 提供 `--diffusion-steps`、`--diffusion-seed` 与 `--diffusion-blocks`；Web UI 使用整条消息 `replace` 事件展示实时去噪预览，并通过 `DiffusionBatchScheduler` 批处理并发扩散请求。
+- **图像编辑（Qwen-Image-Edit）** —— 提示词加输入图像生成编辑后的图像。所加载的 `qwen_image` GGUF 是 MMDiT 扩散 Transformer；TensorSharp 在其旁解析两个伴随 GGUF——Qwen-Image VAE（图像 ↔ 16 通道潜变量）与 Qwen2.5-VL-7B 文本编码器（提示词 → 3584 维条件，可选通过 `mmproj` 做视觉接地）。流水线对参考图做 VAE 编码、构建文本（及可选图像）条件、运行带参考潜变量拼接的 FlowMatch-Euler true-CFG 去噪循环，再 VAE 解码回像素。整个 60 块 DiT 前向被 CUDA 图捕获（`TSGgml_QwenImageForward`），flash 注意力默认开启，目标面积按设备 VRAM 预算自动钳制。可从 C# 通过 `QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams)` 驱动，从 CLI 图像编辑模式（`--image`、`--prompt`、`--cfg`、`--diffusion-steps`、`--diffusion-seed`）驱动，以及从带实时去噪预览的 Web UI 驱动。→ [Qwen-Image-Edit 卡片](docs/models/qwenimage_zh-cn.md)
 - **混合 SSM-Transformer** —— Nemotron-H 在单个模型中混合 Mamba2 SSM 层、纯注意力层和 MoE FFN 层；Mamba2 步现在同时提供单序列原生内核与批处理原生内核（`TSGgml_NemotronMamba2BatchedStepF32`，NEON SIMD + GCD 并行）。
 - **混合注意力-递归网络** —— Qwen 3.5/3.6-family 在同一模型中混合全注意力层与 GatedDeltaNet 递归层；批处理路径下递归运行状态保存在每槽位的递归状态池中
 - **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5/3.6-family MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
@@ -159,6 +162,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 | Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B、Nemotron-H-47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni（图像） | 图像（Omni） | 支持 | 支持 | — | [nemotron_zh-cn.md](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | — | [mistral3_zh-cn.md](docs/models/mistral3_zh-cn.md) |
 | DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma 文本扩散 GGUF | 仅文本 | 不支持 | 不支持 | — | [diffusiongemma_zh-cn.md](docs/models/diffusiongemma_zh-cn.md) |
+| Qwen-Image-Edit | `qwen_image` | qwen-image-edit MMDiT GGUF（+ VAE 与 Qwen2.5-VL 伴随文件） | 图像编辑（图像+文本 → 图像） | 不支持 | 不支持 | — | [qwenimage_zh-cn.md](docs/models/qwenimage_zh-cn.md) |
 
 各架构的端到端文档见[按模型架构卡片](docs/models/README_zh-cn.md)（来源、前向计算图、组件、参数、权重命名，以及 TensorSharp 如何实现并优化 prefill 与 decode）。
 
@@ -182,6 +186,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | Mistral 3 | mistral3-mmproj（Pixtral 视觉投影器） | [bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/Mistral-Small-3.1-24B-Instruct-2503-GGUF) |
 | DiffusionGemma | diffusion-gemma 文本扩散 GGUF | 使用 `general.architecture` 为 `diffusion-gemma` 或 `diffusion_gemma` 的 GGUF 文件 |
+| Qwen-Image-Edit | Qwen-Image-Edit MMDiT（`qwen_image`） | `general.architecture` 为 `qwen_image` 的 DiT GGUF，外加同目录下的 Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器 GGUF（或通过 `TS_QWEN_IMAGE_VAE` / `TS_QWEN_IMAGE_TE` / `TS_QWEN_IMAGE_MMPROJ` 指定）。VAE 可为原始 `.safetensors`。 |
 
 ## 计算后端
 
@@ -210,7 +215,7 @@ TensorSharp/
 │   ├── KvBlockHash.cs           # 内容寻址的块哈希，用于跨请求前缀复用
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
-│   ├── Models/<Family>/         # 每个架构一个目录（DiffusionGemma、Gemma3、Gemma4、GptOss、Mistral3、Nemotron、Qwen3、Qwen35）
+│   ├── Models/<Family>/         # 每个架构一个目录（DiffusionGemma、Gemma3、Gemma4、GptOss、Mistral3、Nemotron、Qwen3、Qwen35、QwenImage）
 │   │   ├── <Family>Model.cs                # 旧的单序列 ModelBase 实现
 │   │   └── <Family>Model.BatchedForward.cs # IBatchedPagedModel.ForwardBatch —— 批处理/分页路径（Mistral3、Gemma4、GptOss、Qwen35、Nemotron、Qwen3）
 │   ├── Paged/                   # 张量侧的分页注意力辅助（TensorPagedAttention）
@@ -232,6 +237,7 @@ TensorSharp/
 │   ├── ggml_ops_mamba2.cpp                # Nemotron Mamba2 内核（按序列 + 批处理 SIMD）
 │   ├── ggml_ops_paged_attention.cpp       # 分页注意力原生内核（驱动 ggml_flash_attn_ext + sinks 变体）
 │   ├── ggml_ops_diffusion.cpp             # DiffusionGemma 融合 decode-layer / 整模型 / lm-head 内核
+│   ├── ggml_ops_qwen_image.cpp            # Qwen-Image-Edit MMDiT 整模型前向（CUDA 图捕获）+ CFG-batched 内核
 │   ├── ggml_ops_training.cpp              # 仅训练用内核（运行时不使用）
 │   └── tests/                              # 原生单元 + 烟雾测试
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
@@ -450,6 +456,13 @@ cd TensorSharp.Cli/bin
 ./TensorSharp.Cli --model <diffusion-gemma.gguf> --input prompt.txt --backend ggml_metal \
     --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0
 
+# Qwen-Image-Edit 图像编辑（提示词 + 输入图像 -> 编辑后的图像）
+# VAE + Qwen2.5-VL 文本编码器伴随文件会在 DiT GGUF 旁解析
+# （或用 --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj 指定）。
+./TensorSharp.Cli --model <qwen-image-edit-DiT.gguf> --image input.png \
+    --prompt "Make the sky a dramatic sunset." --output edited.png \
+    --backend ggml_cuda --diffusion-steps 30 --cfg 4.0 --diffusion-seed 0
+
 # 思维链 / 推理模式
 ./TensorSharp.Cli --model <model.gguf> --input prompt.txt --backend ggml_metal --think
 
@@ -531,6 +544,13 @@ cd TensorSharp.Cli/bin
 | `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48） |
 | `--diffusion-seed <N>` | DiffusionGemma 确定性采样种子（默认：0） |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
+| `--image <path>` | Qwen-Image-Edit 的输入图像（也是多模态聊天的图像输入）。在 `qwen_image` DiT GGUF 上触发图像编辑模式所必需。 |
+| `--prompt <text>` | Qwen-Image-Edit 编辑指令（省略时回退到 `--input` 文件内容）。 |
+| `--output <path>` | Qwen-Image-Edit 输出 PNG 路径（默认：`edited.png`）。 |
+| `--cfg <F>` | Qwen-Image-Edit true-CFG 引导尺度（默认：4.0；`<= 1` 关闭负向分支）。步数与种子复用 `--diffusion-steps` / `--diffusion-seed`。 |
+| `--qwen-image-vae <path>` | 覆盖解析到的 Qwen-Image VAE 伴随文件（`.gguf` 或 `.safetensors`）。 |
+| `--qwen-image-vl <path>` | 覆盖解析到的 Qwen2.5-VL-7B 文本编码器 GGUF。 |
+| `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen2.5-VL mmproj（视觉接地）GGUF。 |
 | `--test` | 运行内置的分词器、Qwen3 聊天模板与 ollama 对比测试 |
 | `--test-templates <dir>` | 对 `<dir>` 下的每个 *.gguf 校验硬编码模板与 GGUF Jinja2 模板的一致性 |
 | `--log-level <lvl>` | 控制台与文件日志级别：`trace`、`debug`、`info`、`warning`、`error`、`critical`、`off` |
@@ -1093,7 +1113,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` Q4/Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、DiffusionGemma、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及各具体模型架构和多模态辅助组件（Gemma 3/4、DiffusionGemma、Qwen 3/3.5、GPT OSS、Nemotron-H、Mistral 3、Qwen-Image-Edit）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 

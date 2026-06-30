@@ -20,8 +20,9 @@
 
   <h2 id="catalog">Highlights</h2>
   <div class="card-grid">
-    <div class="card"><div class="ic">🧠</div><h3>Multi-architecture</h3><p>Gemma 4 / 3, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma.</p></div>
+    <div class="card"><div class="ic">🧠</div><h3>Multi-architecture</h3><p>Gemma 4 / 3, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma, Qwen-Image-Edit.</p></div>
     <div class="card"><div class="ic">🖼️</div><h3>Multimodal</h3><p>Image, video, and audio inputs (Gemma 4); image input for several others.</p></div>
+    <div class="card"><div class="ic">🎨</div><h3>Image editing</h3><p>Qwen-Image-Edit turns a prompt + input image into an edited image (MMDiT diffusion).</p></div>
     <div class="card"><div class="ic">💭</div><h3>Thinking mode</h3><p>Structured chain-of-thought, separated from the visible answer.</p></div>
     <div class="card"><div class="ic">🛠️</div><h3>Tool calling</h3><p>Multi-turn function calling across all three API styles.</p></div>
     <div class="card"><div class="ic">📦</div><h3>Native quantized compute</h3><p>Q4_K_M, Q8_0, MXFP4, IQ2_XXS and more run in matmul without dequantizing to FP32.</p></div>
@@ -32,12 +33,13 @@
 
   <h2 id="models-features">Models &amp; modalities</h2>
   <ul>
-    <li><strong>Multi-architecture support</strong> — Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3. → <a href="models.html#table">Supported models</a></li>
+    <li><strong>Multi-architecture support</strong> — Gemma 4, Gemma 3, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family, GPT OSS, Nemotron-H, Mistral 3, Qwen-Image-Edit. → <a href="models.html#table">Supported models</a></li>
     <li><strong>Multimodal inference</strong> — image, video, and audio inputs for Gemma 4; images for Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni. → <a href="models.html#multimodal">Multimodal</a></li>
     <li><strong>Mixture of Experts (MoE)</strong> — Gemma 4 MoE (e.g. 26B-A4B), GPT OSS MoE (gpt-oss-20b), Qwen 3.5/3.6 MoE (35B-A3B), and Nemotron-H MoE FFN layers, with a fused batched GPU MoE dispatch.</li>
     <li><strong>Hybrid SSM-Transformer</strong> — Nemotron-H mixes Mamba2 SSM layers, attention layers, and MoE FFN in one model.</li>
     <li><strong>Hybrid Attention-Recurrent</strong> — Qwen 3.5/3.6-family mix full-attention layers with GatedDeltaNet recurrent layers.</li>
     <li><strong>Text-diffusion generation</strong> — DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive decode. → <a href="advanced.html#diffusion">DiffusionGemma</a></li>
+    <li><strong>Image editing (Qwen-Image-Edit)</strong> — a prompt + input image produces an edited image via a 60-block MMDiT diffusion transformer, a Qwen-Image VAE, and a Qwen2.5-VL-7B text encoder (FlowMatch-Euler true-CFG, CUDA-graph-captured DiT forward). → <a href="models.html#imageedit">Image editing</a></li>
   </ul>
 
   <h2 id="generation">Generation &amp; control</h2>

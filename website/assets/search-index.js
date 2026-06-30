@@ -26,9 +26,10 @@ window.SEARCH_INDEX = [
   { t: "Pure C# CPU backend", p: "Backends", u: "backends.html#cpu", s: "--backend cpu — portable, no native dependencies; ggml_cpu for native CPU kernels.", k: "portable debugging no gpu" },
   { t: "Build the native GGML / MLX libraries", p: "Backends", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh and CUDA arch detection.", k: "compile native cmake cuda arch" },
 
-  { t: "Supported models", p: "Models", u: "models.html#table", s: "Gemma 3/4, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma.", k: "architectures families gemma qwen gptoss nemotron mistral" },
+  { t: "Supported models", p: "Models", u: "models.html#table", s: "Gemma 3/4, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma, Qwen-Image-Edit.", k: "architectures families gemma qwen gptoss nemotron mistral image edit" },
   { t: "Model downloads (GGUF)", p: "Models", u: "models.html#downloads", s: "Hugging Face links for every supported architecture.", k: "huggingface weights download" },
   { t: "Multimodal: image, video, audio", p: "Models", u: "models.html#multimodal", s: "Image/video/audio for Gemma 4; image for Gemma 3, Qwen 3.5-family, Mistral 3, Nemotron-H Omni.", k: "vision image audio video mmproj projector" },
+  { t: "Image editing (Qwen-Image-Edit)", p: "Models", u: "models.html#imageedit", s: "Prompt + input image -> edited image via the qwen_image MMDiT, a Qwen-Image VAE, and a Qwen2.5-VL text encoder.", k: "qwen image edit mmdit diffusion vae flowmatch cfg picture photo" },
   { t: "Thinking / reasoning mode", p: "Models", u: "models.html#thinking", s: "Structured chain-of-thought with think tags for Qwen, Gemma 4, GPT OSS, Nemotron-H.", k: "reasoning chain of thought think cot" },
   { t: "Tool calling / function calling", p: "Models", u: "models.html#toolcalling", s: "Models invoke user-defined tools; multi-turn across all three API styles.", k: "functions tools agent" },
 
@@ -37,6 +38,7 @@ window.SEARCH_INDEX = [
   { t: "Interactive REPL commands", p: "CLI", u: "cli.html#repl", s: "Slash commands: /reset, /system, /think, /model, /backend, /image, /temp.", k: "chat repl interactive slash commands" },
   { t: "Batch processing (JSONL)", p: "CLI", u: "cli.html#jsonl", s: "Run many prompts from a JSONL file with --input-jsonl.", k: "batch jsonl multi-turn" },
   { t: "DiffusionGemma generation", p: "CLI", u: "cli.html#diffusion", s: "--diffusion-steps, --diffusion-seed, --diffusion-blocks text diffusion.", k: "diffusion denoising entropybound" },
+  { t: "Image editing (CLI)", p: "CLI", u: "cli.html#imageedit", s: "Qwen-Image-Edit: --image, --prompt, --output, --cfg, --diffusion-steps; companion overrides --qwen-image-vae/-vl/-mmproj.", k: "qwen image edit cli command picture photo cfg" },
 
   { t: "Start the server", p: "Server", u: "server.html#start", s: "./TensorSharp.Server --model model.gguf --backend ggml_metal — serves http://localhost:5000.", k: "web server host run port" },
   { t: "Server options", p: "Server", u: "server.html#options", s: "--model, --mmproj, --backend, --max-tokens, default sampling, batching flags.", k: "flags arguments parameters" },
@@ -54,6 +56,8 @@ window.SEARCH_INDEX = [
 
   { t: "Use TensorSharp from C#", p: "C# Library", u: "code-api.html#quickstart", s: "ModelBase.Create, Tokenizer.Encode, Forward, Sample — a decode loop in code.", k: "library code embed nuget dotnet api" },
   { t: "NuGet packages", p: "C# Library", u: "code-api.html#packages", s: "TensorSharp.Core, .Runtime, .Models, .Backends.*, .Server, .Cli.", k: "nuget package dependency namespace" },
+  { t: "DiffusionGemma from C#", p: "C# Library", u: "code-api.html#diffusion", s: "DiffusionGemmaModel + DiffusionGemmaSampler.Generate with DiffusionEbParams; Forward() is unsupported.", k: "diffusion text denoising sampler entropybound csharp code" },
+  { t: "Qwen-Image-Edit from C#", p: "C# Library", u: "code-api.html#imageedit", s: "QwenImageModel.EditImage(prompt, RgbImage, QwenImageParams); ImageIO load/save PNG.", k: "image edit qwen editimage rgbimage imageio diffusion csharp code" },
   { t: "SamplingConfig", p: "C# Library", u: "code-api.html#sampling", s: "Temperature, TopK, TopP, MinP, penalties, Seed, StopSequences, MaxTokens.", k: "sampling config class properties" },
   { t: "Public namespaces", p: "C# Library", u: "code-api.html#namespaces", s: "TensorSharp, TensorSharp.Runtime, TensorSharp.Models and backend namespaces.", k: "namespace types api" },
 
