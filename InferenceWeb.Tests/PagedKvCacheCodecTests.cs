@@ -71,6 +71,36 @@ public class PagedKvCacheCodecTests
     }
 
     [Fact]
+    public void PagedManager_WithInt2Codec_ShrinksHardAndRestoresWithinTolerance()
+    {
+        var manager = NewEnabledManager("fp-int2-rt", bits: 2);
+        var model = new FloatFakeArchitecture("fp-int2-rt", seed: 17);
+        var tokens = Enumerable.Range(1, BlockSize * 3).ToArray();
+        model.InjectFullState(tokens.Length);
+        manager.Capture(model, tokens, tokens.Length);
+        var stats = manager.GetStats();
+
+        // int2 affine on fp32 should compress hard (>8x): per 32-element group
+        // 12 encoded bytes vs 128 raw.
+        long rawBytes = model.ComputeKVBlockByteSize(BlockSize) * stats.ramBlocks;
+        Assert.True(stats.ramBlocks > 0);
+        Assert.True(stats.ramBytes * 8 < rawBytes,
+            $"int2 should compress fp32 by >=8x: encoded {stats.ramBytes} vs raw {rawBytes}");
+
+        var modelB = new FloatFakeArchitecture("fp-int2-rt", seed: 17);
+        int restored = manager.TryRestorePrefix(modelB, tokens);
+        Assert.True(restored >= BlockSize,
+            $"Expected at least one restored block, got {restored}");
+
+        // 2-bit affine: worst-case ~1/3 of group range, fp16 scale/min slack on
+        // top. The paged tier only recycles this on far-prefix reuse where the
+        // softmax dwarfs the noise; the tolerance here just guards the codec.
+        float maxRelErr = model.MaxRelativeFloatErrorPrefix(modelB, restored);
+        Assert.True(maxRelErr < 0.50f,
+            $"int2 round-trip relative error {maxRelErr:G4} above tolerance");
+    }
+
+    [Fact]
     public void PagedManager_WithInt8Codec_RestoresWithTighterTolerance()
     {
         var manager = NewEnabledManager("fp-int8-rt", bits: 8);

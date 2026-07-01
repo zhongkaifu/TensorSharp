@@ -43,6 +43,79 @@ public class TurboQuantKvCodecTests
     }
 
     [Fact]
+    public void Int2_Float32_RoundTrip_BoundsRelativeError()
+    {
+        var codec = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 2);
+        var values = SampleFloats(seed: 21, count: 4 * GroupSize, range: 4f);
+        byte[] raw = FloatsToBytes(values);
+
+        byte[] encoded = codec.Encode(raw);
+        var decoded = new byte[raw.Length];
+        Assert.True(codec.TryDecode(encoded, decoded));
+
+        float[] roundTripped = BytesToFloats(decoded);
+        // Affine 2-bit spreads 4 codes across [min,max]; worst-case quant error
+        // is half a step = (max-min)/6 ≈ 1/3 of the group range. fp16 scale/min
+        // rounding adds a hair on top.
+        AssertRelativeError(values, roundTripped, maxAvgError: 0.20f, maxMaxError: 0.50f);
+    }
+
+    [Fact]
+    public void Int2_IsLessPreciseThanInt4_ButCompressesMore()
+    {
+        var values = SampleFloats(seed: 22, count: 8 * GroupSize, range: 4f);
+        byte[] raw = FloatsToBytes(values);
+
+        var int2 = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 2);
+        var int4 = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 4);
+
+        byte[] enc2 = int2.Encode(raw);
+        byte[] enc4 = int4.Encode(raw);
+
+        var dec2 = RoundTrip(int2, raw, raw.Length);
+        var dec4 = RoundTrip(int4, raw, raw.Length);
+        float err2 = MeanAbsError(values, BytesToFloats(dec2));
+        float err4 = MeanAbsError(values, BytesToFloats(dec4));
+
+        // 2-bit trades precision for footprint: coarser than int4 but a smaller
+        // encoded block.
+        Assert.True(err2 > err4,
+            $"int2 ({err2:G4}) should be coarser than int4 ({err4:G4})");
+        Assert.True(enc2.Length < enc4.Length,
+            $"int2 ({enc2.Length} B) should be smaller than int4 ({enc4.Length} B)");
+    }
+
+    [Fact]
+    public void Int2_CompressesFloat32_ByMoreThan8x()
+    {
+        // 32 fp32 = 128 raw bytes. Encoded per group: 2 (scale) + 2 (min) +
+        // 8 (codes) = 12 bytes + 16-byte header amortized. For many groups this
+        // approaches 128/12 ≈ 10.7x.
+        var codec = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 2);
+        var values = SampleFloats(seed: 23, count: 64 * GroupSize, range: 1f);
+        byte[] raw = FloatsToBytes(values);
+
+        byte[] encoded = codec.Encode(raw);
+        Assert.True(encoded.Length * 8 < raw.Length,
+            $"int2 should achieve >8x compression on fp32; got {raw.Length}->{encoded.Length}");
+    }
+
+    [Fact]
+    public void Int2_Float16_RoundTrip_BoundsRelativeError()
+    {
+        var codec = new TurboQuantKvCodec(KvCodecElementType.Float16, bits: 2);
+        var values = SampleFloats(seed: 24, count: 4 * GroupSize, range: 4f);
+        byte[] raw = HalvesToBytes(values);
+
+        byte[] encoded = codec.Encode(raw);
+        var decoded = new byte[raw.Length];
+        Assert.True(codec.TryDecode(encoded, decoded));
+
+        float[] roundTripped = BytesToHalves(decoded);
+        AssertRelativeError(values, roundTripped, maxAvgError: 0.20f, maxMaxError: 0.50f);
+    }
+
+    [Fact]
     public void Int8_Float32_RoundTrip_IsMorePreciseThanInt4()
     {
         var values = SampleFloats(seed: 2, count: 8 * GroupSize, range: 4f);
@@ -186,6 +259,40 @@ public class TurboQuantKvCodecTests
         {
             Environment.SetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS", previous);
         }
+    }
+
+    [Fact]
+    public void FromEnvironment_HonorsInt2()
+    {
+        var previous = Environment.GetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS");
+        try
+        {
+            Environment.SetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS", "2");
+            var codec = TurboQuantKvCodec.FromEnvironment(KvCodecElementType.Float16);
+            Assert.NotNull(codec);
+            Assert.Equal(2, codec.BitsPerElement);
+            Assert.Equal("turboquant-int2", codec.Name);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_KV_PAGED_QUANT_BITS", previous);
+        }
+    }
+
+    [Fact]
+    public void Decode_RejectsInt2PayloadUnderInt4Codec()
+    {
+        var int2 = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 2);
+        var int4 = new TurboQuantKvCodec(KvCodecElementType.Float32, bits: 4);
+
+        var values = SampleFloats(seed: 25, count: 2 * GroupSize, range: 4f);
+        byte[] raw = FloatsToBytes(values);
+        byte[] encoded2 = int2.Encode(raw);
+
+        // A codec configured for a different bit width must refuse the block
+        // rather than misinterpreting the affine layout as symmetric nibbles.
+        var decoded = new byte[raw.Length];
+        Assert.False(int4.TryDecode(encoded2, decoded));
     }
 
     [Fact]

@@ -72,14 +72,14 @@ namespace TensorSharp.GGML
 
         public override IntPtr PtrAtElement(long index)
         {
-            // Block-quantized types (Q8_0) cannot be addressed at element granularity.
-            // Native kernels always pass index = 0 (the buffer base) so we honour that;
-            // anything else is a bug in the caller.
-            if (ElementType == DType.Q8_0)
+            // Block-quantized types (Q8_0 / Q4_0) cannot be addressed at element
+            // granularity. Native kernels always pass index = 0 (the buffer base)
+            // so we honour that; anything else is a bug in the caller.
+            if (ElementType == DType.Q8_0 || ElementType == DType.Q4_0)
             {
                 if (index != 0)
                     throw new NotSupportedException(
-                        $"Q8_0 storage does not support element-level addressing (index={index}).");
+                        $"{ElementType} storage does not support element-level addressing (index={index}).");
                 return buffer;
             }
             return new IntPtr(buffer.ToInt64() + (index * ElementType.Size()));

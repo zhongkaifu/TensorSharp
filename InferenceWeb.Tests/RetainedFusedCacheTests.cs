@@ -69,6 +69,57 @@ public class RetainedFusedCacheTests
         Assert.True(pctB >= 80.0, $"follow-up B reuse {pctB:F1}% too low");
     }
 
+    /// <summary>
+    /// Single-stream ("请继续") analogue of the bug above, on a model whose KV cache
+    /// is BLOCK-QUANTIZED (q4_0 / q8_0). Such a model declines the batched paged path
+    /// — its <see cref="IBatchedPagedModel.ForwardBatch"/> throws NotSupported and it
+    /// reports <c>SupportsLinearKVMigration=false</c> — but it still keeps a single
+    /// live linear cache exactly like the f16 path (<see cref="FusedStubModel"/>
+    /// matches this shape: ForwardBatch throws, SupportsPerSequenceFusedForward=true,
+    /// SupportsLinearKVMigration defaults to false).
+    ///
+    /// Repro of the user report ("--kv-cache-dtype q4_0 makes KV cache reuse 0 on a
+    /// follow-up turn; f16 reuses fully"): pre-fix, a block-quant N=1 step skipped the
+    /// N=1 fast path (gated on SupportsLinearKVMigration) and fell into the
+    /// ExecuteStepBatched attempt, which cleared <c>_liveCacheValid</c> BEFORE
+    /// ForwardBatch threw. The per-seq fallback's EnsureOwnership then saw the
+    /// stale-false flag and aborted the live-cache continuation, re-prefilling the
+    /// whole conversation (PrefixCacheReusedTokens reset to 0). f16 took the fast path
+    /// and never tripped that flag, hence the dtype-specific symptom.
+    /// </summary>
+    [Fact]
+    public async Task SingleStream_BlockQuantLikeModel_LiveCacheContinuation_ReusesFullPrefix()
+    {
+        var model = new FusedStubModel();
+        using var engine = new InferenceEngine(model, Config(), NullLogger.Instance);
+
+        // Turn 1: ONE sequence, prompt longer than the pooled-reuse Cap so only
+        // live-cache continuation (not the capped pool) can reuse it on turn 2.
+        var prompt1 = Enumerable.Repeat(1, PromptLen).ToList();
+        var seq1 = new SequenceState("t1", prompt1, Round1NewTokens, BlockSize, SamplingConfig.Greedy);
+        var (_, out1) = await DrainAsync(engine.SubmitRequest(seq1));
+
+        // Turn 2: "请继续" — prompt = turn-1 (prompt + output) + a short new suffix.
+        // Submitted only AFTER turn 1 fully drained, so the whole conversation runs
+        // single-stream (N=1) and exercises live-cache continuation, not the
+        // concurrent retained-fused path.
+        var prompt2 = new List<int>(prompt1);
+        prompt2.AddRange(out1);
+        prompt2.AddRange(Enumerable.Repeat(PeakToken, SuffixLen));
+        var seq2 = new SequenceState("t2", prompt2, 8, BlockSize, SamplingConfig.Greedy);
+        var (c2, _) = await DrainAsync(engine.SubmitRequest(seq2));
+
+        // The reused prefix must equal the entire turn-1 conversation (well past Cap):
+        // only the short new suffix is re-prefilled. Pre-fix this was 0.
+        Assert.True(c2.PrefixCacheReusedTokens > Cap,
+            $"single-stream follow-up reused {c2.PrefixCacheReusedTokens} tokens " +
+            $"(expected > {Cap}); reuse 0 is the reported q4_0 bug.");
+        Assert.Equal(c2.PromptTokenCount - SuffixLen, c2.PrefixCacheReusedTokens);
+
+        double pct = 100.0 * c2.PrefixCacheReusedTokens / c2.PromptTokenCount;
+        Assert.True(pct >= 80.0, $"single-stream follow-up reuse {pct:F1}% too low");
+    }
+
     private const int PromptLen = 24;   // > Cap so only the live holder can reuse it
     private const int Round1NewTokens = 24;
     private const int SuffixLen = 4;

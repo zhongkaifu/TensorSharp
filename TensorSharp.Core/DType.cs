@@ -25,6 +25,12 @@ namespace TensorSharp
         // KV-cache storage where reads/writes go through the native GGML kernels
         // (which understand the block layout natively).
         Q8_0 = 5,
+        // Block-quantized 4-bit float (GGML Q4_0). 32 elements per block, 18 bytes
+        // per block (16-bit scale + 32 int4 values packed two-per-byte), giving
+        // ~0.5625 bytes/elem - half the footprint of Q8_0. Same restriction as
+        // Q8_0: no direct element access; reads/writes go through the native GGML
+        // kernels (ggml_cpy F32<->Q4_0 and flash_attn_ext both handle Q4_0 K/V).
+        Q4_0 = 6,
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -49,6 +55,10 @@ namespace TensorSharp
                 // We return 1 here for legacy callers that scale offsets - actual
                 // buffer allocation must use Q8_0Bytes() for block-aligned sizing.
                 case DType.Q8_0: return 1;
+                // Q4_0 is ~0.5625 bytes/elem (block layout). Like Q8_0 we return a
+                // nominal 1 for legacy offset-scaling callers; real buffer sizing
+                // must go through Q4_0Bytes() for block-aligned allocation.
+                case DType.Q4_0: return 1;
                 default:
                     throw new NotSupportedException("Element type " + value + " not supported.");
             }
@@ -67,10 +77,25 @@ namespace TensorSharp
             return blocks * blockBytes;
         }
 
+        /// <summary>
+        /// Total bytes for storing <paramref name="elementCount"/> Q4_0 elements,
+        /// rounded up to the 32-element block boundary (1 block = 18 bytes:
+        /// 2-byte F16 scale + 32 int4 quants packed two-per-byte).
+        /// </summary>
+        public static long Q4_0Bytes(long elementCount)
+        {
+            const int blockElems = 32;
+            const int blockBytes = 18;
+            long blocks = (elementCount + blockElems - 1) / blockElems;
+            return blocks * blockBytes;
+        }
+
         public static long ByteLengthFor(this DType value, long elementCount)
         {
             if (value == DType.Q8_0)
                 return Q8_0Bytes(elementCount);
+            if (value == DType.Q4_0)
+                return Q4_0Bytes(elementCount);
             return elementCount * value.Size();
         }
 

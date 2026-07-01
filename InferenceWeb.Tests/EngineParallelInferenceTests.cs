@@ -35,6 +35,13 @@ public class EngineParallelInferenceTests
             // The "-assistant" variant ships under the same prefix; exclude it.
             ExcludePatterns: new[] { "assistant" },
             MmprojPatterns: new[] { "gemma-4-mmproj" }),
+        // The exact E4B build from the q4_0 KV-cache reuse bug report
+        // (gemma-4-E4B-it-uncensored-Q8_0.gguf). Matches any E4B "it" GGUF;
+        // excludes the tiny assistant/mmproj sidecars.
+        ["gemma4-e4b"] = new ModelManifest(
+            ModelPatterns: new[] { "gemma-4-E4B-it" },
+            ExcludePatterns: new[] { "assistant", "mmproj" },
+            MmprojPatterns: new[] { "gemma-4-mmproj" }),
         // The user-reported repro runs the 12B QAT build on ggml_cuda. Matches the
         // exact files from the bug report; set TS_TEST_MODEL_DIR to their folder and
         // TS_TEST_BACKEND=ggml_cuda to exercise the concurrent fused-decode path.
@@ -127,6 +134,15 @@ public class EngineParallelInferenceTests
     // each re-prefilled the whole conversation. Post-fix: the finished holders are
     // retained and re-adopted, so the follow-ups reuse the whole prefix.
     [Fact] public Task Gemma4_ConcurrentSwaPrefixReuseAcrossTurns() => RunConcurrentSwaPrefixReuseRepro("gemma4-12b");
+    // Real-model repro for the reported bug: with --kv-cache-dtype q4_0 a
+    // same-session follow-up ("请继续") after a long first turn reused 0 KV
+    // tokens (re-prefilling the whole conversation), while f16 reused nearly
+    // all of it. Both variants must now reuse the full prefix via live-cache
+    // continuation. Needs TS_TEST_MODEL_DIR=<dir with gemma-4-E4B-it*.gguf> and
+    // TS_TEST_BACKEND=ggml_cuda (block-quant live KV needs the fused CUDA path).
+    [Fact] public Task Gemma4E4B_Q4_0_LongTurnPrefixReuse() => RunKvDtypeLongPromptReuseRepro("gemma4-e4b", KvCacheDtype.Q4_0);
+    [Fact] public Task Gemma4E4B_F16_LongTurnPrefixReuse() => RunKvDtypeLongPromptReuseRepro("gemma4-e4b", KvCacheDtype.F16);
+    [Fact] public Task Gemma4E4B_Q8_0_LongTurnPrefixReuse() => RunKvDtypeLongPromptReuseRepro("gemma4-e4b", KvCacheDtype.Q8_0);
     [Fact] public Task Qwen36_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("qwen36");
     [Fact] public Task Nemotron3_PrefixCacheHitAcceleratesSecondRequest() => RunPrefixCacheBench("nemotron3");
 
@@ -325,6 +341,75 @@ public class EngineParallelInferenceTests
             Assert.True(mentionsApple,
                 $"image request output \"{imageResult.OutputText}\" doesn't mention apple/fruit - " +
                 "vision embeddings probably weren't injected (engine-path multimodal bug).");
+        }
+    }
+
+    // Real-model driver for the q4_0 KV-cache reuse bug. A long first turn
+    // (whose K/V wraps the SWA circular cache) followed by a same-session
+    // "请继续" that must reuse the whole prefix via live-cache continuation,
+    // run under a chosen KV-cache dtype. Reports reuse% and the follow-up's
+    // wall time (the "high performance" check: reuse means the follow-up
+    // re-prefills only the short new suffix, not the whole conversation).
+    private async Task RunKvDtypeLongPromptReuseRepro(string key, TensorSharp.Models.KvCacheDtype kvDtype)
+    {
+        // The model captures KvCacheDtypeConfig.Current at construction, so
+        // set it BEFORE loading (mirrors the server's --kv-cache-dtype flag).
+        TensorSharp.Models.KvCacheDtypeConfig.Set(kvDtype);
+        if (!TryLoad(key, out var ctx)) return;
+        using (ctx)
+        {
+            Assert.Equal(kvDtype, ctx.Model.KvCacheDtype);
+            int window = ctx.Model.Config?.SlidingWindow ?? 0;
+            _output.WriteLine($"[{key}] kvDtype={ctx.Model.KvCacheDtype.ToShortString()} slidingWindow={window}");
+            var sampling = SamplingConfig.Greedy;
+
+            // Build a long first-turn user message (~2.4k tokens of deterministic
+            // filler) so turn-1 K/V comfortably exceeds the SWA window and only
+            // live-cache continuation (not the window-capped pool) can reuse it.
+            var sb = new System.Text.StringBuilder();
+            sb.Append("请阅读下面这段材料，然后用中文简要总结它的主要内容。\n\n");
+            for (int i = 0; i < 120; i++)
+                sb.Append($"第{i + 1}段：在一个遥远的星系里，探险者们记录下了行星的轨道、恒星的亮度以及气候的缓慢变化，并把这些观测整理成册。 ");
+            string longText = sb.ToString();
+
+            var turn1History = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = longText },
+            };
+            var sw1 = Stopwatch.StartNew();
+            var (t1, t1RawTokens) = await SubmitWithHistoryCapturingTokens(ctx, turn1History, maxNewTokens: 40, "kvq-turn1", sampling);
+            sw1.Stop();
+            _output.WriteLine($"[{key}] turn1: prompt={t1.PromptTokenCount} reused={t1.PrefixCacheReusedTokens} out={t1.OutputTokenCount} wall={sw1.Elapsed.TotalMilliseconds:F0}ms");
+            Assert.True(t1.PromptTokenCount > window,
+                $"turn1 prompt {t1.PromptTokenCount} must exceed the SWA window {window} to exercise the bug");
+
+            // Turn 2: same session, "请继续" appended after turn 1's output. Splice
+            // turn 1's raw output tokens so the re-render produces an exact token
+            // prefix match (as the production chat pipeline does).
+            var turn2History = new List<ChatMessage>
+            {
+                new ChatMessage { Role = "user", Content = longText },
+                new ChatMessage { Role = "assistant", Content = t1.OutputText, RawOutputTokens = t1RawTokens },
+                new ChatMessage { Role = "user", Content = "请继续" },
+            };
+            var sw2 = Stopwatch.StartNew();
+            var (t2, _) = await SubmitWithHistoryCapturingTokens(ctx, turn2History, maxNewTokens: 40, "kvq-turn2", sampling);
+            sw2.Stop();
+
+            double t2Pct = t2.PromptTokenCount > 0 ? 100.0 * t2.PrefixCacheReusedTokens / t2.PromptTokenCount : 0;
+            _output.WriteLine($"[{key}] turn2: prompt={t2.PromptTokenCount} reused={t2.PrefixCacheReusedTokens} ({t2Pct:F1}%) out={t2.OutputTokenCount} wall={sw2.Elapsed.TotalMilliseconds:F0}ms");
+            _output.WriteLine($"[{key}] turn2 sample: {Truncate(t2.OutputText, 160)}");
+
+            // Output sanity: a re-prefill loop or corruption would show as long
+            // immediate repeats.
+            Assert.True(LongestImmediateRepeat(t2.OutputText ?? string.Empty) < 20,
+                $"turn2 output looks degenerate: {Truncate(t2.OutputText, 200)}");
+            // The fix: the follow-up reuses (almost) the entire conversation
+            // prefix instead of the reported 0. Pre-fix q4_0/q8_0 gave ~0% here
+            // while f16 gave ~full; post-fix all three reuse the full prefix.
+            Assert.True(t2Pct >= 70.0,
+                $"[{kvDtype.ToShortString()}] turn2 reuse {t2Pct:F1}% too low (the q4_0 reuse-0 bug). " +
+                $"reused={t2.PrefixCacheReusedTokens}/{t2.PromptTokenCount}");
         }
     }
 

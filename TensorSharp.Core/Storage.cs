@@ -29,9 +29,9 @@ namespace TensorSharp
         public DType ElementType { get; private set; }
         public long ElementCount { get; private set; }
 
-        // Block-quantized types (Q8_0) round their byte length up to the block
-        // boundary (32-element blocks of 34 bytes each). Linear types stay at
-        // ElementCount * ElementType.Size() as before.
+        // Block-quantized types round their byte length up to the block boundary
+        // (32-element blocks: Q8_0 = 34 bytes, Q4_0 = 18 bytes). Linear types stay
+        // at ElementCount * ElementType.Size() as before.
         public long ByteLength => ElementType.ByteLengthFor(ElementCount);
 
         public bool IsOwnerExclusive()

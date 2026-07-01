@@ -145,7 +145,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **混合注意力-递归网络** —— Qwen 3.5/3.6-family 在同一模型中混合全注意力层与 GatedDeltaNet 递归层；批处理路径下递归运行状态保存在每槽位的递归状态池中
 - **专家混合（MoE）** —— 支持 Gemma 4 MoE 变体（例如 gemma-4-26B-A4B）、GPT OSS MoE（例如 gpt-oss-20b）、Qwen 3.5/3.6-family MoE（`qwen35moe` / `qwen3next` 变体，例如 Qwen3.5-35B-A3B）以及 Nemotron-H MoE FFN 层
 - **批量 GPU MoE** —— Qwen 3.5/3.6-family 与 Nemotron-H 在 decode 时通过单次融合的 GGML 计算图调度处理所有被选中的专家（Qwen 3.5-family 还包括可选的 shared expert 与残差加法），消除每个专家的 CPU-GPU 往返
-- **KV 缓存编解码器** —— 通过 `IKvBlockCodec` 接口插件化；内置的 TurboQuant（Q4 / Q8）编解码器可在分页块上启用，由 `--paged-kv-quant-bits` 控制
+- **KV 缓存编解码器** —— 通过 `IKvBlockCodec` 接口插件化；内置的 TurboQuant（2-bit 仿射 / Q4 / Q8）编解码器可在分页块上启用，由 `--paged-kv-quant-bits` 控制（2-bit 档位在 fp32 块上可达约 10 倍压缩，面向超长上下文）
 - **消息编辑** —— 在 Web 聊天界面中编辑或删除历史消息，并从该位置重新生成回复
 - **文本/图像/音频/视频上传** —— Web 界面支持最大 500 MB 的文件上传，对超大文本会按 token 预算自动截断
 - **每轮可观测性** —— 结构化日志会完整保留用户输入与模型原始输出（包括 `<think>` 思维链和最终结果），并记录 KV 缓存命中率。同样的命中率指标通过所有 API 透出：Ollama 的 `prompt_cache_hit_tokens` / `prompt_cache_hit_ratio`、OpenAI 的 `usage.prompt_tokens_details.cached_tokens`，以及 Web UI SSE `done` 事件中的 `promptTokens` / `kvReusedTokens` / `kvReusePercent`
@@ -210,7 +210,7 @@ TensorSharp/
 │   ├── PagedKvCacheManager.cs   # 单会话分页 KV 管理（块分配、前缀复用）
 │   ├── PagedKvBlockStore.cs     # 带可选 SSD 溢出的 RAM/磁盘分级分页块存储
 │   ├── SsdKvBlockTier.cs        # 分页块的 SSD 冷层
-│   ├── TurboQuantKvCodec.cs     # 实现 IKvBlockCodec 的量化 KV 块编解码器（Q4 / Q8）
+│   ├── TurboQuantKvCodec.cs     # 实现 IKvBlockCodec 的量化 KV 块编解码器（2-bit / Q4 / Q8）
 │   ├── PrefillChunking.cs       # SWA / 超长 prompt 使用的分块 prefill 辅助
 │   ├── KvBlockHash.cs           # 内容寻址的块哈希，用于跨请求前缀复用
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
@@ -514,7 +514,7 @@ cd TensorSharp.Cli/bin
 | `--mmproj <path>` | 多模态投影器 GGUF 文件路径 |
 | `--max-tokens <N>` | 最大生成 token 数（默认：100） |
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal` 或 `ggml_cuda` |
-| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16` 或 `q8_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省。 |
+| `--kv-cache-dtype <type>` | KV 缓存精度：`f32`（默认）、`f16`、`q8_0` 或 `q4_0`。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径。 |
 | `--interactive` / `-i` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
@@ -691,7 +691,7 @@ cd TensorSharp.Server/bin
 | `--paged-kv-ram-mb <N>` | 旧的独立分页 KV RAM 层上限。 |
 | `--paged-kv-ssd-dir <dir>` | 旧的独立分页 KV SSD 冷层目录。 |
 | `--paged-kv-ssd-mb <N>` | 旧的独立分页 KV SSD 上限。 |
-| `--paged-kv-quant-bits <0\|4\|8>` | 旧的独立分页 KV 块量化（TurboQuantKvCodec）。 |
+| `--paged-kv-quant-bits <0\|2\|4\|8>` | 旧的独立分页 KV 块量化（TurboQuantKvCodec；`2` = 仿射 min+scale，`4`/`8` = 对称）。 |
 
 请求 JSON 中的字段（如 `temperature`、`top_p`、`top_k`、`min_p`、
 `repeat_penalty`、`presence_penalty`、`frequency_penalty`、`seed`、
@@ -733,7 +733,7 @@ cd TensorSharp.Server/bin
 | `TS_KV_CACHE_MAX_RAM_MB` | 旧的独立分页 KV RAM 层上限。 |
 | `TS_KV_CACHE_SSD_DIR` | 旧的独立分页 KV SSD 冷层目录。 |
 | `TS_KV_CACHE_MAX_SSD_MB` | 旧的独立分页 KV SSD 上限。 |
-| `TS_KV_PAGED_QUANT_BITS` | 旧的独立分页 KV 块量化位数（`0` = 透传，`4`，或 `8`）。 |
+| `TS_KV_PAGED_QUANT_BITS` | 旧的独立分页 KV 块量化位数（`0` = 透传，`2` = 仿射，`4`，或 `8`）。 |
 | `TS_SCHED_DISABLE_BATCHED` | `1` 会即使模型实现了 `IBatchedPagedModel`，也强制回退到按序列 KV 交换。CLI 快捷方式是 `--no-continuous-batching`。 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` | 调度器每步 token 预算（默认：`4096`）。 |
 | `TS_SCHED_MAX_RUNNING_SEQS` | 同时在执行的最大序列数（默认：`16`）。 |
@@ -806,7 +806,7 @@ cd TensorSharp.Server/bin
 | 连续批处理引擎（`InferenceEngine` + 调度器） | 在 `TensorSharp.Server` 中默认启用 | `TS_SCHED_DISABLE_BATCHED=1` 强制按序列回退 | `--no-continuous-batching` / `--continuous-batching` |
 | 旧的按会话分页 KV 管理器 | 已从服务端请求路径移除 | `TS_KV_PAGED_CACHE`（`0` / `1`）、`TS_KV_BLOCK_SIZE` 仅为兼容 / 独立测试保留 | `--paged-kv` / `--no-paged-kv`、`--paged-kv-block-size N` |
 | 旧的分页 KV SSD 冷层溢出 | 关闭 | `TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`、`--paged-kv-ssd-dir`、`--paged-kv-ssd-mb` |
-| 旧的分页 KV 块量化（TurboQuantKvCodec） | 关闭（`0` = 透传） | `TS_KV_PAGED_QUANT_BITS`（`0` / `4` / `8`） | `--paged-kv-quant-bits` |
+| 旧的分页 KV 块量化（TurboQuantKvCodec） | 关闭（`0` = 透传） | `TS_KV_PAGED_QUANT_BITS`（`0` / `2` / `4` / `8`） | `--paged-kv-quant-bits` |
 | 跨请求的块级哈希前缀共享 | 启用 | `TS_SCHED_PREFIX_CACHE=0` 关闭 | — |
 | 调度器调优（每步 token 预算、最大同时序列数、prefill 分块、块池大小、decode quantum） | 引擎默认 | `TS_SCHED_MAX_BATCHED_TOKENS`、`TS_SCHED_MAX_RUNNING_SEQS`、`TS_SCHED_PREFILL_CHUNK`、`TS_SCHED_NUM_BLOCKS`、`TS_SCHED_BLOCK_SIZE`、`TS_SCHED_DECODE_QUANTUM` | — |
 
@@ -1163,7 +1163,7 @@ TensorSharp 采用分层系统结构：
 - **有界池保留量**：集成 GPU / CPU 内存池现在将单个保留块上限设为 64 MB，整池上限设为 32 块。结合 mmap 后的权重，可在快速复用短生命中间张量的同时限制峰值常驻内存。
 - **高内存效率模型加载**：大张量直接流式加载到原生内存，避免中间托管分配。F32 权重与 norm 仍按需加载；量化权重在受支持的后端上通过 mmap 方式绑定。
 - **可选 SSD 溢出的分页 KV 块池**：`PagedKvBlockStore` 保留了 RAM / SSD 分层块存储能力（`TS_KV_CACHE_MAX_RAM_MB`、`TS_KV_CACHE_SSD_DIR`、`TS_KV_CACHE_MAX_SSD_MB`），主要服务独立分页 KV 组件与后续扩展；服务端请求路径的活跃块由每个引擎的 `BlockPool` 统一管理。
-- **KV 块编解码器**：`TurboQuantKvCodec`（Q4 或 Q8）可压缩分页块，以微小精度成本换取每块带宽与内存占用减半 / 减为四分之一。带递归状态的模型会自动回退到 passthrough。
+- **KV 块编解码器**：`TurboQuantKvCodec`（2-bit 仿射、Q4 或 Q8）可压缩分页块，以精度换取更小的每块带宽与内存占用——大致减半（Q8）、减为四分之一（Q4）或约十分之一（2-bit，fp32 块）。2-bit 档位使用每组仿射 min+scale（即 llama.cpp Q2_K 背后的 block-min 思路），让四个码值覆盖该组的实际取值范围；它面向超长上下文的远端前缀复用，此时注意力权重远大于量化噪声。带递归状态的模型会自动回退到 passthrough。
 
 ## 性能数据
 

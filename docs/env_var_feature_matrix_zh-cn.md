@@ -48,7 +48,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `KV_CACHE_DTYPE` | 全部 | KV cache 元素类型 | `f32` | `f32`, `f16`, `q8_0` | 是 |
+| `KV_CACHE_DTYPE` | 全部 | KV cache 元素类型 | `f32` | `f32`, `f16`, `q8_0`, `q4_0` | 是 |
 | `TS_KV_PAGED_QUANT_BITS` | 全部 | TurboQuant 分页 KV 块编解码器 | 关闭（`0`） | `0`, `4`, `8` | 是 |
 | `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限 | 模型默认值 | `4096`, `8192`, `16384` | 是 |
 

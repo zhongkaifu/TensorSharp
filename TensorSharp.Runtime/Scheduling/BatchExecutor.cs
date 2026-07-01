@@ -331,10 +331,27 @@ namespace TensorSharp.Runtime.Scheduling
                     //      committed state to paged storage
                     //      (KvStateInPagedStorage), since Forward would attend
                     //      against an empty linear cache.
-                    //   2. Restrict the fast path to models that implement
-                    //      TryMigrateLinearKVToPaged, so the upcoming N=2
-                    //      transition can copy the linear state across before
-                    //      the batched kernel reads it.
+                    //   2. Restrict the fast path to models that EITHER implement
+                    //      TryMigrateLinearKVToPaged (so the upcoming N=2
+                    //      transition can copy the linear state into paged
+                    //      storage before the batched kernel reads it) OR serve
+                    //      N>=2 through the per-sequence FUSED path
+                    //      (SupportsPerSequenceFusedForward) — those models never
+                    //      read paged storage for concurrent decode, so the N=2
+                    //      transition is handled by AdoptPrimaryCacheToFused (the
+                    //      owner's linear cache is moved into its per-request
+                    //      holder) and no linear→paged migration is needed.
+                    //      This second case is what keeps BLOCK-QUANTIZED KV
+                    //      caches (q4_0 / q8_0) on the fast path: their
+                    //      ForwardBatch throws NotSupported, so they report
+                    //      SupportsLinearKVMigration=false, but they still own a
+                    //      single linear cache exactly like the f16 fast path.
+                    //      Without this, block-quant N=1 steps fell into the
+                    //      ExecuteStepBatched attempt below, which clears
+                    //      _liveCacheValid *before* ForwardBatch throws — that
+                    //      stale-false flag then aborted same-session live-cache
+                    //      continuation ("请继续" follow-ups), so multi-turn KV
+                    //      reuse dropped to 0 for q4_0/q8_0 while f16 reused fully.
                     //
                     // Gate: SupportsKVStateSnapshot is only relevant when
                     // ExecuteStepPerSequence has to *swap* ownership (i.e.
@@ -347,7 +364,8 @@ namespace TensorSharp.Runtime.Scheduling
                     // need to A/B against the batched-only path.
                     if (IsBatchedN1FastPathEnabled()
                         && output.ScheduledWork.Count == 1
-                        && batched2.SupportsLinearKVMigration)
+                        && (batched2.SupportsLinearKVMigration
+                            || batched2.SupportsPerSequenceFusedForward))
                     {
                         var only = output.ScheduledWork[0].Sequence;
                         bool noSwapNeeded =
@@ -557,14 +575,16 @@ namespace TensorSharp.Runtime.Scheduling
 
         private List<SequenceStepResult> ExecuteStepBatched(IBatchedPagedModel batched, SchedulerOutput output)
         {
-            // The batched paged path manages K/V in paged storage (slot mapping),
-            // not the single live linear cache the continuation fast-path tracks.
-            // Drop any live-cache claim so a follow-up can't continue from stale state.
-            _liveCacheValid = false;
-            // Batched steps clobber the linear-cache world the speculative
-            // context depends on (e.g. per-slot GDN state swaps model-level
-            // references), so speculation must re-arm from a fresh prefill.
-            _mtpCtx = null;
+            // NOTE: we must NOT clear _liveCacheValid here. Some models
+            // (e.g. Gemma 4 with a block-quantized KV cache) decline the
+            // batched path by throwing NotSupportedException from ForwardBatch,
+            // and the caller falls back to ExecuteStepPerSequence. If we had
+            // already cleared the live-cache claim, that fallback's
+            // EnsureOwnership would see a stale-false flag and abort an
+            // in-flight live-cache continuation, re-prefilling the whole
+            // conversation. The claim is only genuinely invalidated once the
+            // batched kernel actually ran and moved K/V into paged storage, so
+            // we clear it AFTER ForwardBatch returns (below).
             int numSeqs = output.ScheduledWork.Count;
             var ctx = new BatchedForwardContext
             {
@@ -634,6 +654,18 @@ namespace TensorSharp.Runtime.Scheduling
             var swForward = Stopwatch.StartNew();
             IReadOnlyList<float[]> perSeqLogits = batched.ForwardBatch(ctx);
             swForward.Stop();
+
+            // The batched kernel actually ran: K/V now lives in paged storage
+            // (slot mapping), not the single live linear cache the continuation
+            // fast-path tracks, so drop any live-cache claim now that it is
+            // genuinely stale. (If ForwardBatch had thrown, we never reach here
+            // and the live-cache claim is correctly preserved for the per-seq
+            // fallback.) Batched steps also clobber the linear-cache world the
+            // speculative context depends on (per-slot GDN state swaps), so the
+            // MTP context must re-arm from a fresh prefill.
+            _liveCacheValid = false;
+            _mtpCtx = null;
+
             if (perSeqLogits == null || perSeqLogits.Count != numSeqs)
                 throw new InvalidOperationException(
                     $"ForwardBatch returned {perSeqLogits?.Count ?? -1} results for {numSeqs} sequences.");

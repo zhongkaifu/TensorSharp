@@ -50,6 +50,7 @@ public class TurboQuantKvCodecBenchmark
         Console.WriteLine($"[TurboQuant.fp32] Block: {ElementsPerBlock:N0} elements, " +
                           $"{rawBytes / 1024.0 / 1024.0:F2} MB raw");
 
+        BenchOne(KvCodecElementType.Float32, raw, 2, warmup, iters, rawBytes);
         BenchOne(KvCodecElementType.Float32, raw, 4, warmup, iters, rawBytes);
         BenchOne(KvCodecElementType.Float32, raw, 8, warmup, iters, rawBytes);
     }
@@ -67,6 +68,7 @@ public class TurboQuantKvCodecBenchmark
         Console.WriteLine($"[TurboQuant.fp16] Block: {ElementsPerBlock:N0} elements, " +
                           $"{rawBytes / 1024.0 / 1024.0:F2} MB raw");
 
+        BenchOne(KvCodecElementType.Float16, raw, 2, warmup, iters, rawBytes);
         BenchOne(KvCodecElementType.Float16, raw, 4, warmup, iters, rawBytes);
         BenchOne(KvCodecElementType.Float16, raw, 8, warmup, iters, rawBytes);
     }
@@ -91,7 +93,7 @@ public class TurboQuantKvCodecBenchmark
             float[] values = sampler(32 * 1024);
             byte[] raw = FloatsToBytes(values);
 
-            foreach (int bits in new[] { 4, 8 })
+            foreach (int bits in new[] { 2, 4, 8 })
             {
                 var codec = new TurboQuantKvCodec(KvCodecElementType.Float32, bits);
                 byte[] encoded = codec.Encode(raw);
@@ -135,6 +137,9 @@ public class TurboQuantKvCodecBenchmark
         };
 
         long passthroughBytes = MeasureCaptureBytes(pagedConfig, codec: null, model, tokens, totalTokens, out double passthroughMs);
+        long int2Bytes = MeasureCaptureBytes(pagedConfig,
+            codec: new TurboQuantKvCodec(KvCodecElementType.Float32, 2),
+            model, tokens, totalTokens, out double int2Ms);
         long int4Bytes = MeasureCaptureBytes(pagedConfig,
             codec: new TurboQuantKvCodec(KvCodecElementType.Float32, 4),
             model, tokens, totalTokens, out double int4Ms);
@@ -144,9 +149,14 @@ public class TurboQuantKvCodecBenchmark
 
         Console.WriteLine($"[TurboQuant.paged] blocks={blocksToCapture} bytesPerBlockRaw={model.ComputeKVBlockByteSize(blockTokens) / 1024.0 / 1024.0:F2} MB");
         Console.WriteLine($"  passthrough   : {passthroughBytes / 1024 / 1024:N0} MB resident, capture {passthroughMs:F1} ms");
+        Console.WriteLine($"  int2 codec    : {int2Bytes / 1024 / 1024:N0} MB resident, capture {int2Ms:F1} ms ({(double)passthroughBytes / int2Bytes:F2}x smaller)");
         Console.WriteLine($"  int4 codec    : {int4Bytes / 1024 / 1024:N0} MB resident, capture {int4Ms:F1} ms ({(double)passthroughBytes / int4Bytes:F2}x smaller)");
         Console.WriteLine($"  int8 codec    : {int8Bytes / 1024 / 1024:N0} MB resident, capture {int8Ms:F1} ms ({(double)passthroughBytes / int8Bytes:F2}x smaller)");
 
+        Assert.True(int2Bytes * 8 < passthroughBytes,
+            $"int2 codec must reduce resident bytes by >=8x (passthrough={passthroughBytes}, int2={int2Bytes})");
+        Assert.True(int2Bytes < int4Bytes,
+            $"int2 codec must be smaller than int4 (int2={int2Bytes}, int4={int4Bytes})");
         Assert.True(int4Bytes * 4 < passthroughBytes,
             $"int4 codec must reduce resident bytes by >=4x (passthrough={passthroughBytes}, int4={int4Bytes})");
         Assert.True(int8Bytes * 2 < passthroughBytes,

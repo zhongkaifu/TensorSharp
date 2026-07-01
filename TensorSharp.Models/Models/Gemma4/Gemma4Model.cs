@@ -156,6 +156,15 @@ namespace TensorSharp.Models
         private static readonly bool s_MoeModelDecodeEnabled =
             Environment.GetEnvironmentVariable("TS_GEMMA4_MOE_MODEL_DECODE") != "0";
 
+        // Escape hatch: route block-quantized (Q8_0 / Q4_0) dense prefill through the
+        // fused whole-model verify kernel (the only path that supports a block-
+        // quantized cache; the per-op fallback throws). Set
+        // TS_G4_FUSED_PREFILL_DISABLE_BLOCKQUANT=1 to restore the historical gate
+        // that disabled fused prefill for block-quantized caches (which left them
+        // with no working multi-token prefill route at all).
+        private static readonly bool TS_G4_FUSED_PREFILL_DISABLE_BLOCKQUANT =
+            Environment.GetEnvironmentVariable("TS_G4_FUSED_PREFILL_DISABLE_BLOCKQUANT") == "1";
+
         // Flash attention for the global-layer chunk-2+ (linear-cache) prefill path
         // on GGML backends, replacing the materialized [numHeads, seqLen, kvLen]
         // score-matrix path. TS_GEMMA4_FLASH_GLOBAL=0 forces the legacy materialized
@@ -2702,6 +2711,16 @@ namespace TensorSharp.Models
         private static readonly bool s_wholeModelMMPrefillEnabled =
             Environment.GetEnvironmentVariable("TS_G4_MM_PREFILL") != "0";
 
+        // Allow the whole-model verify kernel to serve SWA-wrapped chunks at
+        // start_pos>0 via its in-kernel swaPrev gather (the previous window is read
+        // from the rolling cache before this chunk overwrites it, then prepended to
+        // the fresh chunk). This keeps long / multi-turn prefill on the fast 1-graph
+        // on-device path instead of the per-op chunked tail, and reads block-quant
+        // (q4_0/q8_0) caches natively via flash_attn_ext. Default on; set
+        // TS_G4_VERIFY_SWAPREV=0 to force the per-op path for the wrapped tail.
+        private static readonly bool s_verifySwaPrevEnabled =
+            Environment.GetEnvironmentVariable("TS_G4_VERIFY_SWAPREV") != "0";
+
         /// <summary>
         /// Whether a dense Gemma 4 prefill chunk can run through the fused
         /// whole-model multi-token kernel (<see cref="NativeGemma4ModelVerify"/>)
@@ -2731,25 +2750,36 @@ namespace TensorSharp.Models
             // Later-turn multimodal chunks (startPos>0) keep the per-op path.
             if (exceptPositions != null && (!s_wholeModelMMPrefillEnabled || startPos != 0)) return false;
             if (_decodeArrays == null || !_canUseFusedFullModelDecode) return false; // dense only (no MoE)
-            if (_kvCacheDtype.IsBlockQuantized()) return false;
+            // Block-quantized (Q8_0 / Q4_0) caches REQUIRE this fused verify path:
+            // the per-op TransformerBlock fallback walks the cache as a flat F32/F16
+            // buffer and throws on block-quantized layouts. The verify kernel writes
+            // and reads K/V exclusively through ggml ops (ggml_cpy into the typed
+            // cache + flash_attn_ext), which handle Q8_0/Q4_0 natively, so it is the
+            // path that makes a block-quantized KV cache usable for multi-token
+            // prefill (decode already uses the fused seqLen==1 kernel). Previously
+            // gated off here, which left block-quantized prefill with no working
+            // route and surfaced as the "requires fused native kernels" throw.
+            if (TS_G4_FUSED_PREFILL_DISABLE_BLOCKQUANT && _kvCacheDtype.IsBlockQuantized()) return false;
 
             long totalSeqLen = (long)startPos + seqLen;
-            // The kernel's fresh-K/V SWA path attends over the whole chunk's fresh
-            // K/V (a sliding-window mask, correct for any N) at start_pos==0 — for
-            // both non-shared layers (their own K/V) and shared (KV-donor) SWA
-            // layers (the donor's retained fresh K/V). The start_pos==0 restriction
-            // holds because only then is the fresh chunk the entire history; chunked
-            // / multi-turn prefill past the window falls back to the per-op path.
-            bool swaFreshOk = startPos == 0;
+            // The kernel's SWA paths attend the whole chunk's K/V with a sliding-window
+            // mask, correct for any N: at start_pos==0 over the FRESH chunk (swaFresh);
+            // at start_pos>0 over [prev window ++ fresh chunk] where the prev window is
+            // gathered in-kernel from the rolling cache before this chunk overwrites it
+            // (swaPrev). Both cover non-shared (own K/V) and shared (KV-donor) SWA
+            // layers. swaPrev requires the kill-switch on; without it, start_pos>0
+            // SWA-wrapped chunks fall back to the per-op path.
+            bool swaWrapOk = startPos == 0 || s_verifySwaPrevEnabled;
             var a = _decodeArrays;
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (totalSeqLen <= a.CacheSize[l]) continue;       // no wrap / fits
                 bool isLocal = a.IsLocal[l] != 0;
-                if (!isLocal || !swaFreshOk) return false;         // would overflow global / wrap SWA past chunk
-                // Shared SWA layer: the kernel attends the donor's fresh full K/V,
-                // which only exists when the donor is a non-shared layer (computes
-                // its own K/V). A donor that is itself shared is unsupported here.
+                if (!isLocal || !swaWrapOk) return false;          // global overflow, or SWA wrap with swaPrev disabled
+                // Shared SWA layer: the kernel attends the donor's fresh full K/V (and,
+                // at start_pos>0, the donor's retained prev window), which only exist
+                // when the donor is a non-shared layer (computes its own K/V). A donor
+                // that is itself shared is unsupported here.
                 int src = a.KvSource[l];
                 if (src != l && a.KvSource[src] != src) return false;
             }
@@ -3612,18 +3642,26 @@ namespace TensorSharp.Models
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
             bool isShared, Tensor perLayerInput, HashSet<int> exceptPositions = null)
         {
-            // The C# managed prefill / decode path reads and writes the cache as a
-            // flat F32 (or F16) buffer. Block-quantized layouts (Q8_0) cannot be
-            // walked with raw pointer arithmetic, so we surface a clear error
-            // here rather than letting downstream pointer math silently corrupt
-            // the cache. Users should pick --kv-cache-dtype f16 for multimodal
-            // prompts or any setup that disables the native fused kernels.
-            if (_kvCacheDtype.IsBlockQuantized())
+            // Block-quantized (Q4_0 / Q8_0) caches cannot be walked as a flat F32/F16
+            // buffer. Multi-token text prefill (seqLen > 1, no multimodal spans) is
+            // supported: the cache is read by dequantizing into F32 (ExpandKVHeads /
+            // BuildSwaPrevWindow) and written by quantizing fresh K/V back into the
+            // block layout (CopyToCache[Circular]), so chunked long-prompt prefill
+            // works for block-quant exactly as it does for F16. The remaining managed
+            // entry points still lack that handling, so surface a clear error rather
+            // than corrupting the cache:
+            //   * seqLen == 1  : the non-fused per-op decode fallback (the fused
+            //                    full-model decode normally serves block-quant decode).
+            //   * exceptPositions != null : multimodal soft-token injection, whose
+            //                    bidirectional-span attention path reads the cache
+            //                    through code that has no block-quant branch.
+            // Both are reachable only when the native fused kernels are unavailable;
+            // pick --kv-cache-dtype f16 for those configurations.
+            if (_kvCacheDtype.IsBlockQuantized() && (seqLen == 1 || exceptPositions != null))
                 throw new InvalidOperationException(
-                    $"Q8_0 KV cache requires the fused native attention kernels. " +
-                    $"This call path (multimodal injection / fused-prefill bailout / non-fused decode) " +
-                    $"falls back to the C# managed attention helpers which only support F32/F16. " +
-                    $"Use --kv-cache-dtype f16 for this configuration.");
+                    $"{_kvCacheDtype.ToShortString()} KV cache requires the fused native attention kernels for this " +
+                    $"call path (multimodal injection / non-fused decode), which falls back to the C# managed " +
+                    $"attention helpers that only support F32/F16. Use --kv-cache-dtype f16 for this configuration.");
 
             string prefix = $"blk.{layer}";
 
@@ -6404,6 +6442,56 @@ namespace TensorSharp.Models
                 return result;
             }
 
+            // Block-quantized cache (Q4_0 / Q8_0 via --kv-cache-dtype). The native
+            // fused-layer prefill kernel (TSGgml_Gemma4LayerPrefill) reads/writes the
+            // typed circular cache through ggml ops, but the SWA prev-window it
+            // attends to is handed in as a contiguous F32 buffer. So we dequantize
+            // the live window out of the block-quantized cache here rather than
+            // memcpy raw bytes. Each (head, slot) row is headDim elements = a whole
+            // number of quant blocks (headDim % 32 == 0 for Gemma), so a contiguous
+            // run of slots dequantizes in one pass. Same wrap handling as F32/F16.
+            if (cache.ElementType == DType.Q4_0 || cache.ElementType == DType.Q8_0)
+            {
+                cache.Storage.EnsureHostReadable();
+                int ggmlType = _kvCacheDtype.GgmlType();
+                long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
+                long cacheBaseAddr = (long)TensorComputePrimitives.GetStoragePointer(cache);
+                long dstBaseAddr = (long)GetFloatPtr(result);
+                int firstSlotQ = firstSlot;
+                int prevWindowLenQ = prevWindowLen;
+                int cacheSizeQ = cacheSize;
+                int headDimQ = headDim;
+                int ggmlTypeQ = ggmlType;
+                long rowBytesQ = rowBytes;
+                void DequantOneHead(int h)
+                {
+                    byte* cacheHead = (byte*)cacheBaseAddr + (long)h * cacheSizeQ * rowBytesQ;
+                    float* dstHead = (float*)dstBaseAddr + (long)h * prevWindowLenQ * headDimQ;
+                    if (firstSlotQ + prevWindowLenQ <= cacheSizeQ)
+                    {
+                        ManagedQuantizedOps.DequantizeRowToFloat32(ggmlTypeQ,
+                            (IntPtr)(cacheHead + (long)firstSlotQ * rowBytesQ),
+                            dstHead, (long)prevWindowLenQ * headDimQ);
+                    }
+                    else
+                    {
+                        int tailLen = cacheSizeQ - firstSlotQ;
+                        ManagedQuantizedOps.DequantizeRowToFloat32(ggmlTypeQ,
+                            (IntPtr)(cacheHead + (long)firstSlotQ * rowBytesQ),
+                            dstHead, (long)tailLen * headDimQ);
+                        int headLen = prevWindowLenQ - tailLen;
+                        ManagedQuantizedOps.DequantizeRowToFloat32(ggmlTypeQ,
+                            (IntPtr)cacheHead,
+                            dstHead + (long)tailLen * headDimQ, (long)headLen * headDimQ);
+                    }
+                }
+                if (kvHeads >= 4)
+                    System.Threading.Tasks.Parallel.For(0, kvHeads, DequantOneHead);
+                else
+                    for (int h = 0; h < kvHeads; h++) DequantOneHead(h);
+                return result;
+            }
+
             float* cachePtr = GetFloatPtr(cache);
             float* dstPtr = GetFloatPtr(result);
             long headBytes = (long)headDim * sizeof(float);
@@ -6566,6 +6654,40 @@ namespace TensorSharp.Models
                         }
                     }
                 }
+                InvalidateTensorDeviceCache(cache);
+                return;
+            }
+
+            // Block-quantized circular cache (Q4_0 / Q8_0 via --kv-cache-dtype): quantize
+            // each fresh (head, position) row into its rolling slot. Mirrors the F16 path
+            // but writes block layout; ggml's native decode kernels dequantize it back.
+            if (cache.ElementType == DType.Q4_0 || cache.ElementType == DType.Q8_0)
+            {
+                cache.Storage.EnsureHostReadable();
+                int ggmlTypeQ = GgmlTypeForCacheDType(cache.ElementType);
+                long rowBytesQ = ManagedQuantizedOps.RowSize(ggmlTypeQ, headDim);
+                long srcAddrQ = (long)GetFloatPtr(src);
+                long dstAddrQ = (long)TensorComputePrimitives.GetStoragePointer(cache);
+                int totalWorkQ = seqLen * numHeads;
+                int seqLenQ = seqLen, cacheSizeQ = cacheSize, headDimQ = headDim;
+                int startPosQ = startPos, numHeadsQ = numHeads, ggmlTypeQL = ggmlTypeQ;
+                long rowBytesQL = rowBytesQ;
+                void QuantizeOneRow(int idx)
+                {
+                    int s = idx / numHeadsQ;
+                    int h = idx % numHeadsQ;
+                    int cacheIdx = (startPosQ + s) % cacheSizeQ;
+                    float* srcRow = (float*)srcAddrQ + (long)h * seqLenQ * headDimQ + (long)s * headDimQ;
+                    byte* dstRow = (byte*)dstAddrQ + (long)h * cacheSizeQ * rowBytesQL + (long)cacheIdx * rowBytesQL;
+                    ManagedQuantizedOps.QuantizeRowFromFloat32(ggmlTypeQL, srcRow, (IntPtr)dstRow, headDimQ);
+                }
+                // Parallelize only when the chunk does not wrap the rolling window;
+                // a wrapping chunk (seqLen > cacheSize) aliases slots, so keep the
+                // writes ordered (last-writer-wins, matching the scalar F16 path).
+                if (totalWorkQ >= 64 && seqLen <= cacheSize)
+                    System.Threading.Tasks.Parallel.For(0, totalWorkQ, QuantizeOneRow);
+                else
+                    for (int idx = 0; idx < totalWorkQ; idx++) QuantizeOneRow(idx);
                 InvalidateTensorDeviceCache(cache);
                 return;
             }

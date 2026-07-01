@@ -51,6 +51,13 @@ bool mtpSpecFlagsApplied = ServerOptionsBuilder.ApplyMtpSpeculativeCliFlags(args
 // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the VAE, Qwen2.5-VL
 // text-encoder, and mmproj GGUFs. Must run before the startup model is loaded.
 bool qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
+// Translate --kv-cache-dtype into the process-wide KvCacheDtypeConfig (or honor
+// the KV_CACHE_DTYPE env var) so block-quantized / half-precision KV caches are
+// selectable on the server, mirroring the CLI. The fused native decode path used
+// by the scheduler is the one that supports block-quantized (q8_0 / q4_0) caches.
+// Must run before the startup model is loaded so InitKVCache sees the choice.
+TensorSharp.Models.KvCacheDtypeConfig.ConfigureFromEnvironment();
+bool kvCacheDtypeFlagApplied = ServerOptionsBuilder.ApplyKvCacheDtypeCliFlag(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);

@@ -157,6 +157,45 @@ namespace TensorSharp.Models
             DequantizeToFloat32(type, (byte*)src.ToPointer(), dst, numElements);
         }
 
+        /// <summary>
+        /// Quantize a contiguous run of <paramref name="numElements"/> F32 values into a
+        /// block-quantized buffer (Q4_0 or Q8_0), matching ggml's reference block layout
+        /// (fp16 block scale + packed quants). Used by the managed KV-cache write path so
+        /// that block-quantized caches (<c>--kv-cache-dtype q4_0/q8_0</c>) can be appended
+        /// to from the per-op prefill path; the bytes it produces are dequantized
+        /// identically by ggml's native kernels on the subsequent fused decode read.
+        /// <paramref name="numElements"/> must be a multiple of the 32-element block size.
+        /// </summary>
+        public static unsafe void QuantizeRowFromFloat32(int ggmlType, float* src, IntPtr dst, long numElements)
+        {
+            var type = (GgmlTensorType)ggmlType;
+            byte* d = (byte*)dst.ToPointer();
+            switch (type)
+            {
+                case GgmlTensorType.Q4_0:
+                    if (numElements % QK4_0 != 0)
+                        throw new NotSupportedException($"Q4_0 requires {QK4_0}-element alignment, got {numElements}.");
+                    QuantizeF32ToQ4_0(src, d, (int)numElements);
+                    break;
+                case GgmlTensorType.Q8_0:
+                    if (numElements % QK8_0 != 0)
+                        throw new NotSupportedException($"Q8_0 requires {QK8_0}-element alignment, got {numElements}.");
+                    QuantizeF32ToQ8_0(src, d, (int)numElements);
+                    break;
+                default:
+                    throw new NotSupportedException($"QuantizeRowFromFloat32 does not support GGUF tensor type {type}.");
+            }
+        }
+
+        public static unsafe void QuantizeRowFromFloat32(int ggmlType, float[] src, int srcOffset, byte[] dst, int dstOffset, long numElements)
+        {
+            fixed (float* s = src)
+            fixed (byte* d = dst)
+            {
+                QuantizeRowFromFloat32(ggmlType, s + srcOffset, (IntPtr)(d + dstOffset), numElements);
+            }
+        }
+
         public static unsafe void DotRowBatchToFloat32(int ggmlType, byte[] src, int srcOffset,
             float[] inputs, int inputOffset, int inputRowStride, int rowCount, long numElements,
             float[] outputs, int outputOffset)
@@ -863,6 +902,48 @@ namespace TensorSharp.Models
                 float invScale = 1.0f / scale;
                 for (int i = 0; i < QK8_0; i++)
                     qs[i] = ClampToInt8(MathF.Round(blockSrc[i] * invScale));
+            }
+        }
+
+        // Mirror of ggml's quantize_row_q4_0_ref: per 32-element block, d = max/-8
+        // (max = the element with the largest magnitude, sign included), stored as
+        // fp16, then 4-bit quants qi = MIN(15, (int)(x/d + 8.5)). Low nibble holds
+        // element j, high nibble holds element j+16 (matches DequantizeQ40 above).
+        private static unsafe void QuantizeF32ToQ4_0(float* src, byte* dst, int elementCount)
+        {
+            int blockCount = elementCount / QK4_0;
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockSrc = src + block * QK4_0;
+                byte* blockDst = dst + block * Q4_0BlockBytes;
+
+                float amax = 0.0f, max = 0.0f;
+                for (int j = 0; j < QK4_0; j++)
+                {
+                    float v = blockSrc[j];
+                    float av = MathF.Abs(v);
+                    if (av > amax) { amax = av; max = v; }
+                }
+
+                float d = max / -8.0f;
+                WriteHalf(blockDst, d);
+
+                byte* qs = blockDst + 2;
+                if (d == 0.0f)
+                {
+                    Unsafe.InitBlockUnaligned(qs, 0, QK4_0 / 2);
+                    continue;
+                }
+
+                float id = 1.0f / d;
+                for (int j = 0; j < QK4_0 / 2; j++)
+                {
+                    float x0 = blockSrc[j] * id;
+                    float x1 = blockSrc[j + QK4_0 / 2] * id;
+                    int xi0 = Math.Min(15, (int)(x0 + 8.5f));
+                    int xi1 = Math.Min(15, (int)(x1 + 8.5f));
+                    qs[j] = (byte)(xi0 | (xi1 << 4));
+                }
             }
         }
 

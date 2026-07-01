@@ -392,14 +392,20 @@ namespace TensorSharp.Models
         /// <summary>
         /// Map the model's KV-cache storage dtype to the codec element type
         /// the paged tier's optional TurboQuant codec uses to interpret the
-        /// raw block bytes. Q8_0 caches bypass the codec entirely (the bytes
-        /// are already 8-bit quantized with their own per-block scale).
+        /// raw block bytes. Block-quantized caches (Q8_0, Q4_0) bypass the codec
+        /// entirely (the bytes are already quantized with their own per-block
+        /// scale, so re-quantizing would compound error for no real shrink).
+        /// Q4_0 maps onto the same passthrough handling as Q8_0 - the codec's
+        /// passthrough branch and <c>FromEnvironment</c> skip are keyed on the
+        /// Q8_0 element type, which means "already block-quantized; leave the
+        /// bytes untouched" regardless of the underlying 4- vs 8-bit width.
         /// </summary>
         public virtual KvCodecElementType KVStateElementType => _kvCacheDtype switch
         {
             KvCacheDtype.F32 => KvCodecElementType.Float32,
             KvCacheDtype.F16 => KvCodecElementType.Float16,
             KvCacheDtype.Q8_0 => KvCodecElementType.Q8_0,
+            KvCacheDtype.Q4_0 => KvCodecElementType.Q8_0,
             _ => KvCodecElementType.Float32,
         };
 
@@ -2222,9 +2228,48 @@ namespace TensorSharp.Models
                 CopyToCacheF16(cache, src, startPos, seqLen);
                 return;
             }
+            if (IsBlockQuantCacheDType(cache.ElementType))
+            {
+                CopyToCacheBlockQuant(cache, src, startPos, seqLen);
+                return;
+            }
 
             using var cacheSlice = cache.Narrow(1, startPos, seqLen);
             Ops.Copy(cacheSlice, src);
+            InvalidateTensorDeviceCache(cache);
+        }
+
+        /// <summary>
+        /// Append <paramref name="seqLen"/> rows of an F32 (numKVHeads, seqLen, headDim)
+        /// tensor to a block-quantized (Q4_0 / Q8_0) linear cache starting at
+        /// <paramref name="startPos"/>, quantizing each appended position into the cache's
+        /// block layout. The bytes written are dequantized identically by ggml's native
+        /// kernels on the subsequent fused-decode read. Block-quant analogue of
+        /// CopyToCacheF16.
+        /// </summary>
+        private unsafe void CopyToCacheBlockQuant(Tensor cache, Tensor src, int startPos, int seqLen)
+        {
+            int numKVHeads = (int)cache.Sizes[0];
+            int maxSeqLen = (int)cache.Sizes[1];
+            int headDim = (int)cache.Sizes[2];
+            int ggmlType = GgmlTypeForCacheDType(cache.ElementType);
+            long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
+
+            cache.Storage.EnsureHostReadable();
+            byte* dstBase = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
+            float* srcBase = GetFloatPtr(src);
+
+            // Linear (global) cache: positions [startPos, startPos+seqLen) are appended
+            // contiguously, so each head's seqLen rows form one contiguous block-aligned
+            // run that quantizes in a single pass.
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                byte* dstHead = dstBase + (long)h * maxSeqLen * rowBytes + (long)startPos * rowBytes;
+                float* srcHead = srcBase + (long)h * seqLen * headDim;
+                ManagedQuantizedOps.QuantizeRowFromFloat32(ggmlType, srcHead, (IntPtr)dstHead,
+                    (long)seqLen * headDim);
+            }
+
             InvalidateTensorDeviceCache(cache);
         }
 
@@ -2263,11 +2308,62 @@ namespace TensorSharp.Models
         {
             if (cache.ElementType == DType.Float16)
                 return ExpandKVHeadsF16(cache, groupSize, totalSeqLen);
+            if (IsBlockQuantCacheDType(cache.ElementType))
+                return ExpandKVHeadsBlockQuant(cache, groupSize, totalSeqLen);
 
             using var active = cache.Narrow(1, 0, totalSeqLen);
             if (groupSize == 1)
                 return Ops.NewContiguous(active);
             return Ops.RepeatInterleave(null, active, groupSize, 0);
+        }
+
+        // Block-quantized (Q4_0 / Q8_0) caches cannot be walked as a flat float
+        // buffer, so the per-op prefill attention reads them by dequantizing the
+        // active [0, totalSeqLen) window into a fresh F32 tensor (GQA-broadcast
+        // along the head axis when group_size > 1) — the block-quant analogue of
+        // ExpandKVHeadsF16. mul_mat then accumulates in F32, identical to having
+        // dequantized in the native kernel.
+        private static bool IsBlockQuantCacheDType(DType dt) =>
+            dt == DType.Q4_0 || dt == DType.Q8_0;
+
+        // ggml type id for a block-quantized KV-cache dtype (must match ggml.h /
+        // KvCacheDtypeExtensions.GgmlType): Q4_0 -> 2, Q8_0 -> 8.
+        protected static int GgmlTypeForCacheDType(DType dt) => dt switch
+        {
+            DType.Q4_0 => 2,
+            DType.Q8_0 => 8,
+            _ => throw new NotSupportedException($"Not a block-quantized KV-cache dtype: {dt}"),
+        };
+
+        private unsafe Tensor ExpandKVHeadsBlockQuant(Tensor cache, int groupSize, int totalSeqLen)
+        {
+            int numKVHeads = (int)cache.Sizes[0];
+            int maxSeqLen = (int)cache.Sizes[1];
+            int headDim = (int)cache.Sizes[2];
+            int outHeads = numKVHeads * groupSize;
+            int ggmlType = GgmlTypeForCacheDType(cache.ElementType);
+            long rowBytes = ManagedQuantizedOps.RowSize(ggmlType, headDim);
+
+            cache.Storage.EnsureHostReadable();
+            var f32 = new Tensor(_allocator, DType.Float32, outHeads, totalSeqLen, headDim);
+            float* dstBase = GetFloatPtr(f32);
+            byte* srcBase = (byte*)TensorComputePrimitives.GetStoragePointer(cache);
+
+            for (int h = 0; h < numKVHeads; h++)
+            {
+                // Active window is the first totalSeqLen slots of this head, which are
+                // contiguous (each slot = headDim elements = a whole number of blocks).
+                byte* srcHead = srcBase + (long)h * maxSeqLen * rowBytes;
+                for (int g = 0; g < groupSize; g++)
+                {
+                    float* dstHead = dstBase + (long)(h * groupSize + g) * totalSeqLen * headDim;
+                    ManagedQuantizedOps.DequantizeRowToFloat32(ggmlType, (IntPtr)srcHead,
+                        dstHead, (long)totalSeqLen * headDim);
+                }
+            }
+
+            InvalidateTensorDeviceCache(f32);
+            return f32;
         }
 
         private unsafe Tensor ExpandKVHeadsF16(Tensor cache, int groupSize, int totalSeqLen)

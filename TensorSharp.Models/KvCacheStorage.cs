@@ -36,12 +36,25 @@ namespace TensorSharp.Models
     /// kernels - models that fall back to the C# managed attention helpers
     /// (which expect to walk the cache as a flat F32/F16 buffer) will reject
     /// Q8_0 at <c>InitKVCache</c> time.
+    ///
+    /// <c>Q4_0</c> is the most aggressive tier: 32-element blocks of one int4
+    /// quant per element plus a single F16 scale, for ~0.5625 bytes/elem - half
+    /// of Q8_0 and roughly 1/7 of F32 (e.g. Gemma 4 E4B drops from ~4136 MB at
+    /// F32 to ~582 MB at the full 131K context). This is the right tier for very
+    /// long contexts (128K-256K) where the KV cache dominates memory. It shares
+    /// Q8_0's constraint - block-quantized, so only valid on the native flash
+    /// path; the model-level <c>IsBlockQuantized</c> guards route it exactly like
+    /// Q8_0. ggml's CUDA <c>cpy</c> (F32->Q4_0 cache write) and
+    /// <c>flash_attn_ext</c> (K=Q4_0/V=Q4_0) both support it directly. Quality is
+    /// lower than Q8_0 - 4-bit K/V noise is visible on tasks needing precise
+    /// long-range recall - so it is opt-in via <c>--kv-cache-dtype q4_0</c>.
     /// </summary>
     public enum KvCacheDtype
     {
         F32 = 0,
         F16 = 1,
         Q8_0 = 2,
+        Q4_0 = 3,
     }
 
     public static class KvCacheDtypeExtensions
@@ -50,6 +63,7 @@ namespace TensorSharp.Models
         // ExternalProjects/ggml/include/ggml.h.
         private const int GGML_TYPE_F32  = 0;
         private const int GGML_TYPE_F16  = 1;
+        private const int GGML_TYPE_Q4_0 = 2;
         private const int GGML_TYPE_Q8_0 = 8;
 
         public static int ElementBytes(this KvCacheDtype dtype) => dtype switch
@@ -57,20 +71,24 @@ namespace TensorSharp.Models
             KvCacheDtype.F32 => 4,
             KvCacheDtype.F16 => 2,
             // Lower-bound for budget logging; actual storage rounds up to the
-            // 32-element block boundary (34 bytes per block).
+            // 32-element block boundary (34 bytes per block for Q8_0,
+            // 18 bytes per block for Q4_0).
             KvCacheDtype.Q8_0 => 1,
+            KvCacheDtype.Q4_0 => 1,
             _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
         };
 
         /// <summary>
-        /// Bytes consumed by a contiguous Q8_0 cache of the given length (32-element
-        /// blocks of 34 bytes each). For F32/F16 this is just elementCount*Size.
+        /// Bytes consumed by a contiguous block-quantized cache of the given length
+        /// (Q8_0: 32-element blocks of 34 bytes; Q4_0: 32-element blocks of 18
+        /// bytes). For F32/F16 this is just elementCount*Size.
         /// </summary>
         public static long ByteLengthFor(this KvCacheDtype dtype, long elementCount) => dtype switch
         {
             KvCacheDtype.F32 => elementCount * 4,
             KvCacheDtype.F16 => elementCount * 2,
             KvCacheDtype.Q8_0 => DTypeExtensions.Q8_0Bytes(elementCount),
+            KvCacheDtype.Q4_0 => DTypeExtensions.Q4_0Bytes(elementCount),
             _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
         };
 
@@ -79,6 +97,7 @@ namespace TensorSharp.Models
             KvCacheDtype.F32 => DType.Float32,
             KvCacheDtype.F16 => DType.Float16,
             KvCacheDtype.Q8_0 => DType.Q8_0,
+            KvCacheDtype.Q4_0 => DType.Q4_0,
             _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
         };
 
@@ -87,6 +106,7 @@ namespace TensorSharp.Models
             KvCacheDtype.F32 => "f32",
             KvCacheDtype.F16 => "f16",
             KvCacheDtype.Q8_0 => "q8_0",
+            KvCacheDtype.Q4_0 => "q4_0",
             _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
         };
 
@@ -95,6 +115,7 @@ namespace TensorSharp.Models
             KvCacheDtype.F32 => GGML_TYPE_F32,
             KvCacheDtype.F16 => GGML_TYPE_F16,
             KvCacheDtype.Q8_0 => GGML_TYPE_Q8_0,
+            KvCacheDtype.Q4_0 => GGML_TYPE_Q4_0,
             _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
         };
 
@@ -107,6 +128,7 @@ namespace TensorSharp.Models
         public static bool IsBlockQuantized(this KvCacheDtype dtype) => dtype switch
         {
             KvCacheDtype.Q8_0 => true,
+            KvCacheDtype.Q4_0 => true,
             _ => false,
         };
     }
@@ -172,6 +194,11 @@ namespace TensorSharp.Models
                 case "q8":
                 case "int8":
                     dtype = KvCacheDtype.Q8_0;
+                    return true;
+                case "q4_0":
+                case "q4":
+                case "int4":
+                    dtype = KvCacheDtype.Q4_0;
                     return true;
                 default:
                     return false;

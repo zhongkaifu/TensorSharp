@@ -14,20 +14,35 @@ using System.Runtime.CompilerServices;
 namespace TensorSharp.Runtime
 {
     /// <summary>
-    /// Group-wise int4 / int8 quantization codec for the paged KV tier, inspired
-    /// by the TurboQuant-KV scheme used in upstream oMLX. Splits the captured
-    /// payload into fixed-size groups (32 elements), records a single fp16 scale
-    /// per group, and stores each element as a signed N-bit integer. The
-    /// reconstruction is <c>x ≈ q * scale</c> where <c>q ∈ [-2^(N-1), 2^(N-1)-1]</c>.
+    /// Group-wise int2 / int4 / int8 quantization codec for the paged KV tier,
+    /// inspired by the TurboQuant-KV scheme used in upstream oMLX. Splits the
+    /// captured payload into fixed-size groups (32 elements) and stores each
+    /// element as a low-bit integer with a per-group scale.
     ///
-    /// Why this is safe for paged-tier blocks: the live (in-model) KV cache stays
-    /// in its native dtype (F32 / F16 / Q8_0). The codec only kicks in when a
-    /// block has already been evicted from the model and copied into the paged
-    /// store; the small per-group quantization error therefore only affects the
-    /// reuse path - a fresh prefill produces bit-identical output - and prefix
-    /// blocks attended at large distances see attention weights orders of
-    /// magnitude smaller than the leading tokens, so int4 noise at -8..7 levels
-    /// is overwhelmed by the softmax.
+    /// Two quantization schemes are used, selected by bit width:
+    ///   * <b>int4 / int8 — symmetric.</b> A single fp16 scale per group;
+    ///     reconstruction is <c>x ≈ q * scale</c> with
+    ///     <c>q ∈ [-2^(N-1), 2^(N-1)-1]</c>. At 4/8 bits the symmetric range is
+    ///     accurate, and keeping this layout byte-stable means blocks already
+    ///     written to the SSD tier stay decodable.
+    ///   * <b>int2 — affine (min + scale).</b> With only four codes
+    ///     <c>q ∈ {0,1,2,3}</c> a symmetric mapping wastes one level and leaves
+    ///     ~50% worst-case error, so the 2-bit path stores a per-group fp16
+    ///     <c>min</c> alongside the fp16 <c>scale = (max - min) / 3</c> and
+    ///     reconstructs <c>x ≈ min + q * scale</c>. Spreading the four codes
+    ///     across the group's actual range roughly halves the error versus a
+    ///     symmetric 2-bit mapping — the same trick llama.cpp's Q2_K / Q4_1
+    ///     block formats use (block min + scale) for their lowest-bit tiers.
+    ///
+    /// Why aggressive quantization is safe for paged-tier blocks: the live
+    /// (in-model) KV cache stays in its native dtype (F32 / F16 / Q8_0). The
+    /// codec only kicks in when a block has already been evicted from the model
+    /// and copied into the paged store; the small per-group quantization error
+    /// therefore only affects the reuse path - a fresh prefill produces
+    /// bit-identical output - and prefix blocks attended at large distances see
+    /// attention weights orders of magnitude smaller than the leading tokens, so
+    /// even int2 noise is overwhelmed by the softmax on the far prefix that the
+    /// paged tier is built to recycle.
     ///
     /// Q8_0 payloads are passed through untouched: re-quantizing already-quantized
     /// bytes would compound error without shrinking the block much, and the
@@ -48,20 +63,28 @@ namespace TensorSharp.Runtime
         private readonly int _bits;
         private readonly int _qMin;
         private readonly int _qMax;
+        // 2-bit uses an affine (min + scale) layout; 4/8-bit use the symmetric
+        // (scale only) layout. Cached here so the hot path branches on a bool
+        // instead of re-deriving from the bit count.
+        private readonly bool _affine;
 
         /// <summary>
         /// Construct a codec that interprets raw payload bytes as elements of
         /// <paramref name="elementType"/> and quantizes them to
-        /// <paramref name="bits"/> bits per element (must be 4 or 8). For
-        /// <see cref="KvCodecElementType.Q8_0"/> the bit count is ignored and
-        /// every encode is a passthrough.
+        /// <paramref name="bits"/> bits per element (must be 2, 4, or 8). 2-bit
+        /// uses an affine min+scale layout; 4/8-bit use a symmetric scale-only
+        /// layout. For <see cref="KvCodecElementType.Q8_0"/> the bit count is
+        /// ignored and every encode is a passthrough.
         /// </summary>
         public TurboQuantKvCodec(KvCodecElementType elementType, int bits)
         {
-            if (bits != 4 && bits != 8)
-                throw new ArgumentOutOfRangeException(nameof(bits), "TurboQuant supports 4 or 8 bits per element.");
+            if (bits != 2 && bits != 4 && bits != 8)
+                throw new ArgumentOutOfRangeException(nameof(bits), "TurboQuant supports 2, 4, or 8 bits per element.");
             _elementType = elementType;
             _bits = bits;
+            _affine = bits == 2;
+            // Symmetric range (used by the 4/8-bit path). The affine 2-bit path
+            // maps to the unsigned code range [0, 3] instead and ignores these.
             _qMax = (1 << (bits - 1)) - 1;
             _qMin = -(1 << (bits - 1));
         }
@@ -97,7 +120,7 @@ namespace TensorSharp.Runtime
             }
 
             long groupCount = elementCount / GroupSize;
-            int perGroupBytes = 2 + (GroupSize * _bits / 8);
+            int perGroupBytes = PerGroupBytes(_bits);
             long encodedBytes = HeaderBytes + groupCount * perGroupBytes;
             if (encodedBytes > int.MaxValue)
                 return PackPassthrough(rawBlock);
@@ -112,6 +135,46 @@ namespace TensorSharp.Runtime
             {
                 long elemStart = g * GroupSize;
                 LoadGroup(rawBlock, elemStart, scratch);
+
+                if (_affine)
+                {
+                    // 2-bit affine: spread codes {0,1,2,3} across [min, max].
+                    float min = scratch[0], max = scratch[0];
+                    for (int i = 1; i < GroupSize; i++)
+                    {
+                        float v = scratch[i];
+                        if (v < min) min = v;
+                        else if (v > max) max = v;
+                    }
+
+                    float aScale = max > min ? (max - min) / 3f : 0f;
+                    float aInvScale = aScale > 0f ? 1f / aScale : 0f;
+
+                    // Per-group scale then min, both fp16.
+                    BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(offset, 2),
+                        System.BitConverter.HalfToUInt16Bits((System.Half)aScale));
+                    offset += 2;
+                    BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(offset, 2),
+                        System.BitConverter.HalfToUInt16Bits((System.Half)min));
+                    offset += 2;
+
+                    // Re-snap min through fp16 so the encoder quantizes against
+                    // the exact value the decoder will reconstruct from.
+                    float minQ = (float)System.BitConverter.UInt16BitsToHalf(
+                        System.BitConverter.HalfToUInt16Bits((System.Half)min));
+
+                    // Pack four 2-bit codes per byte, element 0 in the low bits.
+                    for (int i = 0; i < GroupSize; i += 4)
+                    {
+                        int q0 = QuantizeAffine(scratch[i], minQ, aInvScale);
+                        int q1 = QuantizeAffine(scratch[i + 1], minQ, aInvScale);
+                        int q2 = QuantizeAffine(scratch[i + 2], minQ, aInvScale);
+                        int q3 = QuantizeAffine(scratch[i + 3], minQ, aInvScale);
+                        result[offset++] = (byte)(q0 | (q1 << 2) | (q2 << 4) | (q3 << 6));
+                    }
+
+                    continue;
+                }
 
                 float maxAbs = 0f;
                 for (int i = 0; i < GroupSize; i++)
@@ -188,7 +251,7 @@ namespace TensorSharp.Runtime
                 return true;
             }
 
-            if (bits != 4 && bits != 8)
+            if (bits != 2 && bits != 4 && bits != 8)
                 return false;
             if (bits != _bits)
                 return false;
@@ -202,7 +265,7 @@ namespace TensorSharp.Runtime
                 return false;
 
             long groupCount = (long)elementCount / GroupSize;
-            int perGroupBytes = 2 + (GroupSize * bits / 8);
+            int perGroupBytes = PerGroupBytes(bits);
             long expectedEncoded = HeaderBytes + groupCount * perGroupBytes;
             if (encoded.Length != expectedEncoded)
                 return false;
@@ -212,6 +275,29 @@ namespace TensorSharp.Runtime
 
             for (long g = 0; g < groupCount; g++)
             {
+                if (_affine)
+                {
+                    // 2-bit affine: [fp16 scale][fp16 min][8 packed bytes].
+                    float aScale = (float)System.BitConverter.UInt16BitsToHalf(
+                        BinaryPrimitives.ReadUInt16LittleEndian(encoded[offset..]));
+                    offset += 2;
+                    float aMin = (float)System.BitConverter.UInt16BitsToHalf(
+                        BinaryPrimitives.ReadUInt16LittleEndian(encoded[offset..]));
+                    offset += 2;
+
+                    for (int i = 0; i < GroupSize; i += 4)
+                    {
+                        byte packed = encoded[offset++];
+                        scratch[i] = aMin + (packed & 0x03) * aScale;
+                        scratch[i + 1] = aMin + ((packed >> 2) & 0x03) * aScale;
+                        scratch[i + 2] = aMin + ((packed >> 4) & 0x03) * aScale;
+                        scratch[i + 3] = aMin + ((packed >> 6) & 0x03) * aScale;
+                    }
+
+                    StoreGroup(scratch, g * GroupSize, rawDestination);
+                    continue;
+                }
+
                 ushort scaleBits = BinaryPrimitives.ReadUInt16LittleEndian(encoded[offset..]);
                 offset += 2;
                 float scale = (float)System.BitConverter.UInt16BitsToHalf(scaleBits);
@@ -325,6 +411,25 @@ namespace TensorSharp.Runtime
             return q;
         }
 
+        // Affine 2-bit quantize: map x into the unsigned code range [0, 3]
+        // anchored at the group min. invScale is 1 / ((max - min) / 3); a
+        // degenerate (all-equal) group has invScale == 0 and collapses to code 0.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int QuantizeAffine(float x, float min, float invScale)
+        {
+            int q = (int)MathF.Round((x - min) * invScale);
+            if (q < 0) q = 0;
+            else if (q > 3) q = 3;
+            return q;
+        }
+
+        // Encoded bytes per 32-element group. 2-bit carries an extra fp16 min
+        // (affine layout): 2 (scale) + 2 (min) + 8 (codes). 4/8-bit carry only
+        // the fp16 scale: 2 + GroupSize * bits / 8.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int PerGroupBytes(int bits)
+            => bits == 2 ? 4 + (GroupSize * 2 / 8) : 2 + (GroupSize * bits / 8);
+
         private static int ElementBytes(KvCodecElementType dtype) => dtype switch
         {
             KvCodecElementType.Float32 => 4,
@@ -348,7 +453,7 @@ namespace TensorSharp.Runtime
                 return null;
             if (bits == 0)
                 return null;
-            if (bits != 4 && bits != 8)
+            if (bits != 2 && bits != 4 && bits != 8)
                 return null;
             // Q8_0 lives in 32-element ggml blocks with their own fp16 scale;
             // wrapping it in TurboQuant would just add a header without

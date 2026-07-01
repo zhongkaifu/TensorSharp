@@ -475,6 +475,52 @@ public class ManagedQuantizedOpsTests
         Assert.True(maxDiff < 0.08f, $"Direct quantized path drifted too far from dequantized reference: {maxDiff}");
     }
 
+    [Theory]
+    [InlineData(GgmlTensorType.Q4_0, 32)]
+    [InlineData(GgmlTensorType.Q4_0, 256)]
+    [InlineData(GgmlTensorType.Q4_0, 512)]
+    [InlineData(GgmlTensorType.Q8_0, 32)]
+    [InlineData(GgmlTensorType.Q8_0, 256)]
+    public void QuantizeRowFromFloat32_ProducesGgmlCompatibleBytes(GgmlTensorType type, int n)
+    {
+        // The managed KV-cache write path (CopyToCache[Circular]/ExpandKVHeads for
+        // block-quant) quantizes fresh K/V into the cache with QuantizeRowFromFloat32
+        // and the subsequent fused decode reads it back with ggml's native dequant.
+        // Validate that round trip: quantize here, dequantize with the native ggml
+        // kernel, and assert the values come back within the tier's quant step.
+        var rng = new Random(4242);
+        float[] src = Enumerable.Range(0, n)
+            .Select(i => (float)(rng.NextDouble() * 2.0 - 1.0) * (0.2f + 0.3f * (i % 7)))
+            .ToArray();
+
+        int rowBytes = (int)NativeDequant.RowSize((int)type, n);
+        byte[] quant = new byte[rowBytes];
+        ManagedQuantizedOps.QuantizeRowFromFloat32((int)type, src, 0, quant, 0, n);
+
+        float[] back = new float[n];
+        NativeDequant.DequantizeToFloat32((int)type, quant, 0, back, 0, n);
+
+        float maxAbs = 0f;
+        foreach (var v in src) maxAbs = MathF.Max(maxAbs, MathF.Abs(v));
+        // Q4_0: 4-bit over [-8d,7d], step = maxAbs/8. Q8_0: 8-bit, step = maxAbs/127.
+        float tol = (type == GgmlTensorType.Q4_0 ? maxAbs / 8f : maxAbs / 100f) + 1e-4f;
+        for (int i = 0; i < n; i++)
+            Assert.True(MathF.Abs(src[i] - back[i]) <= tol,
+                $"index {i}: src {src[i]}, dequant {back[i]}, tol {tol} ({type})");
+    }
+
+    [Fact]
+    public void QuantizeRowFromFloat32_AllZeros_DequantizesToZero()
+    {
+        float[] src = new float[256];
+        byte[] quant = new byte[(int)NativeDequant.RowSize((int)GgmlTensorType.Q4_0, 256)];
+        ManagedQuantizedOps.QuantizeRowFromFloat32((int)GgmlTensorType.Q4_0, src, 0, quant, 0, 256);
+
+        float[] back = new float[256];
+        NativeDequant.DequantizeToFloat32((int)GgmlTensorType.Q4_0, quant, 0, back, 0, 256);
+        Assert.All(back, v => Assert.Equal(0f, v));
+    }
+
     private static void WriteHalf(byte[] buffer, int offset, float value)
     {
         BinaryPrimitives.WriteUInt16LittleEndian(

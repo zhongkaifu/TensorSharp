@@ -36,15 +36,16 @@ namespace TensorSharp.GGML
             // hand-written conversion helpers in ModelBase + the native flash-attention
             // kernels which understand F16 cache layouts directly).
             //
-            // Q8_0 is even more restricted: only the native GGML kernels can read/write
-            // it (they understand the 32-element block layout). Direct element access
-            // from C# throws.
+            // Q8_0 / Q4_0 are even more restricted: only the native GGML kernels can
+            // read/write them (they understand the 32-element block layout). Direct
+            // element access from C# throws.
             if (elementType != DType.Float32 &&
                 elementType != DType.Float16 &&
                 elementType != DType.Float64 &&
                 elementType != DType.Int32 &&
                 elementType != DType.UInt8 &&
-                elementType != DType.Q8_0)
+                elementType != DType.Q8_0 &&
+                elementType != DType.Q4_0)
             {
                 throw new NotSupportedException($"GGML backend does not support storage for {elementType}.");
             }

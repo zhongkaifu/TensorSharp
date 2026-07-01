@@ -53,7 +53,7 @@ results as part of the standard matrix.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `KV_CACHE_DTYPE` | all | KV cache element type | `f32` | `f32`, `f16`, `q8_0` | yes |
+| `KV_CACHE_DTYPE` | all | KV cache element type | `f32` | `f32`, `f16`, `q8_0`, `q4_0` | yes |
 | `TS_KV_PAGED_QUANT_BITS` | all | TurboQuant paged-KV block codec | off (`0`) | `0`, `4`, `8` | yes |
 | `MAX_CONTEXT` | long text / uploaded text | Hard context cap | model default | `4096`, `8192`, `16384` | yes |
 

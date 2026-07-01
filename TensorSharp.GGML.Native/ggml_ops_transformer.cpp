@@ -39,13 +39,15 @@ namespace
             // Returning 0 here makes any accidental `head_dim * elem_size` use
             // visibly wrong rather than silently miscounting.
             case GGML_TYPE_Q8_0: return 0;
+            case GGML_TYPE_Q4_0: return 0;
             default:             return 4;
         }
     }
 
     inline bool kv_cache_is_block_quantized(int kv_cache_type)
     {
-        return static_cast<ggml_type>(kv_cache_type) == GGML_TYPE_Q8_0;
+        const ggml_type t = static_cast<ggml_type>(kv_cache_type);
+        return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
     }
 
     // Bytes occupied by a [kv_heads, cache_size, head_dim] cache tensor of the
@@ -6243,6 +6245,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             ggml_tensor* k_cached_t; ggml_tensor* v_cached_t;
             ggml_tensor* k_cpy; ggml_tensor* v_cpy;     // primary cache write
             ggml_tensor* k_cpy2; ggml_tensor* v_cpy2;   // wrapped tail (circular SWA write past the buffer end)
+            ggml_tensor* k_prev; ggml_tensor* v_prev;   // swaPrev: F32 copy of the prev window (read before the cache write)
             ggml_tensor* ple_gate_w; ggml_tensor* ple_proj_w; ggml_tensor* ple_post_norm_w;
         };
         std::vector<LayerTensors> layers(num_layers);
@@ -6412,6 +6415,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         std::vector<ggml_tensor*> layer_k_full(num_layers, nullptr);
         std::vector<ggml_tensor*> layer_v_full(num_layers, nullptr);
 
+        // swaPrev (start_pos>0, SWA window wrapped): retain each non-shared SWA
+        // layer's gathered previous-window F32 copy so a shared (KV-donor) SWA layer
+        // downstream can prepend the SAME prev window the donor used. Mirrors
+        // layer_k_full but for the [start_pos-prevCount, start_pos) rolling history.
+        std::vector<ggml_tensor*> layer_k_prev(num_layers, nullptr);
+        std::vector<ggml_tensor*> layer_v_prev(num_layers, nullptr);
+
         for (int l = 0; l < num_layers; l++)
         {
             auto& lt = layers[l];
@@ -6455,11 +6465,24 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, num_heads, N]
 
             lt.k_cpy = nullptr; lt.v_cpy = nullptr; lt.k_cpy2 = nullptr; lt.v_cpy2 = nullptr;
+            lt.k_prev = nullptr; lt.v_prev = nullptr;
             // Fresh post-norm/RoPE K/V for this chunk, retained so SWA layers whose
             // sequence exceeds the (circular) window at start_pos==0 can attend over
             // the whole chunk directly instead of the W-sized cache view.
             ggml_tensor* k_write = nullptr;
             ggml_tensor* v_write = nullptr;
+
+            // swaPrev: a SWA (local) layer at start_pos>0 whose window has wrapped
+            // (totalSeqLen > W) must attend up to W-1 keys from the PREVIOUS chunk(s).
+            // Those live in the rolling cache right now but this chunk's own K/V write
+            // (below) will overwrite them, so we gather them into an F32 copy first and
+            // prepend to the fresh chunk (mirrors the swaFresh start_pos==0 case and the
+            // MoE verify swaPrev). prevCount/swaBase are shared by a KV-donor and the
+            // SWA layers that follow it (same cacheSize / start_pos).
+            const bool swaPrev = info.isLocal && start_pos != 0 && totalSeqLen > info.cacheSize;
+            const int prevCount = swaPrev ? std::min(info.cacheSize, start_pos) : 0;
+            const int swaBase = start_pos - prevCount;   // logical position of the prev-window start
+
             if (!info.isShared)
             {
                 // per-head K norm + V norm (unweighted), then RoPE on K.
@@ -6479,6 +6502,29 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // cross the wrap point once, so it splits into up to two cpy ops.
                 k_write = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));  // [hd, N, kvHeads]
                 v_write = ggml_cont(ctx, ggml_permute(ctx, v_3d, 0, 2, 1, 3));     // [hd, N, kvHeads]
+
+                // swaPrev gather: materialise [swaBase, start_pos) from the rolling
+                // cache into F32 BEFORE the write below overwrites it (the cpy is built
+                // into the graph ahead of the write cpy, so on the single execution
+                // stream it reads the OLD cache contents). Retained in layer_k_prev so a
+                // following shared SWA layer reuses the donor's prev window.
+                if (swaPrev && prevCount > 0)
+                {
+                    ggml_tensor* kpv = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type);
+                    ggml_tensor* vpv = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, swaBase, prevCount, kv_cache_type);
+                    if (kpv == nullptr || vpv == nullptr)
+                    {
+                        set_last_error("Gemma4 model verify: failed to view prev SWA window.");
+                        return 0;
+                    }
+                    ggml_tensor* kpf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, prevCount, info.kvHeads);
+                    ggml_tensor* vpf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, info.hd, prevCount, info.kvHeads);
+                    lt.k_prev = ggml_cpy(ctx, kpv, kpf);
+                    lt.v_prev = ggml_cpy(ctx, vpv, vpf);
+                    layer_k_prev[l] = lt.k_prev;
+                    layer_v_prev[l] = lt.v_prev;
+                }
+
                 const int writeOffsetInChunk = (info.isLocal && N > info.cacheSize) ? (N - info.cacheSize) : 0;
                 const int writeLen = N - writeOffsetInChunk;                       // <= cacheSize for SWA
                 const int writeStartLogical = start_pos + writeOffsetInChunk;
@@ -6551,6 +6597,41 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, N, info.kvHeads);
                     k_full = ggml_cpy(ctx, k_fresh, kf);
                     v_full = ggml_cpy(ctx, v_fresh, vf);
+                }
+            }
+            else if (swaPrev && ((!info.isShared && lt.k_prev != nullptr)
+                                 || (info.isShared && layer_k_prev[info.kvSource] != nullptr
+                                     && layer_k_full[info.kvSource] != nullptr)))
+            {
+                // SWA window overflow at start_pos>0: attend the extended K/V
+                // [prev window (prevCount) ++ fresh chunk (N)], covering logical
+                // [swaBase, start_pos+N) in chronological order. Non-shared layers use
+                // their own gathered prev window + fresh K/V; shared (KV-donor) layers
+                // reuse the donor's retained prev window + fresh chunk. The buffer is in
+                // chronological order, so get_causal_mask(bufLen, bufLen, W) below maps
+                // query qi (causal cutoff prevCount+qi, W-wide window) correctly — no
+                // explicit keyBase needed (nPast = bufLen - N = prevCount).
+                ggml_tensor* k_p = info.isShared ? layer_k_prev[info.kvSource] : lt.k_prev;
+                ggml_tensor* v_p = info.isShared ? layer_v_prev[info.kvSource] : lt.v_prev;
+                ggml_tensor* k_f = info.isShared ? layer_k_full[info.kvSource] : k_write;
+                ggml_tensor* v_f = info.isShared ? layer_v_full[info.kvSource] : v_write;
+                const int bufLen = prevCount + N;
+                attendLen = bufLen;
+                attnKvLen = bufLen;
+                maskWindow = info.cacheSize;     // sliding window W
+                ggml_tensor* kext = ggml_concat(ctx, k_p, k_f, 1);   // [hd, prevCount+N, kvHeads] F32
+                ggml_tensor* vext = ggml_concat(ctx, v_p, v_f, 1);
+                if (kv_cache_type == GGML_TYPE_F32)
+                {
+                    k_full = kext;
+                    v_full = vext;
+                }
+                else
+                {
+                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, bufLen, info.kvHeads);
+                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, bufLen, info.kvHeads);
+                    k_full = ggml_cpy(ctx, kext, kf);
+                    v_full = ggml_cpy(ctx, vext, vf);
                 }
             }
             else
@@ -6679,8 +6760,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // Tiled SWA attention adds ~8 nodes (flash + concat + views + mask) per query
         // tile per local layer; budget for it so the graph never overflows.
         const int swa_tiles = (swa_tiled && N > swa_tile) ? ((N + swa_tile - 1) / swa_tile) : 1;
-        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (192 + static_cast<std::size_t>(swa_tiles) * 8) + 512;
+        // +16/layer headroom for swaPrev (gather view+cpy, concat, optional dtype cpy).
+        const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (208 + static_cast<std::size_t>(swa_tiles) * 8) + 512;
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
+        // swaPrev gathers MUST be expanded (and thus scheduled) before the cache
+        // writes: the gather reads the rolling window the write then overwrites, so
+        // it has to run first on the single execution stream (mirrors the MoE verify).
+        for (int l = 0; l < num_layers; l++)
+        {
+            if (layers[l].k_prev != nullptr) ggml_build_forward_expand(graph, layers[l].k_prev);
+            if (layers[l].v_prev != nullptr) ggml_build_forward_expand(graph, layers[l].v_prev);
+        }
         for (int l = 0; l < num_layers; l++)
         {
             // Shared (KV-donor) layers write no K/V of their own.

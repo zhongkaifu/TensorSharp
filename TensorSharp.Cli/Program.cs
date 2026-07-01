@@ -214,9 +214,9 @@ namespace TensorSharp.Cli
                     {
                         string bitsStr = args[++i];
                         if (!int.TryParse(bitsStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int bitsVal))
-                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: '{bitsStr}'. Expected 0 (off), 4, or 8.");
-                        if (bitsVal != 0 && bitsVal != 4 && bitsVal != 8)
-                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: {bitsVal}. Expected 0 (off), 4, or 8.");
+                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: '{bitsStr}'. Expected 0 (off), 2, 4, or 8.");
+                        if (bitsVal != 0 && bitsVal != 2 && bitsVal != 4 && bitsVal != 8)
+                            throw new ArgumentException($"Invalid value for --paged-kv-quant-bits: {bitsVal}. Expected 0 (off), 2, 4, or 8.");
                         pagedKvQuantBitsOverride = bitsVal;
                         break;
                     }
@@ -228,7 +228,7 @@ namespace TensorSharp.Cli
                         {
                             string kvDtypeStr = args[++i];
                             if (!KvCacheDtypeConfig.TryParse(kvDtypeStr, out KvCacheDtype kvDtype))
-                                throw new ArgumentException($"Unknown --kv-cache-dtype value '{kvDtypeStr}'. Valid: f32, f16, q8_0.");
+                                throw new ArgumentException($"Unknown --kv-cache-dtype value '{kvDtypeStr}'. Valid: f32, f16, q8_0, q4_0.");
                             KvCacheDtypeConfig.Set(kvDtype);
                             break;
                         }
@@ -306,7 +306,7 @@ namespace TensorSharp.Cli
                     "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
                     "[--seed N] [--stop <text>] [--think] [--warmup-runs N] " +
                     "[--paged-kv | --no-paged-kv] [--paged-kv-block-size N] [--paged-kv-ram-mb N] " +
-                    "[--paged-kv-ssd-dir <path>] [--paged-kv-ssd-mb N] [--paged-kv-quant-bits 0|4|8] " +
+                    "[--paged-kv-ssd-dir <path>] [--paged-kv-ssd-mb N] [--paged-kv-quant-bits 0|2|4|8] " +
                     "[--log-level info|debug|trace] [--log-dir <path>] [--log-file off] [--log-console off]");
                 return;
             }

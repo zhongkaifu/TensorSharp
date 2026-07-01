@@ -90,19 +90,20 @@ namespace TensorSharp.GGML
                 return;
             }
 
-            // Q8_0 KV-cache initialization path. Q8_0 stores 32-element blocks of
-            // 34 bytes each (16-bit scale + 32 int8 values); the all-zero block
-            // (scale=0, quants=0) decodes to all zeros, so a plain memset of the
-            // entire buffer is the correct fill-with-0 implementation. Non-zero
-            // fills aren't currently used for Q8_0 caches (callers only zero them
-            // at session reset).
-            if (result.ElementType == DType.Q8_0)
+            // Block-quantized (Q8_0 / Q4_0) KV-cache initialization path. Both store
+            // 32-element blocks (Q8_0: 34 bytes = 16-bit scale + 32 int8; Q4_0: 18
+            // bytes = 16-bit scale + 32 int4 packed two-per-byte). The all-zero
+            // block (scale=0, quants=0) decodes to all zeros, so a plain memset of
+            // the entire buffer is the correct fill-with-0 implementation. Non-zero
+            // fills aren't currently used for block-quantized caches (callers only
+            // zero them at session reset).
+            if (result.ElementType == DType.Q8_0 || result.ElementType == DType.Q4_0)
             {
                 if (!IsContiguousNonNarrowed(result))
-                    throw new NotSupportedException("Fill on Q8_0 GGML tensors requires a contiguous, non-narrowed tensor (used for KV-cache reset).");
+                    throw new NotSupportedException("Fill on block-quantized GGML tensors requires a contiguous, non-narrowed tensor (used for KV-cache reset).");
                 if (value != 0f)
-                    throw new NotSupportedException("Fill on Q8_0 GGML tensors only supports value=0 (cache reset).");
-                long byteLength = DTypeExtensions.Q8_0Bytes(result.ElementCount());
+                    throw new NotSupportedException("Fill on block-quantized GGML tensors only supports value=0 (cache reset).");
+                long byteLength = result.ElementType.ByteLengthFor(result.ElementCount());
                 byte* byteBuffer = (byte*)GetBufferStart(result);
                 long offset = 0;
                 while (offset < byteLength)
@@ -115,7 +116,7 @@ namespace TensorSharp.GGML
             }
 
             if (result.ElementType != DType.Float32)
-                throw new InvalidOperationException($"Fill only supports Float32, Float16 and Q8_0 GGML tensors (got {result.ElementType}).");
+                throw new InvalidOperationException($"Fill only supports Float32, Float16, Q8_0 and Q4_0 GGML tensors (got {result.ElementType}).");
 
             float* buffer = (float*)GetBufferStart(result);
             TensorIterState iter = new TensorIterState(buffer, result.DimensionCount, result.SizesMemory, result.StridesMemory);
@@ -3222,10 +3223,10 @@ namespace TensorSharp.GGML
                     $"copy of strided {dtype} tensors requires the innermost dimension to be contiguous on both sides.");
             }
 
-            if (dtype == DType.Q8_0 && (innerElems % 32) != 0)
+            if ((dtype == DType.Q8_0 || dtype == DType.Q4_0) && (innerElems % 32) != 0)
             {
                 throw new NotSupportedException(
-                    $"copy of strided Q8_0 tensors requires the inner contiguous extent ({innerElems} elements) to be a multiple of 32.");
+                    $"copy of strided {dtype} tensors requires the inner contiguous extent ({innerElems} elements) to be a multiple of 32.");
             }
 
             long innerBytes = dtype.ByteLengthFor(innerElems);
@@ -3261,16 +3262,18 @@ namespace TensorSharp.GGML
 
         private static long ElementOffsetToBytes(long elementOffset, DType dtype)
         {
-            if (dtype == DType.Q8_0)
+            if (dtype == DType.Q8_0 || dtype == DType.Q4_0)
             {
-                // Q8_0 stores 32 elements per 34-byte block; outer strides feeding
-                // into this helper are always multiples of 32 elements (validated
-                // by the inner-extent alignment check above for the typical KV
-                // cache layout [heads, capacity, head_dim] where head_dim % 32 == 0).
+                // Block-quantized types store 32 elements per block (Q8_0: 34 bytes,
+                // Q4_0: 18 bytes); outer strides feeding into this helper are always
+                // multiples of 32 elements (validated by the inner-extent alignment
+                // check above for the typical KV cache layout [heads, capacity,
+                // head_dim] where head_dim % 32 == 0).
                 if ((elementOffset % 32) != 0)
                     throw new InvalidOperationException(
-                        $"Q8_0 byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
-                return (elementOffset / 32) * 34;
+                        $"{dtype} byte offset requires element offset ({elementOffset}) to align to 32-element blocks.");
+                long blockBytes = dtype == DType.Q8_0 ? 34 : 18;
+                return (elementOffset / 32) * blockBytes;
             }
             return elementOffset * dtype.Size();
         }
@@ -4847,8 +4850,9 @@ namespace TensorSharp.GGML
 
             // Copy is dtype-preserving: KV-cache resize and similar callers narrow
             // the same storage on both sides, so cross-dtype copy here would just
-            // mask an upstream bug. Float32/Float16/Q8_0 are the storage classes
-            // models actually instantiate (see KvCacheStorage), so accept those.
+            // mask an upstream bug. Float32/Float16/Q8_0/Q4_0 are the storage
+            // classes models actually instantiate (see KvCacheStorage), so accept
+            // those.
             if (result.ElementType != src.ElementType)
             {
                 throw new InvalidOperationException(
@@ -4856,10 +4860,11 @@ namespace TensorSharp.GGML
             }
             if (result.ElementType != DType.Float32
                 && result.ElementType != DType.Float16
-                && result.ElementType != DType.Q8_0)
+                && result.ElementType != DType.Q8_0
+                && result.ElementType != DType.Q4_0)
             {
                 throw new InvalidOperationException(
-                    $"copy supports Float32, Float16, or Q8_0 tensors (got {result.ElementType}).");
+                    $"copy supports Float32, Float16, Q8_0, or Q4_0 tensors (got {result.ElementType}).");
             }
 
             if (result.ElementCount() != src.ElementCount())
