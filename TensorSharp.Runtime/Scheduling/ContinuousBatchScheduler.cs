@@ -132,6 +132,21 @@ namespace TensorSharp.Runtime.Scheduling
             return result;
         }
 
+        /// <summary>Snapshot the currently-running sequences (in fairness order).
+        /// Used by the engine's deadlock path to fail sequences that can no longer
+        /// be scheduled (the running set needs KV blocks the pool can't supply and
+        /// can't free by preemption), rather than spinning on empty schedules.</summary>
+        public List<SequenceState> GetRunningSequencesSnapshot()
+        {
+            var result = new List<SequenceState>(_runningOrder.Count);
+            foreach (var seq in _runningOrder)
+            {
+                if (seq == null || seq.Status.IsFinished()) continue;
+                result.Add(seq);
+            }
+            return result;
+        }
+
         /// <summary>Submit a sequence. It enters the waiting queue; the next
         /// <see cref="Schedule"/> call will try to admit it.</summary>
         public void Submit(SequenceState seq)
@@ -164,20 +179,33 @@ namespace TensorSharp.Runtime.Scheduling
         /// Per-step prefill chunk cap for one sequence. A FRESH solo prefill
         /// (start_pos==0, no contention) runs its whole chunk through the fused
         /// single-graph flash-verify path — the model grows its cache to fit — so
-        /// feed it big (<see cref="SchedulerConfig.SoloPrefillChunkSize"/>). A
-        /// start_pos&gt;0 chunk (the tail of a prompt longer than the fused-prefill
-        /// capacity, or a prefix-cache-adopted start) can only run on the per-op
-        /// path, whose materialized attention-score tensor scales with the chunk
-        /// length — keep those small (<see cref="SchedulerConfig.MaxPrefillChunkSize"/>)
-        /// so the tail can never blow up into a multi-GB score tensor. Any
-        /// contention also uses the small fair chunk so concurrent decode can
-        /// interleave.
+        /// feed it big (<see cref="SchedulerConfig.SoloPrefillChunkSize"/>).
+        ///
+        /// A start_pos&gt;0 chunk (the tail of a prompt longer than the fresh-chunk
+        /// size) ALSO runs on the fused flash path on models that gather the
+        /// wrapped/continued window in-kernel (Gemma 4's swaPrev verify): flash
+        /// attention is O(seq) memory and never materializes the score tensor, so
+        /// the tail does not blow up. Its only per-chunk cost that grows with the
+        /// chunk is the causal mask (rebuilt + uploaded each chunk, ~chunk×context),
+        /// so the tail has its OWN measured sweet spot
+        /// (<see cref="SchedulerConfig.SoloTailPrefillChunkSize"/>, ~2048): big
+        /// enough to amortize per-chunk graph-build/launch overhead and keep the
+        /// flash/GEMM kernels efficient, small enough that the mask stays cheap
+        /// (2048 beat 1024 by ~3% and 8192 by ~6% on Gemma 4 E4B long prefill).
+        /// It is bounded by SoloPrefillChunkSize, which the model already handles
+        /// for the fresh chunk, so it never introduces a new memory ceiling.
+        ///
+        /// Any contention uses the small fair chunk
+        /// (<see cref="SchedulerConfig.MaxPrefillChunkSize"/>) so concurrent decode
+        /// can interleave.
         /// </summary>
         private int PrefillCapFor(SequenceState seq, bool noContention)
         {
-            return (noContention && seq.NumComputedTokens == 0)
+            if (!noContention)
+                return _cfg.MaxPrefillChunkSize;
+            return seq.NumComputedTokens == 0
                 ? _cfg.SoloPrefillChunkSize
-                : _cfg.MaxPrefillChunkSize;
+                : Math.Min(_cfg.SoloTailPrefillChunkSize, _cfg.SoloPrefillChunkSize);
         }
 
         /// <summary>

@@ -56,7 +56,10 @@
     "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens", "max_tokens": 8},
     "prefill_4k": {"kind": "text", "description": "Prefill throughput @ ~4k prompt tokens", "max_tokens": 8},
     "prefill_8k": {"kind": "text", "description": "Prefill throughput @ ~8k prompt tokens", "max_tokens": 8},
-    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens", "max_tokens": 8}
+    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens", "max_tokens": 8},
+    "prefill_32k": {"kind": "text", "description": "Prefill throughput @ ~32k prompt tokens", "max_tokens": 8},
+    "prefill_64k": {"kind": "text", "description": "Prefill throughput @ ~64k prompt tokens", "max_tokens": 8},
+    "prefill_128k": {"kind": "text", "description": "Prefill throughput @ ~128k prompt tokens", "max_tokens": 8}
   },
 
   "engines": {
@@ -82,7 +85,7 @@
   "defaults": {
     "engines": ["tensorsharp", "llamacpp"],
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b"],
-    "scenarios": ["prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k"],
+    "scenarios": ["prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k", "prefill_32k", "prefill_64k", "prefill_128k"],
     "backends": ["gpu"],
     "mtp_modes": [false],
     "concurrency": [1],

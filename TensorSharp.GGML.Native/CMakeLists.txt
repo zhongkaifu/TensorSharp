@@ -122,6 +122,7 @@ set(TSG_GGMLOPS_SOURCES
 )
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})

@@ -262,6 +262,92 @@ public class BatchedExecutorTests
         Assert.Equal(cfg.NumBlocks, engine.PoolStats.freeBlocks);
     }
 
+    [Fact]
+    public async Task InferenceEngine_PromptLongerThanKvPool_FailsCleanlyInsteadOfHanging()
+    {
+        // Repro for the reported hang: a prompt whose KV footprint exceeds the
+        // whole block pool prefills until the pool is exhausted, then — being the
+        // only running sequence with nothing to preempt — can never be scheduled
+        // again. Pre-fix the engine spun on empty schedules forever (GPU idle,
+        // "stuck forever"). Post-fix it fails the request with a capacity error
+        // and stays healthy enough to serve a subsequent in-budget request.
+        //
+        // maxContext defaults to 0, so the pool is NOT auto-grown; this exercises
+        // the deadlock guard rather than the auto-sizing path.
+        var model = new BatchedStubModel("fp-capacity", peakToken: 7);
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 8,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 8,
+            SoloPrefillChunkSize = 8,
+            NumBlocks = 4,          // pool holds 4*8 = 32 tokens of KV
+            BlockSize = BlockSize,  // 8
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+        };
+        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+        // Pool was not auto-grown (model advertises no context length).
+        Assert.Equal(cfg.NumBlocks, engine.PoolStats.totalBlocks);
+
+        // 40-token prompt needs ceil(40/8)=5 blocks > the 4-block pool.
+        var tooLong = new SequenceState("too-long", Enumerable.Range(1, 40).ToList(),
+            maxNewTokens: 4, BlockSize, SamplingConfig.Default);
+        var shortOk = new SequenceState("short-ok", Enumerable.Range(1, 4).ToList(),
+            maxNewTokens: 3, BlockSize, SamplingConfig.Default);
+
+        var tooLongHandle = engine.SubmitRequest(tooLong);
+        var shortHandle = engine.SubmitRequest(shortOk);
+
+        // The over-length request fails rather than hanging: if the engine were
+        // still spinning, WaitAsync would throw TimeoutException here instead.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => tooLongHandle.Completion.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Contains("capacity", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(SequenceStatus.FinishedError, tooLong.Status);
+        Assert.Equal(0, tooLong.BlockTable.NumBlocks);
+
+        // The engine recovered: the in-budget request still completes and the
+        // pool is fully reclaimed.
+        var completion = await shortHandle.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(completion.OutputTokenCount > 0);
+        Assert.Equal(cfg.NumBlocks, engine.PoolStats.freeBlocks);
+    }
+
+    [Fact]
+    public async Task InferenceEngine_AutoSizesKvPoolToModelContext_SoLongPromptDoesNotDeadlock()
+    {
+        // A model that advertises a context length gets its KV block pool sized to
+        // cover that context, so an in-context prompt longer than the configured
+        // default pool completes instead of deadlocking (the reported hang).
+        const int modelContext = 512;
+        var model = new BatchedStubModel("fp-autosize", peakToken: 7, maxContext: modelContext);
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 64,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 32,
+            SoloPrefillChunkSize = 64,
+            NumBlocks = 4,          // default would hold only 4*8 = 32 tokens
+            BlockSize = BlockSize,  // 8
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+        };
+        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+
+        // Pool auto-grew to cover the model's advertised context.
+        int expectedBlocks = (modelContext + BlockSize - 1) / BlockSize; // 64
+        Assert.Equal(expectedBlocks, engine.PoolStats.totalBlocks);
+
+        // A 100-token prompt overflows the configured 32-token pool but fits the
+        // auto-sized 512-token pool: it must complete, not hang.
+        var seq = new SequenceState("long-in-context", Enumerable.Range(1, 100).ToList(),
+            maxNewTokens: 4, BlockSize, SamplingConfig.Default);
+        var handle = engine.SubmitRequest(seq);
+        var completion = await handle.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(completion.OutputTokenCount > 0);
+    }
+
     // ----- helpers -----
 
     private static SchedulerConfig SmallConfig() => new()
@@ -284,15 +370,17 @@ public class BatchedExecutorTests
     {
         private readonly string _fp;
         private readonly int _peak;
+        private readonly int _maxContext;
         private int _cacheSeqLen;
 
         public int NumBatchCalls { get; private set; }
         public int MaxSequencesInAnyBatch { get; private set; }
 
-        public BatchedStubModel(string fp, int peakToken)
+        public BatchedStubModel(string fp, int peakToken, int maxContext = 0)
         {
             _fp = fp;
             _peak = peakToken;
+            _maxContext = maxContext;
             Tokenizer = new StubTokenizer(VocabSize);
         }
 
@@ -302,6 +390,9 @@ public class BatchedExecutorTests
         public IBackendExecutionPlan ExecutionPlan => null;
         public bool SupportsKVCacheTruncation => true;
         public bool SupportsKVStateSnapshot => true;
+        // 0 => model advertises no context length (pool keeps its configured size);
+        // a positive value drives the engine's KV-pool auto-sizing.
+        public int MaxContextLength => _maxContext;
         public string KVStateFingerprint => _fp;
         public long ComputeKVBlockByteSize(int tokenCount)
             => 2L * NumLayers * NumKVHeads * tokenCount * HeadDim * sizeof(float);

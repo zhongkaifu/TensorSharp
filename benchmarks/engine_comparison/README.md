@@ -142,7 +142,7 @@ relocate the whole set with `BENCH_GEMMA4_QAT_DIR`); the E4B draft defaults to
 per-cell speedup (a value `< 1.0×` means speculation cost more than it saved —
 expected where the fused full-model decode path is already fastest).
 
-### Prefill (prompt-processing) benchmark (`prefill_2k` / `4k` / `8k` / `16k`)
+### Prefill (prompt-processing) benchmark (`prefill_2k` / `4k` / `8k` / `16k` / `32k` / `64k` / `128k`)
 
 The plain text scenarios' longest prompt (`text_long`) is only ~1.2k tokens, where
 time-to-first-token is dominated by **fixed per-request overhead** (HTTP,
@@ -151,15 +151,21 @@ so `prefill_tps` there understates and noisily estimates true prompt-processing
 throughput. The `prefill_<N>` scenarios drive the prompt to controlled lengths long
 enough for the per-token prefill cost to separate cleanly from that fixed overhead.
 
-These scenarios are part of the **main `benchmark_config.json`** matrix and run by
-default (the no-flag run includes the 2k/4k/8k/16k sweep). For a *focused* prefill
-run — just the sweep, with the multimodal / diffusion scenarios and models stripped
-out and results written to a separate `results_prefill/` — use the dedicated
-**`benchmark_config_prefill.json`**:
+These scenarios are part of the **main `benchmark_config.json`** matrix (which runs
+the 2k/4k/8k sweep by default). For a *focused* prefill run — the full
+2k → 128k sweep, with the multimodal / diffusion scenarios and models stripped out
+and results written to a separate `results_prefill/` — use the dedicated
+**`benchmark_config_prefill.json`** (its `defaults.scenarios` runs every length
+through `prefill_128k`).
+
+The long-context lengths (`prefill_32k` / `64k` / `128k`) drive very large prompts:
+`run_matrix.py` auto-raises llama.cpp's `-c` context to fit (≈170k tokens for the
+128k case), and the engine needs enough KV VRAM/RAM to hold it — trim the selection
+on smaller hosts.
 
 ```bash
 # Just the prefill sweep, default matrix (selecting the scenarios from the main config)
-python run_matrix.py --scenarios prefill_2k,prefill_4k,prefill_8k,prefill_16k
+python run_matrix.py --scenarios prefill_2k,prefill_4k,prefill_8k,prefill_16k,prefill_32k,prefill_64k,prefill_128k
 
 # Focused prefill-only run (TensorSharp vs llama.cpp, GPU, separate results dir)
 python run_matrix.py --config benchmark_config_prefill.json
@@ -174,7 +180,8 @@ python report.py --config benchmark_config_prefill.json
 
 How it works:
 
-- Scenarios `prefill_2k` / `prefill_4k` / `prefill_8k` / `prefill_16k` slice
+- Scenarios `prefill_2k` / `prefill_4k` / `prefill_8k` / `prefill_16k` /
+  `prefill_32k` / `prefill_64k` / `prefill_128k` slice
   `assets/prefill_corpus.txt` to a target **token** budget (the id names the
   target; `scenarios._prefill` converts it to a character budget at
   ~4.6 chars/token, tiling the corpus when a target exceeds it). The label is

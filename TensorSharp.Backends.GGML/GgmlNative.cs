@@ -1412,7 +1412,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            byte[] isExceptArr);
+            byte[] isExceptArr,
+            IntPtr pleTokenEmbdData, int pleTokenEmbdType,
+            long pleTokenEmbdNe0, long pleTokenEmbdNe1, long pleTokenEmbdBytes,
+            int[] pleTokenIds,
+            IntPtr pleProjWData, int pleProjWType,
+            long pleProjWNe0, long pleProjWNe1, long pleProjWBytes,
+            IntPtr pleProjNormData);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4DraftStep(
@@ -3380,7 +3386,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            byte[] isExceptArr = null)
+            byte[] isExceptArr = null,
+            IntPtr pleTokenEmbdData = default, int pleTokenEmbdType = 0,
+            long pleTokenEmbdNe0 = 0, long pleTokenEmbdNe1 = 0, long pleTokenEmbdBytes = 0,
+            int[] pleTokenIds = null,
+            IntPtr pleProjWData = default, int pleProjWType = 0,
+            long pleProjWNe0 = 0, long pleProjWNe1 = 0, long pleProjWBytes = 0,
+            IntPtr pleProjNormData = default)
         {
             int r = TSGgml_Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -3404,7 +3416,13 @@ internal enum GgmlIndexReductionOp
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
                 plePostNormArr,
-                isExceptArr);
+                isExceptArr,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenIds,
+                pleProjWData, pleProjWType,
+                pleProjWNe0, pleProjWNe1, pleProjWBytes,
+                pleProjNormData);
             if (r == 0 && Environment.GetEnvironmentVariable("TS_GGML_FUSED_DEBUG") == "1")
                 Console.Error.WriteLine($"[gemma4-verify FAIL] {GetLastErrorMessage("(no native error)")}");
             return r != 0;

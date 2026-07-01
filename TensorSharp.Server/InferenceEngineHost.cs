@@ -72,9 +72,11 @@ namespace TensorSharp.Server
                 var cfg = SchedulerConfig.FromEnvironment();
                 _engine = new InferenceEngine(model, cfg, _logger);
                 _fingerprint = fp;
+                var poolStats = _engine.PoolStats;
                 _logger.LogInformation(
-                    "InferenceEngine constructed for fingerprint {Fingerprint} (blocks={NumBlocks}, blockSize={BlockSize}, maxBatched={MaxBatched})",
-                    fp, cfg.NumBlocks, cfg.BlockSize, cfg.MaxNumBatchedTokens);
+                    "InferenceEngine constructed for fingerprint {Fingerprint} (blocks={NumBlocks}, blockSize={BlockSize}, kvCapacityTokens={KvCapacity}, maxBatched={MaxBatched})",
+                    fp, poolStats.totalBlocks, poolStats.blockSize,
+                    (long)poolStats.totalBlocks * poolStats.blockSize, cfg.MaxNumBatchedTokens);
                 return _engine;
             }
         }

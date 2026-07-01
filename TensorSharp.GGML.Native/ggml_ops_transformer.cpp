@@ -13,6 +13,15 @@
 
 using namespace tsg;
 
+#ifdef TSG_GGML_USE_CUDA
+// On-device causal-mask fill (ggml_ops_mask.cu): generate the verify kernel's
+// [kvLen, N] F16 causal(+windowed) masks straight into their device buffers,
+// eliminating the host fill + H2D upload. Bit-identical to the host path.
+extern "C" bool tsg_cuda_fill_causal_mask_f16(
+    void* mask_dev, int kvLen, int N, int nPast, int window, int validLen);
+extern "C" bool tsg_cuda_sync_stream0(void);
+#endif
+
 // ============================================================================
 // Batched transformer layer decode: full layer in a single GGML graph.
 // Handles: attn_norm → QKV matmul → QK norm → RoPE → flash attention →
@@ -6176,7 +6185,27 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
     // the attention mask is causal PLUS bidirectional within the soft-token spans:
     // a soft-token query may attend forward to a soft-token key. Mirrors the C#
     // per-op ApplyCausalMask exceptPositions path. Null for text / MTP verify.
-    const unsigned char* is_except_arr)
+    const unsigned char* is_except_arr,
+    // In-kernel PLE gather. When ple_token_embd_data != nullptr, the per-layer
+    // embeddings are gathered INSIDE this graph via ggml_get_rows on the resident
+    // quantized per_layer_token_embd table (ple_token_ids = the chunk's N token
+    // ids), instead of being computed in C# and uploaded as ple_data. This avoids
+    // the device->host->device round-trip of the ~88 MB gathered PLE per chunk
+    // (the PLE table is already resident; only the tiny id list is uploaded).
+    // When set, ple_data is ignored. ple_token_embd is [ne0 = num_layers*ple_dim,
+    // ne1 = vocab]; get_rows(table, ids) -> [num_layers*ple_dim, N], byte-identical
+    // layout to the uploaded ple_data.
+    const void* ple_token_embd_data, int ple_token_embd_type,
+    std::int64_t ple_token_embd_ne0, std::int64_t ple_token_embd_ne1, std::int64_t ple_token_embd_bytes,
+    const std::int32_t* ple_token_ids,
+    // Hidden-projection PLE component (nullable): ple = (sqrt(ple_dim)*get_rows +
+    // rmsnorm((hidden @ per_layer_model_proj)/sqrt(hidden), per_layer_proj_norm)) / sqrt(2).
+    // per_layer_model_proj is [ne0=hidden, ne1=num_layers*ple_dim]; per_layer_proj_norm
+    // is F32 [ple_dim]. When ple_proj_w_data is null the token-embedding component is
+    // used alone (matches ComputePLE's pleProj==null branch).
+    const void* ple_proj_w_data, int ple_proj_w_type,
+    std::int64_t ple_proj_w_ne0, std::int64_t ple_proj_w_ne1, std::int64_t ple_proj_w_bytes,
+    const void* ple_proj_norm_data)
 {
     try
     {
@@ -6233,10 +6262,53 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
 
         // PLE input: all N tokens' per-layer embeddings, laid out
         // [num_tokens, num_layers * ple_dim] row-major (matches perLayerInputs).
+        // In-kernel mode gathers it here via get_rows on the resident table; the
+        // uploaded-ple_data mode allocates a plain F32 tensor filled by H2D below.
+        const bool ple_in_kernel = ple_token_embd_data != nullptr && ple_token_ids != nullptr && ple_dim > 0;
+        const int total_ple_dim = num_layers * ple_dim;
         ggml_tensor* ple_input = nullptr;
-        if (ple_data != nullptr && ple_dim > 0)
+        ggml_tensor* ple_table = nullptr;
+        ggml_tensor* ple_ids = nullptr;
+        ggml_tensor* ple_proj_w = nullptr;
+        ggml_tensor* ple_proj_norm_w = nullptr;
+        if (ple_in_kernel)
+        {
+            ple_table = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_token_embd_type),
+                ple_token_embd_ne0, ple_token_embd_ne1);
+            ple_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+            // Token-embedding component: sqrt(ple_dim) * get_rows(table, ids).
+            // get_rows(table[ne0=total_ple_dim, ne1=vocab], ids[N]) -> [total_ple_dim, N]
+            // F32, same memory layout as the uploaded ple_data.
+            ggml_tensor* ple_tok = ggml_get_rows(ctx, ple_table, ple_ids);
+            ple_tok = ggml_scale(ctx, ple_tok, sqrtf(static_cast<float>(ple_dim)));
+
+            if (ple_proj_w_data != nullptr)
+            {
+                // Hidden-projection component: rmsnorm((hidden @ proj)/sqrt(hidden), norm).
+                ple_proj_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_proj_w_type),
+                    ple_proj_w_ne0, ple_proj_w_ne1);
+                ple_proj_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ple_dim);
+                ggml_tensor* proj = ggml_mul_mat(ctx, ple_proj_w, current);   // [total_ple_dim, N]
+                proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
+                // Per-(token,layer) RMSNorm over ple_dim: view [total_ple_dim, N] as
+                // [ple_dim, num_layers*N], norm rows, scale by norm weight, reshape back.
+                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * N);
+                proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_proj_norm_w);
+                proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, N);
+                // combined = (proj + tok) / sqrt(2)
+                ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
+            }
+            else
+            {
+                ple_input = ple_tok;
+            }
+        }
+        else if (ple_data != nullptr && ple_dim > 0)
+        {
             ple_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
                 static_cast<std::int64_t>(N) * num_layers * ple_dim);
+        }
+        const bool has_ple = ple_input != nullptr;
 
         struct LayerTensors {
             ggml_tensor* attn_norm_w; ggml_tensor* qkv_w; ggml_tensor* k_w; ggml_tensor* v_w;
@@ -6284,7 +6356,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             lt.k_cpy = nullptr; lt.v_cpy = nullptr; lt.k_cpy2 = nullptr; lt.v_cpy2 = nullptr;
 
             lt.ple_gate_w = nullptr; lt.ple_proj_w = nullptr; lt.ple_post_norm_w = nullptr;
-            if (ple_data != nullptr && ple_gate_arr != nullptr && ple_gate_arr[l] != nullptr)
+            if (has_ple && ple_gate_arr != nullptr && ple_gate_arr[l] != nullptr)
             {
                 lt.ple_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_gate_type_arr[l]),
                     ple_gate_ne0_arr[l], ple_gate_ne1_arr[l]);
@@ -6318,6 +6390,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // (sliding-window low bound). The windowed variant (window>0) serves SWA
         // prefill that attends the FRESH K/V of all N tokens (start_pos==0, N >
         // sliding window); window==0 covers the circular-cache read and global.
+        // On-device causal-mask generation (CUDA, text prefill only): fill each
+        // [kvLen, N] mask straight into its device buffer after allocation instead
+        // of the O(N*kvLen) host fill + H2D upload. The bidirectional multimodal
+        // case (is_except != nullptr) keeps the host path. dataIdx == -1 in the
+        // cache marks a GPU-filled mask (no host data / no upload).
+#ifdef TSG_GGML_USE_CUDA
+        static const bool gpu_mask_enabled = []{ const char* e = std::getenv("TS_G4_GPU_MASK"); return e == nullptr || e[0] != '0'; }();
+        const bool gpu_mask = gpu_mask_enabled && g_backend_type == BACKEND_TYPE_CUDA && is_except == nullptr;
+#else
+        const bool gpu_mask = false;
+#endif
+        struct GpuMaskFill { ggml_tensor* tensor; int kvLen; int mN; int nPast; int window; int validLen; };
+        std::vector<GpuMaskFill> gpu_mask_fills;
+
         struct VerifyMask { int kvLen; int validLen; int window; ggml_tensor* tensor; int dataIdx; };
         std::vector<VerifyMask> mask_cache;
         std::vector<std::vector<ggml_fp16_t>> mask_data_store;
@@ -6325,6 +6411,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             for (auto& m : mask_cache)
                 if (m.kvLen == kvLen && m.validLen == validLen && m.window == window) return m.tensor;
             ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvLen, N);
+            if (gpu_mask)
+            {
+                // Defer to a device-side fill after gallocr allocates mt->data.
+                gpu_mask_fills.push_back({mt, kvLen, N, validLen - N, window, validLen});
+                mask_cache.push_back({kvLen, validLen, window, mt, -1});
+                return mt;
+            }
             std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * N);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
@@ -6845,6 +6938,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
+        // In-kernel PLE: bind the per_layer_token_embd table (and the projection +
+        // norm weights) resident so the gather / projection read them on-device.
+        if (ple_in_kernel && ple_table != nullptr)
+        {
+            bind_or_mark(ple_table, const_cast<void*>(ple_token_embd_data),
+                static_cast<std::size_t>(ple_token_embd_bytes), true);
+            if (ple_proj_w != nullptr)
+                bind_or_mark(ple_proj_w, const_cast<void*>(ple_proj_w_data),
+                    static_cast<std::size_t>(ple_proj_w_bytes), true);
+            if (ple_proj_norm_w != nullptr)
+                bind_or_mark(ple_proj_norm_w, const_cast<void*>(ple_proj_norm_data),
+                    static_cast<std::size_t>(ple_dim) * sizeof(float), true);
+        }
+
         // Allocation strategy. Small N (MTP speculative verify, N<=16) keeps the
         // bump allocator (alloc_ctx_tensors_reuse: each tensor its own slot, stable
         // addresses, lowest per-call overhead). Large N (prefill routed through this
@@ -6890,15 +6997,37 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
 
         for (auto& m : mask_cache)
-            ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
-                mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
+            if (m.dataIdx >= 0)   // dataIdx == -1: GPU-filled below, no host upload
+                ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
+                    mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
         for (auto& m : tile_mask_cache)
             ggml_backend_tensor_set(m.tensor, mask_data_store[m.dataIdx].data(), 0,
                 mask_data_store[m.dataIdx].size() * sizeof(ggml_fp16_t));
 
-        if (ple_input != nullptr)
+#ifdef TSG_GGML_USE_CUDA
+        // Generate the deferred causal masks directly in their (now-allocated)
+        // device buffers, then block until they complete so the backend-stream
+        // graph compute below sees them (bit-identical to the host fill).
+        if (!gpu_mask_fills.empty())
+        {
+            for (auto& g : gpu_mask_fills)
+                tsg_cuda_fill_causal_mask_f16(g.tensor->data, g.kvLen, g.mN, g.nPast, g.window, g.validLen);
+            tsg_cuda_sync_stream0();
+        }
+#endif
+
+        if (ple_in_kernel)
+        {
+            // Upload only the tiny token-id list; get_rows gathers the PLE on-device.
+            if (ple_ids != nullptr)
+                ggml_backend_tensor_set(ple_ids, ple_token_ids, 0,
+                    static_cast<std::size_t>(N) * sizeof(std::int32_t));
+        }
+        else if (ple_input != nullptr)
+        {
             ggml_backend_tensor_set(ple_input, ple_data, 0,
                 static_cast<std::size_t>(N) * num_layers * ple_dim * sizeof(float));
+        }
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)

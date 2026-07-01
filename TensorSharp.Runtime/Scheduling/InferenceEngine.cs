@@ -53,7 +53,8 @@ namespace TensorSharp.Runtime.Scheduling
             _logger = logger ?? NullLogger.Instance;
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
-            _pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, blockBytes);
+            int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
+            _pool = new BlockPool(numBlocks, cfg.BlockSize, blockBytes);
             _scheduler = new ContinuousBatchScheduler(cfg, _pool, model.KVStateFingerprint ?? string.Empty, logger,
                 supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
                 maxReusablePrefixTokens: model.MaxReusablePrefixTokens);
@@ -155,12 +156,32 @@ namespace TensorSharp.Runtime.Scheduling
                 try
                 {
                     output = _scheduler.Schedule();
-                    if (output.IsEmpty && _scheduler.RunningCount == 0)
-                        continue;
                 }
                 catch (Exception ex)
                 {
                     FailStepSequences(ex, output, "scheduler");
+                    continue;
+                }
+
+                if (output.IsEmpty)
+                {
+                    // A preemption may have occurred while (unsuccessfully) trying
+                    // to fit a needy sequence; let the model reclaim that request's
+                    // per-sequence state before we loop.
+                    NotifyReleasedSequences(output);
+
+                    // An empty schedule while sequences are still running means the
+                    // scheduler is deadlocked: the running set needs KV blocks the
+                    // pool can't supply and can't free enough by preemption (the
+                    // classic case is a single sequence whose prompt is longer than
+                    // the whole block pool — no other sequence to preempt). Nothing
+                    // frees blocks without a completed step, and no step can run, so
+                    // the loop would spin forever with the GPU idle. Fail the
+                    // stalled sequences with a clear capacity error instead of
+                    // hanging. With no running sequences this is just idle — fall
+                    // through to block on the command channel at the loop top.
+                    if (_scheduler.RunningCount > 0)
+                        FailStalledSequences();
                     continue;
                 }
 
@@ -204,6 +225,56 @@ namespace TensorSharp.Runtime.Scheduling
                 foreach (var id in output.PreemptedRequestIds)
                     NotifyReleasedSequence(batched, id, seen);
             }
+        }
+
+        /// <summary>Fail every running sequence the scheduler can no longer make
+        /// progress on (empty schedule + non-empty running set = KV-pool deadlock;
+        /// see the call site). Surfaces a clear capacity error to each client and
+        /// frees the blocks, so a subsequent step can admit any waiting requests
+        /// instead of the engine spinning forever.</summary>
+        private void FailStalledSequences()
+        {
+            var stalled = _scheduler.GetRunningSequencesSnapshot();
+            if (stalled.Count == 0) return;
+
+            var ex = new InvalidOperationException(
+                "KV cache capacity exceeded: the prompt is too long for the model's " +
+                "context / the configured KV block pool, and no running sequence could " +
+                "be scheduled or preempted to free blocks. Shorten the prompt, raise the " +
+                "context (MAX_CONTEXT), or enlarge the KV block pool (TS_SCHED_NUM_BLOCKS).");
+
+            _logger.LogError(
+                "Scheduler stalled: {Count} running sequence(s) cannot be scheduled " +
+                "(KV pool exhausted, nothing to preempt); failing them. Pool: {Free}/{Total} free blocks.",
+                stalled.Count, _pool.NumFreeBlocks, _pool.NumBlocks);
+
+            var released = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var seq in stalled)
+            {
+                if (seq == null) continue;
+                try
+                {
+                    if (_scheduler.NotifyError(seq, ex))
+                        released.Add(seq.RequestId);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogError(
+                        cleanupEx,
+                        "Failed to release scheduler state for stalled sequence {RequestId}",
+                        seq.RequestId);
+                    released.Add(seq.RequestId);
+                }
+
+                if (_handles.TryRemove(seq.RequestId, out var handle))
+                {
+                    LogMtpStatsIfAny(seq);
+                    handle.CompleteWithError(ex);
+                    Interlocked.Increment(ref _totalCompleted);
+                }
+            }
+
+            NotifyReleasedSequences(released);
         }
 
         private void FailStepSequences(Exception ex, SchedulerOutput output, string phase)
@@ -467,6 +538,44 @@ namespace TensorSharp.Runtime.Scheduling
             if (!model.SupportsKVStateSnapshot) return 0;
             long size = model.ComputeKVBlockByteSize(blockSize);
             return Math.Max(size, 0);
+        }
+
+        /// <summary>
+        /// Number of KV blocks to give the pool. Auto-sizes to the model's
+        /// advertised context length so an in-context prompt (up to the model's
+        /// max context) can never exhaust the block table mid-prefill. Without
+        /// this, a prompt longer than <c>NumBlocks * BlockSize</c> would prefill
+        /// until the pool is empty and then — being the only running sequence,
+        /// with nothing to preempt — get skipped by the scheduler every step,
+        /// producing an empty schedule forever (the engine spins with the GPU
+        /// idle: the reported "starts busy, then hangs" symptom). Host slabs are
+        /// allocated lazily (<see cref="Paged.PagedKvStorage"/>), so a pool sized
+        /// for the full context costs nothing until the prefix actually grows.
+        /// The operator can pin the count with <c>TS_SCHED_NUM_BLOCKS</c>, which
+        /// is honoured exactly (no auto-grow).
+        /// </summary>
+        private static int ResolveEffectiveNumBlocks(IModelArchitecture model, SchedulerConfig cfg, ILogger logger)
+        {
+            int numBlocks = cfg.NumBlocks;
+            bool explicitOverride = !string.IsNullOrEmpty(
+                Environment.GetEnvironmentVariable("TS_SCHED_NUM_BLOCKS"));
+            if (explicitOverride || cfg.BlockSize <= 0)
+                return numBlocks;
+
+            int ctx = model.MaxContextLength;
+            if (ctx <= 0)
+                return numBlocks;
+
+            int neededBlocks = (ctx + cfg.BlockSize - 1) / cfg.BlockSize;
+            if (neededBlocks > numBlocks)
+            {
+                logger?.LogInformation(
+                    "Sizing KV block pool to model context: {Ctx} tokens -> {Blocks} blocks of {BlockSize} " +
+                    "(configured default was {Old}). Override with TS_SCHED_NUM_BLOCKS.",
+                    ctx, neededBlocks, cfg.BlockSize, numBlocks);
+                numBlocks = neededBlocks;
+            }
+            return numBlocks;
         }
 
         private struct EngineCommand

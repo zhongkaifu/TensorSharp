@@ -611,6 +611,8 @@ namespace TensorSharp.Runtime.Scheduling
                 int[] inputTokens;
                 if (work.IsPrefill)
                 {
+                    if (seq.NumComputedTokens == 0)
+                        _model.PrepareForPrefill(seq.PromptTokens.Count);
                     inputTokens = BuildPrefillChunk(seq, work);
                 }
                 else
@@ -857,6 +859,10 @@ namespace TensorSharp.Runtime.Scheduling
                     int[] inputTokens;
                     if (work.IsPrefill)
                     {
+                        // Pre-size the KV cache to the whole prompt on the first chunk of
+                        // a fresh prefill (free at start_pos 0; avoids incremental grows).
+                        if (seq.NumComputedTokens == 0)
+                            _model.PrepareForPrefill(seq.PromptTokens.Count);
                         inputTokens = BuildPrefillChunk(seq, work);
                     }
                     else
@@ -1028,6 +1034,10 @@ namespace TensorSharp.Runtime.Scheduling
                     int[] inputTokens;
                     if (work.IsPrefill)
                     {
+                        // Pre-size the KV cache to the whole prompt on the first chunk of
+                        // a fresh prefill (free at start_pos 0; avoids incremental grows).
+                        if (seq.NumComputedTokens == 0)
+                            _model.PrepareForPrefill(seq.PromptTokens.Count);
                         inputTokens = BuildPrefillChunk(seq, work);
                     }
                     else

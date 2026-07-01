@@ -1,5 +1,5 @@
 {
-  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected. For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
+  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k / 32k / 64k / 128k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected (the long-context 32k/64k/128k lengths are registered but not in the default selection). For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
 
   "paths": {
     "model_root": "C:/Works/models",
@@ -95,7 +95,10 @@
     "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
     "prefill_4k": {"kind": "text", "description": "Prefill throughput @ ~4k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
     "prefill_8k": {"kind": "text", "description": "Prefill throughput @ ~8k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
-    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8}
+    "prefill_16k": {"kind": "text", "description": "Prefill throughput @ ~16k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_32k": {"kind": "text", "description": "Prefill throughput @ ~32k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_64k": {"kind": "text", "description": "Prefill throughput @ ~64k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
+    "prefill_128k": {"kind": "text", "description": "Prefill throughput @ ~128k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8}
   },
 
   "engines": {

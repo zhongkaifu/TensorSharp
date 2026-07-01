@@ -2536,7 +2536,13 @@ namespace TensorSharp.GGML
             IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
             IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
             IntPtr[] plePostNormArr,
-            byte[] isExceptArr = null)
+            byte[] isExceptArr = null,
+            IntPtr pleTokenEmbdData = default, int pleTokenEmbdType = 0,
+            long pleTokenEmbdNe0 = 0, long pleTokenEmbdNe1 = 0, long pleTokenEmbdBytes = 0,
+            int[] pleTokenIds = null,
+            IntPtr pleProjWData = default, int pleProjWType = 0,
+            long pleProjWNe0 = 0, long pleProjWNe1 = 0, long pleProjWBytes = 0,
+            IntPtr pleProjNormData = default)
         {
             return GgmlNative.Gemma4ModelVerify(
                 hiddenData, hiddenSize, numLayers, numTokens,
@@ -2560,7 +2566,13 @@ namespace TensorSharp.GGML
                 pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
                 pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
                 plePostNormArr,
-                isExceptArr);
+                isExceptArr,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenIds,
+                pleProjWData, pleProjWType,
+                pleProjWNe0, pleProjWNe1, pleProjWBytes,
+                pleProjNormData);
         }
 
         /// <summary>Fused Gemma 4 MTP draft step. Returns false when the native

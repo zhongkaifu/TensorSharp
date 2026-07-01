@@ -412,6 +412,10 @@ namespace TensorSharp.Models
         public int MaxContextLength => _maxContextLength;
         public int CacheSeqLen => _cacheSeqLen;
 
+        /// <summary>Prefill-length hint (see <see cref="IModelArchitecture.PrepareForPrefill"/>).
+        /// Default no-op; models with a grow-on-demand KV cache override to pre-size it.</summary>
+        public virtual void PrepareForPrefill(int totalPromptTokens) { }
+
         // Timing
         protected long _linearTicks;
         protected long _attnTicks;

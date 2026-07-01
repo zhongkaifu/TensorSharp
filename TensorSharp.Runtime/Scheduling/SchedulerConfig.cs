@@ -63,6 +63,24 @@ namespace TensorSharp.Runtime.Scheduling
         /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.</summary>
         public int SoloPrefillChunkSize { get; init; } = 8192;
 
+        /// <summary>Per-step prefill token cap for the TAIL (start_pos&gt;0) chunks of
+        /// a SOLO prompt — the part beyond the first <see cref="SoloPrefillChunkSize"/>
+        /// tokens. On models that serve start_pos&gt;0 prefill through their fused
+        /// flash-attention path (e.g. Gemma 4's in-kernel swaPrev window gather),
+        /// the tail is NOT on the slow per-op path: flash is O(seq) memory and never
+        /// materializes the attention-score tensor. The only per-chunk cost that
+        /// grows with the chunk is the causal mask (rebuilt + uploaded each chunk,
+        /// ~chunk×context), so the tail has a sweet spot distinct from both the
+        /// contended fairness chunk (<see cref="MaxPrefillChunkSize"/>) and the big
+        /// fresh chunk: large enough to amortize per-chunk graph-build/launch
+        /// overhead and keep the flash/GEMM kernels efficient, small enough to keep
+        /// the mask cheap. Measured on Gemma 4 E4B (16 GB) long prefill: 2048 beats
+        /// the old 1024 tail by ~3% and 8192 by ~6% (mask cost dominates past 2048).
+        /// Bounded by <see cref="SoloPrefillChunkSize"/> (the model already handles
+        /// a chunk that big for the fresh chunk, so this never raises the memory
+        /// ceiling). Default 2048. Env: <c>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</c>.</summary>
+        public int SoloTailPrefillChunkSize { get; init; } = 2048;
+
         /// <summary>Number of physical KV blocks in the pool. The total KV-cache
         /// budget is <c>NumBlocks * BlockSize</c> tokens. When the model exposes
         /// its preferred block size that value is used here.</summary>
@@ -110,6 +128,7 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxNumRunningSequences = ReadInt("TS_SCHED_MAX_RUNNING_SEQS", 16),
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 1024),
                 SoloPrefillChunkSize = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 8192),
+                SoloTailPrefillChunkSize = ReadInt("TS_SCHED_SOLO_TAIL_PREFILL_CHUNK", 2048),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
