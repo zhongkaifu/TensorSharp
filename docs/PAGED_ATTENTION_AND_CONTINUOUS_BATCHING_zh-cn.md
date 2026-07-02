@@ -186,13 +186,15 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | `TS_SCHED_DISABLE_BATCHED` | `0` | 设为 `1` 后，即使模型实现了 `IBatchedPagedModel` 也强制按序列 KV-swap 回退。 |
 | `TS_SCHED_MAX_BATCHED_TOKENS` | `4096` | 每步 token 预算。 |
 | `TS_SCHED_MAX_RUNNING_SEQS` | `16` | 最大同时执行序列数。 |
-| `TS_SCHED_PREFILL_CHUNK` | `1024` | 每步最多调度的 prefill token 数。 |
+| `TS_SCHED_PREFILL_CHUNK` | `1024` | 多个请求争用时每步最多调度的 prefill token 数（公平性分块）。CLI 别名：`--prefill-chunk-size N`。 |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求全新部分（start_pos = 0）的每步 prefill 上限——以大分块把 prompt 送入完全融合的整图 prefill 路径。 |
+| `TS_SCHED_SOLO_TAIL_PREFILL_CHUNK` | `2048` | solo prompt 在首个全新分块之后尾部（start_pos > 0）分块的每步上限。 |
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | `256` | 每块 token 数。 |
 | `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭块哈希前缀复用。 |
 | `TS_SCHED_DECODE_QUANTUM` | block size | 在偏回退路径中，允许切换序列前的 decode token 数。 |
-| `TS_BATCHED_N1_FAST_PATH` | `0` | 将符合条件的单序列步骤也走批处理路径，用于 A/B 测试。 |
-| `TS_KV_PAGED_QUANT_BITS` | `0` | 可选 TurboQuant 分页 KV 块编码位数（`4` 或 `8`）；带递归状态的模型可能回退到 passthrough。 |
+| `TS_BATCHED_N1_FAST_PATH` | `1` | solo 单序列步骤走融合 N=1 快速路径 decode；设为 `0` 可强制这些步骤走完全批处理路径（A/B 测试）。 |
+| `TS_KV_PAGED_QUANT_BITS` | `0` | 可选 TurboQuant 分页 KV 块编码位数（`2`、`4` 或 `8`）；带递归状态的模型可能回退到 passthrough。 |
 | `TS_MTP_SPEC` | `0` | `1` 为单序列启用 MTP / NextN 投机解码（CLI `--mtp-spec`）。 |
 | `TS_MTP_DRAFT` | `8` | 每个投机步最多起草的 token 数（CLI `--mtp-draft`）。 |
 | `TS_MTP_PMIN` | `0.75` | 保留草稿 token 所需的最低草稿置信度（CLI `--mtp-pmin`）。 |
@@ -209,10 +211,17 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 --no-continuous-batching   # 设置 TS_SCHED_DISABLE_BATCHED=1
 --paged-batching           # --continuous-batching 的别名
 --no-paged-batching        # --no-continuous-batching 的别名
+--prefill-chunk-size N     # 设置 TS_SCHED_PREFILL_CHUNK
 ```
 
 旧的 `--paged-kv*` 参数只为已移除的独立按会话分页 KV 管理器保留兼容。当前
 服务端请求 KV 状态由 `InferenceEngine` 持有。
+
+与分页 TurboQuant 编解码器（`TS_KV_PAGED_QUANT_BITS`）相互独立，KV cache 本身也可以用
+`--kv-cache-dtype <f32|f16|q8_0|q4_0>`（或 `KV_CACHE_DTYPE` 环境变量）以更低精度存储，
+CLI 与服务端均支持。默认是 `f32`；块量化档位（`q8_0`、`q4_0`）要求原生 GGML
+flash-attention 路径，`q4_0`（约为 f32 的 1/7）面向 KV cache 主导内存占用的
+128K–256K 超长上下文。
 
 ## 后续工作
 

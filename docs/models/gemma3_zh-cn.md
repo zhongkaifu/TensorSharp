@@ -193,6 +193,10 @@ output.weight                              # LM head（若 tied 则缺失）
 
 `Forward(int[] tokens)` 逐层运行 `TransformerBlock`。Gemma 3 当前没有融合的整模型 GGML kernel —— 所有算子各自调度，是下方优化机会的目标之一。
 
+### 7.1 多模态注入
+
+当 `_pendingVisionEmbeddingsList` 非空时，会在层循环之前调用 `InjectVisionEmbeddings()`。该列表由多模态注入器（`TensorSharp.Models/ModelMultimodalInjector.cs`）填充：它对每个唯一的图像路径只运行一次图像处理器 + 视觉编码器，并缓存得到的 `[TokensPerImage, hidden]` embedding 张量。
+
 ## 8. Prefill 路径
 
 Prefill 走多 token 的标准托管路径：

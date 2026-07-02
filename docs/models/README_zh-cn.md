@@ -82,8 +82,8 @@
 | MTP / NextN 投机解码 | 否 | 是（独立 `gemma4-assistant` 草稿 GGUF） | 否 | 否 | Qwen 3.6 支持（内嵌 NextN 块） | 否 | 否 | 否 |
 | 融合 QKV | 否 | 是 | 是 | 是 | 混合（attention 层拆开，递归层融合 5 路） | 是 | 是 | 是 |
 | 融合单调用 decode | 否 | 是（Gemma4ModelDecode） | 是（DiffusionModelDecode + lm-head tail） | 是（TransformerModelDecode，原生循环） | per-layer 融合（Qwen35AttentionLayerDecode、FusedOutProjFFN、FusedOutProjNormRouter） | per-layer | per-layer / 批量 MoE | 否 |
-| 融合单调用 prefill | 否 | 是（Gemma4LayerPrefill，密集层） | prompt-KV prefill cache | 否 | 是（FusedPrefillAttention、FusedOutProjFFN、MoE prefill） | 是（MoE prefill via mul_mat_id） | 否 | 否 |
-| 批量 GPU MoE | n/a | 待实现 | 融合单 canvas MoE；并发请求由 diffusion scheduler 批处理 | n/a | 是（routed + shared + residual 融合） | 是（stacked weight slabs） | 是 | n/a |
+| 融合单调用 prefill | 否 | 是（整模型 NativeGemma4ModelVerify + 逐层 Gemma4LayerPrefill 回退） | prompt-KV prefill cache | 否 | 是（FusedPrefillAttention、FusedOutProjFFN、MoE prefill） | 是（MoE prefill via mul_mat_id） | 否 | 否 |
+| 批量 GPU MoE | n/a | 全 MoE 变体已支持（融合整模型 MoE decode/verify）；混合 dense+MoE 待实现 | 融合单 canvas MoE；并发请求由 diffusion scheduler 批处理 | n/a | 是（routed + shared + residual 融合） | 是（stacked weight slabs） | 是 | n/a |
 | 融合视觉编码器 | n/a | 标准 | n/a | n/a | 是（FusedVisionAttention + FusedVisionMLP） | n/a | 标准（RADIO ViT） | 标准（Pixtral） |
 | 输出解析器 | `PassthroughOutputParser` | `Gemma4OutputParser` | `PassthroughOutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser`（始终启用） | `Qwen3OutputParser` | `PassthroughOutputParser` |
 
