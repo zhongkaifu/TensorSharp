@@ -20,6 +20,7 @@ matrix and feature comparison.
 | GPT OSS | [models/gptoss.md](models/gptoss.md) | [models/gptoss_zh-cn.md](models/gptoss_zh-cn.md) |
 | Nemotron-H | [models/nemotron.md](models/nemotron.md) | [models/nemotron_zh-cn.md](models/nemotron_zh-cn.md) |
 | Mistral 3 | [models/mistral3.md](models/mistral3.md) | [models/mistral3_zh-cn.md](models/mistral3_zh-cn.md) |
+| Qwen-Image-Edit | [models/qwenimage.md](models/qwenimage.md) | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) |
 
 Each card walks an engineer or researcher from "I have never heard of this
 model" to "I can explain the forward graph and reproduce the inference path

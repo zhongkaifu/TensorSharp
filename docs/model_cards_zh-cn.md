@@ -19,6 +19,7 @@
 | GPT OSS | [models/gptoss_zh-cn.md](models/gptoss_zh-cn.md) | [models/gptoss.md](models/gptoss.md) |
 | Nemotron-H | [models/nemotron_zh-cn.md](models/nemotron_zh-cn.md) | [models/nemotron.md](models/nemotron.md) |
 | Mistral 3 | [models/mistral3_zh-cn.md](models/mistral3_zh-cn.md) | [models/mistral3.md](models/mistral3.md) |
+| Qwen-Image-Edit | [models/qwenimage_zh-cn.md](models/qwenimage_zh-cn.md) | [models/qwenimage.md](models/qwenimage.md) |
 
 每张卡片会把工程师或研究员从“从未听说过这个模型”带到“可以解释它的前向计算图，
 并能在 TensorSharp 中复现推理路径”，统一覆盖：
