@@ -80,6 +80,7 @@
     <li><strong>Qwen2.5-VL-7B 文本编码器</strong> —— 提示词 → 3584 维条件，外加可选的 <code>mmproj</code> 视觉塔以实现图像接地编辑。</li>
   </ul>
   <p>将伴随文件放在 DiT GGUF 旁，或用 <code>TS_QWEN_IMAGE_VAE</code> / <code>TS_QWEN_IMAGE_TE</code> / <code>TS_QWEN_IMAGE_MMPROJ</code> 指定（CLI：<code>--qwen-image-vae</code> / <code>--qwen-image-vl</code> / <code>--qwen-image-mmproj</code>）。流水线对参考图做 VAE 编码、构建条件、运行带参考潜变量拼接的 FlowMatch-Euler true-CFG 去噪循环，再 VAE 解码回像素。整个 60 块 DiT 前向被 CUDA 图捕获，flash 注意力默认开启；除非固定宽/高，否则目标面积按设备 VRAM 预算自动钳制。</p>
+  <p>可选的 <strong>Lightning 蒸馏 LoRA</strong>（<code>--qwen-image-lora</code> / <code>TS_QWEN_IMAGE_LORA</code>，<code>.safetensors</code>）会在加载时合并进 DiT——自动推导减少后的去噪步数（如 4 或 8），并将 CFG 切换为 1.0，跳过负向分支。去噪循环还可由<strong>整步 DiT 缓存</strong>（EasyCache 风格；<code>TS_QWEN_DIT_CACHE_MODE</code> = <code>easycache</code> / <code>fbc</code>）进一步加速：当某个 DiT 步的输出可由上一步预测时直接跳过。</p>
   <p>可从 <a href="cli_zh-cn.html#imageedit">CLI</a>（<code>--image</code> + <code>--prompt</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 图像编辑流程（含实时去噪预览），或在进程内从 <a href="code-api_zh-cn.html#imageedit">C# 通过 <code>QwenImageModel.EditImage()</code></a> 运行。完整细节见仓库的 <code>docs/models/qwenimage_zh-cn.md</code> 卡片。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>

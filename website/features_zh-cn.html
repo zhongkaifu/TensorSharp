@@ -39,7 +39,7 @@
     <li><strong>混合 SSM-Transformer</strong> —— Nemotron-H 在一个模型中混合 Mamba2 SSM 层、注意力层与 MoE FFN。</li>
     <li><strong>混合注意力-循环</strong> —— Qwen 3.5/3.6-family 将全注意力层与 GatedDeltaNet 循环层混合。</li>
     <li><strong>文本扩散生成</strong> —— DiffusionGemma 使用迭代式 EntropyBound 去噪采样器，而非自回归解码。→ <a href="advanced_zh-cn.html#diffusion">DiffusionGemma</a></li>
-    <li><strong>图像编辑（Qwen-Image-Edit）</strong> —— 提示词 + 输入图像，经 60 块 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器生成编辑后的图像（FlowMatch-Euler true-CFG、CUDA 图捕获的 DiT 前向）。→ <a href="models_zh-cn.html#imageedit">图像编辑</a></li>
+    <li><strong>图像编辑（Qwen-Image-Edit）</strong> —— 提示词 + 输入图像，经 60 块 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL-7B 文本编码器生成编辑后的图像（FlowMatch-Euler true-CFG、CUDA 图捕获的 DiT 前向）；可选的 Lightning 蒸馏 LoRA（<code>--qwen-image-lora</code>）能以 CFG 1.0 将去噪循环缩减到寥寥几步。→ <a href="models_zh-cn.html#imageedit">图像编辑</a></li>
   </ul>
 
   <h2 id="generation">生成与控制</h2>
@@ -61,7 +61,7 @@
     <li><strong>MTP / NextN 推测解码</strong> —— 多 token 预测草稿头加速单序列解码；因请求自身的采样器同时驱动草稿与验证，故无损。→ <a href="advanced_zh-cn.html#mtp">推测解码</a></li>
     <li><strong>原生量化计算</strong> —— 量化权重直接用于 matmul，无需展开为 FP32，节省内存与带宽。</li>
     <li><strong>优化的纯 C# CPU 后端</strong> —— 托管 GEMM 快路径，外加 RMSNorm、RoPE、softmax 与融合激活的融合 SIMD 内核。</li>
-    <li><strong>KV 缓存编解码器</strong> —— 可插拔的 <code>IKvBlockCodec</code>，内置面向分页块的 TurboQuant（Q4 / Q8）压缩编解码器。</li>
+    <li><strong>KV 缓存编解码器</strong> —— 可插拔的 <code>IKvBlockCodec</code>，内置面向分页块的 TurboQuant（Q2 / Q4 / Q8）压缩编解码器。</li>
   </ul>
 
   <h2 id="interfaces">接口与集成</h2>

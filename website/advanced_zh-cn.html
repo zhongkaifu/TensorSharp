@@ -75,7 +75,7 @@
   <ul>
     <li><strong>融合 GPU decode</strong>（Gemma 4）—— 所有 transformer 层在一次 GGML 图分派中完成，把每 token 的 CPU↔GPU 往返从数百次降到一次（相对逐 op 分派约 2.6×）。</li>
     <li><strong>融合 GPU prefill</strong>（Gemma 4）—— 在 prefill 期间，dense 层每层一次分派完成整块（归一化、QKV、RoPE、注意力、FFN、残差）。</li>
-    <li><strong>分块 prefill</strong>（Gemma 4）—— 长提示被切成有界块，避免滑动窗口层产生 O(n²) 的注意力分数张量。</li>
+    <li><strong>分块 prefill</strong>（Gemma 4）—— 长提示被切成有界块，避免滑动窗口层产生 O(n²) 的注意力分数张量。独占（无竞争）请求采用拆分的分块大小：全新的 <code>start_pos = 0</code> 分块以 <code>TS_SCHED_SOLO_PREFILL_CHUNK</code>（默认 8192）走融合整图路径，其余尾部按 <code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code>（默认 2048）处理。</li>
     <li><strong>融合 Qwen 3.5/3.6 注意力与 FFN</strong> —— 单图融合注意力层 decode、融合 prefill 注意力、融合 out-proj + FFN，以及融合视觉编码器块（约 15 op → 2）。</li>
     <li><strong>原生量化计算</strong> —— Q4_K_M、Q6_K、Q8_0、IQ2_XXS、MXFP4 直接用于 matmul 而不展开为 FP32；批量 <code>AddmmQuantBatch</code> 在一次分派中处理多个子权重 matmul。</li>
     <li><strong>批量 GPU MoE</strong> —— 所有被选专家（加上可选的共享专家与残差相加）在每个 MoE 层折叠为一次 GGML 图分派。</li>
@@ -88,7 +88,7 @@
     <li><strong>零拷贝文件映射权重</strong> —— GGUF 被内存映射，量化张量直接绑定进原生运算，去掉了大致使常驻内存翻倍的逐张量拷贝。例如 <code>Qwen3.5-35B-A3B-IQ2_XXS</code>（约 10 GB GGUF）在 Metal 下峰值约 7 GB，而非约 17 GB。</li>
     <li><strong>最佳匹配内存池</strong>，带有界保留（块上限 64 MB，池上限 32 块），让长时间运行中工作集保持紧凑。</li>
     <li><strong>带可选 SSD 溢出的分页 KV 块池</strong> —— RAM 上限、LRU 淘汰，并跨会话做内容哈希前缀复用。</li>
-    <li><strong>KV 块编解码器</strong> —— 通过 <code>--paged-kv-quant-bits</code> 用 <code>TurboQuantKvCodec</code>（Q4 / Q8）做可选的原地压缩，以很小的精度代价换取每块占用减半 / 减至四分之一。</li>
+    <li><strong>KV 块编解码器</strong> —— 通过 <code>--paged-kv-quant-bits</code> 用 <code>TurboQuantKvCodec</code>（Q2 / Q4 / Q8）做可选的原地压缩，以很小的精度代价换取每块占用减半 / 减至四分之一。</li>
   </ul>
 
   <div class="content-footer">

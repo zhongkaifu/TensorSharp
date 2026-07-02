@@ -29,22 +29,22 @@ window.SEARCH_INDEX_ZH = [
   { t: "支持的模型", p: "模型", u: "models.html#table", s: "Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Qwen-Image-Edit。", k: "architectures 架构 家族 gemma qwen gptoss nemotron mistral 图像 编辑" },
   { t: "模型下载（GGUF）", p: "模型", u: "models.html#downloads", s: "每个受支持架构的 Hugging Face 链接。", k: "huggingface 权重 下载" },
   { t: "多模态：图像、视频、音频", p: "模型", u: "models.html#multimodal", s: "Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像。", k: "vision 视觉 图像 音频 视频 mmproj 投影器" },
-  { t: "图像编辑（Qwen-Image-Edit）", p: "模型", u: "models.html#imageedit", s: "提示词 + 输入图像 -> 编辑后的图像，经 qwen_image MMDiT、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。", k: "qwen 图像 编辑 mmdit 扩散 vae flowmatch cfg 图片 照片" },
+  { t: "图像编辑（Qwen-Image-Edit）", p: "模型", u: "models.html#imageedit", s: "提示词 + 输入图像 -> 编辑后的图像，经 qwen_image MMDiT、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。", k: "qwen 图像 编辑 mmdit 扩散 vae flowmatch cfg 图片 照片 lora qwen-image-lora lightning step cache easycache fbc dit 步缓存" },
   { t: "思考 / 推理模式", p: "模型", u: "models.html#thinking", s: "Qwen、Gemma 4、GPT OSS、Nemotron-H 带 think 标签的结构化思维链。", k: "reasoning 推理 思维链 think cot" },
   { t: "工具调用 / 函数调用", p: "模型", u: "models.html#toolcalling", s: "模型调用用户自定义工具；跨三种 API 风格的多轮。", k: "functions 函数 工具 agent 智能体" },
 
   { t: "CLI 示例", p: "CLI", u: "cli.html#examples", s: "文本、图像、视频、音频、思考、工具、批处理 JSONL、基准测试。", k: "command line 命令行 控制台 示例" },
-  { t: "CLI 选项参考", p: "CLI", u: "cli.html#options", s: "--model、--input、--backend、--max-tokens、采样参数等。", k: "flags 参数 选项" },
+  { t: "CLI 选项参考", p: "CLI", u: "cli.html#options", s: "--model、--input、--backend、--max-tokens、采样参数等。", k: "flags 参数 选项 kv-cache-dtype q4_0 kv 缓存 精度 qwen-image-lora lora" },
   { t: "交互式 REPL 命令", p: "CLI", u: "cli.html#repl", s: "斜杠命令：/reset、/system、/think、/model、/backend、/image、/temp。", k: "chat repl 交互 斜杠命令" },
   { t: "批处理（JSONL）", p: "CLI", u: "cli.html#jsonl", s: "用 --input-jsonl 从 JSONL 文件运行大量提示词。", k: "batch 批处理 jsonl 多轮" },
   { t: "DiffusionGemma 生成", p: "CLI", u: "cli.html#diffusion", s: "--diffusion-steps、--diffusion-seed、--diffusion-blocks 文本扩散。", k: "diffusion 扩散 去噪 entropybound" },
-  { t: "图像编辑（CLI）", p: "CLI", u: "cli.html#imageedit", s: "Qwen-Image-Edit：--image、--prompt、--output、--cfg、--diffusion-steps；伴随文件覆盖 --qwen-image-vae/-vl/-mmproj。", k: "qwen 图像 编辑 cli 命令 图片 照片 cfg" },
+  { t: "图像编辑（CLI）", p: "CLI", u: "cli.html#imageedit", s: "Qwen-Image-Edit：--image、--prompt、--output、--cfg、--diffusion-steps；伴随文件覆盖 --qwen-image-vae/-vl/-mmproj。", k: "qwen 图像 编辑 cli 命令 图片 照片 cfg lora qwen-image-lora lightning" },
 
   { t: "启动服务器", p: "服务器", u: "server.html#start", s: "./TensorSharp.Server --model model.gguf --backend ggml_metal —— 提供 http://localhost:5000。", k: "web 服务器 托管 运行 端口" },
-  { t: "服务器选项", p: "服务器", u: "server.html#options", s: "--model、--mmproj、--backend、--max-tokens、默认采样、批处理参数。", k: "flags 参数 选项" },
+  { t: "服务器选项", p: "服务器", u: "server.html#options", s: "--model、--mmproj、--backend、--max-tokens、默认采样、批处理参数。", k: "flags 参数 选项 prefill-chunk-size kv-cache-dtype q4_0 qwen-image-lora lora" },
   { t: "Web UI 功能", p: "服务器", u: "server.html#webui", s: "浏览器聊天：多轮、上传、思考开关、工具调用、流式、消息编辑。", k: "browser 浏览器 聊天机器人 ui 前端" },
   { t: "服务器环境变量", p: "服务器", u: "server.html#env", s: "BACKEND、MAX_TOKENS、PORT、调度器与 MLX 调参。", k: "env 环境变量 配置 TS_SCHED" },
-  { t: "连续批处理调参", p: "服务器", u: "server.html#tunables", s: "用于分页 KV 块、运行序列、prefill 分块的 TS_SCHED_* 旋钮。", k: "scheduler 调度器 分页 kv 调优" },
+  { t: "连续批处理调参", p: "服务器", u: "server.html#tunables", s: "用于分页 KV 块、运行序列、prefill 分块的 TS_SCHED_* 旋钮。", k: "scheduler 调度器 分页 kv 调优 solo prefill chunk 独占 decode quantum TS_SCHED_SOLO_PREFILL_CHUNK" },
 
   { t: "兼容 Ollama 的 API", p: "HTTP API", u: "http-api.html#ollama", s: "/api/generate、/api/chat/ollama、/api/tags、/api/show，附 curl 示例。", k: "ollama rest 端点 curl generate chat" },
   { t: "兼容 OpenAI 的 API", p: "HTTP API", u: "http-api.html#openai", s: "/v1/chat/completions 与 /v1/models —— OpenAI 客户端即插即用。", k: "openai chat completions v1 兼容" },
@@ -64,17 +64,17 @@ window.SEARCH_INDEX_ZH = [
   { t: "连续批处理与分页 KV 缓存", p: "高级", u: "advanced.html#continuous-batching", s: "vLLM 式分页 KV 池、块哈希前缀共享、迭代级调度器。", k: "vllm 分页注意力 调度器 批处理" },
   { t: "分页注意力", p: "高级", u: "advanced.html#paged-kv", s: "原生 TSGgml_PagedAttentionForward 在 Metal/CUDA 上驱动 ggml_flash_attn_ext。", k: "flash 闪存注意力 kv 块" },
   { t: "MTP / NextN 推测解码", p: "高级", u: "advanced.html#mtp", s: "草稿头提出 token；主干一次批量前向验证。--mtp-spec。", k: "speculative 推测 解码 草稿 eagle nextn qwen gemma" },
-  { t: "性能优化", p: "高级", u: "advanced.html#perf", s: "融合 GPU decode/prefill、原生量化计算、批量 MoE、KV 前缀复用。", k: "fused 融合 内核 速度 优化 gpu" },
-  { t: "内存优化", p: "高级", u: "advanced.html#memory", s: "零拷贝 mmap 权重、最佳匹配池、SSD KV 溢出、KV 编解码器。", k: "memory 内存 mmap 占用 ram" },
+  { t: "性能优化", p: "高级", u: "advanced.html#perf", s: "融合 GPU decode/prefill、原生量化计算、批量 MoE、KV 前缀复用。", k: "fused 融合 内核 速度 优化 gpu solo prefill chunk 独占" },
+  { t: "内存优化", p: "高级", u: "advanced.html#memory", s: "零拷贝 mmap 权重、最佳匹配池、SSD KV 溢出、KV 编解码器。", k: "memory 内存 mmap 占用 ram turboquant q2 q4 q8 paged-kv-quant-bits kv 编解码器" },
   { t: "DiffusionGemma 文本扩散", p: "高级", u: "advanced.html#diffusion", s: "在 Gemma-4 MoE 主干上的块式 EntropyBound 去噪。", k: "diffusion 扩散 去噪 文本生成" },
 
   { t: "同台对比 vs llama.cpp", p: "基准测试", u: "benchmarks.html#head-to-head", s: "纯 .NET 的 TensorSharp 在相同 GGUF + GPU 下与 llama.cpp 互有胜负：26B-A4B MoE 的 prefill 1.32× / TTFT 1.30×（几何平均，单场景最高 1.70× / 1.65×）；12B 在每个 decode 场景打平或获胜（1.17×）；E4B 上 JSON 模式 decode 7.7×；工具调用 decode 最高 2.37×。", k: "llama.cpp 对比 更快 加速 几何平均 moe prefill ttft 多轮 json 结构化输出 工具调用 decode 持平 vs versus" },
   { t: "基准测试", p: "基准测试", u: "benchmarks.html#head-to-head", s: "在相同 GGUF 文件与硬件上对比 llama.cpp 的同台评测。", k: "performance 性能 数字 吞吐 每秒 token" },
   { t: "测试", p: "基准测试", u: "benchmarks.html#testing", s: "xUnit 单元测试与服务器集成测试。", k: "tests 测试 xunit 集成 ci" },
 
-  { t: "CLI 参数参考", p: "API 参考", u: "api-reference.html#cli-flags", s: "TensorSharp.Cli 命令行选项完整表。", k: "reference 参考 参数 cli 选项 表" },
-  { t: "服务器参数参考", p: "API 参考", u: "api-reference.html#server-flags", s: "TensorSharp.Server 命令行选项完整表。", k: "reference 参考 参数 服务器 选项 表" },
-  { t: "环境变量", p: "API 参考", u: "api-reference.html#env-vars", s: "运行时、调度器、MTP、MLX 与扩散环境变量。", k: "env 环境变量 TS_ 参考" },
+  { t: "CLI 参数参考", p: "API 参考", u: "api-reference.html#cli-flags", s: "TensorSharp.Cli 命令行选项完整表。", k: "reference 参考 参数 cli 选项 表 qwen-image-lora lora q4_0 kv 缓存 精度 paged-kv-quant-bits" },
+  { t: "服务器参数参考", p: "API 参考", u: "api-reference.html#server-flags", s: "TensorSharp.Server 命令行选项完整表。", k: "reference 参考 参数 服务器 选项 表 prefill-chunk-size kv-cache-dtype qwen-image-lora lora" },
+  { t: "环境变量", p: "API 参考", u: "api-reference.html#env-vars", s: "运行时、调度器、MTP、MLX 与扩散环境变量。", k: "env 环境变量 TS_ 参考 KV_CACHE_DTYPE TS_QWEN_IMAGE_LORA TS_QWEN_DIT_CACHE step cache easycache 步缓存 solo prefill chunk decode quantum" },
   { t: "HTTP 端点", p: "API 参考", u: "api-reference.html#endpoints", s: "Ollama、OpenAI、Web UI 与工具端点集于一表。", k: "rest 端点 路由 api 参考" },
   { t: "采样参数参考", p: "API 参考", u: "api-reference.html#sampling-params", s: "Ollama 风格与 OpenAI 风格的采样字段与默认值。", k: "采样 参考 温度 默认" },
   { t: "C# 公共 API", p: "API 参考", u: "api-reference.html#csharp", s: "ModelBase、SamplingConfig、ITokenizer、BackendType 与关键接口。", k: "csharp 类 接口 api 参考" },
@@ -84,5 +84,5 @@ window.SEARCH_INDEX_ZH = [
   { t: "FAQ", p: "术语表", u: "glossary.html#faq", s: "常见问题：选哪个模型、哪个后端、是否需要 GPU、隐私、许可证。", k: "questions 问题 帮助 故障排查" },
   { t: "GGUF 是什么？", p: "术语表", u: "glossary.html#terms", s: "TensorSharp 加载的单文件模型格式，含量化权重与元数据。", k: "gguf 格式 量化" },
   { t: "量化是什么？", p: "术语表", u: "glossary.html#terms", s: "把权重压缩到更少位数（Q4_K_M、Q8_0），以适配内存并更快运行。", k: "量化 q4 q8 位" },
-  { t: "KV 缓存是什么？", p: "术语表", u: "glossary.html#terms", s: "存储的注意力键/值，使多轮与长上下文更高效。", k: "kv 缓存 注意力 复用" }
+  { t: "KV 缓存是什么？", p: "术语表", u: "glossary.html#terms", s: "存储的注意力键/值，使多轮与长上下文更高效。", k: "kv 缓存 注意力 复用 dtype 精度 q4_0 q8_0" }
 ];

@@ -75,7 +75,7 @@
   <ul>
     <li><strong>Fused GPU decode</strong> (Gemma 4) — all transformer layers in a single GGML graph dispatch, cutting CPU↔GPU round-trips from hundreds per token to one (~2.6× over per-op dispatch).</li>
     <li><strong>Fused GPU prefill</strong> (Gemma 4) — dense layers run the whole block (norms, QKV, RoPE, attention, FFN, residuals) as one dispatch per layer during prefill.</li>
-    <li><strong>Chunked prefill</strong> (Gemma 4) — long prompts are split into bounded chunks to avoid O(n²) attention score tensors for sliding-window layers.</li>
+    <li><strong>Chunked prefill</strong> (Gemma 4) — long prompts are split into bounded chunks to avoid O(n²) attention score tensors for sliding-window layers. A solo (uncontended) request gets a split chunk size: the fresh <code>start_pos = 0</code> chunk runs through the fused whole-graph path at <code>TS_SCHED_SOLO_PREFILL_CHUNK</code> (default 8192), the remaining tail at <code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code> (default 2048).</li>
     <li><strong>Fused Qwen 3.5/3.6 attention &amp; FFN</strong> — single-graph fused attention-layer decode, fused prefill attention, fused out-proj + FFN, and fused vision encoder blocks (~15 ops → 2).</li>
     <li><strong>Native quantized compute</strong> — Q4_K_M, Q6_K, Q8_0, IQ2_XXS, MXFP4 used directly in matmul without expanding to FP32; a batched <code>AddmmQuantBatch</code> handles multiple sub-weight matmuls in one dispatch.</li>
     <li><strong>Batched GPU MoE</strong> — all selected experts (plus the optional shared expert and residual add) collapse into a single GGML graph dispatch per MoE layer.</li>
@@ -88,7 +88,7 @@
     <li><strong>Zero-copy file-mapped weights</strong> — the GGUF is memory-mapped and quantized tensors bind directly into native ops, removing a per-tensor copy that roughly doubled the resident set. Example: <code>Qwen3.5-35B-A3B-IQ2_XXS</code> (~10 GB GGUF) runs at ~7 GB peak under Metal instead of ~17 GB.</li>
     <li><strong>Best-fit memory pool</strong> with bounded retention (blocks capped at 64 MB, pool at 32 blocks) keeps the working set tight across long runs.</li>
     <li><strong>Paged KV block pool with optional SSD spillover</strong> — RAM-capped, LRU-evicted, with content-hash prefix reuse across sessions.</li>
-    <li><strong>KV block codecs</strong> — optional in-place compression with <code>TurboQuantKvCodec</code> (Q4 / Q8) via <code>--paged-kv-quant-bits</code>, trading a small accuracy cost for half/quarter the per-block footprint.</li>
+    <li><strong>KV block codecs</strong> — optional in-place compression with <code>TurboQuantKvCodec</code> (Q2 / Q4 / Q8) via <code>--paged-kv-quant-bits</code>, trading a small accuracy cost for half/quarter the per-block footprint.</li>
   </ul>
 
   <div class="content-footer">

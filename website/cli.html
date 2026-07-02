@@ -62,7 +62,7 @@
 # --qwen-image-vl / --qwen-image-mmproj).
 ./TensorSharp.Cli --model &lt;qwen-image-edit-DiT.gguf&gt; --image input.png \
     --prompt "Make the sky a dramatic sunset." --output edited.png \
-    --backend ggml_cuda --diffusion-steps 30 --cfg 4.0 --diffusion-seed 0</code></pre>
+    --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0</code></pre>
 
   <h3 id="diffusion">DiffusionGemma &amp; inspection</h3>
   <pre data-lang="bash"><code># DiffusionGemma text-diffusion generation
@@ -111,7 +111,7 @@
     <tbody>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Maximum tokens to generate (default: 100).</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>Compute backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
-      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, or <code>q8_0</code>.</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, or <code>q4_0</code>. The block-quantized tiers require the native GGML flash-attention path; <code>q4_0</code> (~1/7 the f32 footprint) targets very long 128K–256K contexts.</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL (see below).</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the session's system prompt from text or a file.</td></tr>
       <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode (chain-of-thought).</td></tr>
@@ -145,8 +145,9 @@
       <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma deterministic sampler seed (default: 0).</td></tr>
       <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>Block-autoregressive canvas count (<code>0</code> derives it from <code>--max-tokens</code>).</td></tr>
       <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-Edit: input image, edit instruction, and output PNG (default <code>edited.png</code>). Reuses <code>--diffusion-steps</code> / <code>--diffusion-seed</code>.</td></tr>
-      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG guidance scale (default: 4.0; <code>&lt;= 1</code> disables the negative pass).</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG guidance scale (omit for auto: 2.5, or 1.0 when a Lightning LoRA is loaded; <code>&lt;= 1</code> disables the negative pass).</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-Edit companion GGUFs (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning distillation LoRA (<code>.safetensors</code>), merged into the DiT at load time; auto-derives the denoise step count (e.g. 4 or 8) and switches CFG to 1.0 (no negative pass).</td></tr>
       <tr><td><code>--benchmark</code></td><td>Run a synthetic prefill/decode throughput benchmark.</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>Synthetic prefill length, decode length, and run count.</td></tr>
       <tr><td><code>--bench-kvcache</code> / <code>--bench-kv-turns &lt;N&gt;</code></td><td>Multi-turn KV-cache reuse benchmark (with-cache vs forced-reset).</td></tr>

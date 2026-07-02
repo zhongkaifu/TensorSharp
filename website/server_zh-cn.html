@@ -68,6 +68,10 @@
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>每个推测步草拟的最大 token 数（默认 <code>8</code>）。</td></tr>
       <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>保留某 token 所需的草稿头最低置信度（默认 <code>0.75</code>）。</td></tr>
       <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>独立的 MTP 草稿 GGUF（Gemma 4 的 <code>gemma4-assistant</code>）；Qwen 3.6 会忽略。</td></tr>
+      <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>每个调度步的最大 prefill token 数（设置 <code>TS_SCHED_PREFILL_CHUNK</code>）。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（环境变量 <code>KV_CACHE_DTYPE</code>；<code>q4_0</code> 面向 128K–256K 超长上下文）。</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>），合并进 DiT；自动推导去噪步数，并将 CFG 切换为 1.0。</td></tr>
     </tbody>
   </table>
   </div>
@@ -101,6 +105,9 @@
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>每步 token 预算（默认 <code>4096</code>）。</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>最大在飞序列数（默认 <code>16</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>每步最大 prefill token 数（默认 <code>1024</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>独占 / 无竞争请求全新 <code>start_pos = 0</code> 阶段的 prefill 分块（默认 <code>8192</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code></td><td>独占提示词的尾部分块（默认 <code>2048</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（默认 <code>256</code> = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>引擎池中的物理块数（默认 <code>256</code>） / 每块 token 数（默认 <code>256</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用跨请求的块哈希前缀共享。</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>逐模型的逃生口（如 <code>TS_GEMMA4_BATCHED=0</code>），回退到逐序列 KV 交换。</td></tr>

@@ -68,6 +68,10 @@
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>Max tokens drafted per speculative step (default <code>8</code>).</td></tr>
       <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>Minimum draft-head confidence to keep a token (default <code>0.75</code>).</td></tr>
       <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>Separate MTP draft GGUF (Gemma 4's <code>gemma4-assistant</code>); ignored for Qwen 3.6.</td></tr>
+      <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>Maximum prefill tokens per scheduler step (sets <code>TS_SCHED_PREFILL_CHUNK</code>).</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, or <code>q4_0</code> (env <code>KV_CACHE_DTYPE</code>; <code>q4_0</code> targets very long 128K–256K contexts).</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-Edit companion GGUFs (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning distillation LoRA (<code>.safetensors</code>) merged into the DiT; auto-derives the denoise step count and switches CFG to 1.0.</td></tr>
     </tbody>
   </table>
   </div>
@@ -101,6 +105,9 @@
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>Per-step token budget (default <code>4096</code>).</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>Maximum in-flight sequences (default <code>16</code>).</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>Maximum prefill tokens per step (default <code>1024</code>).</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>Prefill chunk for the fresh <code>start_pos = 0</code> pass of a solo / uncontended request (default <code>8192</code>).</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code></td><td>Tail chunks of a solo prompt (default <code>2048</code>).</td></tr>
+      <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>Decode tokens before a sequence switch (default <code>256</code> = block size).</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>Physical blocks in the engine pool (default <code>256</code>) / tokens per block (default <code>256</code>).</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables block-hash prefix sharing across requests.</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>Per-model escape hatch (e.g. <code>TS_GEMMA4_BATCHED=0</code>) to fall back to per-sequence KV-swap.</td></tr>

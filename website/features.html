@@ -39,7 +39,7 @@
     <li><strong>Hybrid SSM-Transformer</strong> — Nemotron-H mixes Mamba2 SSM layers, attention layers, and MoE FFN in one model.</li>
     <li><strong>Hybrid Attention-Recurrent</strong> — Qwen 3.5/3.6-family mix full-attention layers with GatedDeltaNet recurrent layers.</li>
     <li><strong>Text-diffusion generation</strong> — DiffusionGemma uses an iterative EntropyBound denoising sampler instead of autoregressive decode. → <a href="advanced.html#diffusion">DiffusionGemma</a></li>
-    <li><strong>Image editing (Qwen-Image-Edit)</strong> — a prompt + input image produces an edited image via a 60-block MMDiT diffusion transformer, a Qwen-Image VAE, and a Qwen2.5-VL-7B text encoder (FlowMatch-Euler true-CFG, CUDA-graph-captured DiT forward). → <a href="models.html#imageedit">Image editing</a></li>
+    <li><strong>Image editing (Qwen-Image-Edit)</strong> — a prompt + input image produces an edited image via a 60-block MMDiT diffusion transformer, a Qwen-Image VAE, and a Qwen2.5-VL-7B text encoder (FlowMatch-Euler true-CFG, CUDA-graph-captured DiT forward); an optional Lightning distillation LoRA (<code>--qwen-image-lora</code>) cuts the denoise loop to a few steps at CFG 1.0. → <a href="models.html#imageedit">Image editing</a></li>
   </ul>
 
   <h2 id="generation">Generation &amp; control</h2>
@@ -61,7 +61,7 @@
     <li><strong>MTP / NextN speculative decoding</strong> — multi-token-prediction draft heads accelerate solo decode; lossless because the request's own sampler drives both draft and verify. → <a href="advanced.html#mtp">Speculative decoding</a></li>
     <li><strong>Native quantized compute</strong> — quantized weights are used directly in matmul without expanding to FP32, saving memory and bandwidth.</li>
     <li><strong>Optimized pure C# CPU backend</strong> — managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, and fused activations.</li>
-    <li><strong>KV cache codecs</strong> — pluggable <code>IKvBlockCodec</code> with a built-in TurboQuant (Q4 / Q8) compressed codec for paged blocks.</li>
+    <li><strong>KV cache codecs</strong> — pluggable <code>IKvBlockCodec</code> with a built-in TurboQuant (Q2 / Q4 / Q8) compressed codec for paged blocks.</li>
   </ul>
 
   <h2 id="interfaces">Interfaces &amp; integration</h2>

@@ -47,7 +47,7 @@
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF（放在模型旁则自动检测）。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认 100）。</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
-      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（约为 f32 的 1/7，面向 128K–256K 超长上下文；量化档位需原生 GGML flash-attention 路径）。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>设定系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式。</td></tr>
@@ -57,6 +57,11 @@
       <tr><td><code>--seed &lt;N&gt;</code> / <code>--stop &lt;string&gt;</code></td><td>随机种子（-1 = 随机） / 停止序列（可重复）。</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>渲染提示词 + 分词后退出。</td></tr>
       <tr><td><code>--diffusion-steps / --diffusion-seed / --diffusion-blocks &lt;N&gt;</code></td><td>DiffusionGemma 生成控制。</td></tr>
+      <tr><td><code>--prompt &lt;text&gt;</code></td><td>Qwen-Image-Edit 编辑指令（与 <code>--image</code> 一起；编辑后的 PNG 写入 <code>--output</code>）。</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG 引导尺度（自动：2.5，使用 Lightning LoRA 时为 1.0；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>合并进 DiT 的 Lightning 蒸馏 LoRA（<code>.safetensors</code>）；自动推导步数（如 4 或 8），并将 CFG 切换为 1.0。</td></tr>
+      <tr><td><code>--paged-kv-quant-bits &lt;0|2|4|8&gt;</code></td><td>TurboQuant 分页 KV 块压缩（0 = 关闭）。</td></tr>
       <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>合成吞吐基准。</td></tr>
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准。</td></tr>
       <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>计时前丢弃的前向次数（默认 0）。</td></tr>
@@ -83,6 +88,10 @@
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>每个推测步草拟的最大 token 数（默认 8）。</td></tr>
       <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>保留某 token 所需的草稿头最低置信度（默认 0.75）。</td></tr>
       <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>独立的 MTP 草稿 GGUF（Gemma 4 <code>gemma4-assistant</code>）。</td></tr>
+      <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>每个调度步的最大 prefill token 数（设置 <code>TS_SCHED_PREFILL_CHUNK</code>）。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（环境变量 <code>KV_CACHE_DTYPE</code>）。</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>合并进 DiT 的 Qwen-Image-Edit Lightning LoRA（更少去噪步数，CFG 1.0）。</td></tr>
       <tr><td><code>--paged-kv* / --paged-kv-quant-bits</code></td><td>遗留的独立分页 KV 参数（KV 状态现由引擎管理）。</td></tr>
     </tbody>
   </table>
@@ -101,15 +110,22 @@
       <tr><td><code>TENSORSHARP_REPEAT_PENALTY / _PRESENCE_PENALTY / _FREQUENCY_PENALTY / _SEED</code></td><td>默认惩罚与随机种子。</td></tr>
       <tr><td><code>TENSORSHARP_LOG_LEVEL / _LOG_DIR / _LOG_FILE</code></td><td>日志级别、目录、文件开关（CLI + 服务器）。</td></tr>
       <tr><td><code>DIFFUSION_STEPS / DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma 每块步数 / 最大批处理请求数。</td></tr>
+      <tr><td><code>KV_CACHE_DTYPE</code></td><td>服务器 KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（= <code>--kv-cache-dtype</code>）。</td></tr>
       <tr><td><code>TS_SCHED_DISABLE_BATCHED</code></td><td><code>1</code> 强制逐序列 KV 交换（= <code>--no-continuous-batching</code>）。</td></tr>
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>每步 token 预算（4096）。</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>最大在飞序列数（16）。</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>每步最大 prefill token 数（1024）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>独占 / 无竞争请求的全新 <code>start_pos = 0</code> prefill 分块（8192）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code></td><td>独占提示词的尾部分块（2048）。</td></tr>
+      <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（256 = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS / TS_SCHED_BLOCK_SIZE</code></td><td>引擎块池大小（256） / 每块 token 数（256）。</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用块哈希前缀共享。</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED</code></td><td><code>0</code> 强制某家族走逐序列路径（如 <code>TS_GEMMA4_BATCHED</code>、<code>TS_QWEN35_BATCHED</code>）。</td></tr>
       <tr><td><code>TS_MTP_SPEC / TS_MTP_DRAFT / TS_MTP_PMIN / TS_MTP_DRAFT_MODEL</code></td><td>MTP 推测解码旋钮（对应 <code>--mtp-*</code> 参数）。</td></tr>
       <tr><td><code>TS_GMTP_NO_FUSED / TS_GMTP_NO_FAST_ROLLBACK / TS_GMTP_BATCHED_TRUNK</code></td><td>Gemma 4 MTP 草稿路径 A/B 开关。</td></tr>
+      <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit 伴随文件路径（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
+      <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>合并进 DiT 的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
+      <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>整步 DiT 缓存：<code>0</code> 禁用 / 模式 <code>easycache</code>、<code>fbc</code>、<code>both</code>、<code>off</code>。</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX 后端调参：流水线 decode、mlock GGUF、融合 KV 写、批量 MoE decode、内存上限。</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>覆盖 <code>libmlxc</code> 的搜索路径。</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>在原生构建时跳过 / 固定 ggml 源码克隆。</td></tr>

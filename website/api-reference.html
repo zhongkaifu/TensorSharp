@@ -47,7 +47,7 @@
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF (auto-detected beside the model).</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Maximum tokens to generate (default 100).</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
-      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>.</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, <code>q4_0</code> (~1/7 of f32, for very long 128K–256K contexts; the quantized tiers need the native GGML flash-attention path).</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL.</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the system prompt.</td></tr>
       <tr><td><code>--think</code></td><td>Enable thinking / reasoning mode.</td></tr>
@@ -57,6 +57,11 @@
       <tr><td><code>--seed &lt;N&gt;</code> / <code>--stop &lt;string&gt;</code></td><td>Random seed (-1 = random) / stop sequence (repeatable).</td></tr>
       <tr><td><code>--dump-prompt</code></td><td>Render prompt + tokenization and exit.</td></tr>
       <tr><td><code>--diffusion-steps / --diffusion-seed / --diffusion-blocks &lt;N&gt;</code></td><td>DiffusionGemma generation controls.</td></tr>
+      <tr><td><code>--prompt &lt;text&gt;</code></td><td>Qwen-Image-Edit edit instruction (with <code>--image</code>; the edited PNG goes to <code>--output</code>).</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG guidance scale (auto: 2.5, or 1.0 with a Lightning LoRA; <code>&lt;= 1</code> disables the negative pass).</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-Edit companion GGUFs (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Lightning distillation LoRA (<code>.safetensors</code>) merged into the DiT; auto-derives the step count (e.g. 4 or 8) and switches CFG to 1.0.</td></tr>
+      <tr><td><code>--paged-kv-quant-bits &lt;0|2|4|8&gt;</code></td><td>TurboQuant paged-KV block compression (0 = off).</td></tr>
       <tr><td><code>--benchmark / --bench-prefill / --bench-decode / --bench-runs</code></td><td>Synthetic throughput benchmark.</td></tr>
       <tr><td><code>--bench-kvcache / --bench-kv-turns &lt;N&gt;</code></td><td>Multi-turn KV-cache reuse benchmark.</td></tr>
       <tr><td><code>--warmup-runs &lt;N&gt;</code></td><td>Throw-away forward passes before timing (default 0).</td></tr>
@@ -83,6 +88,10 @@
       <tr><td><code>--mtp-draft &lt;N&gt;</code></td><td>Max tokens drafted per speculative step (default 8).</td></tr>
       <tr><td><code>--mtp-pmin &lt;f&gt;</code></td><td>Minimum draft-head confidence to keep a token (default 0.75).</td></tr>
       <tr><td><code>--mtp-draft-model &lt;path&gt;</code></td><td>Separate MTP draft GGUF (Gemma 4 <code>gemma4-assistant</code>).</td></tr>
+      <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>Maximum prefill tokens per scheduler step (sets <code>TS_SCHED_PREFILL_CHUNK</code>).</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, <code>q4_0</code> (env <code>KV_CACHE_DTYPE</code>).</td></tr>
+      <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-Edit companion GGUFs.</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning LoRA merged into the DiT (fewer denoise steps, CFG 1.0).</td></tr>
       <tr><td><code>--paged-kv* / --paged-kv-quant-bits</code></td><td>Legacy standalone paged-KV flags (engine now owns KV state).</td></tr>
     </tbody>
   </table>
@@ -101,15 +110,22 @@
       <tr><td><code>TENSORSHARP_REPEAT_PENALTY / _PRESENCE_PENALTY / _FREQUENCY_PENALTY / _SEED</code></td><td>Default penalties and seed.</td></tr>
       <tr><td><code>TENSORSHARP_LOG_LEVEL / _LOG_DIR / _LOG_FILE</code></td><td>Logging level, directory, file toggle (CLI + server).</td></tr>
       <tr><td><code>DIFFUSION_STEPS / DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma steps per block / max batched requests.</td></tr>
+      <tr><td><code>KV_CACHE_DTYPE</code></td><td>Server KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, <code>q4_0</code> (= <code>--kv-cache-dtype</code>).</td></tr>
       <tr><td><code>TS_SCHED_DISABLE_BATCHED</code></td><td><code>1</code> forces per-sequence KV-swap (= <code>--no-continuous-batching</code>).</td></tr>
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>Per-step token budget (4096).</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>Max in-flight sequences (16).</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>Max prefill tokens per step (1024).</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>Fresh <code>start_pos = 0</code> prefill chunk for a solo / uncontended request (8192).</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</code></td><td>Tail chunks of a solo prompt (2048).</td></tr>
+      <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>Decode tokens before a sequence switch (256 = block size).</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS / TS_SCHED_BLOCK_SIZE</code></td><td>Engine block-pool size (256) / tokens per block (256).</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> disables block-hash prefix sharing.</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED</code></td><td><code>0</code> forces a family onto the per-sequence path (e.g. <code>TS_GEMMA4_BATCHED</code>, <code>TS_QWEN35_BATCHED</code>).</td></tr>
       <tr><td><code>TS_MTP_SPEC / TS_MTP_DRAFT / TS_MTP_PMIN / TS_MTP_DRAFT_MODEL</code></td><td>MTP speculative-decoding knobs (mirror the <code>--mtp-*</code> flags).</td></tr>
       <tr><td><code>TS_GMTP_NO_FUSED / TS_GMTP_NO_FAST_ROLLBACK / TS_GMTP_BATCHED_TRUNK</code></td><td>Gemma 4 MTP draft-path A/B switches.</td></tr>
+      <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit companion paths (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
+      <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>Lightning LoRA <code>.safetensors</code> merged into the DiT / scale override.</td></tr>
+      <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>Whole-DiT-step cache: <code>0</code> disables / mode <code>easycache</code>, <code>fbc</code>, <code>both</code>, <code>off</code>.</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX backend tuning: pipelined decode, mlock GGUF, fused KV write, batched MoE decode, memory caps.</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>Override the search path for <code>libmlxc</code>.</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>Skip / pin the ggml source clone on native builds.</td></tr>

@@ -62,7 +62,7 @@
 # --qwen-image-mmproj 指定）。
 ./TensorSharp.Cli --model &lt;qwen-image-edit-DiT.gguf&gt; --image input.png \
     --prompt "Make the sky a dramatic sunset." --output edited.png \
-    --backend ggml_cuda --diffusion-steps 30 --cfg 4.0 --diffusion-seed 0</code></pre>
+    --backend ggml_cuda --diffusion-steps 30 --cfg 2.5 --diffusion-seed 0</code></pre>
 
   <h3 id="diffusion">DiffusionGemma 与检查</h3>
   <pre data-lang="bash"><code># DiffusionGemma 文本扩散生成
@@ -111,7 +111,7 @@
     <tbody>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认：100）。</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>计算后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
-      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code> 或 <code>q8_0</code>。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>。块量化档位需要原生 GGML flash-attention 路径；<code>q4_0</code>（约为 f32 占用的 1/7）面向 128K–256K 的超长上下文。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL（见下文）。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。</td></tr>
       <tr><td><code>--think</code></td><td>启用思考 / 推理模式（思维链）。</td></tr>
@@ -145,8 +145,9 @@
       <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma 确定性采样器种子（默认：0）。</td></tr>
       <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>块自回归画布数量（<code>0</code> 由 <code>--max-tokens</code> 推导）。</td></tr>
       <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-Edit：输入图像、编辑指令与输出 PNG（默认 <code>edited.png</code>）。复用 <code>--diffusion-steps</code> / <code>--diffusion-seed</code>。</td></tr>
-      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG 引导尺度（默认：4.0；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-Edit true-CFG 引导尺度（省略则自动取值：2.5，加载 Lightning LoRA 时为 1.0；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-Edit 伴随 GGUF（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
+      <tr><td><code>--qwen-image-lora &lt;path&gt;</code></td><td>Qwen-Image-Edit Lightning 蒸馏 LoRA（<code>.safetensors</code>），在加载时合并进 DiT；自动推导去噪步数（如 4 或 8），并将 CFG 切换为 1.0（无负向分支）。</td></tr>
       <tr><td><code>--benchmark</code></td><td>运行合成的 prefill/decode 吞吐基准。</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>合成的 prefill 长度、decode 长度与运行次数。</td></tr>
       <tr><td><code>--bench-kvcache</code> / <code>--bench-kv-turns &lt;N&gt;</code></td><td>多轮 KV 缓存复用基准（带缓存 vs 强制重置）。</td></tr>
