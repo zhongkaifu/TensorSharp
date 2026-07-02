@@ -1267,7 +1267,43 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_VERIFY_RESIDENT"), "1", StringComparison.Ordinal);
         private bool _fvStateResident;
 
-        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1)
+        /// <summary>Prefill through the whole-model fused verify with the working
+        /// set bounded to TS_QWEN35_PREFILL_UBATCH-token sub-chunks (llama.cpp's
+        /// n_ubatch analogue). The verify graph's activation scratch costs ~1.8 MB
+        /// per prompt token on the 35B-A3B and lands in the shared reuse gallocr,
+        /// which only ever GROWS — one whole-prompt graph (e.g. 3.2k tokens →
+        /// 5.7 GB) pushes total VRAM past the card and WDDM permanently demotes
+        /// resident buffers to shared system memory, collapsing every later
+        /// prefill AND decode ~3.5x until restart. Sub-chunks keep the peak at the
+        /// ubatch size; the kernel's KV append + GDN host-ring round-trip already
+        /// carry state across calls (same mechanism as the chunked ForwardRefill).
+        /// Multimodal rows work too: vision embeddings are already injected into
+        /// <paramref name="hidden"/> and MRoPE positions are sliced per sub-chunk
+        /// via <paramref name="rowOffset"/>.</summary>
+        internal bool TryFullModelVerifyPrefill(Tensor hidden, int startPos, int seqLen, float[] logitsOut)
+        {
+            int ubatch = ResolvePrefillVerifyUbatch();
+            if (ubatch <= 0 || seqLen <= ubatch)
+                return TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: logitsOut, nLogitRows: 1);
+            for (int off = 0; off < seqLen; off += ubatch)
+            {
+                int n = Math.Min(ubatch, seqLen - off);
+                if (!TryFullModelVerify(hidden, startPos + off, n, normedOut: null, logitsOut: logitsOut, nLogitRows: 1, rowOffset: off))
+                {
+                    // First sub-chunk failed before any state advanced: clean per-op
+                    // fallback. A later sub-chunk failing would leave KV/GDN state
+                    // partially advanced — the per-op fallback would double-process
+                    // the leading rows, so surface it instead of corrupting output.
+                    if (off == 0) return false;
+                    throw new InvalidOperationException(
+                        $"Qwen3.5 fused prefill failed mid-prompt (offset {off}/{seqLen}); " +
+                        "cannot fall back to the per-op path without corrupting KV/GDN state.");
+                }
+            }
+            return true;
+        }
+
+        internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0)
         {
             // CUDA-only: the whole-model verify graph uses ggml_set_rows KV writes +
             // a persistent reuse gallocr. On Metal a cpy-based non-persist variant
@@ -1461,6 +1497,27 @@ namespace TensorSharp.Models
                 _fvLayers[l] = a;
             }
 
+            // Multimodal MRoPE: slice this call's rows out of the pending per-axis
+            // positions ([3 * chunkLen], T/H/W per token) into the axis-concatenated
+            // [4 * seqLen] layout ggml_rope_multi expects (4th/time axis stays 0 —
+            // Qwen3.5 ships mrope sections [11,11,10,0]). Text-only prompts pass
+            // null and keep the kernel's sequential NeoX rope.
+            int[] mropePos = null;
+            int[] mropeSecs = null;
+            if (_pendingMRoPEPositions != null && _mropeSections != null && _mropeSections.Length >= 4
+                && _pendingMRoPEPositions.Length >= 3 * (rowOffset + seqLen))
+            {
+                mropePos = new int[4 * seqLen];
+                for (int i = 0; i < seqLen; i++)
+                {
+                    int src = 3 * (rowOffset + i);
+                    mropePos[i]              = _pendingMRoPEPositions[src + 0]; // T
+                    mropePos[seqLen + i]     = _pendingMRoPEPositions[src + 1]; // H
+                    mropePos[2 * seqLen + i] = _pendingMRoPEPositions[src + 2]; // W
+                }
+                mropeSecs = new int[4] { _mropeSections[0], _mropeSections[1], _mropeSections[2], _mropeSections[3] };
+            }
+
             var lmh = ResolveW(_lmHeadQW, _lmHeadF32);
             IntPtr finalNormPtr = (IntPtr)GetFloatPtr(_finalNormW);
             bool ok2;
@@ -1469,7 +1526,7 @@ namespace TensorSharp.Models
             {
                 ok2 = GgmlBasicOps.Qwen35ModelVerify(
                     _fvLayers, n,
-                    (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, startPos, seqLen,
+                    (IntPtr)(GetFloatPtr(hidden) + (long)rowOffset * Config.HiddenSize), Config.HiddenSize, startPos, seqLen,
                     Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                     headDim, 2, kvCacheType,
                     _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads,
@@ -1478,7 +1535,8 @@ namespace TensorSharp.Models
                     _normTopKProb ? 1 : 0, 1.0f,
                     (IntPtr)lp, Config.VocabSize,
                     lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
-                    finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows);
+                    finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows,
+                    mropePos, mropeSecs);
             }
             if (!ok2)
             {

@@ -44,5 +44,11 @@ namespace TensorSharp.Models.QwenImage
 
         /// <summary>Logical row-major shape (outermost dim first) of a named tensor.</summary>
         public long[] Shape(string name) => _src.TensorShape(name);
+
+        /// <summary>Fused whole-VAE device graph, built lazily on first encode/decode
+        /// (null after a failed build → the per-conv path is used). Holds the weights in
+        /// stable unmanaged buffers for resident binding; lives as long as the weights.</summary>
+        internal QwenImageVaeGraph FusedGraph;
+        internal bool FusedGraphBuildFailed;
     }
 }

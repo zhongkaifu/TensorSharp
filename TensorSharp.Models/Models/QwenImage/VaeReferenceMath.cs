@@ -40,6 +40,24 @@ namespace TensorSharp.Models.QwenImage
         internal static bool UseGpuConv =
             Environment.GetEnvironmentVariable("TS_QWEN_VAE_GPU") != "0";
 
+        // Fused whole-VAE graph (TSGgml_QwenVaeRun): the entire encode/decode as ONE
+        // device-resident ggml graph (resident weights, direct convs, no per-op host
+        // round-trips). Falls back to the per-conv path when the backend can't run it.
+        // TS_QWEN_VAE_FUSED=0 disables.
+        internal static readonly bool UseFusedGraph =
+            Environment.GetEnvironmentVariable("TS_QWEN_VAE_FUSED") != "0";
+
+        private static QwenImageVaeGraph FusedGraph(VaeWeights w)
+        {
+            if (!UseGpuConv || !UseFusedGraph || w.FusedGraphBuildFailed) return null;
+            if (w.FusedGraph == null)
+            {
+                w.FusedGraph = QwenImageVaeGraph.TryBuild(w);
+                if (w.FusedGraph == null) w.FusedGraphBuildFailed = true;
+            }
+            return w.FusedGraph;
+        }
+
         private const int BaseDim = 96;
         private const int ZDim = 16;
         private static readonly int[] DimMult = { 1, 2, 4, 4 };
@@ -407,6 +425,16 @@ namespace TensorSharp.Models.QwenImage
             // normalize pixels [0,1] -> [-1,1]
             for (long i = 0; i < x.D.Length; i++) x.D[i] = x.D[i] * 2f - 1f;
 
+            // Fused whole-encoder graph (one device round-trip); DiagonalGaussian.mode()
+            // (the first z_dim channels of the 32-channel head output) applied here.
+            var fused = FusedGraph(w);
+            if (fused != null && fused.TryEncode(x.D, H, Wd, out float[] z32, out int flh, out int flw))
+            {
+                var fl = new float[(long)ZDim * flh * flw];
+                Array.Copy(z32, 0, fl, 0, fl.Length);
+                return new VaeLatent(ZDim, flh, flw, fl);
+            }
+
             // conv_in (encoder.conv1): 3 -> 96
             x = CausalConv3dT1(x, w.Get("encoder.conv1.weight"), BaseDim, 3, 3, 3, 3,
                     w.Get("encoder.conv1.bias"), 1);
@@ -441,6 +469,15 @@ namespace TensorSharp.Models.QwenImage
 
         public static RgbImage Decode(VaeWeights w, VaeLatent latent)
         {
+            // Fused whole-decoder graph (one device round-trip); [-1,1] -> [0,1] applied here.
+            var fusedG = FusedGraph(w);
+            if (fusedG != null && fusedG.TryDecode(latent.Data, latent.Height, latent.Width,
+                    out float[] rgb, out int fh, out int fw))
+            {
+                for (long i = 0; i < rgb.Length; i++) rgb[i] = (rgb[i] + 1f) * 0.5f;
+                return RgbImage.FromPlanarChw(fw, fh, rgb);
+            }
+
             var x = new Feature(latent.Channels, latent.Height, latent.Width, (float[])latent.Data.Clone());
 
             // post_quant_conv (conv2): 16 -> 16, 1x1x1

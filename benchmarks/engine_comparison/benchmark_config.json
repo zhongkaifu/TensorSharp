@@ -83,14 +83,14 @@
   },
 
   "scenarios": {
-    "text_short": {"kind": "text", "description": "Short single-turn text prompt", "max_tokens": 128},
-    "text_long": {"kind": "text", "description": "Long-context single-turn text prompt (~1k tokens in)", "max_tokens": 128},
-    "multi_turn": {"kind": "multi_turn", "description": "3-turn conversation, timed on the final turn", "max_tokens": 128},
-    "function_call": {"kind": "function_call", "description": "Tool/function-calling (get_weather)", "max_tokens": 128},
-    "json_mode": {"kind": "json_mode", "description": "Structured output (response_format json_object)", "max_tokens": 128},
-    "image": {"kind": "image", "description": "Image understanding (test.jpg)", "modality": "image", "max_tokens": 128},
-    "audio": {"kind": "audio", "description": "Audio understanding (~45 s speech)", "modality": "audio", "max_tokens": 128},
-    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 128},
+    "text_short": {"kind": "text", "description": "Short single-turn text prompt (~2k-token context preamble)", "max_tokens": 1280},
+    "text_long": {"kind": "text", "description": "Long-context single-turn text prompt (~2k-token context preamble + passage)", "max_tokens": 1280},
+    "multi_turn": {"kind": "multi_turn", "description": "3-turn conversation (~2k-token context preamble), timed on the final turn", "max_tokens": 1280},
+    "function_call": {"kind": "function_call", "description": "Tool/function-calling (get_weather) with ~2k-token context preamble", "max_tokens": 1280},
+    "json_mode": {"kind": "json_mode", "description": "Structured output (response_format json_object) with ~2k-token context preamble", "max_tokens": 1280},
+    "image": {"kind": "image", "description": "Image understanding (test.jpg)", "modality": "image", "max_tokens": 1280},
+    "audio": {"kind": "audio", "description": "Audio understanding (~45 s speech)", "modality": "audio", "max_tokens": 1280},
+    "video": {"kind": "video", "description": "Video understanding (sampled frames)", "modality": "video", "max_tokens": 1280},
 
     "prefill_2k": {"kind": "text", "description": "Prefill throughput @ ~2k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
     "prefill_4k": {"kind": "text", "description": "Prefill throughput @ ~4k prompt tokens (sliced from prefill_corpus.txt)", "max_tokens": 8},
@@ -124,7 +124,7 @@
   "defaults": {
     "engines": ["tensorsharp", "llamacpp", "vllm"],
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "qwen36-35b-a3b-q4", "diffusiongemma"],
-    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video", "prefill_2k", "prefill_4k", "prefill_8k"],
+    "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
     "backends": ["gpu", "cpu"],
     "mtp_modes": [false],
     "concurrency": [1],

@@ -20,9 +20,14 @@ namespace TensorSharp.Models.QwenImage
 
         public int Steps => Timesteps.Length;
 
-        public QwenImageScheduler(int numSteps, int imageSeqLen)
+        /// <param name="muOverride">Fixed time-shift exponent overriding the resolution-dependent
+        /// dynamic shift. Lightning step-distilled LoRAs are trained with a CONSTANT shift of 3
+        /// (mu = ln 3; lightx2v generate_with_diffusers.py sets base_shift = max_shift = log(3)),
+        /// so sampling them with the dynamic shift walks a different sigma schedule than the
+        /// distillation targets and visibly degrades the few-step output.</param>
+        public QwenImageScheduler(int numSteps, int imageSeqLen, float? muOverride = null)
         {
-            float mu = CalculateShift(imageSeqLen);
+            float mu = muOverride ?? CalculateShift(imageSeqLen);
             var sigmas = new float[numSteps + 1];
             for (int i = 0; i < numSteps; i++)
             {

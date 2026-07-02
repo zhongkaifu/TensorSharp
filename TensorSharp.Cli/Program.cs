@@ -126,12 +126,15 @@ namespace TensorSharp.Cli
             // Qwen-Image-Edit knobs.
             string editPrompt = null;
             float cfgScale = 2.5f;   // Qwen-Image-Edit-2511 recommendation; 4.0 over-guides (distorts faces)
+            bool cfgScaleSet = false;          // explicit --cfg (image edit passes 0 = auto otherwise)
+            bool diffusionStepsSet = false;    // explicit --diffusion-steps (image edit passes 0 = auto otherwise)
             // Qwen-Image-Edit companion GGUFs. The qwen_image DiT GGUF (passed via
             // --model) carries none of these, so the operator can point at them
             // explicitly instead of relying on a same-directory scan / env vars.
             string qwenImageVaePath = null;
             string qwenImageVlPath = null;
             string qwenImageMmprojPath = null;
+            string qwenImageLoraPath = null;
 
             var samplingConfig = SamplingConfig.Greedy;
 
@@ -145,10 +148,11 @@ namespace TensorSharp.Cli
                     case "--output": outputFile = args[++i]; break;
                     case "--image": imagePath = args[++i]; break;
                     case "--prompt": editPrompt = args[++i]; break;
-                    case "--cfg": cfgScale = float.Parse(args[++i]); break;
+                    case "--cfg": cfgScale = float.Parse(args[++i]); cfgScaleSet = true; break;
                     case "--qwen-image-vae": qwenImageVaePath = args[++i]; break;
                     case "--qwen-image-vl": qwenImageVlPath = args[++i]; break;
                     case "--qwen-image-mmproj": qwenImageMmprojPath = args[++i]; break;
+                    case "--qwen-image-lora": qwenImageLoraPath = args[++i]; break;
                     case "--audio": audioPath = args[++i]; break;
                     case "--video": videoPath = args[++i]; break;
                     case "--mmproj": mmProjPath = args[++i]; break;
@@ -221,7 +225,7 @@ namespace TensorSharp.Cli
                         break;
                     }
                     case "--warmup-runs": warmupInferenceRuns = int.Parse(args[++i]); break;
-                    case "--diffusion-steps": diffusionSteps = int.Parse(args[++i]); break;
+                    case "--diffusion-steps": diffusionSteps = int.Parse(args[++i]); diffusionStepsSet = true; break;
                     case "--diffusion-seed": diffusionSeed = int.Parse(args[++i]); break;
                     case "--diffusion-blocks": diffusionBlocks = int.Parse(args[++i]); break;
                     case "--kv-cache-dtype":
@@ -299,7 +303,7 @@ namespace TensorSharp.Cli
                 Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [--input <input.txt>] " +
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
                     "[--prompt <text>] [--cfg F] [--diffusion-steps N] [--diffusion-seed N] " +
-                    "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] " +
+                    "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] [--qwen-image-lora <lora.safetensors>] " +
                     "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
@@ -335,6 +339,7 @@ namespace TensorSharp.Cli
             ApplyQwenImageCompanionOverride("--qwen-image-vae", "TS_QWEN_IMAGE_VAE", qwenImageVaePath);
             ApplyQwenImageCompanionOverride("--qwen-image-vl", "TS_QWEN_IMAGE_TE", qwenImageVlPath);
             ApplyQwenImageCompanionOverride("--qwen-image-mmproj", "TS_QWEN_IMAGE_MMPROJ", qwenImageMmprojPath);
+            ApplyQwenImageCompanionOverride("--qwen-image-lora", "TS_QWEN_IMAGE_LORA", qwenImageLoraPath);
 
             string requestedDtype = KvCacheDtypeConfig.IsExplicitlySet
                 ? KvCacheDtypeConfig.Current.ToShortString()
@@ -362,7 +367,7 @@ namespace TensorSharp.Cli
                 string prompt = editPrompt
                     ?? (inputFile != null && File.Exists(inputFile) ? File.ReadAllText(inputFile).Trim() : "");
                 string outPath = outputFile ?? "edited.png";
-                RunImageEdit(qwenImageModel, imagePath, prompt, outPath, diffusionSteps, cfgScale, diffusionSeed);
+                RunImageEdit(qwenImageModel, imagePath, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed);
                 return;
             }
 

@@ -19,6 +19,7 @@
 #endif
 
 #include <cstdio>
+#include <thread>
 
 // ============================================================================
 // ggml_pool implementation
@@ -2099,4 +2100,94 @@ TSG_EXPORT int TSGgml_DequantizeToF32(int ggml_type, const void* src, int64_t nu
         return 0;
     }
     return -2;
+}
+
+// Merge a LoRA delta into a (possibly quantized) weight IN PLACE:
+//   W[r, :] += scale * sum_k up[r, k] * down[k, :]      (r = 0..ne1-1 output rows)
+// following stable-diffusion.cpp's apply path for quantized weights (lora.hpp
+// build_lora_graph): dequantize to F32, add the delta, requantize back to the SAME
+// type via ggml_quantize_chunk. `w` layout is the ggml row-major weight
+// [ne1 rows x ne0 elements]; `up` is [ne1, rank] row-major, `down` is [rank, ne0]
+// row-major (the safetensors lora_up / lora_down layouts).
+// Returns 0 on success; <0 on validation/type errors (weight left untouched).
+TSG_EXPORT int TSGgml_ApplyLoraDelta(void* w, int ggml_type, int64_t ne0, int64_t ne1,
+                                     const float* up, const float* down, int32_t rank,
+                                     float scale, int32_t n_threads)
+{
+    if (w == nullptr || up == nullptr || down == nullptr || ne0 <= 0 || ne1 <= 0 || rank <= 0)
+        return -1;
+    if (ggml_type < 0 || ggml_type >= GGML_TYPE_COUNT)
+        return -1;
+    const enum ggml_type t = static_cast<enum ggml_type>(ggml_type);
+    const int64_t blck = ggml_blck_size(t);
+    if (blck <= 0 || ne0 % blck != 0)
+        return -2;
+    const bool is_f32 = (t == GGML_TYPE_F32);
+    const struct ggml_type_traits* traits = ggml_get_type_traits(t);
+    if (!is_f32)
+    {
+        if (traits == nullptr || traits->to_float == nullptr)
+            return -3;                                   // no dequant path for this type
+        if (ggml_quantize_requires_imatrix(t))
+            return -4;                                   // can't requantize without an imatrix
+        ggml_quantize_init(t);                           // thread-safe to call up front
+    }
+    const size_t row_bytes = ggml_row_size(t, ne0);
+
+    int nt = n_threads > 0 ? n_threads : (int)std::thread::hardware_concurrency();
+    if (nt < 1) nt = 1;
+    if ((int64_t)nt > ne1) nt = (int)ne1;
+
+    std::atomic<int> err{0};
+    auto worker = [&](int64_t r0, int64_t r1)
+    {
+        std::vector<float> buf((size_t)ne0);
+        for (int64_t r = r0; r < r1 && err.load(std::memory_order_relaxed) == 0; r++)
+        {
+            uint8_t* wrow = static_cast<uint8_t*>(w) + (size_t)r * row_bytes;
+            float* frow;
+            if (is_f32)
+                frow = reinterpret_cast<float*>(wrow);
+            else
+            {
+                traits->to_float(wrow, buf.data(), ne0);
+                frow = buf.data();
+            }
+            const float* uprow = up + (size_t)r * rank;
+            for (int32_t k = 0; k < rank; k++)
+            {
+                const float a = scale * uprow[k];
+                if (a == 0.0f) continue;
+                const float* drow = down + (size_t)k * ne0;
+                for (int64_t i = 0; i < ne0; i++)
+                    frow[i] += a * drow[i];
+            }
+            if (!is_f32)
+            {
+                const size_t written = ggml_quantize_chunk(t, frow, wrow, 0, 1, ne0, nullptr);
+                if (written != row_bytes)
+                    err.store(-5, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    if (nt == 1)
+    {
+        worker(0, ne1);
+    }
+    else
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(nt);
+        const int64_t chunk = (ne1 + nt - 1) / nt;
+        for (int i = 0; i < nt; i++)
+        {
+            int64_t r0 = (int64_t)i * chunk;
+            int64_t r1 = std::min(ne1, r0 + chunk);
+            if (r0 >= r1) break;
+            threads.emplace_back(worker, r0, r1);
+        }
+        for (auto& th : threads) th.join();
+    }
+    return err.load();
 }

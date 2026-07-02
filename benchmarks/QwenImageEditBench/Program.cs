@@ -135,35 +135,81 @@ internal static class Program
             var rope = TensorSharp.Models.QwenImage.DitRope.Build(shapes, txtSeq);
             var ropeNeg = TensorSharp.Models.QwenImage.DitRope.Build(shapes, negTxt);
 
-            Action one = () =>
+            Func<float[]> one = () =>
             {
                 if (cfgPairs && enc.UseCfgBatch && (imgSeq + Math.Max(txtSeq, negTxt)) <= enc.CfgBatchMaxTokens)
                 {
                     var (vc, vn) = enc.PredictCfg(img, imgSeq, cond, txtSeq, rope, negCond, negTxt, ropeNeg, 0.5f, modIndex, -1, 0, seq);
+                    return vc;
                 }
                 else
                 {
-                    enc.Predict(img, imgSeq, cond, txtSeq, 0.5f, modIndex, rope);
+                    float[] v = enc.Predict(img, imgSeq, cond, txtSeq, 0.5f, modIndex, rope);
                     if (cfgPairs) enc.Predict(img, imgSeq, negCond, negTxt, 0.5f, modIndex, ropeNeg);
+                    return v;
                 }
             };
 
+            // Correctness alongside perf: inputs are identical every call, so every velocity
+            // must be finite and IDENTICAL across calls — replay corruption (the historical
+            // flash-under-capture NaN appeared from the first captured replay on) shows up as
+            // NaN or iteration-to-iteration drift here.
+            int nanTotal = 0;
+            double driftMax = 0;
+            float[] first = null;
+            Func<float[], string> check = v =>
+            {
+                int nan = 0;
+                for (int i = 0; i < v.Length; i++) if (float.IsNaN(v[i]) || float.IsInfinity(v[i])) nan++;
+                nanTotal += nan;
+                double d = 0;
+                if (first == null) first = (float[])v.Clone();
+                else for (int i = 0; i < v.Length; i++) d = Math.Max(d, Math.Abs(v[i] - first[i]));
+                driftMax = Math.Max(driftMax, d);
+                return $"nan={nan} maxdiff-vs-first={d:E2}";
+            };
+
             // warmup (cold graph build + capture)
-            var wsw = Stopwatch.StartNew(); one(); Console.WriteLine($"  warmup1: {wsw.Elapsed.TotalMilliseconds:F0}ms");
-            wsw.Restart(); one(); Console.WriteLine($"  warmup2: {wsw.Elapsed.TotalMilliseconds:F0}ms");
+            var wsw = Stopwatch.StartNew(); var v0 = one(); Console.WriteLine($"  warmup1: {wsw.Elapsed.TotalMilliseconds:F0}ms  {check(v0)}");
+            wsw.Restart(); var v1 = one(); Console.WriteLine($"  warmup2: {wsw.Elapsed.TotalMilliseconds:F0}ms  {check(v1)}");
 
             var times = new double[iters];
             for (int i = 0; i < iters; i++)
             {
                 var sw = Stopwatch.StartNew();
-                one();
+                float[] v = one();
                 times[i] = sw.Elapsed.TotalMilliseconds;
+                Console.WriteLine($"  iter{i}: {times[i]:F0}ms  {check(v)}");
             }
             Array.Sort(times);
             double median = times[iters / 2], min = times[0];
             double sum = 0; foreach (var t in times) sum += t;
             Console.WriteLine($"  per-forward{(cfgPairs ? "-pair" : "")}: median={median:F0}ms min={min:F0}ms mean={sum / iters:F0}ms  (all: {string.Join(",", Array.ConvertAll(times, t => t.ToString("F0")))})");
-            return 0;
+
+            // Cross-process reference compare: TS_QIBENCH_DUMP=<path> writes the first velocity;
+            // TS_QIBENCH_REF=<path> compares against a previously dumped one (e.g. captured-flash
+            // vs TS_QWEN_DIT_WHOLE_CAPTURE=0 / TS_QWEN_DIT_FLASH=0 references).
+            string dump = Environment.GetEnvironmentVariable("TS_QIBENCH_DUMP");
+            string refp = Environment.GetEnvironmentVariable("TS_QIBENCH_REF");
+            if (dump != null)
+            {
+                var bytes = new byte[first.Length * 4];
+                Buffer.BlockCopy(first, 0, bytes, 0, bytes.Length);
+                File.WriteAllBytes(dump, bytes);
+                Console.WriteLine($"  dumped velocity -> {dump}");
+            }
+            if (refp != null && File.Exists(refp))
+            {
+                var bytes = File.ReadAllBytes(refp);
+                var rf = new float[bytes.Length / 4];
+                Buffer.BlockCopy(bytes, 0, rf, 0, bytes.Length);
+                Console.WriteLine($"  vs-ref: cosine={Cosine(first, rf):F6} relL2={RelL2(first, rf):E3}");
+            }
+
+            bool pass = nanTotal == 0 && driftMax == 0;
+            Console.WriteLine(pass ? "DIT-FORWARD: PASS (finite, replay-stable)"
+                                   : $"DIT-FORWARD: FAIL (nan={nanTotal} driftMax={driftMax:E2})");
+            return pass ? 0 : 2;
         }
         finally { enc.Dispose(); }
     }
@@ -566,9 +612,17 @@ internal static class Program
     private static string VaePath() =>
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE") ?? "C:/Works/models/qwen_image_vae.gguf";
 
-    private static (VaeWeights w, GgufFile g) OpenVae()
+    private static (VaeWeights w, IDisposable g) OpenVae()
     {
-        var g = new GgufFile(VaePath());
+        // Accept both the converted F32 GGUF and the original .safetensors (BF16->F32
+        // upcast on read) — the same sources QwenImageVae itself resolves.
+        string path = VaePath();
+        if (path.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+        {
+            var st = new TensorSharp.Runtime.SafetensorsFile(path);
+            return (VaeWeights.Load(st), st);
+        }
+        var g = new GgufFile(path);
         return (VaeWeights.Load(g), g);
     }
 
@@ -621,6 +675,19 @@ internal static class Program
         string outPath = args.Length > 2 ? args[2] : "C:/Works/TensorSharp/tools/_vae_rt.png";
         int size = args.Length > 3 ? int.Parse(args[3]) : 128;
         var img = ImageIO.ResizeToArea(ImageIO.Load(imgPath), (long)size * size);
+
+        // vae-roundtrip drives the static math directly (no QwenImageVae ctor to init the
+        // backend), so honor TS_QWEN_BACKEND for device-conv/fused-graph perf runs.
+        if (TensorSharp.Models.QwenImage.VaeReferenceMath.UseGpuConv)
+        {
+            var be = (Environment.GetEnvironmentVariable("TS_QWEN_BACKEND") ?? "ggml_cpu") switch
+            {
+                "ggml_cuda" => TensorSharp.GGML.GgmlBackendType.Cuda,
+                "ggml_metal" => TensorSharp.GGML.GgmlBackendType.Metal,
+                _ => TensorSharp.GGML.GgmlBackendType.Cpu,
+            };
+            TensorSharp.GGML.GgmlBasicOps.EnsureBackendAvailable(be);
+        }
 
         var (w, g) = OpenVae();
         try

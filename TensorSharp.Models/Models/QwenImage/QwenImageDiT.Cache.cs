@@ -22,7 +22,9 @@
 // ParaAttention First-Block-Cache, the original TeaCache paper arXiv:2411.14324).
 // It reduces the NUMBER of expensive block computations rather than the cost of
 // each one, which is the lever the prior fusion/capture/flash-attn work did not
-// touch. Default-on for the native GGML path; TS_QWEN_DIT_CACHE=0 disables it.
+// touch. SUPERSEDED as the default by the whole-step EasyCache
+// (QwenImageStepCache), which skips the entire forward for both CFG branches;
+// select this one back with TS_QWEN_DIT_CACHE_MODE=fbc (or stack with =both).
 //
 // Each CFG branch (conditional / unconditional) keeps an independent cache so the
 // two interleaved forwards do not corrupt one another.
@@ -52,10 +54,12 @@ namespace TensorSharp.Models.QwenImage
         private int _cacheComputed, _cacheSkipped;   // stats over a generation
 
         // First-Block-Cache is only meaningful on the native per-block path (it skips
-        // native block calls). Default-on there; TS_QWEN_DIT_CACHE=0 forces every step
-        // to compute all blocks (the original behavior).
+        // native block calls). Superseded as the default by the whole-step EasyCache
+        // (QwenImageStepCache — skips the entire forward for both CFG branches, not just
+        // blocks 1..N-1 of one branch); select it back with TS_QWEN_DIT_CACHE_MODE=fbc,
+        // or stack both with =both. TS_QWEN_DIT_CACHE=0 disables all caching.
         internal bool CacheEnabled =>
-            NativeBlockOn && Environment.GetEnvironmentVariable("TS_QWEN_DIT_CACHE") != "0";
+            NativeBlockOn && QwenImageStepCache.Mode is "fbc" or "both";
 
         // Relative-L1 threshold on the block-0 residual change. Below it, the step is
         // cached. Lower = more conservative (closer to no-cache); higher = more skips.

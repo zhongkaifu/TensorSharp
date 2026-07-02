@@ -1653,6 +1653,41 @@ namespace TensorSharp.GGML
             return GgmlNative.TryConv2d(in args);
         }
 
+        /// <summary>Whole conditioning-encoder transformer trunk (Qwen2.5-VL LLM or vision
+        /// tower) as ONE device-resident ggml graph (TSGgml_QwenTeTrunk): resident weights,
+        /// host-precomputed rotate-half RoPE tables, per-layer full/causal/window-mask
+        /// attention. Returns false when the backend can't run it (caller falls back to
+        /// the per-op path).</summary>
+        public static bool TryQwenTeTrunk(in QwenTeTrunkArgs args)
+        {
+            return GgmlNative.TryQwenTeTrunk(in args);
+        }
+
+        /// <summary>Whole Qwen-Image VAE encode/decode as ONE device-resident ggml graph
+        /// (TSGgml_QwenVaeRun): the op list mirrors the verified VaeReferenceMath topology,
+        /// features stay on-device end-to-end, weights bind resident by stable pointer, and
+        /// convs run ggml_conv_2d_direct (no materialized im2col). Returns false when the
+        /// backend can't run it, so the caller falls back to the per-conv path.</summary>
+        public static bool TryQwenVaeRun(in QwenVaeArgs args)
+        {
+            return GgmlNative.TryQwenVaeRun(in args);
+        }
+
+        /// <summary>
+        /// Merge a LoRA delta into a (possibly quantized) weight IN PLACE on the host:
+        /// W[r,:] += scale * up[r,:] · down. Quantized rows are dequantized to F32, updated
+        /// and requantized to the SAME type (the stable-diffusion.cpp LoRA apply path).
+        /// <paramref name="w"/> points at the ggml row-major weight [ne1 x ne0] (must be
+        /// writable — e.g. a copy-on-write GGUF mapping); up is [ne1, rank] row-major,
+        /// down is [rank, ne0] row-major. Returns 0 on success, negative on error
+        /// (the weight is untouched on validation errors).
+        /// </summary>
+        public static int ApplyLoraDelta(IntPtr w, int ggmlType, long ne0, long ne1,
+            float[] up, float[] down, int rank, float scale, int nThreads = 0)
+        {
+            return GgmlNative.ApplyLoraDelta(w, ggmlType, ne0, ne1, up, down, rank, scale, nThreads);
+        }
+
         /// <summary>Fused DiffusionGemma lm_head tail (output_norm + lm_head + softcap) in one GGML graph.</summary>
         public static bool TryDiffusionLmHead(
             IntPtr hidden, int hiddenSize, int canvasLen,
@@ -1792,7 +1827,8 @@ namespace TensorSharp.GGML
             int normTopk, float expertWeightsScale,
             IntPtr logits, int vocabSize,
             IntPtr lmHead, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1)
+            IntPtr finalNorm, IntPtr normedOut, int nLogitRows = -1,
+            int[] mropePos = null, int[] mropeSections = null)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -1804,7 +1840,7 @@ namespace TensorSharp.GGML
                 normTopk, expertWeightsScale,
                 logits, vocabSize,
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNorm, normedOut, nLogitRows);
+                finalNorm, normedOut, nLogitRows, mropePos, mropeSections);
         }
 
         /// <summary>Device-resident single-graph fused prefill for ONE Qwen3.5/

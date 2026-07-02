@@ -1277,6 +1277,24 @@ namespace TensorSharp.Models
             return 2048;
         }
 
+        // Micro-batch cap for the whole-model fused prefill (TSGgml_Qwen35ModelVerify),
+        // the analogue of llama.cpp's n_ubatch. The verify graph's activation scratch
+        // costs ~1.8 MB per prompt token on the 35B-A3B, and it lands in the shared
+        // reuse gallocr, which only ever GROWS (it lives for the backend's lifetime).
+        // One long prompt fed as a single graph (e.g. 3.2k tokens -> 5.7 GB scratch)
+        // pushes total VRAM past the card and WDDM demotes resident buffers to shared
+        // system memory — permanently, so EVERY later prefill and decode runs partly
+        // over PCIe (~3.5x collapse across the whole server until restart). Splitting
+        // prefill into sub-chunks bounds the scratch at the ubatch peak instead of
+        // scaling with prompt length. 0 disables the cap.
+        private static int ResolvePrefillVerifyUbatch()
+        {
+            string env = Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_UBATCH");
+            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v >= 0)
+                return v;
+            return 1024;
+        }
+
         // Gates the whole-model fused prefill path (TSGgml_Qwen35ModelVerify, one
         // GGML graph for all layers). Default on; TS_QWEN35_PREFILL_VERIFY=0 forces
         // the per-op layer loop for A/B comparison.
@@ -1295,7 +1313,17 @@ namespace TensorSharp.Models
         {
             if (!_prefillVerifyEnabled || _fvUnsupported) return false;
             if (_backend != BackendType.GgmlCuda || seqLen <= 1) return false;
-            if (_visionEmbeddingsList.Count > 0 || _pendingMRoPEPositions != null) return false;
+            // Vision embeddings must already be injected into the hidden tensor
+            // (Forward injects before the verify branch and clears the list).
+            if (_visionEmbeddingsList.Count > 0) return false;
+            // Multimodal prompts are supported: per-axis MRoPE positions route the
+            // kernel's RoPE through ggml_rope_multi (interleaved MRoPE) using the
+            // GGUF's mrope sections. Bail only when the positions/sections can't
+            // drive that path (per-op ApplyMRoPEPrefill handles those).
+            if (_pendingMRoPEPositions != null
+                && (_mropeSections == null || _mropeSections.Length < 4
+                    || _pendingMRoPEPositions.Length < 3 * seqLen))
+                return false;
             if (_headKDim != _headVDim) return false;
             return true;
         }
@@ -1357,7 +1385,7 @@ namespace TensorSharp.Models
             {
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
-                if (TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
+                if (TryFullModelVerifyPrefill(hidden, startPos, seqLen, _logitsBuffer))
                 {
                     hidden.Dispose();
                     _cacheSeqLen += seqLen;
@@ -1446,7 +1474,7 @@ namespace TensorSharp.Models
             // CUDA prefill cost. Mirrors Gemma4's whole-model prefill-verify routing.
             // Text-only (no multimodal MRoPE); long prompts chunk via ForwardRefill.
             if (seqLen > 1 && CanUsePrefillVerify(startPos, seqLen)
-                && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
+                && TryFullModelVerifyPrefill(hidden, startPos, seqLen, _logitsBuffer))
             {
                 // _logitsBuffer holds the LAST token's logits; KV + GDN state were
                 // committed (host ring) by the kernel. Re-seed the device-resident

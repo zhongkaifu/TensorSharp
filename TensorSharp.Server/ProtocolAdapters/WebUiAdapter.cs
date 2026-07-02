@@ -328,8 +328,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 if (file == null)
                     return Results.BadRequest(new { error = "No image uploaded (field 'image')." });
                 prompt = form["prompt"].ToString();
-                steps = int.TryParse(form["steps"], out int s) ? s : 28;
-                cfg = float.TryParse(form["cfg"], out float c) ? c : 2.5f;   // 2511-recommended (4.0 over-guides faces)
+                steps = int.TryParse(form["steps"], out int s) ? s : 0;   // 0 = auto (30, or the Lightning LoRA's step count)
+                cfg = float.TryParse(form["cfg"], out float c) ? c : 0f;  // 0 = auto (2.5, or 1.0 with a Lightning LoRA)
                 seed = long.TryParse(form["seed"], out long sd) ? sd : 0;
                 if (long.TryParse(form["targetArea"], out long taf) && taf > 0) targetArea = taf;
                 using var ms = new MemoryStream();
@@ -343,8 +343,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 var root = body.RootElement;
                 string imagePath = root.TryGetProperty("imagePath", out var ip) ? ip.GetString() : null;
                 prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
-                steps = root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si) ? si : 28;
-                cfg = root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv) ? cv : 2.5f;
+                steps = root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si) ? si : 0;   // 0 = auto
+                cfg = root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv) ? cv : 0f;  // 0 = auto
                 seed = root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv) ? sv : 0;
                 if (root.TryGetProperty("targetArea", out var ta) && ta.TryGetInt64(out long tav) && tav > 0)
                     targetArea = tav;
@@ -423,8 +423,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 var root = body.RootElement;
                 string imagePath = root.TryGetProperty("imagePath", out var ip) ? ip.GetString() : null;
                 prompt = root.TryGetProperty("prompt", out var pr) ? pr.GetString() ?? "" : "";
-                steps = root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si) ? si : 28;
-                cfg = root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv) ? cv : 2.5f;
+                steps = root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si) ? si : 0;   // 0 = auto
+                cfg = root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv) ? cv : 0f;  // 0 = auto
                 seed = root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv) ? sv : 0;
                 if (root.TryGetProperty("targetArea", out var ta) && ta.TryGetInt64(out long tav) && tav > 0)
                     targetArea = tav;

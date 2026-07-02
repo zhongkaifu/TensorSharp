@@ -21,6 +21,7 @@
 // reorder / window-mask pieces are host-pointer kernels, like QwenImageTextEncoder.
 // ============================================================================
 using System;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp.Core;
 using TensorSharp.Runtime;
@@ -66,25 +67,31 @@ namespace TensorSharp.Models.QwenImage
             // 2D RoPE cos/sin per token (after reorder)
             BuildRope(gridH, gridW, win, out float[] cos, out float[] sin);   // [seq, HeadDim]
 
-            Tensor x = HostToTensor(reordered, seq, Emb);
-            int[] cuFull = { 0, seq };
-            for (int L = 0; L < Blocks; L++)
+            // Fused whole-trunk path (TSGgml_QwenTeTrunk): all 32 blocks in ONE device graph
+            // (window/full attention via an additive mask). Falls back to the per-op loop.
+            float[] groupedHost = TryFusedTrunk(reordered, seq, cos, sin, cuWin);
+            if (groupedHost == null)
             {
-                string p = $"v.blk.{L}";
-                int[] cu = Array.IndexOf(FullAtt, L) >= 0 ? cuFull : cuWin;
-                using (Tensor n1 = RMSNormOp(x, $"{p}.ln1.weight"))
-                using (Tensor attn = Attention(n1, p, seq, cu, cos, sin))
-                    AddInPlace(x, attn, seq, Emb);
-                using (Tensor n2 = RMSNormOp(x, $"{p}.ln2.weight"))
-                using (Tensor ffn = SwiGlu(n2, p))
-                    AddInPlace(x, ffn, seq, Emb);
+                Tensor x = HostToTensor(reordered, seq, Emb);
+                int[] cuFull = { 0, seq };
+                for (int L = 0; L < Blocks; L++)
+                {
+                    string p = $"v.blk.{L}";
+                    int[] cu = Array.IndexOf(FullAtt, L) >= 0 ? cuFull : cuWin;
+                    using (Tensor n1 = RMSNormOp(x, $"{p}.ln1.weight"))
+                    using (Tensor attn = Attention(n1, p, seq, cu, cos, sin))
+                        AddInPlace(x, attn, seq, Emb);
+                    using (Tensor n2 = RMSNormOp(x, $"{p}.ln2.weight"))
+                    using (Tensor ffn = SwiGlu(n2, p))
+                        AddInPlace(x, ffn, seq, Emb);
+                }
+                using Tensor normed = RMSNormOp(x, "v.post_ln.weight");
+                x.Dispose();
+                groupedHost = TensorToHost(normed, (long)seq * Emb); // already grouped contiguous (4 consecutive rows)
             }
-            using Tensor normed = RMSNormOp(x, "v.post_ln.weight");
-            x.Dispose();
 
             // merger: group 4 -> [seq/4, 5120] -> mm.0 -> GELU -> mm.2 -> [seq/4, 3584]
             int merged = seq / MergeUnit;
-            float[] groupedHost = TensorToHost(normed, (long)seq * Emb); // already grouped contiguous (4 consecutive rows)
             using Tensor grouped = HostToTensor(groupedHost, merged, Emb * MergeUnit);
             using Tensor h0 = LinearBias(grouped, "mm.0.weight", "mm.0.bias");
             GeluInPlace(h0);
@@ -324,6 +331,133 @@ namespace TensorSharp.Models.QwenImage
             for (int i = 0; i < a.Length; i++) idx[i] = i;
             Array.Sort(idx, (x, y) => a[x].CompareTo(a[y]));
             return idx;
+        }
+
+        // ---- fused whole-trunk path (TSGgml_QwenTeTrunk) ------------------------------
+        // The per-op loop pays ~10 device<->host round-trips per block (RoPE, bias adds,
+        // block-mask softmax, SiLU as host loops) x 32 blocks. The fused path runs the
+        // whole tower as one device graph; the window/full attention pattern becomes an
+        // additive [seq, seq] mask (0 inside the token's window segment, -inf outside).
+        // Returns the post-v.post_ln hidden states [seq, Emb], or null to fall back.
+        // TS_QWEN_TE_FUSED=0 disables (shared knob with the text-encoder trunk).
+        private static readonly bool FusedTrunkOn =
+            Environment.GetEnvironmentVariable("TS_QWEN_TE_FUSED") != "0";
+        private QwenTeLayerW[] _fusedLayers;
+        private readonly System.Collections.Generic.List<IntPtr> _fusedAllocs = new();
+        private IntPtr _fusedFinalNorm;
+        private bool _fusedFailed;
+
+        private unsafe float[] TryFusedTrunk(float[] reordered, int seq, float[] cos, float[] sin, int[] cuWin)
+        {
+            if (!FusedTrunkOn || !IsGgmlBackend || _fusedFailed) return null;
+            if (_fusedLayers == null && !BuildFusedLayers()) { _fusedFailed = true; return null; }
+
+            // additive window mask from cu_seqlens
+            var seg = new int[seq];
+            for (int i = 0; i < cuWin.Length - 1; i++)
+                for (int t = cuWin[i]; t < cuWin[i + 1]; t++) seg[t] = i;
+            var mask = new float[(long)seq * seq];
+            Parallel.For(0, seq, q =>
+            {
+                long b = (long)q * seq;
+                int sq = seg[q];
+                for (int j = 0; j < seq; j++) mask[b + j] = seg[j] == sq ? 0f : float.NegativeInfinity;
+            });
+
+            var outArr = new float[(long)seq * Emb];
+            bool ok;
+            fixed (float* xp = reordered, cp = cos, sp = sin, mp = mask, op = outArr)
+            fixed (QwenTeLayerW* lp = _fusedLayers)
+            {
+                var a = new QwenTeTrunkArgs
+                {
+                    X = (IntPtr)xp, Out = (IntPtr)op, CosF = (IntPtr)cp, SinF = (IntPtr)sp,
+                    WinMask = (IntPtr)mp, FinalNorm = _fusedFinalNorm,
+                    Layers = (IntPtr)lp, NumLayers = Blocks,
+                    StructBytes = Marshal.SizeOf<QwenTeTrunkArgs>(),
+                    Hidden = Emb, Heads = Heads, KvHeads = Heads, HeadDim = HeadDim, Seq = seq,
+                    Eps = Config.Eps,
+                };
+                ok = GgmlBasicOps.TryQwenTeTrunk(in a);
+            }
+            if (!ok)
+            {
+                Console.WriteLine("  [venc-fused] trunk kernel unavailable; using the per-op path.");
+                _fusedFailed = true;
+                return null;
+            }
+            return outArr;
+        }
+
+        private unsafe bool BuildFusedLayers()
+        {
+            try
+            {
+                QImgAttnW W(string name, string biasName)
+                {
+                    var info = _gguf.Tensors[name];
+                    _gguf.TryGetTensorDataPointer(info, out IntPtr p);
+                    var w = new QImgAttnW
+                    {
+                        W = p,
+                        Type = (int)info.Type,
+                        Ne0 = (long)info.Shape[0],
+                        Ne1 = info.Shape.Length > 1 ? (long)info.Shape[1] : 1,
+                        Bytes = _gguf.GetTensorByteCount(info),
+                    };
+                    if (biasName != null && _gguf.Tensors.ContainsKey(biasName))
+                        w.B = F32Stable(biasName);
+                    return w;
+                }
+
+                var layers = new QwenTeLayerW[Blocks];
+                for (int l = 0; l < Blocks; l++)
+                {
+                    string p = $"v.blk.{l}";
+                    layers[l] = new QwenTeLayerW
+                    {
+                        Ln1 = F32Stable($"{p}.ln1.weight"),
+                        Ln2 = F32Stable($"{p}.ln2.weight"),
+                        Q = W($"{p}.attn_q.weight", $"{p}.attn_q.bias"),
+                        K = W($"{p}.attn_k.weight", $"{p}.attn_k.bias"),
+                        V = W($"{p}.attn_v.weight", $"{p}.attn_v.bias"),
+                        O = W($"{p}.attn_out.weight", $"{p}.attn_out.bias"),
+                        Gate = W($"{p}.ffn_gate.weight", $"{p}.ffn_gate.bias"),
+                        Up = W($"{p}.ffn_up.weight", $"{p}.ffn_up.bias"),
+                        Down = W($"{p}.ffn_down.weight", $"{p}.ffn_down.bias"),
+                        MaskKind = Array.IndexOf(FullAtt, l) >= 0 ? 0 : 2,
+                    };
+                }
+                _fusedFinalNorm = F32Stable("v.post_ln.weight");
+                _fusedLayers = layers;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [venc-fused] layer table build failed ({ex.Message}); using the per-op path.");
+                return false;
+            }
+        }
+
+        private unsafe IntPtr F32Stable(string name)
+        {
+            var info = _gguf.Tensors[name];
+            long n = info.NumElements;
+            var host = new float[n];
+            byte[] raw = _gguf.ReadTensorData(info);
+            GgmlGgufTensorDequant.DequantizeToFloat32((int)info.Type, raw, 0, host, 0, n);
+            IntPtr p = Marshal.AllocHGlobal((IntPtr)(n * sizeof(float)));
+            Marshal.Copy(host, 0, p, (int)n);
+            _fusedAllocs.Add(p);
+            return p;
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            foreach (var p in _fusedAllocs) Marshal.FreeHGlobal(p);
+            _fusedAllocs.Clear();
+            _fusedLayers = null;
         }
 
         // ---- shared small helpers (mirror QwenImageTextEncoder) ----

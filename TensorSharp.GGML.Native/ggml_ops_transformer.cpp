@@ -2121,7 +2121,8 @@ namespace
         int norm_topk, float expert_weights_scale,
         void* logits_data, int vocab_size,
         const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-        const void* final_norm_data, void* normed_out, int n_logit_rows)
+        const void* final_norm_data, void* normed_out, int n_logit_rows,
+        const std::int32_t* mrope_pos, const std::int32_t* mrope_sections)
     {
         if (!ensure_backend())
             return 0;
@@ -2183,13 +2184,19 @@ namespace
         // (validated 252 reuses, no crash). Reuse: setup ~8 ms + compute ~12-20 ms vs
         // ~61 ms non-persist build. TS_Q35_VERIFY_PERSIST=0 forces the rebuild path.
         static const bool fv_persist_cfg = []{ const char* e = std::getenv("TS_Q35_VERIFY_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        // Multimodal MRoPE: per-axis positions (T/H/W/E axis-concatenated, [4N] I32)
+        // route the attention RoPE through ggml_rope_multi (interleaved MRoPE, the
+        // Qwen3-VL LLM rope). Text prompts keep the plain sequential NeoX rope.
+        const bool use_mrope = mrope_pos != nullptr && mrope_sections != nullptr;
+
         // PREFILL (n_logits < N) processes a long prompt one-shot, so it never reuses
         // the cached graph; force the NON-PERSIST path (pooled ctx + gallocr lifetime-
         // packing) which reuses activation buffers across the graph. The persist path
         // gives every intermediate its own slot (no reuse) — for a 40-layer × N-token
         // graph on the VRAM-tight 35B that thrashes WDDM paging (N=512) or OOMs (N>=1024).
         // MTP verify (n_logits == N) keeps the persist+capture fast-replay reuse.
-        const bool fv_persist = fv_persist_cfg && (n_logits >= N);
+        // MRoPE calls are prefill-only; keep them off the persist cache too.
+        const bool fv_persist = fv_persist_cfg && (n_logits >= N) && !use_mrope;
         auto t_start = std::chrono::high_resolution_clock::now();
 
         const std::size_t convStateBytes = static_cast<std::size_t>(convDim) * conv_dim * sizeof(float);
@@ -2307,7 +2314,9 @@ namespace
         }
 
         ggml_tensor* hidden_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
-        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        // MRoPE positions are axis-concatenated [T0..Tn-1, H.., W.., E..] = 4N ints
+        // (ggml_rope_multi asserts pos->ne[0] == 4 * a->ne[2]).
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, use_mrope ? 4 * N : N);
         ggml_tensor* lm_head_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(lm_head_type), lm_head_ne0, lm_head_ne1);
         ggml_tensor* final_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
 
@@ -2458,8 +2467,22 @@ namespace
 
                 ggml_tensor* q_4d = ggml_reshape_4d(ctx, q_normed, head_dim, num_heads, N, 1);
                 ggml_tensor* k_4d = ggml_reshape_4d(ctx, k_normed, head_dim, num_kv_heads, N, 1);
-                ggml_tensor* q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, nullptr, rope_n_dims, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
-                ggml_tensor* k_roped = ggml_rope_ext(ctx, k_4d, pos_tensor, nullptr, rope_n_dims, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+                ggml_tensor* q_roped;
+                ggml_tensor* k_roped;
+                if (use_mrope)
+                {
+                    // Interleaved MRoPE (Qwen3-VL LLM): per-pair modality assignment
+                    // comes from the GGUF's mrope sections; positions per token are
+                    // the (T,H,W,E) axes uploaded into pos_tensor [4N].
+                    int sections_local[4] = { mrope_sections[0], mrope_sections[1], mrope_sections[2], mrope_sections[3] };
+                    q_roped = ggml_rope_multi(ctx, q_4d, pos_tensor, nullptr, rope_n_dims, sections_local, GGML_ROPE_TYPE_IMROPE, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+                    k_roped = ggml_rope_multi(ctx, k_4d, pos_tensor, nullptr, rope_n_dims, sections_local, GGML_ROPE_TYPE_IMROPE, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+                }
+                else
+                {
+                    q_roped = ggml_rope_ext(ctx, q_4d, pos_tensor, nullptr, rope_n_dims, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+                    k_roped = ggml_rope_ext(ctx, k_4d, pos_tensor, nullptr, rope_n_dims, rope_mode, 0, rope_base, rope_freq_scale, 0, 1, 0, 0);
+                }
 
                 ggml_tensor* q_attn = ggml_permute(ctx, q_roped, 0, 2, 1, 3); // [head_dim, N, num_heads]
                 ggml_tensor* k_fresh = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, k_roped, 0, 2, 1, 3)), head_dim, N, num_kv_heads);
@@ -2806,9 +2829,16 @@ namespace
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * N * sizeof(float));
-        std::vector<std::int32_t> pos_vals(N);
-        for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
-        ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+        if (use_mrope)
+        {
+            ggml_backend_tensor_set(pos_tensor, mrope_pos, 0, static_cast<std::size_t>(4) * N * sizeof(std::int32_t));
+        }
+        else
+        {
+            std::vector<std::int32_t> pos_vals(N);
+            for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
+            ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+        }
         ggml_backend_tensor_set(kv_index, kv_index_data.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int64_t));
         ggml_backend_tensor_set(attn_mask, attn_mask_data.data(), 0, attn_mask_data.size() * sizeof(ggml_fp16_t));
         if (!resident_state)
@@ -2913,7 +2943,8 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
     int norm_topk, float expert_weights_scale,
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    const void* final_norm_data, void* normed_out, int n_logit_rows)
+    const void* final_norm_data, void* normed_out, int n_logit_rows,
+    const std::int32_t* mrope_pos, const std::int32_t* mrope_sections)
 {
     try
     {
@@ -2927,7 +2958,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
             norm_topk, expert_weights_scale,
             logits_data, vocab_size,
             lm_head_data, lm_head_type, lm_head_ne0, lm_head_ne1, lm_head_bytes,
-            final_norm_data, normed_out, n_logit_rows);
+            final_norm_data, normed_out, n_logit_rows, mrope_pos, mrope_sections);
         if (r == 0 && std::getenv("TS_Q35_VERIFY_TIMING") != nullptr)
             fprintf(stderr, "[fv-err] %s\n", g_last_error.c_str());
         return r;

@@ -38,7 +38,64 @@ namespace TensorSharp.Models.QwenImage
         {
             Config = new ModelConfig { Architecture = "qwen_image", HiddenSize = Dim, NumLayers = NumLayers };
             EnsureQuantBackendAvailable();
+            // Runtime LoRA (see QwenImageLoraTable): the factors ride along every native
+            // weight descriptor (GgufW) as a side-path — the quantized base weights are
+            // untouched, so this composes with the resident-weight whole-model graph.
+            if (LoraPath != null)
+            {
+                if (!System.IO.File.Exists(LoraPath))
+                    throw new System.IO.FileNotFoundException($"Qwen-Image LoRA not found: {LoraPath}");
+                _loraTable = QwenImageLoraTable.Load(LoraPath, LoraScale);
+                LightningSteps = QwenImageLoraTable.ParseLightningSteps(LoraPath);
+                if (LightningSteps > 0)
+                    Console.WriteLine($"  [lora] Lightning distillation detected: default {LightningSteps} steps, cfg 1.0, fixed timestep shift 3.0");
+            }
             LoadWeights();
+        }
+
+        /// <summary>DiT LoRA (TS_QWEN_IMAGE_LORA / --qwen-image-lora), applied at runtime
+        /// as F32 side-matmuls next to the quantized projections. Null = no LoRA.</summary>
+        internal static string LoraPath =>
+            string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA"))
+                ? null : Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA");
+
+        private static float LoraScale
+        {
+            get
+            {
+                var v = Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA_SCALE");
+                return v != null && float.TryParse(v, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var f) ? f : 1.0f;
+            }
+        }
+
+        /// <summary>Steps a Lightning (step-distilled) LoRA was trained for, parsed from its
+        /// filename; 0 = no Lightning LoRA. The pipeline uses this to default Steps/CfgScale
+        /// and the scheduler's fixed timestep shift.</summary>
+        internal int LightningSteps { get; }
+
+        // Unmanaged F32 LoRA factors (stable pointers — resident-cached by the native
+        // side like the GGUF weights). Freed on Dispose AFTER the base dispose has
+        // cleared the native caches that reference them.
+        private readonly QwenImageLoraTable _loraTable;
+        internal bool LoraActive => _loraTable != null;
+
+        // The runtime LoRA side-path is implemented in the whole-model forward kernel
+        // (the default CUDA path). If the forward falls back to the per-block or managed
+        // paths, the LoRA silently wouldn't apply — surface that loudly (once).
+        private bool _loraSkipWarned;
+        private void WarnLoraSkipped()
+        {
+            if (!LoraActive || _loraSkipWarned) return;
+            _loraSkipWarned = true;
+            Console.WriteLine("  [lora] WARNING: forward is not using the whole-model graph — " +
+                              "the runtime LoRA is NOT applied on this path (per-block/managed fallback).");
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            _loraTable?.Dispose();
         }
 
         public override float[] Forward(int[] tokens) => throw new NotSupportedException("Use Predict().");
@@ -110,7 +167,10 @@ namespace TensorSharp.Models.QwenImage
                 // Integrated WITH the First-Block-Cache: on a cache-active step, block 0 is run
                 // per-block (for the residual decision), then blocks 1..N-1 go through this kernel
                 // (or are skipped on a cache hit). RunBlocks dispatches the per-layer work.
-                bool cacheActive = CacheEnabled && stepIndex >= 0 && totalSteps > 1;
+                // FBC runs block 0 through the per-block kernel (no LoRA side-path there),
+                // which would make block 0 inconsistent with the LoRA'd blocks 1..N-1 —
+                // disable it when a runtime LoRA is active (EasyCache/no-cache are fine).
+                bool cacheActive = CacheEnabled && stepIndex >= 0 && totalSteps > 1 && !LoraActive;
                 // Run blocks [start, NumLayers) — whole-model graph when enabled, else per-block.
                 void RunBlocks(int start)
                 {
@@ -121,6 +181,7 @@ namespace TensorSharp.Models.QwenImage
                         if (swW != null) { swW.Stop(); Console.WriteLine($"  [dit-timing] whole-model {NumLayers - start}-block graph imgSeq={imgSeq} txtSeq={txtSeq}: {swW.Elapsed.TotalMilliseconds:F0}ms"); }
                         if (ok) return;
                     }
+                    WarnLoraSkipped();
                     for (int layer = start; layer < NumLayers; layer++)
                         RunNativeLayer(layer, imgHost, imgSeq, txtHost, txtSeq, temb, modulateIndex, rope);
                 }
@@ -168,6 +229,7 @@ namespace TensorSharp.Models.QwenImage
             }
             else
             {
+                WarnLoraSkipped();
                 for (int layer = 0; layer < NumLayers; layer++)
                 {
                     Block(ref img, ref txt, temb, imgSeq, txtSeq, layer, modulateIndex, rope);

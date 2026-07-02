@@ -135,6 +135,237 @@ TSG_EXPORT int TSGgml_Conv2d(const TSGgmlConv2dDesc* d)
     catch (...) { set_last_error("Conv2d: unknown error."); return 0; }
 }
 
+// ============================================================================
+// Whole-VAE fused graph. The per-conv TSGgml_Conv2d path above runs the VAE as a
+// long C# chain: every conv re-uploads its weights AND the full feature map, then
+// downloads the result, while SiLU / channel-RMSNorm / nearest-upsample run as C#
+// loops over the (hundreds-of-MB at ~1 MP) host arrays between convs. That is
+// GBs of PCIe traffic + CPU elementwise passes per encode/decode (~21 s + ~27 s
+// at 928x704).
+//
+// This kernel instead executes the WHOLE encoder/decoder as ONE ggml graph:
+// the C# side emits a flat op list (single source of truth stays the verified
+// VaeReferenceMath topology), features stay on-device end-to-end, weights are
+// bound resident by their stable unmanaged pointers (uploaded once, reused across
+// encode/decode/edits), and convs use ggml_conv_2d_direct — no materialized
+// im2col, so the band-tiling workaround is unnecessary here. Per call: one input
+// upload, one compute, one sync, one output download.
+// ============================================================================
+enum TSGVaeOpKind : std::int32_t
+{
+    TSG_VAE_CONV = 0,       // conv2d(weight w, bias b) with stride/pad
+    TSG_VAE_NORM = 1,       // channel RMS norm * gamma (w = gamma index)
+    TSG_VAE_SILU = 2,
+    TSG_VAE_UPSAMPLE = 3,   // nearest x2
+    TSG_VAE_SAVE = 4,       // slots[dst] = slots[src] (alias, no compute)
+    TSG_VAE_ADD = 5,        // slots[dst] = slots[src] + slots[aux]
+    TSG_VAE_ATTN = 6,       // spatial single-head attention over slots[src]=[W,H,3C] -> [W,H,C]
+};
+
+struct TSGVaeWeightRef { void* data; std::int64_t bytes; };   // stable F32 host ptr
+
+struct TSGVaeOp
+{
+    std::int32_t kind;
+    std::int32_t w, b;                       // weight / bias table indices (-1 = none)
+    std::int32_t oc, ic, kh, kw;             // conv shape (attn: oc = C)
+    std::int32_t sh, sw, pt, pb, pl, pr;     // conv stride / padding
+    std::int32_t src, dst, aux;              // virtual feature slots
+};
+
+struct TSGgmlQwenVaeDesc
+{
+    void* input; std::int32_t in_w, in_h, in_c;   // [W,H,C] F32 (C# Feature [C,H,W])
+    void* output; std::int64_t out_len;           // expected element count of the final slot-0
+    const TSGVaeOp* ops; std::int32_t num_ops;
+    const TSGVaeWeightRef* weights; std::int32_t num_weights;
+    std::int32_t struct_bytes;
+};
+
+TSG_EXPORT int TSGgml_QwenVaeRun(const TSGgmlQwenVaeDesc* d)
+{
+    try
+    {
+        if (d == nullptr || d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwenVaeDesc)) ||
+            d->input == nullptr || d->output == nullptr || d->ops == nullptr || d->num_ops <= 0)
+        { set_last_error("QwenVaeRun: bad descriptor."); return 0; }
+        if (!ensure_backend()) return 0;
+
+        PooledContextHandle context;
+        if (!context.init(32 * 1024 * 1024)) { set_last_error("QwenVaeRun: ctx alloc failed."); return 0; }
+        ggml_context* ctx = context.value;
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* t; void* d; std::size_t b; };
+        std::vector<HostBinding> uploads;
+        auto bindW = [&](ggml_tensor* t, int idx) -> bool {
+            if (idx < 0 || idx >= d->num_weights) return false;
+            void* data = d->weights[idx].data;
+            std::size_t bytes = static_cast<std::size_t>(d->weights[idx].bytes);
+            if (data == nullptr || ggml_nbytes(t) != bytes) return false;
+            if (bytes >= 4096) {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
+                    ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
+                    if (needs) uploads.push_back({t, data, bytes});
+                    return true;
+                }
+                invalidate_cached_buffer(data);
+            }
+            ggml_set_input(t);
+            uploads.push_back({t, data, bytes});
+            return true;
+        };
+
+        ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d->in_w, d->in_h, d->in_c, 1);
+        ggml_set_input(input);
+
+        constexpr int kSlots = 8;
+        ggml_tensor* slots[kSlots] = {};
+        slots[0] = input;
+
+        for (int i = 0; i < d->num_ops; i++)
+        {
+            const TSGVaeOp& op = d->ops[i];
+            if (op.src < 0 || op.src >= kSlots || op.dst < 0 || op.dst >= kSlots || slots[op.src] == nullptr)
+            { set_last_error("QwenVaeRun: bad op slots."); return 0; }
+            ggml_tensor* x = slots[op.src];
+
+            switch (op.kind)
+            {
+                case TSG_VAE_CONV:
+                {
+                    int p0 = op.pl, p1 = op.pt;
+                    if (op.pl != op.pr || op.pt != op.pb)
+                    {
+                        // only the encoder Downsample's end-pad (0,1,0,1) is asymmetric
+                        if (op.pl != 0 || op.pt != 0) { set_last_error("QwenVaeRun: unsupported asymmetric pad."); return 0; }
+                        x = ggml_pad(ctx, x, op.pr, op.pb, 0, 0);
+                        p0 = 0; p1 = 0;
+                    }
+                    ggml_tensor* ker = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, op.kw, op.kh, op.ic, op.oc);
+                    if (!bindW(ker, op.w)) { set_last_error("QwenVaeRun: bad conv weight."); return 0; }
+                    // Prefer the im2col+GEMM conv (tensor cores; ~3x the direct kernel) while
+                    // its transient F16 im2col fits a budget — the gallocr reuses that scratch
+                    // across the graph, so the peak is ONE conv's im2col, not the sum. Above
+                    // the budget fall back to ggml_conv_2d_direct (no materialization).
+                    static const long long kIm2colBudget = []() {
+                        const char* e = std::getenv("TS_QWEN_VAE_FUSED_IM2COL_BUDGET");
+                        long long v = e ? std::atoll(e) : 0;
+                        return v > 0 ? v : 2LL * 1024 * 1024 * 1024;
+                    }();
+                    const long long oh = (x->ne[1] + 2LL * p1 - op.kh) / op.sh + 1;
+                    const long long ow = (x->ne[0] + 2LL * p0 - op.kw) / op.sw + 1;
+                    const long long im2col = static_cast<long long>(op.ic) * op.kh * op.kw * oh * ow * 2;
+                    ggml_tensor* y = im2col <= kIm2colBudget
+                        ? ggml_conv_2d(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1)
+                        : ggml_conv_2d_direct(ctx, ker, x, op.sw, op.sh, p0, p1, 1, 1);
+                    if (op.b >= 0)
+                    {
+                        ggml_tensor* bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, op.oc);
+                        if (!bindW(bt, op.b)) { set_last_error("QwenVaeRun: bad conv bias."); return 0; }
+                        y = ggml_add(ctx, y, ggml_reshape_4d(ctx, bt, 1, 1, op.oc, 1));
+                    }
+                    slots[op.dst] = y;
+                    break;
+                }
+                case TSG_VAE_NORM:
+                {
+                    // F.normalize over the channel dim * sqrt(C) * gamma == rms_norm over C
+                    // (with eps mapped from the reference's sum-space 1e-12 to mean-space).
+                    const std::int64_t hw = x->ne[0] * x->ne[1], C = x->ne[2];
+                    ggml_tensor* r = ggml_reshape_2d(ctx, x, hw, C);
+                    ggml_tensor* tr = ggml_cont(ctx, ggml_transpose(ctx, r));            // [C, hw]
+                    ggml_tensor* n = ggml_rms_norm(ctx, tr, 1e-12f / static_cast<float>(C));
+                    ggml_tensor* gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+                    if (!bindW(gamma, op.w)) { set_last_error("QwenVaeRun: bad norm gamma."); return 0; }
+                    n = ggml_mul(ctx, n, gamma);
+                    ggml_tensor* back = ggml_cont(ctx, ggml_transpose(ctx, n));          // [hw, C]
+                    slots[op.dst] = ggml_reshape_3d(ctx, back, x->ne[0], x->ne[1], C);
+                    break;
+                }
+                case TSG_VAE_SILU:
+                    slots[op.dst] = ggml_silu(ctx, x);
+                    break;
+                case TSG_VAE_UPSAMPLE:
+                    slots[op.dst] = ggml_upscale(ctx, x, 2, GGML_SCALE_MODE_NEAREST);
+                    break;
+                case TSG_VAE_SAVE:
+                    slots[op.dst] = x;
+                    break;
+                case TSG_VAE_ADD:
+                    if (op.aux < 0 || op.aux >= kSlots || slots[op.aux] == nullptr)
+                    { set_last_error("QwenVaeRun: bad add slot."); return 0; }
+                    slots[op.dst] = ggml_add(ctx, x, slots[op.aux]);
+                    break;
+                case TSG_VAE_ATTN:
+                {
+                    // x = qkv [W,H,3C], channel-planar. Single head over hw positions, dim C.
+                    const std::int64_t W = x->ne[0], H = x->ne[1], C = op.oc, hw = W * H;
+                    if (x->ne[2] != 3 * C) { set_last_error("QwenVaeRun: attn qkv shape."); return 0; }
+                    ggml_tensor* q2 = ggml_reshape_2d(ctx, x, hw, 3 * C);
+                    auto part = [&](std::int64_t o) {
+                        return ggml_view_2d(ctx, q2, hw, C, q2->nb[1], static_cast<std::size_t>(o) * q2->nb[1]);
+                    };
+                    ggml_tensor* qT = ggml_cont(ctx, ggml_transpose(ctx, part(0)));      // [C, hw]
+                    ggml_tensor* kT = ggml_cont(ctx, ggml_transpose(ctx, part(C)));      // [C, hw]
+                    ggml_tensor* v = ggml_cont(ctx, part(2 * C));                        // [hw, C]
+                    // scores[i,j] = q[:,i]·k[:,j] / sqrt(C); softmax over j; out[c,i] = sum_j P[i,j] v[j,c]
+                    ggml_tensor* S = ggml_mul_mat(ctx, kT, qT);                          // [hw(j), hw(i)]
+                    S = ggml_scale(ctx, S, 1.0f / std::sqrt(static_cast<float>(C)));
+                    ggml_tensor* P = ggml_soft_max(ctx, S);
+                    ggml_tensor* o2 = ggml_mul_mat(ctx, P, v);                           // [hw(i), C]
+                    slots[op.dst] = ggml_reshape_3d(ctx, o2, W, H, C);
+                    break;
+                }
+                default:
+                    set_last_error("QwenVaeRun: unknown op kind.");
+                    return 0;
+            }
+        }
+
+        ggml_tensor* fin = slots[0];
+        if (fin == nullptr || ggml_nelements(fin) != d->out_len)
+        { set_last_error("QwenVaeRun: output shape mismatch."); return 0; }
+        ggml_tensor* out = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, fin->ne[0], fin->ne[1], fin->ne[2], fin->ne[3]);
+        ggml_tensor* copied = ggml_cpy(ctx, fin, out);
+        ggml_set_output(copied);
+
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, 8192, false);
+        ggml_build_forward_expand(graph, copied);
+
+        // Bail out (so the C# per-conv fallback runs) if the backend can't execute any
+        // node — e.g. a backend without the direct GGML_OP_CONV_2D kernel.
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++)
+        {
+            ggml_tensor* node = ggml_graph_node(graph, i);
+            if (!ggml_backend_supports_op(g_backend, node))
+            { set_last_error("QwenVaeRun: op unsupported by backend."); return 0; }
+        }
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_graph_reuse_gallocr(graph))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) { set_last_error("QwenVaeRun: buffer alloc failed."); return 0; }
+        }
+
+        host_read_barrier();
+        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.d, 0, u.b);
+        ggml_backend_tensor_set(input, d->input,
+            0, static_cast<std::size_t>(d->in_w) * d->in_h * d->in_c * sizeof(float));
+
+        if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+        { set_last_error("QwenVaeRun: graph compute failed."); return 0; }
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(out, d->output, 0, static_cast<std::size_t>(d->out_len) * sizeof(float));
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("QwenVaeRun: unknown error."); return 0; }
+}
+
 struct TSGgmlQwenImageModMlpDesc
 {
     // in/out residual stream
@@ -274,7 +505,20 @@ TSG_EXPORT int TSGgml_QwenImageModMlp(const TSGgmlQwenImageModMlpDesc* d)
 // scale/shift/gate precomputed on host; RoPE cos/sin passed in the interleaved-
 // duplicated [head_dim, seq] layout (cos[2i]=cos[2i+1]=cos(angle_i)).
 // ============================================================================
-struct TSGImgAttnW { void* w; int type; std::int64_t ne0, ne1, bytes; void* b; };
+// Weight descriptor. lora_a/lora_b (optional) are a runtime LoRA side-path
+//   y = W·x + b + lora_scale * B·(A·x)
+// computed in F32 alongside the quantized base matmul. A LoRA cannot be MERGED
+// into low-bit weights: e.g. the Lightning distillation deltas are ~1e-4 RMS while
+// Q2_K quantization steps are ~100x larger, so dequantize-add-requantize (the
+// stable-diffusion.cpp approach, fine for F16/Q8_0 models) swallows the delta and
+// replaces it with fresh requantization noise. The side-path keeps the base
+// weights untouched and the delta exact. lora_a = [rank, ne0] row-major (the
+// safetensors lora_down bytes), lora_b = [ne1, rank] row-major (lora_up), F32.
+struct TSGImgAttnW
+{
+    void* w; int type; std::int64_t ne0, ne1, bytes; void* b;
+    void* lora_a; void* lora_b; std::int64_t lora_rank; float lora_scale;
+};
 
 struct TSGgmlQwenImageJointAttnDesc
 {
@@ -316,6 +560,26 @@ ggml_tensor* qi_lin_bias(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml
     return b ? ggml_add(ctx, o, b) : o;
 }
 
+// Device-side handles for one weight's runtime LoRA pair (see TSGImgAttnW).
+struct QiLora
+{
+    ggml_tensor* a = nullptr;   // [ne0(in), rank] F32
+    ggml_tensor* b = nullptr;   // [rank, ne1(out)] F32
+    float scale = 0.0f;
+};
+
+// y = W·x (+bias) + scale * B·(A·x). The LoRA matmuls run in F32 (cuBLAS SGEMM):
+// no activation quantization (so no q8_1 block-sum overflow) and no F16 cast of the
+// unbounded DiT activations (which reach ~1e8 by the late blocks).
+ggml_tensor* qi_lin_lora(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml_tensor* b, const QiLora& lo)
+{
+    ggml_tensor* o = qi_lin_bias(ctx, w, x, b);
+    if (lo.a == nullptr || lo.b == nullptr) return o;
+    ggml_tensor* h = ggml_mul_mat(ctx, lo.a, x);                       // [rank, seq]
+    ggml_tensor* d = ggml_scale(ctx, ggml_mul_mat(ctx, lo.b, h), lo.scale);
+    return ggml_add(ctx, o, d);
+}
+
 // per-head RMSNorm over head_dim then * weight. in: [head_dim, heads, seq]
 ggml_tensor* qi_qk_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, int head_dim, int heads, int seq, float eps)
 {
@@ -338,6 +602,221 @@ ggml_tensor* qi_rope(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cosf, ggml_
 }
 
 } // namespace
+
+// ============================================================================
+// Fused transformer trunk for the Qwen-Image conditioning encoders
+// (TSGgml_QwenTeTrunk): the Qwen2.5-VL text-encoder LLM (28 layers, GQA, causal)
+// and its vision tower (32 layers, MHA, window/full block-diagonal attention)
+// both ran per-op in C# — every layer paid ~10 device<->host round-trips
+// (RoPE, bias adds, SiLU, masks as host loops over GetFloatPtr) -> launch/PCIe
+// bound (~4.7 s vision + ~2.8 s LLM per edit). This kernel runs the WHOLE trunk
+// as ONE graph: weights resident (GGUF mmap ptr for the big matrices), RoPE
+// cos/sin precomputed on the host (M-RoPE / 2D window tables), one upload of the
+// input states + one download of the final hidden states.
+//
+// Layer: x += o_proj(attn(rms_norm(x)*ln1)); x += down(silu(gate)*up over
+// rms_norm(x)*ln2). RoPE is rotate-half (NeoX): out = x*cos + rotate_half(x)*sin
+// with per-token duplicated-half cos/sin tables [head_dim, seq]. Attention is
+// materialized (seq <= ~1.5k here) with per-layer mask kind: 0 = full,
+// 1 = causal (diag_mask_inf), 2 = the uploaded additive window mask.
+// ============================================================================
+struct TSGTeLayerW
+{
+    void* ln1; void* ln2;                        // [hidden] F32 (stable host ptrs)
+    TSGImgAttnW q, k, v, o, gate, up, down;      // .b = optional F32 bias
+    std::int32_t mask_kind;                      // 0 full, 1 causal, 2 window mask
+    std::int32_t pad_;
+};
+
+struct TSGgmlQwenTeTrunkDesc
+{
+    void* x;                 // [hidden, seq] F32 input states
+    void* out;               // [hidden, seq] F32 output (post final norm)
+    void* cosf; void* sinf;  // [head_dim, seq] F32 rotate-half tables
+    void* win_mask;          // [seq, seq] F32 additive mask (mask_kind 2), nullable
+    void* final_norm;        // [hidden] F32, nullable = skip final norm
+    const TSGTeLayerW* layers; std::int32_t num_layers;
+    std::int32_t struct_bytes, hidden, heads, kv_heads, head_dim, seq;
+    float eps;
+};
+
+namespace {
+
+// rotate-half RoPE: x [head_dim, heads, seq]; cos/sin [head_dim, seq].
+ggml_tensor* qte_rope_half(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cosf, ggml_tensor* sinf,
+                           int hd, int heads, int seq)
+{
+    const int half = hd / 2;
+    ggml_tensor* top = ggml_view_3d(ctx, x, half, heads, seq, x->nb[1], x->nb[2], 0);
+    ggml_tensor* bot = ggml_view_3d(ctx, x, half, heads, seq, x->nb[1], x->nb[2],
+                                    static_cast<std::size_t>(half) * x->nb[0]);
+    ggml_tensor* rot = ggml_concat(ctx, ggml_neg(ctx, ggml_cont(ctx, bot)), ggml_cont(ctx, top), 0);
+    ggml_tensor* cos3 = ggml_reshape_3d(ctx, cosf, hd, 1, seq);
+    ggml_tensor* sin3 = ggml_reshape_3d(ctx, sinf, hd, 1, seq);
+    return ggml_add(ctx, ggml_mul(ctx, x, cos3), ggml_mul(ctx, rot, sin3));
+}
+
+} // namespace
+
+TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
+{
+    try
+    {
+        if (d == nullptr || d->struct_bytes != static_cast<std::int32_t>(sizeof(TSGgmlQwenTeTrunkDesc)) ||
+            d->x == nullptr || d->out == nullptr || d->cosf == nullptr || d->sinf == nullptr ||
+            d->layers == nullptr || d->num_layers <= 0)
+        { set_last_error("QwenTeTrunk: bad descriptor."); return 0; }
+        if (!ensure_backend()) return 0;
+        const int hidden = d->hidden, heads = d->heads, kvh = d->kv_heads, hd = d->head_dim, seq = d->seq;
+        const int nl = d->num_layers;
+        if (heads <= 0 || kvh <= 0 || heads % kvh != 0 || hidden != heads * hd)
+        { set_last_error("QwenTeTrunk: bad head geometry."); return 0; }
+        const float eps = d->eps, scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+        PooledContextHandle context;
+        if (!context.init(32 * 1024 * 1024)) { set_last_error("QwenTeTrunk: ctx alloc failed."); return 0; }
+        ggml_context* ctx = context.value;
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+        struct HostBinding { ggml_tensor* t; void* dd; std::size_t b; };
+        std::vector<HostBinding> uploads;
+        auto bind = [&](ggml_tensor* t, void* data, std::size_t bytes) {
+            if (t == nullptr || data == nullptr) return;
+            if (bytes >= 4096) {
+                ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs = false;
+                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs) &&
+                    ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS) {
+                    if (needs) uploads.push_back({t, data, bytes});
+                    return;
+                }
+                invalidate_cached_buffer(data);
+            }
+            ggml_set_input(t);
+            uploads.push_back({t, data, bytes});
+        };
+        auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& wt, ggml_tensor*& bt) {
+            wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
+            bind(wt, s.w, static_cast<std::size_t>(s.bytes));
+            bt = nullptr;
+            if (s.b) {
+                bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, s.ne1);
+                bind(bt, s.b, static_cast<std::size_t>(s.ne1) * sizeof(float));
+            }
+        };
+        // plain mul_mat for F32/F16/BF16 weights; the q8_1-overflow prescale only for
+        // quantized types (whose activation quantization has the FP16 block-sum issue).
+        auto mm = [&](ggml_tensor* w, ggml_tensor* xx, ggml_tensor* b) {
+            ggml_tensor* o = ggml_is_quantized(w->type) ? qi_mm(ctx, w, xx) : ggml_mul_mat(ctx, w, xx);
+            return b ? ggml_add(ctx, o, b) : o;
+        };
+
+        ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
+        ggml_tensor* cosf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
+        ggml_tensor* sinf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, seq);
+        ggml_tensor* outT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq);
+        ggml_tensor* winMask = nullptr;
+        bool needWinMask = false;
+        for (int l = 0; l < nl; l++) needWinMask |= d->layers[l].mask_kind == 2;
+        if (needWinMask)
+        {
+            if (d->win_mask == nullptr) { set_last_error("QwenTeTrunk: missing window mask."); return 0; }
+            winMask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq, seq);
+        }
+
+        ggml_tensor* h = x;
+        for (int l = 0; l < nl; l++)
+        {
+            const TSGTeLayerW& lw = d->layers[l];
+            ggml_tensor *qw, *qb, *kw, *kb, *vw, *vb, *ow, *ob, *gw, *gb, *uw, *ub, *dw, *db;
+            declW(lw.q, qw, qb); declW(lw.k, kw, kb); declW(lw.v, vw, vb); declW(lw.o, ow, ob);
+            declW(lw.gate, gw, gb); declW(lw.up, uw, ub); declW(lw.down, dw, db);
+            ggml_tensor* ln1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+            ggml_tensor* ln2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+            bind(ln1, lw.ln1, static_cast<std::size_t>(hidden) * sizeof(float));
+            bind(ln2, lw.ln2, static_cast<std::size_t>(hidden) * sizeof(float));
+
+            // --- attention ---
+            ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), ln1);
+            ggml_tensor* q = ggml_reshape_3d(ctx, mm(qw, n1, qb), hd, heads, seq);
+            ggml_tensor* k = ggml_reshape_3d(ctx, mm(kw, n1, kb), hd, kvh, seq);
+            ggml_tensor* v = ggml_reshape_3d(ctx, mm(vw, n1, vb), hd, kvh, seq);
+            q = qte_rope_half(ctx, q, cosf, sinf, hd, heads, seq);
+            k = qte_rope_half(ctx, k, cosf, sinf, hd, kvh, seq);
+
+            ggml_tensor* qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));   // [hd, seq, heads]
+            ggml_tensor* kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));   // [hd, seq, kvh]
+            ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);                          // [kv, q, heads] (GQA broadcast)
+            ggml_tensor* probs;
+            if (lw.mask_kind == 1)
+            {
+                kq = ggml_diag_mask_inf(ctx, ggml_scale(ctx, kq, scale), 0);
+                probs = ggml_soft_max(ctx, kq);
+            }
+            else
+            {
+                probs = ggml_soft_max_ext(ctx, kq, lw.mask_kind == 2 ? winMask : nullptr, scale, 0.0f);
+            }
+            ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));   // [kv, hd, kvh]
+            ggml_tensor* kqv = ggml_mul_mat(ctx, vt, probs);                      // [hd, q, heads]
+            ggml_tensor* merged = ggml_reshape_2d(ctx,
+                ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), hidden, seq); // [hidden, seq]
+            h = ggml_add(ctx, h, mm(ow, merged, ob));
+
+            // --- SwiGLU MLP ---
+            ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), ln2);
+            ggml_tensor* g = mm(gw, n2, gb);
+            ggml_tensor* u = mm(uw, n2, ub);
+            ggml_tensor* ff = ggml_mul(ctx, ggml_silu(ctx, g), u);
+            h = ggml_add(ctx, h, mm(dw, ff, db));
+        }
+
+        if (d->final_norm)
+        {
+            ggml_tensor* fn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden);
+            bind(fn, d->final_norm, static_cast<std::size_t>(hidden) * sizeof(float));
+            h = ggml_mul(ctx, ggml_rms_norm(ctx, h, eps), fn);
+        }
+        ggml_tensor* copied = ggml_cpy(ctx, h, outT);
+        ggml_set_output(copied);
+
+        const std::size_t nodes = static_cast<std::size_t>(nl) * 64 + 1024;
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, nodes, false);
+        if (graph == nullptr) { set_last_error("QwenTeTrunk: graph alloc failed."); return 0; }
+        ggml_build_forward_expand(graph, copied);
+
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++)
+        {
+            if (!ggml_backend_supports_op(g_backend, ggml_graph_node(graph, i)))
+            { set_last_error("QwenTeTrunk: op unsupported by backend."); return 0; }
+        }
+
+        ggml_set_input(x); ggml_set_input(cosf); ggml_set_input(sinf);
+        if (winMask) ggml_set_input(winMask);
+
+        BufferHandle buffer(nullptr);
+        if (!alloc_graph_reuse_gallocr(graph))
+        {
+            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (buffer.value == nullptr) { set_last_error("QwenTeTrunk: buffer alloc failed."); return 0; }
+        }
+
+        host_read_barrier();
+        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.dd, 0, u.b);
+        ggml_backend_tensor_set(x, d->x, 0, static_cast<std::size_t>(hidden) * seq * sizeof(float));
+        ggml_backend_tensor_set(cosf, d->cosf, 0, static_cast<std::size_t>(hd) * seq * sizeof(float));
+        ggml_backend_tensor_set(sinf, d->sinf, 0, static_cast<std::size_t>(hd) * seq * sizeof(float));
+        if (winMask) ggml_backend_tensor_set(winMask, d->win_mask, 0, static_cast<std::size_t>(seq) * seq * sizeof(float));
+
+        if (ggml_backend_graph_compute(g_backend, graph) != GGML_STATUS_SUCCESS)
+        { set_last_error("QwenTeTrunk: graph compute failed."); return 0; }
+        ggml_backend_synchronize(g_backend);
+        ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(hidden) * seq * sizeof(float));
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("QwenTeTrunk: unknown error."); return 0; }
+}
 
 TSG_EXPORT int TSGgml_QwenImageJointAttn(const TSGgmlQwenImageJointAttnDesc* d)
 {
@@ -1613,14 +2092,13 @@ ggml_tensor* qi_mod_norm_raw(ggml_context* ctx, ggml_tensor* x, ggml_tensor* sca
 
 // One modulated GEGLU MLP sub-layer with raw scale/shift/gate. x: residual stream.
 ggml_tensor* qi_build_mlp_raw(ggml_context* ctx, ggml_tensor* x, ggml_tensor* scale, ggml_tensor* shift, ggml_tensor* gate,
-                              ggml_tensor* n0w, ggml_tensor* n0b, ggml_tensor* n2w, ggml_tensor* n2b, float eps)
+                              ggml_tensor* n0w, ggml_tensor* n0b, ggml_tensor* n2w, ggml_tensor* n2b, float eps,
+                              const QiLora& lo0 = {}, const QiLora& lo2 = {})
 {
     ggml_tensor* mod = qi_mod_norm_raw(ctx, x, scale, shift, eps);
-    ggml_tensor* h = qi_mm(ctx, n0w, mod);
-    if (n0b) h = ggml_add(ctx, h, n0b);
+    ggml_tensor* h = qi_lin_lora(ctx, n0w, mod, n0b, lo0);
     h = ggml_gelu(ctx, h);
-    ggml_tensor* mlp = qi_mm(ctx, n2w, h);
-    if (n2b) mlp = ggml_add(ctx, mlp, n2b);
+    ggml_tensor* mlp = qi_lin_lora(ctx, n2w, h, n2b, lo2);
     return ggml_add(ctx, x, ggml_mul(ctx, mlp, gate));
 }
 
@@ -1632,6 +2110,8 @@ struct QiFullBlockW
     ggml_tensor *aQw, *aQb, *aKw, *aKb, *aVw, *aVb, *aOw, *aOb;
     ggml_tensor *nQ, *nK, *nAQ, *nAK;
     ggml_tensor *iN0w, *iN0b, *iN2w, *iN2b, *tN0w, *tN0b, *tN2w, *tN2b;
+    // Optional runtime LoRA pairs for the 12 projection matmuls (see TSGImgAttnW).
+    QiLora lToQ, lToK, lToV, lToO, lAQ, lAK, lAV, lAO, lIN0, lIN2, lTN0, lTN2;
 };
 
 // Build one double-stream block: in-graph AdaLN modulation (from silu_temb + this
@@ -1668,12 +2148,12 @@ void qi_full_block(ggml_context* ctx, const QiFullBlockW& w, ggml_tensor* silu_t
     ggml_tensor* imgMod = qi_mod_norm_raw(ctx, img, iScA, iShA, eps);
     ggml_tensor* txtMod = qi_mod_norm_raw(ctx, txt, tScA, tShA, eps);
 
-    ggml_tensor* iq = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.toQw, imgMod, w.toQb), hd, heads, iseq);
-    ggml_tensor* ik = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.toKw, imgMod, w.toKb), hd, heads, iseq);
-    ggml_tensor* iv = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.toVw, imgMod, w.toVb), hd, heads, iseq);
-    ggml_tensor* tq = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.aQw, txtMod, w.aQb), hd, heads, tseq);
-    ggml_tensor* tk = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.aKw, txtMod, w.aKb), hd, heads, tseq);
-    ggml_tensor* tv = ggml_reshape_3d(ctx, qi_lin_bias(ctx, w.aVw, txtMod, w.aVb), hd, heads, tseq);
+    ggml_tensor* iq = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.toQw, imgMod, w.toQb, w.lToQ), hd, heads, iseq);
+    ggml_tensor* ik = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.toKw, imgMod, w.toKb, w.lToK), hd, heads, iseq);
+    ggml_tensor* iv = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.toVw, imgMod, w.toVb, w.lToV), hd, heads, iseq);
+    ggml_tensor* tq = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.aQw, txtMod, w.aQb, w.lAQ), hd, heads, tseq);
+    ggml_tensor* tk = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.aKw, txtMod, w.aKb, w.lAK), hd, heads, tseq);
+    ggml_tensor* tv = ggml_reshape_3d(ctx, qi_lin_lora(ctx, w.aVw, txtMod, w.aVb, w.lAV), hd, heads, tseq);
 
     iq = qi_rope(ctx, qi_qk_norm(ctx, iq, w.nQ, hd, heads, iseq, eps), iCos, iSin, hd, heads, iseq);
     ik = qi_rope(ctx, qi_qk_norm(ctx, ik, w.nK, hd, heads, iseq, eps), iCos, iSin, hd, heads, iseq);
@@ -1692,14 +2172,14 @@ void qi_full_block(ggml_context* ctx, const QiFullBlockW& w, ggml_tensor* silu_t
     ggml_tensor* txt_attn = ggml_cont(ctx, ggml_view_2d(ctx, attn_flat, dim, tseq, attn_flat->nb[1], 0));
     ggml_tensor* img_attn = ggml_cont(ctx, ggml_view_2d(ctx, attn_flat, dim, iseq, attn_flat->nb[1],
                                                         static_cast<std::size_t>(tseq) * attn_flat->nb[1]));
-    ggml_tensor* img_o = qi_lin_bias(ctx, w.toOw, img_attn, w.toOb);
-    ggml_tensor* txt_o = qi_lin_bias(ctx, w.aOw, txt_attn, w.aOb);
+    ggml_tensor* img_o = qi_lin_lora(ctx, w.toOw, img_attn, w.toOb, w.lToO);
+    ggml_tensor* txt_o = qi_lin_lora(ctx, w.aOw, txt_attn, w.aOb, w.lAO);
     img = ggml_add(ctx, img, ggml_mul(ctx, img_o, iGA));
     txt = ggml_add(ctx, txt, ggml_mul(ctx, txt_o, tGA));
 
     // --- MLP sub-layer ---
-    img = qi_build_mlp_raw(ctx, img, iScM, iShM, iGM, w.iN0w, w.iN0b, w.iN2w, w.iN2b, eps);
-    txt = qi_build_mlp_raw(ctx, txt, tScM, tShM, tGM, w.tN0w, w.tN0b, w.tN2w, w.tN2b, eps);
+    img = qi_build_mlp_raw(ctx, img, iScM, iShM, iGM, w.iN0w, w.iN0b, w.iN2w, w.iN2b, eps, w.lIN0, w.lIN2);
+    txt = qi_build_mlp_raw(ctx, txt, tScM, tShM, tGM, w.tN0w, w.tN0b, w.tN2w, w.tN2b, eps, w.lTN0, w.lTN2);
 }
 
 // ----------------------------------------------------------------------------
@@ -1753,19 +2233,31 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
     g.tSin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, tseq);
     g.modIdx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, iseq);
 
-    // NB: the captured graph deliberately uses the MATERIALIZED attention path (mask
-    // left null -> qi_attention takes the scores+softmax branch). ggml-cuda's large-batch
-    // flash-attn (Q->ne[1] >= 1024, our 60-block prefill geometry) runs the parallel_blocks/
-    // stream_k kernel, which pool-allocs scratch (dst_tmp/KV_max) whose addresses are baked
-    // at capture time but churn across replays -> NaN from the 2nd captured forward on (LLM
-    // decode never hits this, being single-token). Materialized attention has no per-call
-    // scratch and replays correctly. The scores are gallocr-reused across the 60 blocks so
-    // peak VRAM stays ~one block's [total,total] (953 MB @1944 tok, ~4.4 GB @full-res clamp).
-    (void)total;
+    // Flash-attention in the CAPTURED graph. Historically this NaN'd from the 2nd
+    // captured forward on: ggml-cuda's large-batch flash path (Q->ne[1] >= 1024) pool-allocs
+    // per-launch scratch (KV_max/dst_tmp/dst_tmp_meta) whose addresses are baked into the
+    // captured CUDA graph while the pool hands the same region to other work between
+    // replays. launch_fattn now serves that scratch from a capture-stable per-context arena
+    // (see fattn-common.cuh), so flash replays correctly and the captured entry no longer
+    // materializes the O(total^2) scores — capture (and its launch-overhead elimination)
+    // extends to the high-resolution token counts that used to fall back to the slow
+    // non-persistent path. TS_QWEN_DIT_FLASH=0 restores the materialized path.
+    if (qi_flash_enabled())
+    {
+        g.maskHost = qi_attn_mask_host(total, g.total_pad);
+        g.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, g.total_pad, g.total_pad);
+    }
 
     auto declW = [&](const TSGImgAttnW& s, ggml_tensor*& wt, ggml_tensor*& bt, int blen) {
         wt = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(s.type), s.ne0, s.ne1);
         bt = s.b ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, blen) : nullptr;
+    };
+    // Runtime LoRA pair: A [ne0(in), rank], B [rank, ne1(out)], both F32 (see TSGImgAttnW).
+    auto declL = [&](const TSGImgAttnW& s, QiLora& lo) {
+        if (s.lora_a == nullptr || s.lora_b == nullptr || s.lora_rank <= 0) return;
+        lo.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.ne0, s.lora_rank);
+        lo.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.lora_rank, s.ne1);
+        lo.scale = s.lora_scale;
     };
     std::vector<QiFullBlockW> bw(nl);
     for (int l = 0; l < nl; l++)
@@ -1784,6 +2276,9 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
         b.nAK = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hd);
         declW(s.i_net0, b.iN0w, b.iN0b, ff); declW(s.i_net2, b.iN2w, b.iN2b, dim);
         declW(s.t_net0, b.tN0w, b.tN0b, ff); declW(s.t_net2, b.tN2w, b.tN2b, dim);
+        declL(s.to_q, b.lToQ); declL(s.to_k, b.lToK); declL(s.to_v, b.lToV); declL(s.to_out, b.lToO);
+        declL(s.add_q, b.lAQ); declL(s.add_k, b.lAK); declL(s.add_v, b.lAV); declL(s.to_add_out, b.lAO);
+        declL(s.i_net0, b.lIN0); declL(s.i_net2, b.lIN2); declL(s.t_net0, b.lTN0); declL(s.t_net2, b.lTN2);
     }
 
     ggml_tensor* silu_temb = ggml_silu(ctx, g.temb);
@@ -1795,7 +2290,7 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
     ggml_tensor* oi = ggml_cpy(ctx, img, g.imgOut); ggml_set_output(oi);
     ggml_tensor* ot = ggml_cpy(ctx, txt, g.txtOut); ggml_set_output(ot);
 
-    const std::size_t nodes = static_cast<std::size_t>(nl) * 384 + 2048;
+    const std::size_t nodes = static_cast<std::size_t>(nl) * 448 + 2048;   // +LoRA: up to 12x3 extra ops/block
     g.graph = ggml_new_graph_custom(ctx, nodes, false);
     if (g.graph == nullptr) return false;
     ggml_build_forward_expand(g.graph, oi);
@@ -1822,6 +2317,14 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
         if (bt && s.b) bind(bt, s.b, static_cast<std::size_t>(blen) * sizeof(float));
     };
     auto bind1 = [&](ggml_tensor* tt, void* dd, int len) { bind(tt, dd, static_cast<std::size_t>(len) * sizeof(float)); };
+    // LoRA A/B host buffers are stable unmanaged allocations (owned by the C# DiT
+    // instance for the process lifetime), so they take the same resident-cacheable
+    // path as the GGUF weights: uploaded once, replayed by the captured graph.
+    auto bindL = [&](const QiLora& lo, const TSGImgAttnW& s) {
+        if (lo.a == nullptr) return;
+        bind(lo.a, s.lora_a, static_cast<std::size_t>(s.ne0) * s.lora_rank * sizeof(float));
+        bind(lo.b, s.lora_b, static_cast<std::size_t>(s.lora_rank) * s.ne1 * sizeof(float));
+    };
     for (int l = 0; l < nl; l++)
     {
         const TSGImgBlockW& s = d->blocks[l];
@@ -1836,6 +2339,9 @@ bool qi_fwd_build_graph(ggml_context* ctx, const TSGgmlQwenImageForwardDesc* d, 
         bind1(b.nAQ, s.norm_aq, hd); bind1(b.nAK, s.norm_ak, hd);
         bindW(b.iN0w, b.iN0b, s.i_net0, ff); bindW(b.iN2w, b.iN2b, s.i_net2, dim);
         bindW(b.tN0w, b.tN0b, s.t_net0, ff); bindW(b.tN2w, b.tN2b, s.t_net2, dim);
+        bindL(b.lToQ, s.to_q); bindL(b.lToK, s.to_k); bindL(b.lToV, s.to_v); bindL(b.lToO, s.to_out);
+        bindL(b.lAQ, s.add_q); bindL(b.lAK, s.add_k); bindL(b.lAV, s.add_v); bindL(b.lAO, s.to_add_out);
+        bindL(b.lIN0, s.i_net0); bindL(b.lIN2, s.i_net2); bindL(b.lTN0, s.t_net0); bindL(b.lTN2, s.t_net2);
     }
 
     auto markIn = [](ggml_tensor* x) { if (x) ggml_set_input(x); };
@@ -1894,17 +2400,17 @@ bool qi_whole_capture_enabled()
     return name != nullptr && std::strncmp(name, "CUDA", 4) == 0;
 }
 
-// The captured whole-model graph uses the MATERIALIZED attention path (flash breaks under
-// CUDA-graph capture), so its dedicated gallocr must hold the [total,total] QK scores + probs
-// reused across the 60 blocks: 2 * total^2 * heads * 4 bytes (empirically ~4.4 GB at 4808
-// tok) PLUS the per-block activations + resident weights + the still-resident VAE. At higher
-// resolution this won't fit; attempting the capture anyway grabs the device, the spill-guard
-// bails, and the freed-but-fragmented VRAM can even break the non-persistent fallback
-// (all-NaN at ~1 MP). The exact ceiling is hard to predict (depends on quant, VAE residency,
-// driver overhead), so rather than estimate, we remember the shapes whose capture build
-// actually bailed and never retry them — the first forward attempts once, bails, and records;
-// every later forward of that shape skips straight to the non-persistent FLASH path (O(n)
-// attention, correct at any resolution). This removes the per-forward alloc/bail/free waste.
+// With flash-attention (default) the captured whole-model graph's gallocr is ~O(total)
+// (no materialized scores), so it fits VRAM at any practical resolution. With flash OFF
+// (TS_QWEN_DIT_FLASH=0) it must hold the [total,total] QK scores + probs reused across
+// the 60 blocks (2 * total^2 * heads * 4 bytes, ~4.4 GB at 4808 tok) and can exceed VRAM;
+// attempting the capture anyway grabs the device, the spill-guard bails, and the
+// freed-but-fragmented VRAM can even break the non-persistent fallback (all-NaN at ~1 MP).
+// The exact ceiling is hard to predict (depends on quant, VAE residency, driver overhead),
+// so rather than estimate, we remember the shapes whose capture build actually bailed and
+// never retry them — the first forward attempts once, bails, and records; every later
+// forward of that shape skips straight to the non-persistent FLASH path (O(n) attention,
+// correct at any resolution). This removes the per-forward alloc/bail/free waste.
 struct QiFwdTooBig { int iseq, tseq, nl; const void* wkey; };
 std::vector<QiFwdTooBig> g_qiFwdTooBig;
 

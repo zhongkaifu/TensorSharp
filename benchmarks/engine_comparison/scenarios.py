@@ -39,6 +39,56 @@ def _data_uri(path: Path, mime: str) -> str:
     return f"data:{mime};base64,{_b64_file(path)}"
 
 
+# ---------------------------------------------------------------------------
+# Shared prompt-context preamble
+# ---------------------------------------------------------------------------
+# The interactive text scenarios (text_short / text_long / multi_turn /
+# function_call / json_mode) are timed by TTFT. At tiny prompt lengths TTFT is
+# dominated by fixed per-request overhead (HTTP, scheduling, cold-graph launch,
+# first-token sampling) rather than prefill compute, so the numbers are noisy
+# and engine-to-engine differences are unreliable. To measure on a realistic,
+# stable footing every one of these scenarios is prefixed with the same
+# ~2k-token reference document; the scenario's actual task then follows.
+_PREFILL_CHARS_PER_TOKEN = 4.6   # ~English prose under these models' tokenizers
+_CONTEXT_TOKENS = 2048           # ~2k-token context preamble for text scenarios
+
+
+@functools.lru_cache(maxsize=8)
+def _sliced_corpus(target_tokens: int) -> str:
+    """Tile `prefill_corpus.txt` to ~`target_tokens` tokens (char-budget approx).
+
+    Length is controlled by slicing to a target character budget; the *reported*
+    `prompt_tokens` (from each engine's own tokenizer) is what the throughput math
+    actually uses, so this approximation only needs to land in the right ballpark.
+    """
+    corpus = _read_asset("prefill_corpus.txt",
+                         "The quick brown fox jumps over the lazy dog. " * 400)
+    target_chars = int(target_tokens * _PREFILL_CHARS_PER_TOKEN)
+
+    # Tile the corpus (with a numbered separator, so adjacent blocks are not
+    # byte-identical) until it is long enough, then truncate to the budget.
+    body = corpus
+    section = 2
+    while len(body) < target_chars:
+        body += f"\n\n--- continued (part {section}) ---\n\n{corpus}"
+        section += 1
+    return body[:target_chars].rstrip()
+
+
+def _context_preamble(tag: str) -> str:
+    """A ~2k-token reference-document preamble to prepend to a text scenario.
+
+    `tag` is embedded in a unique header at position 0 so that scenarios sharing
+    this identical body cannot hit a server's prompt/prefix cache off one another
+    (which would report a near-zero TTFT and a wildly inflated prefill_tps). The
+    differing tag busts any shared-prefix match within the first few tokens.
+    """
+    doc = _sliced_corpus(_CONTEXT_TOKENS)
+    header = (f"[context:{tag}] Reference document, provided for context; keep it "
+              f"in mind when answering the request that follows.\n\n")
+    return f"{header}{doc}\n\n---\n\n"
+
+
 @functools.lru_cache(maxsize=4)
 def _video_frames_b64(path_str: str, n: int = 4) -> tuple:
     """Sample `n` evenly-spaced frames from a video, return JPEG base64 strings."""
@@ -68,31 +118,34 @@ def _video_frames_b64(path_str: str, n: int = 4) -> tuple:
 def _text_short(engine, model):
     return {"messages": [
         {"role": "user",
-         "content": "Explain what a transformer neural network is in three concise sentences."}]}
+         "content": _context_preamble("text_short") +
+                    "Explain what a transformer neural network is in three concise sentences."}]}
 
 
 def _text_long(engine, model):
     doc = _read_asset("long_text.txt", "Lorem ipsum dolor sit amet. " * 200)
     return {"messages": [
         {"role": "user",
-         "content": doc + "\n\nSummarize the passage above in two sentences."}]}
+         "content": _context_preamble("text_long") +
+                    doc + "\n\nSummarize the passage immediately above in two sentences."}]}
 
 
 # ---------------------------------------------------------------------------
 # Prefill (prompt-processing) dataset
 # ---------------------------------------------------------------------------
 # Dedicated long-prompt scenarios used to measure prefill throughput accurately.
-# `text_long` tops out near ~1.2k tokens, where time-to-first-token is dominated
-# by fixed per-request overhead (HTTP, scheduling, cold-graph launch, first-token
-# sampling) rather than prefill compute. These scenarios drive the prompt to
-# several thousand / tens-of-thousands of tokens at controlled lengths so the
-# per-token prefill cost separates cleanly from that fixed overhead.
+# The interactive text scenarios carry only a ~2k-token context preamble (see
+# `_context_preamble`), enough to keep TTFT out of the fixed-overhead floor but
+# still short enough that per-token prefill cost does not fully dominate. The
+# prefill scenarios below instead drive the prompt to several thousand /
+# tens-of-thousands of tokens at controlled lengths so the per-token prefill
+# cost separates cleanly from that fixed overhead.
 #
 # Length is controlled by slicing `prefill_corpus.txt` to a target character
-# budget; the *reported* `prompt_tokens` (from each engine's own tokenizer) is
-# what `prefill_tps = prompt_tokens / ttft` actually uses, so this approximation
-# only needs to land each scenario in the right ballpark, not hit an exact count.
-_PREFILL_CHARS_PER_TOKEN = 4.6   # ~English prose under these models' tokenizers
+# budget (see `_sliced_corpus`); the *reported* `prompt_tokens` (from each
+# engine's own tokenizer) is what `prefill_tps = prompt_tokens / ttft` actually
+# uses, so this approximation only needs to land each scenario in the right
+# ballpark, not hit an exact count.
 
 
 def _parse_prefill_target(scenario_id: str) -> int:
@@ -104,18 +157,7 @@ def _parse_prefill_target(scenario_id: str) -> int:
 
 
 def _prefill(target_tokens: int, engine, model):
-    corpus = _read_asset("prefill_corpus.txt",
-                         "The quick brown fox jumps over the lazy dog. " * 400)
-    target_chars = int(target_tokens * _PREFILL_CHARS_PER_TOKEN)
-
-    # Tile the corpus (with a numbered separator, so adjacent blocks are not
-    # byte-identical) until it is long enough, then truncate to the budget.
-    body = corpus
-    section = 2
-    while len(body) < target_chars:
-        body += f"\n\n--- continued (part {section}) ---\n\n{corpus}"
-        section += 1
-    body = body[:target_chars].rstrip()
+    body = _sliced_corpus(target_tokens)
 
     # A unique-per-length header at position 0 so the longer prompts cannot hit
     # the server's prompt/prefix cache off the shorter ones (which would report a
@@ -131,8 +173,11 @@ def _prefill(target_tokens: int, engine, model):
 
 
 def _multi_turn(engine, model):
+    # Prepend the ~2k-token context to the first user turn so the final (timed)
+    # turn re-processes a realistic-length conversation prefix.
     return {"messages": [
-        {"role": "user", "content": "I'm planning a trip to Japan. My budget is $3000."},
+        {"role": "user", "content": _context_preamble("multi_turn") +
+                                    "I'm planning a trip to Japan. My budget is $3000."},
         {"role": "assistant", "content": "Great! Japan is a wonderful destination. With a $3000 budget, "
                                          "you can have a comfortable week-long trip. What time of year are you thinking?"},
         {"role": "user", "content": "Cherry blossom season. Which two cities should I prioritize and why?"},
@@ -155,7 +200,8 @@ def _function_call(engine, model):
 
     return {"messages": [
         {"role": "user",
-         "content": "What is the current weather in Paris in celsius? Use the available tool."}],
+         "content": _context_preamble("function_call") +
+                    "What is the current weather in Paris in celsius? Use the available tool."}],
         "tools": tools,
         "checker": checker}
 
@@ -163,7 +209,8 @@ def _function_call(engine, model):
 def _json_mode(engine, model):
     return {"messages": [
         {"role": "user",
-         "content": "Return a JSON object describing the planet Mars with keys "
+         "content": _context_preamble("json_mode") +
+                    "Return a JSON object describing the planet Mars with keys "
                     "'name', 'diameter_km' (number), and 'has_moons' (boolean)."}],
         "response_format": {"type": "json_object"}}
 

@@ -368,6 +368,16 @@ namespace TensorSharp.Server.Hosting
                     changed = true;
                     continue;
                 }
+                if (TryReadOption(args, ref i, "--qwen-image-lora", out string loraOpt))
+                {
+                    // DiT LoRA (e.g. a lightx2v Lightning step-distillation checkpoint),
+                    // merged into the quantized weights at model load. A Lightning LoRA
+                    // also switches the sampling defaults (its step count, cfg 1.0,
+                    // fixed timestep shift 3).
+                    SetQwenImageCompanionEnv("--qwen-image-lora", "TS_QWEN_IMAGE_LORA", loraOpt);
+                    changed = true;
+                    continue;
+                }
             }
             return changed;
         }
@@ -565,7 +575,8 @@ namespace TensorSharp.Server.Hosting
                 // unknown-arg trap below.
                 if (TryReadOption(args, ref i, "--qwen-image-vae", out _)
                     || TryReadOption(args, ref i, "--qwen-image-vl", out _)
-                    || TryReadOption(args, ref i, "--qwen-image-mmproj", out _))
+                    || TryReadOption(args, ref i, "--qwen-image-mmproj", out _)
+                    || TryReadOption(args, ref i, "--qwen-image-lora", out _))
                 {
                     continue;
                 }
@@ -608,7 +619,7 @@ namespace TensorSharp.Server.Hosting
                 "--continuous-batching", "--no-continuous-batching",
                 "--paged-batching", "--no-paged-batching",
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
-                "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj",
+                "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
                 "--kv-cache-dtype",
             };
             string best = null;

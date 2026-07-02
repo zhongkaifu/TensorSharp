@@ -579,13 +579,46 @@ namespace TensorSharp.Runtime
             _stream = null!;
         }
 
+        // Paths whose mappings should be COPY-ON-WRITE instead of read-only. A COW view
+        // reads identically (and stays file-backed until written), but lets the process
+        // patch tensor bytes IN PLACE — the pages written become process-private RAM and
+        // the file on disk is never modified. Used to merge LoRA deltas into quantized
+        // weights while keeping every already-handed-out tensor pointer valid (same
+        // mapping base, same offsets). Must be requested BEFORE the file's first mapped
+        // access (the view is created lazily and only once).
+        private static readonly object s_cowLock = new();
+        private static readonly HashSet<string> s_cowPaths = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Request that mappings of <paramref name="path"/> be copy-on-write (see
+        /// field notes). Takes effect on the next (first) mapping of that file.</summary>
+        public static void RequestCopyOnWriteMapping(string path)
+        {
+            lock (s_cowLock) s_cowPaths.Add(Path.GetFullPath(path));
+        }
+
+        /// <summary>True when the active mapping is copy-on-write (tensor bytes are writable).</summary>
+        public bool IsMappedCopyOnWrite { get; private set; }
+
         private unsafe void EnsureMappedView()
         {
             if (_mappedBase != null)
                 return;
 
-            _mappedFile ??= MemoryMappedFile.CreateFromFile(_path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            _mappedView ??= _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            bool cow;
+            lock (s_cowLock) cow = s_cowPaths.Contains(Path.GetFullPath(_path));
+            var access = cow ? MemoryMappedFileAccess.CopyOnWrite : MemoryMappedFileAccess.Read;
+            if (_mappedFile == null)
+            {
+                // Map from an explicitly read-only, share-read stream: copy-on-write needs
+                // only read access to the file (writes go to process-private pages), but the
+                // string-path CreateFromFile overload would open it writable and collide with
+                // the other read handles on the same GGUF (loader streams, second instances).
+                var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                _mappedFile = MemoryMappedFile.CreateFromFile(fs, null, 0, access,
+                    HandleInheritability.None, leaveOpen: false);
+            }
+            _mappedView ??= _mappedFile.CreateViewAccessor(0, 0, access);
+            IsMappedCopyOnWrite = cow;
 
             byte* viewPtr = null;
             _mappedView.SafeMemoryMappedViewHandle.AcquirePointer(ref viewPtr);

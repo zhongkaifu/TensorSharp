@@ -38,13 +38,22 @@ namespace TensorSharp.Models.QwenImage
         // upload + sync. Validated bit-exact vs the single-branch path and faster (captured-
         // combined ~1.9x denoise; non-persist combined ~1.1x), with a safe VRAM fallback, so
         // default-on. TS_QWEN_DIT_CFG_BATCH=0 forces the two-separate-forwards path.
-        // CFG-batching's real win is the CUDA persist/CUDA-graph-capture path (replays the
-        // combined block, ~1.9x). On Metal the non-persist combined block runs both branches
-        // serially in one (gallocr-packed) graph and measured ~2x SLOWER than two separate
-        // single-block forwards (each already launch-amortized + stable via the reuse gallocr),
-        // so restrict CFG-batching to CUDA. Metal/CPU use the two-forward path.
+        // CFG-batching's real win was the CUDA persist/CUDA-graph-capture path (replays the
+        // combined block, ~1.9x vs the per-block weight-streaming forwards it was measured
+        // against). On Metal the non-persist combined block runs both branches serially in one
+        // (gallocr-packed) graph and measured ~2x SLOWER than two separate single-block
+        // forwards, so it was always CUDA-only.
+        //
+        // SUPERSEDED by the whole-model resident-weight path: two whole-model captured
+        // forwards measured 2.2x FASTER than the CFG-batched per-block path (1.77s vs 3.85s
+        // per pair at imgSeq=468 — the per-block path re-uploads ~4.4 GB of weights per pair,
+        // the whole-model path uploads none), and the per-block CFG captured graph also shows
+        // a replay-drift defect (identical inputs, 5e-2 output drift on the first captured
+        // replays) that the whole-model path does not (bitwise replay-stable). So prefer the
+        // whole-model route whenever it is available; TS_QWEN_DIT_WHOLE=0 (which disables the
+        // whole-model path) restores the old CFG-batched behavior.
         internal bool UseCfgBatch =>
-            NativeBlockOn && _backend == BackendType.GgmlCuda &&
+            NativeBlockOn && _backend == BackendType.GgmlCuda && !WholeModelOn &&
             Environment.GetEnvironmentVariable("TS_QWEN_DIT_CFG_BATCH") != "0";
 
         // CFG-batching only helps up to the token count where the captured-combined block fits
@@ -67,7 +76,9 @@ namespace TensorSharp.Models.QwenImage
         internal static readonly bool TimingOn =
             Environment.GetEnvironmentVariable("TS_QWEN_DIT_TIMING") == "1";
 
-        // Raw GGUF weight (+optional bias) descriptor for the native kernels.
+        // Raw GGUF weight (+optional bias) descriptor for the native kernels. When a
+        // runtime LoRA is loaded and covers this weight, the descriptor also carries the
+        // F32 factor pointers (honored by the whole-model forward path — see QImgAttnW).
         private QImgAttnW GgufW(string weightName, string biasName)
         {
             var info = DitGgufLocal.Tensors[weightName];
@@ -75,15 +86,29 @@ namespace TensorSharp.Models.QwenImage
             IntPtr bp = IntPtr.Zero;
             if (biasName != null && DitGgufLocal.Tensors.TryGetValue(biasName, out var binfo))
                 DitGgufLocal.TryGetTensorDataPointer(binfo, out bp);
-            return new QImgAttnW
+            long ne0 = (long)info.Shape[0];
+            long ne1 = info.Shape.Length > 1 ? (long)info.Shape[1] : 1;
+            var w = new QImgAttnW
             {
                 W = wp,
                 Type = (int)info.Type,
-                Ne0 = (long)info.Shape[0],
-                Ne1 = info.Shape.Length > 1 ? (long)info.Shape[1] : 1,
+                Ne0 = ne0,
+                Ne1 = ne1,
                 Bytes = DitGgufLocal.GetTensorByteCount(info),
                 B = bp,
             };
+            if (_loraTable != null && _loraTable.TryGet(weightName, out var le))
+            {
+                if (le.In == ne0 && le.Out == ne1)
+                {
+                    w.LoraA = le.A; w.LoraB = le.B; w.LoraRank = le.Rank; w.LoraScale = le.Scale;
+                }
+                else
+                {
+                    Console.WriteLine($"  [lora] SKIP {weightName}: shape mismatch (lora {le.Out}x{le.Rank}x{le.In} vs weight {ne1}x{ne0})");
+                }
+            }
+            return w;
         }
 
         private IntPtr GgufF32Ptr(string name)

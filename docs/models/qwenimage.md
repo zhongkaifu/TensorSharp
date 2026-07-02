@@ -113,14 +113,68 @@ into the token sequence so the edit is grounded on the original image.
 - **CFG-batching**: both guidance branches run in one launch-amortized fused
   pass when the combined token block fits VRAM (`TS_QWEN_DIT_CFG_BATCH_MAXTOK`);
   larger images fall back to two forwards per step.
-- **First-Block-Cache** across denoise steps (reset per generation).
-- **Fused vision encoder** (`TS_QWEN35_VENC_FUSED`): the Qwen2.5-VL vision tower
-  runs as a single graph (~2.1× over per-block), though it is only a small slice
-  of the edit's wall time.
+- **Lightning distillation LoRA (4/8-step editing)** — `--qwen-image-lora
+  <lora.safetensors>` (CLI + server) / `TS_QWEN_IMAGE_LORA` applies a DiT LoRA as
+  a **runtime side-path** next to each targeted projection:
+  `y = W_quant·x + b + (alpha/rank)·up·(down·x)` in F32, with the quantized base
+  weights untouched. (Merging into the weights — the stable-diffusion.cpp
+  dequantize→add→requantize path — is only sound for F16/Q8_0 storage: the
+  Lightning deltas are ~1e-4 RMS, far below a Q2_K quantization step, so a merge
+  replaces them with requantization noise.) The factors are resident like the
+  weights, capture-safe, and cost a few % extra per forward + ~1.6 GB VRAM. With
+  a lightx2v
+  [Qwen-Image-Edit-2511-Lightning](https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning)
+  checkpoint the sampling defaults switch automatically (parsed from the
+  filename): its trained step count (4 or 8), cfg 1.0 (single forward per step),
+  and the fixed timestep shift 3 the distillation was trained with — cutting the
+  default 60 DiT forwards to 4–8. Explicit `steps`/`cfg` still win;
+  `TS_QWEN_IMAGE_LORA_SCALE` adjusts the LoRA multiplier (default 1.0). The
+  side-path is implemented in the whole-model forward (the default CUDA path); a
+  fallback to the per-block/managed paths logs a warning that the LoRA is not
+  applied there.
+- **Whole-step denoise cache (EasyCache)** — the default cache mode, ported from
+  stable-diffusion.cpp's `easycache.hpp`. It predicts each step's output change
+  from the measured input-latent change (times an empirically tracked
+  input→output transformation rate) and, while the accumulated prediction stays
+  below a threshold, skips the **entire DiT forward for both CFG branches**,
+  reconstructing each branch's velocity as `input + cached(output − input)`.
+  The first ~15% and last ~5% of steps always compute. Typically skips 40–55%
+  of steps at the default threshold with a perceptually equivalent result.
+  Knobs: `TS_QWEN_DIT_CACHE_MODE` (`easycache`/`fbc`/`both`/`off`),
+  `TS_QWEN_DIT_EASYCACHE_THRESHOLD` (default 0.2 — lower = closer to no-cache),
+  `TS_QWEN_DIT_EASYCACHE_START`/`_END` (window fractions, 0.15/0.95),
+  `TS_QWEN_DIT_CACHE_DEBUG=1` (per-step decision trace).
+- **First-Block-Cache** across denoise steps (reset per generation); the previous
+  default, now selected with `TS_QWEN_DIT_CACHE_MODE=fbc`. It always computes
+  block 0 per branch and skips blocks 1..59 on low-change steps — strictly less
+  saving than the whole-step cache, but its decision uses the actual block-0
+  residual rather than a prediction.
+- **Fused conditioning-encoder trunks** (`TSGgml_QwenTeTrunk`, default on): the
+  Qwen2.5-VL text-encoder LLM (28 layers, GQA, causal) and its vision tower
+  (32 layers, MHA, window/full attention as an additive mask) each run their whole
+  layer stack as ONE device graph — the per-op path paid ~10 device⇄host round
+  trips per layer (M-RoPE, bias adds, SiLU, block-mask softmax as host loops).
+  RoPE cos/sin tables are host-precomputed; weights bind resident by GGUF mmap
+  pointer. At the default edit: vision 4.7 s → **1.6 s**, LLM prefill 2.8 s →
+  **0.8 s** (text-conditioning phase 11.2 s → 2.5 s). Verified vs the numpy
+  oracles (`te-verify` cosine 0.9989, `vis-verify` 0.9994 — both ≥ the per-op
+  path's own scores). Falls back to the per-op path when the backend can't run
+  it; `TS_QWEN_TE_FUSED=0` disables both.
 - **VRAM budgeting**: the text + vision encoders are freed after conditioning so
   the DiT (and its attention scratch) own the working set; the target output
   area is auto-clamped to fit device VRAM unless `Width`/`Height` are pinned, and
   the persistent reuse `gallocr` is handed back before the final VAE decode.
+- **Fused whole-VAE graph** (`TSGgml_QwenVaeRun`, default on): the entire VAE
+  encode/decode runs as ONE device-resident ggml graph — the C# side emits a flat
+  op list mirroring the verified `VaeReferenceMath` topology, features stay on the
+  GPU end-to-end, weights bind resident from stable buffers (uploaded once), and
+  each conv picks im2col+GEMM (tensor cores) while its transient F16 im2col fits a
+  budget (`TS_QWEN_VAE_FUSED_IM2COL_BUDGET`, default 2 GiB; the gallocr reuses the
+  scratch so the peak is one conv's im2col) or `ggml_conv_2d_direct` above it.
+  Replaces the per-conv path's GBs of PCIe round-trips + CPU SiLU/norm loops:
+  at 928×688 encode 19.5 s → **0.95 s**, decode 22.8 s → **1.35 s**, bit-equivalent
+  to the diffusers oracle (PSNR 99 dB, same as the legacy path). Falls back to the
+  per-conv path when the backend can't run it; `TS_QWEN_VAE_FUSED=0` disables.
 - **Band-tiled VAE conv** (`VaeReferenceMath.TryGpuConv2dMaybeTiled`): `ggml_conv_2d`
   materializes an F16 im2col of `~IC·KH·KW·OH·OW·2` bytes, which is several GB at
   high resolution and used to spill into shared VRAM (≈3× slower VAE) or OOM — it
@@ -137,18 +191,23 @@ Important toggles:
 |---|---|
 | `TS_QWEN_IMAGE_VAE` / `TS_QWEN_IMAGE_TE` / `TS_QWEN_IMAGE_MMPROJ` | Override the resolved companion GGUFs (the CLI exposes these as `--qwen-image-vae` / `--qwen-image-vl` / `--qwen-image-mmproj`) |
 | `TS_QWEN_IMAGE_NO_VISION=1` | Skip vision grounding (faster, ungrounded text-only conditioning) |
+| `TS_QWEN_IMAGE_LORA` | DiT LoRA safetensors applied as a runtime F32 side-path (CLI/server: `--qwen-image-lora`); a Lightning checkpoint also switches the sampling defaults (its steps, cfg 1.0, fixed shift 3) |
+| `TS_QWEN_IMAGE_LORA_SCALE` | LoRA multiplier (default 1.0; 0 = structurally on but zero effect) |
 | `TS_QWEN_IMAGE_MAX_AREA` | Override the Metal default target-area clamp |
 | `TS_QWEN_DIT_WHOLE_CAPTURE=0` | Disable the CUDA-graph-captured whole-DiT forward |
 | `TS_QWEN_DIT_FLASH=0` | Force the explicit-scores attention path (tighter quadratic VRAM budget) |
 | `TS_QWEN_DIT_CFG_BATCH_MAXTOK` | Token budget under which CFG-batching stays enabled |
+| `TS_QWEN_DIT_CACHE_MODE` | Denoise cache: `easycache` (default, whole-step skip), `fbc` (First-Block-Cache), `both`, `off` |
+| `TS_QWEN_DIT_EASYCACHE_THRESHOLD` | EasyCache accumulated-change threshold (default 0.2; lower = closer to no-cache, higher = more skips) |
+| `TS_QWEN_DIT_CACHE=0` | Legacy master switch — disables all denoise caching |
 | `TS_QIMG_DEBUG=1` | Per-step velocity / latent statistics |
 
 ## 6. Generation parameters (`QwenImageParams`)
 
 | Property | Default | Meaning |
 |---|---:|---|
-| `Steps` | 30 | FlowMatch-Euler denoising steps |
-| `CfgScale` | 2.5 | True-CFG guidance scale; `<= 1` disables the negative pass. 2.5 follows the Qwen-Image-Edit-2511 recommendation — 4.0 over-guides ("CFG burn": distorted faces, over-saturated color). Raise toward 3.5–4 for stronger stylization at the cost of face fidelity |
+| `Steps` | 0 (auto) | FlowMatch-Euler denoising steps. Auto = 30, or the step count of a loaded Lightning LoRA (4/8) |
+| `CfgScale` | 0 (auto) | True-CFG guidance scale; `<= 1` disables the negative pass. Auto = 2.5 (the Qwen-Image-Edit-2511 recommendation — 4.0 over-guides: distorted faces, over-saturated color), or 1.0 with a Lightning LoRA. Raise toward 3.5–4 for stronger stylization at the cost of face fidelity |
 | `NegativePrompt` | `" "` | Negative prompt for the CFG pass (used only when `CfgScale > 1`) |
 | `Seed` | 0 | Deterministic initial-noise seed |
 | `TargetArea` | 1024×1024 | Output area in pixels (aspect follows the input; dims snapped to /16) |

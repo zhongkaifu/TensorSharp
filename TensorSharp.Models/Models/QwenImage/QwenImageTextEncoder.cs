@@ -79,6 +79,11 @@ namespace TensorSharp.Models.QwenImage
             int seq = tokens.Length;
             _mropePos = BuildPositions(tokens.Length, img);
 
+            // Fused whole-trunk path (TSGgml_QwenTeTrunk): all layers in ONE device graph
+            // instead of ~10 host round-trips per layer. Falls back to the per-op loop below.
+            if (TryFusedEncode(tokens, img, out float[] fusedOut))
+                return fusedOut;
+
             Tensor hidden = Embedding(tokens);             // [seq, hidden]
             if (img != null)
             {
@@ -274,5 +279,152 @@ namespace TensorSharp.Models.QwenImage
         public override float[] Forward(int[] tokens) =>
             throw new NotSupportedException("Use EncodeHidden().");
         public override void ResetKVCache() { }
+
+        // ---- fused whole-trunk path (TSGgml_QwenTeTrunk) --------------------------------
+        // The per-op loop above pays ~10 device<->host round-trips per layer (M-RoPE, bias
+        // adds, SiLU as host loops) x 28 layers. The fused path assembles the embeddings and
+        // rotate-half M-RoPE tables on the host, then runs the whole causal GQA trunk as one
+        // device graph (weights resident by GGUF mmap ptr). TS_QWEN_TE_FUSED=0 disables.
+        private static readonly bool FusedTrunkOn =
+            Environment.GetEnvironmentVariable("TS_QWEN_TE_FUSED") != "0";
+        private QwenTeLayerW[] _fusedLayers;
+        private readonly System.Collections.Generic.List<IntPtr> _fusedAllocs = new();
+        private IntPtr _fusedFinalNorm;
+        private bool _fusedFailed;
+
+        private unsafe bool TryFusedEncode(int[] tokens, ImageCond img, out float[] result)
+        {
+            result = null;
+            if (!FusedTrunkOn || !IsGgmlBackend || _fusedFailed) return false;
+            if (_fusedLayers == null && !BuildFusedLayers()) { _fusedFailed = true; return false; }
+
+            int seq = tokens.Length, H = Config.HiddenSize, hd = _headDim, half = hd / 2;
+
+            // input embeddings (host) + vision-embed injection
+            Tensor emb = Embedding(tokens);
+            float[] x = TensorToHostFloat(emb, (long)seq * H);
+            emb.Dispose();
+            if (img != null)
+                for (int i = 0; i < img.Count; i++)
+                    Array.Copy(img.Embeds, (long)i * H, x, (long)(img.Start + i) * H, H);
+
+            // rotate-half M-RoPE tables [seq, head_dim] (duplicated halves), from the same
+            // 3D positions/sections as ApplyMRoPE.
+            var cos = new float[(long)seq * hd];
+            var sin = new float[(long)seq * hd];
+            int[] pos = _mropePos;
+            Parallel.For(0, seq, s =>
+            {
+                int acc = 0, sec = 0;
+                long b = (long)s * hd;
+                for (int i = 0; i < half; i++)
+                {
+                    if (i >= acc + MRopeSection[sec]) { acc += MRopeSection[sec]; sec++; }
+                    float freq = (float)Math.Pow(_ropeBase, -2.0 * i / hd);
+                    float ang = pos[sec * seq + s] * freq;
+                    float c = MathF.Cos(ang), sn = MathF.Sin(ang);
+                    cos[b + i] = c; cos[b + half + i] = c;
+                    sin[b + i] = sn; sin[b + half + i] = sn;
+                }
+            });
+
+            var outArr = new float[(long)seq * H];
+            bool ok;
+            fixed (float* xp = x, cp = cos, sp = sin, op = outArr)
+            fixed (QwenTeLayerW* lp = _fusedLayers)
+            {
+                var a = new QwenTeTrunkArgs
+                {
+                    X = (IntPtr)xp, Out = (IntPtr)op, CosF = (IntPtr)cp, SinF = (IntPtr)sp,
+                    WinMask = IntPtr.Zero, FinalNorm = _fusedFinalNorm,
+                    Layers = (IntPtr)lp, NumLayers = _numLayers,
+                    StructBytes = System.Runtime.InteropServices.Marshal.SizeOf<QwenTeTrunkArgs>(),
+                    Hidden = H, Heads = _numHeads, KvHeads = _numKVHeads, HeadDim = hd, Seq = seq,
+                    Eps = Config.Eps,
+                };
+                ok = GgmlBasicOps.TryQwenTeTrunk(in a);
+            }
+            if (!ok)
+            {
+                Console.WriteLine("  [te-fused] trunk kernel unavailable; using the per-op path.");
+                _fusedFailed = true;
+                return false;
+            }
+            result = outArr;
+            return true;
+        }
+
+        private unsafe bool BuildFusedLayers()
+        {
+            try
+            {
+                QImgAttnW W(string name, string biasName)
+                {
+                    var info = _gguf.Tensors[name];
+                    _gguf.TryGetTensorDataPointer(info, out IntPtr p);
+                    var w = new QImgAttnW
+                    {
+                        W = p,
+                        Type = (int)info.Type,
+                        Ne0 = (long)info.Shape[0],
+                        Ne1 = info.Shape.Length > 1 ? (long)info.Shape[1] : 1,
+                        Bytes = _gguf.GetTensorByteCount(info),
+                    };
+                    if (biasName != null && _gguf.Tensors.ContainsKey(biasName))
+                        w.B = F32Stable(biasName);
+                    return w;
+                }
+
+                var layers = new QwenTeLayerW[_numLayers];
+                for (int l = 0; l < _numLayers; l++)
+                {
+                    string p = $"blk.{l}";
+                    layers[l] = new QwenTeLayerW
+                    {
+                        Ln1 = F32Stable($"{p}.attn_norm.weight"),
+                        Ln2 = F32Stable($"{p}.ffn_norm.weight"),
+                        Q = W($"{p}.attn_q.weight", $"{p}.attn_q.bias"),
+                        K = W($"{p}.attn_k.weight", $"{p}.attn_k.bias"),
+                        V = W($"{p}.attn_v.weight", $"{p}.attn_v.bias"),
+                        O = W($"{p}.attn_output.weight", null),
+                        Gate = W($"{p}.ffn_gate.weight", null),
+                        Up = W($"{p}.ffn_up.weight", null),
+                        Down = W($"{p}.ffn_down.weight", null),
+                        MaskKind = 1,   // causal
+                    };
+                }
+                _fusedFinalNorm = F32Stable("output_norm.weight");
+                _fusedLayers = layers;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [te-fused] layer table build failed ({ex.Message}); using the per-op path.");
+                return false;
+            }
+        }
+
+        // Stable unmanaged F32 copy of a (small) GGUF tensor — norm weights / biases must
+        // outlive the call and be F32 regardless of on-disk type.
+        private unsafe IntPtr F32Stable(string name)
+        {
+            var info = _gguf.Tensors[name];
+            long n = info.NumElements;
+            var host = new float[n];
+            byte[] raw = _gguf.ReadTensorData(info);
+            TensorSharp.GGML.GgmlGgufTensorDequant.DequantizeToFloat32((int)info.Type, raw, 0, host, 0, n);
+            IntPtr p = System.Runtime.InteropServices.Marshal.AllocHGlobal((IntPtr)(n * sizeof(float)));
+            System.Runtime.InteropServices.Marshal.Copy(host, 0, p, (int)n);
+            _fusedAllocs.Add(p);
+            return p;
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            foreach (var p in _fusedAllocs) System.Runtime.InteropServices.Marshal.FreeHGlobal(p);
+            _fusedAllocs.Clear();
+            _fusedLayers = null;
+        }
     }
 }
