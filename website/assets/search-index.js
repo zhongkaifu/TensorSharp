@@ -68,7 +68,7 @@ window.SEARCH_INDEX = [
   { t: "Memory optimizations", p: "Advanced", u: "advanced.html#memory", s: "Zero-copy mmap weights, best-fit pool, SSD KV spillover, KV codecs.", k: "memory mmap footprint ram" },
   { t: "DiffusionGemma text diffusion", p: "Advanced", u: "advanced.html#diffusion", s: "Block-wise EntropyBound denoising over a Gemma-4 MoE backbone.", k: "diffusion denoising text generation" },
 
-  { t: "Head-to-head vs llama.cpp", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Pure-.NET TensorSharp out-prefills llama.cpp on every model (geomean 1.18×–1.88×) with decode at parity on the same GGUF + GPU: 26B-A4B MoE leads at 1.88× prefill / 1.69× TTFT; structured-output prefill 5.89×; multi-turn up to 1.93×.", k: "llama.cpp comparison faster speedup geomean moe prefill ttft multi-turn json structured output decode parity vs versus" },
+  { t: "Head-to-head vs llama.cpp", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Pure-.NET TensorSharp trades wins with llama.cpp on the same GGUF + GPU: 26B-A4B MoE prefill 1.32× / TTFT 1.30× geomean (up to 1.70× / 1.65×); 12B wins or ties every decode scenario (1.17×); JSON-mode decode 7.7× on E4B; tool-call decode up to 2.37×.", k: "llama.cpp comparison faster speedup geomean moe prefill ttft multi-turn json structured output tool function call decode parity vs versus" },
   { t: "Benchmarks", p: "Benchmarks", u: "benchmarks.html#head-to-head", s: "Head-to-head vs llama.cpp on the same GGUF files and hardware.", k: "performance numbers throughput tokens per second" },
   { t: "Testing", p: "Benchmarks", u: "benchmarks.html#testing", s: "xUnit unit tests and server integration tests.", k: "tests xunit integration ci" },
 

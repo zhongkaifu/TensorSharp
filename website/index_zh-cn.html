@@ -95,7 +95,7 @@ dotnet build TensorSharp.slnx -c Release</code></pre>
     <div class="card"><div class="ic">🖥️</div><h3>随处可运行</h3><p>NVIDIA (CUDA)、Apple Silicon (Metal/MLX) 或纯 CPU —— 均带自动回退。</p></div>
     <div class="card"><div class="ic">🧠</div><h3>现代模型支持</h3><p>Gemma、Qwen、GPT-OSS、Nemotron-H、Mistral，外加视觉、音频、推理与工具调用。</p></div>
     <div class="card"><div class="ic">⚙️</div><h3>用 .NET 构建</h3><p>原生 C# 引擎，可嵌入你的应用，而不只是一个黑盒二进制。</p></div>
-    <a class="card" href="benchmarks_zh-cn.html#head-to-head"><div class="ic">🏁</div><h3>对比 llama.cpp 的基准</h3><p>在相同 GGUF 文件与相同 GPU 上，它在每个模型上的 prefill 都快于 C++ 引擎（几何平均 1.18×–1.88×）—— Gemma 4 26B-A4B MoE 领跑，达 1.88× prefill / 1.69× TTFT。</p></a>
+    <a class="card" href="benchmarks_zh-cn.html#head-to-head"><div class="ic">🏁</div><h3>对比 llama.cpp 的基准</h3><p>在相同 GGUF 文件与相同 GPU 上与 C++ 引擎互有胜负：26B-A4B MoE 的 prefill 快 1.32×、首 token 早 1.30×，12B 在每个 decode 场景上打平或获胜（1.17×），E4B 上 JSON 模式 decode 流速快 7.7×。</p></a>
   </div>
 
   <h2 id="audience">这是为谁准备的？</h2>

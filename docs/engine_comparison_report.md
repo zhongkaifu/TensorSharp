@@ -8,7 +8,7 @@ Numbers are tokens/second (higher is better). `—` = not applicable / skipped, 
 
 | Component | Version / detail |
 |---|---|
-| TensorSharp | git `4631a25`, .NET 10.0.204 (backends: ggml_cuda / ggml_cpu) |
+| TensorSharp | git `ca2f808`, .NET 10.0.204 (backends: ggml_cuda / ggml_cpu) |
 | llama.cpp | `C:\Works\llama.cpp\build-cuda\bin\Release\llama-server.exe` |
 | vLLM | endpoint `http://127.0.0.1:8000` (connect-only) |
 | GPU | NVIDIA GeForce RTX 3080 Laptop GPU, 16384 MiB |
@@ -28,10 +28,10 @@ Geomean of TensorSharp's per-scenario speedup over each reference engine on the 
 
 | Model | Comparison | decode | prefill | TTFT |
 |---|---|---:|---:|---:|
-| Gemma 4 E4B it (Q8_0, dense multimodal) | vs llama.cpp · GPU | 1.29× | 0.58× | 1.03× |
-| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | vs llama.cpp · GPU | 1.12× | 0.67× | 1.19× |
-| Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE) | vs llama.cpp · GPU | 1.20× | 1.46× | 1.44× |
-| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | vs llama.cpp · GPU | 0.41× | 0.31× | 0.34× |
+| Gemma 4 E4B it (Q8_0, dense multimodal) | vs llama.cpp · GPU | 1.46× | 0.83× | 0.82× |
+| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | vs llama.cpp · GPU | 1.17× | 1.01× | 0.99× |
+| Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE) | vs llama.cpp · GPU | 0.96× | 1.32× | 1.30× |
+| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | vs llama.cpp · GPU | 0.92× | 0.99× | 0.97× |
 
 ## Gemma 4 E4B it (Q8_0, dense multimodal)  (`gemma4-e4b`)
 
@@ -39,40 +39,31 @@ Geomean of TensorSharp's per-scenario speedup over each reference engine on the 
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 51.6 | 53.1 |
-| text_long | 51.1 | 52.4 |
-| multi_turn | 51.0 | 52.5 |
-| function_call | 50.7 | 52.9 |
-| json_mode | 392.6 | 52.1 |
-| image | 50.7 | 53.4 |
-| audio | 50.3 | 52.0 |
-| video | 49.6 | — |
+| text_short | 51.2 | 53.4 |
+| text_long | 51.3 | 52.9 |
+| multi_turn | 51.2 | 52.9 |
+| function_call | 50.9 | 53.0 |
+| json_mode | 405.1 | 52.4 |
 
 **Prefill throughput (tok/s)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 2578.3 | 2150.1 |
-| text_long | 2796.4 | 2492.0 |
-| multi_turn | 2627.4 | 2280.0 |
-| function_call | 2643.6 | 2410.0 |
-| json_mode | 506.2 | 2333.3 |
-| image | 301.2 | 528.3 |
-| audio | 141.8 | 1313.1 |
-| video | 505.6 | — |
+| text_short | 2578.3 | 2112.8 |
+| text_long | 2757.2 | 2555.4 |
+| multi_turn | 2733.7 | 2363.4 |
+| function_call | 2758.9 | 2453.6 |
+| json_mode | 504.3 | 2248.0 |
 
 **Time to first token (ms, lower is better)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 766.0 | 906.0 |
-| text_long | 1125.0 | 1250.0 |
-| multi_turn | 797.0 | 907.0 |
-| function_call | 766.0 | 844.0 |
-| json_mode | 4016.0 | 843.0 |
-| image | 953.0 | 547.0 |
-| audio | 141.0 | 875.0 |
-| video | 2156.0 | — |
+| text_short | 766.0 | 922.0 |
+| text_long | 1141.0 | 1219.0 |
+| multi_turn | 766.0 | 875.0 |
+| function_call | 734.0 | 829.0 |
+| json_mode | 4031.0 | 875.0 |
 
 **Performance ratio — TensorSharp vs reference (> 1.0× = TensorSharp faster)**
 
@@ -80,40 +71,31 @@ _Decode throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 0.97× |
-| text_long | 0.98× |
+| text_short | 0.96× |
+| text_long | 0.97× |
 | multi_turn | 0.97× |
 | function_call | 0.96× |
-| json_mode | 7.54× |
-| image | 0.95× |
-| audio | 0.97× |
-| video | — |
+| json_mode | 7.73× |
 
 _Prefill throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.20× |
-| text_long | 1.12× |
-| multi_turn | 1.15× |
-| function_call | 1.10× |
+| text_short | 1.22× |
+| text_long | 1.08× |
+| multi_turn | 1.16× |
+| function_call | 1.12× |
 | json_mode | 0.22× |
-| image | 0.57× |
-| audio | 0.11× |
-| video | — |
 
 _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.18× |
-| text_long | 1.11× |
+| text_short | 1.20× |
+| text_long | 1.07× |
 | multi_turn | 1.14× |
-| function_call | 1.10× |
-| json_mode | 0.21× |
-| image | 0.57× |
-| audio | 6.21× |
-| video | — |
+| function_call | 1.13× |
+| json_mode | 0.22× |
 
 ## Gemma 4 12B it (QAT UD-Q4_K_XL, dense)  (`gemma4-12b`)
 
@@ -121,40 +103,31 @@ _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 39.3 | 39.4 |
-| text_long | 39.7 | 37.4 |
-| multi_turn | 39.4 | 38.2 |
-| function_call | 83.9 | 39.2 |
-| json_mode | 38.6 | 38.8 |
-| image | 39.5 | 41.3 |
-| audio | 39.7 | 39.9 |
-| video | 38.5 | — |
+| text_short | 39.6 | 39.5 |
+| text_long | 39.3 | 37.6 |
+| multi_turn | 39.5 | 38.5 |
+| function_call | 81.0 | 39.5 |
+| json_mode | 39.4 | 39.0 |
 
 **Prefill throughput (tok/s)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 1128.6 | 1188.4 |
-| text_long | 1163.9 | 1120.1 |
-| multi_turn | 1185.7 | 1059.4 |
-| function_call | 902.9 | 1067.7 |
-| json_mode | 1171.8 | 991.4 |
-| image | 129.3 | 247.4 |
-| audio | 91.3 | 826.7 |
-| video | 361.4 | — |
+| text_short | 1139.0 | 1199.4 |
+| text_long | 1170.4 | 1120.5 |
+| multi_turn | 1196.6 | 1076.5 |
+| function_call | 897.1 | 1094.1 |
+| json_mode | 1161.7 | 999.5 |
 
 **Time to first token (ms, lower is better)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 1750.0 | 1640.0 |
-| text_long | 2703.0 | 2782.0 |
-| multi_turn | 1766.0 | 1953.0 |
-| function_call | 2297.0 | 1906.0 |
-| json_mode | 1735.0 | 1985.0 |
-| image | 2219.0 | 1172.0 |
-| audio | 219.0 | 1391.0 |
-| video | 3016.0 | — |
+| text_short | 1734.0 | 1625.0 |
+| text_long | 2688.0 | 2781.0 |
+| multi_turn | 1750.0 | 1922.0 |
+| function_call | 2312.0 | 1860.0 |
+| json_mode | 1750.0 | 1969.0 |
 
 **Performance ratio — TensorSharp vs reference (> 1.0× = TensorSharp faster)**
 
@@ -163,13 +136,10 @@ _Decode throughput_
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
 | text_short | 1.00× |
-| text_long | 1.06× |
+| text_long | 1.05× |
 | multi_turn | 1.03× |
-| function_call | 2.14× |
-| json_mode | 0.99× |
-| image | 0.96× |
-| audio | 0.99× |
-| video | — |
+| function_call | 2.05× |
+| json_mode | 1.01× |
 
 _Prefill throughput_
 
@@ -177,12 +147,9 @@ _Prefill throughput_
 |---|---:|
 | text_short | 0.95× |
 | text_long | 1.04× |
-| multi_turn | 1.12× |
-| function_call | 0.85× |
-| json_mode | 1.18× |
-| image | 0.52× |
-| audio | 0.11× |
-| video | — |
+| multi_turn | 1.11× |
+| function_call | 0.82× |
+| json_mode | 1.16× |
 
 _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
@@ -190,12 +157,9 @@ _Time to first token (latency; > 1.0× = TensorSharp lower)_
 |---|---:|
 | text_short | 0.94× |
 | text_long | 1.03× |
-| multi_turn | 1.11× |
-| function_call | 0.83× |
-| json_mode | 1.14× |
-| image | 0.53× |
-| audio | 6.35× |
-| video | — |
+| multi_turn | 1.10× |
+| function_call | 0.80× |
+| json_mode | 1.13× |
 
 ## Gemma 4 26B-A4B it (QAT UD-Q4_K_XL, MoE)  (`gemma4-26b-a4b`)
 
@@ -203,40 +167,31 @@ _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 73.5 | 73.9 |
-| text_long | 77.6 | 69.5 |
-| multi_turn | 77.6 | 71.3 |
-| function_call | 173.5 | 72.7 |
-| json_mode | 75.8 | 71.4 |
-| image | 80.5 | 83.9 |
-| audio | 80.0 | fail |
-| video | 78.9 | — |
+| text_short | 56.0 | 74.7 |
+| text_long | 50.9 | 70.7 |
+| multi_turn | 48.7 | 72.4 |
+| function_call | 174.3 | 73.4 |
+| json_mode | 68.4 | 73.3 |
 
 **Prefill throughput (tok/s)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 826.0 | 685.3 |
-| text_long | 1610.9 | 1337.9 |
-| multi_turn | 1786.7 | 1285.1 |
-| function_call | 1427.4 | 1264.8 |
-| json_mode | 1734.6 | 947.1 |
-| image | 73.2 | 31.7 |
-| audio | 128.2 | fail |
-| video | 70.3 | — |
+| text_short | 1599.2 | 1006.2 |
+| text_long | 1548.2 | 1444.6 |
+| multi_turn | 1739.2 | 1337.4 |
+| function_call | 1411.8 | 1315.4 |
+| json_mode | 1626.4 | 954.4 |
 
 **Time to first token (ms, lower is better)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 2391.0 | 2844.0 |
-| text_long | 1953.0 | 2329.0 |
-| multi_turn | 1172.0 | 1610.0 |
-| function_call | 1453.0 | 1609.0 |
-| json_mode | 1172.0 | 2078.0 |
-| image | 3922.0 | 9140.0 |
-| audio | 156.0 | fail |
-| video | 15500.0 | — |
+| text_short | 1235.0 | 1937.0 |
+| text_long | 2032.0 | 2157.0 |
+| multi_turn | 1204.0 | 1547.0 |
+| function_call | 1469.0 | 1547.0 |
+| json_mode | 1250.0 | 2062.0 |
 
 **Performance ratio — TensorSharp vs reference (> 1.0× = TensorSharp faster)**
 
@@ -244,40 +199,31 @@ _Decode throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 0.99× |
-| text_long | 1.12× |
-| multi_turn | 1.09× |
-| function_call | 2.39× |
-| json_mode | 1.06× |
-| image | 0.96× |
-| audio | — |
-| video | — |
+| text_short | 0.75× |
+| text_long | 0.72× |
+| multi_turn | 0.67× |
+| function_call | 2.37× |
+| json_mode | 0.93× |
 
 _Prefill throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.21× |
-| text_long | 1.20× |
-| multi_turn | 1.39× |
-| function_call | 1.13× |
-| json_mode | 1.83× |
-| image | 2.31× |
-| audio | — |
-| video | — |
+| text_short | 1.59× |
+| text_long | 1.07× |
+| multi_turn | 1.30× |
+| function_call | 1.07× |
+| json_mode | 1.70× |
 
 _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.19× |
-| text_long | 1.19× |
-| multi_turn | 1.37× |
-| function_call | 1.11× |
-| json_mode | 1.77× |
-| image | 2.33× |
-| audio | — |
-| video | — |
+| text_short | 1.57× |
+| text_long | 1.06× |
+| multi_turn | 1.28× |
+| function_call | 1.05× |
+| json_mode | 1.65× |
 
 ## Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)  (`qwen36-35b-a3b`)
 
@@ -285,40 +231,31 @@ _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 70.6 | 81.5 |
-| text_long | 22.3 | 79.6 |
-| multi_turn | 20.5 | 77.2 |
-| function_call | 25.1 | 77.4 |
-| json_mode | 21.2 | 76.8 |
-| image | 60.0 | 78.0 |
-| audio | — | — |
-| video | — | — |
+| text_short | 71.3 | 81.4 |
+| text_long | 75.5 | 81.4 |
+| multi_turn | 75.9 | 81.2 |
+| function_call | 78.6 | 82.2 |
+| json_mode | 75.0 | 81.1 |
 
 **Prefill throughput (tok/s)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 1259.0 | 1164.7 |
-| text_long | 373.4 | 1223.8 |
-| multi_turn | 413.8 | 1120.0 |
-| function_call | 420.8 | 1123.6 |
-| json_mode | 416.8 | 1133.6 |
-| image | 17.3 | 316.6 |
-| audio | — | — |
-| video | — | — |
+| text_short | 1259.0 | 1186.1 |
+| text_long | 1188.7 | 1246.2 |
+| multi_turn | 1198.1 | 1189.2 |
+| function_call | 1196.5 | 1196.7 |
+| json_mode | 1140.0 | 1207.5 |
 
 **Time to first token (ms, lower is better)**
 
 | Scenario | TensorSharp · GPU | llama.cpp · GPU |
 |---|---:|---:|
-| text_short | 1610.0 | 1718.0 |
-| text_long | 8656.0 | 2610.0 |
-| multi_turn | 5203.0 | 1891.0 |
-| function_call | 5687.0 | 2047.0 |
-| json_mode | 5000.0 | 1781.0 |
-| image | 115984.0 | 12829.0 |
-| audio | — | — |
-| video | — | — |
+| text_short | 1610.0 | 1687.0 |
+| text_long | 2719.0 | 2563.0 |
+| multi_turn | 1797.0 | 1781.0 |
+| function_call | 2000.0 | 1922.0 |
+| json_mode | 1828.0 | 1672.0 |
 
 **Performance ratio — TensorSharp vs reference (> 1.0× = TensorSharp faster)**
 
@@ -326,40 +263,31 @@ _Decode throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 0.87× |
-| text_long | 0.28× |
-| multi_turn | 0.27× |
-| function_call | 0.32× |
-| json_mode | 0.28× |
-| image | 0.77× |
-| audio | — |
-| video | — |
+| text_short | 0.88× |
+| text_long | 0.93× |
+| multi_turn | 0.93× |
+| function_call | 0.96× |
+| json_mode | 0.92× |
 
 _Prefill throughput_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.08× |
-| text_long | 0.31× |
-| multi_turn | 0.37× |
-| function_call | 0.37× |
-| json_mode | 0.37× |
-| image | 0.05× |
-| audio | — |
-| video | — |
+| text_short | 1.06× |
+| text_long | 0.95× |
+| multi_turn | 1.01× |
+| function_call | 1.00× |
+| json_mode | 0.94× |
 
 _Time to first token (latency; > 1.0× = TensorSharp lower)_
 
 | Scenario | vs llama.cpp · GPU |
 |---|---:|
-| text_short | 1.07× |
-| text_long | 0.30× |
-| multi_turn | 0.36× |
-| function_call | 0.36× |
-| json_mode | 0.36× |
-| image | 0.11× |
-| audio | — |
-| video | — |
+| text_short | 1.05× |
+| text_long | 0.94× |
+| multi_turn | 0.99× |
+| function_call | 0.96× |
+| json_mode | 0.91× |
 
 ## MTP / NextN speculative decoding (on vs off)
 

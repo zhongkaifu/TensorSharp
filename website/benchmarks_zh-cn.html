@@ -19,13 +19,13 @@
   <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比，以及守护正确性的测试框架。</p>
 
   <h2 id="head-to-head">同台对比：TensorSharp vs llama.cpp</h2>
-  <p>一个<strong>纯 .NET 引擎与手工优化的 C++ <code>llama.cpp</code> 正面较量</strong> —— 相同的 GGUF 文件、相同的 <strong>NVIDIA RTX 3080 Laptop GPU（16 GB）</strong>、相同的 GGML CUDA 后端，以及统一的 OpenAI <code>/v1/chat/completions</code> 接口，覆盖文本、多轮、结构化输出（JSON）等场景。完整的逐场景报告（含一个仅连接的 vLLM 端点）见仓库中的 <code>docs/engine_comparison_report.md</code>。</p>
+  <p>一个<strong>纯 .NET 引擎与手工优化的 C++ <code>llama.cpp</code> 正面较量</strong> —— 相同的 GGUF 文件、相同的 <strong>NVIDIA RTX 3080 Laptop GPU（16 GB）</strong>、相同的 GGML CUDA 后端，以及统一的 OpenAI <code>/v1/chat/completions</code> 接口，覆盖长短文本、多轮、工具调用、结构化输出（JSON）等场景。完整的逐场景报告（含一个仅连接的 vLLM 端点）见仓库中的 <code>docs/engine_comparison_report.md</code>。</p>
 
   <div class="card-grid">
-    <div class="card"><div class="ic">🚀</div><h3>每个模型 prefill 更快</h3><p>TensorSharp 在所有模型上的 prefill 都快于 llama.cpp —— 几何平均 <strong>1.18× → 1.88×</strong>，同时 decode 持平。</p></div>
-    <div class="card"><div class="ic">🏆</div><h3>MoE 旗舰领跑</h3><p>在 Gemma 4 <strong>26B-A4B</strong> 上，几何平均 <strong>1.88× prefill</strong> 与 <strong>1.69× 更低 TTFT</strong>，同时 decode 保持竞争力。</p></div>
-    <div class="card"><div class="ic">🧩</div><h3>结构化输出 5.89×</h3><p>26B-A4B 上受约束的 JSON prefill 快 <strong>5.89×</strong>（354.7 vs 60.2 tok/s），首 token 早 <strong>3.34×</strong>。</p></div>
-    <div class="card"><div class="ic">💬</div><h3>多轮对话最高 1.9×</h3><p>基于内容哈希的分页 KV 前缀复用让后续轮次更快返回：26B-A4B 上 prefill / TTFT 为 <strong>1.87× / 1.93×</strong>。</p></div>
+    <div class="card"><div class="ic">🏆</div><h3>MoE 旗舰：prefill 与 TTFT</h3><p>在 Gemma 4 <strong>26B-A4B</strong> 上，prefill 在<strong>每个场景</strong>都获胜（最高 <strong>1.70×</strong>），首 token 最高早 <strong>1.65×</strong> 到达 —— 几何平均 <strong>1.32× prefill / 1.30× TTFT</strong>。</p></div>
+    <div class="card"><div class="ic">⚡</div><h3>dense decode 从不落败</h3><p>Gemma 4 <strong>12B</strong> 在<strong>全部五个场景</strong>的 decode 上打平或获胜（几何平均 <strong>1.17×</strong>）；流式工具调用轮次 decode 快 <strong>2.05×</strong>。</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>结构化输出 7.7×</h3><p>Gemma 4 <strong>E4B</strong> 上受约束的 JSON decode 流速达 <strong>405 vs 52 tok/s</strong>，把它的 decode 几何平均拉高到 <strong>1.46×</strong>。</p></div>
+    <div class="card"><div class="ic">🛠️</div><h3>MoE 上工具调用 2.37×</h3><p>26B-A4B 的 function-call decode 快 <strong>2.37×</strong>（174.3 vs 73.4 tok/s）—— 同时首 token 延迟也更低。</p></div>
   </div>
 
   <p>下表为 TensorSharp 相对 llama.cpp 在<strong>相同后端</strong>上的几何平均加速比（单流、贪心采样、关闭 MTP）。<strong>&gt; 1.0× 表示 TensorSharp 更快</strong>（decode / prefill）或延迟更低（TTFT）：</p>
@@ -33,14 +33,14 @@
   <table>
     <thead><tr><th>模型</th><th>decode</th><th>prefill</th><th>TTFT</th></tr></thead>
     <tbody>
-      <tr><td>Gemma 4 26B-A4B it (UD-Q4_K_XL, <strong>MoE</strong>)</td><td>0.92×</td><td><span class="yes">1.88×</span></td><td><span class="yes">1.69×</span></td></tr>
-      <tr><td>Gemma 4 12B it (UD-Q4_K_XL, dense)</td><td>0.93×</td><td><span class="yes">1.23×</span></td><td><span class="yes">1.10×</span></td></tr>
-      <tr><td>Gemma 4 E4B it (Q8_0, dense 多模态)</td><td>0.95×</td><td><span class="yes">1.21×</span></td><td><span class="yes">1.07×</span></td></tr>
-      <tr><td>Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)</td><td>0.94×</td><td><span class="yes">1.18×</span></td><td>0.95×</td></tr>
+      <tr><td>Gemma 4 E4B it (Q8_0, dense 多模态)</td><td><span class="yes">1.46×</span></td><td>0.83×</td><td>0.82×</td></tr>
+      <tr><td>Gemma 4 12B it (UD-Q4_K_XL, dense)</td><td><span class="yes">1.17×</span></td><td>1.01×</td><td>0.99×</td></tr>
+      <tr><td>Gemma 4 26B-A4B it (UD-Q4_K_XL, <strong>MoE</strong>)</td><td>0.96×</td><td><span class="yes">1.32×</span></td><td><span class="yes">1.30×</span></td></tr>
+      <tr><td>Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE)</td><td>0.92×</td><td>0.99×</td><td>0.97×</td></tr>
     </tbody>
   </table>
   </div>
-  <p>这些领先来自 TensorSharp 的架构专属快路径：基于 verify 的整模型 prefill（配以融合的 FFN / attention 内核）、常驻捕获式 CUDA 图 MoE decode，以及让多轮对话更快返回的 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。JSON 模式下 decode 甚至在 E4B（1.10×）与 Qwen 3.6（1.07×）上完胜，曾经孱弱的 IQ2_XXS Qwen 3.6 路径如今也具备竞争力（0.94× decode、1.18× prefill）。decode 在 dense 与 MoE 上均基本持平（0.92–0.95×），因此这些 prefill / TTFT / 结构化输出上的胜势是叠加在有竞争力的 token 生成之上；剩余少数低于 1.0× 的项——主要是长上下文 dense prefill——仍是正在优化的目标，胜负各项的完整数据均已发布在报告中。</p>
+  <p>这些领先来自 TensorSharp 的架构专属快路径：基于 verify 的整模型 prefill（配以融合的 FFN / attention 内核）、常驻捕获式 CUDA 图 MoE decode，以及 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。E4B 在每个文本场景的 prefill 都快于 llama.cpp（1.08×–1.22×），首 token 最高早 1.20× 到达；即便是激进量化的 IQ2_XXS Qwen 3.6 35B-A3B MoE，decode 差距也在约 8% 以内、prefill 持平——纯 .NET 引擎在 2-bit 权重上与手工优化的 C++ 并驾齐驱。在亮点单元之外，decode 与 llama.cpp 的差距在几个百分点以内，因此这些 prefill / TTFT / 工具调用 / 结构化输出上的胜势是叠加在有竞争力的 token 生成之上；剩余少数低于 1.0× 的项——主要是 26B-A4B 纯文本 decode 与 E4B JSON 模式 prefill——仍是正在优化的目标，胜负各项的完整数据均已发布在报告中。</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、GGML CUDA、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
 

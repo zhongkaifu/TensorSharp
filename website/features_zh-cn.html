@@ -54,7 +54,7 @@
 
   <h2 id="performance">性能与扩展</h2>
   <ul>
-    <li><strong>prefill 与 TTFT 快于 llama.cpp</strong> —— 在相同 GGUF 文件与相同 GPU 上同台较量，这个纯 .NET 引擎在每个受测模型上的 prefill 都超越手工优化的 C++ <code>llama.cpp</code>（几何平均 1.18×–1.88×），同时 decode 持平：Gemma 4 26B-A4B MoE 领跑，达 1.88× prefill / 1.69× TTFT，结构化输出（JSON）prefill 高达 5.89×，多轮对话首 token 最高早 1.93×。→ <a href="benchmarks_zh-cn.html#head-to-head">同台基准测试</a></li>
+    <li><strong>与 llama.cpp 同台较量、互有胜负</strong> —— 在相同 GGUF 文件与相同 GPU 上，这个纯 .NET 引擎在关键负载上追平乃至超越手工优化的 C++ <code>llama.cpp</code>：Gemma 4 26B-A4B MoE 的 prefill 快 1.32×、首 token 早 1.30×（单场景最高 1.70× / 1.65×），Gemma 4 12B 在每个 decode 场景上打平或获胜（几何平均 1.17×），流式工具调用轮次 decode 最高快 2.37×，E4B 上结构化输出（JSON）decode 流速快 7.7×。→ <a href="benchmarks_zh-cn.html#head-to-head">同台基准测试</a></li>
     <li><strong>GPU 加速</strong> —— GGML Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）、直接 CUDA/cuBLAS 后端，以及面向 Apple Silicon 的 MLX 后端 —— 均带 CPU 回退。→ <a href="backends_zh-cn.html">后端</a></li>
     <li><strong>连续批处理与分页 KV 缓存</strong> —— 块分页 KV 池、块哈希前缀共享、可在批中接纳 / 抢占序列的迭代级调度器、可选 SSD 后备层，以及原生融合分页注意力内核。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></li>
     <li><strong>批量 / 并行推理</strong> —— 将 N 个序列打包进一次前向，配以分页 K/V 散写（Mistral 3、Gemma 4、GPT OSS、Qwen 3 / 3.5 / 3.6、Nemotron-H）。</li>
