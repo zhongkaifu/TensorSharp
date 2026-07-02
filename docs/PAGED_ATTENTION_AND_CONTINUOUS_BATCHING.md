@@ -201,13 +201,15 @@ fails fast at server startup (`MtpStartupValidation`).
 | `TS_SCHED_DISABLE_BATCHED` | `0` | `1` forces the per-sequence KV-swap fallback even when a model implements `IBatchedPagedModel`. |
 | `TS_SCHED_MAX_BATCHED_TOKENS` | `4096` | Per-step token budget. |
 | `TS_SCHED_MAX_RUNNING_SEQS` | `16` | Maximum in-flight sequences. |
-| `TS_SCHED_PREFILL_CHUNK` | `1024` | Maximum prefill tokens scheduled per step. |
+| `TS_SCHED_PREFILL_CHUNK` | `1024` | Maximum prefill tokens scheduled per step when requests contend (fairness chunk). CLI alias: `--prefill-chunk-size N`. |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | Per-step fresh (start_pos = 0) prefill cap for a solo (uncontended) request — feeds the prompt through the fully fused whole-graph prefill path in big chunks. |
+| `TS_SCHED_SOLO_TAIL_PREFILL_CHUNK` | `2048` | Per-step cap for the tail (start_pos > 0) chunks of a solo prompt beyond the first fresh chunk. |
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `256` | Tokens per block. |
 | `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable block-hash prefix reuse. |
 | `TS_SCHED_DECODE_QUANTUM` | block size | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
-| `TS_BATCHED_N1_FAST_PATH` | `0` | Routes eligible single-sequence steps through the batched path for A/B testing. |
-| `TS_KV_PAGED_QUANT_BITS` | `0` | Optional TurboQuant codec bits for paged KV blocks (`4` or `8`); recurrent-state models may fall back to passthrough. |
+| `TS_BATCHED_N1_FAST_PATH` | `1` | Solo single-sequence steps use the fused N=1 fast-path decode; set `0` to force those steps onto the fully-batched path (A/B testing). |
+| `TS_KV_PAGED_QUANT_BITS` | `0` | Optional TurboQuant codec bits for paged KV blocks (`2`, `4`, or `8`); recurrent-state models may fall back to passthrough. |
 | `TS_MTP_SPEC` | `0` | `1` enables MTP / NextN speculative decoding for solo sequences (CLI `--mtp-spec`). |
 | `TS_MTP_DRAFT` | `8` | Max tokens drafted per speculative step (CLI `--mtp-draft`). |
 | `TS_MTP_PMIN` | `0.75` | Min draft-head confidence to keep a drafted token (CLI `--mtp-pmin`). |
@@ -224,11 +226,20 @@ Server CLI aliases:
 --no-continuous-batching   # sets TS_SCHED_DISABLE_BATCHED=1
 --paged-batching           # alias for --continuous-batching
 --no-paged-batching        # alias for --no-continuous-batching
+--prefill-chunk-size N     # sets TS_SCHED_PREFILL_CHUNK
 ```
 
 The older `--paged-kv*` flags are retained for compatibility with the removed
 standalone per-session paged-KV manager. Current server request KV state is
 owned by `InferenceEngine`.
+
+Separately from the paged TurboQuant codec (`TS_KV_PAGED_QUANT_BITS`), the KV
+cache itself can be stored at reduced precision with
+`--kv-cache-dtype <f32|f16|q8_0|q4_0>` (or the `KV_CACHE_DTYPE` env var) on
+both the CLI and the server. `f32` is the default; the block-quantized tiers
+(`q8_0`, `q4_0`) require the native GGML flash-attention path, and `q4_0`
+(~1/7 of f32) targets very long 128K–256K contexts where the KV cache
+dominates memory.
 
 ## Remaining Work
 

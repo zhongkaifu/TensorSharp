@@ -127,8 +127,8 @@ and Gemma 4 (§12) cards.
 | MTP / NextN speculative decoding | No | Yes (separate `gemma4-assistant` draft GGUF) | No | No | Yes on Qwen 3.6 (embedded NextN block) | No | No | No |
 | Fused QKV | No | Yes | Yes | Yes | Mixed (full attention layers split, recurrent layers fuse a 5-way pack) | Yes | Yes | Yes |
 | Fused single-graph decode | No | Yes (Gemma4ModelDecode) | Yes (DiffusionModelDecode + lm-head tail) | Yes (TransformerModelDecode, native loop) | Per-layer fused (Qwen35AttentionLayerDecode, FusedOutProjFFN, FusedOutProjNormRouter) | Per-layer | Per-layer / batched MoE | No |
-| Fused single-graph prefill | No | Yes (Gemma4LayerPrefill, dense layers) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
-| Batched GPU MoE | n/a | Pending | Fused per-canvas MoE; concurrent requests batched by diffusion scheduler | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
+| Fused single-graph prefill | No | Yes (whole-model NativeGemma4ModelVerify + per-layer Gemma4LayerPrefill fallback) | Prompt-KV prefill cache | No | Yes (FusedPrefillAttention, FusedOutProjFFN, MoE prefill) | Yes (MoE prefill via mul_mat_id) | No | No |
+| Batched GPU MoE | n/a | Yes for all-MoE variants (fused whole-model MoE decode/verify); mixed dense+MoE pending | Fused per-canvas MoE; concurrent requests batched by diffusion scheduler | n/a | Yes (routed + shared + residual fused) | Yes (stacked weight slabs) | Yes | n/a |
 | Fused vision encoder | n/a | Standard | n/a | n/a | Yes (FusedVisionAttention + FusedVisionMLP) | n/a | Standard (RADIO ViT) | Standard (Pixtral) |
 | Output parser | `PassthroughOutputParser` | `Gemma4OutputParser` | `PassthroughOutputParser` | `Qwen3OutputParser` | `Qwen35OutputParser` | `HarmonyOutputParser` (always required) | `Qwen3OutputParser` | `PassthroughOutputParser` |
 

@@ -53,7 +53,7 @@ results as part of the standard matrix.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `KV_CACHE_DTYPE` | all | KV cache element type | `f32` | `f32`, `f16`, `q8_0`, `q4_0` | yes |
+| `KV_CACHE_DTYPE` | all | KV cache element type | `f32` | `f32`, `f16`, `q8_0` (runtime also accepts `q4_0`, not swept) | yes |
 | `TS_KV_PAGED_QUANT_BITS` | all | TurboQuant paged-KV block codec | off (`0`) | `0`, `4`, `8` | yes |
 | `MAX_CONTEXT` | long text / uploaded text | Hard context cap | model default | `4096`, `8192`, `16384` | yes |
 
@@ -61,7 +61,7 @@ results as part of the standard matrix.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_PREFILL_CHUNK` | GPT OSS, Qwen 3.5 / 3.6 family on long-context features | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
+| `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H, Mistral 3, and Qwen 3 as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
 | `GDN_DISABLE_CHUNKED_PREFILL` | `qwen3next` | Disable GDN chunked prefill | OFF | `0`, `1` | no |
 | `TS_GGML_ASYNC_COMPUTE` | GGML backends | Async compute submission | OFF | `0`, `1` | yes |
 

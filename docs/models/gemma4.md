@@ -381,6 +381,46 @@ Multimodal prompts skip chunking because injection positions are absolute.
 
 ## 8. Prefill optimization
 
+### Whole-model single-graph prefill (`NativeGemma4ModelVerify`)
+
+On ggml backends, ordinary multi-token prefill is served by the same fused
+whole-model kernel that MTP verification uses (§12): all layers run in a
+single GGML graph dispatch with activations device-resident, instead of one
+graph per layer. `CanUseWholeModelPrefillVerify()` gates the path — dense
+models only, with multimodal chunks eligible at `startPos == 0` via the
+kernel's bidirectional-span mask (`TS_G4_MM_PREFILL=0` reverts multimodal to
+the per-op path). SWA-wrapped chunks at `startPos > 0` stay on the fused path
+through the kernel's in-kernel swaPrev gather (`TS_G4_VERIFY_SWAPREV=0`
+disables). All-MoE variants (e.g. 26B-A4B) have a sibling fused path,
+`CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`. Set
+`TS_G4_WHOLE_PREFILL=0` to force the per-op chunked path for A/B. Note that
+block-quantized (`q8_0` / `q4_0`) KV caches *require* this path for
+multi-token prefill — the per-op fallback cannot walk block-quantized cache
+layouts.
+
+The scheduler feeds a solo (uncontended) prompt to this path in big chunks:
+the fresh chunk is capped by `TS_SCHED_SOLO_PREFILL_CHUNK` (default 8192) and
+the tail chunks by `TS_SCHED_SOLO_TAIL_PREFILL_CHUNK` (default 2048). See
+[`docs/perf/gemma4-prefill-cuda-graph-design.md`](../perf/gemma4-prefill-cuda-graph-design.md)
+for the measured design.
+
+### In-kernel PLE gather
+
+The per-layer embeddings (PLE) are gathered inside the fused verify graph via
+`ggml_get_rows` on the resident quantized `per_layer_token_embd` table,
+instead of computing them in C# and shuttling the ~88 MB result
+device→host→device every chunk. Default on; `TS_G4_PLE_IN_KERNEL=0` reverts
+to the uploaded path.
+
+### KV cache pre-grow (`PrepareForPrefill`)
+
+At the start of a fresh prefill the grow-on-demand global KV cache is
+pre-sized to the whole prompt (`PrepareForPrefill(totalPromptTokens)`). At
+`start_pos == 0` the cache holds no committed K/V, so growing to the final
+size copies nothing — this eliminates the incremental doubling grows that
+each re-copied and device↔host round-tripped the whole global cache (a
+measured ~7% at 64k). GGML GPU backends only, clamped to the model context.
+
 ### Fused per-layer prefill (`Gemma4LayerPrefill`)
 
 For each eligible layer (dense, non-shared KV, no PLE injection in the
@@ -652,12 +692,13 @@ not ship a Jinja2 one.
 
 ## 14. Optimization opportunities
 
-- **Fused MoE GPU kernel** for Gemma 4 — MoE layers currently disable both
-  `Gemma4ModelDecode` and `Gemma4LayerPrefill`. A batched expert kernel
-  similar to Qwen 3.5's `MoEExpertsSwiGLUResidual` would recover the speedup
-  for the fused decode / prefill graphs. (The expert-batched FFN kernel
-  described below already removes the sequential per-expert dispatches from
-  the unfused path.)
+- **Fused MoE kernels for mixed dense+MoE layouts** — all-MoE variants
+  (e.g. 26B-A4B) now run fused whole-model MoE decode
+  (`TryFusedMoEModelDecode` / `TSGgml_Gemma4MoEModelDecode`) and prefill/verify
+  (`TryFusedMoEModelVerify`), but a hypothetical model mixing dense and MoE
+  layers would still fall back to the per-layer graphs. (The expert-batched
+  FFN kernel described below already removes the sequential per-expert
+  dispatches from the unfused path.)
 - **Audio prefill on GPU** — the audio encoder currently dispatches its
   conv subsampling on CPU. Moving the conv stack onto Metal / CUDA would
   improve TTFT for long audio prompts.
