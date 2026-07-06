@@ -30,7 +30,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// Historical note: an earlier benchmark with the (since-disabled-by-
         /// default) N=1 fast path in <see cref="BatchExecutor.ExecuteStep"/>
         /// showed smaller chunks hurt wall-clock for mixed prefill+decode
-        /// workloads — that path got the first request through fused decode
+        /// workloads ÔÇö that path got the first request through fused decode
         /// before the second one arrived, and small chunks pushed more of
         /// it onto the slow batched path. With the fast path off by default
         /// the chunk-size sensitivity is much milder; 1024 is still a sane
@@ -39,7 +39,7 @@ namespace TensorSharp.Runtime.Scheduling
         public int MaxPrefillChunkSize { get; init; } = 1024;
 
         /// <summary>Per-step prefill token cap used ONLY when there is no GPU
-        /// contention — i.e. at most one sequence is in the system (running +
+        /// contention ÔÇö i.e. at most one sequence is in the system (running +
         /// waiting &lt;= 1). The small <see cref="MaxPrefillChunkSize"/> exists
         /// purely to let concurrent decode requests interleave at the GPU; for a
         /// lone request it is counter-productive. On GPU backends a chunk that
@@ -48,38 +48,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// after every op on CUDA, where async deferral is Metal-only), so
         /// splitting a solo prompt into small chunks is several times SLOWER than
         /// feeding it whole. Matching the CLI (which never sub-divides a solo
-        /// prompt below ~5120 tokens) recovers full prefill throughput.
-        ///
-        /// This caps only the FRESH (start_pos==0) chunk, which the model runs as
-        /// ONE fused flash-verify graph (O(seq) memory). A prompt longer than this
-        /// has its TAIL processed in small per-op chunks (<see cref="MaxPrefillChunkSize"/>),
-        /// so a big value only raises the size of the prompt that gets the fully-
-        /// fused fast path — not the per-op score tensor (which the tail bounds).
-        /// The ceiling is GPU memory: the fused verify graph's activations scale
-        /// with the chunk, so an over-large fresh chunk OOMs the graph and falls
-        /// back to the slow per-op path for the WHOLE chunk. 8192 keeps a 12B dense
-        /// model's whole-chunk verify comfortably within a 16 GB card while covering
-        /// the common long-prompt case in one fused pass; raise it on bigger GPUs.
+        /// prompt below ~5120 tokens) recovers full prefill throughput. Bounded
+        /// by <see cref="MaxNumBatchedTokens"/> for activation-memory safety.
         /// Default 8192. Env: <c>TS_SCHED_SOLO_PREFILL_CHUNK</c>.</summary>
         public int SoloPrefillChunkSize { get; init; } = 8192;
-
-        /// <summary>Per-step prefill token cap for the TAIL (start_pos&gt;0) chunks of
-        /// a SOLO prompt — the part beyond the first <see cref="SoloPrefillChunkSize"/>
-        /// tokens. On models that serve start_pos&gt;0 prefill through their fused
-        /// flash-attention path (e.g. Gemma 4's in-kernel swaPrev window gather),
-        /// the tail is NOT on the slow per-op path: flash is O(seq) memory and never
-        /// materializes the attention-score tensor. The only per-chunk cost that
-        /// grows with the chunk is the causal mask (rebuilt + uploaded each chunk,
-        /// ~chunk×context), so the tail has a sweet spot distinct from both the
-        /// contended fairness chunk (<see cref="MaxPrefillChunkSize"/>) and the big
-        /// fresh chunk: large enough to amortize per-chunk graph-build/launch
-        /// overhead and keep the flash/GEMM kernels efficient, small enough to keep
-        /// the mask cheap. Measured on Gemma 4 E4B (16 GB) long prefill: 2048 beats
-        /// the old 1024 tail by ~3% and 8192 by ~6% (mask cost dominates past 2048).
-        /// Bounded by <see cref="SoloPrefillChunkSize"/> (the model already handles
-        /// a chunk that big for the fresh chunk, so this never raises the memory
-        /// ceiling). Default 2048. Env: <c>TS_SCHED_SOLO_TAIL_PREFILL_CHUNK</c>.</summary>
-        public int SoloTailPrefillChunkSize { get; init; } = 2048;
 
         /// <summary>Number of physical KV blocks in the pool. The total KV-cache
         /// budget is <c>NumBlocks * BlockSize</c> tokens. When the model exposes
@@ -128,7 +100,6 @@ namespace TensorSharp.Runtime.Scheduling
                 MaxNumRunningSequences = ReadInt("TS_SCHED_MAX_RUNNING_SEQS", 16),
                 MaxPrefillChunkSize = ReadInt("TS_SCHED_PREFILL_CHUNK", 1024),
                 SoloPrefillChunkSize = ReadInt("TS_SCHED_SOLO_PREFILL_CHUNK", 8192),
-                SoloTailPrefillChunkSize = ReadInt("TS_SCHED_SOLO_TAIL_PREFILL_CHUNK", 2048),
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),

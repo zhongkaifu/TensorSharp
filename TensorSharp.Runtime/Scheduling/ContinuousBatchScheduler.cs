@@ -132,21 +132,6 @@ namespace TensorSharp.Runtime.Scheduling
             return result;
         }
 
-        /// <summary>Snapshot the currently-running sequences (in fairness order).
-        /// Used by the engine's deadlock path to fail sequences that can no longer
-        /// be scheduled (the running set needs KV blocks the pool can't supply and
-        /// can't free by preemption), rather than spinning on empty schedules.</summary>
-        public List<SequenceState> GetRunningSequencesSnapshot()
-        {
-            var result = new List<SequenceState>(_runningOrder.Count);
-            foreach (var seq in _runningOrder)
-            {
-                if (seq == null || seq.Status.IsFinished()) continue;
-                result.Add(seq);
-            }
-            return result;
-        }
-
         /// <summary>Submit a sequence. It enters the waiting queue; the next
         /// <see cref="Schedule"/> call will try to admit it.</summary>
         public void Submit(SequenceState seq)
@@ -176,74 +161,25 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>
-        /// Per-step prefill chunk cap for one sequence. A FRESH solo prefill
-        /// (start_pos==0, no contention) runs its whole chunk through the fused
-        /// single-graph flash-verify path — the model grows its cache to fit — so
-        /// feed it big (<see cref="SchedulerConfig.SoloPrefillChunkSize"/>).
-        ///
-        /// A start_pos&gt;0 chunk (the tail of a prompt longer than the fresh-chunk
-        /// size) ALSO runs on the fused flash path on models that gather the
-        /// wrapped/continued window in-kernel (Gemma 4's swaPrev verify): flash
-        /// attention is O(seq) memory and never materializes the score tensor, so
-        /// the tail does not blow up. Its only per-chunk cost that grows with the
-        /// chunk is the causal mask (rebuilt + uploaded each chunk, ~chunk×context),
-        /// so the tail has its OWN measured sweet spot
-        /// (<see cref="SchedulerConfig.SoloTailPrefillChunkSize"/>, ~2048): big
-        /// enough to amortize per-chunk graph-build/launch overhead and keep the
-        /// flash/GEMM kernels efficient, small enough that the mask stays cheap
-        /// (2048 beat 1024 by ~3% and 8192 by ~6% on Gemma 4 E4B long prefill).
-        /// It is bounded by SoloPrefillChunkSize, which the model already handles
-        /// for the fresh chunk, so it never introduces a new memory ceiling.
-        ///
-        /// Any contention uses the small fair chunk
-        /// (<see cref="SchedulerConfig.MaxPrefillChunkSize"/>) so concurrent decode
-        /// can interleave.
-        /// </summary>
-        private int PrefillCapFor(SequenceState seq, bool noContention)
-        {
-            if (!noContention)
-                return _cfg.MaxPrefillChunkSize;
-            return seq.NumComputedTokens == 0
-                ? _cfg.SoloPrefillChunkSize
-                : Math.Min(_cfg.SoloTailPrefillChunkSize, _cfg.SoloPrefillChunkSize);
-        }
-
-        /// <summary>
         /// Decide the work for the next forward pass.
         /// </summary>
         public SchedulerOutput Schedule()
         {
             var output = new SchedulerOutput();
+            int tokenBudget = _cfg.MaxNumBatchedTokens;
 
             // When there's at most one sequence in the whole system there is no
             // concurrent decode to interleave with, so the small prefill chunk
             // (which exists only for fairness) just forces a long prompt onto the
-            // slow per-op path. Feed a lone prompt's FRESH (start_pos==0) chunk in
-            // one big piece (bounded by SoloPrefillChunkSize) so it runs as ONE
-            // fused single-graph prefill — the model grows its cache to fit and
-            // routes the whole chunk through the flash verify kernel. The moment a
-            // 2nd request appears this reverts to small chunks (see PrefillCapFor).
-            //
-            // CRITICAL: the big chunk only helps at start_pos==0. A prompt LONGER
-            // than the fused-prefill capacity spills its tail into start_pos>0
-            // chunks that can ONLY run on the per-op path, whose materialized score
-            // tensor grows with the chunk size (an 8k tail chunk = a multi-GB score
-            // tensor, minutes of compute). So tail chunks (start_pos>0) stay small
-            // at MaxPrefillChunkSize regardless of contention — bounding that score
-            // tensor. PrefillCapFor encodes both rules.
+            // slow per-op, GPU-syncs-every-op path for every chunk that crosses
+            // the sliding-window boundary. Feed a lone prompt in one big chunk
+            // (bounded by the batched-token budget) like the CLI does, keeping it
+            // on the fused single-graph prefill path. The moment a 2nd request
+            // appears this reverts to small chunks automatically.
             bool noContention = (_running.Count + _waiting.Count) <= 1;
-
-            // Per-step token budget. MaxNumBatchedTokens caps the COMBINED work of
-            // all sequences in a step — an activation-memory bound that matters when
-            // batching concurrent requests. A lone prompt has no concurrent
-            // activations to share that budget with, and its fused whole-model
-            // prefill graph is O(seq) memory (flash attention, last-token-only
-            // logits), so let the solo fresh chunk reach SoloPrefillChunkSize.
-            // Without this lift the budget would re-chunk the prompt at
-            // MaxNumBatchedTokens and push the remainder onto the slow per-op path.
-            int tokenBudget = noContention
-                ? Math.Max(_cfg.MaxNumBatchedTokens, _cfg.SoloPrefillChunkSize)
-                : _cfg.MaxNumBatchedTokens;
+            int prefillCap = noContention
+                ? Math.Min(_cfg.SoloPrefillChunkSize, _cfg.MaxNumBatchedTokens)
+                : _cfg.MaxPrefillChunkSize;
 
             // -------------------------------------------------------------- 1. Run existing running set first.
             //    This guarantees decoding sequences make forward progress even
@@ -259,7 +195,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
                 bool isPrefill = promptUncomputed > 0;
                 int want = isPrefill
-                    ? Math.Min(promptUncomputed, PrefillCapFor(seq, noContention))
+                    ? Math.Min(promptUncomputed, prefillCap)
                     : 1; // decode step
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
@@ -317,10 +253,10 @@ namespace TensorSharp.Runtime.Scheduling
                     // request's full circular KV is kept alive; if this prompt extends
                     // it exactly, continue from that retained holder (reusing the whole
                     // conversation prefix past the pooled window cap). Each retained
-                    // holder is independent — no shared live cache to clobber — so this
+                    // holder is independent ÔÇö no shared live cache to clobber ÔÇö so this
                     // is NOT gated to the sole-sequence case and doesn't block
                     // co-admitting other sequences this step. This is the path that
-                    // gives multi-turn "请继续" follow-ups their prefix reuse back after
+                    // gives multi-turn "Þ»Àþ╗ºþ╗¡" follow-ups their prefix reuse back after
                     // a concurrent (per-seq fused) round left nothing in the pool.
                     if (!plannedLiveContinuation
                         && _fusedContinuationLcp != null
@@ -343,7 +279,7 @@ namespace TensorSharp.Runtime.Scheduling
                     promptUncomputed = 1;
                 }
 
-                int want = Math.Min(promptUncomputed, PrefillCapFor(seq, noContention));
+                int want = Math.Min(promptUncomputed, prefillCap);
                 want = Math.Min(want, tokenBudget);
                 if (want <= 0) break;
 
@@ -593,7 +529,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // sliding window, where the circular cache has wrapped and
                 // the byte-level snapshot is ill-defined) keep Used at 0.
                 // Registering those would seed the prefix-cache index with
-                // junk data — a future sequence with a matching prompt
+                // junk data ÔÇö a future sequence with a matching prompt
                 // prefix would adopt them, claim NumComputedTokens past the
                 // SWA window, and then EnsureOwnership.InjectAllBlocks would
                 // fail on the same wrap-aliased positions (the "Inject
