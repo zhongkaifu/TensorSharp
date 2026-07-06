@@ -72,6 +72,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulQ80Dp4aF32;
         private readonly IntPtr quantMatmulQ80MmaF32;
         private readonly IntPtr quantizeQ81RowsF32;
+        private readonly IntPtr qkNormRopeNeoxF32;
+        private readonly IntPtr qwen35GdnFusedF32;
 
         // q8_1 block = half d + half s + 32 int8 = 36 bytes (matches ts_block_q8_1).
         public const int Q81BlockBytes = 36;
@@ -147,6 +149,8 @@ namespace TensorSharp.Cuda
             quantMatmulQ80MmaF32 = module.GetFunction("ts_quant_matmul_q8_0_mma_f32");
             quantizeQ81RowsF32 = module.GetFunction("ts_quantize_q8_1_rows_f32");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
+            qkNormRopeNeoxF32 = module.GetFunction("ts_qk_norm_rope_neox_f32");
+            qwen35GdnFusedF32 = module.GetFunction("ts_qwen35_gdn_fused_f32");
         }
 
         public static CudaKernels TryCreate()
@@ -390,7 +394,8 @@ namespace TensorSharp.Cuda
                 &headKDimArg, &headVDimArg, &convKernelArg, &convWriteIdxArg, &epsArg
             };
             uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
-            Launch(qwen35GdnPackedF32, (uint)numVHeads, 1, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
+            uint gridY = (uint)((headVDim + 15) / 16); // ceil(headVDim / num_warps)
+            Launch(qwen35GdnPackedF32, (uint)numVHeads, gridY, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
 
             int convDim = convKernel - 1;
             if (convDim <= 0)
@@ -439,6 +444,38 @@ namespace TensorSharp.Cuda
             Launch(qwen35GdnPackInputsF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchQwen35GdnFusedF32(
+            IntPtr qkv, IntPtr z, IntPtr beta, IntPtr alpha,
+            IntPtr convState, IntPtr ssmState, IntPtr convWeight,
+            IntPtr dtBias, IntPtr aLog, IntPtr ssmNorm, IntPtr output,
+            int seqLen, int qkvDim, int zDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, int convWriteIdx, float eps, IntPtr stream)
+        {
+            IntPtr qkvArg = qkv; IntPtr zArg = z; IntPtr betaArg = beta; IntPtr alphaArg = alpha;
+            IntPtr convStateArg = convState; IntPtr ssmStateArg = ssmState; IntPtr convWeightArg = convWeight;
+            IntPtr dtBiasArg = dtBias; IntPtr aLogArg = aLog; IntPtr ssmNormArg = ssmNorm; IntPtr outputArg = output;
+            int seqLenArg = seqLen; int qkvDimArg = qkvDim; int zDimArg = zDim;
+            int qkDimArg = qkDim; int vDimArg = vDim;
+            int numKHeadsArg = numKHeads; int numVHeadsArg = numVHeads;
+            int headKDimArg = headKDim; int headVDimArg = headVDim;
+            int convKernelArg = convKernel; int convWriteIdxArg = convWriteIdx;
+            float epsArg = eps;
+
+            void** args = stackalloc void*[]
+            {
+                &qkvArg, &zArg, &betaArg, &alphaArg,
+                &convStateArg, &ssmStateArg, &convWeightArg,
+                &dtBiasArg, &aLogArg, &ssmNormArg, &outputArg,
+                &seqLenArg, &qkvDimArg, &zDimArg, &qkDimArg, &vDimArg,
+                &numKHeadsArg, &numVHeadsArg, &headKDimArg, &headVDimArg,
+                &convKernelArg, &convWriteIdxArg, &epsArg
+            };
+            uint sharedBytes = checked((uint)((2 * headKDim + headVDim) * sizeof(float)));
+            uint gridY = (uint)((headVDim + 15) / 16);
+            Launch(qwen35GdnFusedF32, (uint)numVHeads, gridY, 1, GdnBlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
         public void LaunchRMSNormF32(IntPtr input, IntPtr alpha, IntPtr beta, IntPtr output, int rows, int cols, float eps, IntPtr stream)
         {
             IntPtr inputArg = input;
@@ -452,7 +489,7 @@ namespace TensorSharp.Cuda
             Launch(rmsNormF32, (uint)rows, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
-        // residual[row,i] += rms_norm(input[row], alpha)[i] — fused norm + residual add.
+        // residual[row,i] += rms_norm(input[row], alpha)[i] ÔÇö fused norm + residual add.
         public void LaunchRMSNormResidualAddF32(IntPtr input, IntPtr alpha, IntPtr residual, int rows, int cols, float eps, IntPtr stream)
         {
             IntPtr inputArg = input;
@@ -1191,6 +1228,52 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[]
             { &dataArg, &cosTableArg, &sinTableArg, &numHeadsArg, &seqLenArg, &headDimArg, &ropeHalfArg };
             Launch(neoxRopeFlatF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>
+        /// Fused QK-RMSNorm + NeoX RoPE kernel.  Normalizes each row via RMSNorm,
+        /// then applies NeoX rotary position embeddings in-place ÔÇö all in a single
+        /// kernel launch with one shared-memory pass.
+        /// </summary>
+        /// <param name="data">Q or K tensor [rows, cols], modified in-place.</param>
+        /// <param name="alpha">RMSNorm weight [cols].</param>
+        /// <param name="positions">Token positions [rows] as int32.</param>
+        /// <param name="rows">seqLen * numHeads (or seqLen * kvHeads).</param>
+        /// <param name="cols">headDim.</param>
+        /// <param name="ropeHalf">rope_dims / 2 (number of rotary pairs).</param>
+        /// <param name="eps">RMSNorm epsilon.</param>
+        /// <param name="ropeBase">RoPE base frequency (e.g. 1000000.0).</param>
+        /// <param name="ropeFreqScale">1.0 / rope_scale.</param>
+        public void LaunchQKNormRopeNeoxF32(
+            IntPtr data,
+            IntPtr alpha,
+            IntPtr positions,
+            int rows,
+            int cols,
+            int ropeHalf,
+            float eps,
+            float ropeBase,
+            float ropeFreqScale,
+            IntPtr stream)
+        {
+            IntPtr dataArg = data;
+            IntPtr alphaArg = alpha;
+            IntPtr positionsArg = positions;
+            int rowsArg = rows;
+            int colsArg = cols;
+            int ropeHalfArg = ropeHalf;
+            float epsArg = eps;
+            float ropeBaseArg = ropeBase;
+            float ropeFreqScaleArg = ropeFreqScale;
+
+            void** args = stackalloc void*[]
+            {
+                &dataArg, &alphaArg, &positionsArg, &rowsArg, &colsArg,
+                &ropeHalfArg, &epsArg, &ropeBaseArg, &ropeFreqScaleArg
+            };
+
+            uint sharedBytes = checked((uint)(2 * cols * sizeof(float)));
+            Launch(qkNormRopeNeoxF32, Grid(rows), 1, 1, BlockSize, 1, 1, sharedBytes, stream, args);
         }
 
         public void LaunchIndexSelectF32(IntPtr source, IntPtr indices, IntPtr output, int rows, int cols, int sourceRows, int indicesAreInt32, int isAdd, IntPtr stream)

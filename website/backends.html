@@ -25,7 +25,7 @@
     <tbody>
       <tr><td><strong>Apple Silicon (Mac)</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Default on macOS. <code>mlx</code> is an alternative Apple-Silicon GPU path.</td></tr>
       <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>Most-tested NVIDIA path. <code>cuda</code> is the direct PTX/cuBLAS backend for experimentation.</td></tr>
-      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>Vendor-neutral GPU path via ggml-vulkan (cooperative-matrix accelerated where the driver supports it). Opt in at native build time with <code>--vulkan</code>.</td></tr>
+      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>Vendor-neutral GPU path via ggml-vulkan (cooperative-matrix accelerated where the driver supports it). Built automatically when the machine has a Vulkan runtime; opt out with <code>--no-vulkan</code>.</td></tr>
       <tr><td><strong>No GPU / portability / debugging</strong></td><td>Pure C# CPU</td><td><code>cpu</code></td><td>No native dependencies. For faster CPU inference use <code>ggml_cpu</code> (native kernels).</td></tr>
     </tbody>
   </table>
@@ -77,15 +77,15 @@
 # macOS (Metal)
 bash build-macos.sh
 
-# Linux — CPU only / with CUDA / with Vulkan
+# Linux — CPU only, force CUDA on, force Vulkan off
 bash build-linux.sh
 bash build-linux.sh --cuda
-bash build-linux.sh --vulkan</code></pre>
-  <pre data-lang="powershell"><code># Windows — CPU only / with CUDA / with Vulkan
+bash build-linux.sh --no-vulkan</code></pre>
+  <pre data-lang="powershell"><code># Windows — CPU only, force CUDA on, force Vulkan off
 .\build-windows.ps1 --no-cuda
 .\build-windows.ps1 --cuda
-.\build-windows.ps1 --vulkan</code></pre>
-  <p>The GGML Vulkan backend is opt-in (<code>--vulkan</code> or <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>). On Windows, a <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> is used when installed; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a <code>vulkan-1</code> import library generated from the system loader, glslc, SPIRV-Headers) into <code>ExternalProjects/vulkan-toolchain/</code> via <code>eng/fetch-vulkan-toolchain.ps1</code>. On Linux, install the distro Vulkan SDK packages first (e.g. <code>apt install libvulkan-dev glslc spirv-headers</code>). A GPU driver with Vulkan 1.3 support is required at run time.</p>
+.\build-windows.ps1 --no-vulkan</code></pre>
+  <p>The GGML Vulkan backend is <strong>enabled automatically</strong> when the machine has a Vulkan runtime (a loader such as <code>vulkan-1.dll</code> on Windows or <code>libvulkan.so.1</code> on Linux, shipped by every recent GPU driver); opt out with <code>--no-vulkan</code> (or <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF</code>), and an explicit choice sticks across rebuilds via the CMake cache. On Windows, a <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> is used when installed; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a <code>vulkan-1</code> import library generated from the system loader, glslc, SPIRV-Headers) into <code>ExternalProjects/vulkan-toolchain/</code> via <code>eng/fetch-vulkan-toolchain.ps1</code>. On Linux, distro dev packages are used when present (<code>apt install libvulkan-dev glslc spirv-headers</code>); otherwise the build auto-provisions the missing pieces (Vulkan-Headers, glslc from the shaderc CI prebuilts, SPIRV-Headers) via <code>eng/fetch-vulkan-toolchain.sh</code>. A GPU driver with Vulkan 1.3 support is required at run time.</p>
   <p>On Windows/Linux the script auto-detects the visible NVIDIA GPU compute capability and passes a narrow <code>CMAKE_CUDA_ARCHITECTURES</code> (e.g. <code>86-real</code> on an RTX 3080), which cuts CUDA build time substantially. Override it explicitly:</p>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
 bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>

@@ -135,7 +135,7 @@
       <tr><td><code>TS_MLX_* </code></td><td>MLX backend tuning: pipelined decode, mlock GGUF, fused KV write, batched MoE decode, memory caps.</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>Override the search path for <code>libmlxc</code>.</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>Skip / pin the ggml source clone on native builds.</td></tr>
-      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td><code>ON</code> builds the native bridge with the GGML Vulkan backend (= build-script <code>--vulkan</code>).</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td>Force the GGML Vulkan backend on/off at native build time (<code>ON</code>/<code>OFF</code> = build-script <code>--vulkan</code>/<code>--no-vulkan</code>). Auto-enabled when a Vulkan runtime is detected; an explicit choice sticks across rebuilds.</td></tr>
     </tbody>
   </table>
   </div>

@@ -49,7 +49,7 @@ namespace TensorSharp.Runtime.Scheduling
         // Set after every per-sequence forward; invalidated whenever the model's KV
         // cache is reset / rebuilt for a different sequence (or the batched path
         // takes over). Lets a same-session follow-up turn whose prompt extends this
-        // sequence skip re-prefill entirely by continuing from the live cache —
+        // sequence skip re-prefill entirely by continuing from the live cache ÔÇö
         // critical for sliding-window models where the pooled snapshot can only
         // reuse one window.
         private SequenceState _liveCacheSeq;
@@ -64,7 +64,7 @@ namespace TensorSharp.Runtime.Scheduling
         // multi-turn follow-up would re-prefill the whole conversation (KV reuse 0).
         // We retain a small LRU of finished fused holders (the model keeps the K/V
         // alive) keyed by their full token list, and re-adopt one for a later request
-        // whose prompt exactly extends it — the cross-request analogue of the
+        // whose prompt exactly extends it ÔÇö the cross-request analogue of the
         // single-stream live-cache continuation. See ComputeFusedContinuationLcp.
         private sealed class RetainedFusedCache
         {
@@ -85,8 +85,8 @@ namespace TensorSharp.Runtime.Scheduling
         // At most one sequence at a time runs speculatively: the draft head's
         // KV cache and pending hidden state live in the model's single live
         // (linear) cache, so continuity is (sequence identity, exact trunk
-        // position). Any KV rebuild/swap — ownership change, batched/fused
-        // step, preemption — invalidates the context; it re-arms only at a
+        // position). Any KV rebuild/swap ÔÇö ownership change, batched/fused
+        // step, preemption ÔÇö invalidates the context; it re-arms only at a
         // fresh full prefill from position 0.
         private MtpSeqContext _mtpCtx;
 
@@ -194,7 +194,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // reference outlives that. Without this reset, the next
                 // step's TryMigrateOwnerToPagedIfNeeded would call into
                 // TryMigrateLinearKVToPaged with NumBlocks==0 (it returns
-                // false and the executor logs a misleading "linear→paged
+                // false and the executor logs a misleading "linearÔåÆpaged
                 // migration failed" warning), and EnsureOwnership on the
                 // new sequence would try to extract state out of the dead
                 // owner. Treat anything that's not Running as "no owner";
@@ -227,7 +227,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // text correctness intact.
                 // Models that handle multimodal in batched mode (e.g. Qwen3.5
                 // Phase 4) declare SupportsBatchedMultimodal=true and run the
-                // whole batch — multimodal + text — through ForwardBatch in
+                // whole batch ÔÇö multimodal + text ÔÇö through ForwardBatch in
                 // one shot. Other models still get the multimodal/text split
                 // so per-seq Forward handles their vision-encoded sequences.
                 bool batchedModalSafe = _model is IBatchedPagedModel mmCheck && mmCheck.SupportsBatchedMultimodal;
@@ -237,7 +237,7 @@ namespace TensorSharp.Runtime.Scheduling
 
                 // NextN/MTP speculative decoding. Models whose batched paged
                 // path can serve the speculative trunk (paged KV + per-slot
-                // recurrent state) run spec directly on that path — the same
+                // recurrent state) run spec directly on that path ÔÇö the same
                 // kernels as the non-speculative batched baseline, no
                 // linear-cache detour, composing with prefix caching and
                 // concurrency transitions. When the handler declines (multi-
@@ -266,7 +266,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // each request owns an isolated KV cache (no cross-sequence
                 // byte-level swap), the per-seq Forward injects this request's
                 // bucketed vision/audio embeddings into its own cache without
-                // colliding with concurrent text sequences — the very isolation
+                // colliding with concurrent text sequences ÔÇö the very isolation
                 // the legacy multimodal/text split worked around on the swap
                 // path. Routing everything through the fused path also avoids a
                 // KV-storage split (fused sequences keep K/V in their linear
@@ -314,11 +314,11 @@ namespace TensorSharp.Runtime.Scheduling
                     // and the model has a fused single-pass decode kernel
                     // (e.g. Gemma 4's NativeGemma4ModelDecode), the per-seq
                     // Forward path is dramatically faster than the batched
-                    // op-by-op path — ForwardBatch makes ~10 Ops.* dispatches
-                    // per layer × 42 layers = ~420 kernel dispatches per token,
+                    // op-by-op path ÔÇö ForwardBatch makes ~10 Ops.* dispatches
+                    // per layer ├ù 42 layers = ~420 kernel dispatches per token,
                     // while Forward submits the whole 42-layer decode as a
                     // single ggml graph compute. Profiling shows a ~4x speedup
-                    // (≈21 tok/s vs ≈5 tok/s for Gemma 4 E4B Q8_0 on Metal).
+                    // (Ôëê21 tok/s vs Ôëê5 tok/s for Gemma 4 E4B Q8_0 on Metal).
                     //
                     // Safety: Forward writes K/V into the model's LINEAR cache,
                     // while ForwardBatch reads from PAGED buffers. When a
@@ -331,27 +331,10 @@ namespace TensorSharp.Runtime.Scheduling
                     //      committed state to paged storage
                     //      (KvStateInPagedStorage), since Forward would attend
                     //      against an empty linear cache.
-                    //   2. Restrict the fast path to models that EITHER implement
-                    //      TryMigrateLinearKVToPaged (so the upcoming N=2
-                    //      transition can copy the linear state into paged
-                    //      storage before the batched kernel reads it) OR serve
-                    //      N>=2 through the per-sequence FUSED path
-                    //      (SupportsPerSequenceFusedForward) — those models never
-                    //      read paged storage for concurrent decode, so the N=2
-                    //      transition is handled by AdoptPrimaryCacheToFused (the
-                    //      owner's linear cache is moved into its per-request
-                    //      holder) and no linear→paged migration is needed.
-                    //      This second case is what keeps BLOCK-QUANTIZED KV
-                    //      caches (q4_0 / q8_0) on the fast path: their
-                    //      ForwardBatch throws NotSupported, so they report
-                    //      SupportsLinearKVMigration=false, but they still own a
-                    //      single linear cache exactly like the f16 fast path.
-                    //      Without this, block-quant N=1 steps fell into the
-                    //      ExecuteStepBatched attempt below, which clears
-                    //      _liveCacheValid *before* ForwardBatch throws — that
-                    //      stale-false flag then aborted same-session live-cache
-                    //      continuation ("请继续" follow-ups), so multi-turn KV
-                    //      reuse dropped to 0 for q4_0/q8_0 while f16 reused fully.
+                    //   2. Restrict the fast path to models that implement
+                    //      TryMigrateLinearKVToPaged, so the upcoming N=2
+                    //      transition can copy the linear state across before
+                    //      the batched kernel reads it.
                     //
                     // Gate: SupportsKVStateSnapshot is only relevant when
                     // ExecuteStepPerSequence has to *swap* ownership (i.e.
@@ -364,8 +347,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // need to A/B against the batched-only path.
                     if (IsBatchedN1FastPathEnabled()
                         && output.ScheduledWork.Count == 1
-                        && (batched2.SupportsLinearKVMigration
-                            || batched2.SupportsPerSequenceFusedForward))
+                        && batched2.SupportsLinearKVMigration)
                     {
                         var only = output.ScheduledWork[0].Sequence;
                         bool noSwapNeeded =
@@ -401,14 +383,14 @@ namespace TensorSharp.Runtime.Scheduling
                         //      (e.g. a model whose batched path is gated off
                         //      via env var so every step is served by the
                         //      per-seq fallback anyway). This is expected,
-                        //      not a failure — silently route to per-seq.
+                        //      not a failure ÔÇö silently route to per-seq.
                         // In both cases the batched path would corrupt this
                         // owner; serve via per-seq where the linear cache
                         // is still authoritative.
                         if (batched2.SupportsLinearKVMigration)
                         {
                             _logger.LogWarning(
-                                "BatchExecutor: linear→paged migration failed for {RequestId}; falling back to per-seq path.",
+                                "BatchExecutor: linearÔåÆpaged migration failed for {RequestId}; falling back to per-seq path.",
                                 _currentOwner?.RequestId);
                         }
                         return ExecuteStepPerSequence(output);
@@ -443,7 +425,7 @@ namespace TensorSharp.Runtime.Scheduling
         ///
         /// Returns true when migration succeeded or no migration was needed
         /// (no owner, or owner already in paged storage). Returns false
-        /// when migration was needed but cannot proceed — either because
+        /// when migration was needed but cannot proceed ÔÇö either because
         /// the model doesn't expose migration at all (common case for
         /// models whose batched path is gated off, so every step runs
         /// per-seq and accumulates linear-only state) or because the model
@@ -475,7 +457,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>True when this step should be served by the per-sequence
         /// path so MTP speculative decoding can engage (or keep a sequence
         /// that already lives in the linear cache on a correct path).
-        /// Speculation itself additionally requires an armed context — a
+        /// Speculation itself additionally requires an armed context ÔÇö a
         /// routed sequence that can't arm (e.g. prefix-cache reuse skipped the
         /// full prefill) simply runs plain per-seq decode.</summary>
         private bool ShouldRouteMtpSpeculative(SchedulerOutput output)
@@ -510,7 +492,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 return false;
             }
-            // A sequence living in a per-request fused cache must stay fused —
+            // A sequence living in a per-request fused cache must stay fused ÔÇö
             // its tail K/V isn't reconstructable from the shared caches.
             if (_model is IBatchedPagedModel fused
                 && fused.SupportsPerSequenceFusedForward
@@ -529,7 +511,7 @@ namespace TensorSharp.Runtime.Scheduling
                 "MTP speculative decoding was requested (--mtp-spec) but for the loaded model " +
                 "on this backend the standard decode path is already faster than speculative " +
                 "decode (its multi-token verify/draft runs op-by-op and cannot amortize a cheap, " +
-                "fused/captured decode). Serving the fast standard decode instead — no action needed.");
+                "fused/captured decode). Serving the fast standard decode instead ÔÇö no action needed.");
         }
 
         private static bool IsBatchedN1FastPathEnabled()
@@ -537,7 +519,7 @@ namespace TensorSharp.Runtime.Scheduling
             // Default ON. The bug that previously made this dangerous (a
             // second concurrent request corrupting the first's output via
             // paged-vs-linear KV-cache divergence) is now handled by the
-            // linear→paged migration at the N=1→batched transition, gated
+            // linearÔåÆpaged migration at the N=1ÔåÆbatched transition, gated
             // on IBatchedPagedModel.SupportsLinearKVMigration. Disable via
             // TS_BATCHED_N1_FAST_PATH=0 to A/B the fully-batched path.
             string raw = Environment.GetEnvironmentVariable("TS_BATCHED_N1_FAST_PATH");
@@ -575,16 +557,14 @@ namespace TensorSharp.Runtime.Scheduling
 
         private List<SequenceStepResult> ExecuteStepBatched(IBatchedPagedModel batched, SchedulerOutput output)
         {
-            // NOTE: we must NOT clear _liveCacheValid here. Some models
-            // (e.g. Gemma 4 with a block-quantized KV cache) decline the
-            // batched path by throwing NotSupportedException from ForwardBatch,
-            // and the caller falls back to ExecuteStepPerSequence. If we had
-            // already cleared the live-cache claim, that fallback's
-            // EnsureOwnership would see a stale-false flag and abort an
-            // in-flight live-cache continuation, re-prefilling the whole
-            // conversation. The claim is only genuinely invalidated once the
-            // batched kernel actually ran and moved K/V into paged storage, so
-            // we clear it AFTER ForwardBatch returns (below).
+            // The batched paged path manages K/V in paged storage (slot mapping),
+            // not the single live linear cache the continuation fast-path tracks.
+            // Drop any live-cache claim so a follow-up can't continue from stale state.
+            _liveCacheValid = false;
+            // Batched steps clobber the linear-cache world the speculative
+            // context depends on (e.g. per-slot GDN state swaps model-level
+            // references), so speculation must re-arm from a fresh prefill.
+            _mtpCtx = null;
             int numSeqs = output.ScheduledWork.Count;
             var ctx = new BatchedForwardContext
             {
@@ -611,8 +591,6 @@ namespace TensorSharp.Runtime.Scheduling
                 int[] inputTokens;
                 if (work.IsPrefill)
                 {
-                    if (seq.NumComputedTokens == 0)
-                        _model.PrepareForPrefill(seq.PromptTokens.Count);
                     inputTokens = BuildPrefillChunk(seq, work);
                 }
                 else
@@ -656,18 +634,6 @@ namespace TensorSharp.Runtime.Scheduling
             var swForward = Stopwatch.StartNew();
             IReadOnlyList<float[]> perSeqLogits = batched.ForwardBatch(ctx);
             swForward.Stop();
-
-            // The batched kernel actually ran: K/V now lives in paged storage
-            // (slot mapping), not the single live linear cache the continuation
-            // fast-path tracks, so drop any live-cache claim now that it is
-            // genuinely stale. (If ForwardBatch had thrown, we never reach here
-            // and the live-cache claim is correctly preserved for the per-seq
-            // fallback.) Batched steps also clobber the linear-cache world the
-            // speculative context depends on (per-slot GDN state swaps), so the
-            // MTP context must re-arm from a fresh prefill.
-            _liveCacheValid = false;
-            _mtpCtx = null;
-
             if (perSeqLogits == null || perSeqLogits.Count != numSeqs)
                 throw new InvalidOperationException(
                     $"ForwardBatch returned {perSeqLogits?.Count ?? -1} results for {numSeqs} sequences.");
@@ -832,7 +798,7 @@ namespace TensorSharp.Runtime.Scheduling
                         }
                         return results;
                     }
-                    // else: not appended — fall through to the round-robin loop.
+                    // else: not appended ÔÇö fall through to the round-robin loop.
                 }
             }
 
@@ -859,10 +825,6 @@ namespace TensorSharp.Runtime.Scheduling
                     int[] inputTokens;
                     if (work.IsPrefill)
                     {
-                        // Pre-size the KV cache to the whole prompt on the first chunk of
-                        // a fresh prefill (free at start_pos 0; avoids incremental grows).
-                        if (seq.NumComputedTokens == 0)
-                            _model.PrepareForPrefill(seq.PromptTokens.Count);
                         inputTokens = BuildPrefillChunk(seq, work);
                     }
                     else
@@ -960,13 +922,13 @@ namespace TensorSharp.Runtime.Scheduling
             //
             // Rotation only fires when SupportsKVStateSnapshot is true; that
             // gate preserves the original Gemma-4-with-wrapped-SWA-cache
-            // safety property — when the swap is unsafe the model reports
+            // safety property ÔÇö when the swap is unsafe the model reports
             // false and we stay with the owner.
             var picked = output.ScheduledWork[0];
             if (_currentOwner != null && output.ScheduledWork.Count > 0)
             {
                 // Rotating ownership to another sequence requires extracting the
-                // current owner's state and injecting the newcomer's — a cross-
+                // current owner's state and injecting the newcomer's ÔÇö a cross-
                 // sequence snapshot round-trip. Models whose restore is not faithful
                 // (Gemma 4 SWA) report SupportsCrossSequenceKvReuse=false, so we never
                 // swap; concurrent sequences serialize on the owner instead of
@@ -1034,10 +996,6 @@ namespace TensorSharp.Runtime.Scheduling
                     int[] inputTokens;
                     if (work.IsPrefill)
                     {
-                        // Pre-size the KV cache to the whole prompt on the first chunk of
-                        // a fresh prefill (free at start_pos 0; avoids incremental grows).
-                        if (seq.NumComputedTokens == 0)
-                            _model.PrepareForPrefill(seq.PromptTokens.Count);
                         inputTokens = BuildPrefillChunk(seq, work);
                     }
                     else
@@ -1069,9 +1027,9 @@ namespace TensorSharp.Runtime.Scheduling
                     // BatchExecutor calls _model.Forward only once per step.
                     // The model's `_logitsBuffer` is overwritten on the next
                     // Forward, but we always sample before that next Forward
-                    // fires — so a defensive 1 MB clone per token (Gemma 4
-                    // vocab = 262144 × 4 bytes) is wasted memcpy and GC
-                    // pressure (~20 µs / token). Borrow the model's buffer
+                    // fires ÔÇö so a defensive 1 MB clone per token (Gemma 4
+                    // vocab = 262144 ├ù 4 bytes) is wasted memcpy and GC
+                    // pressure (~20 ┬Ás / token). Borrow the model's buffer
                     // directly; the contract is: callers must consume
                     // LastLogits before this sequence's next forward.
                     //
@@ -1138,7 +1096,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// the plain path instead. Assumes <see cref="EnsureOwnership"/> has
         /// already run for <paramref name="seq"/> (a fresh sequence therefore
         /// starts with a clean model cache). Models whose batched path can
-        /// serve the speculative trunk never arm here — they are handled by
+        /// serve the speculative trunk never arm here ÔÇö they are handled by
         /// <see cref="TryExecuteStepMtpBatchedTrunk"/> before the per-seq
         /// route is ever taken.</summary>
         private SequenceStepResult TryExecuteMtpStep(
@@ -1206,7 +1164,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// NextN/MTP speculative decoding with the trunk on the BATCHED paged
         /// path (see <see cref="IMtpBatchedSpeculativeModel"/>): solo text
         /// sequences arm at a fresh full prefill and run draft/verify with
-        /// trunk passes through <c>SpecForwardBatched</c> — the same kernels
+        /// trunk passes through <c>SpecForwardBatched</c> ÔÇö the same kernels
         /// the non-speculative batched baseline uses, with the sequence's K/V
         /// in paged storage throughout (prefix caching and concurrency
         /// transitions compose). Returns null when this step should be served
@@ -1234,7 +1192,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 return null;
             }
-            // A sequence living in a per-request fused cache must stay fused —
+            // A sequence living in a per-request fused cache must stay fused ÔÇö
             // its tail K/V isn't reconstructable from paged storage.
             if (_model is IBatchedPagedModel fused
                 && fused.SupportsPerSequenceFusedForward
@@ -1341,7 +1299,7 @@ namespace TensorSharp.Runtime.Scheduling
 
             // Cap the draft window so this step's 1+K forwarded tokens fit in
             // (a) the request's remaining token budget and (b) the KV blocks
-            // the scheduler allocated — it reserves capacity for ONE decode
+            // the scheduler allocated ÔÇö it reserves capacity for ONE decode
             // token per step, so block-boundary steps degrade to plain decode
             // for one step instead of overrunning the block table.
             int kMax = Math.Min(
@@ -1349,7 +1307,7 @@ namespace TensorSharp.Runtime.Scheduling
                 seq.BlockTable.FreeSlotsInCurrentBlocks - 1);
 
             var accepted = new List<int>();
-            var penaltySampler = new TokenSampler(seq.SamplingConfig);
+            var penaltySampler = seq.GetOrCreateSampler();
             var swDecode = Stopwatch.StartNew();
             MtpDecodeOutcome outcome = _mtpCtx.Exec.DecodeStep(
                 sampledToken,
@@ -1358,7 +1316,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // Each verify row is drawn with the request's own sampler over
                 // the live output history (kept exact by onDraftAccepted).
                 drawNext: rowLogits =>
-                    new TokenSampler(seq.SamplingConfig).Sample(rowLogits, seq.OutputTokens),
+                    seq.GetOrCreateSampler().Sample(rowLogits, seq.OutputTokens),
                 // Penalty-aligned drafting: the draft head must argmax the
                 // same penalized distribution verification draws from, or
                 // acceptance decays toward zero as the output history grows.
@@ -1456,7 +1414,7 @@ namespace TensorSharp.Runtime.Scheduling
                 return 0; // no new suffix to forward (or prompt shorter than cache)
 
             // Require the entire live sequence to be an exact prefix of the new
-            // prompt. This is the common multi-turn append ("请继续") case and avoids
+            // prompt. This is the common multi-turn append ("Þ»Àþ╗ºþ╗¡") case and avoids
             // truncating the circular cache (which would reintroduce the wrap issue).
             for (int i = 0; i < liveLen; i++)
             {
@@ -1514,13 +1472,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>True when the loaded model serves concurrent decode through
         /// per-request fused holders AND caps pooled prefix reuse (sliding-window /
-        /// circular cache). Only such models need retained-fused continuation — an
+        /// circular cache). Only such models need retained-fused continuation ÔÇö an
         /// uncapped pure-attention model already reuses the full prefix through the
         /// shared pool. This targets Gemma 4 (the reported repro). Qwen 3.5/3.6 is
         /// deliberately excluded for now: it reports MaxReusablePrefixTokens=int.MaxValue
         /// (uncapped), and its recurrent GatedDeltaNet state can't be reconstructed
         /// from the pool either, so enabling it would need its own correctness pass on
-        /// GDN-state reuse — a follow-up, not part of this fix.</summary>
+        /// GDN-state reuse ÔÇö a follow-up, not part of this fix.</summary>
         private bool ModelUsesRetainableFusedCache()
             => IsRetainedFusedCacheEnabled()
             && _model is IBatchedPagedModel f
@@ -1531,7 +1489,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// of <paramref name="seq"/>'s prompt, or 0 when no retained holder applies.
         /// The matched holder's K/V is the full circular cache from the finished
         /// request, so continuing from it reuses the entire conversation prefix (past
-        /// the sliding-window cap) with no corruption — the cross-request analogue of
+        /// the sliding-window cap) with no corruption ÔÇö the cross-request analogue of
         /// <see cref="ComputeLiveContinuationLcp"/>. Invoked by the scheduler at
         /// admission (same worker thread as the executor).</summary>
         public int ComputeFusedContinuationLcp(SequenceState seq)
@@ -1591,7 +1549,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int len = entry.Tokens.Length;
                 // NB: no `len <= cap` skip. The fused path writes nothing to the shared
                 // pool, so a retained holder is the ONLY reuse source for a concurrent
-                // conversation — even one shorter than the sliding window.
+                // conversation ÔÇö even one shorter than the sliding window.
                 if (seq.PromptTokens.Count <= len) continue;    // no new suffix to forward
                 if (best != null && len <= best.Tokens.Length) continue;
                 bool prefix = true;
@@ -1766,7 +1724,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (seq.LastLogits == null)
                 throw new InvalidOperationException(
                     $"Sequence {seq.RequestId} has no LastLogits to sample from at position {seq.NumComputedTokens}.");
-            var sampler = new TokenSampler(seq.SamplingConfig);
+            var sampler = seq.GetOrCreateSampler();
             return sampler.Sample(seq.LastLogits, seq.OutputTokens);
         }
 
@@ -1793,7 +1751,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
                 {
                     // For SWA-bounded models (e.g. Gemma 4) blocks whose positions
-                    // have aged out of the sliding window can't be re-extracted —
+                    // have aged out of the sliding window can't be re-extracted ÔÇö
                     // their K/V is gone from the model's circular cache. Those
                     // blocks were already captured into pool storage at the moment
                     // they first became full (via CaptureNewlyFullBlocks), so the
@@ -1964,7 +1922,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequence that has run through the N=1 fast path (which writes
         /// only to the legacy linear KV cache) over to the paged storage
         /// that <see cref="ForwardBatch"/> reads from. When false, the
-        /// executor must not use the N=1 fast path for this model — a
+        /// executor must not use the N=1 fast path for this model ÔÇö a
         /// later second-sequence arrival would corrupt the first
         /// sequence's attention.</summary>
         bool SupportsLinearKVMigration => false;
@@ -2023,8 +1981,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// inject any prefix-cache-reused prefix before the first forward.</summary>
         bool BindSequenceCache(string requestId) => false;
 
-        /// <summary>Transition the current single-stream (N==1) owner — whose
-        /// live K/V is in the model's primary cache — into a per-request holder
+        /// <summary>Transition the current single-stream (N==1) owner ÔÇö whose
+        /// live K/V is in the model's primary cache ÔÇö into a per-request holder
         /// without copying KV bytes, and give the primary cache a fresh empty
         /// allocation. Called once when the first concurrent step finds a prior
         /// owner so its history is preserved as an isolated per-request cache.</summary>
@@ -2037,7 +1995,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>True iff a per-request fused cache holder already exists for
         /// <paramref name="requestId"/> (i.e. the sequence has run on the fused
-        /// path before and must stay on it — its tail K/V isn't reconstructable
+        /// path before and must stay on it ÔÇö its tail K/V isn't reconstructable
         /// from paged storage).</summary>
         bool HasFusedSequenceCache(string requestId) => false;
 
@@ -2047,11 +2005,11 @@ namespace TensorSharp.Runtime.Scheduling
         // its own holder and never writes the shared paged block storage, so it
         // contributes nothing to the prefix-cache pool. For a sliding-window model
         // the pool can't restore a long prefix anyway (only the live circular cache
-        // can), so a multi-turn follow-up ("请继续") that arrives while/after other
+        // can), so a multi-turn follow-up ("Þ»Àþ╗ºþ╗¡") that arrives while/after other
         // requests ran concurrently would re-prefill the whole conversation from
         // scratch (KV-reuse ratio 0). To fix that, the executor RETAINS a finished
         // fused request's holder and re-adopts it for a later request whose prompt
-        // exactly extends the retained tokens — the cross-request analogue of the
+        // exactly extends the retained tokens ÔÇö the cross-request analogue of the
         // single-stream live-cache continuation. The model side just keeps the
         // holder alive and lets it be re-keyed.
 
@@ -2111,12 +2069,12 @@ namespace TensorSharp.Runtime.Scheduling
         public int[] OverrideFlatTokens { get; init; }
 
         /// <summary>When non-null, receives the post-final-norm hidden state of
-        /// every row (numTokens × hidden floats) — llama.cpp's h_nextn, consumed
+        /// every row (numTokens ├ù hidden floats) ÔÇö llama.cpp's h_nextn, consumed
         /// by the MTP draft head.</summary>
         public float[] CaptureHiddenAll { get; init; }
 
         /// <summary>When non-null, receives LM-head logits for every row
-        /// (numTokens × vocab floats) — speculative verification needs per-row
+        /// (numTokens ├ù vocab floats) ÔÇö speculative verification needs per-row
         /// logits, not just the last position.</summary>
         public float[] CaptureLogitsAll { get; init; }
     }

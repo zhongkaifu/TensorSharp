@@ -28,7 +28,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>
         /// True when speculation is expected to be PROFITABLE on the current
-        /// backend — i.e. the model can drive its accelerated MTP path (the fused
+        /// backend ÔÇö i.e. the model can drive its accelerated MTP path (the fused
         /// multi-token verify + draft kernels). When false the verify (seqLen=K+1)
         /// and draft fall to the per-op fallback, which does not amortize the trunk
         /// over the speculative window and makes speculation net-negative; the
@@ -85,7 +85,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// live cache), and the model has no recurrent state that a re-forward would
         /// need to advance. When true the executor skips the redundant kept-prefix
         /// re-forward on partial acceptance and simply rewinds the cache position to
-        /// keep the verify's writes — the dominant rollback cost on long contexts.
+        /// keep the verify's writes ÔÇö the dominant rollback cost on long contexts.
         /// Default false (the re-forward path) so recurrent models (e.g. Qwen 3.5
         /// GatedDeltaNet) are unaffected.
         /// </summary>
@@ -100,7 +100,7 @@ namespace TensorSharp.Runtime.Scheduling
     /// non-speculative batched baseline, composes with prefix caching, and
     /// transitions gracefully to/from concurrent batches (the sequence's K/V
     /// always lives in paged storage). The MTP draft head itself still runs
-    /// on the linear cache at the draft layer — it is one decoder block whose
+    /// on the linear cache at the draft layer ÔÇö it is one decoder block whose
     /// state is private to the speculative context.
     /// </summary>
     public interface IMtpBatchedSpeculativeModel : IMtpSpeculativeModel
@@ -138,7 +138,7 @@ namespace TensorSharp.Runtime.Scheduling
     /// <summary>
     /// The trunk backend a speculative execution drives: prompt/verify/plain
     /// forwards plus recurrent-state snapshot/rollback. Two implementations:
-    /// <see cref="LinearMtpTrunk"/> (the model's live linear cache — the
+    /// <see cref="LinearMtpTrunk"/> (the model's live linear cache ÔÇö the
     /// standalone decoder and the per-sequence engine fallback) and the
     /// executor's batched trunk (paged KV + per-slot state via
     /// <see cref="IMtpBatchedSpeculativeModel"/>).
@@ -234,6 +234,21 @@ namespace TensorSharp.Runtime.Scheduling
         public double CatchUpMs => TicksToMs(CatchUpTicks);
         public double PlainMs => TicksToMs(PlainTicks);
 
+        /// <summary>Per-position counters for diagnosing draft quality.
+        /// Index <c>i</c> = position after <c>i</c> accepted tokens
+        /// (0 = first draft token, 1 = second, ...).</summary>
+        /// <remarks>
+        ///   DraftAttemptCount[i] ÔÇö how many times position i was drafted
+        ///   DraftStopCount[i]    ÔÇö how many times drafting stopped BEFORE position i
+        ///                          because confidence was too low
+        ///   AcceptCount[i]       ÔÇö how many times position i was accepted (rejection sampling)
+        ///   RejectCount[i]       ÔÇö how many times position i was rejected (sampled from residual)
+        /// </remarks>
+        public int[] DraftAttemptCount { get; internal set; }
+        public int[] DraftStopCount { get; internal set; }
+        public int[] AcceptCount { get; internal set; }
+        public int[] RejectCount { get; internal set; }
+
         private static double TicksToMs(long ticks)
             => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 
@@ -253,7 +268,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>The token DRAWN from the first mismatching verify row (or
         /// the bonus row after full acceptance). It is the sequence's next
-        /// output token and must be emitted as-is on the caller's next step —
+        /// output token and must be emitted as-is on the caller's next step ÔÇö
         /// re-drawing from <see cref="NextLogits"/> later would bias the stream
         /// toward the drafts (the classic speculative-sampling pitfall).
         /// -1 when the step degraded to a plain decode (no confident drafts):
@@ -278,7 +293,7 @@ namespace TensorSharp.Runtime.Scheduling
     ///      hidden output. The optional <c>adjustDraftLogits</c> hook lets the
     ///      caller apply its sampler's repetition/presence/frequency penalties
     ///      to the draft logits so drafting argmaxes the SAME distribution
-    ///      verification draws from — without it, penalized configs (the chat
+    ///      verification draws from ÔÇö without it, penalized configs (the chat
     ///      default repPen 1.1, including --temperature 0) diverge ever more
     ///      often as the output history grows and acceptance decays to ~0.
     ///   2. VERIFY: the trunk forwards [lastToken, d1..dK] as ONE batch with
@@ -317,6 +332,15 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly float[] _stepLogits;    // [vocab] for plain/re-advance steps
         private readonly float[] _rowLogits;     // [vocab] scratch row handed to drawNext
         private readonly List<int> _draftTokens = new();
+
+        // Rejection-sampling (Leviathan/Chen 2023):
+        //   accept draft token x when u < min(1, p_trunk(x) / p_draft(x)),
+        //   otherwise sample from the residual (p_trunk - p_draft)Ôü║.
+        private readonly float[][] _draftProbs;      // [K+1][vocab] softmax per draft step
+        private readonly float[] _verifyProbs;       // [vocab]   softmax of current verify row
+        private readonly float[] _residualProbs;     // [vocab]   (p - q)Ôü║ scratch buffer
+        private readonly Random _rng;
+
         private float[] _chunkH;                 // [chunk * hidden] prefill h capture
         private float[] _chunkHPairs;            // [chunk * hidden] (token k, h of token k-1) pairs
 
@@ -355,6 +379,13 @@ namespace TensorSharp.Runtime.Scheduling
             _catchUpH = new float[(maxDraftTokens + 1) * _hidden];
             _stepLogits = new float[_vocab];
             _rowLogits = new float[_vocab];
+
+            _draftProbs = new float[maxDraftTokens + 1][];
+            for (int i = 0; i <= maxDraftTokens; i++)
+                _draftProbs[i] = new float[_vocab];
+            _verifyProbs = new float[_vocab];
+            _residualProbs = new float[_vocab];
+            _rng = new Random(42);
         }
 
         /// <summary>Reset speculative state and statistics. Does NOT touch the model's KV cache.</summary>
@@ -362,6 +393,21 @@ namespace TensorSharp.Runtime.Scheduling
         {
             Array.Clear(_pendingH);
             Stats.Reset();
+            int maxK = MaxDraftTokens;
+            if (Stats.DraftAttemptCount == null || Stats.DraftAttemptCount.Length != maxK + 1)
+            {
+                Stats.DraftAttemptCount = new int[maxK + 1];
+                Stats.DraftStopCount = new int[maxK + 1];
+                Stats.AcceptCount = new int[maxK + 1];
+                Stats.RejectCount = new int[maxK + 1];
+            }
+            else
+            {
+                Array.Clear(Stats.DraftAttemptCount);
+                Array.Clear(Stats.DraftStopCount);
+                Array.Clear(Stats.AcceptCount);
+                Array.Clear(Stats.RejectCount);
+            }
         }
 
         /// <summary>
@@ -437,10 +483,17 @@ namespace TensorSharp.Runtime.Scheduling
                 for (int i = 0; i < kMax; i++)
                 {
                     _model.MtpDraftStep(tokIn, hIn, position + i, _draftLogits, hOut);
+                    Stats.DraftAttemptCount[i]++;
                     adjustDraftLogits?.Invoke(_draftLogits, _draftTokens);
+                    // Softmax saved for rejection sampling is computed inline
+                    // in the verify loop; computing it here on every draft step
+                    // would be wasteful and may affect draft confidence timing.
                     int d = ArgmaxWithTopKConfidence(_draftLogits, _vocab, out float p);
                     if (p < MinDraftProb)
+                    {
+                        Stats.DraftStopCount[i]++;
                         break;
+                    }
                     _draftTokens.Add(d);
                     tokIn = d;
                     // Chain the MTP hidden output into the next draft step.
@@ -489,19 +542,36 @@ namespace TensorSharp.Runtime.Scheduling
             Stats.VerifyTicks += Stopwatch.GetTimestamp() - tVerify0;
 
             int m = 0;
-            int nextToken;
-            while (true)
+            int nextToken = -1;
+            while (m < k)
             {
                 Array.Copy(_verifyLogits, (long)m * _vocab, _rowLogits, 0, _vocab);
-                int drawn = drawNext(_rowLogits);
-                if (m < k && drawn == _draftTokens[m])
+                Softmax(_rowLogits, _verifyProbs, _vocab);
+
+                int d = _draftTokens[m];
+                float q = _draftProbs[m][d];
+                float p = _verifyProbs[d];
+                float pAccept = Math.Min(1.0f, p / Math.Max(q, 1e-10f));
+
+                if (_rng.NextDouble() < pAccept)
                 {
-                    onDraftAccepted?.Invoke(drawn);
+                    Stats.AcceptCount[m]++;
+                    onDraftAccepted?.Invoke(d);
                     m++;
                     continue;
                 }
-                nextToken = drawn;
+                // Rejection (Leviathan/Chen 2023): sample from residual (p_trunk - p_draft)Ôü║
+                Stats.RejectCount[m]++;
+                nextToken = SampleFromResidual(_verifyProbs, _draftProbs[m], _vocab, _rng);
                 break;
+            }
+
+            if (m >= k)
+            {
+                // All K drafts accepted ÔåÆ draw bonus token from trunk distribution
+                Array.Copy(_verifyLogits, (long)k * _vocab, _rowLogits, 0, _vocab);
+                Softmax(_rowLogits, _verifyProbs, _vocab);
+                nextToken = SampleFromDistribution(_verifyProbs, _vocab, _rng);
             }
 
             Stats.TokensDrafted += k;
@@ -511,7 +581,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 // Partial acceptance. Fast path: if the verify already persisted
                 // reusable KV for the accepted prefix (no recurrent state), just keep
-                // those writes and advance the position — the kept-prefix re-forward
+                // those writes and advance the position ÔÇö the kept-prefix re-forward
                 // is redundant (it would recompute byte-identical KV). This is the
                 // dominant rollback cost on long contexts. Otherwise roll back to the
                 // pre-verify checkpoint and re-advance over the kept prefix.
@@ -522,7 +592,7 @@ namespace TensorSharp.Runtime.Scheduling
                     _trunk.Rollback(position);
                     int[] keep = new int[m + 1];
                     Array.Copy(batch, keep, m + 1);
-                    _trunk.Forward(keep, null, _stepLogits, allLogitsRows: false);
+                    _trunk.Forward(keep, null, null, allLogitsRows: false);
                 }
                 Stats.RollbackTicks += Stopwatch.GetTimestamp() - tRoll0;
             }
@@ -564,7 +634,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>
         /// Argmax plus the top-1 probability computed over the top-10 logits
-        /// (softmax restricted to the 10 best candidates — the same confidence
+        /// (softmax restricted to the 10 best candidates ÔÇö the same confidence
         /// measure llama.cpp's draft-mtp top-k(10) sampler thresholds with p_min).
         /// </summary>
         private static int ArgmaxWithTopKConfidence(float[] logits, int vocab, out float prob)
@@ -598,6 +668,68 @@ namespace TensorSharp.Runtime.Scheduling
             }
             prob = denom > 0 ? (float)(1.0 / denom) : 0f;
             return best;
+        }
+
+        /// <summary>Numerically stable softmax in-place. Writes probability
+        /// distribution to <paramref name="probs"/>.</summary>
+        private static void Softmax(float[] logits, float[] probs, int vocab)
+        {
+            double max = double.NegativeInfinity;
+            for (int i = 0; i < vocab; i++)
+                if (logits[i] > max) max = logits[i];
+
+            double sum = 0;
+            for (int i = 0; i < vocab; i++)
+            {
+                double e = Math.Exp(logits[i] - max);
+                probs[i] = (float)e;
+                sum += e;
+            }
+
+            double inv = 1.0 / sum;
+            for (int i = 0; i < vocab; i++)
+                probs[i] = (float)(probs[i] * inv);
+        }
+
+        /// <summary>Sample an index from a normalized probability distribution
+        /// via inverse CDF (CDF walk with a <c>U(0,1)</c> uniform draw).</summary>
+        private static int SampleFromDistribution(float[] probs, int vocab, Random rng)
+        {
+            double u = rng.NextDouble();
+            double acc = 0;
+            for (int i = 0; i < vocab; i++)
+            {
+                acc += probs[i];
+                if (acc >= u - 1e-15)
+                    return i;
+            }
+            return vocab - 1;
+        }
+
+        /// <summary>Sample from the residual distribution
+        /// <c>(p - q)Ôü║ / ╬ú</c> (Leviathan/Chen 2023, Algorithm 1).
+        /// Called when a draft token is rejected.</summary>
+        private int SampleFromResidual(float[] p, float[] q, int vocab, Random rng)
+        {
+            double sum = 0;
+            for (int i = 0; i < vocab; i++)
+            {
+                float r = p[i] - q[i];
+                if (r < 0) r = 0;
+                _residualProbs[i] = r;
+                sum += r;
+            }
+            if (sum < 1e-20)
+                return SampleFromDistribution(p, vocab, rng);
+            double u = rng.NextDouble() * sum;
+            double acc = 0;
+            for (int i = 0; i < vocab; i++)
+            {
+                acc += _residualProbs[i];
+                if (acc >= u - 1e-15)
+                    return i;
+            }
+            return vocab - 1;
         }
     }
 }

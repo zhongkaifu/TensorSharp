@@ -135,7 +135,7 @@
       <tr><td><code>TS_MLX_* </code></td><td>MLX 后端调参：流水线 decode、mlock GGUF、融合 KV 写、批量 MoE decode、内存上限。</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>覆盖 <code>libmlxc</code> 的搜索路径。</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>在原生构建时跳过 / 固定 ggml 源码克隆。</td></tr>
-      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td><code>ON</code> 让原生桥接库带上 GGML Vulkan 后端（= 构建脚本 <code>--vulkan</code>）。</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td>在原生构建时强制开启/关闭 GGML Vulkan 后端（<code>ON</code>/<code>OFF</code> = 构建脚本 <code>--vulkan</code>/<code>--no-vulkan</code>）。检测到 Vulkan 运行时时自动启用；显式选择会在重复构建中保持。</td></tr>
     </tbody>
   </table>
   </div>

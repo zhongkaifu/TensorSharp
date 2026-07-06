@@ -48,7 +48,7 @@ namespace TensorSharp.Cuda
     {
         private const int DecodeAttentionPartitionSize = 512;
         private const int DecodeAttentionPartitionThreshold = 2048;
-        private const int DecodeAttentionSingleBlockMaxTokens = 8192;
+        internal const int DecodeAttentionSingleBlockMaxTokens = 8192;
 
         public static bool TryFill(Tensor result, float value)
         {
@@ -1157,7 +1157,7 @@ namespace TensorSharp.Cuda
             return true;
         }
 
-        private static bool TryLaunchPartitionedGqaDecodeAttention(
+        internal static bool TryLaunchPartitionedGqaDecodeAttention(
             CudaKernels kernels,
             CudaAllocator allocator,
             IntPtr queryPtr,
@@ -1603,6 +1603,55 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool TryQKNormRopeNeox(
+            Tensor data,
+            Tensor alpha,
+            Tensor positions,
+            int rows,
+            int cols,
+            int ropeHalf,
+            float eps,
+            float ropeBase,
+            float ropeFreqScale)
+        {
+            if (!TryGetContiguousFloat(data, out CudaStorage dataStorage, out IntPtr dataPtr, out int dataCount) ||
+                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
+                !TryGetContiguous(positions, out CudaStorage posStorage, out IntPtr posPtr, out long posCount) ||
+                rows <= 0 ||
+                cols <= 0 ||
+                ropeHalf <= 0 ||
+                ropeHalf * 2 > cols ||
+                dataCount != checked(rows * cols) ||
+                alphaCount != cols ||
+                posCount != rows ||
+                positions.ElementType != DType.Int32)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = dataStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            dataStorage.EnsureDeviceCurrent();
+            alphaStorage.EnsureDeviceCurrent();
+            posStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchQKNormRopeNeoxF32(
+                dataPtr,
+                alphaPtr,
+                posPtr,
+                rows,
+                cols,
+                ropeHalf,
+                eps,
+                ropeBase,
+                ropeFreqScale,
+                allocator.Stream.Handle);
+            dataStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryIndexSelect(Tensor result, Tensor src, Tensor indices, bool isAdd)
         {
             if (!TryGetContiguousRows(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int rows, out int cols) ||
@@ -1843,6 +1892,73 @@ namespace TensorSharp.Cuda
                 convKernel,
                 convWriteIdx,
                 eps,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            convStateStorage.MarkDeviceModified();
+            ssmStateStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryQwen35GdnFused(
+            Tensor result,
+            Tensor qkv, Tensor z, Tensor beta, Tensor alpha,
+            Tensor convState, Tensor ssmState, Tensor convWeight,
+            Tensor dtBias, Tensor aLog, Tensor ssmNorm,
+            int seqLen, int qkvDim, int zDim, int qkDim, int vDim,
+            int numKHeads, int numVHeads, int headKDim, int headVDim,
+            int convKernel, int convWriteIdx, float eps)
+        {
+            int convDim = convKernel - 1;
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloat(qkv, out CudaStorage qkvStorage, out IntPtr qkvPtr, out int qkvCount) ||
+                !TryGetContiguousFloat(z, out CudaStorage zStorage, out IntPtr zPtr, out int zCount) ||
+                !TryGetContiguousFloat(beta, out CudaStorage betaStorage, out IntPtr betaPtr, out int betaCount) ||
+                !TryGetContiguousFloat(alpha, out CudaStorage alphaStorage, out IntPtr alphaPtr, out int alphaCount) ||
+                !TryGetContiguousFloat(convState, out CudaStorage convStateStorage, out IntPtr convStatePtr, out int convStateCount) ||
+                !TryGetContiguousFloat(ssmState, out CudaStorage ssmStateStorage, out IntPtr ssmStatePtr, out int ssmStateCount) ||
+                !TryGetContiguousFloat(convWeight, out CudaStorage convWeightStorage, out IntPtr convWeightPtr, out int convWeightCount) ||
+                !TryGetContiguousFloat(dtBias, out CudaStorage dtBiasStorage, out IntPtr dtBiasPtr, out int dtBiasCount) ||
+                !TryGetContiguousFloat(aLog, out CudaStorage aLogStorage, out IntPtr aLogPtr, out int aLogCount) ||
+                !TryGetContiguousFloat(ssmNorm, out CudaStorage ssmNormStorage, out IntPtr ssmNormPtr, out int ssmNormCount) ||
+                seqLen <= 0 || qkvDim <= 0 || zDim <= 0 || qkDim <= 0 || vDim <= 0 ||
+                numKHeads <= 0 || numVHeads <= 0 || headKDim <= 0 || headVDim <= 0 ||
+                convKernel <= 0 || convDim <= 0 || convWriteIdx < 0 || convWriteIdx >= convDim ||
+                eps <= 0.0f ||
+                qkDim != checked(numKHeads * headKDim) ||
+                vDim != checked(numVHeads * headVDim) ||
+                qkvDim != checked(2 * qkDim + vDim) ||
+                result.DimensionCount != 2 || result.Sizes[0] != seqLen || result.Sizes[1] != vDim ||
+                resultCount != checked(seqLen * vDim) ||
+                qkvCount != checked(seqLen * qkvDim) ||
+                zCount != checked(seqLen * zDim) ||
+                betaCount != checked(seqLen * numVHeads) ||
+                alphaCount != checked(seqLen * numVHeads) ||
+                convStateCount != checked(convDim * qkvDim) ||
+                ssmStateCount != checked(numVHeads * headVDim * headKDim) ||
+                convWeightCount != checked(qkvDim * convKernel) ||
+                dtBiasCount < numVHeads || aLogCount < numVHeads || ssmNormCount < headVDim)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            qkvStorage.EnsureDeviceCurrent(); zStorage.EnsureDeviceCurrent();
+            betaStorage.EnsureDeviceCurrent(); alphaStorage.EnsureDeviceCurrent();
+            convStateStorage.EnsureDeviceCurrent(); ssmStateStorage.EnsureDeviceCurrent();
+            convWeightStorage.EnsureDeviceCurrent(); dtBiasStorage.EnsureDeviceCurrent();
+            aLogStorage.EnsureDeviceCurrent(); ssmNormStorage.EnsureDeviceCurrent();
+
+            allocator.Context.MakeCurrent();
+            kernels.LaunchQwen35GdnFusedF32(
+                qkvPtr, zPtr, betaPtr, alphaPtr,
+                convStatePtr, ssmStatePtr, convWeightPtr,
+                dtBiasPtr, aLogPtr, ssmNormPtr, resultPtr,
+                seqLen, qkvDim, zDim, qkDim, vDim,
+                numKHeads, numVHeads, headKDim, headVDim,
+                convKernel, convWriteIdx, eps,
                 allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
             convStateStorage.MarkDeviceModified();

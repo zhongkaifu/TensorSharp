@@ -156,7 +156,7 @@ namespace TensorSharp.Models
         // _moeBatchedDown: [K, hidden]
         // _moeBatchedExpertIndices: [K] int32 (device-side topK)
         // _moeBatchedRouteWeights: [1, K] float32 (device-side routing
-        //     weights — used as the LHS of the final matmul that turns
+        //     weights ÔÇö used as the LHS of the final matmul that turns
         //     [K, hidden] expert outputs into a single [1, hidden]).
         // All allocated lazily on first use; reused across all calls.
         private Tensor _moeBatchedGate;
@@ -205,7 +205,7 @@ namespace TensorSharp.Models
             // The fused per-layer attention decode kernel folds 6 small
             // CPU-side ops into a single Metal graph dispatch. omlx/vllm
             // both use the equivalent (mx.fast.scaled_dot_product_attention)
-            // unconditionally — the per-call setup cost is amortised even
+            // unconditionally ÔÇö the per-call setup cost is amortised even
             // at small KV lengths once the rest of the model is on-device.
             return 1;
         }
@@ -216,7 +216,7 @@ namespace TensorSharp.Models
             if (!string.IsNullOrWhiteSpace(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
             // Always prefer the Metal flash-attention kernel for MLX
-            // decode — see omlx/mlx-lm which dispatches
+            // decode ÔÇö see omlx/mlx-lm which dispatches
             // mx.fast.scaled_dot_product_attention for every step.
             return 1;
         }
@@ -316,9 +316,9 @@ namespace TensorSharp.Models
         // the start of each call; missing/null means use plain scalar RoPE.
         // Per-pair modality assignment (which (T,H,W) axis drives which rotary
         // pair) is precomputed once in PrecomputeMRoPEInterleavedIds from
-        // _mropeSections — vLLM mrope_interleaved.py's get_mrope_interleaved_id_list.
+        // _mropeSections ÔÇö vLLM mrope_interleaved.py's get_mrope_interleaved_id_list.
         private int[] _pendingMRoPEPositions;
-        private int[] _mropeInterleavedIds; // length rotary_dim/2; values ∈ {0=T,1=H,2=W}
+        private int[] _mropeInterleavedIds; // length rotary_dim/2; values Ôêê {0=T,1=H,2=W}
 
         // (GDN scratch buffers, chunked-prefill staging, and timing counters live in
         // Qwen35Model.GatedDeltaNet.cs.)
@@ -336,7 +336,7 @@ namespace TensorSharp.Models
 
         // QWEN35_DECODE_PROFILE=1: bucket the per-decode-token time into
         // attention/MoE/norm/lm-head/sync so we can attack the dominant
-        // bucket. Adds a Stopwatch.GetTimestamp per layer; ~0.05 μs each,
+        // bucket. Adds a Stopwatch.GetTimestamp per layer; ~0.05 ╬╝s each,
         // negligible at decode rates.
         private static readonly bool _profileDecodeStages =
             string.Equals(Environment.GetEnvironmentVariable("QWEN35_DECODE_PROFILE"), "1", StringComparison.Ordinal);
@@ -417,7 +417,7 @@ namespace TensorSharp.Models
 
             // Determine which layers are recurrent (GatedDeltaNet) vs full-attention.
             // Prefer an explicit GGUF `layer_types` array if present (vLLM reads
-            // `config.layer_types[i]` ∈ {"linear_attention","full_attention"} at
+            // `config.layer_types[i]` Ôêê {"linear_attention","full_attention"} at
             // qwen3_5.py:230; future fine-tunes can ship a non-default pattern).
             // Fall back to the period-`full_attention_interval` pattern that stock
             // 27B/35B-A3B GGUFs use (no layer_types array shipped).
@@ -487,7 +487,7 @@ namespace TensorSharp.Models
                     continue;
 
                 string prefix = $"blk.{layer}.";
-                if (TryFuseWeights(prefix + "attn_qkv.weight",
+                if (TryFuseWeights(prefix + "attn_qkv.weight", keepSources: false,
                     prefix + "attn_q.weight",
                     prefix + "attn_k.weight",
                     prefix + "attn_v.weight"))
@@ -509,7 +509,7 @@ namespace TensorSharp.Models
                     continue;
 
                 string prefix = $"blk.{layer}.";
-                if (TryFuseWeights(prefix + "ssm_in_proj.weight",
+                if (TryFuseWeights(prefix + "ssm_in_proj.weight", keepSources: true,
                     prefix + "attn_qkv.weight",
                     prefix + "attn_gate.weight",
                     prefix + "ssm_beta.weight",
@@ -523,7 +523,7 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Fused projections: {fused} recurrent input packs");
         }
 
-        private unsafe bool TryFuseWeights(string fusedName, params string[] weightNames)
+        private unsafe bool TryFuseWeights(string fusedName, bool keepSources, params string[] weightNames)
         {
             if (weightNames == null || weightNames.Length < 2)
                 return false;
@@ -558,14 +558,16 @@ namespace TensorSharp.Models
                     return false;
 
                 _quantWeights[fusedName] = fusedWeight;
-                for (int i = 0; i < weightNames.Length; i++)
+                if (!keepSources)
                 {
-                    var name = weightNames[i];
-                    var qw = quantWeights[i];
-                    _quantWeights.Remove(name);
-                    qw.Dispose();
+                    for (int i = 0; i < weightNames.Length; i++)
+                    {
+                        var name = weightNames[i];
+                        var qw = quantWeights[i];
+                        _quantWeights.Remove(name);
+                        qw.Dispose();
+                    }
                 }
-
                 return true;
             }
 
@@ -983,7 +985,7 @@ namespace TensorSharp.Models
         /// On <c>ggml_cuda</c> the MoE decode/prefill read the experts exclusively
         /// through the per-layer STACKED expert device buffer (one device copy per
         /// <c>*_exps</c> tensor, cached on first use). Preloading each per-expert
-        /// split view as well would put a SECOND full copy of every expert in VRAM —
+        /// split view as well would put a SECOND full copy of every expert in VRAM ÔÇö
         /// for the 35B-A3B that is an extra ~10 GB, which overflows the 16 GB card
         /// into shared GPU memory (WDDM paging) and tanks decode speed. Skip the
         /// per-expert members; their host views stay mapped so the rare per-op
@@ -1277,33 +1279,6 @@ namespace TensorSharp.Models
             return 2048;
         }
 
-        // Micro-batch cap for the whole-model fused prefill (TSGgml_Qwen35ModelVerify),
-        // the analogue of llama.cpp's n_ubatch. The verify graph's activation scratch
-        // costs ~1.8 MB per prompt token on the 35B-A3B, and it lands in the shared
-        // reuse gallocr, which only ever GROWS (it lives for the backend's lifetime).
-        // One long prompt fed as a single graph (e.g. 3.2k tokens -> 5.7 GB scratch)
-        // pushes total VRAM past the card and WDDM demotes resident buffers to shared
-        // system memory — permanently, so EVERY later prefill and decode runs partly
-        // over PCIe (~3.5x collapse across the whole server until restart). Splitting
-        // prefill into sub-chunks bounds the scratch at the ubatch peak instead of
-        // scaling with prompt length. 0 disables the cap.
-        private int ResolvePrefillVerifyUbatch()
-        {
-            string env = Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_UBATCH");
-            if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v >= 0)
-                return v;
-            // Vulkan has a sharper VRAM cliff than CUDA: the reuse gallocr grows to the
-            // ubatch peak and, once it exceeds the card, WDDM demotes it permanently to
-            // shared memory. On a 16 GB card with the 27B (~9 GB weights) a 1024-token
-            // chunk spills hard (pp2048 358->104, pp4096 345->83 tok/s). 768 stays
-            // resident with a clear margin at every length (pp512/2048/4096 = 368/358/345,
-            // matching llama.cpp's 360/352/344); 512 is safe too but its extra chunks add
-            // per-chunk overhead at long prompts (pp4096 only 215). The MoE-activation
-            // peak scales with the ubatch, not the prompt length (KV is pre-allocated), so
-            // 768's headroom holds across contexts. CUDA keeps 1024 (more headroom).
-            return _backend == BackendType.GgmlVulkan ? 768 : 1024;
-        }
-
         // Gates the whole-model fused prefill path (TSGgml_Qwen35ModelVerify, one
         // GGML graph for all layers). Default on; TS_QWEN35_PREFILL_VERIFY=0 forces
         // the per-op layer loop for A/B comparison.
@@ -1316,23 +1291,13 @@ namespace TensorSharp.Models
         /// (start_pos..+N) and a pure causal mask, so it is correct only when there
         /// are no multimodal spans / custom MRoPE positions. Capacity (start_pos +
         /// seqLen &lt;= cacheSize) and weight/shape support are re-checked inside
-        /// <see cref="TryFullModelVerify"/>, which bails (→ per-op fallback) otherwise.
+        /// <see cref="TryFullModelVerify"/>, which bails (ÔåÆ per-op fallback) otherwise.
         /// </summary>
         private bool CanUsePrefillVerify(int startPos, int seqLen)
         {
             if (!_prefillVerifyEnabled || _fvUnsupported) return false;
-            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan) || seqLen <= 1) return false;
-            // Vision embeddings must already be injected into the hidden tensor
-            // (Forward injects before the verify branch and clears the list).
-            if (_visionEmbeddingsList.Count > 0) return false;
-            // Multimodal prompts are supported: per-axis MRoPE positions route the
-            // kernel's RoPE through ggml_rope_multi (interleaved MRoPE) using the
-            // GGUF's mrope sections. Bail only when the positions/sections can't
-            // drive that path (per-op ApplyMRoPEPrefill handles those).
-            if (_pendingMRoPEPositions != null
-                && (_mropeSections == null || _mropeSections.Length < 4
-                    || _pendingMRoPEPositions.Length < 3 * seqLen))
-                return false;
+            if (_backend != BackendType.GgmlCuda || seqLen <= 1) return false;
+            if (_visionEmbeddingsList.Count > 0 || _pendingMRoPEPositions != null) return false;
             if (_headKDim != _headVDim) return false;
             return true;
         }
@@ -1386,7 +1351,7 @@ namespace TensorSharp.Models
                 _prefillEmbedTicks += embEnd - t1;
 
             // Whole-model fused prefill chunk (same path as Forward, but the logits
-            // are discarded — this is an interior chunk). KV + GDN state are written
+            // are discarded ÔÇö this is an interior chunk). KV + GDN state are written
             // on-device; the next chunk / decode reads the committed state. Carries
             // across chunks exactly like the per-op loop (the kernel attends over the
             // full [0, startPos+seqLen) cache and reads the committed GDN ring).
@@ -1394,7 +1359,7 @@ namespace TensorSharp.Models
             {
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
-                if (TryFullModelVerifyPrefill(hidden, startPos, seqLen, _logitsBuffer))
+                if (TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
                 {
                     hidden.Dispose();
                     _cacheSeqLen += seqLen;
@@ -1479,11 +1444,11 @@ namespace TensorSharp.Models
             // MoE + final-norm + last-token lm_head) for all N prompt tokens as ONE
             // fused GGML graph (TSGgml_Qwen35ModelVerify with nLogitRows=1), writing
             // KV + GDN state on-device. This replaces the per-layer dispatch loop
-            // whose host round-trip per op keeps the GPU mostly idle — the dominant
+            // whose host round-trip per op keeps the GPU mostly idle ÔÇö the dominant
             // CUDA prefill cost. Mirrors Gemma4's whole-model prefill-verify routing.
             // Text-only (no multimodal MRoPE); long prompts chunk via ForwardRefill.
             if (seqLen > 1 && CanUsePrefillVerify(startPos, seqLen)
-                && TryFullModelVerifyPrefill(hidden, startPos, seqLen, _logitsBuffer))
+                && TryFullModelVerify(hidden, startPos, seqLen, normedOut: null, logitsOut: _logitsBuffer, nLogitRows: 1))
             {
                 // _logitsBuffer holds the LAST token's logits; KV + GDN state were
                 // committed (host ring) by the kernel. Re-seed the device-resident
@@ -1594,7 +1559,7 @@ namespace TensorSharp.Models
         // Standard Forward(int[] tokens) issues all 60 layers + the LM head
         // and then host-syncs the 200K-float logits tensor before returning.
         // The sync drains all queued MLX kernels, costing ~8 ms/token on MLX
-        // (Qwen3.6-35B-A3B IQ2_XXS) — pure GPU-idle wait from the host's
+        // (Qwen3.6-35B-A3B IQ2_XXS) ÔÇö pure GPU-idle wait from the host's
         // perspective.
         //
         // The pipelined API lets the CLI inference loop kick off forward N+1
@@ -1666,7 +1631,7 @@ namespace TensorSharp.Models
             lastNormed.Dispose();
             _lmHeadTicks += Stopwatch.GetTimestamp() - lmT0;
 
-            // Device argmax → [1] int32. Falls back to host argmax if MLX
+            // Device argmax ÔåÆ [1] int32. Falls back to host argmax if MLX
             // path fails (e.g. non-MLX backend or unsupported dtype).
             var deviceToken = new Tensor(_allocator, DType.Int32, 1);
             if (!MlxFusedOps.TryArgMaxLastAxis(deviceToken, logitsTensor))
@@ -1745,7 +1710,7 @@ namespace TensorSharp.Models
             }
 
             // F32 token_embd path: use Ops.IndexSelect if supported on MLX.
-            // Most quantized models won't hit this — left as a TODO so we
+            // Most quantized models won't hit this ÔÇö left as a TODO so we
             // fall back to host path until/unless someone tests it.
             return false;
         }
@@ -2040,40 +2005,68 @@ namespace TensorSharp.Models
             qFull.Dispose();
             if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnDeinterleaveTicks += now - stageStart; stageStart = now; }
 
-            qTensor = ApplyQKNormCached(qTensor, _attnQNormW[layer], numHeads, seqLen);
-            kTensor = ApplyQKNormCached(kTensor, _attnKNormW[layer], numKVHeads, seqLen);
-            if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnQknormTicks += now - stageStart; stageStart = now; }
-
-            // RoPE - decode path applies Q and K together so the cos/sin table is computed once.
-            // If the multimodal injector has staged per-axis MRoPE positions for
-            // this prefill (vision prompt on Qwen3.5), route through ApplyMRoPEPrefill
-            // so image-region rotary dims get the right (T,H,W) angle interleaving.
-            // Text-only prompts and post-image decode tokens use the scalar path.
+            // Fused QK-RMSNorm + NeoX RoPE path: on CUDA backend without MRoPE,
+            // fuse the per-head RMSNorm and RoPE into a single kernel per Q/K tensor.
+            // This eliminates 2-4 separate kernel launches (2x RMSNorm + 2x RoPE)
+            // and the intermediate global memory writes of the normalized tensors.
             bool useMRoPE = _pendingMRoPEPositions != null && _pendingMRoPEPositions.Length >= 3 * seqLen;
-            if (useMRoPE)
+            bool fusedNormRopeApplied = false;
+            // TS_FUSED_QKNORM_ROPE=0 disables the fused path. Default: ON (lookup-table optimized).
+            bool fusedEnabled = !string.Equals(Environment.GetEnvironmentVariable("TS_FUSED_QKNORM_ROPE"), "0", StringComparison.Ordinal);
+            if (fusedEnabled && _backend == BackendType.Cuda && !useMRoPE)
             {
-                qTensor = ApplyMRoPEPrefill(qTensor, numHeads, seqLen, _pendingMRoPEPositions);
-                kTensor = ApplyMRoPEPrefill(kTensor, numKVHeads, seqLen, _pendingMRoPEPositions);
+                int ropeDim = _ropeDimCount > 0 ? _ropeDimCount : headDim;
+                int ropeHalf = ropeDim / 2;
+                int qRows = seqLen * numHeads;
+                int kRows = seqLen * numKVHeads;
+
+                Tensor qPosTensor = EnsureRoPEPositions(startPos, seqLen, numHeads);
+                Tensor kPosTensor = numHeads == numKVHeads
+                    ? qPosTensor
+                    : EnsureRoPEPositions(startPos, seqLen, numKVHeads);
+
+                bool qOk = CudaFusedOps.TryQKNormRopeNeox(
+                    qTensor, _attnQNormW[layer], qPosTensor,
+                    qRows, headDim, ropeHalf, Config.Eps,
+                    Config.RopeBase, 1.0f / Config.RopeScale);
+
+                bool kOk = qOk && CudaFusedOps.TryQKNormRopeNeox(
+                    kTensor, _attnKNormW[layer], kPosTensor,
+                    kRows, headDim, ropeHalf, Config.Eps,
+                    Config.RopeBase, 1.0f / Config.RopeScale);
+
+                fusedNormRopeApplied = qOk && kOk;
             }
-            else if (seqLen == 1)
+
+            if (!fusedNormRopeApplied)
             {
-                // The in-place CPU RoPE reads Q/K to the host (a draining sync on
-                // MLX/CUDA). Those backends use the on-device prefill RoPE instead so
-                // the whole attention block stays resident on the GPU.
-                if (_backend == BackendType.Mlx || _backend == BackendType.Cuda)
+                // Separate RMSNorm + RoPE path (non-CUDA or fused fallback).
+                qTensor = ApplyQKNormCached(qTensor, _attnQNormW[layer], numHeads, seqLen);
+                kTensor = ApplyQKNormCached(kTensor, _attnKNormW[layer], numKVHeads, seqLen);
+                if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnQknormTicks += now - stageStart; stageStart = now; }
+
+                if (useMRoPE)
+                {
+                    qTensor = ApplyMRoPEPrefill(qTensor, numHeads, seqLen, _pendingMRoPEPositions);
+                    kTensor = ApplyMRoPEPrefill(kTensor, numKVHeads, seqLen, _pendingMRoPEPositions);
+                }
+                else if (seqLen == 1)
+                {
+                    if (_backend == BackendType.Mlx || _backend == BackendType.Cuda)
+                    {
+                        qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
+                        kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
+                    }
+                    else
+                    {
+                        ApplyRoPEDecodeQKInPlace(qTensor, kTensor, numHeads, numKVHeads, startPos);
+                    }
+                }
+                else
                 {
                     qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
                     kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
                 }
-                else
-                {
-                    ApplyRoPEDecodeQKInPlace(qTensor, kTensor, numHeads, numKVHeads, startPos);
-                }
-            }
-            else
-            {
-                qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
-                kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
             }
             if (profilePrefill) { long now = Stopwatch.GetTimestamp(); _prefillAttnRopeTicks += now - stageStart; stageStart = now; }
 
@@ -2145,7 +2138,7 @@ namespace TensorSharp.Models
                     // the (head-first) KV cache in place. The legacy AttentionDecodePureCS
                     // path copies the whole allocated cache to the host every layer (a 4 MB
                     // DtoH that drains the pipeline 16x per token) and computes attention on
-                    // the CPU — by far the dominant per-token stall on the cuda backend.
+                    // the CPU ÔÇö by far the dominant per-token stall on the cuda backend.
                     bool cudaAttn = _backend == BackendType.Cuda &&
                         CudaFusedOps.TryGqaDecodeAttention(
                             attnOutput, qTensor, _kvCacheK[layer], _kvCacheV[layer],
@@ -2171,7 +2164,7 @@ namespace TensorSharp.Models
 
                 if (profilePrefill) { long now2 = Stopwatch.GetTimestamp(); _prefillAttnExpandKvTicks += now2 - stageStart; stageStart = now2; }
 
-                // Fused GPU attention: Q*K^T → causal mask → softmax → *V in one
+                // Fused GPU attention: Q*K^T ÔåÆ causal mask ÔåÆ softmax ÔåÆ *V in one
                 // GGML graph dispatch, eliminating ExpandKVHeads + 5 separate ops.
                 //
                 // FusedPrefillAttention is F32-only on the native side. The continuation
@@ -2984,7 +2977,7 @@ namespace TensorSharp.Models
             if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32)
                 return false;
 
-            // Skip gated-delta-net (recurrent) layers — they go through their
+            // Skip gated-delta-net (recurrent) layers ÔÇö they go through their
             // own kernel path entirely.
             if (_isRecurrent != null && _isRecurrent[layer]) return false;
 
@@ -3117,7 +3110,7 @@ namespace TensorSharp.Models
 
             // Decode (seqLen==1): the CPU path is faster per call for tiny
             // tensors, but on MLX every GetFloatPtr forces an mlx_eval +
-            // device→host copy. With 4 syncs/attn-layer × 60 layers that's a
+            // deviceÔåÆhost copy. With 4 syncs/attn-layer ├ù 60 layers that's a
             // lot of round trips, so stay on device for MLX. Other backends
             // keep the CPU SIMD fast path which saves 2 GPU dispatches.
             // CPU SIMD norm avoids a GPU dispatch for tiny decode tensors, but on
@@ -3247,6 +3240,29 @@ namespace TensorSharp.Models
             return data;
         }
 
+        /// <summary>
+        /// Returns a cached int32 position tensor [seqLen * numHeads] for the CUDA
+        /// fused QK-RMSNorm + RoPE kernel.  Positions are laid out as
+        /// [startPos, startPos, ..., startPos+1, startPos+1, ...] ÔÇö each position
+        /// repeated numHeads times so row r maps to position startPos + (r / numHeads).
+        /// </summary>
+        private Tensor EnsureRoPEPositions(int startPos, int seqLen, int numHeads)
+        {
+            int totalRows = seqLen * numHeads;
+            if (_cachedRoPEPosSeqLen == seqLen && _cachedRoPEPosStartPos == startPos)
+            {
+                bool isQ = numHeads == Config.NumHeads;
+                Tensor cached = isQ ? _cachedRoPEPosQ : _cachedRoPEPosK;
+                if (cached != null && (int)cached.Sizes[0] == totalRows)
+                    return cached;
+            }
+            int[] positions = new int[totalRows];
+            for (int s = 0; s < seqLen; s++)
+                for (int h = 0; h < numHeads; h++)
+                    positions[s * numHeads + h] = startPos + s;
+            return CreateIntTensor(positions, totalRows);
+        }
+
         /// <summary>Set the per-axis (T,H,W) positions for the next prefill
         /// call. Length must equal 3 * seqLen of the upcoming Forward(). Called
         /// by ModelMultimodalInjector.QueuePromptEmbeddingsForSlice when an
@@ -3259,7 +3275,7 @@ namespace TensorSharp.Models
         /// <summary>Build the per-pair modality assignment from `_mropeSections`
         /// using vLLM's get_mrope_interleaved_id_list algorithm (see
         /// mrope_interleaved.py:138-185). Result: int[rotary_dim/2] where
-        /// each entry ∈ {0=T, 1=H, 2=W}. Called lazily on first MRoPE-prefill.</summary>
+        /// each entry Ôêê {0=T, 1=H, 2=W}. Called lazily on first MRoPE-prefill.</summary>
         private void PrecomputeMRoPEInterleavedIds()
         {
             int ropeDim = _ropeDimCount > 0 ? _ropeDimCount : Config.HeadDim;
@@ -3759,8 +3775,8 @@ namespace TensorSharp.Models
             // Batched per-layer expert dispatch. Uploads routedTokenRows /
             // routedWeights once, gathers all routes into a single
             // [totalRoutes, hidden] tensor, then narrow-views that buffer
-            // per expert. Per-expert work reduces to: narrow → matmul
-            // (gate/up) → SiLUMul → matmul (down) → scatter-add with
+            // per expert. Per-expert work reduces to: narrow ÔåÆ matmul
+            // (gate/up) ÔåÆ SiLUMul ÔåÆ matmul (down) ÔåÆ scatter-add with
             // narrow-views of the layer-wide indices/weights tensors.
             // Each narrow is a free view (shares storage, just adjusts
             // offset/sizes).
@@ -3929,13 +3945,13 @@ namespace TensorSharp.Models
             // ggml_mul_mat_id dispatch per projection against the DEVICE-RESIDENT
             // stacked expert weights (GgmlBasicOps.MoEFFNPrefill), instead of the
             // per-expert ExpertLinearForwardAlloc loop below. That loop re-streams
-            // each selected expert's quantized weight from host every step — and
+            // each selected expert's quantized weight from host every step ÔÇö and
             // the stacked-MoE VRAM fix (ShouldPreloadCudaQuantWeightToDevice)
             // deliberately makes per-expert weights NON-resident, so on ggml_cuda
             // it is catastrophically slow (the N>=2 batched decode "deadlock":
             // ~K*3*numLayers host->device weight uploads per token). The stacked
             // weights ARE device-resident, so this dispatch amortizes the weight
-            // read across all tokens — the vLLM-style batched MoE. Handles decode
+            // read across all tokens ÔÇö the vLLM-style batched MoE. Handles decode
             // (seqLen==1/N) and prefill chunks uniformly.
             if (IsGgmlBackend
                 && _layerStackedGate != null && _layerStackedGate[layer] != null
@@ -4008,7 +4024,7 @@ namespace TensorSharp.Models
 
             // For the mlxDecodeOnDevice path we already zeroed `output` on
             // device above; re-syncing it to host here would force a
-            // device→host copy and discard that work. Likewise `input` only
+            // deviceÔåÆhost copy and discard that work. Likewise `input` only
             // needs a host pointer if a downstream code path (shared expert
             // gate scalar / legacy outRow accumulate) actually reads it.
             float* inputPtr = null;
@@ -4043,7 +4059,7 @@ namespace TensorSharp.Models
 
             // Prefill batched-by-expert path: group tokens by expert assignment
             // and run batched matmuls instead of per-token dispatches.
-            // Converts seqLen*numExpertsUsed individual matmuls → numExperts batched matmuls.
+            // Converts seqLen*numExpertsUsed individual matmuls ÔåÆ numExperts batched matmuls.
             if (seqLen > 1 && _expertGateQW != null && _expertGateQW[layer] != null)
             {
                 // 1. Route all tokens and group by expert
@@ -4076,7 +4092,7 @@ namespace TensorSharp.Models
                         Buffer.MemoryCopy(inputPtr + (long)batch[b].tokenIdx * hiddenSize,
                             batchPtr + (long)b * hiddenSize, rowBytes, rowBytes);
 
-                    // Batched expert FFN: gate → up → SiLU*up → down
+                    // Batched expert FFN: gate ÔåÆ up ÔåÆ SiLU*up ÔåÆ down
                     Tensor gate = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 0);
                     Tensor up = ExpertLinearForwardAlloc(batchInput, layer, e, kind: 1);
                     batchInput.Dispose();
@@ -4240,7 +4256,7 @@ namespace TensorSharp.Models
             // where gate/up are IQ2_XXS but down is IQ2_S) are fully supported. The
             // old all-types-must-match guard forced every such model onto the
             // per-expert ExpertLinearForwardAlloc loop, which re-streams every routed
-            // expert's NON-resident quantized weight from host each forward — the
+            // expert's NON-resident quantized weight from host each forward ÔÇö the
             // dominant (~18 s/forward, seqLen-independent) prefill cost on ggml_cuda.
             if (gateW.PerExpertNe0 != hiddenSize || upW.PerExpertNe0 != hiddenSize
                 || upW.PerExpertNe1 != intermediate
@@ -4334,8 +4350,8 @@ namespace TensorSharp.Models
         // MLX-only decode helper: keep all expert accumulation on the GPU.
         // The legacy RunMoEExpertsReused path issues 3 matmuls + SiLUMul per
         // expert and then calls GetFloatPtr+VecScaleAdd, which forces an
-        // mlx_eval+device→host sync after every expert. With 8 active
-        // experts × 60 MoE layers that's ~480 round trips per decode token.
+        // mlx_eval+deviceÔåÆhost sync after every expert. With 8 active
+        // experts ├ù 60 MoE layers that's ~480 round trips per decode token.
         //
         // Two on-device variants:
         //  - Batched: a single custom Metal kernel processes all K active
@@ -4343,7 +4359,7 @@ namespace TensorSharp.Models
         //    dispatch each. Requires a per-quant-type batched MoE kernel
         //    (currently only IQ2_XXS). Saves K-1 dispatches per matmul:
         //    on Qwen3.5 with K=8 that's ~21 dispatches saved per MoE
-        //    layer (was 24 individual matmuls + 8 SiLUMul + 8 AddScaled →
+        //    layer (was 24 individual matmuls + 8 SiLUMul + 8 AddScaled ÔåÆ
         //    now 3 batched matmuls + 1 SiLUMul + 1 routeW@down matmul).
         //  - Sequential (fallback): per-expert matmul loop with the
         //    fused AddScaled accumulator. Used when no batched kernel
@@ -4373,12 +4389,12 @@ namespace TensorSharp.Models
 
         // Decode-only MoEForward that does the routing on-device. Skips
         // the per-MoE-layer host sync on routerLogits/routerData by:
-        //   1. Running the top-K + softmax of routerLogits on device →
+        //   1. Running the top-K + softmax of routerLogits on device ÔåÆ
         //      _moeBatchedExpertIndices [K] int32, _moeBatchedRouteWeights
         //      [1, K] float32.
         //   2. Running the batched MoE matmul using those device tensors.
         //   3. Adding the shared expert contribution if applicable
-        //      (no host-side gate scalar — only used when there's no
+        //      (no host-side gate scalar ÔÇö only used when there's no
         //      shared-expert gate, asserted by the caller).
         // Returns null on precondition failure so the caller can fall
         // through to the host-routing path.
@@ -4450,7 +4466,7 @@ namespace TensorSharp.Models
                     return null;
                 }
 
-                // 5. Shared expert add (no host scalar — the gate-less
+                // 5. Shared expert add (no host scalar ÔÇö the gate-less
                 //    path just adds the full shared down).
                 if (sharedDownAll != null)
                 {
@@ -4578,7 +4594,7 @@ namespace TensorSharp.Models
                 }
                 if (!fusedOk)
                 {
-                    // 1. Batched gate matmul: [1, hidden] @ stackedGate → [K, intermediate]
+                    // 1. Batched gate matmul: [1, hidden] @ stackedGate ÔåÆ [K, intermediate]
                     if (!MlxQuantizedOps.TryMoeMatmulBatched(
                             _moeBatchedGate, tokenInput, _moeBatchedExpertIndices,
                             gateW.Data, gateW.Data, gateW.GgmlType,
@@ -4586,7 +4602,7 @@ namespace TensorSharp.Models
                             sharedInput: true))
                         return false;
 
-                    // 2. Batched up matmul: same input → [K, intermediate]
+                    // 2. Batched up matmul: same input ÔåÆ [K, intermediate]
                     if (!MlxQuantizedOps.TryMoeMatmulBatched(
                             _moeBatchedUp, tokenInput, _moeBatchedExpertIndices,
                             upW.Data, upW.Data, upW.GgmlType,
@@ -4598,7 +4614,7 @@ namespace TensorSharp.Models
                     Ops.SiLUMul(_moeBatchedGate, _moeBatchedGate, _moeBatchedUp);
                 }
 
-                // 4. Batched down matmul: [K, intermediate] @ stackedDown → [K, hidden]
+                // 4. Batched down matmul: [K, intermediate] @ stackedDown ÔåÆ [K, hidden]
                 if (!MlxQuantizedOps.TryMoeMatmulBatched(
                         _moeBatchedDown, _moeBatchedGate, _moeBatchedExpertIndices,
                         downW.Data, downW.Data, downW.GgmlType,
@@ -4622,7 +4638,7 @@ namespace TensorSharp.Models
         // mlx_compile path enabled this is ONE fused Metal kernel via
         // MlxFusedOps.TryAddScaledInPlace; otherwise we fall back to
         // mulv + addt (2 kernels). The fallback variant is destructive on
-        // `src` — _moeDownBuf is rewritten next iteration by the next
+        // `src` ÔÇö _moeDownBuf is rewritten next iteration by the next
         // expert's down matmul anyway, so this is safe in the decode loop.
         private void AddScaledTensorMlx(Tensor output, Tensor src, float scalar)
         {

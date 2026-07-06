@@ -25,7 +25,7 @@ window.SEARCH_INDEX_ZH = [
   { t: "MLX 后端", p: "后端", u: "backends.html#mlx", s: "--backend mlx —— 基于 mlx-c 的 Apple Silicon GPU 路径。", k: "apple metal mlx-c 苹果" },
   { t: "直接 CUDA 后端", p: "后端", u: "backends.html#cuda", s: "--backend cuda —— 直接 CUDA Driver API + cuBLAS + PTX 内核（纯 C#）。", k: "nvidia ptx cublas 实验" },
   { t: "纯 C# CPU 后端", p: "后端", u: "backends.html#cpu", s: "--backend cpu —— 可移植、无原生依赖；ggml_cpu 提供原生 CPU 内核。", k: "可移植 调试 无 gpu" },
-  { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh、CUDA 架构检测，以及 --vulkan 选择启用（Windows 便携 Vulkan 工具链）。", k: "compile 编译 native cmake cuda arch vulkan glslc TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
+  { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh、CUDA 架构检测，以及自动启用的 Vulkan（用 --no-vulkan 退出；Windows 便携 Vulkan 工具链）。", k: "compile 编译 native cmake cuda arch vulkan glslc no-vulkan TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
 
   { t: "支持的模型", p: "模型", u: "models.html#table", s: "Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Qwen-Image-Edit。", k: "architectures 架构 家族 gemma qwen gptoss nemotron mistral 图像 编辑" },
   { t: "模型下载（GGUF）", p: "模型", u: "models.html#downloads", s: "每个受支持架构的 Hugging Face 链接。", k: "huggingface 权重 下载" },

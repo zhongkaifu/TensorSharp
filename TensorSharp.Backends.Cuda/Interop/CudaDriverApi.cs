@@ -130,6 +130,23 @@ namespace TensorSharp.Cuda.Interop
         [DllImport(LibName)]
         public static extern int cuGetErrorString(int error, out IntPtr str);
 
+        // ---- CUDA Events ----
+        [DllImport(LibName)]
+        public static extern int cuEventCreate(out IntPtr phEvent, uint flags);
+
+        [DllImport(LibName, EntryPoint = "cuEventDestroy_v2")]
+        public static extern int cuEventDestroy(IntPtr hEvent);
+
+        [DllImport(LibName, EntryPoint = "cuEventRecord")]
+        public static extern int cuEventRecord(IntPtr hEvent, IntPtr hStream);
+
+        [DllImport(LibName)]
+        public static extern int cuStreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
+
+        // CUstream flags
+        public const uint CU_STREAM_DEFAULT = 0;
+        public const uint CU_STREAM_NON_BLOCKING = 1;
+
         public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
         public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
         public const int CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;

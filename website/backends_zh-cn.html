@@ -25,7 +25,7 @@
     <tbody>
       <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>macOS 默认。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
       <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端。</td></tr>
-      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。需在原生构建时用 <code>--vulkan</code> 选择启用。</td></tr>
+      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。当主机存在 Vulkan 运行时时会在原生构建时自动启用；用 <code>--no-vulkan</code> 退出。</td></tr>
       <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖。要更快的 CPU 推理请用 <code>ggml_cpu</code>（原生内核）。</td></tr>
     </tbody>
   </table>
@@ -77,15 +77,15 @@
 # macOS（Metal）
 bash build-macos.sh
 
-# Linux —— 仅 CPU / 启用 CUDA / 启用 Vulkan
+# Linux —— 仅 CPU、强制启用 CUDA、强制关闭 Vulkan
 bash build-linux.sh
 bash build-linux.sh --cuda
-bash build-linux.sh --vulkan</code></pre>
-  <pre data-lang="powershell"><code># Windows —— 仅 CPU / 启用 CUDA / 启用 Vulkan
+bash build-linux.sh --no-vulkan</code></pre>
+  <pre data-lang="powershell"><code># Windows —— 仅 CPU、强制启用 CUDA、强制关闭 Vulkan
 .\build-windows.ps1 --no-cuda
 .\build-windows.ps1 --cuda
-.\build-windows.ps1 --vulkan</code></pre>
-  <p>GGML Vulkan 后端需选择启用（<code>--vulkan</code> 或 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>）。Windows 上已安装 <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> 时直接使用；未安装时构建会通过 <code>eng/fetch-vulkan-toolchain.ps1</code> 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 <code>vulkan-1</code> 导入库、glslc、SPIRV-Headers）准备到 <code>ExternalProjects/vulkan-toolchain/</code>。Linux 上请先安装发行版 Vulkan SDK 软件包（例如 <code>apt install libvulkan-dev glslc spirv-headers</code>）。运行时需要支持 Vulkan 1.3 的 GPU 驱动。</p>
+.\build-windows.ps1 --no-vulkan</code></pre>
+  <p>GGML Vulkan 后端<strong>会自动启用</strong>——当主机存在 Vulkan 运行时（Windows 上的 <code>vulkan-1.dll</code> 或 Linux 上的 <code>libvulkan.so.1</code> loader，近期 GPU 驱动均自带）时即启用；用 <code>--no-vulkan</code>（或 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF</code>）退出，且显式选择会经 CMake 缓存在重复构建中保持。Windows 上已安装 <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> 时直接使用；未安装时构建会通过 <code>eng/fetch-vulkan-toolchain.ps1</code> 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 <code>vulkan-1</code> 导入库、glslc、SPIRV-Headers）准备到 <code>ExternalProjects/vulkan-toolchain/</code>。Linux 上有发行版开发包时直接使用（<code>apt install libvulkan-dev glslc spirv-headers</code>）；否则构建会通过 <code>eng/fetch-vulkan-toolchain.sh</code> 自动补齐缺失部分（Vulkan-Headers、来自 shaderc CI 预编译的 glslc、SPIRV-Headers）。运行时需要支持 Vulkan 1.3 的 GPU 驱动。</p>
   <p>在 Windows/Linux 上，脚本会自动检测可见 NVIDIA GPU 的计算能力，并传入一个收窄的 <code>CMAKE_CUDA_ARCHITECTURES</code>（例如 RTX 3080 上的 <code>86-real</code>），从而大幅缩短 CUDA 构建时间。可显式覆盖：</p>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
 bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>

@@ -27,6 +27,10 @@
 # Linux + NVIDIA GPU
 ./TensorSharp.Server --model ./models/model.gguf --backend ggml_cuda
 
+# Any Vulkan GPU (AMD / Intel / NVIDIA) — pick the device on multi-GPU hosts
+./TensorSharp.Server --list-gpus
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1
+
 # Multimodal models: host an explicit projector too
 ./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
   <p>The server starts on <strong><code>http://localhost:5000</code></strong>. Open it in a browser for the chat UI, or point an HTTP client at the <a href="http-api.html">compatibility endpoints</a>.</p>

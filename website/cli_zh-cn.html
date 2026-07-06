@@ -29,6 +29,15 @@
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
+# 在任意 Vulkan GPU（AMD / Intel / NVIDIA）上的文本推理
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_vulkan
+
+# 多 GPU 主机：先列出可见的 Vulkan 设备，再按索引选择
+./TensorSharp.Cli --list-gpus
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt \
+    --backend ggml_vulkan --gpu-device 1
+
 # 交互式逐轮聊天（REPL），带 KV 缓存复用与斜杠命令
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal --interactive
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal -i \
