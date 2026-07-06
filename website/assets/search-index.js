@@ -25,7 +25,7 @@ window.SEARCH_INDEX = [
   { t: "MLX backend", p: "Backends", u: "backends.html#mlx", s: "--backend mlx — Apple Silicon GPU path built on mlx-c.", k: "apple metal mlx-c" },
   { t: "Direct CUDA backend", p: "Backends", u: "backends.html#cuda", s: "--backend cuda — direct CUDA Driver API + cuBLAS + PTX kernels (pure C#).", k: "nvidia ptx cublas experimental" },
   { t: "Pure C# CPU backend", p: "Backends", u: "backends.html#cpu", s: "--backend cpu — portable, no native dependencies; ggml_cpu for native CPU kernels.", k: "portable debugging no gpu" },
-  { t: "Build the native GGML / MLX libraries", p: "Backends", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh, CUDA arch detection, and the --vulkan opt-in (portable Vulkan toolchain on Windows).", k: "compile native cmake cuda arch vulkan glslc TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
+  { t: "Build the native GGML / MLX libraries", p: "Backends", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh, CUDA arch detection, and auto-enabled Vulkan (opt out with --no-vulkan; portable Vulkan toolchain on Windows).", k: "compile native cmake cuda arch vulkan glslc no-vulkan TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
 
   { t: "Supported models", p: "Models", u: "models.html#table", s: "Gemma 3/4, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma, Qwen-Image-Edit.", k: "architectures families gemma qwen gptoss nemotron mistral image edit" },
   { t: "Model downloads (GGUF)", p: "Models", u: "models.html#downloads", s: "Hugging Face links for every supported architecture.", k: "huggingface weights download" },

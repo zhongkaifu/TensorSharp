@@ -32,7 +32,7 @@
       <tr><td><strong>macOS</strong>（Metal）</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ 与 Xcode 命令行工具。MLX 还会额外构建 <code>libmlxc</code>。</td></tr>
       <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、Visual Studio 2022 C++ 构建工具、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
       <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
-      <tr><td><strong>Windows / Linux</strong>（任何 Vulkan GPU）</td><td><code>ggml_vulkan</code></td><td>用 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>（或构建脚本的 <code>--vulkan</code>）选择启用。Windows 上未安装 SDK 时会自动准备便携 Vulkan 工具链；Linux 上请安装如 <code>libvulkan-dev glslc spirv-headers</code>。运行时需要 Vulkan 1.3 驱动。</td></tr>
+      <tr><td><strong>Windows / Linux</strong>（任何 Vulkan GPU）</td><td><code>ggml_vulkan</code></td><td>当主机存在 Vulkan 运行时（loader 已安装）时自动启用；用 <code>--no-vulkan</code>（或 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF</code>）退出。Windows 上未安装 SDK 时会自动准备便携 Vulkan 工具链；Linux 上请安装如 <code>libvulkan-dev glslc spirv-headers</code>。运行时需要 Vulkan 1.3 驱动。</td></tr>
       <tr><td>任意（仅 CPU）</td><td><code>cpu</code> / <code>ggml_cpu</code></td><td>除 .NET SDK 外无需任何东西。</td></tr>
     </tbody>
   </table>
@@ -68,7 +68,7 @@ dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre
 # Windows / Linux + NVIDIA
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda
 
-# Windows / Linux + AMD / Intel / NVIDIA（启用 Vulkan 的原生构建）
+# Windows / Linux + AMD / Intel / NVIDIA（GGML Vulkan；存在 Vulkan 运行时时自动构建启用）
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_vulkan
 
 # 可移植 / 调试（无 GPU）

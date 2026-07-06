@@ -27,6 +27,10 @@
 # Linux + NVIDIA GPU
 ./TensorSharp.Server --model ./models/model.gguf --backend ggml_cuda
 
+# 任意 Vulkan GPU（AMD / Intel / NVIDIA）—— 多 GPU 主机上可选择设备
+./TensorSharp.Server --list-gpus
+./TensorSharp.Server --model ./models/model.gguf --backend ggml_vulkan --gpu-device 1
+
 # 多模态模型：同时托管显式投影器
 ./TensorSharp.Server --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
   <p>服务器在 <strong><code>http://localhost:5000</code></strong> 启动。用浏览器打开它即可使用聊天 UI，或将 HTTP 客户端指向<a href="http-api_zh-cn.html">兼容端点</a>。</p>

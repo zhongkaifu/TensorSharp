@@ -29,6 +29,15 @@
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
     --max-tokens 200 --backend ggml_cuda
 
+# Text inference on any Vulkan GPU (AMD / Intel / NVIDIA)
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt --output result.txt \
+    --max-tokens 200 --backend ggml_vulkan
+
+# Multi-GPU host: list the visible Vulkan devices, then pick one by index
+./TensorSharp.Cli --list-gpus
+./TensorSharp.Cli --model &lt;model.gguf&gt; --input prompt.txt \
+    --backend ggml_vulkan --gpu-device 1
+
 # Interactive turn-by-turn chat (REPL) with KV-cache reuse and slash commands
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal --interactive
 ./TensorSharp.Cli --model &lt;model.gguf&gt; --backend ggml_metal -i \
