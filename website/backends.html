@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Compute Backends — TensorSharp Wiki</title>
-  <meta name="description" content="Choose between pure C# CPU, direct CUDA, MLX Metal, GGML CPU/Metal/CUDA — and learn how to build the native libraries.">
+  <meta name="description" content="Choose between pure C# CPU, direct CUDA, MLX Metal, GGML CPU/Metal/CUDA/Vulkan — and learn how to build the native libraries.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -25,6 +25,7 @@
     <tbody>
       <tr><td><strong>Apple Silicon (Mac)</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Default on macOS. <code>mlx</code> is an alternative Apple-Silicon GPU path.</td></tr>
       <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>Most-tested NVIDIA path. <code>cuda</code> is the direct PTX/cuBLAS backend for experimentation.</td></tr>
+      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>Vendor-neutral GPU path via ggml-vulkan (cooperative-matrix accelerated where the driver supports it). Opt in at native build time with <code>--vulkan</code>.</td></tr>
       <tr><td><strong>No GPU / portability / debugging</strong></td><td>Pure C# CPU</td><td><code>cpu</code></td><td>No native dependencies. For faster CPU inference use <code>ggml_cpu</code> (native kernels).</td></tr>
     </tbody>
   </table>
@@ -39,19 +40,21 @@
       <tr><td>MLX Metal</td><td><code>mlx</code></td><td>Apple Silicon (alternative to GGML Metal)</td></tr>
       <tr><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Apple Silicon (default on macOS)</td></tr>
       <tr><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>NVIDIA inference through ggml</td></tr>
+      <tr><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>Vendor-neutral GPU inference through ggml (AMD / Intel / NVIDIA)</td></tr>
       <tr><td>GGML CPU</td><td><code>ggml_cpu</code></td><td>Native CPU kernels</td></tr>
       <tr><td>Pure C# CPU</td><td><code>cpu</code></td><td>Portability &amp; debugging</td></tr>
     </tbody>
   </table>
   </div>
 
-  <h3 id="ggml">GGML Metal &amp; GGML CUDA</h3>
-  <p>The most-tested GPU paths, built on a native C++ bridge that links <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a>.</p>
+  <h3 id="ggml">GGML Metal, GGML CUDA &amp; GGML Vulkan</h3>
+  <p>The GPU paths built on a native C++ bridge that links <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a>.</p>
   <ul>
     <li><strong>GGML Metal</strong> (<code>ggml_metal</code>, macOS) — quantized weights are mapped <em>zero-copy</em> from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size.</li>
     <li><strong>GGML CUDA</strong> (<code>ggml_cuda</code>, Windows/Linux + NVIDIA) — quantized weights are uploaded to device memory once at load time and the host copy is released afterwards.</li>
+    <li><strong>GGML Vulkan</strong> (<code>ggml_vulkan</code>, Windows/Linux + AMD/Intel/NVIDIA) — vendor-neutral GPU path for any GPU with a Vulkan 1.3 driver, using cooperative-matrix shaders (KHR coopmat / NV coopmat2) where the driver supports them. Weights are device-resident like GGML CUDA and the same fused whole-model decode/prefill graphs are used. On multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one), pick the device with <code>--gpu-device N</code> (or the <code>TS_GGML_VULKAN_DEVICE</code> env var) and list the visible devices with <code>--list-gpus</code>.</li>
   </ul>
-  <p>Both run native quantized matmul (Q4_K_M, Q8_0, …) without dequantizing to FP32, plus a native paged-attention kernel that drives <code>ggml_flash_attn_ext</code>.</p>
+  <p>All three run native quantized matmul (Q4_K_M, Q8_0, …) without dequantizing to FP32, plus a native paged-attention kernel that drives <code>ggml_flash_attn_ext</code>.</p>
 
   <h3 id="mlx">MLX Metal</h3>
   <p><code>--backend mlx</code> is a GPU-accelerated Apple-Silicon path built on <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a>. It implements quantized ops (Q4_K_M, Q8_0, Q5_K, Q6_K, IQ2_XXS, IQ4_XS, IQ4_NL, MXFP4, …) without dequantizing to FP32, fused decode/prefill Metal kernels, compiled-graph kernels, async worker dispatch, batched MoE decode, and MoE expert offload. It pins the GGUF mmap in physical RAM via <code>mlock(2)</code> and derives allocator caps from the host's unified-memory capacity. Requires <code>libmlxc</code> (built locally or located via <code>TENSORSHARP_MLX_LIBRARY</code> / <code>TENSORSHARP_MLX_LIBRARY_DIR</code>).</p>
@@ -65,7 +68,7 @@
     <li><strong>GGML CPU</strong> (<code>ggml_cpu</code>) — native GGML CPU kernels with quantized weights mapped zero-copy from the GGUF file. Faster than pure C# on most CPUs.</li>
   </ul>
 
-  <div class="callout note"><div class="ic">🔎</div><p>The server reports which backends are actually available on the host in <code>GET /api/models</code> (<code>supportedBackends</code>). If a CUDA or MLX backend is missing, the host did not detect a usable driver/runtime at startup.</p></div>
+  <div class="callout note"><div class="ic">🔎</div><p>The server reports which backends are actually available on the host in <code>GET /api/models</code> (<code>supportedBackends</code>). If a CUDA or MLX backend is missing, the host did not detect a usable driver/runtime at startup. If <code>ggml_vulkan</code> is missing, the native bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found.</p></div>
 
   <h2 id="native-build">Building the native libraries</h2>
   <p>The native GGML library is built automatically on the first <code>dotnet build</code>. To build it manually or with CUDA:</p>
@@ -74,12 +77,15 @@
 # macOS (Metal)
 bash build-macos.sh
 
-# Linux — CPU only / with CUDA
+# Linux — CPU only / with CUDA / with Vulkan
 bash build-linux.sh
-bash build-linux.sh --cuda</code></pre>
-  <pre data-lang="powershell"><code># Windows — CPU only / with CUDA
+bash build-linux.sh --cuda
+bash build-linux.sh --vulkan</code></pre>
+  <pre data-lang="powershell"><code># Windows — CPU only / with CUDA / with Vulkan
 .\build-windows.ps1 --no-cuda
-.\build-windows.ps1 --cuda</code></pre>
+.\build-windows.ps1 --cuda
+.\build-windows.ps1 --vulkan</code></pre>
+  <p>The GGML Vulkan backend is opt-in (<code>--vulkan</code> or <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>). On Windows, a <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> is used when installed; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a <code>vulkan-1</code> import library generated from the system loader, glslc, SPIRV-Headers) into <code>ExternalProjects/vulkan-toolchain/</code> via <code>eng/fetch-vulkan-toolchain.ps1</code>. On Linux, install the distro Vulkan SDK packages first (e.g. <code>apt install libvulkan-dev glslc spirv-headers</code>). A GPU driver with Vulkan 1.3 support is required at run time.</p>
   <p>On Windows/Linux the script auto-detects the visible NVIDIA GPU compute capability and passes a narrow <code>CMAKE_CUDA_ARCHITECTURES</code> (e.g. <code>86-real</code> on an RTX 3080), which cuts CUDA build time substantially. Override it explicitly:</p>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
 bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>

@@ -39,6 +39,90 @@ has_cuda_toolkit() {
     return 1
 }
 
+# Prints the system Vulkan loader library path (preferring the dev symlink
+# libvulkan.so over the runtime soname libvulkan.so.1 — CMake accepts a full
+# path in Vulkan_LIBRARY either way). Fails when no loader is installed, which
+# is the "this machine does not support Vulkan" signal for auto-detection.
+find_vulkan_loader_library() {
+    local candidates=()
+    if command -v ldconfig >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            candidates+=("${line}")
+        done < <(ldconfig -p 2>/dev/null | awk '$1 == "libvulkan.so" || $1 == "libvulkan.so.1" { print $NF }')
+    fi
+    local dir name
+    for dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib /usr/local/lib; do
+        for name in libvulkan.so libvulkan.so.1; do
+            if [[ -e "${dir}/${name}" ]]; then
+                candidates+=("${dir}/${name}")
+            fi
+        done
+    done
+
+    local fallback=""
+    local candidate
+    for candidate in ${candidates[@]+"${candidates[@]}"}; do
+        if [[ "${candidate}" == *libvulkan.so ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+        if [[ -z "${fallback}" ]]; then
+            fallback="${candidate}"
+        fi
+    done
+    if [[ -n "${fallback}" ]]; then
+        echo "${fallback}"
+        return 0
+    fi
+    return 1
+}
+
+# Ensures the Vulkan build toolchain (headers, glslc, SPIRV-Headers) exists,
+# downloading the portable pieces via eng/fetch-vulkan-toolchain.sh when the
+# system does not already provide them, and fills VULKAN_CMAKE_ARGS with
+# explicit FindVulkan hints. Returns non-zero when the toolchain cannot be
+# provisioned (no loader, no network, ...).
+VULKAN_CMAKE_ARGS=()
+prepare_vulkan_toolchain() {
+    VULKAN_CMAKE_ARGS=()
+
+    # Full LunarG SDK: CMake's FindVulkan discovers everything via VULKAN_SDK.
+    if [[ -n "${VULKAN_SDK:-}" && -f "${VULKAN_SDK}/include/vulkan/vulkan.h" && -x "${VULKAN_SDK}/bin/glslc" ]]; then
+        return 0
+    fi
+
+    local loader
+    if ! loader="$(find_vulkan_loader_library)"; then
+        echo "warning: no Vulkan loader (libvulkan.so / libvulkan.so.1) found on this system." >&2
+        return 1
+    fi
+
+    if ! bash "${SCRIPT_DIR}/../eng/fetch-vulkan-toolchain.sh"; then
+        return 1
+    fi
+
+    local toolchain_dir
+    toolchain_dir="$(cd "${SCRIPT_DIR}/.." && pwd)/ExternalProjects/vulkan-toolchain"
+
+    local glslc_path
+    if command -v glslc >/dev/null 2>&1; then
+        glslc_path="$(command -v glslc)"
+    elif [[ -x "${toolchain_dir}/shaderc-linux/bin/glslc" ]]; then
+        glslc_path="${toolchain_dir}/shaderc-linux/bin/glslc"
+    else
+        echo "warning: glslc not found after provisioning the Vulkan toolchain." >&2
+        return 1
+    fi
+
+    VULKAN_CMAKE_ARGS=(
+        "-DVulkan_INCLUDE_DIR=${toolchain_dir}/Vulkan-Headers/include"
+        "-DVulkan_LIBRARY=${loader}"
+        "-DVulkan_GLSLC_EXECUTABLE=${glslc_path}"
+        "-DSPIRV-Headers_DIR=${toolchain_dir}/spirv-headers-install/share/cmake/SPIRV-Headers"
+    )
+    return 0
+}
+
 read_cached_backend_setting() {
     local cache_variable="$1"
     local cache_file="${BUILD_DIR}/CMakeCache.txt"
@@ -164,20 +248,41 @@ if [[ -z "${ENABLE_CUDA}" ]]; then
     ENABLE_CUDA="OFF"
 fi
 
-# Vulkan is opt-in (--vulkan or TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON) and
-# expects the distro Vulkan SDK bits: headers + loader (libvulkan-dev), glslc
-# (shaderc / glslc package) and spirv-headers. Once enabled, the setting sticks
-# via the CMake cache like the CUDA one does.
+# Vulkan: an explicit choice (--vulkan/--no-vulkan or
+# TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN) wins and sticks via the CMake cache;
+# TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT records that the cached value was
+# explicit, so an auto-detected default never becomes sticky. Otherwise the
+# backend is auto-enabled when the machine supports Vulkan (a loader is
+# installed) and the build toolchain (headers, glslc, SPIRV-Headers) is
+# downloaded automatically by eng/fetch-vulkan-toolchain.sh when missing. An
+# auto-enable whose toolchain cannot be provisioned (e.g. no network) degrades
+# to a warning and builds without Vulkan; an explicit --vulkan makes it fatal.
+VULKAN_EXPLICIT=OFF
 ENABLE_VULKAN="$(normalize_bool "${ENABLE_VULKAN}")"
-if [[ -z "${ENABLE_VULKAN}" ]]; then
+if [[ -n "${ENABLE_VULKAN}" ]]; then
+    VULKAN_EXPLICIT=ON
+elif [[ "$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT)" == "ON" ]]; then
     ENABLE_VULKAN="$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)"
+    if [[ -n "${ENABLE_VULKAN}" ]]; then
+        VULKAN_EXPLICIT=ON
+    fi
 fi
 if [[ -z "${ENABLE_VULKAN}" ]]; then
-    ENABLE_VULKAN="OFF"
+    if [[ -n "${VULKAN_SDK:-}" ]] || find_vulkan_loader_library >/dev/null; then
+        ENABLE_VULKAN=ON
+    else
+        ENABLE_VULKAN=OFF
+    fi
 fi
-if [[ "${ENABLE_VULKAN}" == "ON" ]] && ! command -v glslc >/dev/null 2>&1 && [[ -z "${VULKAN_SDK:-}" ]]; then
-    echo "warning: --vulkan requested but glslc was not found on PATH and VULKAN_SDK is not set." >&2
-    echo "         Install the Vulkan SDK (e.g. apt install libvulkan-dev glslc spirv-headers) or set VULKAN_SDK." >&2
+if [[ "${ENABLE_VULKAN}" == "ON" ]] && ! prepare_vulkan_toolchain; then
+    if [[ "${VULKAN_EXPLICIT}" == "ON" ]]; then
+        echo "error: the ggml-vulkan backend was requested explicitly but its build toolchain could not be provisioned." >&2
+        echo "       Install the Vulkan SDK (e.g. apt install libvulkan-dev glslc spirv-headers) or set VULKAN_SDK." >&2
+        exit 1
+    fi
+    echo "warning: this machine supports Vulkan but the ggml-vulkan build toolchain could not be provisioned;" >&2
+    echo "         building without the ggml-vulkan backend. Pass --vulkan to make this an error." >&2
+    ENABLE_VULKAN=OFF
 fi
 
 if [[ "${ENABLE_CUDA}" == "ON" && -z "${CUDA_ARCHITECTURES}" && "${USER_SET_CMAKE_CUDA_ARCHITECTURES}" != "ON" ]]; then
@@ -216,7 +321,9 @@ CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA="${ENABLE_CUDA}"
     -DTENSORSHARP_GGML_NATIVE_ENABLE_VULKAN="${ENABLE_VULKAN}"
+    -DTENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT="${VULKAN_EXPLICIT}"
     -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS="${BUILD_TESTS}"
+    ${VULKAN_CMAKE_ARGS[@]+"${VULKAN_CMAKE_ARGS[@]}"}
 )
 
 if [[ "${ENABLE_CUDA}" == "ON" && -n "${CUDA_ARCHITECTURES}" && "${USER_SET_CMAKE_CUDA_ARCHITECTURES}" != "ON" ]]; then

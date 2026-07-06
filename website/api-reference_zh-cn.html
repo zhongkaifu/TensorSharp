@@ -46,7 +46,9 @@
       <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>用于视觉 / 视频 / 音频推理的媒体。</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF（放在模型旁则自动检测）。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认 100）。</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>。</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 在多 GPU 主机上使用的 Vulkan 设备索引（默认 0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>列出可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code>、<code>q4_0</code>（约为 f32 的 1/7，面向 128K–256K 超长上下文；量化档位需原生 GGML flash-attention 路径）。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>设定系统提示。</td></tr>
@@ -79,6 +81,8 @@
       <tr><td><code>--model &lt;path&gt;</code></td><td>要托管的 GGUF 文件（推理必需）。</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF；<code>none</code> 可禁用。</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>默认计算后端。</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code> / <code>--list-gpus</code></td><td><code>ggml_vulkan</code> 的 Vulkan 设备选择 / 列出可见 Vulkan 设备后退出。</td></tr>
+      <tr><td><code>--help</code></td><td>打印参数说明后退出（不带任何参数启动时也会显示）。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>请求未指定时的默认生成上限（默认 20000）。</td></tr>
       <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>默认采样值。</td></tr>
       <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>默认惩罚与随机种子。</td></tr>
@@ -126,9 +130,12 @@
       <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit 伴随文件路径（VAE / Qwen2.5-VL 文本编码器 / mmproj）。</td></tr>
       <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>合并进 DiT 的 Lightning LoRA <code>.safetensors</code> / 缩放覆盖。</td></tr>
       <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>整步 DiT 缓存：<code>0</code> 禁用 / 模式 <code>easycache</code>、<code>fbc</code>、<code>both</code>、<code>off</code>。</td></tr>
+      <tr><td><code>TS_GGML_VULKAN_DEVICE</code></td><td><code>ggml_vulkan</code> 使用的 Vulkan 设备索引（= <code>--gpu-device</code>）。</td></tr>
+      <tr><td><code>TS_JSON_FORCE_OPEN</code></td><td><code>0</code> 关闭结构化输出的首 token <code>{</code> 约束（<code>json_object</code> / <code>json_schema</code> 默认开启）。</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX 后端调参：流水线 decode、mlock GGUF、融合 KV 写、批量 MoE decode、内存上限。</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>覆盖 <code>libmlxc</code> 的搜索路径。</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>在原生构建时跳过 / 固定 ggml 源码克隆。</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td><code>ON</code> 让原生桥接库带上 GGML Vulkan 后端（= 构建脚本 <code>--vulkan</code>）。</td></tr>
     </tbody>
   </table>
   </div>

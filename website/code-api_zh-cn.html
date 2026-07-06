@@ -173,7 +173,7 @@ Console.WriteLine($"Saved {output.Width}x{output.Height} edited image.");</code>
     <thead><tr><th>类型</th><th>角色</th></tr></thead>
     <tbody>
       <tr><td><code>ModelBase</code></td><td>每个架构的抽象基类。<code>Create(path, backend)</code>、<code>Forward(int[])</code>、<code>Sample(...)</code>、<code>SampleGreedy(...)</code>，外加 <code>Config</code> 与 <code>Tokenizer</code>。</td></tr>
-      <tr><td><code>BackendType</code></td><td>枚举：<code>Cpu</code>、<code>GgmlCpu</code>、<code>GgmlMetal</code>、<code>GgmlCuda</code>、<code>Cuda</code>、<code>Mlx</code>。</td></tr>
+      <tr><td><code>BackendType</code></td><td>枚举：<code>Cpu</code>、<code>GgmlCpu</code>、<code>GgmlMetal</code>、<code>GgmlCuda</code>、<code>GgmlVulkan</code>、<code>Cuda</code>、<code>Mlx</code>。</td></tr>
       <tr><td><code>SamplingConfig</code></td><td>采样配置（见上表）。</td></tr>
       <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>、<code>Decode(ids)</code>、<code>IsEos(id)</code>、<code>EosTokenIds</code>（BPE 与 SentencePiece 实现）。</td></tr>
       <tr><td><code>ModelConfig</code></td><td>架构元数据：<code>VocabSize</code>、上下文长度等。</td></tr>

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>计算后端 — TensorSharp 维基</title>
-  <meta name="description" content="在纯 C# CPU、直接 CUDA、MLX Metal、GGML CPU/Metal/CUDA 之间选择，并了解如何构建原生库。">
+  <meta name="description" content="在纯 C# CPU、直接 CUDA、MLX Metal、GGML CPU/Metal/CUDA/Vulkan 之间选择，并了解如何构建原生库。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -25,6 +25,7 @@
     <tbody>
       <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>macOS 默认。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
       <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端。</td></tr>
+      <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。需在原生构建时用 <code>--vulkan</code> 选择启用。</td></tr>
       <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖。要更快的 CPU 推理请用 <code>ggml_cpu</code>（原生内核）。</td></tr>
     </tbody>
   </table>
@@ -39,19 +40,21 @@
       <tr><td>MLX Metal</td><td><code>mlx</code></td><td>Apple Silicon（GGML Metal 的替代）</td></tr>
       <tr><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Apple Silicon（macOS 默认）</td></tr>
       <tr><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>通过 ggml 的 NVIDIA 推理</td></tr>
+      <tr><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>通过 ggml 的厂商无关 GPU 推理（AMD / Intel / NVIDIA）</td></tr>
       <tr><td>GGML CPU</td><td><code>ggml_cpu</code></td><td>原生 CPU 内核</td></tr>
       <tr><td>纯 C# CPU</td><td><code>cpu</code></td><td>可移植与调试</td></tr>
     </tbody>
   </table>
   </div>
 
-  <h3 id="ggml">GGML Metal 与 GGML CUDA</h3>
-  <p>测试最充分的 GPU 路径，建立在链接 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> 的原生 C++ 桥接之上。</p>
+  <h3 id="ggml">GGML Metal、GGML CUDA 与 GGML Vulkan</h3>
+  <p>建立在链接 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> 的原生 C++ 桥接之上的 GPU 路径。</p>
   <ul>
     <li><strong>GGML Metal</strong>（<code>ggml_metal</code>，macOS）—— 量化权重经由主机指针缓冲区从 GGUF 文件<em>零拷贝</em>映射进 Metal 命令缓冲，因此常驻内存接近磁盘上的模型大小。</li>
     <li><strong>GGML CUDA</strong>（<code>ggml_cuda</code>，Windows/Linux + NVIDIA）—— 量化权重在加载时一次性上传到显存，之后释放主机副本。</li>
+    <li><strong>GGML Vulkan</strong>（<code>ggml_vulkan</code>，Windows/Linux + AMD/Intel/NVIDIA）—— 与厂商无关的 GPU 路径，支持任何带 Vulkan 1.3 驱动的 GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。在多 GPU 主机上（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡），用 <code>--gpu-device N</code>（或环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）选择设备，用 <code>--list-gpus</code> 列出可见设备。</li>
   </ul>
-  <p>两者都在不反量化为 FP32 的情况下运行原生量化 matmul（Q4_K_M、Q8_0 ……），并配有驱动 <code>ggml_flash_attn_ext</code> 的原生分页注意力内核。</p>
+  <p>三者都在不反量化为 FP32 的情况下运行原生量化 matmul（Q4_K_M、Q8_0 ……），并配有驱动 <code>ggml_flash_attn_ext</code> 的原生分页注意力内核。</p>
 
   <h3 id="mlx">MLX Metal</h3>
   <p><code>--backend mlx</code> 是建立在 <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a> 之上、GPU 加速的 Apple Silicon 路径。它在不反量化为 FP32 的情况下实现量化运算（Q4_K_M、Q8_0、Q5_K、Q6_K、IQ2_XXS、IQ4_XS、IQ4_NL、MXFP4 ……）、融合的 decode/prefill Metal 内核、编译图内核、异步 worker 调度、批量 MoE decode 与 MoE 专家卸载。它通过 <code>mlock(2)</code> 把 GGUF mmap 钉在物理内存中，并根据主机的统一内存容量推导分配器上限。需要 <code>libmlxc</code>（本地构建，或通过 <code>TENSORSHARP_MLX_LIBRARY</code> / <code>TENSORSHARP_MLX_LIBRARY_DIR</code> 定位）。</p>
@@ -65,7 +68,7 @@
     <li><strong>GGML CPU</strong>（<code>ggml_cpu</code>）—— 原生 GGML CPU 内核，量化权重从 GGUF 文件零拷贝映射。在多数 CPU 上比纯 C# 更快。</li>
   </ul>
 
-  <div class="callout note"><div class="ic">🔎</div><p>服务器会在 <code>GET /api/models</code>（<code>supportedBackends</code>）中报告主机上实际可用的后端。如果缺少 CUDA 或 MLX 后端，说明主机在启动时未检测到可用的驱动 / 运行时。</p></div>
+  <div class="callout note"><div class="ic">🔎</div><p>服务器会在 <code>GET /api/models</code>（<code>supportedBackends</code>）中报告主机上实际可用的后端。如果缺少 CUDA 或 MLX 后端，说明主机在启动时未检测到可用的驱动 / 运行时。如果缺少 <code>ggml_vulkan</code>，说明原生桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。</p></div>
 
   <h2 id="native-build">构建原生库</h2>
   <p>原生 GGML 库会在首次 <code>dotnet build</code> 时自动构建。要手动构建或启用 CUDA：</p>
@@ -74,12 +77,15 @@
 # macOS（Metal）
 bash build-macos.sh
 
-# Linux —— 仅 CPU / 启用 CUDA
+# Linux —— 仅 CPU / 启用 CUDA / 启用 Vulkan
 bash build-linux.sh
-bash build-linux.sh --cuda</code></pre>
-  <pre data-lang="powershell"><code># Windows —— 仅 CPU / 启用 CUDA
+bash build-linux.sh --cuda
+bash build-linux.sh --vulkan</code></pre>
+  <pre data-lang="powershell"><code># Windows —— 仅 CPU / 启用 CUDA / 启用 Vulkan
 .\build-windows.ps1 --no-cuda
-.\build-windows.ps1 --cuda</code></pre>
+.\build-windows.ps1 --cuda
+.\build-windows.ps1 --vulkan</code></pre>
+  <p>GGML Vulkan 后端需选择启用（<code>--vulkan</code> 或 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>）。Windows 上已安装 <a href="https://vulkan.lunarg.com/" target="_blank" rel="noopener">LunarG Vulkan SDK</a> 时直接使用；未安装时构建会通过 <code>eng/fetch-vulkan-toolchain.ps1</code> 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 <code>vulkan-1</code> 导入库、glslc、SPIRV-Headers）准备到 <code>ExternalProjects/vulkan-toolchain/</code>。Linux 上请先安装发行版 Vulkan SDK 软件包（例如 <code>apt install libvulkan-dev glslc spirv-headers</code>）。运行时需要支持 Vulkan 1.3 的 GPU 驱动。</p>
   <p>在 Windows/Linux 上，脚本会自动检测可见 NVIDIA GPU 的计算能力，并传入一个收窄的 <code>CMAKE_CUDA_ARCHITECTURES</code>（例如 RTX 3080 上的 <code>86-real</code>），从而大幅缩短 CUDA 构建时间。可显式覆盖：</p>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES='86-real;89-real' bash build-linux.sh --cuda
 bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>

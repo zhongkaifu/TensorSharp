@@ -32,6 +32,7 @@
       <tr><td><strong>macOS</strong>（Metal）</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ 与 Xcode 命令行工具。MLX 还会额外构建 <code>libmlxc</code>。</td></tr>
       <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、Visual Studio 2022 C++ 构建工具、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
       <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+、NVIDIA 驱动 + CUDA Toolkit 12.x（含 cuBLAS）。</td></tr>
+      <tr><td><strong>Windows / Linux</strong>（任何 Vulkan GPU）</td><td><code>ggml_vulkan</code></td><td>用 <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code>（或构建脚本的 <code>--vulkan</code>）选择启用。Windows 上未安装 SDK 时会自动准备便携 Vulkan 工具链；Linux 上请安装如 <code>libvulkan-dev glslc spirv-headers</code>。运行时需要 Vulkan 1.3 驱动。</td></tr>
       <tr><td>任意（仅 CPU）</td><td><code>cpu</code> / <code>ggml_cpu</code></td><td>除 .NET SDK 外无需任何东西。</td></tr>
     </tbody>
   </table>
@@ -48,7 +49,7 @@ dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 
 # Web 应用
 dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre>
-  <p>CLI 二进制位于 <code>TensorSharp.Cli/bin/...</code>，服务器位于 <code>TensorSharp.Server/bin/...</code>。如需启用 CUDA 的原生构建、手动原生构建或 MLX，见<a href="backends_zh-cn.html#native-build">构建原生库</a>。</p>
+  <p>CLI 二进制位于 <code>TensorSharp.Cli/bin/...</code>，服务器位于 <code>TensorSharp.Server/bin/...</code>。如需启用 CUDA 或 Vulkan 的原生构建、手动原生构建或 MLX，见<a href="backends_zh-cn.html#native-build">构建原生库</a>。</p>
   <div class="callout tip"><div class="ic">📦</div><p>不想从源码构建？<strong>Release Binaries</strong> 工作流会发布自包含归档（Windows/Linux CPU 与 CUDA、macOS arm64），其中已捆绑 .NET 10 运行时与原生库 —— 无需另行安装即可运行。见<a href="backends_zh-cn.html#native-build">后端</a>。</p></div>
 
   <h2 id="download">3 · 下载模型</h2>
@@ -66,6 +67,9 @@ dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre
 
 # Windows / Linux + NVIDIA
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda
+
+# Windows / Linux + AMD / Intel / NVIDIA（启用 Vulkan 的原生构建）
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_vulkan
 
 # 可移植 / 调试（无 GPU）
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu</code></pre>

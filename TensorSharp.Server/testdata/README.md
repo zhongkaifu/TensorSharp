@@ -28,7 +28,7 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 ./TensorSharp.Server --model ~/models/model.gguf --backend ggml_metal
 ```
 
-Use `--backend cuda` or `--backend ggml_cuda` on Windows/Linux NVIDIA machines, `--backend ggml_metal` or `--backend mlx` on macOS, or `--backend ggml_cpu` / `--backend cpu` for CPU runs.
+Use `--backend cuda` or `--backend ggml_cuda` on Windows/Linux NVIDIA machines, `--backend ggml_vulkan` on Windows/Linux AMD/Intel/NVIDIA GPUs (Vulkan-enabled native build), `--backend ggml_metal` or `--backend mlx` on macOS, or `--backend ggml_cpu` / `--backend cpu` for CPU runs.
 
 2. Run either suite:
 

@@ -110,7 +110,9 @@
     <thead><tr><th>Option</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Maximum tokens to generate (default: 100).</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td>Compute backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>Compute backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>, <code>ggml_vulkan</code>.</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td>Vulkan device index for the <code>ggml_vulkan</code> backend on multi-GPU hosts (default: 0; env <code>TS_GGML_VULKAN_DEVICE</code>).</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, or <code>q4_0</code>. The block-quantized tiers require the native GGML flash-attention path; <code>q4_0</code> (~1/7 the f32 footprint) targets very long 128K–256K contexts.</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL (see below).</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the session's system prompt from text or a file.</td></tr>

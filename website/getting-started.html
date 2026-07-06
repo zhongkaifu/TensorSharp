@@ -32,6 +32,7 @@
       <tr><td><strong>macOS</strong> (Metal)</td><td><code>ggml_metal</code> / <code>mlx</code></td><td>CMake 3.20+ and Xcode command-line tools. MLX additionally builds <code>libmlxc</code>.</td></tr>
       <tr><td><strong>Windows</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, Visual Studio 2022 C++ build tools, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
       <tr><td><strong>Linux</strong></td><td><code>ggml_cuda</code> / <code>cuda</code></td><td>CMake 3.20+, NVIDIA driver + CUDA Toolkit 12.x (with cuBLAS).</td></tr>
+      <tr><td><strong>Windows / Linux</strong> (any Vulkan GPU)</td><td><code>ggml_vulkan</code></td><td>Opt in with <code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON</code> (or <code>--vulkan</code> on the build scripts). Windows auto-provisions a portable Vulkan toolchain when no SDK is installed; on Linux install e.g. <code>libvulkan-dev glslc spirv-headers</code>. Needs a Vulkan 1.3 driver at run time.</td></tr>
       <tr><td>Any (CPU only)</td><td><code>cpu</code> / <code>ggml_cpu</code></td><td>Nothing beyond the .NET SDK.</td></tr>
     </tbody>
   </table>
@@ -48,7 +49,7 @@ dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 
 # Web application
 dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre>
-  <p>The CLI binary lands in <code>TensorSharp.Cli/bin/...</code> and the server in <code>TensorSharp.Server/bin/...</code>. For a CUDA-enabled native build, manual native builds, or MLX, see <a href="backends.html#native-build">Building the native libraries</a>.</p>
+  <p>The CLI binary lands in <code>TensorSharp.Cli/bin/...</code> and the server in <code>TensorSharp.Server/bin/...</code>. For a CUDA- or Vulkan-enabled native build, manual native builds, or MLX, see <a href="backends.html#native-build">Building the native libraries</a>.</p>
   <div class="callout tip"><div class="ic">📦</div><p>Prefer not to build from source? The <strong>Release Binaries</strong> workflow publishes self-contained archives (Windows/Linux CPU &amp; CUDA, macOS arm64) that bundle the .NET 10 runtime and native libraries — they run with no separate install. See <a href="backends.html#native-build">Backends</a>.</p></div>
 
   <h2 id="download">3 · Download a model</h2>
@@ -66,6 +67,9 @@ dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release</code></pre
 
 # Windows / Linux + NVIDIA
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_cuda
+
+# Windows / Linux + AMD / Intel / NVIDIA (Vulkan-enabled native build)
+./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend ggml_vulkan
 
 # Portable / debugging (no GPU)
 ./TensorSharp.Cli --model gemma-4-E4B-it-Q8_0.gguf --input prompt.txt --backend cpu</code></pre>

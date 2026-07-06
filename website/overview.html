@@ -89,7 +89,7 @@
     <tbody>
       <tr><td>Model families</td><td>Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family (<code>qwen35</code>, <code>qwen35moe</code>, <code>qwen3next</code>), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), Mistral 3, and Qwen-Image-Edit (<code>qwen_image</code> image editing).</td></tr>
       <tr><td>Inference hosts</td><td>CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API.</td></tr>
-      <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA.</td></tr>
+      <tr><td>Backends</td><td>Pure C# CPU, direct CUDA/cuBLAS (<code>cuda</code>), MLX Metal (<code>mlx</code>), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan.</td></tr>
       <tr><td>Multimodal</td><td>Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input.</td></tr>
       <tr><td>Continuous batching</td><td>vLLM-style paged KV cache, block-hash prefix sharing, iteration-level scheduler (on by default; opt-out via <code>--no-continuous-batching</code>).</td></tr>
       <tr><td>Speculative decoding</td><td>MTP / NextN draft heads for Qwen 3.6 (embedded) and Gemma 4 (separate draft GGUF); off by default, opt-in via <code>--mtp-spec</code>.</td></tr>

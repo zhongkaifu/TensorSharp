@@ -14,7 +14,7 @@ TensorSharp 推理测试与基准矩阵运行器。它通过把 `TensorSharp.Cli
 | 维度 | 取值 |
 |---|---|
 | **模型** | 默认从 `/Users/ZhongkaiFu/work/model` 自动发现 GGUF（可配置）；也支持显式配置覆盖。DiffusionGemma 目前还不会被自动分类为一等矩阵模型家族；实验时请使用显式配置项。 |
-| **后端** | `cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`cuda`、`mlx`（按主机能力过滤） |
+| **后端** | `cpu`、`ggml_cpu`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`cuda`、`mlx`（按主机能力过滤） |
 | **功能 / prompt 类型** | 自回归 CLI 功能：合成 prefill（512、2048）、合成 decode（128）、短文本、长文本、上传文本、多轮聊天、函数 / 工具调用、思维链模式、图像、音频、视频。目前没有专门的 diffusion feature。 |
 | **环境变量 sweep** | Baseline cell 加上 [`Defaults/matrix-config.json`](Defaults/matrix-config.json) 中 `default_env_vars` 选择的高影响开关。已注册全集在 `EnvVarMatrix.All`；DiffusionGemma 的 `DIFFUSION_*` 变量当前在矩阵外，默认不会清理或 sweep。详见[矩阵文档](../docs/env_var_feature_matrix_zh-cn.md)。 |
 

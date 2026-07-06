@@ -4265,6 +4265,19 @@ internal enum GgmlIndexReductionOp
 
                 if (backendMessage.Contains("not available in this build", StringComparison.OrdinalIgnoreCase))
                     return $"{backendMessage} {rebuildHint}";
+
+                // The backend is compiled in but device enumeration came back empty.
+                // ggml-vulkan only auto-selects GPU devices; software rasterizers
+                // (llvmpipe/lavapipe) are skipped unless forced. The common trap is
+                // WSL: NVIDIA ships no Vulkan ICD for WSL guests and Ubuntu's mesa
+                // has no dzn driver, so no GPU Vulkan device exists inside WSL even
+                // though the host GPU supports Vulkan.
+                if (backendMessage.Contains("No Vulkan device", StringComparison.OrdinalIgnoreCase))
+                    return backendMessage +
+                        " Install a GPU driver with Vulkan support. ggml-vulkan only auto-selects GPU devices;" +
+                        " a software rasterizer (e.g. llvmpipe) is used only when forced with GGML_VK_VISIBLE_DEVICES=0." +
+                        " Note: inside WSL no NVIDIA Vulkan device is exposed — run the server on the Windows host" +
+                        " (or a Linux host with native GPU drivers) to use ggml_vulkan on the GPU.";
             }
 
             return backendMessage;

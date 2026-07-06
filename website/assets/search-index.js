@@ -18,13 +18,14 @@ window.SEARCH_INDEX = [
   { t: "Download a GGUF model", p: "Get started", u: "getting-started.html#download", s: "Get a model from Hugging Face, e.g. gemma-4-E4B-it Q8_0.", k: "huggingface weights gguf quantization" },
   { t: "First run", p: "Get started", u: "getting-started.html#first-run", s: "One-shot generation, interactive chat, or start the server.", k: "hello world example run" },
 
-  { t: "Pick a backend", p: "Backends", u: "backends.html#table", s: "Choose ggml_metal (Mac), ggml_cuda (NVIDIA), or cpu/ggml_cpu (portable).", k: "choose hardware gpu which backend" },
+  { t: "Pick a backend", p: "Backends", u: "backends.html#table", s: "Choose ggml_metal (Mac), ggml_cuda (NVIDIA), ggml_vulkan (AMD/Intel/NVIDIA), or cpu/ggml_cpu (portable).", k: "choose hardware gpu which backend" },
   { t: "GGML CUDA backend", p: "Backends", u: "backends.html#ggml", s: "--backend ggml_cuda — most-tested NVIDIA path on Windows/Linux.", k: "nvidia gpu cuda windows linux" },
+  { t: "GGML Vulkan backend", p: "Backends", u: "backends.html#ggml", s: "--backend ggml_vulkan — vendor-neutral GPU path (AMD/Intel/NVIDIA, Vulkan 1.3); pick the device with --gpu-device / --list-gpus.", k: "vulkan amd intel gpu device TS_GGML_VULKAN_DEVICE coopmat vendor neutral" },
   { t: "GGML Metal backend", p: "Backends", u: "backends.html#ggml", s: "--backend ggml_metal — default on macOS / Apple Silicon.", k: "apple silicon mac metal" },
   { t: "MLX backend", p: "Backends", u: "backends.html#mlx", s: "--backend mlx — Apple Silicon GPU path built on mlx-c.", k: "apple metal mlx-c" },
   { t: "Direct CUDA backend", p: "Backends", u: "backends.html#cuda", s: "--backend cuda — direct CUDA Driver API + cuBLAS + PTX kernels (pure C#).", k: "nvidia ptx cublas experimental" },
   { t: "Pure C# CPU backend", p: "Backends", u: "backends.html#cpu", s: "--backend cpu — portable, no native dependencies; ggml_cpu for native CPU kernels.", k: "portable debugging no gpu" },
-  { t: "Build the native GGML / MLX libraries", p: "Backends", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh and CUDA arch detection.", k: "compile native cmake cuda arch" },
+  { t: "Build the native GGML / MLX libraries", p: "Backends", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh, CUDA arch detection, and the --vulkan opt-in (portable Vulkan toolchain on Windows).", k: "compile native cmake cuda arch vulkan glslc TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
 
   { t: "Supported models", p: "Models", u: "models.html#table", s: "Gemma 3/4, Qwen 3 / 3.5 / 3.6, GPT OSS, Nemotron-H, Mistral 3, DiffusionGemma, Qwen-Image-Edit.", k: "architectures families gemma qwen gptoss nemotron mistral image edit" },
   { t: "Model downloads (GGUF)", p: "Models", u: "models.html#downloads", s: "Hugging Face links for every supported architecture.", k: "huggingface weights download" },

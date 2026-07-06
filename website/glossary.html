@@ -32,7 +32,7 @@
       <tr><td><strong>Prefill vs decode</strong></td><td><em>Prefill</em> processes your whole prompt at once; <em>decode</em> generates the reply one token at a time. They have different performance characteristics.</td></tr>
       <tr><td><strong>KV cache</strong></td><td>Stored attention "keys and values" from earlier tokens, so the model doesn't recompute them. It makes long contexts and multi-turn chats efficient. → <a href="advanced.html#paged-kv">paged KV</a></td></tr>
       <tr><td><strong>TTFT</strong></td><td>"Time to first token" — how long before the answer starts streaming. KV-cache reuse reduces it on follow-up turns.</td></tr>
-      <tr><td><strong>Backend</strong></td><td>The hardware path that runs the math: CPU, NVIDIA GPU (CUDA), or Apple Silicon GPU (Metal/MLX). → <a href="backends.html">Backends</a></td></tr>
+      <tr><td><strong>Backend</strong></td><td>The hardware path that runs the math: CPU, NVIDIA GPU (CUDA), any Vulkan GPU (AMD/Intel/NVIDIA), or Apple Silicon GPU (Metal/MLX). → <a href="backends.html">Backends</a></td></tr>
       <tr><td><strong>MoE</strong> (Mixture of Experts)</td><td>A model that routes each token to a few specialized sub-networks ("experts") instead of the whole network, giving large capacity at lower compute per token.</td></tr>
       <tr><td><strong>Multimodal</strong></td><td>Able to take more than text — images, audio, or video — as input. → <a href="models.html#multimodal">Multimodal</a></td></tr>
       <tr><td><strong>Thinking / reasoning</strong></td><td>The model produces hidden step-by-step reasoning before its final answer; TensorSharp separates the two. → <a href="models.html#thinking">Thinking mode</a></td></tr>
@@ -48,7 +48,7 @@
   <h2 id="faq">Frequently asked questions</h2>
 
   <h3>Do I need a GPU?</h3>
-  <p>No. TensorSharp runs on plain CPU (<code>--backend cpu</code> or the faster <code>ggml_cpu</code>). A GPU — NVIDIA (CUDA) or Apple Silicon (Metal/MLX) — makes generation substantially faster, especially for larger models. See <a href="backends.html">Backends</a>.</p>
+  <p>No. TensorSharp runs on plain CPU (<code>--backend cpu</code> or the faster <code>ggml_cpu</code>). A GPU — NVIDIA (CUDA), any Vulkan-capable AMD/Intel/NVIDIA GPU, or Apple Silicon (Metal/MLX) — makes generation substantially faster, especially for larger models. See <a href="backends.html">Backends</a>.</p>
 
   <h3>Which model should I start with?</h3>
   <p><strong>Gemma-4-E4B (Q8_0)</strong> is a small, well-tested starting point. For lower memory, choose a <code>Q4_K_M</code> quantization; for higher quality, a larger model or <code>Q8_0</code>. See <a href="models.html#downloads">Model downloads</a>.</p>
@@ -64,7 +64,7 @@
 
   <h3>How can I make it faster?</h3>
   <ul>
-    <li>Use a GPU backend (<code>ggml_cuda</code> or <code>ggml_metal</code>).</li>
+    <li>Use a GPU backend (<code>ggml_cuda</code>, <code>ggml_vulkan</code>, or <code>ggml_metal</code>).</li>
     <li>Pick a smaller or more aggressively quantized model.</li>
     <li>On supported models, enable <a href="advanced.html#mtp">speculative decoding</a> with <code>--mtp-spec</code>.</li>
     <li>Reuse sessions so the <a href="advanced.html#continuous-batching">KV-cache prefix</a> carries over between turns.</li>

@@ -46,7 +46,9 @@
       <tr><td><code>--image / --video / --audio &lt;path&gt;</code></td><td>Media for vision / video / audio inference.</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF (auto-detected beside the model).</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Maximum tokens to generate (default 100).</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td><code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>, <code>ggml_vulkan</code>.</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td>Vulkan device index for <code>ggml_vulkan</code> on multi-GPU hosts (default 0; env <code>TS_GGML_VULKAN_DEVICE</code>).</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>List visible Vulkan devices (index + adapter name) and exit.</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV cache precision: <code>f32</code> (default), <code>f16</code>, <code>q8_0</code>, <code>q4_0</code> (~1/7 of f32, for very long 128K–256K contexts; the quantized tiers need the native GGML flash-attention path).</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>Start the interactive REPL.</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>Seed the system prompt.</td></tr>
@@ -79,6 +81,8 @@
       <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF file to host (required for inference).</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF; <code>none</code> to disable.</td></tr>
       <tr><td><code>--backend &lt;type&gt;</code></td><td>Default compute backend.</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code> / <code>--list-gpus</code></td><td>Vulkan device selection for <code>ggml_vulkan</code> / list visible Vulkan devices and exit.</td></tr>
+      <tr><td><code>--help</code></td><td>Print the parameter reference and exit (also shown when started with no arguments).</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Default generation limit when a request omits it (default 20000).</td></tr>
       <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Default sampling values.</td></tr>
       <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Default penalties and seed.</td></tr>
@@ -126,9 +130,12 @@
       <tr><td><code>TS_QWEN_IMAGE_VAE / TS_QWEN_IMAGE_TE / TS_QWEN_IMAGE_MMPROJ</code></td><td>Qwen-Image-Edit companion paths (VAE / Qwen2.5-VL text encoder / mmproj).</td></tr>
       <tr><td><code>TS_QWEN_IMAGE_LORA / TS_QWEN_IMAGE_LORA_SCALE</code></td><td>Lightning LoRA <code>.safetensors</code> merged into the DiT / scale override.</td></tr>
       <tr><td><code>TS_QWEN_DIT_CACHE / TS_QWEN_DIT_CACHE_MODE</code></td><td>Whole-DiT-step cache: <code>0</code> disables / mode <code>easycache</code>, <code>fbc</code>, <code>both</code>, <code>off</code>.</td></tr>
+      <tr><td><code>TS_GGML_VULKAN_DEVICE</code></td><td>Vulkan device index for <code>ggml_vulkan</code> (= <code>--gpu-device</code>).</td></tr>
+      <tr><td><code>TS_JSON_FORCE_OPEN</code></td><td><code>0</code> disables the structured-output first-token <code>{</code> constraint (on by default for <code>json_object</code> / <code>json_schema</code>).</td></tr>
       <tr><td><code>TS_MLX_* </code></td><td>MLX backend tuning: pipelined decode, mlock GGUF, fused KV write, batched MoE decode, memory caps.</td></tr>
       <tr><td><code>TENSORSHARP_MLX_LIBRARY / _LIBRARY_DIR</code></td><td>Override the search path for <code>libmlxc</code>.</td></tr>
       <tr><td><code>TENSORSHARP_GGML_NO_UPDATE / _GGML_GIT_REF</code></td><td>Skip / pin the ggml source clone on native builds.</td></tr>
+      <tr><td><code>TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN</code></td><td><code>ON</code> builds the native bridge with the GGML Vulkan backend (= build-script <code>--vulkan</code>).</td></tr>
     </tbody>
   </table>
   </div>

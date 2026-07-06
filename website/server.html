@@ -58,7 +58,10 @@
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>GGUF file to host (required for inference).</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>Multimodal projector GGUF (pass <code>none</code> to disable). Requires <code>--model</code>.</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td>Default backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>.</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>Default backend: <code>cpu</code>, <code>cuda</code>, <code>mlx</code>, <code>ggml_cpu</code>, <code>ggml_metal</code>, <code>ggml_cuda</code>, <code>ggml_vulkan</code>.</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td>Vulkan device index for the <code>ggml_vulkan</code> backend on multi-GPU hosts (default: 0; env <code>TS_GGML_VULKAN_DEVICE</code>).</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit.</td></tr>
+      <tr><td><code>--help</code></td><td>Print the full parameter reference and exit — also shown when the server is started with no arguments; pass at least one option (e.g. <code>--backend ggml_cpu</code>) to start headless and load a model later from the web UI.</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>Default generation limit when a request omits it (default: <code>20000</code>).</td></tr>
       <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>Default sampling values when a request does not provide them.</td></tr>
       <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>Default penalties and seed.</td></tr>

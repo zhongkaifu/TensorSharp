@@ -3,6 +3,11 @@ project(GgmlOps LANGUAGES C CXX)
 option(TENSORSHARP_GGML_NATIVE_BUILD_TESTS "Build TensorSharp GGML native regression tests" OFF)
 option(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA "Enable the ggml-cuda backend when building on Windows or Linux" OFF)
 option(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN "Enable the ggml-vulkan backend when building on Windows or Linux" OFF)
+# Cache marker maintained by build-windows.ps1 / build-linux.sh: ON when the
+# ENABLE_VULKAN value came from an explicit user choice (flag or env var) rather
+# than auto-detection, so later script runs keep honoring the explicit choice
+# while auto-detected defaults are re-evaluated. Not read by the build itself.
+option(TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT "The Vulkan on/off choice was made explicitly (build-script cache marker)" OFF)
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND APPLE)
     message(FATAL_ERROR "TENSORSHARP_GGML_NATIVE_ENABLE_CUDA is supported on Windows and Linux only.")

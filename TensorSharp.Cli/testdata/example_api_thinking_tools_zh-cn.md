@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。命令片段默认使用 `ggml_metal`；请根据机器替换为 `mlx`、`cuda`、`ggml_cuda`、`ggml_cpu` 或 `cpu`。
+这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。命令片段默认使用 `ggml_metal`；请根据机器替换为 `mlx`、`cuda`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu` 或 `cpu`。
 
 | 架构 | 思维链 | 工具调用 | 说明 |
 |---|---|---|---|

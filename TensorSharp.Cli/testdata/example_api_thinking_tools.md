@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `mlx`, `cuda`, `ggml_cuda`, `ggml_cpu`, or `cpu` to match your machine.
+These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. The command snippets use `ggml_metal`; replace it with `mlx`, `cuda`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, or `cpu` to match your machine.
 
 | Architecture | Thinking | Tool calls | Notes |
 |---|---|---|---|

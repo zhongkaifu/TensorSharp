@@ -18,13 +18,14 @@ window.SEARCH_INDEX_ZH = [
   { t: "下载 GGUF 模型", p: "快速上手", u: "getting-started.html#download", s: "从 Hugging Face 获取模型，例如 gemma-4-E4B-it Q8_0。", k: "huggingface 权重 gguf 量化" },
   { t: "首次运行", p: "快速上手", u: "getting-started.html#first-run", s: "一次性生成、交互式聊天，或启动服务器。", k: "hello world 示例 运行" },
 
-  { t: "选择后端", p: "后端", u: "backends.html#table", s: "选择 ggml_metal（Mac）、ggml_cuda（NVIDIA）或 cpu/ggml_cpu（可移植）。", k: "choose 选择 硬件 gpu 哪个后端" },
+  { t: "选择后端", p: "后端", u: "backends.html#table", s: "选择 ggml_metal（Mac）、ggml_cuda（NVIDIA）、ggml_vulkan（AMD/Intel/NVIDIA）或 cpu/ggml_cpu（可移植）。", k: "choose 选择 硬件 gpu 哪个后端" },
   { t: "GGML CUDA 后端", p: "后端", u: "backends.html#ggml", s: "--backend ggml_cuda —— Windows/Linux 上测试最充分的 NVIDIA 路径。", k: "nvidia gpu cuda windows linux" },
+  { t: "GGML Vulkan 后端", p: "后端", u: "backends.html#ggml", s: "--backend ggml_vulkan —— 与厂商无关的 GPU 路径（AMD/Intel/NVIDIA，Vulkan 1.3）；用 --gpu-device / --list-gpus 选择设备。", k: "vulkan amd intel gpu 设备 TS_GGML_VULKAN_DEVICE coopmat 厂商无关" },
   { t: "GGML Metal 后端", p: "后端", u: "backends.html#ggml", s: "--backend ggml_metal —— macOS / Apple Silicon 默认。", k: "apple silicon mac metal 苹果" },
   { t: "MLX 后端", p: "后端", u: "backends.html#mlx", s: "--backend mlx —— 基于 mlx-c 的 Apple Silicon GPU 路径。", k: "apple metal mlx-c 苹果" },
   { t: "直接 CUDA 后端", p: "后端", u: "backends.html#cuda", s: "--backend cuda —— 直接 CUDA Driver API + cuBLAS + PTX 内核（纯 C#）。", k: "nvidia ptx cublas 实验" },
   { t: "纯 C# CPU 后端", p: "后端", u: "backends.html#cpu", s: "--backend cpu —— 可移植、无原生依赖；ggml_cpu 提供原生 CPU 内核。", k: "可移植 调试 无 gpu" },
-  { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh 与 CUDA 架构检测。", k: "compile 编译 native cmake cuda arch" },
+  { t: "构建原生 GGML / MLX 库", p: "后端", u: "backends.html#native-build", s: "build-windows.ps1 / build-linux.sh / build-macos.sh、CUDA 架构检测，以及 --vulkan 选择启用（Windows 便携 Vulkan 工具链）。", k: "compile 编译 native cmake cuda arch vulkan glslc TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN" },
 
   { t: "支持的模型", p: "模型", u: "models.html#table", s: "Gemma 3/4、Qwen 3 / 3.5 / 3.6、GPT OSS、Nemotron-H、Mistral 3、DiffusionGemma、Qwen-Image-Edit。", k: "architectures 架构 家族 gemma qwen gptoss nemotron mistral 图像 编辑" },
   { t: "模型下载（GGUF）", p: "模型", u: "models.html#downloads", s: "每个受支持架构的 Hugging Face 链接。", k: "huggingface 权重 下载" },

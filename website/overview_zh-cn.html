@@ -89,7 +89,7 @@
     <tbody>
       <tr><td>模型家族</td><td>Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family（<code>qwen35</code>、<code>qwen35moe</code>、<code>qwen3next</code>）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3，以及 Qwen-Image-Edit（<code>qwen_image</code> 图像编辑）。</td></tr>
       <tr><td>推理宿主</td><td>CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 式 API、OpenAI Chat Completions 式 API。</td></tr>
-      <tr><td>后端</td><td>纯 C# CPU、直接 CUDA/cuBLAS（<code>cuda</code>）、MLX Metal（<code>mlx</code>）、GGML CPU、GGML Metal、GGML CUDA。</td></tr>
+      <tr><td>后端</td><td>纯 C# CPU、直接 CUDA/cuBLAS（<code>cuda</code>）、MLX Metal（<code>mlx</code>）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。</td></tr>
       <tr><td>多模态</td><td>Gemma 4 图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3 与 Nemotron-H Omni 图像输入。</td></tr>
       <tr><td>连续批处理</td><td>vLLM 式分页 KV 缓存、块哈希前缀共享、迭代级调度器（默认开启；可用 <code>--no-continuous-batching</code> 关闭）。</td></tr>
       <tr><td>推测解码</td><td>Qwen 3.6（内嵌）与 Gemma 4（独立草稿 GGUF）的 MTP / NextN 草稿头；默认关闭，通过 <code>--mtp-spec</code> 启用。</td></tr>

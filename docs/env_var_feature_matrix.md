@@ -155,8 +155,9 @@ expected substring because the sample media is runner-provided.
 
 The runner filters the combinatorial product before execution:
 
-1. Backend availability: CUDA backends are skipped on macOS; MLX requires
-   Apple Silicon; GGML Metal requires macOS.
+1. Backend availability: CUDA and Vulkan backends are skipped on macOS (Metal
+   is the GPU backend there); MLX requires Apple Silicon; GGML Metal requires
+   macOS.
 2. Model capability: image/audio/video/tool/thinking features are skipped when
    the discovered or configured model does not advertise that capability.
 3. Projector availability: multimodal features require an mmproj path.

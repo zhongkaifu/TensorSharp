@@ -209,17 +209,61 @@ if ([string]::IsNullOrWhiteSpace($EnableCuda)) {
     $EnableCuda = "OFF"
 }
 
-# Vulkan is opt-in (--vulkan or TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON): unlike
-# CUDA there is no cheap "toolkit installed" signal worth auto-detecting on —
-# nearly every Windows machine has a Vulkan *runtime*, and enabling the backend
-# adds a multi-minute shader compile to the native build. Once enabled, the
-# setting sticks via the CMake cache like the CUDA one does.
+# Vulkan: an explicit choice (--vulkan/--no-vulkan or
+# TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN) wins and sticks via the CMake cache;
+# TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT records that the cached value was
+# explicit, so an auto-detected default never becomes sticky. Otherwise the
+# backend is auto-enabled when the machine supports Vulkan (the runtime
+# vulkan-1.dll that ships with every recent GPU driver is present) and the
+# build toolchain (headers, loader import lib, glslc, SPIRV-Headers) is
+# downloaded automatically by eng/fetch-vulkan-toolchain.ps1 when missing. An
+# auto-enable whose toolchain cannot be provisioned (e.g. no network) degrades
+# to a warning and builds without Vulkan; an explicit --vulkan makes it fatal.
+$VulkanExplicit = "OFF"
 $EnableVulkan = Normalize-Bool $EnableVulkan
-if ([string]::IsNullOrWhiteSpace($EnableVulkan)) {
+if (-not [string]::IsNullOrWhiteSpace($EnableVulkan)) {
+    $VulkanExplicit = "ON"
+}
+elseif ((Read-CachedBackendSetting "TENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT") -eq "ON") {
     $EnableVulkan = Read-CachedBackendSetting "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN"
+    if (-not [string]::IsNullOrWhiteSpace($EnableVulkan)) {
+        $VulkanExplicit = "ON"
+    }
 }
 if ([string]::IsNullOrWhiteSpace($EnableVulkan)) {
-    $EnableVulkan = "OFF"
+    $EnableVulkan = if (Test-Path (Join-Path $env:SystemRoot "System32\vulkan-1.dll")) { "ON" } else { "OFF" }
+}
+
+$VulkanCMakeArgs = New-Object System.Collections.Generic.List[string]
+if ($EnableVulkan -eq "ON") {
+    try {
+        # Ensure the Vulkan build toolchain (headers, loader import lib, glslc,
+        # SPIRV-Headers) is available. With a LunarG SDK installed the script is a
+        # no-op and FindVulkan discovers everything through VULKAN_SDK; otherwise it
+        # provisions a portable toolchain that is passed to CMake explicitly below.
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-vulkan-toolchain.ps1")
+        if ($LASTEXITCODE -ne 0) { throw "fetch-vulkan-toolchain.ps1 failed with exit code $LASTEXITCODE" }
+
+        $VulkanSdk = $env:VULKAN_SDK
+        $HasFullSdk = -not [string]::IsNullOrWhiteSpace($VulkanSdk) -and
+            (Test-Path (Join-Path $VulkanSdk "Include\vulkan\vulkan.h")) -and
+            (Test-Path (Join-Path $VulkanSdk "Lib\vulkan-1.lib")) -and
+            (Test-Path (Join-Path $VulkanSdk "Bin\glslc.exe"))
+        if (-not $HasFullSdk) {
+            $ToolchainDir = (Resolve-Path (Join-Path $ScriptDir "..\ExternalProjects\vulkan-toolchain")).Path
+            $VulkanCMakeArgs.Add("-DVulkan_INCLUDE_DIR=$(Join-Path $ToolchainDir 'Vulkan-Headers\include')")
+            $VulkanCMakeArgs.Add("-DVulkan_LIBRARY=$(Join-Path $ToolchainDir 'loader\vulkan-1.lib')")
+            $VulkanCMakeArgs.Add("-DVulkan_GLSLC_EXECUTABLE=$(Join-Path $ToolchainDir 'shaderc\bin\glslc.exe')")
+            $VulkanCMakeArgs.Add("-DSPIRV-Headers_DIR=$(Join-Path $ToolchainDir 'spirv-headers-install\share\cmake\SPIRV-Headers')")
+        }
+    }
+    catch {
+        if ($VulkanExplicit -eq "ON") { throw }
+        Write-Warning ("This machine supports Vulkan but the ggml-vulkan build toolchain could not be provisioned: " +
+            "$($_.Exception.Message) Building without the ggml-vulkan backend; pass --vulkan to make this an error.")
+        $EnableVulkan = "OFF"
+        $VulkanCMakeArgs.Clear()
+    }
 }
 
 if ($EnableCuda -eq "ON" -and [string]::IsNullOrWhiteSpace($CudaArchitectures) -and -not $UserSetCudaArchitectures) {
@@ -270,8 +314,10 @@ $CMakeArgs = @(
     "-DCMAKE_BUILD_TYPE=Release",
     "-DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA=$EnableCuda",
     "-DTENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=$EnableVulkan",
+    "-DTENSORSHARP_GGML_NATIVE_VULKAN_EXPLICIT=$VulkanExplicit",
     "-DTENSORSHARP_GGML_NATIVE_BUILD_TESTS=$BuildTests"
 )
+$CMakeArgs += $VulkanCMakeArgs
 
 if ($EnableCuda -eq "ON" -and -not [string]::IsNullOrWhiteSpace($CudaArchitectures) -and -not $UserSetCudaArchitectures) {
     $CMakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures"
@@ -280,28 +326,6 @@ if ($EnableCuda -eq "ON" -and -not [string]::IsNullOrWhiteSpace($CudaArchitectur
 # Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-ggml.ps1")
 if ($LASTEXITCODE -ne 0) { throw "fetch-ggml.ps1 failed with exit code $LASTEXITCODE" }
-
-if ($EnableVulkan -eq "ON") {
-    # Ensure the Vulkan build toolchain (headers, loader import lib, glslc,
-    # SPIRV-Headers) is available. With a LunarG SDK installed the script is a
-    # no-op and FindVulkan discovers everything through VULKAN_SDK; otherwise it
-    # provisions a portable toolchain that is passed to CMake explicitly below.
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "..\eng\fetch-vulkan-toolchain.ps1")
-    if ($LASTEXITCODE -ne 0) { throw "fetch-vulkan-toolchain.ps1 failed with exit code $LASTEXITCODE" }
-
-    $VulkanSdk = $env:VULKAN_SDK
-    $HasFullSdk = -not [string]::IsNullOrWhiteSpace($VulkanSdk) -and
-        (Test-Path (Join-Path $VulkanSdk "Include\vulkan\vulkan.h")) -and
-        (Test-Path (Join-Path $VulkanSdk "Lib\vulkan-1.lib")) -and
-        (Test-Path (Join-Path $VulkanSdk "Bin\glslc.exe"))
-    if (-not $HasFullSdk) {
-        $ToolchainDir = (Resolve-Path (Join-Path $ScriptDir "..\ExternalProjects\vulkan-toolchain")).Path
-        $CMakeArgs += "-DVulkan_INCLUDE_DIR=$(Join-Path $ToolchainDir 'Vulkan-Headers\include')"
-        $CMakeArgs += "-DVulkan_LIBRARY=$(Join-Path $ToolchainDir 'loader\vulkan-1.lib')"
-        $CMakeArgs += "-DVulkan_GLSLC_EXECUTABLE=$(Join-Path $ToolchainDir 'shaderc\bin\glslc.exe')"
-        $CMakeArgs += "-DSPIRV-Headers_DIR=$(Join-Path $ToolchainDir 'spirv-headers-install\share\cmake\SPIRV-Headers')"
-    }
-}
 
 cmake -S $ScriptDir -B $BuildDir @GeneratorArgs @CMakeArgs @ExtraCMakeArgs
 

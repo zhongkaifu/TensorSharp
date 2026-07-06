@@ -201,7 +201,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   <p>Continue the loop by appending the assistant <code>tool_calls</code> plus a <code>{"role": "tool", "tool_call_id": "...", "content": "..."}</code> message with the function result, then calling the endpoint again. (The Ollama endpoint uses the same flow with a <code>role: "tool"</code> message.)</p>
 
   <h2 id="structured">4 · Structured outputs (JSON schema)</h2>
-  <p>The OpenAI <code>response_format</code> accepts <code>text</code>, <code>json_object</code>, and validated <code>json_schema</code>. The server injects strict JSON instructions and validates the output before returning it.</p>
+  <p>The OpenAI <code>response_format</code> accepts <code>text</code>, <code>json_object</code>, and validated <code>json_schema</code>. The server injects strict JSON instructions and validates the output before returning it. JSON requests also constrain the <strong>first sampled token</strong> to a <code>{</code>-opening candidate, so chatty models cannot ramble prose before the object and streamed time-to-first-token reflects prefill latency (<code>TS_JSON_FORCE_OPEN=0</code> disables).</p>
   <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{

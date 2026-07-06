@@ -58,7 +58,10 @@
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>要托管的 GGUF 文件（推理必需）。</td></tr>
       <tr><td><code>--mmproj &lt;path&gt;</code></td><td>多模态投影器 GGUF（传 <code>none</code> 可禁用）。需要 <code>--model</code>。</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td>默认后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>默认后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>。</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 后端在多 GPU 主机上使用的 Vulkan 设备索引（默认：0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
+      <tr><td><code>--help</code></td><td>打印完整参数说明后退出 —— 不带任何参数启动服务时也会显示；传入至少一个参数（如 <code>--backend ggml_cpu</code>）即可无模型启动，之后在 Web UI 中加载模型。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>请求未指定时的默认生成上限（默认：<code>20000</code>）。</td></tr>
       <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>请求未提供时的默认采样值。</td></tr>
       <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>默认惩罚与随机种子。</td></tr>

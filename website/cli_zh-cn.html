@@ -110,7 +110,9 @@
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>最大生成 token 数（默认：100）。</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td>计算后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>计算后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>。</td></tr>
+      <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 后端在多 GPU 主机上使用的 Vulkan 设备索引（默认：0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
+      <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
       <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>（默认）、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>。块量化档位需要原生 GGML flash-attention 路径；<code>q4_0</code>（约为 f32 占用的 1/7）面向 128K–256K 的超长上下文。</td></tr>
       <tr><td><code>--interactive</code> / <code>-i</code></td><td>启动交互式 REPL（见下文）。</td></tr>
       <tr><td><code>--system &lt;text&gt;</code> / <code>--system-file &lt;path&gt;</code></td><td>从文本或文件设定会话的系统提示。</td></tr>

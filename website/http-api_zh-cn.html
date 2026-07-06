@@ -201,7 +201,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   <p>续接循环：把助手的 <code>tool_calls</code> 与一条携带函数结果的 <code>{"role": "tool", "tool_call_id": "...", "content": "..."}</code> 消息追加进去，再次调用该端点。（Ollama 端点使用同样的流程，配以一条 <code>role: "tool"</code> 消息。）</p>
 
   <h2 id="structured">4 · 结构化输出（JSON schema）</h2>
-  <p>OpenAI 的 <code>response_format</code> 接受 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。服务器会注入严格的 JSON 指令，并在返回前校验输出。</p>
+  <p>OpenAI 的 <code>response_format</code> 接受 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。服务器会注入严格的 JSON 指令，并在返回前校验输出。JSON 请求还会把<strong>首个采样 token</strong> 约束为以 <code>{</code> 开头的候选，使爱闲聊的模型无法在 JSON 对象前输出散文，流式首 token 时延因此反映 prefill 延迟（<code>TS_JSON_FORCE_OPEN=0</code> 可关闭）。</p>
   <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{

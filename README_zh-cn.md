@@ -55,7 +55,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 |---|---|---|---|
 | **Apple Silicon（Mac）** | GGML Metal | `--backend ggml_metal` | macOS 默认。`--backend mlx` 是另一条 Apple Silicon GPU 路径。 |
 | **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | 测试最充分的 NVIDIA 路径。`--backend cuda` 是用于实验的 Direct PTX/cuBLAS 后端。 |
-| **Windows / Linux + AMD / Intel / NVIDIA GPU** | GGML Vulkan | `--backend ggml_vulkan` | 与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。需在原生构建时用 `--vulkan` 选择启用。 |
+| **Windows / Linux + AMD / Intel / NVIDIA GPU** | GGML Vulkan | `--backend ggml_vulkan` | 与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。机器有 Vulkan 运行时即自动构建；用 `--no-vulkan` 退出。 |
 | **无 GPU / 可移植 / 调试** | 纯 C# CPU | `--backend cpu` | 无原生依赖。需要更快的 CPU 推理可用 `--backend ggml_cpu`（原生算子）。 |
 
 每个后端的完整说明及其加速范围见 [计算后端](#计算后端)。
@@ -114,7 +114,7 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 |---|---|
 | 模型家族 | Gemma 3/4、DiffusionGemma、Qwen 3、Qwen 3.5/3.6-family GGUF（`qwen35`、`qwen35moe`、`qwen3next`）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni）、Mistral 3。图像编辑通过 Qwen-Image-Edit（`qwen_image` MMDiT）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API。DiffusionGemma 当前走 CLI 扩散运行模式与 Web UI 去噪流；Qwen-Image-Edit 走 CLI 图像编辑模式与 Web UI 图像编辑流程。 |
-| 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA |
+| 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan |
 | 多模态 | Gemma 4 支持图像/视频/音频；Gemma 3、Qwen 3.5-family、Mistral 3、Nemotron-H Omni 支持图像输入 |
 | 连续批处理 | vLLM 风格的分页 KV 缓存、跨请求基于内容哈希的前缀共享、迭代级调度器（默认启用，可通过 `--no-continuous-batching` 关闭） |
 | 投机解码 | MTP / NextN 草稿头用于单序列 decode：Qwen 3.6（内嵌 NextN）与 Gemma 4（独立 `gemma4-assistant` 草稿 GGUF）；默认关闭，通过 `--mtp-spec` 启用（Gemma 4 还需 `--mtp-draft-model`）。在 ggml 后端与纯 C# `cuda` 后端上有收益；CPU / MLX 走标准 decode。 |
@@ -129,9 +129,9 @@ echo "用一句话解释 Mixture-of-Experts。" > prompt.txt
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3、Qwen 3.5/3.6-family、Gemma 4、GPT OSS、Nemotron-H）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **量化模型支持** —— 加载 Q4_K_M、Q8_0、F16、MXFP4 等量化格式的 GGUF 文件；执行原生量化矩阵乘法（matmul），无需反量化到 FP32，并且纯 C# CPU 后端在加载大型 GGUF 时也会保持量化权重压缩状态
-- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）和 GGML CUDA（Windows/Linux + NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
+- **GPU 加速** —— 通过 GGML 支持 Apple Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）和 GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA），并提供 Direct CUDA/cuBLAS 后端（含 PTX 内核与未覆盖算子的 CPU 回退），以及面向 Apple Silicon 的 MLX 后端（mlx-c / Metal）
 - **优化后的纯 C# CPU 后端** —— 为 GEMM、RMSNorm、RoPE、softmax、融合激活等推理热点路径提供托管快速路径和 SIMD 内核
-- **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
+- **连续批处理 & 分页 KV 缓存** —— vLLM 风格的分页 KV 块池，跨请求的块级哈希前缀共享，迭代级调度器（可在批内动态加入/抢占序列），可选的 SSD 冷层用于超大 KV 工作集，原生融合分页注意力内核（`TSGgml_PagedAttentionForward`，在 Metal/CUDA/Vulkan 上驱动 `ggml_flash_attn_ext`）。`TensorSharp.Server` 默认启用，可用 `--no-continuous-batching` 关闭。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **MTP / NextN 投机解码** —— 多 token 预测草稿头加速单序列（无并发）decode。Qwen 3.6 将 NextN 块内嵌在主干 GGUF 中；Gemma 4 通过 `--mtp-draft-model` 加载独立的 EAGLE 风格 `gemma4-assistant` 草稿 GGUF，其草稿层读取目标模型自身的 KV 缓存。草稿头每步最多提议 `--mtp-draft` 个 token（草稿置信度 ≥ `--mtp-pmin` 时保留），主干用一次批量前向完成验证；起草与验证均由该请求自己的采样器（含惩罚项）驱动，因此输出与标准 decode 完全一致。通过 `--mtp-spec` 启用（默认关闭）。ggml 后端有融合的多 token 验证 / 草稿步内核，是明确收益；纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿，同样有收益；CPU / MLX 保持标准 decode。环境变量：`TS_MTP_*`（通用）与 `TS_GMTP_*`（Gemma 4 调优）。
 - **批处理 / 并行推理** —— 已为 Mistral 3、Gemma 4、GPT OSS、Qwen 3、Qwen 3.5/3.6-family、Nemotron-H 全部默认启用 `IBatchedPagedModel.ForwardBatch`，能在一次前向传播中打包 N 个序列，使用 `slotMapping` 进行分页 K/V 写入，并通过原生内核做按序列注意力。每个模型都提供 `TS_<FAMILY>_BATCHED=0` 兜底开关（如 `TS_GEMMA4_BATCHED=0`、`TS_QWEN35_BATCHED=0`、`TS_GPTOSS_BATCHED=0`、`TS_NEMOTRON_BATCHED=0`），可强制回到按序列 KV-swap 路径用于 A/B 对比或回归排查。
 - **兼容 Ollama 与 OpenAI API** —— 可作为现有工具链的即插即用替代端点
@@ -197,7 +197,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的 Hugging
 | MLX Metal | `--backend mlx` | Apple Silicon（GGML Metal 之外的另一选择） | 基于 [mlx-c](https://github.com/ml-explore/mlx-c) 的 GPU 加速路径。实现了原生量化算子（Q4_K_M、Q8_0、Q5_K、Q6_K、IQ2_XXS、IQ4_XS、IQ4_NL、MXFP4 等无需反量化到 FP32）、融合 decode / prefill Metal kernel（融合 QKV 预处理、融合 gate+up+SiLUMul MoE、融合多维 KV 写入）、编译图 kernel、定期 `async_eval` 让 GPU/CPU 工作重叠的异步 worker 派发、用堆叠权重 slab 的批处理 MoE 解码、MoE 专家 offload、通过 `mlock(2)` 把 GGUF mmap 钉在物理内存、按宿主机派生的分配器上限（`TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB`），并对未实现的算子提供 CPU 回退。依赖 `libmlxc`（可通过 `TensorSharp.Backends.MLX/build-native-macos.sh` 在本地编译，或用 `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR` 指定路径）。 |
 | GGML Metal | `--backend ggml_metal` | Apple Silicon（macOS 默认） | 通过 Apple Metal 进行 GPU 加速。量化权重通过 host 指针缓冲区从 GGUF 文件零拷贝映射到 Metal command buffer，常驻内存接近模型在磁盘上的大小。 |
 | GGML CUDA | `--backend ggml_cuda` | 通过 ggml 使用 NVIDIA 推理 | 通过 GGML CUDA 在 Windows 或 Linux + NVIDIA GPU 上进行加速。量化权重在加载时一次性上传到设备显存，之后释放主机端拷贝。 |
-| GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。在原生构建时用 `--vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`）选择启用；Windows 上若未安装 Vulkan SDK，构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动准备便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers），Linux 上请先安装发行版 Vulkan SDK 软件包（如 `libvulkan-dev`、`glslc`、`spirv-headers`）。 |
+| GGML Vulkan | `--backend ggml_vulkan` | 通过 ggml 的厂商无关 GPU 推理 | 通过 GGML Vulkan 在 Windows 或 Linux 上加速——支持带 Vulkan 1.3 驱动的 AMD、Intel 与 NVIDIA GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。机器有 Vulkan 运行时（已安装 loader）时原生构建会自动启用；未安装 Vulkan SDK 或发行版开发包时，构建会通过 `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` 自动下载便携工具链（headers、glslc、SPIRV-Headers，Windows 上还有 loader 导入库）。用 `--no-vulkan`（或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`）退出。 |
 | GGML CPU | `--backend ggml_cpu` | 原生 CPU 内核 | 使用原生 GGML 与优化内核进行 CPU 推理。量化权重以零拷贝方式从 GGUF 文件映射。 |
 | 纯 C# CPU | `--backend cpu` | 可移植性与调试 | 无原生依赖的可移植 CPU 推理。 |
 
@@ -224,7 +224,7 @@ TensorSharp/
 │   ├── KvBlockTransfer.cs       # 跨序列的 KV 块 extract/inject 辅助
 │   ├── MtpSpeculativeDecoder.cs # Qwen 3.6 与 Gemma 4 共用的 MTP/NextN 起草-验证-回滚驱动
 │   └── ModelMultimodalInjector.cs # 视觉 / 音频 / 视频嵌入注入
-├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/CPU）
+├── TensorSharp.Backends.GGML/   # GGML 后端绑定（通过原生库支持 Metal/CUDA/Vulkan/CPU）
 ├── TensorSharp.Backends.Cuda/   # Direct CUDA 后端（CUDA Driver API、cuBLAS、PTX 内核）
 ├── TensorSharp.Backends.MLX/    # Apple Silicon MLX 后端（mlx-c / Metal），原生桥接由 `build-native-macos.sh` 编译
 ├── TensorSharp.GGML.Native/     # 到 ggml 的原生 C++ 桥接（构建 libGgmlOps，拆分为多个专注源文件）
@@ -245,7 +245,7 @@ TensorSharp/
 ├── TensorSharp.Server/          # Web 聊天 + API 服务（ASP.NET Core）
 │   ├── Program.cs               # 精简启动：DI 注册、中间件、端点映射、paged-KV + 连续批处理 CLI 翻译
 │   ├── ModelService.cs          # 保持服务端推理公共 API 稳定的门面，持有 InferenceEngineHost
-│   ├── ModelLifecycleService.cs # 模型加载/释放与后端选择（CPU / CUDA / MLX / GGML CPU/Metal/CUDA）
+│   ├── ModelLifecycleService.cs # 模型加载/释放与后端选择（CPU / CUDA / MLX / GGML CPU/Metal/CUDA/Vulkan）
 │   ├── InferenceEngineHost.cs   # DI 注册的单模型 InferenceEngine 单例（连续批处理入口）
 │   ├── ChatGenerationPipeline.cs # Prompt 渲染，将请求提交到 InferenceEngine，流式返回 token，处理 stop
 │   ├── InferenceTelemetry.cs    # Prompt/eval 计时、TTFT、tokens/sec、完整输入/输出日志
@@ -327,8 +327,8 @@ pwsh ./eng/verify-packages.ps1
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具；若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`
 - **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
 - **Linux（GGML CPU / CUDA 后端）：** CMake 3.20+；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本
-- **Windows（GGML Vulkan 后端）：** 在 `dotnet build` 前设置 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`（或运行 `build-windows.ps1 --vulkan`）。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。运行时需要支持 Vulkan 1.3 的 GPU 驱动
-- **Linux（GGML Vulkan 后端）：** 用 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`（或 `build-linux.sh --vulkan`）选择启用；请先安装发行版 Vulkan SDK 软件包，例如 `apt install libvulkan-dev glslc spirv-headers`
+- **Windows（GGML Vulkan 后端）：** 机器有 Vulkan 运行时（每个较新的 GPU 驱动都带的 `System32\vulkan-1.dll`）时自动启用。已安装 [LunarG Vulkan SDK](https://vulkan.lunarg.com/) 时直接使用；未安装时构建会通过 `eng/fetch-vulkan-toolchain.ps1` 自动把便携工具链（Vulkan-Headers、由系统 loader 生成的 vulkan-1 导入库、glslc、SPIRV-Headers）准备到 `ExternalProjects/vulkan-toolchain/`。用 `build-windows.ps1 --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出。运行时需要支持 Vulkan 1.3 的 GPU 驱动
+- **Linux（GGML Vulkan 后端）：** 已安装 Vulkan loader（`libvulkan.so.1`）时自动启用。存在发行版开发包时直接使用（`apt install libvulkan-dev glslc spirv-headers`）；否则构建会通过 `eng/fetch-vulkan-toolchain.sh` 把缺失的部分（Vulkan-Headers、shaderc CI 预编译的 glslc、SPIRV-Headers）自动下载到 `ExternalProjects/vulkan-toolchain/`。用 `build-linux.sh --no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF` 退出
 - GGUF 模型文件（例如来自 [Hugging Face](https://huggingface.co)）
 
 ## 构建
@@ -413,7 +413,7 @@ TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.Cli/TensorSharp.
 $env:TENSORSHARP_GGML_NATIVE_ENABLE_CUDA='ON'; dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 ```
 
-在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Windows 和 Linux 上，原生脚本会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-windows.ps1 --cuda`、`build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。构建产物会自动复制到应用输出目录。
+在 macOS 上会生成带 Metal GPU 支持的 `libGgmlOps.dylib`。在 Windows 和 Linux 上，原生脚本会保留已有的 CUDA 构建，并在检测到 CUDA 工具链时自动启用 GGML_CUDA；也可以通过 `build-windows.ps1 --cuda`、`build-linux.sh --cuda` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` 显式启用。GGML Vulkan 后端在机器有 Vulkan 运行时时同样自动启用，并在首次使用时下载其构建工具链；`--vulkan` / `--no-vulkan` 或 `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON/OFF` 可显式指定，显式选择会在后续重建中保持（构建自动准备的 Vulkan 工具链见[前置要求](#前置要求)）。构建产物会自动复制到应用输出目录。
 
 Direct `cuda` 后端由托管 C# 代码和 PTX 内核组成。执行 `dotnet build` 时，`TensorSharp.Backends.Cuda` 会在检测到 `nvcc` 后把 `native/kernels/*.cu` 编译到 `native/ptx/*.ptx`；如果缺少 `nvcc`，构建会继续，PTX 覆盖的算子会使用 CPU 回退。cuBLAS GEMM 仍要求运行时能够找到 CUDA 运行库。
 
@@ -601,7 +601,7 @@ cd TensorSharp.Cli/bin
 |---|---|
 | `/info`、`/status` | 显示当前加载的模型、后端、架构、上下文/词表大小、投影器、对话深度与待发送附件 |
 | `/model <路径>` | 在当前后端上加载另一个 `.gguf` 模型（会重置会话） |
-| `/backend <名称>` | 用其他后端重新加载当前模型：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` |
+| `/backend <名称>` | 用其他后端重新加载当前模型：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
 | `/mmproj <路径>` | 为当前模型加载（或替换）多模态投影器。别名：`/projector` |
 
 采样（实时生效，跨多轮持久化）：
@@ -909,6 +909,7 @@ cd TensorSharp.Server/bin
 | 功能 | 默认 | 环境变量 | 构建脚本参数 |
 |---|---|---|---|
 | 在原生构建中启用 GGML CUDA | 根据工具链自动检测 | `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` | `--cuda` / `--no-cuda` |
+| 在原生构建中启用 GGML Vulkan | 根据已安装的 Vulkan 运行时自动检测；未安装 Vulkan SDK / 开发包时自动下载便携工具链（headers、glslc、SPIRV-Headers） | `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON/OFF` | `--vulkan` / `--no-vulkan` |
 | 精简 `CMAKE_CUDA_ARCHITECTURES` 列表 | 根据可见 GPU 自动检测 | `TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES` | `--cuda-arch='86-real;89-real'` |
 | 原生构建并行度上限 | 保守自动上限 | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
 
@@ -1164,7 +1165,7 @@ TensorSharp 采用分层系统结构：
 - **环形 KV 缓存**：滑动窗口注意力层使用固定大小环形缓冲区，使内存占用不随序列长度增长。
 - **KV 缓存前缀复用**：多轮对话会复用各轮之间最长的匹配 token 前缀。对 SWA 模型，截断会自动按滑动窗口大小回退，使后缀部分可以重建 SWA 上下文。
 - **分页 KV 缓存 & 块哈希前缀共享**：连续批处理引擎把 KV 切分成固定大小的块，对每个写满的块做内容哈希，并在并发 / 历史请求间共享。尚未实现 `IBatchedPagedModel` 的模型仍会走同一引擎内隔离的按序列 KV-swap 回退路径。
-- **原生分页注意力内核**：`TSGgml_PagedAttentionForward`（及面向 GPT OSS 的 `WithSinks` 变体）在 C++ 中按序列从分页缓冲区聚合 K/V，按序列构建小型 GGML 图，并派发 `ggml_flash_attn_ext`——也就是旧的单序列路径所使用的同一融合 Metal/CUDA flash 注意力内核。在 Ministral-3-14B 长上下文（4×~800 tokens）上比旧的按序列 GGML 路径**快 ~21%**。
+- **原生分页注意力内核**：`TSGgml_PagedAttentionForward`（及面向 GPT OSS 的 `WithSinks` 变体）在 C++ 中按序列从分页缓冲区聚合 K/V，按序列构建小型 GGML 图，并派发 `ggml_flash_attn_ext`——也就是旧的单序列路径所使用的同一融合 GPU flash 注意力内核（Metal/CUDA/Vulkan）。在 Ministral-3-14B 长上下文（4×~800 tokens）上比旧的按序列 GGML 路径**快 ~21%**。
 - **批处理 / 分页前向**：Mistral 3、Gemma 4、GPT OSS、Qwen 3.5/3.6（含 GatedDeltaNet 递归状态池）、Nemotron-H（含 Mamba2 递归状态池 + 原生批处理 Mamba2 内核）把 N 个序列打包到一次 `ForwardBatch` 调用中，每层执行一次批处理线性投影 matmul，通过 `slotMapping` 写入分页 K/V，并通过原生内核做按序列注意力。Gemma 4 批处理路径在 batch=8 短 prompt 下达到 **1.5×** 旧吞吐，在 4×800-token prompt 下达到 **1.6×**；Nemotron-H Mamba2 批处理在 Apple M4 Pro 上 batch=3 时达到 **3.95×**。详见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)。
 - **MTP / NextN 投机解码**：单序列可运行多 token 预测草稿头（Qwen 3.6 内嵌 NextN 块；Gemma 4 独立 `gemma4-assistant` 草稿 GGUF）。草稿头最多提议 `--mtp-draft` 个 token，主干用一次批量前向验证，二者均由该请求自己的采样器驱动，因此在不改变输出的前提下加速 decode。在 ggml 后端上，融合的单图多 token 验证与草稿步内核（`NativeGemma4ModelVerify` / `TryFusedMoEModelVerify` / `NativeGemma4DraftStep`，以及 Qwen 3.6 的 NextN 图）摊销了验证开销；Gemma 4 路径还增加了 gallocr 验证 scratch 以及部分接受时避免重跑已保留前缀的稠密快速回滚。纯 C# `cuda` 后端运行完全驻留 GPU 的逐算子验证 / 草稿（donor 缓存注意力、GQA decode 内核、GPU RoPE），使验证层循环零宿主端同步停顿。默认关闭；`--mtp-spec`。
 - **DiffusionGemma prompt-KV 缓存与融合去噪**：GPU 后端会在每个 block 中只对 `[prompt | canvas]` 的 prompt 部分预填充一次 K/V，并在去噪多步中复用；GGML 后端默认使用融合整模型 diffusion decode 与融合 lm-head tail。Web UI 通过 `DiffusionBatchScheduler` 在 block 边界批处理并发 diffusion 请求。

@@ -17,7 +17,7 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 |---|---|
 | 承载模型 | 单个 GGUF 文件，通过 `--model` 选择；请求中的 `model` 必须是该文件名或 basename |
 | 投影器 | 可选单个投影器，通过 `--mmproj` 选择；供多模态模型使用 |
-| 后端 | `mlx`、`cuda`、`ggml_metal`、`ggml_cuda`、`ggml_cpu`、`cpu`；`/api/models` 会返回当前主机可用项 |
+| 后端 | `mlx`、`cuda`、`ggml_metal`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu`、`cpu`；`/api/models` 会返回当前主机可用项 |
 | 并发 | 自回归聊天使用连续批处理引擎。旧队列 API 只保留状态 / 兼容字段；DiffusionGemma Web UI 请求使用独立的 block 边界 diffusion scheduler。 |
 | 生成模式 | 自回归模型流式追加 token chunk。DiffusionGemma 在 append-only 兼容端点返回最终文本，在 Web UI `/api/chat` 上提供整条消息替换式实时去噪预览。 |
 | 会话 | Web UI 使用每个浏览器 tab 独立会话；Ollama/OpenAI 兼容端点共享默认会话 |
@@ -34,6 +34,9 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 
 # Windows/Linux + NVIDIA，GGML CUDA 后端
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_cuda
+
+# Windows/Linux + AMD/Intel/NVIDIA GPU，GGML Vulkan 后端（多 GPU 主机用 --gpu-device 选择设备；见 --list-gpus）
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
 
 # Apple Silicon，MLX 后端
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend mlx
@@ -64,6 +67,7 @@ DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
 | `ggml_cpu` | 原生 GGML CPU 后端 |
 | `ggml_metal` | macOS 的 GGML Metal 后端 |
 | `ggml_cuda` | NVIDIA GPU 的 GGML CUDA 后端 |
+| `ggml_vulkan` | AMD / Intel / NVIDIA GPU 的 GGML Vulkan 后端（与厂商无关；需要在原生构建时启用 Vulkan） |
 
 ---
 
@@ -596,7 +600,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -830,6 +834,7 @@ print()
 注意事项：
 
 - `response_format.type = "json_schema"` 当前不能与 `tools` 或 `think` 同时使用。
+- `json_object` / `json_schema` 请求会把**首个采样 token** 约束为以 `{` 开头的候选（效果等同于 llama.cpp 的 JSON grammar），使爱闲聊的模型无法在 JSON 对象前输出散文，流式首 token 时延（TTFT）因此反映 prefill 延迟而不是被过滤掉的前导文本。后续 token 正常采样。设置 `TS_JSON_FORCE_OPEN=0` 可关闭。
 - 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。设置 `TS_STRUCTURED_STREAM_BUFFER=1` 可对两者强制使用旧的“全部缓存”行为。非流式请求始终归一化。
 - 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。
 

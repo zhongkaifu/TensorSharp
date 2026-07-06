@@ -32,7 +32,7 @@
       <tr><td><strong>Prefill vs decode</strong></td><td><em>Prefill</em> 一次性处理你的整个提示词；<em>decode</em> 逐 token 生成回复。两者性能特征不同。</td></tr>
       <tr><td><strong>KV 缓存</strong></td><td>存储较早 token 的注意力“键与值”，使模型不必重算。它让长上下文与多轮对话更高效。→ <a href="advanced_zh-cn.html#paged-kv">分页 KV</a></td></tr>
       <tr><td><strong>TTFT</strong></td><td>“首 token 时间” —— 答案开始流式输出前需多久。KV 缓存复用会在后续轮次降低它。</td></tr>
-      <tr><td><strong>后端（Backend）</strong></td><td>运行数学运算的硬件路径：CPU、NVIDIA GPU（CUDA）或 Apple Silicon GPU（Metal/MLX）。→ <a href="backends_zh-cn.html">后端</a></td></tr>
+      <tr><td><strong>后端（Backend）</strong></td><td>运行数学运算的硬件路径：CPU、NVIDIA GPU（CUDA）、任何 Vulkan GPU（AMD/Intel/NVIDIA）或 Apple Silicon GPU（Metal/MLX）。→ <a href="backends_zh-cn.html">后端</a></td></tr>
       <tr><td><strong>MoE</strong>（专家混合）</td><td>一种把每个 token 路由到少数几个专门子网络（“专家”）而非整张网络的模型，以更低的每 token 计算获得更大容量。</td></tr>
       <tr><td><strong>多模态（Multimodal）</strong></td><td>能接收文本以外的输入 —— 图像、音频或视频。→ <a href="models_zh-cn.html#multimodal">多模态</a></td></tr>
       <tr><td><strong>思考 / 推理</strong></td><td>模型在最终答案前产生隐藏的逐步推理；TensorSharp 将两者分离。→ <a href="models_zh-cn.html#thinking">思考模式</a></td></tr>
@@ -48,7 +48,7 @@
   <h2 id="faq">常见问题</h2>
 
   <h3>我需要 GPU 吗？</h3>
-  <p>不需要。TensorSharp 可在普通 CPU 上运行（<code>--backend cpu</code> 或更快的 <code>ggml_cpu</code>）。GPU —— NVIDIA（CUDA）或 Apple Silicon（Metal/MLX）—— 会让生成显著更快，尤其是更大的模型。见<a href="backends_zh-cn.html">后端</a>。</p>
+  <p>不需要。TensorSharp 可在普通 CPU 上运行（<code>--backend cpu</code> 或更快的 <code>ggml_cpu</code>）。GPU —— NVIDIA（CUDA）、任何支持 Vulkan 的 AMD/Intel/NVIDIA GPU，或 Apple Silicon（Metal/MLX）—— 会让生成显著更快，尤其是更大的模型。见<a href="backends_zh-cn.html">后端</a>。</p>
 
   <h3>我该从哪个模型开始？</h3>
   <p><strong>Gemma-4-E4B (Q8_0)</strong> 是一个轻量、经过充分测试的起点。要更低内存，选 <code>Q4_K_M</code> 量化；要更高质量，选更大的模型或 <code>Q8_0</code>。见<a href="models_zh-cn.html#downloads">模型下载</a>。</p>
@@ -64,7 +64,7 @@
 
   <h3>我如何让它更快？</h3>
   <ul>
-    <li>使用 GPU 后端（<code>ggml_cuda</code> 或 <code>ggml_metal</code>）。</li>
+    <li>使用 GPU 后端（<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_metal</code>）。</li>
     <li>选更小或量化更激进的模型。</li>
     <li>在受支持的模型上，用 <code>--mtp-spec</code> 启用<a href="advanced_zh-cn.html#mtp">推测解码</a>。</li>
     <li>复用会话，让 <a href="advanced_zh-cn.html#continuous-batching">KV 缓存前缀</a>在轮次间延续。</li>

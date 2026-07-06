@@ -42,7 +42,9 @@
   </div>
   <p>这些领先来自 TensorSharp 的架构专属快路径：基于 verify 的整模型 prefill（配以融合的 FFN / attention 内核）、常驻捕获式 CUDA 图 MoE decode，以及 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。E4B 在每个文本场景的 prefill 都快于 llama.cpp（1.08×–1.22×），首 token 最高早 1.20× 到达；即便是激进量化的 IQ2_XXS Qwen 3.6 35B-A3B MoE，decode 差距也在约 8% 以内、prefill 持平——纯 .NET 引擎在 2-bit 权重上与手工优化的 C++ 并驾齐驱。在亮点单元之外，decode 与 llama.cpp 的差距在几个百分点以内，因此这些 prefill / TTFT / 工具调用 / 结构化输出上的胜势是叠加在有竞争力的 token 生成之上；剩余少数低于 1.0× 的项——主要是 26B-A4B 纯文本 decode 与 E4B JSON 模式 prefill——仍是正在优化的目标，胜负各项的完整数据均已发布在报告中。</p>
 
-  <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、GGML CUDA、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
+  <p><strong>GGML Vulkan 后端</strong> —— 与厂商无关的 GPU 路径以同样方式做了评测（同一主机，两个引擎都使用各自的 Vulkan 构建，覆盖 Gemma 4 E4B 与 12B）。文本场景 decode 与 llama.cpp 的差距在几个百分点以内（各场景 0.91–1.02×，其中 12B 工具调用轮次 decode 快 <strong>1.96×</strong>）；短提示词、JSON 模式与多轮对话的文本 prefill 已达到持平（最高 <strong>1.20×</strong>）。低于 1.0× 的 prefill 几何平均（E4B 0.68× / 12B 0.70×）主要来自尚未在 Vulkan 上优化的图像 / 音频 prefill 路径。逐场景数据见报告的 Vulkan 章节。</p>
+
+  <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
 
   <h2 id="testing">测试</h2>
   <h3>单元测试（xUnit）</h3>
