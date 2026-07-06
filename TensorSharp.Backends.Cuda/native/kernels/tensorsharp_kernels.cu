@@ -764,11 +764,22 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
     if (h >= num_v_heads)
         return;
 
+    // Row block: each block processes one (head, row_group) pair.
+    // Instead of one block walking all head_v_dim rows sequentially,
+    // launch ceil(head_v_dim / num_warps) blocks per head.
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int num_warps = nthreads >> 5;
+    int row_base = blockIdx.y * num_warps;
+    if (row_base >= head_v_dim)
+        return;
+
     // The delta-net rows of a head are mutually independent: row r reads and writes
     // only state_head[r, :]. The shared inputs (the normalized conv outputs q/k and
     // the per-head scalars) are computed once, then every row is processed by its own
-    // warp in parallel. This replaces the old design that walked the rows one at a
-    // time with a full block reduction per row (head_v_dim sequential sync points).
+    // warp in parallel.
     extern __shared__ float scratch[];
     float* q = scratch;
     float* k = q + head_k_dim;
@@ -779,12 +790,6 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
     __shared__ float gate_h;
     __shared__ float beta_h;
     __shared__ float rms_inv;
-
-    int tid = threadIdx.x;
-    int nthreads = blockDim.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int num_warps = nthreads >> 5;
 
     int src_h = h % num_k_heads;
     int q_offset = src_h * head_k_dim;
@@ -841,10 +846,12 @@ extern "C" __global__ void ts_qwen35_gdn_packed_f32(
             state_head[i] *= state_scale;
         __syncthreads();
 
-        // One warp per row: kv = <state_row, k>, rank-1 update, core = <state_row, q>.
+        // One row per warp: kv = <state_row, k>, rank-1 update, core = <state_row, q>.
+        // Each block owns num_warps consecutive rows; row_base = blockIdx.y * num_warps.
         // All lanes share the same row, so __shfl broadcasts/reductions are warp-safe.
         float beta = beta_h;
-        for (int row = warp; row < head_v_dim; row += num_warps)
+        int row = row_base + warp;
+        if (row < head_v_dim)
         {
             float* state_row = state_head + (size_t)row * head_k_dim;
             float kv_mem = 0.0f;
@@ -1202,7 +1209,7 @@ extern "C" __global__ void ts_scaled_dot_product_attention_f32(
 // kv_stride is the per-kv-head element stride of key/value: it equals kv_len for a
 // CONTIGUOUS [num_kv_heads, kv_len, head_dim] tensor (the seq-heads case), or the
 // cache capacity for the LIVE cache [num_kv_heads, cache_size, head_dim] read in
-// place (global full-attention verify — kv_len <= kv_stride logical positions).
+// place (global full-attention verify ÔÇö kv_len <= kv_stride logical positions).
 extern "C" __global__ void ts_gqa_prefill_attention_f32(
     const float* query,
     const float* key,
@@ -2260,7 +2267,7 @@ extern "C" __global__ void ts_neox_rope_head_first_f32(
 }
 
 // NeoX RoPE for the FLAT [seq_len, num_heads * head_dim] layout (element (s,h,j)
-// at (s*num_heads + h)*head_dim + j) — the layout Gemma 4's q/k carry before
+// at (s*num_heads + h)*head_dim + j) ÔÇö the layout Gemma 4's q/k carry before
 // ReshapeToHeads. Same rotation/table indexing as the head-first kernel; only the
 // element address differs. cos/sin tables are [seq_len, rope_half] (rope_half =
 // partial-rotary-dims/2, with per-frequency rope_freqs.weight already baked in),
@@ -2557,7 +2564,7 @@ extern "C" __global__ void ts_quant_matmul_f32(
 // grid.y = ceil(rows/TILE) covers the rest. Kept small (matches the 4-row
 // ts_quant_matmul_q8_0_f32 tiling) so the accumulators stay in registers.
 // Weight memory traffic / dequant work drops from B x to ceil(B/TILE) x.
-// (Q4_0 — the dominant dense quant — has its own row-tiled kernel,
+// (Q4_0 ÔÇö the dominant dense quant ÔÇö has its own row-tiled kernel,
 // ts_quant_matmul_q4_0_batched_f32, that covers a full draft window in one pass.)
 #define TS_QMM_ROW_TILE 4
 
@@ -3116,13 +3123,13 @@ extern "C" __global__ void ts_quantize_q8_1_rows_f32(
     quantize_q8_1_block(input + (size_t)r * in_dim + (size_t)qb * TS_QK8_1, out + idx);
 }
 
-// Block-tile dp4a (int8-MMA) Q8_0 GEMM — the fast multi-row path for the MTP verify
+// Block-tile dp4a (int8-MMA) Q8_0 GEMM ÔÇö the fast multi-row path for the MTP verify
 // window (rows 2-8). The scalar block-reduce kernels above are compute-bound on the
 // big FFN matmuls (measured ~78% of verify GPU time). This kernel:
 //   * 256 threads compute a TS_Q8_DP4A_ROWS x TS_Q8_DP4A_COLS output tile;
 //   * reads the pre-quantized q8_1 activations (xq) from global (L2-cached; quantized
 //     once by ts_quantize_q8_1_rows_f32), weight read once per row-tile;
-//   * each thread strides the dp4a-GROUPS (4 elements) of in_dim — full parallelism
+//   * each thread strides the dp4a-GROUPS (4 elements) of in_dim ÔÇö full parallelism
 //     even for small in_dim (gate_up). Q8_0 is symmetric so the per-32-block scale
 //     d_w*d_act is constant within a block and can be applied per group (exact);
 //   * a SINGLE fused block reduction combines all ROWS*COLS partials (one
@@ -3162,7 +3169,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_dp4a_f32(
         int ib = g >> 3;
         int gib = g & 7;
 
-        // Load each row's activation group + scale ONCE (reused across all columns) —
+        // Load each row's activation group + scale ONCE (reused across all columns) ÔÇö
         // the activation is identical for every output column of this tile.
         int   a4[TS_Q8_DP4A_ROWS];
         float dact[TS_Q8_DP4A_ROWS];
@@ -3236,7 +3243,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_dp4a_f32(
     }
 }
 
-// dp4a (int8) Q4_0 GEMM — the fast path for BOTH single-token decode (rows == 1)
+// dp4a (int8) Q4_0 GEMM ÔÇö the fast path for BOTH single-token decode (rows == 1)
 // and the MTP verify window (rows 2-9) on the dominant dense quant. Mirrors the
 // Q8_0 dp4a kernel above (256 threads compute a ROWS x COLS output tile from the
 // pre-quantized q8_1 activations) but unpacks Q4_0 nibbles and carries the -8
@@ -3470,6 +3477,308 @@ extern "C" __global__ void ts_quant_matmul_q8_0_mma_f32(
 #else
     (void)weights; (void)xq; (void)output; (void)in_dim; (void)out_dim; (void)rows;
 #endif
+}
+
+// =====================================================================
+// ts_qk_norm_rope_neox_f32 ÔÇö Fused QK-RMSNorm + NeoX RoPE
+// =====================================================================
+// Fuses per-head RMSNorm and NeoX rotary position embeddings into a
+// single kernel pass.  Eliminates the intermediate global-memory write
+// of the normalized Q/K tensor and the separate RoPE kernel launch.
+//
+// Grid:  (rows,)       ÔÇö one block per row (= seqLen * numHeads)
+// Block: (BlockSize,)  ÔÇö 256 threads
+// Shared: cols * sizeof(float)  ÔÇö for normalized values + RoPE rotation
+//
+// rows    = seqLen * numHeads  (or seqLen * kvHeads)
+// cols    = headDim            (must match rope_dims for full rotation)
+// rope_half = rope_dims / 2    (number of rotary pairs)
+// eps     = RMSNorm epsilon
+// rope_base, rope_freq_scale = RoPE frequency parameters
+// positions = int32 [rows]     ÔÇö token position for each row
+// =====================================================================
+extern "C" __global__ void ts_qk_norm_rope_neox_f32(
+    float* data,
+    const float* alpha,
+    const int* positions,
+    int rows,
+    int cols,
+    int rope_half,
+    float eps,
+    float rope_base,
+    float rope_freq_scale)
+{
+    int row = blockIdx.x;
+    if (row >= rows)
+        return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float* x = data + (size_t)row * cols;
+
+    // Phase 1: Compute sum of squares for RMSNorm
+    float sum_sq = 0.0f;
+    for (int i = tid; i < cols; i += num_threads)
+    {
+        float v = x[i];
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+
+    __shared__ float inv_rms;
+    if (tid == 0)
+        inv_rms = rsqrtf(sum_sq / (float)cols + eps);
+    __syncthreads();
+
+    // Phase 2: Normalize and store in shared memory
+    // Layout: smem[0..cols-1] = normalized values, smem[cols..cols+rope_half-1] = cos table, smem[cols+rope_half..cols+2*rope_half-1] = sin table
+    extern __shared__ float smem[];
+    for (int i = tid; i < cols; i += num_threads)
+        smem[i] = x[i] * inv_rms * alpha[i];
+    __syncthreads();
+
+    // Phase 2b: Pre-compute RoPE cos/sin lookup table in shared memory
+    // Replaces on-the-fly powf/cosf/sinf with 2 global loads per pair
+    float* cos_table = smem + cols;
+    float* sin_table = smem + cols + rope_half;
+    int pos = positions[row];
+    for (int j = tid; j < rope_half; j += num_threads)
+    {
+        float theta = (float)pos * powf(rope_base, -2.0f * (float)j / (float)cols);
+        float angle = theta * rope_freq_scale;
+        cos_table[j] = cosf(angle);
+        sin_table[j] = sinf(angle);
+    }
+    __syncthreads();
+
+    // Phase 3: Apply NeoX RoPE rotation on pairs via lookup table
+    // NeoX layout: pair j means (smem[j], smem[j + rope_half])
+    for (int j = tid; j < rope_half; j += num_threads)
+    {
+        float c = cos_table[j];
+        float s = sin_table[j];
+
+        float x0 = smem[j];
+        float x1 = smem[j + rope_half];
+        smem[j]              = x0 * c - x1 * s;
+        smem[j + rope_half]  = x0 * s + x1 * c;
+    }
+    __syncthreads();
+
+    // Phase 4: Write back to global memory
+    for (int i = tid; i < cols; i += num_threads)
+        x[i] = smem[i];
+}
+
+// =====================================================================
+// ts_qwen35_gdn_fused_f32 ÔÇö Fused pack + GDN kernel
+// =====================================================================
+// Reads directly from raw projection buffers (qkv, z, beta, alpha)
+// instead of a pre-packed buffer.  Eliminates the separate
+// ts_qwen35_gdn_pack_inputs_f32 kernel launch and the intermediate
+// packed buffer allocation.
+//
+// Grid:  (numVHeads, ceil(headVDim / num_warps), 1)
+// Block: (512, 1, 1)
+// Shared: (2 * headKDim + headVDim) floats
+// =====================================================================
+
+__device__ __forceinline__ float gdn_read_raw(
+    const float* qkv, const float* z, const float* beta, const float* alpha,
+    int s, int ch, int qkv_dim, int z_dim, int num_v_heads)
+{
+    if (ch < qkv_dim)
+        return qkv[(size_t)s * qkv_dim + ch];
+    ch -= qkv_dim;
+    if (ch < z_dim)
+        return z[(size_t)s * z_dim + ch];
+    ch -= z_dim;
+    if (ch < num_v_heads)
+        return beta[(size_t)s * num_v_heads + ch];
+    return alpha[(size_t)s * num_v_heads + (ch - num_v_heads)];
+}
+
+__device__ __forceinline__ float gdn_conv_channel_raw(
+    const float* qkv, const float* z, const float* beta, const float* alpha,
+    const float* conv_state, const float* conv_w,
+    int s, int ch, int seq_len, int qkv_dim, int z_dim, int num_v_heads,
+    int conv_kernel, int conv_write_idx)
+{
+    int conv_dim = conv_kernel - 1;
+    float acc = 0.0f;
+    for (int ki = 0; ki < conv_kernel; ki++)
+    {
+        int logical = s + ki;
+        float x;
+        if (logical < conv_dim)
+        {
+            int slot = (conv_write_idx + logical) % conv_dim;
+            x = conv_state[(size_t)slot * qkv_dim + ch];
+        }
+        else
+        {
+            int input_s = logical - conv_dim;
+            input_s = input_s < seq_len ? input_s : seq_len - 1;
+            x = gdn_read_raw(qkv, z, beta, alpha, input_s, ch, qkv_dim, z_dim, num_v_heads);
+        }
+        acc += x * conv_w[(size_t)ch * conv_kernel + ki];
+    }
+    return silu(acc);
+}
+
+extern "C" __global__ void ts_qwen35_gdn_fused_f32(
+    const float* qkv,
+    const float* z,
+    const float* beta,
+    const float* alpha,
+    float* conv_state,
+    float* ssm_state,
+    const float* conv_w,
+    const float* dt_bias,
+    const float* a_log,
+    const float* ssm_norm,
+    float* output,
+    int seq_len,
+    int qkv_dim,
+    int z_dim,
+    int qk_dim,
+    int v_dim,
+    int num_k_heads,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    int conv_kernel,
+    int conv_write_idx,
+    float eps)
+{
+    int h = blockIdx.x;
+    if (h >= num_v_heads)
+        return;
+
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int num_warps = nthreads >> 5;
+    int row_base = blockIdx.y * num_warps;
+    if (row_base >= head_v_dim)
+        return;
+
+    extern __shared__ float scratch[];
+    float* q = scratch;
+    float* k = q + head_k_dim;
+    float* core = k + head_k_dim;
+
+    __shared__ float q_scale;
+    __shared__ float k_scale;
+    __shared__ float gate_h;
+    __shared__ float beta_h;
+    __shared__ float rms_inv;
+
+    int src_h = h % num_k_heads;
+    int q_offset = src_h * head_k_dim;
+    int k_offset = qk_dim + src_h * head_k_dim;
+    int v_offset = 2 * qk_dim + h * head_v_dim;
+    int state_per_head = head_v_dim * head_k_dim;
+    float* state_head = ssm_state + (size_t)h * state_per_head;
+    float q_head_scale = rsqrtf((float)head_v_dim);
+
+    for (int s = 0; s < seq_len; s++)
+    {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (int d = tid; d < head_k_dim; d += nthreads)
+        {
+            float qv = gdn_conv_channel_raw(
+                qkv, z, beta, alpha, conv_state, conv_w,
+                s, q_offset + d, seq_len, qkv_dim, z_dim, num_v_heads,
+                conv_kernel, conv_write_idx);
+            float kv = gdn_conv_channel_raw(
+                qkv, z, beta, alpha, conv_state, conv_w,
+                s, k_offset + d, seq_len, qkv_dim, z_dim, num_v_heads,
+                conv_kernel, conv_write_idx);
+            q[d] = qv;
+            k[d] = kv;
+            q_sum += qv * qv;
+            k_sum += kv * kv;
+        }
+
+        q_sum = block_reduce_sum(q_sum);
+        __syncthreads();
+        k_sum = block_reduce_sum(k_sum);
+        if (tid == 0)
+        {
+            q_scale = rsqrtf(q_sum + eps) * q_head_scale;
+            k_scale = rsqrtf(k_sum + eps);
+            float alpha_val = gdn_read_raw(qkv, z, beta, alpha, s,
+                qkv_dim + v_dim + num_v_heads + h, qkv_dim, z_dim, num_v_heads);
+            float beta_val = gdn_read_raw(qkv, z, beta, alpha, s,
+                qkv_dim + v_dim + h, qkv_dim, z_dim, num_v_heads);
+            gate_h = softplus_f32(alpha_val + dt_bias[h]) * a_log[h];
+            beta_h = sigmoid_f32(beta_val);
+        }
+        __syncthreads();
+
+        float state_scale = expf(gate_h);
+        for (int d = tid; d < head_k_dim; d += nthreads)
+        {
+            q[d] *= q_scale;
+            k[d] *= k_scale;
+        }
+        for (int i = tid; i < state_per_head; i += nthreads)
+            state_head[i] *= state_scale;
+        __syncthreads();
+
+        float bval = beta_h;
+        int row = row_base + warp;
+        if (row < head_v_dim)
+        {
+            float* state_row = state_head + (size_t)row * head_k_dim;
+            float kv_mem = 0.0f;
+            for (int d = lane; d < head_k_dim; d += 32)
+                kv_mem += state_row[d] * k[d];
+            kv_mem = warp_allreduce_sum(kv_mem);
+
+            float vrow;
+            if (lane == 0)
+                vrow = gdn_conv_channel_raw(
+                    qkv, z, beta, alpha, conv_state, conv_w,
+                    s, v_offset + row, seq_len, qkv_dim, z_dim, num_v_heads,
+                    conv_kernel, conv_write_idx);
+            vrow = __shfl_sync(0xFFFFFFFF, vrow, 0);
+            float delta = (vrow - kv_mem) * bval;
+
+            float core_v = 0.0f;
+            for (int d = lane; d < head_k_dim; d += 32)
+            {
+                float sd = state_row[d] + k[d] * delta;
+                state_row[d] = sd;
+                core_v += sd * q[d];
+            }
+            core_v = warp_allreduce_sum(core_v);
+            if (lane == 0)
+                core[row] = core_v;
+        }
+        __syncthreads();
+
+        float sum_sq = 0.0f;
+        for (int row = tid; row < head_v_dim; row += nthreads)
+            sum_sq += core[row] * core[row];
+        sum_sq = block_reduce_sum(sum_sq);
+        if (tid == 0)
+            rms_inv = rsqrtf(sum_sq / (float)head_v_dim + eps);
+        __syncthreads();
+
+        float* out_row = output + (size_t)s * v_dim + h * head_v_dim;
+        for (int row = tid; row < head_v_dim; row += nthreads)
+        {
+            float z_val = gdn_read_raw(qkv, z, beta, alpha, s,
+                qkv_dim + h * head_v_dim + row, qkv_dim, z_dim, num_v_heads);
+            out_row[row] = core[row] * rms_inv * ssm_norm[row] * silu(z_val);
+        }
+        __syncthreads();
+    }
 }
 
 extern "C" __global__ void ts_quant_get_rows_f32(
