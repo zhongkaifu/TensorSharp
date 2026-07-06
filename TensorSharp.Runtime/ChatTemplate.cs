@@ -564,6 +564,8 @@ namespace TensorSharp.Runtime
                         {
                             if (architecture == "gemma4" && addGenerationPrompt && !enableThinking)
                                 result = EnsureGemma4ThinkingBlock(result);
+                            else if (IsQwen35Family(architecture) && addGenerationPrompt && enableThinking)
+                                result = EnsureQwen35ThinkOpen(result);
                             Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
                             return result;
                         }
@@ -1271,6 +1273,28 @@ namespace TensorSharp.Runtime
                     result += "\n";
                 result += emptyThinkBlock;
             }
+            return result;
+        }
+
+        /// <summary>
+        /// Ensure a thinking-enabled Qwen 3.5/3.6 generation prompt ends with an OPEN
+        /// thinking block "&lt;think&gt;\n" (note the trailing newline).
+        ///
+        /// The model's own Jinja chat template emits exactly "&lt;think&gt;\n" for the
+        /// generation prompt when reasoning is enabled, but the blanket
+        /// <c>Render(...).TrimEnd()</c> above strips that trailing newline, leaving a
+        /// bare "&lt;think&gt;". This model (matching llama.cpp's behavior) treats a bare
+        /// "&lt;think&gt;" as a signal to produce an EMPTY reasoning block: it immediately
+        /// emits "\n\n&lt;/think&gt;" and skips chain-of-thought entirely, collapsing the
+        /// answer to a short, lower-quality direct reply. Restoring the newline makes the
+        /// model actually reason, producing token-for-token the same high-quality output
+        /// as llama.cpp for the same prompt.
+        /// </summary>
+        private static string EnsureQwen35ThinkOpen(string result)
+        {
+            const string openThink = "<think>";
+            if (result.EndsWith(openThink))
+                result += "\n";
             return result;
         }
 

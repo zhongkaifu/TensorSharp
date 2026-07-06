@@ -1301,18 +1301,35 @@ namespace
         //     nodes + 176 norm-weight re-uploads every token). set_rows has a Vulkan
         //     kernel in ggml v0.15.3 (unlike Metal, where ggml_metal_op_set_rows
         //     SEGFAULTs — Metal stays on the non-persist cpy path).
-        // Exact analogue of the dense Gemma4 decode's persist gate.
-        static const bool persist_cfg = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
-        const bool persist = persist_cfg &&
-            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         // Persist mode pads the attention window to a fixed stride so the graph is
         // identical token-to-token (CUDA-graph capture); the F16 mask zeroes valid
         // positions and -inf's the padding. Non-persist keeps the exact window.
+        static const bool persist_cfg = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
+        const bool persist = persist_cfg &&
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         constexpr int kPersistKvStride = 256;
         const int attnKvLen = persist
             ? std::min(cache_size, ((totalSeqLen + kPersistKvStride - 1) / kPersistKvStride) * kPersistKvStride)
             : flash_attn_kv_length(totalSeqLen, cache_size, head_dim);
         const bool use_persist_mask = persist;
+        // VULKAN CORRECTNESS: the persist path pads the flash-attn KV window to the
+        // 256-stride so the graph topology stays constant for replay. On ggml-vulkan a
+        // padded window (KV a multiple of the flash block width) selects the "aligned"
+        // flash-attn shader, which computes INCORRECT attention for this model's
+        // head_dim=256 GQA over the masked/padded window — output stays coherent for
+        // ~10-20 tokens then degenerates into a repetition loop (proven by A/B: forcing
+        // the padded window + F16 mask into the otherwise-correct non-persist path
+        // reproduces it, and it survives zeroing the padded KV rows, so it is the
+        // aligned-shader path itself, not stale KV). CUDA's flash handles the padded
+        // window correctly. FIX: on Vulkan persist, compute attention WITHOUT flash —
+        // explicit mul_mat + soft_max_ext(mask) + mul_mat (see the attention block).
+        // That applies the -inf mask through soft_max (so padded positions contribute
+        // nothing) using only core, validated Vulkan ops, and keeps the stable padded
+        // topology persist needs — restoring the persist perf win (~16 vs ~5.7 tok/s)
+        // with correct output. Non-persist and CUDA keep flash. TS_QWEN35_VULKAN_FLASH=1
+        // forces the (incorrect) flash path on Vulkan persist for A/B debugging only.
+        static const bool vulkan_flash_forced = []{ const char* e = std::getenv("TS_QWEN35_VULKAN_FLASH"); return e != nullptr && e[0] == '1'; }();
+        const bool use_non_flash_attn = persist && g_backend_type == BACKEND_TYPE_VULKAN && !vulkan_flash_forced;
         const void* sig_disc = layers[0].attn_norm_w;
         // Per-holder identity: first attention layer's KV cache device ptr. With
         // per-request fused-decode holders (Qwen35Model.BindSequenceCache) this is
@@ -1592,9 +1609,39 @@ namespace
                     if (persist) ggml_free(ctx);
                     return 0;
                 }
-                ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(attn_out_4d, GGML_PREC_F32);
-                ggml_tensor* attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
+                ggml_tensor* attn_out_2d;
+                if (use_non_flash_attn)
+                {
+                    // Non-flash attention (avoids ggml-vulkan's incorrect aligned
+                    // flash-attn shader on the padded persist window; see the
+                    // use_non_flash_attn comment above). Single decode query:
+                    //   q_attn : [head_dim, 1, num_heads]
+                    //   k_full/v_full : [head_dim, KV, num_kv_heads]
+                    // Materialize K/V as CONTIGUOUS F32 so the GQA-broadcast matmuls
+                    // work for any KV cache dtype (F16/quant) and any window stride
+                    // (view_kv_cache_window returns a view strided by cache_size), which
+                    // is what flash_attn_ext handles internally.
+                    ggml_tensor* k_f32 = ggml_cpy(ctx, k_full, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, attnKvLen, num_kv_heads));
+                    ggml_tensor* v_f32 = ggml_cpy(ctx, v_full, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, attnKvLen, num_kv_heads));
+                    // scores = softmax( (Q·Kᵀ)*scale + mask ), broadcasting num_kv_heads→num_heads.
+                    // q_attn is a permuted (non-contiguous) view; ggml_mul_mat needs a
+                    // contiguous src1, so cont it (flash_attn_ext handled the permute
+                    // internally). Matches the verify-path non-flash fallback.
+                    ggml_tensor* q_attn_cont = ggml_cont(ctx, q_attn);
+                    ggml_tensor* kq = ggml_mul_mat(ctx, k_f32, q_attn_cont);            // [KV, 1, num_heads]
+                    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+                    ggml_tensor* kq_soft = ggml_soft_max_ext(ctx, kq, mask_for_attn, attn_scale, 0.0f);
+                    // out = scores · V  (transpose V to [KV, head_dim, num_kv_heads])
+                    ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_f32, 1, 0, 2, 3));
+                    ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq_soft);                  // [head_dim, 1, num_heads]
+                    attn_out_2d = ggml_reshape_2d(ctx, kqv, head_dim, num_heads);
+                }
+                else
+                {
+                    ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f);
+                    ggml_flash_attn_ext_set_prec(attn_out_4d, GGML_PREC_F32);
+                    attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
+                }
                 ggml_tensor* gate_2d = ggml_cont(ctx, gate_view);
                 ggml_tensor* attn_gated = ggml_mul(ctx, attn_out_2d, ggml_sigmoid(ctx, gate_2d));
                 ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_gated, qDim, 1);
@@ -1923,6 +1970,39 @@ namespace
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
+
+        // Zero the padded KV rows [totalSeqLen, attnKvLen) once per graph build for the
+        // Vulkan non-flash persist path. That path reads the FULL padded window and
+        // masks the padding to -inf via soft_max_ext. But the padded rows are
+        // UNINITIALIZED device memory whose F16/quant garbage can decode to +/-inf;
+        // `inf + (-inf) = NaN` inside soft_max survives the mask and corrupts attention
+        // (coherent for the first 256-window, then a repetition loop once the window
+        // grows to 512+ and the padding region is large). Zeroing makes the masked-out
+        // rows finite (q·0 = 0 -> exp(0 + -inf) = 0), matching llama.cpp's
+        // zero-initialized KV cache. Only positions < totalSeqLen are read as valid;
+        // the growing decode writes into this zeroed tail as it advances within the
+        // stride, so one build-time zero covers the whole stride. Cheap: a few memsets
+        // per attention layer, once per 256-token window grow (not per token).
+        if (use_non_flash_attn && attnKvLen > totalSeqLen)
+        {
+            const std::size_t kvRowBytes = ggml_row_size(static_cast<ggml_type>(kv_cache_type), head_dim);
+            const std::size_t padBytes = static_cast<std::size_t>(attnKvLen - totalSeqLen) * kvRowBytes;
+            for (int l = 0; l < num_layers; l++)
+            {
+                if (layers[l].is_recurrent != 0)
+                    continue;
+                LayerTensors& t = lt[l];
+                if (t.k_cache_base == nullptr || t.v_cache_base == nullptr)
+                    continue;
+                for (int h = 0; h < num_kv_heads; h++)
+                {
+                    const std::size_t off =
+                        (static_cast<std::size_t>(h) * cache_size + static_cast<std::size_t>(totalSeqLen)) * kvRowBytes;
+                    ggml_backend_tensor_memset(t.k_cache_base, 0, off, padBytes);
+                    ggml_backend_tensor_memset(t.v_cache_base, 0, off, padBytes);
+                }
+            }
+        }
 
         ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
         std::int32_t pos_val = position;
