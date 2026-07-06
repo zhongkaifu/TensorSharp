@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "text_short",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 1948,
+  "completion_tokens": 527,
+  "ttft_ms": 1125.0,
+  "prefill_tps": 1731.6,
+  "decode_tps": 47.0,
+  "total_wall_ms": 12281.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The transformer architecture was developed to overcome the limitations of earlier sequence networks, which processed input one element at a time, leading to slow training and forgetfulness over long distances. It replaces this sequential reading with a mechanism called attention. This attention allo",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 47.0,
+  "requests_ok": 1
+}

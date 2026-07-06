@@ -17,6 +17,7 @@ namespace TensorSharp.Runtime
         GgmlCpu,
         GgmlMetal,
         GgmlCuda,
+        GgmlVulkan,
     }
 
     public class ModelConfig

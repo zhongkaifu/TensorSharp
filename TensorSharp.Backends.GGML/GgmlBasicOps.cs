@@ -1344,6 +1344,12 @@ namespace TensorSharp.GGML
         public static bool CanInitializeBackend(GgmlBackendType backendType) => GgmlNative.CanInitialize(backendType);
         public static void EnsureBackendAvailable(GgmlBackendType backendType) => GgmlNative.EnsureAvailable(backendType);
 
+        /// <summary>Env var (read at Vulkan backend init) selecting the Vulkan device index.</summary>
+        public const string VulkanDeviceEnvVar = GgmlNative.VulkanDeviceEnvVar;
+        public static void SetVulkanDeviceIndex(int deviceIndex) => GgmlNative.SetVulkanDeviceIndex(deviceIndex);
+        public static int GetVulkanDeviceCount() => GgmlNative.GetVulkanDeviceCount();
+        public static string GetVulkanDeviceDescription(int deviceIndex) => GgmlNative.GetVulkanDeviceDescription(deviceIndex);
+
         public static void TransformerModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
@@ -2467,7 +2473,13 @@ namespace TensorSharp.GGML
             IntPtr[] vArr = null, int[] vTypeArr = null, long[] vNe0Arr = null, long[] vNe1Arr = null, long[] vBytesArr = null,
             IntPtr logitsData = default, int vocabSize = 0,
             IntPtr lmHeadData = default, int lmHeadType = 0, long lmHeadNe0 = 0, long lmHeadNe1 = 0, long lmHeadBytes = 0,
-            IntPtr finalNormData = default, float logitSoftcap = 0f)
+            IntPtr finalNormData = default, float logitSoftcap = 0f,
+            IntPtr pleTokenEmbdData = default, int pleTokenEmbdType = 0,
+            long pleTokenEmbdNe0 = 0, long pleTokenEmbdNe1 = 0, long pleTokenEmbdBytes = 0,
+            int pleTokenId = -1,
+            IntPtr pleModelProjData = default, int pleModelProjType = 0,
+            long pleModelProjNe0 = 0, long pleModelProjNe1 = 0, long pleModelProjBytes = 0,
+            IntPtr pleModelProjNormData = default)
         {
             GgmlNative.Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -2494,7 +2506,13 @@ namespace TensorSharp.GGML
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 logitsData, vocabSize,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNormData, logitSoftcap);
+                finalNormData, logitSoftcap,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenId,
+                pleModelProjData, pleModelProjType,
+                pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
+                pleModelProjNormData);
         }
 
         /// <summary>True token-batched dense decode (N concurrent sequences in one

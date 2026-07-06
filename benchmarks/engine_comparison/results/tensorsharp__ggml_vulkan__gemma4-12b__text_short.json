@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "text_short",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 1975,
+  "completion_tokens": 71,
+  "ttft_ms": 2406.0,
+  "prefill_tps": 820.9,
+  "decode_tps": 32.7,
+  "total_wall_ms": 4578.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "A transformer is a neural network architecture that processes sequences by using a mechanism called \"attention\" instead of reading inputs one element at a time. This allows every position in a sequence to directly consult and weigh the importance of every other position simultaneously. By replacing ",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 32.7,
+  "requests_ok": 1
+}

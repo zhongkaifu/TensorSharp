@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "text_long",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 3116,
+  "completion_tokens": 737,
+  "ttft_ms": 4109.0,
+  "prefill_tps": 758.3,
+  "decode_tps": 32.0,
+  "total_wall_ms": 27047.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The history of computing traces a progression from ancient mechanical aids and 19th-century conceptual designs to the theoretical foundations and hardware innovations that established the modern computer. This evolution is characterized by a continuous layering of abstraction, transforming computati",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 32.0,
+  "requests_ok": 1
+}

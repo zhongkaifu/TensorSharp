@@ -31,6 +31,7 @@ public class SamplingConfigCloneTests
             FrequencyPenalty = 0.3f,
             Seed = 1234,
             MaxTokens = 999,
+            FirstTokenAllowList = new[] { 7, 42 },
         };
 
         var clone = src.Clone();
@@ -44,6 +45,7 @@ public class SamplingConfigCloneTests
         Assert.Equal(src.FrequencyPenalty, clone.FrequencyPenalty);
         Assert.Equal(src.Seed, clone.Seed);
         Assert.Equal(src.MaxTokens, clone.MaxTokens);
+        Assert.Equal(src.FirstTokenAllowList, clone.FirstTokenAllowList);
         Assert.NotSame(src, clone);
     }
 

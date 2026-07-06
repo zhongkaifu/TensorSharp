@@ -2,9 +2,14 @@ cmake_minimum_required(VERSION 3.20)
 project(GgmlOps LANGUAGES C CXX)
 option(TENSORSHARP_GGML_NATIVE_BUILD_TESTS "Build TensorSharp GGML native regression tests" OFF)
 option(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA "Enable the ggml-cuda backend when building on Windows or Linux" OFF)
+option(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN "Enable the ggml-vulkan backend when building on Windows or Linux" OFF)
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND APPLE)
     message(FATAL_ERROR "TENSORSHARP_GGML_NATIVE_ENABLE_CUDA is supported on Windows and Linux only.")
+endif()
+
+if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN AND APPLE)
+    message(FATAL_ERROR "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN is supported on Windows and Linux only (Metal is the GPU backend on macOS).")
 endif()
 
 if (APPLE)
@@ -102,7 +107,59 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_COMPRESSION_MODE "speed" CACHE STRING "" FORCE)
 endif()
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml" ggml-build)
+if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
+    # ggml-vulkan needs the Vulkan headers + loader import library and the glslc
+    # shader compiler (find_package(Vulkan COMPONENTS glslc) inside ggml), plus
+    # the SPIRV-Headers CMake package. With a LunarG Vulkan SDK installed
+    # (VULKAN_SDK env var) all of these are found automatically; otherwise
+    # build-windows.ps1 provisions a portable toolchain under
+    # ExternalProjects/vulkan-toolchain (see eng/fetch-vulkan-toolchain.ps1) and
+    # passes Vulkan_INCLUDE_DIR / Vulkan_LIBRARY / Vulkan_GLSLC_EXECUTABLE /
+    # SPIRV-Headers_DIR explicitly.
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+endif()
+
+# The binary-dir name is deliberately terse ("g", not "ggml-build"): ggml-vulkan's
+# vulkan-shaders-gen ExternalProject nests
+#   <bindir>/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build
+# under it, and MSBuild's file tracker (.tlog) breaks CMake try-compiles once that
+# inner binary dir exceeds ~137 characters ("CL.exe could not be run:
+# DirectoryNotFoundException ... cmTC_*.tlog"). Every character saved here buys
+# headroom for repos cloned into deeper paths.
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml" g)
+
+if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN AND TARGET ggml-vulkan)
+    # ggml-vulkan.cpp includes <spirv/unified1/spirv.hpp>, but upstream's CMake
+    # only *checks* that the SPIRV-Headers package exists — it assumes the header
+    # is reachable through the Vulkan SDK's Include directory (LunarG layout) or
+    # a system include path (Linux distro packages). With the portable toolchain
+    # (bare Vulkan-Headers checkout) neither holds, so link the imported
+    # SPIRV-Headers interface target onto ggml-vulkan to add its include dir.
+    # Scoped to the one target (not include_directories) so the CUDA/CPU targets'
+    # command lines — and therefore their incremental-build state — are untouched.
+    find_package(SPIRV-Headers CONFIG QUIET)
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+    endif()
+endif()
+
+if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
+    # Guard against the MSBuild path-length limit described above: the deepest
+    # path the vulkan-shaders-gen ExternalProject configure creates is
+    #   <bindir>/g/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-XXXXXX/cmTC_XXXXX.dir/Debug/cmTC_XXXXX.tlog/...
+    # which fails opaquely once the inner binary dir passes ~137 characters.
+    # 74 = "/g/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build".
+    string(LENGTH "${CMAKE_BINARY_DIR}" TSG_BINARY_DIR_LEN)
+    math(EXPR TSG_VK_SHADERS_GEN_DIR_LEN "${TSG_BINARY_DIR_LEN} + 74")
+    if (CMAKE_GENERATOR MATCHES "Visual Studio" AND TSG_VK_SHADERS_GEN_DIR_LEN GREATER 137)
+        message(FATAL_ERROR
+            "TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN: the build directory path is too long "
+            "(${TSG_BINARY_DIR_LEN} chars). ggml-vulkan's shader-generator sub-build would "
+            "exceed the MSBuild file-tracker path limit and fail with a cryptic "
+            "'CL.exe could not be run: DirectoryNotFoundException (...cmTC_*.tlog)' error. "
+            "Clone the repository into a shorter path (e.g. C:/Works/TensorSharp) or use the Ninja generator.")
+    endif()
+endif()
 
 set(TSG_GGMLOPS_SOURCES
     ggml_ops_core.cpp
@@ -126,6 +183,10 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
 endif()
 
 add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
+
+if (TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)
+    target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_VULKAN=1)
+endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)

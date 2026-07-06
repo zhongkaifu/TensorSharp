@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "function_call",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2035,
+  "completion_tokens": 78,
+  "ttft_ms": 2906.0,
+  "prefill_tps": 700.3,
+  "decode_tps": 33.5,
+  "total_wall_ms": 5125.0,
+  "finish_reason": "tool_calls",
+  "tool_call_ok": true,
+  "output_preview": "The user is asking for the current weather in Paris in Celsius.\nI have a tool `get_weather` that takes `city` and `units` as parameters.\nI should call `get_weather(city='Paris', units='c')`.",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 33.5,
+  "requests_ok": 1
+}

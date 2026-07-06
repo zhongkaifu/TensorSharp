@@ -349,6 +349,113 @@ public class ServerOptionsBuilderTests : IDisposable
             ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(new[] { "--paged-kv-quant-bits", "int4" }));
     }
 
+    // ----- Vulkan GPU device selection -----
+
+    [Fact]
+    public void ApplyGpuDeviceCliFlag_SetsVulkanDeviceEnvVar()
+    {
+        _env.Set(TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar, null);
+        bool applied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(new[] { "--gpu-device", "1" });
+        Assert.True(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable(TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar));
+    }
+
+    [Fact]
+    public void ApplyGpuDeviceCliFlag_NoFlag_LeavesEnvUnchanged()
+    {
+        _env.Set(TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar, "1");
+        bool applied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(new[] { "--unrelated", "value" });
+        Assert.False(applied);
+        Assert.Equal("1", Environment.GetEnvironmentVariable(TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar));
+    }
+
+    [Fact]
+    public void ApplyGpuDeviceCliFlag_RejectsNegativeAndNonInteger()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyGpuDeviceCliFlag(new[] { "--gpu-device", "-1" }));
+        Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.ApplyGpuDeviceCliFlag(new[] { "--gpu-device", "nvidia" }));
+    }
+
+    [Fact]
+    public void Build_GpuDeviceFlag_DoesNotTripUnknownArgTrap()
+    {
+        // --gpu-device is consumed by ApplyGpuDeviceCliFlag before ParseArgs;
+        // ParseArgs's unknown-arg guard must recognise and skip it.
+        var options = ServerOptionsBuilder.Build(new[] { "--gpu-device", "1" }, _baseDir);
+        Assert.NotNull(options);
+    }
+
+    // ----- Usage page / informational flags -----
+
+    [Fact]
+    public void ServerUsage_HelpRequested_RecognisesAliases()
+    {
+        Assert.True(ServerUsage.IsHelpRequested(new[] { "--help" }));
+        Assert.True(ServerUsage.IsHelpRequested(new[] { "-h" }));
+        Assert.True(ServerUsage.IsHelpRequested(new[] { "--model", "x.gguf", "--help" }));
+        Assert.False(ServerUsage.IsHelpRequested(new[] { "--model", "x.gguf" }));
+        Assert.False(ServerUsage.IsHelpRequested(Array.Empty<string>()));
+    }
+
+    [Fact]
+    public void ServerUsage_ListGpusRequested_MatchesFlagAnywhere()
+    {
+        Assert.True(ServerUsage.IsListGpusRequested(new[] { "--list-gpus" }));
+        Assert.True(ServerUsage.IsListGpusRequested(new[] { "--backend", "ggml_vulkan", "--list-gpus" }));
+        Assert.False(ServerUsage.IsListGpusRequested(new[] { "--backend", "ggml_vulkan" }));
+    }
+
+    [Fact]
+    public void ServerUsage_PrintUsage_DocumentsEveryKnownFlag()
+    {
+        var sw = new StringWriter();
+        ServerUsage.PrintUsage(sw);
+        string usage = sw.ToString();
+
+        // Every operator-facing flag the server accepts must appear on the
+        // usage page, with defaults and an example per option.
+        string[] flags =
+        {
+            "--model", "--mmproj", "--backend", "--gpu-device", "--list-gpus",
+            "--max-tokens", "--temperature", "--top-k", "--top-p", "--min-p",
+            "--repeat-penalty", "--presence-penalty", "--frequency-penalty",
+            "--seed", "--stop", "--kv-cache-dtype",
+            "--paged-kv", "--paged-kv-block-size", "--paged-kv-ram-mb",
+            "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
+            "--continuous-batching", "--prefill-chunk-size",
+            "--mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
+            "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
+            "--help",
+        };
+        foreach (string flag in flags)
+            Assert.Contains(flag, usage);
+
+        Assert.Contains("Default:", usage);
+        Assert.Contains("Example:", usage);
+    }
+
+    [Fact]
+    public void Build_InformationalFlags_DoNotTripUnknownArgTrap()
+    {
+        // Program.cs exits on --help/--list-gpus before Build runs, but Build
+        // must still tolerate them (tests, future reordering of the passes).
+        Assert.NotNull(ServerOptionsBuilder.Build(new[] { "--list-gpus" }, _baseDir));
+        Assert.NotNull(ServerOptionsBuilder.Build(new[] { "--help" }, _baseDir));
+    }
+
+    [Fact]
+    public void Build_PrefillChunkSize_DoesNotTripUnknownArgTrap()
+    {
+        // Regression: --prefill-chunk-size is consumed by
+        // ApplyContinuousBatchingCliFlag's earlier pass but was missing from
+        // ParseArgs's skip list, so passing it aborted server startup.
+        _env.Set("TS_SCHED_PREFILL_CHUNK", null);
+        var options = ServerOptionsBuilder.Build(new[] { "--prefill-chunk-size", "256" }, _baseDir);
+        Assert.NotNull(options);
+    }
+
     // ----- MTP speculative-decoding CLI flags -----
 
     [Fact]

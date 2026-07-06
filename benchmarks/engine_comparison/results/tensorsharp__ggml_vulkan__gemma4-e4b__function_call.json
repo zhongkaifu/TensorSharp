@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "function_call",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2025,
+  "completion_tokens": 191,
+  "ttft_ms": 1094.0,
+  "prefill_tps": 1851.0,
+  "decode_tps": 43.7,
+  "total_wall_ms": 5453.0,
+  "finish_reason": "tool_calls",
+  "tool_call_ok": true,
+  "output_preview": "The user is asking for the current weather in Paris in Celsius.\nI have a tool `get_weather` that can retrieve the current weather for a city.\nThis tool requires one argument: `city`.\n\n1.  **Identify the required information:** City name (\"Paris\").\n2.  **Check the tool signature:** `get_weather(city:",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 43.7,
+  "requests_ok": 1
+}

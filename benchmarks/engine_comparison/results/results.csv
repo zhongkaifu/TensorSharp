@@ -1,0 +1,17 @@
+engine,backend,model,scenario,mtp,concurrency,status,detail,prompt_tokens,completion_tokens,ttft_ms,prefill_tps,decode_tps,aggregate_decode_tps,requests_ok,total_wall_ms,finish_reason,tool_call_ok
+llamacpp,ggml_vulkan,gemma4-12b,function_call,False,1,ok,,2035,78,2906.0,700.3,33.5,33.5,1,5125.0,tool_calls,True
+llamacpp,ggml_vulkan,gemma4-12b,multi_turn,False,1,ok,,2069,1280,3172.0,652.3,32.5,32.5,1,42484.0,length,
+llamacpp,ggml_vulkan,gemma4-12b,text_long,False,1,ok,,3116,737,4109.0,758.3,32.0,32.0,1,27047.0,stop,
+llamacpp,ggml_vulkan,gemma4-12b,text_short,False,1,ok,,1949,557,2532.0,769.7,33.4,33.4,1,19094.0,stop,
+llamacpp,ggml_vulkan,gemma4-e4b,function_call,False,1,ok,,2034,226,1219.0,1668.6,46.6,46.6,1,6000.0,tool_calls,True
+llamacpp,ggml_vulkan,gemma4-e4b,multi_turn,False,1,ok,,2068,1280,1344.0,1538.7,46.4,46.4,1,28891.0,length,
+llamacpp,ggml_vulkan,gemma4-e4b,text_long,False,1,ok,,3115,578,1766.0,1763.9,46.4,46.4,1,14172.0,stop,
+llamacpp,ggml_vulkan,gemma4-e4b,text_short,False,1,ok,,1948,527,1125.0,1731.6,47.0,47.0,1,12281.0,stop,
+tensorsharp,ggml_vulkan,gemma4-12b,function_call,False,1,ok,,2074,39,3235.0,641.1,65.7,65.7,1,3844.0,tool_calls,True
+tensorsharp,ggml_vulkan,gemma4-12b,multi_turn,False,1,ok,,2094,500,3187.0,657.0,32.7,32.7,1,18484.0,stop,
+tensorsharp,ggml_vulkan,gemma4-12b,text_long,False,1,ok,,3146,76,5031.0,625.3,31.8,31.8,1,7422.0,stop,
+tensorsharp,ggml_vulkan,gemma4-12b,text_short,False,1,ok,,1975,71,2406.0,820.9,32.7,32.7,1,4578.0,stop,
+tensorsharp,ggml_vulkan,gemma4-e4b,function_call,False,1,ok,,2025,191,1094.0,1851.0,43.7,43.7,1,5453.0,tool_calls,True
+tensorsharp,ggml_vulkan,gemma4-e4b,multi_turn,False,1,ok,,2094,1169,1156.0,1811.4,43.6,43.6,1,27953.0,stop,
+tensorsharp,ggml_vulkan,gemma4-e4b,text_long,False,1,ok,,3146,320,2438.0,1290.4,42.9,42.9,1,9891.0,stop,
+tensorsharp,ggml_vulkan,gemma4-e4b,text_short,False,1,ok,,1975,239,1125.0,1755.6,44.4,44.4,1,6516.0,stop,

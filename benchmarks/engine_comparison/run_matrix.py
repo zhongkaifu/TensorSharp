@@ -4,9 +4,11 @@ Cross-engine inference benchmark driver.
 
 Compares TensorSharp, llama.cpp and vLLM on the same GGUF files across text /
 image / audio / video / single-turn / multi-turn / function-call / structured
-scenarios on GPU and CPU backends. One server instance is launched per
-(engine, backend, model) group, all of that group's scenarios run against it,
-then it is torn down — so per-scenario timings exclude model-load cost.
+scenarios, on any compute backend declared in the config's `backends` registry
+(e.g. ggml_cuda, ggml_vulkan, ggml_metal, ggml_cpu, cpu). One server instance
+is launched per (engine, backend, model) group, all of that group's scenarios
+run against it, then it is torn down — so per-scenario timings exclude
+model-load cost.
 
 Each cell writes one JSON file to the results directory:
     results/{engine}__{backend}__{model}__{scenario}.json
@@ -21,8 +23,14 @@ invocations are unchanged:
 Examples
 --------
 # Smoke test one cheap cell
-python run_matrix.py --engines tensorsharp --backends gpu \
+python run_matrix.py --engines tensorsharp --backends ggml_cuda \
     --models gemma4-12b --scenarios text_short,multi_turn
+
+# Same model on several backends (any id from the config's `backends` registry;
+# the legacy aliases gpu / cpu still resolve)
+python run_matrix.py --engines tensorsharp,llamacpp \
+    --backends ggml_cuda,ggml_vulkan,ggml_cpu,cpu \
+    --models gemma4-12b --scenarios text_short
 
 # MTP on vs off (TensorSharp), single-stream
 python run_matrix.py --engines tensorsharp --backends gpu \
@@ -224,7 +232,9 @@ def main():
     ap.add_argument("--engines", default=None,
                     help=f"comma list (default from config: {','.join(config.DEFAULT_ENGINES)})")
     ap.add_argument("--backends", default=None,
-                    help=f"comma list (default from config: {','.join(config.BACKENDS)})")
+                    help=f"comma list of backend ids from the config's `backends` registry "
+                         f"(available: {','.join(config.BACKENDS)}; "
+                         f"default: {','.join(config.DEFAULT_BACKENDS)})")
     ap.add_argument("--models", default=None,
                     help=f"comma list (default from config: {','.join(config.DEFAULT_MODELS)})")
     ap.add_argument("--scenarios", default=None,
@@ -245,7 +255,14 @@ def main():
     args = ap.parse_args()
 
     engine_ids = _csv(args.engines) or list(config.DEFAULT_ENGINES)
-    backend_ids = _csv(args.backends) or list(config.BACKENDS)
+    backend_ids = []
+    for b in (_csv(args.backends) or list(config.DEFAULT_BACKENDS)):
+        rid = config.resolve_backend(b)
+        if rid is None:
+            raise SystemExit(f"--backends: unknown backend '{b}' "
+                             f"(available: {', '.join(config.BACKENDS)})")
+        if rid not in backend_ids:
+            backend_ids.append(rid)
     model_ids = _csv(args.models) or list(config.DEFAULT_MODELS)
     scenario_ids = _csv(args.scenarios) or list(config.DEFAULT_SCENARIOS)
     mtp_modes = _parse_mtp(args.mtp) if args.mtp else list(config.DEFAULT_MTP_MODES)
@@ -331,8 +348,9 @@ def main():
             missing = f"model file not found: {model.gguf}"
         elif engine_id == "tensorsharp" and not config.TENSORSHARP_SERVER_DLL.exists():
             missing = f"TensorSharp.Server.dll not found: {config.TENSORSHARP_SERVER_DLL}"
-        elif engine_id == "llamacpp" and not config.LLAMA_SERVER_EXE.exists():
-            missing = f"llama-server.exe not found: {config.LLAMA_SERVER_EXE}"
+        elif engine_id == "llamacpp" and not config.llama_server_exe_for(backend).exists():
+            missing = (f"llama-server for backend '{backend}' not found: "
+                       f"{config.llama_server_exe_for(backend)}")
         if missing:
             print(f"    SKIP group: {missing}")
             for c in cells:
@@ -352,7 +370,19 @@ def main():
                                      max_tokens=config.SERVER_MAX_TOKENS, mtp=mtp)
 
         t0 = time.monotonic()
-        server.start()
+        try:
+            server.start()
+        except Exception as ex:
+            detail = f"server launch failed: {ex}"
+            print(f"    FAIL group: {detail}")
+            for c in cells:
+                for conc in concurrency_levels:
+                    _write(results_dir, engines.BenchResult(
+                        engine=engine_id, backend=backend, model=model_id,
+                        scenario=c[3], status="fail", detail=detail,
+                        mtp=mtp, concurrency=conc))
+            server.stop()
+            continue
         timeout = config.READY_TIMEOUT_S[model.size_class]
         ready = server.wait_ready(timeout)
         load_s = time.monotonic() - t0
@@ -360,7 +390,8 @@ def main():
             status = "skipped" if engine_id == "vllm" else "fail"
             detail = (f"engine unavailable at {server.base_url}"
                       if engine_id == "vllm"
-                      else f"server not ready in {timeout:.0f}s; log tail:\n{server.tail_log()}")
+                      else f"server not ready in {load_s:.0f}s; {server.ready_hint}"
+                           f"log tail:\n{server.tail_log()}")
             print(f"    {status.upper()} group: server not ready ({load_s:.0f}s)")
             for c in cells:
                 for conc in concurrency_levels:

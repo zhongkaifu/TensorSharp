@@ -1,5 +1,5 @@
 {
-  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k / 32k / 64k / 128k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected (the long-context 32k/64k/128k lengths are registered but not in the default selection). For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
+  "_comment": "Central configuration for the cross-engine inference benchmark. EVERY setting (host paths, model / scenario / engine / backend registries, and run defaults) lives here rather than in code. Edit this file to retarget the harness; override individual selections at run time with run_matrix.py command-line flags (CLI > env > this file > built-in fallback). Pick a different file with --config PATH or the BENCH_CONFIG env var. Path strings may use ${repo_root}, ${here}, ${model_root}, ${gemma4_qat_dir} placeholders. A path may also be written as {\"path\": \"...\", \"env\": \"BENCH_X\"} so the named environment variable can override it for host retargeting. The `backends` section is a registry of concrete compute backends (ggml_cuda / ggml_vulkan / ggml_metal / ggml_cpu / cpu / ...); pick which to run with --backends or defaults.backends (see the registry's own _comment for the entry format; the legacy list+maps form from older configs is still accepted). The long-prompt PREFILL sweep (prefill_2k / 4k / 8k / 16k / 32k / 64k / 128k) is part of this matrix: each prefill scenario slices assets/prefill_corpus.txt to a target token budget (scenarios._prefill) and is timed by TTFT (max_tokens=8); run_matrix.py auto-raises llama.cpp's context to fit whichever prefill lengths are selected (the long-context 32k/64k/128k lengths are registered but not in the default selection). For a prefill-only run that excludes the multimodal/diffusion scenarios, use --config benchmark_config_prefill.json instead.",
 
   "paths": {
     "model_root": "C:/Works/models",
@@ -107,11 +107,50 @@
     "vllm": {"display": "vLLM", "transport": "connect", "backends": ["gpu"]}
   },
 
-  "backends": ["gpu", "cpu"],
-
-  "maps": {
-    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "cpu"},
-    "llama_ngl": {"gpu": 999, "cpu": 0}
+  "backends": {
+    "_comment": "Backend registry: one entry per concrete compute backend selectable with --backends (each becomes a report column). `kind` (gpu|cpu) drives generic gating (large models skip cpu-kind; engines.*.backends may list ids and/or kinds). Per-engine sub-objects say how that engine launches on the backend — omit the sub-object and the engine's cells are recorded as skipped. tensorsharp: {backend: --backend value, extra_args: [...], env: {...}}; llamacpp: {ngl: -ngl value, server_exe: per-backend llama-server build (path/env form supported; falls back to paths.llama_server_exe), extra_args, env}; vllm: true marks the column the external vLLM endpoint is comparable on. `aliases` lets old names keep working (legacy `gpu`). NOTE: TensorSharp.Server silently falls back to the first available backend when the requested one is not supported by the build/host — check results/logs/*.log if numbers look implausible.",
+    "ggml_cuda": {
+      "display": "CUDA",
+      "kind": "gpu",
+      "aliases": ["gpu"],
+      "tensorsharp": {"backend": "ggml_cuda"},
+      "llamacpp": {"ngl": 999},
+      "vllm": true
+    },
+    "ggml_vulkan": {
+      "display": "Vulkan",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "ggml_vulkan"},
+      "llamacpp": {"ngl": 999, "server_exe": {"path": "C:/Works/llama.cpp/build-vulkan/bin/Release/llama-server.exe", "env": "BENCH_LLAMA_SERVER_VULKAN"}, "extra_args": ["--device", "Vulkan0"]}
+    },
+    "ggml_metal": {
+      "display": "Metal",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "ggml_metal"},
+      "llamacpp": {"ngl": 999, "server_exe": {"path": null, "env": "BENCH_LLAMA_SERVER_METAL"}}
+    },
+    "cuda": {
+      "display": "Direct CUDA",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "cuda"}
+    },
+    "mlx": {
+      "display": "MLX Metal",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "mlx"}
+    },
+    "ggml_cpu": {
+      "display": "GGML CPU",
+      "kind": "cpu",
+      "tensorsharp": {"backend": "ggml_cpu"},
+      "llamacpp": {"ngl": 0}
+    },
+    "cpu": {
+      "display": "C# CPU",
+      "kind": "cpu",
+      "tensorsharp": {"backend": "cpu"},
+      "llamacpp": {"ngl": 0}
+    }
   },
 
   "llama": {
@@ -125,7 +164,7 @@
     "engines": ["tensorsharp", "llamacpp", "vllm"],
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b", "qwen36-35b-a3b-q4", "diffusiongemma"],
     "scenarios": ["text_short", "text_long", "multi_turn", "function_call", "json_mode", "image", "audio", "video"],
-    "backends": ["gpu", "cpu"],
+    "backends": ["ggml_cuda", "cpu"],
     "mtp_modes": [false],
     "concurrency": [1],
     "max_tokens": 128,

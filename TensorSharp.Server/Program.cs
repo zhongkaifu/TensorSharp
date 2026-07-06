@@ -32,6 +32,22 @@ Console.OutputEncoding = System.Text.Encoding.UTF8;
 bool showSarah = Array.Exists(args, a => a == "--xzf");
 ConsoleBanner.Print(showSarah);
 
+// Informational invocations print and exit before the web host is built. A
+// bare `TensorSharp.Server` shows the usage page instead of silently starting
+// a model-less server; passing any option (e.g. --backend ggml_cpu) still
+// starts headless for operators who load models from the web UI.
+if (args.Length == 0 || ServerUsage.IsHelpRequested(args))
+{
+    ServerUsage.PrintUsage(Console.Out);
+    return;
+}
+
+if (ServerUsage.IsListGpusRequested(args))
+{
+    ServerUsage.PrintVulkanGpus(Console.Out);
+    return;
+}
+
 string baseDirectory = AppContext.BaseDirectory;
 ServerHostingOptions hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);
 LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
@@ -58,6 +74,10 @@ bool qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlag
 // Must run before the startup model is loaded so InitKVCache sees the choice.
 TensorSharp.Models.KvCacheDtypeConfig.ConfigureFromEnvironment();
 bool kvCacheDtypeFlagApplied = ServerOptionsBuilder.ApplyKvCacheDtypeCliFlag(args);
+// Translate --gpu-device into TS_GGML_VULKAN_DEVICE so multi-GPU hosts can pick
+// which Vulkan device the ggml_vulkan backend initializes on. Must run before
+// the startup model is loaded (the device is fixed at first backend init).
+bool gpuDeviceFlagApplied = ServerOptionsBuilder.ApplyGpuDeviceCliFlag(args);
 
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
@@ -122,6 +142,13 @@ if (mtpSpecFlagsApplied)
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "MTP speculative decoding configured via CLI: enabled={Enabled} maxDraft={MaxDraft} pMin={PMin} (engages on NextN/MTP draft-head models only)",
         schedCfg.MtpSpeculativeEnabled, schedCfg.MtpMaxDraftTokens, schedCfg.MtpMinDraftProb);
+}
+
+if (gpuDeviceFlagApplied)
+{
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Vulkan GPU device configured via CLI: --gpu-device {DeviceIndex} (applies when the ggml_vulkan backend initializes)",
+        Environment.GetEnvironmentVariable(GgmlBasicOps.VulkanDeviceEnvVar));
 }
 
 if (qwenImageFlagsApplied)

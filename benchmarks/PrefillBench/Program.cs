@@ -51,6 +51,7 @@ string modelPath = Environment.GetEnvironmentVariable("TS_PREFILL_MODEL")
 BackendType backend = (Environment.GetEnvironmentVariable("TS_PREFILL_BACKEND") ?? "ggml_cuda").ToLowerInvariant() switch
 {
     "ggml_cuda" => BackendType.GgmlCuda,
+    "ggml_vulkan" => BackendType.GgmlVulkan,
     "ggml_cpu" => BackendType.GgmlCpu,
     "cpu" => BackendType.Cpu,
     "cuda" => BackendType.Cuda,

@@ -15,7 +15,8 @@ public sealed record BackendInfo(
     string DisplayName,
     bool RequiresCuda,
     bool RequiresMetal,
-    bool RequiresAppleSilicon)
+    bool RequiresAppleSilicon,
+    bool RequiresVulkan = false)
 {
     public bool IsAvailableOnHost()
     {
@@ -33,6 +34,16 @@ public sealed record BackendInfo(
             // Heuristic: assume CUDA is available on non-OSX hosts when not explicitly
             // disabled. The actual check happens when TensorSharp.Cli starts; if CUDA
             // is missing the runner records a 'backend unavailable' error.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                return false;
+            }
+        }
+        if (RequiresVulkan)
+        {
+            // Same heuristic as CUDA: ggml-vulkan is built for Windows/Linux only
+            // (Metal is the GPU backend on macOS); the real device check happens
+            // when TensorSharp.Cli starts.
             if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
                 return false;
@@ -72,6 +83,14 @@ public static class BackendCatalog
         RequiresMetal: false,
         RequiresAppleSilicon: false);
 
+    public static readonly BackendInfo GgmlVulkan = new(
+        Id: "ggml_vulkan",
+        DisplayName: "GGML Vulkan (GPU)",
+        RequiresCuda: false,
+        RequiresMetal: false,
+        RequiresAppleSilicon: false,
+        RequiresVulkan: true);
+
     public static readonly BackendInfo DirectCuda = new(
         Id: "cuda",
         DisplayName: "CUDA (cuBLAS GPU)",
@@ -88,7 +107,7 @@ public static class BackendCatalog
 
     public static readonly IReadOnlyList<BackendInfo> All = new[]
     {
-        Cpu, GgmlCpu, GgmlMetal, GgmlCuda, DirectCuda, Mlx,
+        Cpu, GgmlCpu, GgmlMetal, GgmlCuda, GgmlVulkan, DirectCuda, Mlx,
     };
 
     public static BackendInfo? FindById(string id)

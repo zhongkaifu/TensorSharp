@@ -187,6 +187,58 @@ namespace TensorSharp.Server.ProtocolAdapters
         private static bool ForceStructuredStreamBuffer() =>
             string.Equals(Environment.GetEnvironmentVariable("TS_STRUCTURED_STREAM_BUFFER"), "1", StringComparison.Ordinal);
 
+        // Structured output (response_format json_object / json_schema) must
+        // produce a JSON object, so constrain the FIRST sampled token to a
+        // '{'-opening candidate — the same effect llama.cpp gets from its JSON
+        // grammar. Without it, chatty models ramble prose before the object;
+        // the streaming filter suppresses that preamble, so clients saw
+        // seconds of dead air before the first byte (TTFT looked like decode,
+        // not prefill), and the buffered/normalized paths threw the preamble
+        // away anyway. TS_JSON_FORCE_OPEN=0 disables.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, int[]>
+            s_jsonOpenerTokens = new();
+
+        private SamplingConfig WithJsonFirstTokenConstraint(
+            SamplingConfig samplingConfig, StructuredOutputFormat responseFormat)
+        {
+            if (responseFormat == null || samplingConfig == null)
+                return samplingConfig;
+            if (string.Equals(Environment.GetEnvironmentVariable("TS_JSON_FORCE_OPEN"), "0", StringComparison.Ordinal))
+                return samplingConfig;
+            var tokenizer = _svc.Model?.Tokenizer;
+            if (tokenizer == null)
+                return samplingConfig;
+
+            int[] openers = s_jsonOpenerTokens.GetValue(tokenizer, tk =>
+            {
+                var t = (TensorSharp.Runtime.ITokenizer)tk;
+                var ids = new HashSet<int>();
+                // Common object-opening spellings; the sampler picks the most
+                // probable, so the model still chooses its preferred one.
+                foreach (string opener in new[] { "{", " {", "{\"", "{\n" })
+                {
+                    try
+                    {
+                        var enc = t.Encode(opener, addSpecial: false);
+                        if (enc != null && enc.Count > 0)
+                            ids.Add(enc[0]);
+                    }
+                    catch
+                    {
+                        // A tokenizer that can't encode a literal is fine — just
+                        // skip that spelling.
+                    }
+                }
+                return ids.Count > 0 ? System.Linq.Enumerable.ToArray(ids) : Array.Empty<int>();
+            });
+            if (openers.Length == 0)
+                return samplingConfig;
+
+            var constrained = samplingConfig.Clone();
+            constrained.FirstTokenAllowList = openers;
+            return constrained;
+        }
+
         // ---- Streaming -------------------------------------------------------
 
         private async Task StreamCompletionAsync(
@@ -245,6 +297,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 }
                 return;
             }
+
+            samplingConfig = WithJsonFirstTokenConstraint(samplingConfig, responseFormat);
 
             bool useStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
                 || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
@@ -456,6 +510,8 @@ namespace TensorSharp.Server.ProtocolAdapters
                 await ctx.Response.WriteAsJsonAsync(new { error = new { message = loadError, type = "invalid_request_error" } });
                 return;
             }
+
+            samplingConfig = WithJsonFirstTokenConstraint(samplingConfig, responseFormat);
 
             var sb = new StringBuilder();
             int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;

@@ -56,10 +56,10 @@ namespace TensorSharp.GGML
                 : Math.Max(GgmlHostPtrAlignment, systemPageSize);
             _useVirtualAlloc = true;
 
-            if (backendType == GgmlBackendType.Cuda)
+            if (backendType == GgmlBackendType.Cuda || backendType == GgmlBackendType.Vulkan)
             {
-                // CUDA weights / KV caches are mirrored on device, so holding onto large
-                // freed host buffers just bloats RAM without helping steady-state decode.
+                // CUDA/Vulkan weights / KV caches are mirrored on device, so holding onto
+                // large freed host buffers just bloats RAM without helping steady-state decode.
                 _initialBlockCount = CudaInitialBlockCount;
                 _maxPooledBlocks = CudaMaxPooledBlocks;
                 _maxRetainedBlockSize = (nuint)CudaMaxRetainedBlockSize;

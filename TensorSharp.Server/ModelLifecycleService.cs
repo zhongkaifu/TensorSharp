@@ -185,6 +185,7 @@ namespace TensorSharp.Server
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cpu" => BackendType.GgmlCpu,
                 "ggml_cuda" => BackendType.GgmlCuda,
+                "ggml_vulkan" => BackendType.GgmlVulkan,
                 "cpu" => BackendType.Cpu,
                 _ => BackendType.GgmlCpu
             };

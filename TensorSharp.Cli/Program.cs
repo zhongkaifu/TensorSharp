@@ -117,6 +117,11 @@ namespace TensorSharp.Cli
             long? pagedKvSsdMbOverride = null;
             int? pagedKvQuantBitsOverride = null;
             bool runInteractive = false;
+            // Vulkan GPU selection (multi-GPU hosts, e.g. an integrated Intel GPU
+            // next to a discrete NVIDIA one). Plumbed through the env var that
+            // GgmlNative reads when the ggml_vulkan backend initializes.
+            int? gpuDeviceOverride = null;
+            bool listGpus = false;
             string systemPrompt = null;
             int warmupInferenceRuns = 0;
             // DiffusionGemma sampler knobs (used only for the diffusion-gemma architecture).
@@ -159,6 +164,15 @@ namespace TensorSharp.Cli
                     case "--max-tokens": maxTokens = int.Parse(args[++i]); break;
                     case "--test": runTest = true; break;
                     case "--backend": backendStr = args[++i].ToLowerInvariant(); break;
+                    case "--gpu-device":
+                    {
+                        string gpuStr = args[++i];
+                        if (!int.TryParse(gpuStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out int gpuIndex) || gpuIndex < 0)
+                            throw new ArgumentException($"Invalid value for --gpu-device: '{gpuStr}'. Expected a non-negative Vulkan device index (see --list-gpus).");
+                        gpuDeviceOverride = gpuIndex;
+                        break;
+                    }
+                    case "--list-gpus": listGpus = true; break;
                     case "--test-templates": testTemplatesDir = args[++i]; break;
                     case "--think": enableThinking = true; break;
                     case "--tools": toolsFile = args[++i]; break;
@@ -265,6 +279,12 @@ namespace TensorSharp.Cli
                 }
             }
 
+            if (listGpus)
+            {
+                ListVulkanGpus();
+                return;
+            }
+
             List<ToolFunction> tools = null;
             if (toolsFile != null)
             {
@@ -304,7 +324,8 @@ namespace TensorSharp.Cli
                     "[--input-jsonl <requests.jsonl>] [--image <image.png>] [--output <output.txt>] " +
                     "[--prompt <text>] [--cfg F] [--diffusion-steps N] [--diffusion-seed N] " +
                     "[--qwen-image-vae <vae.gguf>] [--qwen-image-vl <qwen2.5-vl.gguf>] [--qwen-image-mmproj <mmproj.gguf>] [--qwen-image-lora <lora.safetensors>] " +
-                    "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda] " +
+                    "[--max-tokens N] [--test] [--backend cpu|cuda|mlx|ggml_cpu|ggml_metal|ggml_cuda|ggml_vulkan] " +
+                    "[--gpu-device N] [--list-gpus] " +
                     "[--interactive] [--system <text>] [--system-file <path>] " +
                     "[--temperature F] [--top-k N] [--top-p F] [--min-p F] " +
                     "[--repeat-penalty F] [--presence-penalty F] [--frequency-penalty F] " +
@@ -323,13 +344,34 @@ namespace TensorSharp.Cli
                 "ggml_cpu" => BackendType.GgmlCpu,
                 "ggml_metal" => BackendType.GgmlMetal,
                 "ggml_cuda" or "ggml-cuda" => BackendType.GgmlCuda,
-                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, mlx, ggml_cpu, ggml_metal, ggml_cuda"),
+                "ggml_vulkan" or "ggml-vulkan" => BackendType.GgmlVulkan,
+                _ => throw new ArgumentException($"Unknown backend '{backendStr}'. Use: cpu, cuda, mlx, ggml_cpu, ggml_metal, ggml_cuda, ggml_vulkan"),
             };
 
             ApplyPagedKvCacheCliOverrides(
                 pagedKvEnableOverride, pagedKvBlockSizeOverride,
                 pagedKvRamMbOverride, pagedKvSsdDirOverride, pagedKvSsdMbOverride,
                 pagedKvQuantBitsOverride);
+
+            if (gpuDeviceOverride.HasValue)
+            {
+                if (backend == BackendType.GgmlVulkan)
+                {
+                    // GgmlNative reads this env var (managed-side) when the Vulkan
+                    // backend initializes and pushes the index down to the native
+                    // bridge before ggml_backend_vk_init runs.
+                    Environment.SetEnvironmentVariable(
+                        TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar,
+                        gpuDeviceOverride.Value.ToString(CultureInfo.InvariantCulture));
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Vulkan GPU selected via CLI: --gpu-device {DeviceIndex}", gpuDeviceOverride.Value);
+                }
+                else
+                {
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "--gpu-device applies to the ggml_vulkan backend only; ignored for backend {Backend}", backend);
+                }
+            }
 
             // Qwen-Image-Edit: let the operator override the companion GGUFs that
             // QwenImageModel otherwise resolves from a same-directory scan. These
@@ -2665,6 +2707,29 @@ namespace TensorSharp.Cli
         /// falling back to the same-directory scan and surfacing as a confusing
         /// "companion not found" later.
         /// </summary>
+        /// <summary>
+        /// Print the Vulkan devices ggml-vulkan can see (index + adapter name) so the
+        /// operator knows what to pass to <c>--gpu-device</c> on multi-GPU hosts.
+        /// Enumerating spins up the Vulkan instance but no backend/device state.
+        /// </summary>
+        static void ListVulkanGpus()
+        {
+            int count = TensorSharp.GGML.GgmlBasicOps.GetVulkanDeviceCount();
+            if (count <= 0)
+            {
+                Console.WriteLine("No Vulkan devices found. Ensure the native GGML bridge is built with Vulkan support " +
+                    "(TensorSharp.GGML.Native/build-windows.ps1 --vulkan) and a Vulkan driver is installed.");
+                return;
+            }
+
+            Console.WriteLine($"Vulkan devices ({count}):");
+            for (int i = 0; i < count; i++)
+            {
+                Console.WriteLine($"  {i}: {TensorSharp.GGML.GgmlBasicOps.GetVulkanDeviceDescription(i) ?? "(unknown)"}");
+            }
+            Console.WriteLine("Select one with: --backend ggml_vulkan --gpu-device <index>");
+        }
+
         static void ApplyQwenImageCompanionOverride(string flag, string envVar, string path)
         {
             if (string.IsNullOrWhiteSpace(path))

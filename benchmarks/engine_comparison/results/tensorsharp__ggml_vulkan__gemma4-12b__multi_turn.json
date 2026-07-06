@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "multi_turn",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2094,
+  "completion_tokens": 500,
+  "ttft_ms": 3187.0,
+  "prefill_tps": 657.0,
+  "decode_tps": 32.7,
+  "total_wall_ms": 18484.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "Since you have a $3000 budget (which is quite healthy for a standard trip to Japan), the best way to split your spending depends on whether you want a \"luxury\" experience in one city or a balanced experience across both.\n\nHowever, because **Tokyo** generally has a higher cost of living and more dive",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 32.7,
+  "requests_ok": 1
+}

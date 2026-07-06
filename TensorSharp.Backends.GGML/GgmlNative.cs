@@ -23,6 +23,7 @@ public enum GgmlBackendType
     Metal = 1,
     Cpu = 2,
     Cuda = 3,
+    Vulkan = 4,
 }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -615,6 +616,15 @@ internal enum GgmlIndexReductionOp
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_IsBackendAvailable(int backendType);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_SetVulkanDeviceIndex(int deviceIndex);
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GetVulkanDeviceCount();
+
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_GetVulkanDeviceDescription(int deviceIndex, byte[] description, int descriptionSize);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_AddmmF32(
@@ -1432,7 +1442,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
             IntPtr logitsData, int vocabSize,
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
-            IntPtr finalNormData, float logitSoftcap);
+            IntPtr finalNormData, float logitSoftcap,
+            IntPtr pleTokenEmbdData, int pleTokenEmbdType,
+            long pleTokenEmbdNe0, long pleTokenEmbdNe1, long pleTokenEmbdBytes,
+            int pleTokenId,
+            IntPtr pleModelProjData, int pleModelProjType,
+            long pleModelProjNe0, long pleModelProjNe1, long pleModelProjBytes,
+            IntPtr pleModelProjNormData);
 
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_Gemma4ModelDecodeBatched(
@@ -2357,6 +2373,16 @@ internal enum GgmlIndexReductionOp
                 throw new PlatformNotSupportedException("The GGML CUDA backend is supported on Windows and Linux only.");
             }
 
+            if (backendType == GgmlBackendType.Vulkan && !IsVulkanPlatformSupported())
+            {
+                throw new PlatformNotSupportedException("The GGML Vulkan backend is supported on Windows and Linux only.");
+            }
+
+            if (backendType == GgmlBackendType.Vulkan)
+            {
+                ApplyVulkanDeviceFromEnvironment();
+            }
+
             try
             {
                 if (TSGgml_IsBackendAvailable((int)backendType) == 0)
@@ -2365,6 +2391,7 @@ internal enum GgmlIndexReductionOp
                     {
                         GgmlBackendType.Metal => "ggml-metal",
                         GgmlBackendType.Cuda => "ggml-cuda",
+                        GgmlBackendType.Vulkan => "ggml-vulkan",
                         _ => "ggml-cpu",
                     };
                     throw new InvalidOperationException($"Failed to initialize {backendName}. {GetBackendAvailabilityHint(backendType)}");
@@ -2392,6 +2419,11 @@ internal enum GgmlIndexReductionOp
                 return false;
             }
 
+            if (backendType == GgmlBackendType.Vulkan && !IsVulkanPlatformSupported())
+            {
+                return false;
+            }
+
             try
             {
                 return TSGgml_CanInitializeBackend((int)backendType) != 0;
@@ -2404,6 +2436,97 @@ internal enum GgmlIndexReductionOp
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Environment variable holding the Vulkan device index for the GGML Vulkan
+        /// backend (multi-GPU hosts, e.g. an integrated GPU next to a discrete one).
+        /// Read from managed code when the Vulkan backend initializes — the native
+        /// bridge cannot see env vars set after process start on Windows (the CRT
+        /// snapshots the environment), so the value is pushed down via
+        /// <see cref="SetVulkanDeviceIndex"/> instead.
+        /// </summary>
+        public const string VulkanDeviceEnvVar = "TS_GGML_VULKAN_DEVICE";
+
+        /// <summary>
+        /// Selects which Vulkan device the GGML Vulkan backend initializes on.
+        /// Must be called before the backend first initializes; the device cannot
+        /// change afterwards.
+        /// </summary>
+        public static void SetVulkanDeviceIndex(int deviceIndex)
+        {
+            try
+            {
+                if (TSGgml_SetVulkanDeviceIndex(deviceIndex) == 0)
+                {
+                    throw new InvalidOperationException(
+                        GetLastErrorMessage($"Failed to select Vulkan device {deviceIndex}."));
+                }
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                // Older native bridges hardcode device 0, so requesting it is a no-op.
+                if (deviceIndex == 0)
+                    return;
+                throw new InvalidOperationException(
+                    "The native GGML bridge is out of date and does not support Vulkan device selection. Rebuild `TensorSharp.GGML.Native`.", ex);
+            }
+        }
+
+        /// <summary>Number of Vulkan devices visible to ggml-vulkan, or 0 when the build has no Vulkan support.</summary>
+        public static int GetVulkanDeviceCount()
+        {
+            try
+            {
+                return Math.Max(0, TSGgml_GetVulkanDeviceCount());
+            }
+            catch (DllNotFoundException)
+            {
+                return 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>Human-readable description of a Vulkan device (adapter name), or null when unavailable.</summary>
+        public static string GetVulkanDeviceDescription(int deviceIndex)
+        {
+            byte[] buffer = new byte[256];
+            try
+            {
+                if (TSGgml_GetVulkanDeviceDescription(deviceIndex, buffer, buffer.Length) == 0)
+                    return null;
+            }
+            catch (DllNotFoundException)
+            {
+                return null;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return null;
+            }
+
+            int length = Array.IndexOf(buffer, (byte)0);
+            if (length < 0)
+                length = buffer.Length;
+            return length == 0 ? null : System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+        }
+
+        private static void ApplyVulkanDeviceFromEnvironment()
+        {
+            string raw = Environment.GetEnvironmentVariable(VulkanDeviceEnvVar);
+            if (string.IsNullOrWhiteSpace(raw))
+                return;
+
+            if (!int.TryParse(raw, out int deviceIndex) || deviceIndex < 0)
+            {
+                throw new InvalidOperationException(
+                    $"Invalid {VulkanDeviceEnvVar} value '{raw}'. Expected a non-negative Vulkan device index.");
+            }
+
+            SetVulkanDeviceIndex(deviceIndex);
         }
 
         public static void Addmm(GgmlTensorView2D result, GgmlTensorView2D src, GgmlTensorView2D m1, GgmlTensorView2D m2, float beta, float alpha)
@@ -3368,7 +3491,13 @@ internal enum GgmlIndexReductionOp
             IntPtr[] vArr = null, int[] vTypeArr = null, long[] vNe0Arr = null, long[] vNe1Arr = null, long[] vBytesArr = null,
             IntPtr logitsData = default, int vocabSize = 0,
             IntPtr lmHeadData = default, int lmHeadType = 0, long lmHeadNe0 = 0, long lmHeadNe1 = 0, long lmHeadBytes = 0,
-            IntPtr finalNormData = default, float logitSoftcap = 0f)
+            IntPtr finalNormData = default, float logitSoftcap = 0f,
+            IntPtr pleTokenEmbdData = default, int pleTokenEmbdType = 0,
+            long pleTokenEmbdNe0 = 0, long pleTokenEmbdNe1 = 0, long pleTokenEmbdBytes = 0,
+            int pleTokenId = -1,
+            IntPtr pleModelProjData = default, int pleModelProjType = 0,
+            long pleModelProjNe0 = 0, long pleModelProjNe1 = 0, long pleModelProjBytes = 0,
+            IntPtr pleModelProjNormData = default)
         {
             CheckResult(TSGgml_Gemma4ModelDecode(
                 hiddenData, hiddenSize, numLayers,
@@ -3395,7 +3524,13 @@ internal enum GgmlIndexReductionOp
                 vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
                 logitsData, vocabSize,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                finalNormData, logitSoftcap), "gemma4_model_decode");
+                finalNormData, logitSoftcap,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenId,
+                pleModelProjData, pleModelProjType,
+                pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
+                pleModelProjNormData), "gemma4_model_decode");
         }
 
         /// <summary>True token-batched dense decode: N concurrent sequences, one
@@ -4030,6 +4165,13 @@ internal enum GgmlIndexReductionOp
             return OperatingSystem.IsWindows() || OperatingSystem.IsLinux();
         }
 
+        private static bool IsVulkanPlatformSupported()
+        {
+            // Metal is the GPU backend on macOS; ggml-vulkan is built for
+            // Windows and Linux only (see TensorSharp.GGML.Native/CMakeLists.txt).
+            return OperatingSystem.IsWindows() || OperatingSystem.IsLinux();
+        }
+
         private static void EnsureWindowsNativeDependencySearchPaths()
         {
             if (!OperatingSystem.IsWindows())
@@ -4104,6 +4246,19 @@ internal enum GgmlIndexReductionOp
                 string rebuildHint = OperatingSystem.IsWindows()
                     ? "Rebuild the native GGML bridge with CUDA enabled, for example: `powershell -ExecutionPolicy Bypass -File TensorSharp.GGML.Native/build-windows.ps1 --cuda` or `set TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON` before `dotnet build`."
                     : "Rebuild the native GGML bridge with CUDA enabled, for example: `bash TensorSharp.GGML.Native/build-linux.sh --cuda` or `TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build`.";
+
+                if (string.IsNullOrWhiteSpace(backendMessage))
+                    return rebuildHint;
+
+                if (backendMessage.Contains("not available in this build", StringComparison.OrdinalIgnoreCase))
+                    return $"{backendMessage} {rebuildHint}";
+            }
+
+            if (backendType == GgmlBackendType.Vulkan && IsVulkanPlatformSupported())
+            {
+                string rebuildHint = OperatingSystem.IsWindows()
+                    ? "Rebuild the native GGML bridge with Vulkan enabled, for example: `powershell -ExecutionPolicy Bypass -File TensorSharp.GGML.Native/build-windows.ps1 --vulkan` or `set TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` before `dotnet build`."
+                    : "Rebuild the native GGML bridge with Vulkan enabled, for example: `bash TensorSharp.GGML.Native/build-linux.sh --vulkan` or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON dotnet build`.";
 
                 if (string.IsNullOrWhiteSpace(backendMessage))
                     return rebuildHint;

@@ -76,7 +76,7 @@ namespace TensorSharp.Models
             // baked into the persistent CUDA-graph-captured single-token decode
             // graph. Drop it so the next per-seq fused Forward rebuilds + recaptures
             // against the current pool state (see Gemma4ResetDecodeCache).
-            if (_backend == BackendType.GgmlCuda)
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();

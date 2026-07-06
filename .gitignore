@@ -31,6 +31,10 @@ ExternalProjects/.ggml-fetch.lock
 ExternalProjects/.ggml-fetch.lock.d/
 ExternalProjects/ggml/
 
+# Portable Vulkan build toolchain (headers, loader import lib, glslc), provisioned
+# at build time by eng/fetch-vulkan-toolchain.ps1 when no Vulkan SDK is installed.
+ExternalProjects/vulkan-toolchain/
+
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
 

@@ -38,28 +38,30 @@ RESULTS_DIR = config.RESULTS_DIR
 REPORT_PATH = config.REPO_ROOT / "docs" / "engine_comparison_report.md"
 CSV_PATH = RESULTS_DIR / "results.csv"
 
-# Column order: engine x backend.
-COLUMNS = [
-    ("tensorsharp", "gpu"), ("tensorsharp", "cpu"),
-    ("llamacpp", "gpu"), ("llamacpp", "cpu"),
-    ("vllm", "gpu"),
-]
-COL_LABEL = {
-    ("tensorsharp", "gpu"): "TensorSharp · GPU",
-    ("tensorsharp", "cpu"): "TensorSharp · CPU",
-    ("llamacpp", "gpu"): "llama.cpp · GPU",
-    ("llamacpp", "cpu"): "llama.cpp · CPU",
-    ("vllm", "gpu"): "vLLM · GPU",
-}
+# Columns are (engine, backend) pairs discovered in the results, ordered by the
+# config registries (engine outer, backend inner). Results may contain backend
+# ids that are not in the current config (e.g. the legacy abstract gpu / cpu
+# ids from an older run); those sort after the registry ids and are labeled by
+# their raw id.
+def _order_key(col) -> tuple:
+    eng_order = list(config.ENGINES.keys())
+    b_order = list(config.BACKENDS.keys())
+    e, b = col
+    return (eng_order.index(e) if e in eng_order else len(eng_order),
+            b_order.index(b) if b in b_order else len(b_order), str(e), str(b))
 
-# Performance-ratio comparisons: TensorSharp (numerator) vs a reference engine on
-# the *same* backend, so the columns stay apples-to-apples. A ratio > 1.0×
+
+def _col_label(col) -> str:
+    e, b = col
+    eng = config.ENGINES.get(e)
+    spec = config.BACKENDS.get(b)
+    return f"{eng.display if eng else e} · {spec.display if spec else b}"
+
+
+# Performance-ratio comparisons: TensorSharp (numerator) vs a reference engine
+# on the *same* backend, so the columns stay apples-to-apples. A ratio > 1.0×
 # means TensorSharp is faster (for throughput metrics) / lower-latency (TTFT).
-RATIO_PAIRS = [
-    (("tensorsharp", "gpu"), ("llamacpp", "gpu"), "vs llama.cpp · GPU"),
-    (("tensorsharp", "cpu"), ("llamacpp", "cpu"), "vs llama.cpp · CPU"),
-    (("tensorsharp", "gpu"), ("vllm", "gpu"), "vs vLLM · GPU"),
-]
+_RATIO_REF_ENGINES = ("llamacpp", "vllm")
 
 
 def load_all() -> dict:
@@ -102,7 +104,7 @@ def _present_columns(data: dict) -> list:
     for scen_map in data.values():
         for col_map in scen_map.values():
             seen.update(col_map.keys())
-    return [c for c in COLUMNS if c in seen]
+    return sorted(seen, key=_order_key)
 
 
 def _scenario_rows(scen_map: dict) -> list:
@@ -116,7 +118,7 @@ def _scenario_rows(scen_map: dict) -> list:
 
 
 def metric_table(scen_map: dict, cols: list, metric: str) -> str:
-    head = "| Scenario | " + " | ".join(COL_LABEL[c] for c in cols) + " |"
+    head = "| Scenario | " + " | ".join(_col_label(c) for c in cols) + " |"
     sep = "|---|" + "|".join(["---:"] * len(cols)) + "|"
     rows = [head, sep]
     for scenario_id in _scenario_rows(scen_map):
@@ -163,14 +165,23 @@ _RATIO_METRICS = (("decode_tps", True), ("prefill_tps", True), ("ttft_ms", False
 
 def _present_ratio_pairs(scen_map: dict) -> list:
     """Ratio pairs that yield at least one real number for this model — i.e. some
-    scenario where both TensorSharp and the reference actually ran. Drops e.g. an
-    all-`—` vLLM column when that endpoint never produced a comparable cell."""
+    scenario where both TensorSharp and the reference actually ran on the same
+    backend. Built from whatever backends appear in the data, so new backend ids
+    (ggml_vulkan, ...) get their own comparison columns automatically; drops e.g.
+    an all-`—` vLLM column when that endpoint never produced a comparable cell."""
+    cols = set()
+    for col_map in scen_map.values():
+        cols.update(col_map.keys())
     out = []
-    for ts, ref, lbl in RATIO_PAIRS:
-        if any(_ratio_val(col_map.get(ts), col_map.get(ref), m, hib) > 0
-               for col_map in scen_map.values()
-               for m, hib in _RATIO_METRICS):
-            out.append((ts, ref, lbl))
+    for ts in sorted((c for c in cols if c[0] == "tensorsharp"), key=_order_key):
+        for ref_eng in _RATIO_REF_ENGINES:
+            ref = (ref_eng, ts[1])
+            if ref not in cols:
+                continue
+            if any(_ratio_val(col_map.get(ts), col_map.get(ref), m, hib) > 0
+                   for col_map in scen_map.values()
+                   for m, hib in _RATIO_METRICS):
+                out.append((ts, ref, f"vs {_col_label(ref)}"))
     return out
 
 
@@ -233,10 +244,11 @@ def versions_block() -> str:
     ts_rev = _try(["git", "-C", str(config.REPO_ROOT), "rev-parse", "--short", "HEAD"])
     dotnet_v = _try(["dotnet", "--version"])
     gpu = _try(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
+    ts_backends = " / ".join(b.ts_backend for b in config.BACKENDS.values() if b.ts_backend)
     return (
         "| Component | Version / detail |\n"
         "|---|---|\n"
-        f"| TensorSharp | git `{ts_rev}`, .NET {dotnet_v} (backends: ggml_cuda / ggml_cpu) |\n"
+        f"| TensorSharp | git `{ts_rev}`, .NET {dotnet_v} (backends: {ts_backends}) |\n"
         f"| llama.cpp | `{config.LLAMA_SERVER_EXE}` |\n"
         f"| vLLM | endpoint `{config.VLLM_BASE_URL}` (connect-only) |\n"
         f"| GPU | {gpu or 'unknown'} |\n"
@@ -356,7 +368,8 @@ def main():
     out.append("# Engine comparison benchmark — TensorSharp vs llama.cpp vs vLLM\n")
     out.append("Same GGUF files, same host, one uniform OpenAI `/v1/chat/completions` "
                "surface, across text / image / audio / video / single-turn / multi-turn / "
-               "function-call / structured-output scenarios on GPU and CPU backends.\n")
+               "function-call / structured-output scenarios on the selected compute "
+               "backends (ggml_cuda / ggml_vulkan / ggml_metal / ggml_cpu / cpu / ...).\n")
     out.append("Numbers are tokens/second (higher is better). `—` = not applicable / skipped, "
                "`fail` = errored at runtime, `n/a` = combination never attempted.\n")
 

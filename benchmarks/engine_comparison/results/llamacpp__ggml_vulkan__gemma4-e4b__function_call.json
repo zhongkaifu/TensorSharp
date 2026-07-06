@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "function_call",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2034,
+  "completion_tokens": 226,
+  "ttft_ms": 1219.0,
+  "prefill_tps": 1668.6,
+  "decode_tps": 46.6,
+  "total_wall_ms": 6000.0,
+  "finish_reason": "tool_calls",
+  "tool_call_ok": true,
+  "output_preview": "1. **Analyze the Request:** The user is asking for \"the current weather in Paris in celsius\" and explicitly instructs to \"Use the available tool.\"\n\n2. **Examine Available Tools:** The provided tool definition is `get_weather`.\n   - `get_weather(city: STRING, units: STRING)`\n   - `city` is required.\n",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 46.6,
+  "requests_ok": 1
+}

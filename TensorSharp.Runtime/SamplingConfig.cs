@@ -82,6 +82,19 @@ namespace TensorSharp.Runtime
         public int MaxTokens { get; set; } = 0;
 
         /// <summary>
+        /// Restricts the FIRST generated token of the request to these token ids
+        /// (null/empty = unrestricted). Used by structured output
+        /// (<c>response_format: json_object/json_schema</c>) to force the reply
+        /// to open with the JSON object — the same effect llama.cpp achieves via
+        /// its JSON grammar — so time-to-first-token reflects prefill latency
+        /// instead of however much prose the model would have rambled before the
+        /// first <c>{</c> (which the streaming JSON filter suppresses). The most
+        /// probable allowed token is picked (deterministic); subsequent tokens
+        /// sample normally.
+        /// </summary>
+        public IReadOnlyList<int>? FirstTokenAllowList { get; set; }
+
+        /// <summary>
         /// Returns true if this config is effectively greedy decoding.
         /// </summary>
         public bool IsGreedy => Temperature <= 0f && TopK <= 0 && TopP >= 1.0f && MinP <= 0f;
@@ -133,6 +146,7 @@ namespace TensorSharp.Runtime
                 Seed = Seed,
                 MaxTokens = MaxTokens,
                 StopSequences = StopSequences != null ? new List<string>(StopSequences) : null,
+                FirstTokenAllowList = FirstTokenAllowList,
             };
         }
     }

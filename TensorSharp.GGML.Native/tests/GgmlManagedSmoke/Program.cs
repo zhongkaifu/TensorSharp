@@ -17,7 +17,8 @@ static GgmlBackendType ParseBackend(string[] args)
     {
         "cpu" or "ggml_cpu" => GgmlBackendType.Cpu,
         "cuda" or "ggml_cuda" => GgmlBackendType.Cuda,
-        _ => throw new ArgumentException("Unknown backend. Use cpu or cuda.")
+        "vulkan" or "ggml_vulkan" => GgmlBackendType.Vulkan,
+        _ => throw new ArgumentException("Unknown backend. Use cpu, cuda, or vulkan.")
     };
 }
 

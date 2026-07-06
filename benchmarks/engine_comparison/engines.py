@@ -17,6 +17,7 @@ run non-streaming and its throughput is wall-clock tokens/second.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import time
@@ -333,6 +334,31 @@ def _wait_port_free(host: str, port: int, timeout_s: float = 30.0) -> None:
         time.sleep(0.5)
 
 
+def _pid_listening(port: int):
+    """PID of the process LISTENING on the port (Windows netstat), or None."""
+    try:
+        out = subprocess.check_output(["netstat", "-ano"], text=True,
+                                      stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "TCP" and "LISTENING" in parts:
+            if parts[1].endswith(f":{port}"):
+                try:
+                    return int(parts[-1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _find_free_port(start: int, tries: int = 20) -> int:
+    for p in range(start, start + tries):
+        if not _port_open("127.0.0.1", p):
+            return p
+    return start  # caller's launch will then fail with a clear bind error
+
+
 class ServerHandle:
     """Common helpers for a launched OpenAI server process."""
 
@@ -342,6 +368,7 @@ class ServerHandle:
         self.log_path = log_path
         self.proc: Optional[subprocess.Popen] = None
         self._log_fh = None
+        self.ready_hint = ""     # diagnosis when wait_ready gives up early
 
     def _spawn(self, cmd: list[str], cwd: Optional[Path], env: Optional[dict]):
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -359,6 +386,7 @@ class ServerHandle:
     def wait_ready(self, timeout_s: float) -> bool:
         url = self.base_url.rstrip("/") + "/v1/models"
         deadline = time.monotonic() + timeout_s
+        silent_but_open = 0
         while time.monotonic() < deadline:
             if self.proc is not None and self.proc.poll() is not None:
                 return False  # process exited before becoming ready
@@ -366,8 +394,31 @@ class ServerHandle:
                 r = requests.get(url, timeout=3)
                 if r.status_code == 200:
                     return True
+                silent_but_open = 0
             except requests.RequestException:
-                pass
+                # Distinguish "nothing listening yet" (normal while the model
+                # loads) from "TCP connects but HTTP never answers". The latter
+                # is the signature of a leftover server squatting the port: a
+                # hung process (e.g. llama-server stuck in a GPU-driver call is
+                # unkillable and keeps its socket) lets the kernel complete
+                # handshakes into the listen backlog while never serving them.
+                # If the port's owner is not our child process, we can never
+                # become ready — bail out with a diagnosis instead of burning
+                # the whole ready timeout looking stuck.
+                if _port_open("127.0.0.1", self.port):
+                    silent_but_open += 1
+                    if silent_but_open >= 3:
+                        owner = _pid_listening(self.port)
+                        ours = self.proc.pid if self.proc is not None else None
+                        if owner is not None and ours is not None and owner != ours:
+                            self.ready_hint = (
+                                f"port {self.port} is owned by PID {owner}, not our "
+                                f"server (PID {ours}) — a leftover/hung server is "
+                                f"squatting the port; kill it (taskkill /F /PID {owner}) "
+                                f"or reboot if it will not die. ")
+                            return False
+                else:
+                    silent_but_open = 0
             time.sleep(1.0)
         return False
 
@@ -413,11 +464,21 @@ class TensorSharpServer(ServerHandle):
         self.mtp = mtp
 
     def start(self):
-        ts_backend = config.TENSORSHARP_BACKEND[self.backend]
+        spec = config.BACKENDS[self.backend]
+        # TensorSharp.Server hard-codes its listen address to 0.0.0.0:5000, so a
+        # squatted port cannot be worked around by moving — fail fast and clearly.
+        if _port_open("127.0.0.1", self.port):
+            pid = _pid_listening(self.port)
+            raise RuntimeError(
+                f"port {self.port} is already in use by PID {pid} and "
+                f"TensorSharp.Server's listen address is hard-coded to "
+                f"0.0.0.0:{self.port}. Stop that process (taskkill /F /PID {pid}); "
+                f"if it will not die (stuck in a GPU-driver call), reboot.")
         cmd = ["dotnet", str(config.TENSORSHARP_SERVER_DLL),
                "--model", str(self.model.gguf),
-               "--backend", ts_backend,
+               "--backend", spec.ts_backend,
                "--max-tokens", str(self.max_tokens)]
+        cmd += [str(a) for a in spec.ts_extra_args]
         if self.model.mmproj is not None and self.model.mmproj.exists():
             cmd += ["--mmproj", str(self.model.mmproj)]
         # MTP / NextN speculative decoding: --mtp-spec engages it; Gemma 4 also
@@ -426,8 +487,8 @@ class TensorSharpServer(ServerHandle):
             cmd += ["--mtp-spec"]
             if self.model.mtp_draft is not None:
                 cmd += ["--mtp-draft-model", str(self.model.mtp_draft)]
-        import os
         env = os.environ.copy()
+        env.update(spec.ts_env)
         if self.model.is_diffusion:
             env["DIFFUSION_STEPS"] = str(self.model.diffusion_steps)
         self._spawn(cmd, cwd=config.TENSORSHARP_SERVER_DLL.parent, env=env)
@@ -444,17 +505,34 @@ class LlamaCppServer(ServerHandle):
         self.backend = backend
 
     def start(self):
-        ngl = config.LLAMA_NGL[self.backend]
-        cmd = [str(config.LLAMA_SERVER_EXE),
+        spec = config.BACKENDS[self.backend]
+        exe = config.llama_server_exe_for(self.backend)
+        # A leftover/hung llama-server (unkillable while stuck in a GPU-driver
+        # call) may still own the configured port. llama-server's port is fully
+        # under our control, so shift to a free one instead of letting the
+        # health checks talk to the zombie's dead listen backlog.
+        if _port_open("127.0.0.1", self.port):
+            squatter = _pid_listening(self.port)
+            new_port = _find_free_port(self.port + 1)
+            print(f"    note: port {self.port} is already in use (PID {squatter}); "
+                  f"launching llama-server on port {new_port} instead", flush=True)
+            self.port = new_port
+            self.base_url = f"http://127.0.0.1:{self.port}"
+        cmd = [str(exe),
                "-m", str(self.model.gguf),
-               "-ngl", str(ngl),
+               "-ngl", str(spec.llama_ngl),
                "--host", "127.0.0.1",
-               "--port", str(config.LLAMA_PORT),
+               "--port", str(self.port),
                "-c", str(config.LLAMA_CONTEXT_SIZE)]
         cmd += [str(a) for a in config.LLAMA_EXTRA_ARGS]
+        cmd += [str(a) for a in spec.llama_extra_args]
         if self.model.mmproj is not None and self.model.mmproj.exists():
             cmd += ["--mmproj", str(self.model.mmproj)]
-        self._spawn(cmd, cwd=config.LLAMA_SERVER_EXE.parent, env=None)
+        env = None
+        if spec.llama_env:
+            env = os.environ.copy()
+            env.update(spec.llama_env)
+        self._spawn(cmd, cwd=exe.parent, env=env)
 
 
 # ---------------------------------------------------------------------------

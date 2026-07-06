@@ -647,7 +647,7 @@ namespace TensorSharp.Models
             // mis-aliasing trap. On Metal this replaces the chunked path's per-GDN-layer
             // HOST round-trip (Conv1D + SiLU + packing on the CPU, then upload
             // Q/K/V/Z/alpha/beta) with one device-resident graph per layer.
-            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal) return false;
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal) return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32) return false;
             if (hidden.Sizes[0] != seqLen || hidden.Sizes[1] != Config.HiddenSize) return false;
             if (_headKDim != _headVDim) return false; // gated_delta_net path assumes shared head dim

@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "multi_turn",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2068,
+  "completion_tokens": 1280,
+  "ttft_ms": 1344.0,
+  "prefill_tps": 1538.7,
+  "decode_tps": 46.4,
+  "total_wall_ms": 28891.0,
+  "finish_reason": "length",
+  "tool_call_ok": null,
+  "output_preview": "This is a tricky question because the split depends heavily on **how long** you plan to spend in each city, and whether you prioritize high-end experiences (like luxury hotels or fine dining) or budget travel.\n\nHowever, assuming you are planning a balanced trip (e.g., 4-5 days in each city), here is",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 46.4,
+  "requests_ok": 1
+}

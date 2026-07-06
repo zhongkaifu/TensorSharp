@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "function_call",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2074,
+  "completion_tokens": 39,
+  "ttft_ms": 3235.0,
+  "prefill_tps": 641.1,
+  "decode_tps": 65.7,
+  "total_wall_ms": 3844.0,
+  "finish_reason": "tool_calls",
+  "tool_call_ok": true,
+  "output_preview": "<|tool_response>thought\n<channel|>The current weather in Paris is 15\u00b0C with clear skies.",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 65.7,
+  "requests_ok": 1
+}

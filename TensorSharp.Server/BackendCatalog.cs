@@ -19,6 +19,7 @@ namespace TensorSharp.Server
             new("cuda", "CUDA (cuBLAS GPU)", null, AlwaysAvailable: false),
             new("ggml_metal", "GGML Metal (GPU)", GgmlBackendType.Metal, AlwaysAvailable: false),
             new("ggml_cuda", "GGML CUDA (GPU)", GgmlBackendType.Cuda, AlwaysAvailable: false),
+            new("ggml_vulkan", "GGML Vulkan (GPU)", GgmlBackendType.Vulkan, AlwaysAvailable: false),
             new("ggml_cpu", "GGML CPU", GgmlBackendType.Cpu, AlwaysAvailable: true),
             new("cpu", "CPU (Pure C#)", GgmlBackendType.Cpu, AlwaysAvailable: true),
         };
@@ -65,6 +66,7 @@ namespace TensorSharp.Server
                 "mlx" or "mlx_metal" or "mlx-metal" => "mlx",
                 "cuda" or "direct_cuda" or "direct-cuda" => "cuda",
                 "ggml_cuda" or "ggml-cuda" => "ggml_cuda",
+                "ggml_vulkan" or "ggml-vulkan" => "ggml_vulkan",
                 "ggml_metal" => "ggml_metal",
                 "ggml_cpu" => "ggml_cpu",
                 "cpu" => "cpu",
@@ -80,6 +82,7 @@ namespace TensorSharp.Server
                 BackendType.Cuda => "cuda",
                 BackendType.GgmlMetal => "ggml_metal",
                 BackendType.GgmlCuda => "ggml_cuda",
+                BackendType.GgmlVulkan => "ggml_vulkan",
                 BackendType.GgmlCpu => "ggml_cpu",
                 BackendType.Cpu => "cpu",
                 _ => null,

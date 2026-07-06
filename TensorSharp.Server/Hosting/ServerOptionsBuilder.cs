@@ -146,7 +146,7 @@ namespace TensorSharp.Server.Hosting
                 // as a single ExecuteStep that holds ModelBase.GpuComputeLock
                 // for the duration of its forward pass, so smaller chunks
                 // give parallel decode requests more frequent turns at the
-                // GPU. Default 256 (see SchedulerConfig.MaxPrefillChunkSize).
+                // GPU. Default 1024 (see SchedulerConfig.MaxPrefillChunkSize).
                 if (TryReadOption(args, ref i, "--prefill-chunk-size", out string chunkOpt))
                 {
                     if (!int.TryParse(chunkOpt, out int chunk) || chunk <= 0)
@@ -180,6 +180,36 @@ namespace TensorSharp.Server.Hosting
                         throw new ArgumentException(
                             $"Unknown --kv-cache-dtype value '{dtypeOpt}'. Valid: f32, f16, q8_0, q4_0.");
                     TensorSharp.Models.KvCacheDtypeConfig.Set(dtype);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Translate <c>--gpu-device &lt;index&gt;</c> into the env var that
+        /// <c>GgmlNative</c> reads when the GGML Vulkan backend initializes
+        /// (<c>TS_GGML_VULKAN_DEVICE</c>), so operators on multi-GPU hosts
+        /// (e.g. an integrated Intel GPU next to a discrete NVIDIA one) can pick
+        /// which Vulkan device serves inference. Only the ggml_vulkan backend
+        /// consumes the value; it is inert for every other backend. Must run
+        /// before the startup model is loaded. Returns true when the flag was
+        /// present so the caller can emit a startup-log line.
+        /// </summary>
+        public static bool ApplyGpuDeviceCliFlag(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return false;
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (TryReadOption(args, ref i, "--gpu-device", out string gpuOpt))
+                {
+                    if (!int.TryParse(gpuOpt, NumberStyles.Integer, CultureInfo.InvariantCulture, out int gpuIndex) || gpuIndex < 0)
+                        throw new ArgumentException($"Invalid value for --gpu-device: '{gpuOpt}'. Expected a non-negative Vulkan device index.");
+                    Environment.SetEnvironmentVariable(
+                        TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar,
+                        gpuIndex.ToString(CultureInfo.InvariantCulture));
                     return true;
                 }
             }
@@ -529,13 +559,17 @@ namespace TensorSharp.Server.Hosting
                 {
                     continue;
                 }
-                // Continuous-batching flag is also consumed by an earlier pass
-                // (ApplyContinuousBatchingCliFlag). Skip here so ParseArgs
-                // doesn't trip the unknown-arg trap.
+                // Continuous-batching flags are also consumed by an earlier pass
+                // (ApplyContinuousBatchingCliFlag, including --prefill-chunk-size).
+                // Skip here so ParseArgs doesn't trip the unknown-arg trap.
                 if (string.Equals(args[i], "--continuous-batching", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(args[i], "--paged-batching", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(args[i], "--no-continuous-batching", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(args[i], "--no-paged-batching", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (TryReadOption(args, ref i, "--prefill-chunk-size", out _))
                 {
                     continue;
                 }
@@ -551,6 +585,21 @@ namespace TensorSharp.Server.Hosting
                 // in a separate earlier pass; skip it (and its value) here so it
                 // doesn't trip the unknown-arg trap below.
                 if (TryReadOption(args, ref i, "--kv-cache-dtype", out _))
+                {
+                    continue;
+                }
+                // --gpu-device is consumed by ApplyGpuDeviceCliFlag(args) in a
+                // separate earlier pass; skip it (and its value) here so it
+                // doesn't trip the unknown-arg trap below.
+                if (TryReadOption(args, ref i, "--gpu-device", out _))
+                {
+                    continue;
+                }
+                // --list-gpus / --help exit in Program.cs before Build runs;
+                // recognise them here anyway so a Build with them present
+                // (tests, future reordering) doesn't trip the unknown-arg trap.
+                if (string.Equals(args[i], "--list-gpus", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[i], "--help", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -617,10 +666,10 @@ namespace TensorSharp.Server.Hosting
                 "--paged-kv-block-size", "--paged-kv-ram-mb",
                 "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
                 "--continuous-batching", "--no-continuous-batching",
-                "--paged-batching", "--no-paged-batching",
+                "--paged-batching", "--no-paged-batching", "--prefill-chunk-size",
                 "--mtp-spec", "--no-mtp-spec", "--mtp-draft", "--mtp-pmin", "--mtp-draft-model",
                 "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-lora",
-                "--kv-cache-dtype",
+                "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
             };
             string best = null;
             int bestDist = int.MaxValue;

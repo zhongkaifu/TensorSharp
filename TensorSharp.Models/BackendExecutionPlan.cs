@@ -21,7 +21,8 @@ namespace TensorSharp.Models
         public bool UsesGgmlBackend =>
             BackendType == BackendType.GgmlCpu ||
             BackendType == BackendType.GgmlMetal ||
-            BackendType == BackendType.GgmlCuda;
+            BackendType == BackendType.GgmlCuda ||
+            BackendType == BackendType.GgmlVulkan;
 
         public bool ShouldStoreWeightQuantized(GgufTensorInfo info)
         {

@@ -658,9 +658,7 @@ namespace
             if (host_ptr == nullptr || bytes == 0 || dev == nullptr) return nullptr;
             const std::size_t alignment = get_host_ptr_alignment(g_backend, dev);
             if (!is_pointer_aligned(host_ptr, alignment)) return nullptr;
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
-            if (!props.caps.buffer_from_host_ptr) return nullptr;
+            if (!get_device_static_props(dev).buffer_from_host_ptr) return nullptr;
 
             // Lookup.
             for (auto& e : g_host_ptr_cache) {

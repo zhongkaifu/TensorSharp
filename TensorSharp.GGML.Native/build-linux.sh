@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 ENABLE_CUDA="${TENSORSHARP_GGML_NATIVE_ENABLE_CUDA:-}"
+ENABLE_VULKAN="${TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN:-}"
 BUILD_TESTS="${TENSORSHARP_GGML_NATIVE_BUILD_TESTS:-OFF}"
 CUDA_ARCHITECTURES="${TENSORSHARP_GGML_NATIVE_CUDA_ARCHITECTURES:-}"
 BUILD_PARALLEL_LEVEL="${TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
@@ -38,7 +39,8 @@ has_cuda_toolkit() {
     return 1
 }
 
-read_cached_cuda_setting() {
+read_cached_backend_setting() {
+    local cache_variable="$1"
     local cache_file="${BUILD_DIR}/CMakeCache.txt"
     if [[ ! -f "${cache_file}" ]]; then
         echo ""
@@ -46,7 +48,7 @@ read_cached_cuda_setting() {
     fi
 
     local cached
-    cached="$(awk -F= '/^TENSORSHARP_GGML_NATIVE_ENABLE_CUDA:BOOL=/{print $2; exit}' "${cache_file}")"
+    cached="$(awk -F= -v var="^${cache_variable}:BOOL=" '$0 ~ var {print $2; exit}' "${cache_file}")"
     normalize_bool "${cached}"
 }
 
@@ -120,6 +122,12 @@ while (($# > 0)); do
         --no-cuda)
             ENABLE_CUDA=OFF
             ;;
+        --vulkan)
+            ENABLE_VULKAN=ON
+            ;;
+        --no-vulkan)
+            ENABLE_VULKAN=OFF
+            ;;
         --tests)
             BUILD_TESTS=ON
             ;;
@@ -147,13 +155,29 @@ done
 
 ENABLE_CUDA="$(normalize_bool "${ENABLE_CUDA}")"
 if [[ -z "${ENABLE_CUDA}" ]]; then
-    ENABLE_CUDA="$(read_cached_cuda_setting)"
+    ENABLE_CUDA="$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)"
 fi
 if [[ -z "${ENABLE_CUDA}" ]] && has_cuda_toolkit; then
     ENABLE_CUDA="ON"
 fi
 if [[ -z "${ENABLE_CUDA}" ]]; then
     ENABLE_CUDA="OFF"
+fi
+
+# Vulkan is opt-in (--vulkan or TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON) and
+# expects the distro Vulkan SDK bits: headers + loader (libvulkan-dev), glslc
+# (shaderc / glslc package) and spirv-headers. Once enabled, the setting sticks
+# via the CMake cache like the CUDA one does.
+ENABLE_VULKAN="$(normalize_bool "${ENABLE_VULKAN}")"
+if [[ -z "${ENABLE_VULKAN}" ]]; then
+    ENABLE_VULKAN="$(read_cached_backend_setting TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)"
+fi
+if [[ -z "${ENABLE_VULKAN}" ]]; then
+    ENABLE_VULKAN="OFF"
+fi
+if [[ "${ENABLE_VULKAN}" == "ON" ]] && ! command -v glslc >/dev/null 2>&1 && [[ -z "${VULKAN_SDK:-}" ]]; then
+    echo "warning: --vulkan requested but glslc was not found on PATH and VULKAN_SDK is not set." >&2
+    echo "         Install the Vulkan SDK (e.g. apt install libvulkan-dev glslc spirv-headers) or set VULKAN_SDK." >&2
 fi
 
 if [[ "${ENABLE_CUDA}" == "ON" && -z "${CUDA_ARCHITECTURES}" && "${USER_SET_CMAKE_CUDA_ARCHITECTURES}" != "ON" ]]; then
@@ -183,7 +207,7 @@ if [[ ! "${BUILD_PARALLEL_LEVEL}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 BUILD_PARALLEL_ARGS=(--parallel "${BUILD_PARALLEL_LEVEL}")
 
-echo "Configuring TensorSharp.GGML.Native (CUDA=${ENABLE_CUDA}, CUDA_ARCHITECTURES=${CUDA_ARCH_SUMMARY}, TESTS=${BUILD_TESTS}, PARALLEL=${BUILD_PARALLEL_LEVEL})"
+echo "Configuring TensorSharp.GGML.Native (CUDA=${ENABLE_CUDA}, CUDA_ARCHITECTURES=${CUDA_ARCH_SUMMARY}, VULKAN=${ENABLE_VULKAN}, TESTS=${BUILD_TESTS}, PARALLEL=${BUILD_PARALLEL_LEVEL})"
 
 # Ensure the ggml sources are present (cloned from ggml-org/ggml at build time).
 bash "${SCRIPT_DIR}/../eng/fetch-ggml.sh"
@@ -191,6 +215,7 @@ bash "${SCRIPT_DIR}/../eng/fetch-ggml.sh"
 CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DTENSORSHARP_GGML_NATIVE_ENABLE_CUDA="${ENABLE_CUDA}"
+    -DTENSORSHARP_GGML_NATIVE_ENABLE_VULKAN="${ENABLE_VULKAN}"
     -DTENSORSHARP_GGML_NATIVE_BUILD_TESTS="${BUILD_TESTS}"
 )
 

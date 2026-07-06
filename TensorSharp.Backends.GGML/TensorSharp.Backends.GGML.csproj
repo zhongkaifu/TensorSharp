@@ -27,6 +27,7 @@
     <GgmlNativeBuildScript Condition="$([MSBuild]::IsOSPlatform('Linux'))">build-linux.sh</GgmlNativeBuildScript>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Windows')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
     <GgmlNativeBuildArgs Condition="$([MSBuild]::IsOSPlatform('Linux')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)' == 'TRUE')">--cuda</GgmlNativeBuildArgs>
+    <GgmlNativeBuildArgs Condition="!$([MSBuild]::IsOSPlatform('OSX')) And ('$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)' == 'ON' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)' == 'on' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)' == 'true' Or '$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)' == 'TRUE')">$(GgmlNativeBuildArgs) --vulkan</GgmlNativeBuildArgs>
     <!-- The native build (CMake + ggml, optionally a full CUDA backend) is
          expensive — minutes even when nothing changed, because the build targets
          below previously ran build-*.{ps1,sh} on every C# build. Make it
@@ -77,7 +78,7 @@
        sources are otherwise unchanged. -->
   <Target Name="_PrepareGgmlNativeIncremental" Condition="'$(GgmlNativeBuildScript)' != ''">
     <PropertyGroup>
-      <_GgmlNativeConfigKey>cuda=$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)</_GgmlNativeConfigKey>
+      <_GgmlNativeConfigKey>cuda=$(TENSORSHARP_GGML_NATIVE_ENABLE_CUDA);vulkan=$(TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN)</_GgmlNativeConfigKey>
       <_GgmlNativeConfigStamp>$(IntermediateOutputPath)$(GgmlNativeConfigStampName)</_GgmlNativeConfigStamp>
     </PropertyGroup>
     <ReadLinesFromFile File="$(_GgmlNativeConfigStamp)" Condition="Exists('$(_GgmlNativeConfigStamp)')">

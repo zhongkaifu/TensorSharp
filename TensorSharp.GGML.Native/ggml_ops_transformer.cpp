@@ -4072,7 +4072,8 @@ namespace
         ggml_tensor* hidden_in = nullptr;
         ggml_tensor* hidden_out = nullptr;
         ggml_tensor* pos_tensor = nullptr;
-        ggml_tensor* ple_input = nullptr;            // nullable
+        ggml_tensor* ple_input = nullptr;            // nullable (uploaded-PLE mode)
+        ggml_tensor* ple_ids = nullptr;              // nullable (in-kernel PLE gather mode: per-token I32 id)
         std::vector<ggml_tensor*> kv_index;          // per-layer I64 write row (null for shared)
         std::vector<ggml_tensor*> attn_mask;         // per-layer F16 padding mask (shared -> donor's)
         std::vector<int> layer_window;               // per-layer padded window length
@@ -4081,6 +4082,7 @@ namespace
         int num_layers = 0;
         int hidden_size = 0;
         int ple_dim = 0;
+        bool ple_gather = false;                     // in-kernel PLE gather graph vs uploaded ple_data
         bool folded = false;                         // hidden_out holds logits (final norm + lm_head folded in)
         int out_count = 0;                           // floats to download (vocab when folded, else hidden)
 
@@ -4089,10 +4091,11 @@ namespace
             if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
-            hidden_in = hidden_out = pos_tensor = ple_input = nullptr;
+            hidden_in = hidden_out = pos_tensor = ple_input = ple_ids = nullptr;
             kv_index.clear(); attn_mask.clear(); layer_window.clear();
             sig_disc = sig_kcache0 = nullptr;
             num_layers = hidden_size = ple_dim = 0;
+            ple_gather = false;
             folded = false; out_count = 0;
         }
     };
@@ -4213,7 +4216,20 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
     // the C# caller skips its separate final-norm/lm_head/softcap dispatches.
     void* logits_data, int vocab_size,
     const void* lm_head_data, int lm_head_type, std::int64_t lm_head_ne0, std::int64_t lm_head_ne1, std::int64_t lm_head_bytes,
-    const void* final_norm_data, float logit_softcap)
+    const void* final_norm_data, float logit_softcap,
+    // In-kernel PLE gather (nullable, mirrors TSGgml_Gemma4ModelVerify): when the
+    // quantized per_layer_token_embd table (+ optionally the quantized
+    // per_layer_model_proj and its F32 norm) is supplied along with the token id,
+    // the graph reproduces C#'s ComputePLE on-device — get_rows + hidden
+    // projection + RMSNorm + combine — and `ple_data` is ignored. This removes
+    // ~5 per-op device dispatches per decode token (measured ~4.8 ms/token on
+    // ggml-vulkan, ~1 ms on ggml-cuda).
+    const void* ple_token_embd_data, int ple_token_embd_type,
+    std::int64_t ple_token_embd_ne0, std::int64_t ple_token_embd_ne1, std::int64_t ple_token_embd_bytes,
+    int ple_token_id,
+    const void* ple_model_proj_data, int ple_model_proj_type,
+    std::int64_t ple_model_proj_ne0, std::int64_t ple_model_proj_ne1, std::int64_t ple_model_proj_bytes,
+    const float* ple_model_proj_norm_data)
 {
     try
     {
@@ -4221,6 +4237,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             return 0;
 
         const int totalSeqLen = position + 1;
+
+        // In-kernel PLE gather mode (see the parameter block above).
+        const bool ple_gather = ple_dim > 0 && ple_token_embd_data != nullptr && ple_token_id >= 0;
 
         // Fold final-norm + lm_head into the graph when the caller supplies the
         // lm_head weight, output-norm weight and a logits output buffer.
@@ -4278,10 +4297,15 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         // (write row = an I64 INPUT). On the Metal backend ggml_set_rows over a
         // gallocr-allocated graph hands a null-context buffer to
         // ggml_metal_op_set_rows -> ggml_metal_buffer_get_id (EXC_BAD_ACCESS at
-        // 0x14, SIGSEGV). Persist's only benefit is CUDA-graph capture, so gate it
-        // to CUDA; Metal falls through to the proven ggml_cpy path below, which
-        // STILL folds the LM head and keeps the KV cache device-resident.
-        bool can_persist = g4_persist && g_backend_type == BACKEND_TYPE_CUDA;
+        // 0x14, SIGSEGV), so Metal falls through to the proven ggml_cpy path
+        // below, which STILL folds the LM head and keeps the KV cache
+        // device-resident. On CUDA persist enables CUDA-graph capture; on Vulkan
+        // there is no capture but reusing the built graph still removes the
+        // per-token rebuild + bind + gallocr work (~1 ms/token measured) and lets
+        // ggml-vulkan's rope+view+set_rows subgraph fusion apply. Vulkan's
+        // set_rows covers every KV dtype used here (F32/F16/BF16/Q8_0/Q4_0).
+        bool can_persist = g4_persist &&
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         {
             auto roundup_stride = [](int v){ return ((v + kG4PersistKvStride - 1) / kG4PersistKvStride) * kG4PersistKvStride; };
             for (int l = 0; l < num_layers; l++)
@@ -4314,7 +4338,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         G4DecodeCache* dc = (can_persist && g4_persist) ? g_g4dc_pool.find(g4_sig, g4_kc0) : nullptr;
         if (dc != nullptr && dc->graph != nullptr &&
             dc->num_layers == num_layers && dc->hidden_size == hidden_size &&
-            dc->ple_dim == ple_dim && dc->layer_window == pwindow &&
+            dc->ple_dim == ple_dim && dc->ple_gather == ple_gather &&
+            dc->layer_window == pwindow &&
             dc->folded == fold && dc->out_count == (fold ? vocab_size : hidden_size))
         {
             auto t_start = std::chrono::high_resolution_clock::now();
@@ -4330,7 +4355,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             decode_input_set_async(dc->hidden_in, hidden_data, static_cast<std::size_t>(hidden_size) * sizeof(float));
             std::int32_t pos_val = position;
             decode_input_set_async(dc->pos_tensor, &pos_val, sizeof(std::int32_t));
-            if (dc->ple_input != nullptr && ple_data != nullptr)
+            std::int32_t ple_id_val = ple_token_id;
+            if (dc->ple_ids != nullptr)
+                decode_input_set_async(dc->ple_ids, &ple_id_val, sizeof(std::int32_t));
+            else if (dc->ple_input != nullptr && ple_data != nullptr)
                 decode_input_set_async(dc->ple_input, ple_data, static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
             for (int l = 0; l < num_layers; l++)
             {
@@ -4408,16 +4436,66 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
             freq_factors_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, rope_freq_factors_len);
 
-        // PLE input
+        // PLE input: either gathered in-kernel from the resident quantized table
+        // (ple_gather; per-token input = the token id) or uploaded as an F32
+        // buffer computed by C#'s ComputePLE (legacy path).
+        const int total_ple_dim = num_layers * ple_dim;
         ggml_tensor* ple_input = nullptr;
-        if (ple_data != nullptr && ple_dim > 0)
+        ggml_tensor* ple_table_t = nullptr;
+        ggml_tensor* ple_ids_t = nullptr;
+        ggml_tensor* ple_model_proj_t = nullptr;
+        ggml_tensor* ple_model_proj_norm_t = nullptr;
+        if (ple_gather)
+        {
+            static std::atomic<int> s_ple_dbg_once{0};
+            if (g4_fd_timing && s_ple_dbg_once.fetch_add(1) == 0)
+            {
+                fprintf(stderr, "[g4-fd] ple_gather dims: table ne0=%lld ne1=%lld type=%d, proj ne0=%lld ne1=%lld type=%d, num_layers=%d ple_dim=%d total=%d hidden=%d token=%d\n",
+                    (long long)ple_token_embd_ne0, (long long)ple_token_embd_ne1, ple_token_embd_type,
+                    (long long)ple_model_proj_ne0, (long long)ple_model_proj_ne1, ple_model_proj_type,
+                    num_layers, ple_dim, total_ple_dim, hidden_size, ple_token_id);
+                fflush(stderr);
+            }
+            ple_table_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_token_embd_type),
+                ple_token_embd_ne0, ple_token_embd_ne1);
+            ple_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            // Token-embedding component: sqrt(ple_dim) * get_rows(table, id).
+            ggml_tensor* ple_tok = ggml_get_rows(ctx, ple_table_t, ple_ids_t);
+            ple_tok = ggml_scale(ctx, ple_tok, sqrtf(static_cast<float>(ple_dim)));
+            ple_tok = ggml_reshape_1d(ctx, ple_tok, total_ple_dim);
+
+            if (ple_model_proj_data != nullptr && ple_model_proj_norm_data != nullptr)
+            {
+                // Hidden-projection component: rmsnorm((hidden @ proj)/sqrt(hidden), norm).
+                ple_model_proj_t = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_model_proj_type),
+                    ple_model_proj_ne0, ple_model_proj_ne1);
+                ple_model_proj_norm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ple_dim);
+                ggml_tensor* proj = ggml_mul_mat(ctx, ple_model_proj_t, current);   // [total_ple_dim]
+                proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
+                // Per-layer RMSNorm over ple_dim: view [total_ple_dim] as
+                // [ple_dim, num_layers], norm rows, scale by the norm weight.
+                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, num_layers);
+                proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_model_proj_norm_t);
+                proj = ggml_reshape_1d(ctx, proj_r, total_ple_dim);
+                // combined = (proj + tok) / sqrt(2)
+                ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
+            }
+            else
+            {
+                ple_input = ple_tok;
+            }
+        }
+        else if (ple_data != nullptr && ple_dim > 0)
+        {
             ple_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_layers * ple_dim);
+        }
 
         if (can_persist)
         {
             ggml_set_input(current);
             ggml_set_input(pos_tensor);
-            if (ple_input != nullptr) ggml_set_input(ple_input);
+            if (ple_gather && ple_ids_t != nullptr) ggml_set_input(ple_ids_t);
+            else if (ple_input != nullptr) ggml_set_input(ple_input);
         }
 
         struct LayerTensors {
@@ -4490,7 +4568,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             lt.ple_gate_w = nullptr;
             lt.ple_proj_w = nullptr;
             lt.ple_post_norm_w = nullptr;
-            if (ple_data != nullptr && ple_gate_arr != nullptr && ple_gate_arr[l] != nullptr)
+            // ple_input exists in BOTH PLE modes: uploaded (ple_data) or gathered
+            // in-kernel (ple_gather); the per-layer injection weights are needed
+            // whenever the graph carries per-layer embeddings at all.
+            if ((ple_data != nullptr || ple_gather) && ple_gate_arr != nullptr && ple_gate_arr[l] != nullptr)
             {
                 lt.ple_gate_w = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_gate_type_arr[l]),
                     ple_gate_ne0_arr[l], ple_gate_ne1_arr[l]);
@@ -4769,6 +4850,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         }
         ggml_build_forward_expand(graph, out_hidden);
 
+        auto t_graph_done = std::chrono::high_resolution_clock::now();
+
         // Bind weight data
         ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
 
@@ -4859,6 +4942,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             bind_or_mark(final_norm_t, const_cast<void*>(final_norm_data), static_cast<std::size_t>(hidden_size) * sizeof(float), true);
         }
 
+        if (ple_gather)
+        {
+            bind_or_mark(ple_table_t, const_cast<void*>(ple_token_embd_data), static_cast<std::size_t>(ple_token_embd_bytes), true);
+            if (ple_model_proj_t != nullptr)
+                bind_or_mark(ple_model_proj_t, const_cast<void*>(ple_model_proj_data), static_cast<std::size_t>(ple_model_proj_bytes), true);
+            if (ple_model_proj_norm_t != nullptr)
+                bind_or_mark(ple_model_proj_norm_t, const_cast<void*>(static_cast<const void*>(ple_model_proj_norm_data)), static_cast<std::size_t>(ple_dim) * sizeof(float), true);
+        }
+
+        auto t_bind_done = std::chrono::high_resolution_clock::now();
+
         // Allocate backend buffer. Reuse a persistent compute buffer across
         // decode steps instead of allocating a fresh one every token (llama.cpp
         // amortizes this via a persistent graph allocator; we mirror that). The
@@ -4888,6 +4982,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
         }
 
+        auto t_alloc_done = std::chrono::high_resolution_clock::now();
+
         // Drain pending async work before CPU memcpys from C# tensor buffers.
         host_read_barrier();
 
@@ -4904,7 +5000,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             ggml_backend_tensor_set(freq_factors_t, rope_freq_factors, 0,
                 static_cast<std::size_t>(rope_freq_factors_len) * sizeof(float));
 
-        if (ple_input != nullptr && ple_data != nullptr)
+        if (ple_gather && ple_ids_t != nullptr)
+        {
+            std::int32_t ple_id_val = ple_token_id;
+            ggml_backend_tensor_set(ple_ids_t, &ple_id_val, 0, sizeof(std::int32_t));
+        }
+        else if (ple_input != nullptr && ple_data != nullptr)
             ggml_backend_tensor_set(ple_input, ple_data, 0,
                 static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float));
 
@@ -4925,6 +5026,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             }
         }
 
+        auto t_upload_done = std::chrono::high_resolution_clock::now();
+
         // Execute single graph
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
@@ -4932,6 +5035,22 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
             if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
             return 0;
+        }
+
+        auto t_compute_done = std::chrono::high_resolution_clock::now();
+
+        static const bool g4_ple_debug = std::getenv("TS_G4_PLE_DEBUG") != nullptr;
+        if (g4_ple_debug && ple_input != nullptr)
+        {
+            std::vector<float> dbg(static_cast<std::size_t>(total_ple_dim));
+            ggml_backend_synchronize(g_backend);
+            ggml_backend_tensor_get(ple_input, dbg.data(), 0, dbg.size() * sizeof(float));
+            double sum = 0; for (float v : dbg) sum += v;
+            fprintf(stderr, "[g4-ple] mode=%s pos=%d tok=%d nodes=%d first=[%.6f %.6f %.6f %.6f %.6f %.6f] sum=%.4f l1=[%.6f %.6f] l41=[%.6f %.6f]\n",
+                ple_gather ? "gather" : "upload", position, ple_token_id, ggml_graph_n_nodes(graph),
+                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4], dbg[5], sum,
+                dbg[256], dbg[257], dbg[41*256], dbg[41*256+1]);
+            fflush(stderr);
         }
 
         // Download hidden state (async blit on Metal in async mode), or the
@@ -4951,7 +5070,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             g4dc->hidden_in = current;
             g4dc->hidden_out = hidden_out;
             g4dc->pos_tensor = pos_tensor;
-            g4dc->ple_input = ple_input;
+            // In gather mode ple_input is a computed node — only the token id is a
+            // per-token input, so that's what the REUSE fast-path refreshes.
+            g4dc->ple_input = ple_gather ? nullptr : ple_input;
+            g4dc->ple_ids = ple_gather ? ple_ids_t : nullptr;
             g4dc->kv_index = layer_kv_index;
             g4dc->attn_mask = layer_attn_mask;
             g4dc->layer_window = pwindow;
@@ -4960,6 +5082,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             g4dc->num_layers = num_layers;
             g4dc->hidden_size = hidden_size;
             g4dc->ple_dim = ple_dim;
+            g4dc->ple_gather = ple_gather;
             g4dc->folded = fold;
             g4dc->out_count = g4_out_count;
             g4dc->valid = true;
@@ -4968,8 +5091,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         {
             auto t_end = std::chrono::high_resolution_clock::now();
             auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
-            fprintf(stderr, "[g4-fd] BUILD total=%.2f ms (persist=%d upload_list=%zu)\n",
-                ms(t_build_start, t_end), can_persist ? 1 : 0, upload_list.size());
+            fprintf(stderr, "[g4-fd] BUILD total=%.2f ms (persist=%d upload_list=%zu graph=%.2f bind=%.2f alloc=%.2f upload=%.2f compute=%.2f download=%.2f)\n",
+                ms(t_build_start, t_end), can_persist ? 1 : 0, upload_list.size(),
+                ms(t_build_start, t_graph_done), ms(t_graph_done, t_bind_done),
+                ms(t_bind_done, t_alloc_done),
+                ms(t_alloc_done, t_upload_done), ms(t_upload_done, t_compute_done),
+                ms(t_compute_done, t_end));
             fflush(stderr);
         }
 
@@ -6243,10 +6370,41 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         if (!ensure_backend())
             return 0;
 
+        // TS_G4_VERIFY_TIMING=1: print a per-call phase breakdown (build / bind /
+        // alloc / upload / compute / download) so prefill overhead outside the
+        // GPU kernels is visible. Mirrors TS_GEMMA4_FD_TIMING on the decode path.
+        static const bool g4v_timing = std::getenv("TS_G4_VERIFY_TIMING") != nullptr;
+        using vt_clock = std::chrono::steady_clock;
+        const auto vt0 = vt_clock::now();
+        auto vt_ms = [](vt_clock::time_point a, vt_clock::time_point b)
+            { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        vt_clock::time_point vt_built{}, vt_bound{}, vt_alloced{}, vt_uploaded{}, vt_computed{};
+
         const int N = num_tokens;
         const int totalSeqLen = start_pos + N;
         if (N <= 1)
             return 0;
+
+        // Batch (query-count) padding, Vulkan only. ggml-vulkan's quantized
+        // GEMMs and flash attention both run measurably faster when the batch
+        // dimension is tile-aligned: every weight GEMM here has ne11 == N, and
+        // whole-prefill was ~8% slower at N=1985 than at N=2016/2048 on
+        // gemma4-12B (the GEMM kernels drop from ~28 to ~24 TFLOPS, flash from
+        // its aligned to its unaligned shader). llama.cpp never hits this
+        // because its ubatches are 512-token aligned. Pad the query batch to a
+        // multiple of 64 with dummy rows: their input embeddings are uploaded
+        // as ZEROS (finite through every column-wise op — matmul / norms / GLU
+        // touch each column independently), causality already excludes key
+        // positions >= N from every real query row (dummy keys sit after the
+        // real ones), the KV-cache writes below copy only the first N rows,
+        // and only the first N rows of the output hidden are downloaded. The
+        // dummy columns cost <= 63 columns of extra GEMM work (< 3% at 2k
+        // tokens) and their outputs are discarded. Gated to N > 64 so the MTP
+        // speculative verify (N <= 16, latency-critical) keeps its exact
+        // shapes. TS_G4_VERIFY_NPAD=0 disables.
+        static const bool g4v_npad_enabled = []{ const char* e = std::getenv("TS_G4_VERIFY_NPAD"); return e == nullptr || e[0] != '0'; }();
+        const bool pad_batch = g4v_npad_enabled && g_backend_type == BACKEND_TYPE_VULKAN && N > 64;
+        const int NQ = pad_batch ? ((N + 63) & ~63) : N;
 
         // The bidirectional-span mask maps view-index == logical position only at
         // start_pos==0 (nPast==0); the C# gate guarantees that for multimodal.
@@ -6284,8 +6442,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         }
         ggml_context* ctx = context.value;
 
-        ggml_tensor* current = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, N);
-        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        ggml_tensor* current = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, NQ);
+        ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NQ);
 
         ggml_tensor* freq_factors_t = nullptr;
         if (rope_freq_factors != nullptr && rope_freq_factors_len > 0)
@@ -6306,7 +6464,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         {
             ple_table = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(ple_token_embd_type),
                 ple_token_embd_ne0, ple_token_embd_ne1);
-            ple_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+            ple_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NQ);
             // Token-embedding component: sqrt(ple_dim) * get_rows(table, ids).
             // get_rows(table[ne0=total_ple_dim, ne1=vocab], ids[N]) -> [total_ple_dim, N]
             // F32, same memory layout as the uploaded ple_data.
@@ -6323,9 +6481,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
                 // Per-(token,layer) RMSNorm over ple_dim: view [total_ple_dim, N] as
                 // [ple_dim, num_layers*N], norm rows, scale by norm weight, reshape back.
-                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * N);
+                ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * NQ);
                 proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_proj_norm_w);
-                proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, N);
+                proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, NQ);
                 // combined = (proj + tok) / sqrt(2)
                 ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
             }
@@ -6337,7 +6495,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         else if (ple_data != nullptr && ple_dim > 0)
         {
             ple_input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                static_cast<std::int64_t>(N) * num_layers * ple_dim);
+                static_cast<std::int64_t>(NQ) * num_layers * ple_dim);
         }
         const bool has_ple = ple_input != nullptr;
 
@@ -6441,19 +6599,24 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         auto get_causal_mask = [&](int kvLen, int validLen, int window) -> ggml_tensor* {
             for (auto& m : mask_cache)
                 if (m.kvLen == kvLen && m.validLen == validLen && m.window == window) return m.tensor;
-            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvLen, N);
+            // Mask rows cover the padded query batch (NQ >= N); the extra dummy
+            // rows keep a non-empty in-range band (their causal threshold is past
+            // validLen, so the band clamps to real keys) — never fully masked, so
+            // flash attention's row softmax stays finite. nPast derives from the
+            // REAL token count: validLen - N == start_pos for real rows.
+            ggml_tensor* mt = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kvLen, NQ);
             if (gpu_mask)
             {
                 // Defer to a device-side fill after gallocr allocates mt->data.
-                gpu_mask_fills.push_back({mt, kvLen, N, validLen - N, window, validLen});
+                gpu_mask_fills.push_back({mt, kvLen, NQ, validLen - N, window, validLen});
                 mask_cache.push_back({kvLen, validLen, window, mt, -1});
                 return mt;
             }
-            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * N);
+            std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * NQ);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
             const int nPast = validLen - N;
-            for (int qi = 0; qi < N; qi++)
+            for (int qi = 0; qi < NQ; qi++)
             {
                 const int threshold = nPast + qi;
                 const int low = (window > 0) ? (threshold - window + 1) : 0;
@@ -6504,6 +6667,30 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // -> the caller falls back to the full-N flash there.
         static const bool swa_tiled = []{ const char* e = std::getenv("TS_G4_SWA_TILED"); return e == nullptr || e[0] != '0'; }();
         static const int swa_tile = []{ const char* e = std::getenv("TS_G4_SWA_TILE"); int v = e ? std::atoi(e) : 0; return (v >= 256) ? v : 1024; }();
+
+        // Flash-attention KV alignment (Vulkan only). ggml-vulkan's FA dispatch
+        // only picks the fast "aligned" shader variant when the KV length is a
+        // multiple of the pipeline's block_cols (32/64 for these shapes — see
+        // ggml_vk_flash_attn's `aligned`); llama.cpp always satisfies it because
+        // its unified KV cache pads n_kv. Our SWA fresh-chunk/extended-buffer
+        // reads used the raw length, so any chunk with N % 32 != 0 silently
+        // dropped all 40 SWA layers' flash onto the slow unaligned shader
+        // (~10% whole-prefill regression measured on gemma4-12B at N=1985 vs
+        // N=2016/2048). Pad the flash KV length to a multiple of 64: ggml_pad
+        // zero-fills the tail rows (finite) and the causal mask already marks
+        // ki >= validLen as -inf, so results are unchanged. CUDA handles
+        // unaligned KV without a slow path — keep other backends' graphs
+        // unchanged. TS_G4_FLASH_KV_PAD=0 disables.
+        static const bool flash_kv_pad_enabled = []{ const char* e = std::getenv("TS_G4_FLASH_KV_PAD"); return e == nullptr || e[0] != '0'; }();
+        const bool pad_flash_kv = flash_kv_pad_enabled && g_backend_type == BACKEND_TYPE_VULKAN;
+        // 64 covers every FA pipeline's block_cols on the shapes used here.
+        auto flash_pad_len = [pad_flash_kv](int len) {
+            return pad_flash_kv ? ((len + 63) & ~63) : len;
+        };
+        // Zero-pad a fresh [hd, len, kvHeads] F32 K/V tensor to padLen rows.
+        auto pad_kv_rows = [ctx](ggml_tensor* t, int len, int padLen) {
+            return (padLen > len) ? ggml_pad(ctx, t, 0, padLen - len, 0, 0) : t;
+        };
         struct TileMask { int kLen; int qLen; int qStart; int kStart; int window; ggml_tensor* tensor; int dataIdx; };
         std::vector<TileMask> tile_mask_cache;
         auto get_window_tile_mask = [&](int kLen, int qLen, int qStart, int kStart, int window) -> ggml_tensor* {
@@ -6574,16 +6761,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
             else
             {
-                ggml_tensor* qkv = ggml_mul_mat(ctx, lt.qkv_w, normed);  // [qDim+2kDim, N]
-                q_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.qDim, N, qkv->nb[1], 0));
-                k_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, N, qkv->nb[1],
+                ggml_tensor* qkv = ggml_mul_mat(ctx, lt.qkv_w, normed);  // [qDim+2kDim, NQ]
+                q_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.qDim, NQ, qkv->nb[1], 0));
+                k_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, NQ, qkv->nb[1],
                     static_cast<std::size_t>(info.qDim) * sizeof(float)));
-                v_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, N, qkv->nb[1],
+                v_lin = ggml_cont(ctx, ggml_view_2d(ctx, qkv, info.kDim, NQ, qkv->nb[1],
                     static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float)));
             }
 
             // per-head Q norm + RoPE (always; Q is this layer's own)
-            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_lin, info.hd, num_heads, N);
+            ggml_tensor* q_3d = ggml_reshape_3d(ctx, q_lin, info.hd, num_heads, NQ);
             q_3d = ggml_mul(ctx, ggml_rms_norm(ctx, q_3d, eps), lt.q_norm_w);
             ggml_tensor* q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff,
                 rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, num_heads, N]
@@ -6610,12 +6797,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             if (!info.isShared)
             {
                 // per-head K norm + V norm (unweighted), then RoPE on K.
-                ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_lin, info.hd, info.kvHeads, N);
-                ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_lin, info.hd, info.kvHeads, N);
+                ggml_tensor* k_3d = ggml_reshape_3d(ctx, k_lin, info.hd, info.kvHeads, NQ);
+                ggml_tensor* v_3d = ggml_reshape_3d(ctx, v_lin, info.hd, info.kvHeads, NQ);
                 k_3d = ggml_mul(ctx, ggml_rms_norm(ctx, k_3d, eps), lt.k_norm_w);
                 v_3d = ggml_rms_norm(ctx, v_3d, eps);
                 ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff,
-                    rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, kvHeads, N]
+                    rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, kvHeads, NQ]
 
                 // Write the K/V into the persistent cache. Global: linear append of
                 // all N at start_pos. SWA (circular, size = window): only the LAST
@@ -6703,11 +6890,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             ggml_tensor* v_full;
             if (swaFresh || swaFreshShared)
             {
-                ggml_tensor* k_fresh = swaFresh ? k_write : layer_k_full[info.kvSource];  // [hd, N, kvHeads]
-                ggml_tensor* v_fresh = swaFresh ? v_write : layer_v_full[info.kvSource];  // [hd, N, kvHeads]
-                attendLen = N;                  // fresh K/V covers [0, N)
-                attnKvLen = N;                  // local head_dim 256 needs no flash padding
-                maskWindow = info.cacheSize;    // sliding window W
+                ggml_tensor* k_fresh = swaFresh ? k_write : layer_k_full[info.kvSource];  // [hd, NQ, kvHeads]
+                ggml_tensor* v_fresh = swaFresh ? v_write : layer_v_full[info.kvSource];  // [hd, NQ, kvHeads]
+                attendLen = N;                       // real keys: the fresh chunk's first N rows
+                // Batch padding already leaves the fresh K/V 64-row aligned (the
+                // dummy tail rows are finite and causally masked); without it,
+                // zero-pad for the FA aligned-shader requirement.
+                attnKvLen = (NQ > N) ? NQ : flash_pad_len(N);
+                maskWindow = info.cacheSize;         // sliding window W
+                k_fresh = pad_kv_rows(k_fresh, NQ, attnKvLen);
+                v_fresh = pad_kv_rows(v_fresh, NQ, attnKvLen);
                 // flash_attn_ext needs K/V in the cache dtype; convert the fresh F32
                 // chunk when the cache is F16 (no-op when F32).
                 if (kv_cache_type == GGML_TYPE_F32)
@@ -6717,8 +6909,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 }
                 else
                 {
-                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, N, info.kvHeads);
-                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, N, info.kvHeads);
+                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, attnKvLen, info.kvHeads);
+                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, attnKvLen, info.kvHeads);
                     k_full = ggml_cpy(ctx, k_fresh, kf);
                     v_full = ggml_cpy(ctx, v_fresh, vf);
                 }
@@ -6739,12 +6931,17 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 ggml_tensor* v_p = info.isShared ? layer_v_prev[info.kvSource] : lt.v_prev;
                 ggml_tensor* k_f = info.isShared ? layer_k_full[info.kvSource] : k_write;
                 ggml_tensor* v_f = info.isShared ? layer_v_full[info.kvSource] : v_write;
-                const int bufLen = prevCount + N;
-                attendLen = bufLen;
-                attnKvLen = bufLen;
+                // The fresh chunk contributes NQ rows (batch padding): keys are
+                // [prevCount real ++ N real ++ NQ-N dummy]; validLen = prevCount+N
+                // excludes the finite dummy tail via the causal mask.
+                const int bufLen = prevCount + NQ;
+                attendLen = prevCount + N;
+                attnKvLen = flash_pad_len(bufLen);   // FA-alignment padding (Vulkan); mask covers the tail
                 maskWindow = info.cacheSize;     // sliding window W
-                ggml_tensor* kext = ggml_concat(ctx, k_p, k_f, 1);   // [hd, prevCount+N, kvHeads] F32
+                ggml_tensor* kext = ggml_concat(ctx, k_p, k_f, 1);   // [hd, prevCount+NQ, kvHeads] F32
                 ggml_tensor* vext = ggml_concat(ctx, v_p, v_f, 1);
+                kext = pad_kv_rows(kext, bufLen, attnKvLen);
+                vext = pad_kv_rows(vext, bufLen, attnKvLen);
                 if (kv_cache_type == GGML_TYPE_F32)
                 {
                     k_full = kext;
@@ -6752,8 +6949,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 }
                 else
                 {
-                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, bufLen, info.kvHeads);
-                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, bufLen, info.kvHeads);
+                    ggml_tensor* kf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, attnKvLen, info.kvHeads);
+                    ggml_tensor* vf = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(kv_cache_type), info.hd, attnKvLen, info.kvHeads);
                     k_full = ggml_cpy(ctx, kext, kf);
                     v_full = ggml_cpy(ctx, vext, vf);
                 }
@@ -6763,10 +6960,16 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 attendLen = info.isLocal ? std::min(totalSeqLen, info.cacheSize) : totalSeqLen;
                 const int activeStart = info.isLocal ? ((totalSeqLen - attendLen) % info.cacheSize) : 0;
                 // Flash attention reads a (possibly padded) KV window; padding slots
-                // beyond attendLen are masked out. Padding only applies to global
-                // (linear, activeStart==0, head_dim 512) layers — local SWA layers
-                // (head_dim 256) need no padding, so wrap-around is never padded.
+                // beyond attendLen are masked out. head_dim 512/576 requires it
+                // (custom CUDA kernels); on Vulkan pad every layer so the FA
+                // dispatch stays on the aligned fast shader (never-written cache
+                // rows are finite — same contract the 512-dim path relies on).
+                // This branch's SWA reads only occur unwrapped (activeStart==0:
+                // overflow goes through swaFresh/swaPrev above), so a padded view
+                // never crosses the circular boundary.
                 attnKvLen = flash_attn_kv_length(attendLen, info.cacheSize, info.hd);
+                if (pad_flash_kv)
+                    attnKvLen = std::min(info.cacheSize, std::max(attnKvLen, flash_pad_len(attendLen)));
                 maskWindow = 0;                 // window already enforced by the cache view
                 k_full = view_kv_cache_window(ctx, lt.k_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
                 v_full = view_kv_cache_window(ctx, lt.v_cached_t, info.hd, info.cacheSize, info.kvHeads, activeStart, attnKvLen, kv_cache_type);
@@ -6790,17 +6993,26 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // Only tile when there are >= 3 tiles (N > 2*tile): below that the full-N
             // flash's wasted (masked) work is small and the per-tile launch + concat
             // overhead would erase the win.
+            // maskWindow > 0 implies the swaFresh/swaFreshShared branch above:
+            // k_full/v_full hold the fresh chunk's N rows (+ FA-alignment padding).
             const bool use_tiled = swa_tiled && maskWindow > 0 && is_except == nullptr
-                && N > 2 * swa_tile && attendLen == N && attnKvLen == N;
+                && N > 2 * swa_tile && attendLen == N;
             if (use_tiled)
             {
                 ggml_tensor* acc = nullptr;
-                for (int qs = 0; qs < N; qs += swa_tile)
+                for (int qs = 0; qs < NQ; qs += swa_tile)
                 {
-                    const int qe = (qs + swa_tile < N) ? (qs + swa_tile) : N;
+                    const int qe = (qs + swa_tile < NQ) ? (qs + swa_tile) : NQ;
                     const int qLen = qe - qs;
                     const int ks = (qs > maskWindow) ? (qs - maskWindow) : 0;
-                    const int kLen = qe - ks;
+                    // Pad each tile's key slice for FA alignment (Vulkan). ks is
+                    // 64-aligned (qs is a multiple of swa_tile, maskWindow of the
+                    // 512/1024 window), so the padded slice stays within the padded
+                    // parent [0, attnKvLen); rows beyond the real qe - ks keys are
+                    // causal-future (finite) or zero padding, and the tile mask
+                    // marks them -inf either way.
+                    const int kLenReal = qe - ks;
+                    const int kLen = std::min(flash_pad_len(kLenReal), attnKvLen - ks);
                     ggml_tensor* q_tile = ggml_view_3d(ctx, q_t, info.hd, qLen, num_heads,
                         q_t->nb[1], q_t->nb[2], static_cast<std::size_t>(qs) * q_t->nb[1]);
                     ggml_tensor* k_tile = ggml_view_3d(ctx, k_full, info.hd, kLen, info.kvHeads,
@@ -6833,9 +7045,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     return 0;
                 }
             }
-            // flash_attn_ext returns [hd, num_heads, N, 1] — each column holds all
+            // flash_attn_ext returns [hd, num_heads, NQ, 1] — each column holds all
             // heads contiguously, exactly what the O projection wants.
-            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, N);
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, NQ);
 
             // O projection -> post-attn norm -> residual
             ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);                  // [hidden, N]
@@ -6860,9 +7072,9 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // ple_slice is a strided view of ple_input: column i (row i) at layer l.
             if (lt.ple_gate_w != nullptr && ple_input != nullptr)
             {
-                ggml_tensor* ple_slice = ggml_cont(ctx, ggml_view_2d(ctx, ple_input, ple_dim, N,
+                ggml_tensor* ple_slice = ggml_cont(ctx, ggml_view_2d(ctx, ple_input, ple_dim, NQ,
                     static_cast<std::size_t>(num_layers) * ple_dim * sizeof(float),
-                    static_cast<std::size_t>(l) * ple_dim * sizeof(float)));               // [ple_dim, N]
+                    static_cast<std::size_t>(l) * ple_dim * sizeof(float)));               // [ple_dim, NQ]
                 ggml_tensor* ple_gate_proj = ggml_mul_mat(ctx, lt.ple_gate_w, residual2);  // [ple_dim, N]
                 ggml_tensor* ple_gated = ggml_mul(ctx, ggml_gelu(ctx, ple_gate_proj), ple_slice);  // [ple_dim, N]
                 ggml_tensor* ple_proj = ggml_mul_mat(ctx, lt.ple_proj_w, ple_gated);       // [hidden, N]
@@ -6877,15 +7089,18 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             hidden = residual2;
         }
 
-        ggml_tensor* hidden_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, N);
+        // hidden holds NQ columns; only the first N (real) columns are downloaded
+        // below — they are the contiguous prefix of the buffer.
+        ggml_tensor* hidden_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, NQ);
         ggml_tensor* out_hidden = ggml_cpy(ctx, hidden, hidden_out);
         ggml_set_output(out_hidden);
 
         // Tiled SWA attention adds ~8 nodes (flash + concat + views + mask) per query
         // tile per local layer; budget for it so the graph never overflows.
-        const int swa_tiles = (swa_tiled && N > swa_tile) ? ((N + swa_tile - 1) / swa_tile) : 1;
+        const int swa_tiles = (swa_tiled && NQ > swa_tile) ? ((NQ + swa_tile - 1) / swa_tile) : 1;
         // +16/layer headroom for swaPrev (gather view+cpy, concat, optional dtype cpy).
         const std::size_t graph_size = static_cast<std::size_t>(num_layers) * (208 + static_cast<std::size_t>(swa_tiles) * 8) + 512;
+        if (g4v_timing) vt_built = vt_clock::now();
         ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         // swaPrev gathers MUST be expanded (and thus scheduled) before the cache
         // writes: the gather reads the rolling window the write then overwrites, so
@@ -6909,15 +7124,28 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         struct HostBinding { ggml_tensor* tensor; void* data; std::size_t bytes; };
         std::vector<HostBinding> upload_list;
         std::vector<BufferHandle> ephemeral_bufs;
+        // g4v-timing attribution: where bind time goes (cache lookups vs
+        // tensor_alloc vs fallthrough), and how many tensors were re-uploaded.
+        double vtb_lookup_ms = 0.0, vtb_talloc_ms = 0.0;
+        int vtb_hits = 0, vtb_misses = 0;
         auto bind_or_mark = [&](ggml_tensor* t, void* data, std::size_t bytes, bool cacheable,
                                 enum ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             if (t == nullptr || data == nullptr) return;
-            if (cacheable && bytes >= 4096)
+            // 512-byte floor (was 4096): the per-head q/k norm weights are 1-2 KB,
+            // and leaving them below the cacheable floor re-uploaded ~96 tiny
+            // tensors per prefill call — each ggml_backend_tensor_set on Vulkan is
+            // a full submit+wait, so those uploads dominated the setup phase.
+            if (cacheable && bytes >= 512)
             {
                 ggml_backend_buffer_t buf = nullptr; void* addr = nullptr; bool needs_upload = false;
-                if (try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage))
+                const auto tl0 = g4v_timing ? vt_clock::now() : vt_clock::time_point{};
+                bool got = try_get_cacheable_tensor_buffer(g_backend, dev, t, data, bytes, buf, addr, needs_upload, usage);
+                const auto tl1 = g4v_timing ? vt_clock::now() : vt_clock::time_point{};
+                if (g4v_timing) vtb_lookup_ms += vt_ms(tl0, tl1);
+                if (got)
                 {
                     ggml_status st = ggml_backend_tensor_alloc(buf, t, addr);
+                    if (g4v_timing) { vtb_talloc_ms += vt_ms(tl1, vt_clock::now()); vtb_hits++; }
                     if (st == GGML_STATUS_SUCCESS) { if (needs_upload) upload_list.push_back({t, data, bytes}); return; }
                     invalidate_cached_buffer(data);
                 }
@@ -6932,6 +7160,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     if (st == GGML_STATUS_SUCCESS) return;
                 }
             }
+            if (g4v_timing) vtb_misses++;
             upload_list.push_back({t, data, bytes});
         };
 
@@ -6983,6 +7212,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     static_cast<std::size_t>(ple_dim) * sizeof(float), true);
         }
 
+        if (g4v_timing) vt_bound = vt_clock::now();
+
         // Allocation strategy. Small N (MTP speculative verify, N<=16) keeps the
         // bump allocator (alloc_ctx_tensors_reuse: each tensor its own slot, stable
         // addresses, lowest per-call overhead). Large N (prefill routed through this
@@ -7012,16 +7243,46 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             }
         }
 
+        if (g4v_timing) vt_alloced = vt_clock::now();
+
         host_read_barrier();
+
+        if (g4v_timing)
+        {
+            static std::atomic<int> s_uplist_dump{0};
+            if (s_uplist_dump.fetch_add(1) == 1)   // second call = steady state
+            {
+                std::size_t tot = 0;
+                for (auto& u : upload_list) tot += u.bytes;
+                fprintf(stderr, "[g4v-uplist] %zu tensors, %zu bytes total:\n", upload_list.size(), tot);
+                for (auto& u : upload_list)
+                    fprintf(stderr, "  %s type=%s ne=[%lld,%lld,%lld] bytes=%zu\n",
+                        u.tensor->name[0] ? u.tensor->name : "(unnamed)",
+                        ggml_type_name(u.tensor->type),
+                        (long long)u.tensor->ne[0], (long long)u.tensor->ne[1], (long long)u.tensor->ne[2], u.bytes);
+                fflush(stderr);
+            }
+        }
 
         for (auto& u : upload_list)
             ggml_backend_tensor_set(u.tensor, u.data, 0, u.bytes);
 
         ggml_backend_tensor_set(current, hidden_data, 0, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
+        if (NQ > N)
+        {
+            // Zero the dummy (batch-padding) embedding rows so every value that
+            // flows out of them is finite: rms_norm(0)*w == 0, matmul of a zero
+            // column is zero, and the causal mask already keeps them out of
+            // every real query's attention.
+            const std::vector<float> zero_rows(static_cast<std::size_t>(hidden_size) * (NQ - N), 0.0f);
+            ggml_backend_tensor_set(current, zero_rows.data(),
+                static_cast<std::size_t>(hidden_size) * N * sizeof(float),
+                zero_rows.size() * sizeof(float));
+        }
 
-        std::vector<std::int32_t> pos_vals(N);
-        for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
-        ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
+        std::vector<std::int32_t> pos_vals(NQ);
+        for (int i = 0; i < NQ; i++) pos_vals[i] = start_pos + i;
+        ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(NQ) * sizeof(std::int32_t));
 
         if (freq_factors_t != nullptr)
             ggml_backend_tensor_set(freq_factors_t, rope_freq_factors, 0,
@@ -7051,14 +7312,34 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         {
             // Upload only the tiny token-id list; get_rows gathers the PLE on-device.
             if (ple_ids != nullptr)
+            {
                 ggml_backend_tensor_set(ple_ids, ple_token_ids, 0,
                     static_cast<std::size_t>(N) * sizeof(std::int32_t));
+                if (NQ > N)
+                {
+                    // Dummy rows gather a valid (finite) PLE row; their columns
+                    // are discarded.
+                    const std::vector<std::int32_t> tail_ids(static_cast<std::size_t>(NQ - N), ple_token_ids[N - 1]);
+                    ggml_backend_tensor_set(ple_ids, tail_ids.data(),
+                        static_cast<std::size_t>(N) * sizeof(std::int32_t),
+                        tail_ids.size() * sizeof(std::int32_t));
+                }
+            }
         }
         else if (ple_input != nullptr)
         {
             ggml_backend_tensor_set(ple_input, ple_data, 0,
                 static_cast<std::size_t>(N) * num_layers * ple_dim * sizeof(float));
+            if (NQ > N)
+            {
+                const std::vector<float> zero_ple(static_cast<std::size_t>(NQ - N) * num_layers * ple_dim, 0.0f);
+                ggml_backend_tensor_set(ple_input, zero_ple.data(),
+                    static_cast<std::size_t>(N) * num_layers * ple_dim * sizeof(float),
+                    zero_ple.size() * sizeof(float));
+            }
         }
+
+        if (g4v_timing) vt_uploaded = vt_clock::now();
 
         ggml_status status = ggml_backend_graph_compute(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
@@ -7067,7 +7348,23 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             return 0;
         }
 
+        if (g4v_timing) vt_computed = vt_clock::now();
+
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * N * sizeof(float));
+
+        if (g4v_timing)
+        {
+            const auto vt_done = vt_clock::now();
+            fprintf(stderr,
+                "[g4v-timing] N=%d start=%d nodes=%d build=%.1f bind=%.1f (lookup=%.1f talloc=%.1f hits=%d miss=%d uplist=%zu) alloc=%.1f upload=%.1f compute=%.1f download=%.1f total=%.1f ms\n",
+                N, start_pos, ggml_graph_n_nodes(graph),
+                vt_ms(vt0, vt_built), vt_ms(vt_built, vt_bound),
+                vtb_lookup_ms, vtb_talloc_ms, vtb_hits, vtb_misses, upload_list.size(),
+                vt_ms(vt_bound, vt_alloced),
+                vt_ms(vt_alloced, vt_uploaded), vt_ms(vt_uploaded, vt_computed),
+                vt_ms(vt_computed, vt_done), vt_ms(vt0, vt_done));
+            fflush(stderr);
+        }
 
         // If this call allocated a per-call backend buffer (the reuse-buffer
         // fallback), drain the queued async download before BufferHandle frees

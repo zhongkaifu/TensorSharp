@@ -646,7 +646,7 @@ namespace TensorSharp.Models
         public override void PrepareForPrefill(int totalPromptTokens)
         {
             if (totalPromptTokens <= 0 || _kvCacheK == null) return;
-            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal) return;
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal) return;
             int target = Math.Min(totalPromptTokens, _maxContextLength);
             if (target > _kvCacheGlobalCapacity)
                 EnsureCacheCapacity(target);
@@ -755,7 +755,9 @@ namespace TensorSharp.Models
             _kvCacheHostDirty = false;
             // The persistent fused-decode graph pins the KV-cache device buffers;
             // a reset/clear invalidates them, so drop the cached graph too.
-            if (_backend == BackendType.GgmlCuda)
+            // GgmlVulkan runs the same persist decode pool (graph reuse without
+            // CUDA capture), so it follows the same reset discipline.
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
@@ -1005,6 +1007,14 @@ namespace TensorSharp.Models
         // mode only — turn off for steady-state perf measurement.
         private static readonly bool s_DecodeProfileEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DECODE_PROFILE"), "1", StringComparison.Ordinal);
+        // Lightweight wall-clock split of a GGML decode token (no forced device
+        // syncs, unlike the MLX profiler above): where does per-token time go
+        // outside the fused native decode graph? TS_G4_DECODE_CSPROF=1 prints a
+        // summary from PrintTimingStats.
+        private static readonly bool s_GgmlDecodeCsProf =
+            string.Equals(Environment.GetEnvironmentVariable("TS_G4_DECODE_CSPROF"), "1", StringComparison.Ordinal);
+        private long _csProfPleTicks, _csProfFusedTicks, _csProfForwardTicks;
+        private int _csProfDecodeCalls;
         private long _profEmbedTicks, _profPleTicks, _profLayerTicks, _profFinalNormTicks, _profLmHeadTicks, _profSoftcapTicks, _profLogitsCopyTicks;
         private long _profAttnSdpaTicks, _profAttnOutTicks, _profFfnTicks, _profPleInjectTicks;
         private int _profDecodeCalls;
@@ -1020,6 +1030,14 @@ namespace TensorSharp.Models
         {
             base.PrintTimingStats();
             DumpDecodeProfile();
+            if (s_GgmlDecodeCsProf && _csProfDecodeCalls > 0)
+            {
+                double inv = 1000.0 / Stopwatch.Frequency / _csProfDecodeCalls;
+                Console.WriteLine($"=== GGML decode C#-side split ({_csProfDecodeCalls} decode calls) ===");
+                Console.WriteLine($"  PLE compute : {_csProfPleTicks * inv:F3} ms/tok");
+                Console.WriteLine($"  fused decode: {_csProfFusedTicks * inv:F3} ms/tok (native call incl. compute)");
+                Console.WriteLine($"  forward     : {_csProfForwardTicks * inv:F3} ms/tok (embed -> logits, whole ForwardCore)");
+            }
         }
 
         public void DumpDecodeProfile()
@@ -1122,10 +1140,21 @@ namespace TensorSharp.Models
             bool pleInKernel = useWholeModelPrefill && _pleDim > 0
                 && exceptPositions == null && CanGatherPleInKernel();
 
+            // Same in-kernel PLE gather for the fused single-token decode graph:
+            // the ~5 per-op device dispatches ComputePLE issues per token
+            // (get_rows + proj matmul + mul/rmsnorm/add) measured ~4.8 ms/token on
+            // ggml-vulkan (~1 ms on ggml-cuda) — folding them into the decode
+            // graph removes that host round-trip entirely.
+            bool pleInKernelDecode = useFusedDecode && _pleDim > 0
+                && exceptPositions == null && CanGatherPleInKernel();
+
             Tensor perLayerInputs = null;
             long pPle = s_DecodeProfileEnabled && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
-            if (_pleDim > 0 && !pleInKernel)
+            long pPleRaw = s_GgmlDecodeCsProf && seqLen == 1 ? Stopwatch.GetTimestamp() : 0;
+            if (_pleDim > 0 && !pleInKernel && !pleInKernelDecode)
                 perLayerInputs = ComputePLE(tokens, hidden, seqLen);
+            if (s_GgmlDecodeCsProf && seqLen == 1)
+                _csProfPleTicks += Stopwatch.GetTimestamp() - pPleRaw;
             if (s_DecodeProfileEnabled && seqLen == 1) ProfMark(ref _profPleTicks, pPle, perLayerInputs);
 
             // The all-MoE sibling (e.g. 26B-A4B) routes through the fused MoE verify
@@ -1142,7 +1171,7 @@ namespace TensorSharp.Models
             // backstops the resets in PrefillWithoutLogits/ResetKVCache/BatchedForward
             // for any prefill that reaches Forward directly (e.g. the CLI's single
             // ForwardRefill, or a multi-turn follow-up prompt).
-            if (seqLen > 1 && _backend == BackendType.GgmlCuda)
+            if (seqLen > 1 && (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan))
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
@@ -1174,17 +1203,20 @@ namespace TensorSharp.Models
                 // part of the single CUDA-graph replay. _logitsBuffer receives the
                 // logits directly; the C# LM-head tail below is then skipped.
                 bool tryFold = seqLen == 1 && exceptPositions == null;
+                int decodePleTokenId = pleInKernelDecode ? tokens[0] : -1;
                 if (tryFold)
                 {
                     if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                         _logitsBuffer = new float[Config.VocabSize];
-                    decodeFolded = NativeGemma4ModelDecode(hidden, startPos, perLayerInputs, _logitsBuffer);
+                    decodeFolded = NativeGemma4ModelDecode(hidden, startPos, perLayerInputs, _logitsBuffer, decodePleTokenId);
                 }
                 else
                 {
-                    NativeGemma4ModelDecode(hidden, startPos, perLayerInputs);
+                    NativeGemma4ModelDecode(hidden, startPos, perLayerInputs, null, decodePleTokenId);
                 }
-                _linearTicks += Stopwatch.GetTimestamp() - tFused;
+                long tFusedEnd = Stopwatch.GetTimestamp();
+                _linearTicks += tFusedEnd - tFused;
+                if (s_GgmlDecodeCsProf) { _csProfFusedTicks += tFusedEnd - tFused; _csProfDecodeCalls++; }
                 _kvCacheHostDirty = true;
             }
             else if (useWholeModelPrefill && NativeGemma4ModelVerify(hidden, startPos, seqLen, perLayerInputs, exceptPositions, pleInKernel ? tokens : null))
@@ -1343,6 +1375,7 @@ namespace TensorSharp.Models
                 // wrote the logits straight into _logitsBuffer; skip the C# tail.
                 hidden.Dispose();
                 if (s_DecodeProfileEnabled && seqLen == 1) _profDecodeCalls++;
+                if (s_GgmlDecodeCsProf) _csProfForwardTicks += Stopwatch.GetTimestamp() - t0;
                 _cacheSeqLen += seqLen;
                 _forwardCount++;
                 _forwardSw.Stop();
@@ -1761,7 +1794,7 @@ namespace TensorSharp.Models
             // can move the addresses baked into the persistent (CUDA-graph-captured)
             // decode graph. Drop it so the next fused decode rebuilds + re-captures
             // against the post-prefill pool state (mirrors Qwen3.5's reseed drop).
-            if (seqLen > 1 && _backend == BackendType.GgmlCuda)
+            if (seqLen > 1 && (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan))
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
@@ -2352,7 +2385,7 @@ namespace TensorSharp.Models
         // written directly into that buffer; the method returns true and the caller
         // skips its separate LM-head tail. Otherwise it outputs the bare hidden
         // state (return false) exactly as before.
-        private unsafe bool NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs, float[] foldLogitsOut = null)
+        private unsafe bool NativeGemma4ModelDecode(Tensor hidden, int startPos, Tensor perLayerInputs, float[] foldLogitsOut = null, int pleTokenId = -1)
         {
             float* hiddenPtr = GetFloatPtr(hidden);
             var a = _decodeArrays;
@@ -2360,6 +2393,41 @@ namespace TensorSharp.Models
             IntPtr pleDataPtr = IntPtr.Zero;
             if (perLayerInputs != null)
                 pleDataPtr = (IntPtr)GetFloatPtr(perLayerInputs);
+
+            // In-kernel PLE gather (mirrors NativeGemma4ModelVerify): pass the
+            // resident quantized per_layer_token_embd table + the token id, plus
+            // the quantized per_layer_model_proj and its F32 norm, so the fused
+            // decode graph reproduces ComputePLE on-device instead of the caller
+            // shuttling per-op results through the host every token.
+            IntPtr pleTableData = IntPtr.Zero;
+            int pleTableType = 0;
+            long pleTableNe0 = 0, pleTableNe1 = 0, pleTableBytes = 0;
+            int pleIdArg = -1;
+            IntPtr pleProjWData = IntPtr.Zero;
+            int pleProjWType = 0;
+            long pleProjWNe0 = 0, pleProjWNe1 = 0, pleProjWBytes = 0;
+            IntPtr pleProjNormData = IntPtr.Zero;
+            if (pleTokenId >= 0 && _pleDim > 0
+                && _quantWeights.TryGetValue("per_layer_token_embd.weight", out var pleQw))
+            {
+                pleTableData = pleQw.CacheKey;
+                pleTableType = (int)pleQw.GgmlType;
+                pleTableNe0 = pleQw.Ne0;
+                pleTableNe1 = pleQw.Ne1;
+                pleTableBytes = pleQw.RawBytes;
+                pleIdArg = pleTokenId;
+
+                if (_quantWeights.TryGetValue("per_layer_model_proj.weight", out var projQw)
+                    && _weights.TryGetValue("per_layer_proj_norm.weight", out var projNormW))
+                {
+                    pleProjWData = projQw.CacheKey;
+                    pleProjWType = (int)projQw.GgmlType;
+                    pleProjWNe0 = projQw.Ne0;
+                    pleProjWNe1 = projQw.Ne1;
+                    pleProjWBytes = projQw.RawBytes;
+                    pleProjNormData = (IntPtr)GetFloatPtr(projNormW);
+                }
+            }
 
             IntPtr freqFactorsPtr = IntPtr.Zero;
             int freqFactorsLen = 0;
@@ -2413,7 +2481,13 @@ namespace TensorSharp.Models
                     a.PlePostNorm,
                     _kvCacheDtype.GgmlType(),
                     a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
-                    a.V, a.VType, a.VNe0, a.VNe1, a.VBytes);
+                    a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                    pleTokenEmbdData: pleTableData, pleTokenEmbdType: pleTableType,
+                    pleTokenEmbdNe0: pleTableNe0, pleTokenEmbdNe1: pleTableNe1, pleTokenEmbdBytes: pleTableBytes,
+                    pleTokenId: pleIdArg,
+                    pleModelProjData: pleProjWData, pleModelProjType: pleProjWType,
+                    pleModelProjNe0: pleProjWNe0, pleModelProjNe1: pleProjWNe1, pleModelProjBytes: pleProjWBytes,
+                    pleModelProjNormData: pleProjNormData);
                 return false;
             }
 
@@ -2445,7 +2519,13 @@ namespace TensorSharp.Models
                     a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
                     (IntPtr)logitsPtr, Config.VocabSize,
                     lmHeadKey, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
-                    finalNormPtr, _finalLogitSoftcap);
+                    finalNormPtr, _finalLogitSoftcap,
+                    pleTableData, pleTableType,
+                    pleTableNe0, pleTableNe1, pleTableBytes,
+                    pleIdArg,
+                    pleProjWData, pleProjWType,
+                    pleProjWNe0, pleProjWNe1, pleProjWBytes,
+                    pleProjNormData);
             }
             return true;
         }
@@ -3254,7 +3334,7 @@ namespace TensorSharp.Models
             // pool, which can shift the addresses baked into the persistent
             // CUDA-graph-captured decode graph. Drop it so the next plain-step decode
             // rebuilds + re-captures against the post-verify pool state.
-            if (_backend == BackendType.GgmlCuda)
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
 
             // The kernel reads/writes the KV cache through the cached _decodeArrays
@@ -4850,7 +4930,7 @@ namespace TensorSharp.Models
             {
                 BackendType.Mlx => MlxFusedOps.TryRmsNormAddInPlace(residual, input, normW, Config.Eps),
                 BackendType.Cuda => CudaFusedOps.TryRmsNormResidualAdd(residual, input, normW, Config.Eps),
-                BackendType.GgmlCuda or BackendType.GgmlMetal or BackendType.GgmlCpu when _ggmlFusedNormAdd
+                BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal or BackendType.GgmlCpu when _ggmlFusedNormAdd
                     => TryGgmlRmsNormResidualAdd(residual, input, normW),
                 _ => false,
             };
@@ -4900,7 +4980,7 @@ namespace TensorSharp.Models
         {
             if (!_ggmlFusedPle)
                 return false;
-            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCpu)
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan && _backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCpu)
                 return false;
             if (result == null || result.DimensionCount != 2 || perLayerInput == null || perLayerInput.DimensionCount != 2)
                 return false;

@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "text_long",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 3146,
+  "completion_tokens": 76,
+  "ttft_ms": 5031.0,
+  "prefill_tps": 625.3,
+  "decode_tps": 31.8,
+  "total_wall_ms": 7422.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The history of computing is a progression from ancient mechanical aids and 19th-century conceptual designs to the development of universal theoretical models, electronic architectures, and exponential hardware scaling. This evolution has been defined by a continuous \"ladder of abstraction,\" where ea",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 31.8,
+  "requests_ok": 1
+}

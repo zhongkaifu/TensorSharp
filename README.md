@@ -1,4 +1,4 @@
-﻿# TensorSharp
+# TensorSharp
 
 <p align="center">
   <img src="imgs/banner_1.png" alt="TensorSharp logo" width="320">
@@ -55,6 +55,7 @@ Not sure which backend to use? Start here. Every backend falls back to CPU for a
 |---|---|---|---|
 | **Apple Silicon (Mac)** | GGML Metal | `--backend ggml_metal` | Default on macOS. `--backend mlx` is an alternative Apple-Silicon GPU path. |
 | **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | Most-tested NVIDIA path. `--backend cuda` is the direct PTX/cuBLAS backend for experimentation. |
+| **Windows / Linux + AMD / Intel / NVIDIA GPU** | GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU path via ggml-vulkan (cooperative-matrix accelerated where the driver supports it). Opt in at native build time with `--vulkan`. |
 | **No GPU / portability / debugging** | Pure C# CPU | `--backend cpu` | No native dependencies. For faster CPU inference use `--backend ggml_cpu` (native kernels). |
 
 See [Compute Backends](#compute-backends) for the full description of every backend and what each one accelerates.
@@ -98,7 +99,7 @@ Everything below is detailed reference. New here? The five sections above are al
 |---|---|
 | [Quick build and usage](#building) | Build the solution, compile the native GGML bridge, and run the CLI or server |
 | [Supported model architectures](#supported-model-architectures) | Check which GGUF architecture keys, modalities, thinking mode, and tool calling paths are implemented |
-| [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, MLX Metal, GGML CPU, GGML Metal, and GGML CUDA |
+| [Compute backends](#compute-backends) | Choose between pure C# CPU, direct CUDA/cuBLAS, MLX Metal, GGML CPU, GGML Metal, GGML CUDA, and GGML Vulkan |
 | [HTTP APIs](#http-apis) | Use the Ollama-compatible, OpenAI-compatible, or Web UI SSE endpoints |
 | [Per-model architecture cards](docs/models/README.md) | Read end-to-end documentation of one architecture (origin, forward graph, components, parameters, and how TensorSharp implements / optimizes prefill and decode) |
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | Understand the vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
@@ -113,7 +114,7 @@ Everything below is detailed reference. New here? The five sections above are al
 |---|---|
 | Model families | Gemma 3/4, DiffusionGemma, Qwen 3, Qwen 3.5/3.6-family GGUFs (`qwen35`, `qwen35moe`, `qwen3next`), GPT OSS, Nemotron-H (incl. Nemotron 3 Nano Omni), and Mistral 3. Image editing via Qwen-Image-Edit (`qwen_image` MMDiT). |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core web UI, Ollama-style API, OpenAI Chat Completions-style API. DiffusionGemma currently uses the CLI diffusion run mode and Web UI denoising stream; Qwen-Image-Edit runs via the CLI image-edit mode and the Web UI image-edit flow. |
-| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA |
+| Backends | Pure C# CPU, direct CUDA/cuBLAS (`cuda`), MLX Metal (`mlx`), GGML CPU, GGML Metal, GGML CUDA, GGML Vulkan |
 | Multimodal | Gemma 4 image/video/audio; Gemma 3, Qwen 3.5-family, Mistral 3, and Nemotron-H Omni image input |
 | Continuous batching | vLLM-style paged KV cache, block-hash prefix sharing across requests, iteration-level scheduler (enabled by default; opt-out via `--no-continuous-batching`) |
 | Speculative decoding | MTP / NextN draft heads for solo decode on Qwen 3.6 (embedded NextN) and Gemma 4 (separate `gemma4-assistant` draft GGUF); off by default, opt-in via `--mtp-spec` (+ `--mtp-draft-model` for Gemma 4). Profitable on ggml backends and the pure-C# `cuda` backend; CPU / MLX stay on standard decode. |
@@ -128,7 +129,7 @@ Everything below is detailed reference. New here? The five sections above are al
 - **Thinking / reasoning mode** -- structured chain-of-thought output with `<think>` / `<|channel>thought` / `<|channel>analysis` tags (Qwen 3, Qwen 3.5/3.6-family, Gemma 4, GPT OSS, Nemotron-H)
 - **Tool calling / function calling** -- models can invoke user-defined tools; multi-turn tool-call conversations supported across all three API styles
 - **Quantized model support** -- loads GGUF files with Q4_K_M, Q8_0, F16, MXFP4, and other quantization formats; performs native quantized matmul without dequantizing to FP32, including memory-efficient pure C# CPU loading for large GGUFs
-- **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
+- **GPU-accelerated** -- GGML Metal on macOS, GGML CUDA on Windows/Linux with NVIDIA GPUs, GGML Vulkan on Windows/Linux with AMD/Intel/NVIDIA GPUs, a direct CUDA/cuBLAS backend with PTX kernels, and an MLX backend for Apple Silicon (mlx-c / Metal), all with CPU fallbacks for unsupported ops
 - **Optimized pure C# CPU backend** -- managed GEMM fast paths plus fused SIMD kernels for RMSNorm, RoPE, softmax, fused activations, and other inference hot paths
 - **Continuous batching & paged KV cache** -- vLLM-style block-paged KV pool with block-hash prefix sharing across requests, iteration-level scheduler that admits / preempts sequences mid-batch, optional SSD-backed tier for very large KV working sets, and a native fused paged-attention kernel (`TSGgml_PagedAttentionForward`) that drives `ggml_flash_attn_ext` on Metal/CUDA. Enabled by default in `TensorSharp.Server`; opt-out with `--no-continuous-batching`. See [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md).
 - **MTP / NextN speculative decoding** -- multi-token-prediction draft heads accelerate solo (non-concurrent) decode. Qwen 3.6 ships its NextN block fused into the trunk GGUF; Gemma 4 loads a separate EAGLE-style `gemma4-assistant` draft GGUF via `--mtp-draft-model` whose draft layers attend the target's own KV cache. The draft proposes up to `--mtp-draft` tokens per step (kept while draft confidence ≥ `--mtp-pmin`) and the trunk verifies them in a single batched forward; the request's own sampler — penalties included — drives both drafting and verification, so output is identical to standard decode. Opt in with `--mtp-spec` (off by default). On ggml backends fused multi-token-verify / draft-step kernels make it a clear win; the pure-C# `cuda` backend runs a fully GPU-resident per-op verify/draft and is also a win. CPU / MLX stay on standard decode. Env: `TS_MTP_*` (shared) and `TS_GMTP_*` (Gemma 4 tuning).
@@ -196,6 +197,7 @@ TensorSharp loads models in GGUF format. Below are Hugging Face links where you 
 | MLX Metal | `--backend mlx` | Apple Silicon (alternative to GGML Metal) | GPU-accelerated path built on [mlx-c](https://github.com/ml-explore/mlx-c). Implements quantized ops (Q4_K_M, Q8_0, Q5_K, Q6_K, IQ2_XXS, IQ4_XS, IQ4_NL, MXFP4, etc.) without dequantizing to FP32, fused decode/prefill Metal kernels (fused QKV preprocess, fused gate+up+SiLUMul MoE, fused multi-dim KV write), compiled-graph kernels, async worker dispatch with periodic `async_eval` to overlap GPU/CPU work, batched MoE decode with stacked expert weight slabs, MoE expert offload, GGUF mmap pinned in physical RAM via `mlock(2)`, host-derived allocator caps (`TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB`), and a CPU fallback for ops that aren't yet wired up. Requires `libmlxc` (built locally by `TensorSharp.Backends.MLX/build-native-macos.sh` or located via `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR`). |
 | GGML Metal | `--backend ggml_metal` | Apple Silicon (default on macOS) | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
 | GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
+| GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU inference through ggml | GPU-accelerated via GGML Vulkan on Windows or Linux — runs on AMD, Intel, and NVIDIA GPUs with a Vulkan 1.3 driver, using cooperative-matrix shaders (KHR coopmat / NV coopmat2) where the driver supports them. Weights are device-resident like GGML CUDA and the same fused whole-model decode/prefill graphs are used. Opt in at native build time with `--vulkan` (or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON`); on Windows the build auto-provisions a portable Vulkan toolchain (headers, loader import lib, glslc, SPIRV-Headers) via `eng/fetch-vulkan-toolchain.ps1` when no Vulkan SDK is installed, on Linux install the distro Vulkan SDK packages (e.g. `libvulkan-dev`, `glslc`, `spirv-headers`). |
 | GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
 | Pure C# CPU | `--backend cpu` | Portability and debugging | Portable CPU inference with no native dependencies. |
 
@@ -339,6 +341,8 @@ Alongside the managed NuGet packages, the [`Release Binaries`](.github/workflows
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
 - **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
 - **Linux (GGML CPU / CUDA backends):** CMake 3.20+; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS
+- **Windows (GGML Vulkan backend):** opt in with `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` before `dotnet build` (or `build-windows.ps1 --vulkan`). With a [LunarG Vulkan SDK](https://vulkan.lunarg.com/) installed it is used directly; without one the build auto-provisions a portable toolchain (Vulkan-Headers, a vulkan-1 import library generated from the system loader, glslc, SPIRV-Headers) into `ExternalProjects/vulkan-toolchain/` via `eng/fetch-vulkan-toolchain.ps1`. A GPU driver with Vulkan 1.3 support is required at runtime
+- **Linux (GGML Vulkan backend):** opt in with `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=ON` (or `build-linux.sh --vulkan`); install the distro Vulkan SDK packages first, e.g. `apt install libvulkan-dev glslc spirv-headers`
 - GGUF model files (e.g., from [Hugging Face](https://huggingface.co))
 
 ## Building
@@ -527,7 +531,9 @@ cd TensorSharp.Cli/bin
 | `--audio <path>` | Audio file (WAV, MP3, OGG) for audio inference |
 | `--mmproj <path>` | Path to the multimodal projector GGUF file |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
+| `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
+| `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--kv-cache-dtype <type>` | KV cache precision: `f32` (default), `f16`, `q8_0`, or `q4_0`. Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path. |
 | `--interactive` / `-i` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
@@ -609,7 +615,7 @@ Model and runtime:
 |---|---|
 | `/info`, `/status` | Show the loaded model, backend, architecture, context/vocab size, projector, conversation depth, and pending attachments |
 | `/model <path>` | Load a different `.gguf` model on the current backend (resets the session) |
-| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
 | `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector` |
 
 Sampling (live, persists across turns):
@@ -682,11 +688,16 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 
 **Server command-line options:**
 
+Running `TensorSharp.Server` with no arguments prints the full parameter reference (description, default, and an example per option) and exits; `--help` does the same. Pass at least one option to start the server — e.g. `--backend ggml_cpu` starts it with no hosted model so one can be loaded later from the web UI.
+
 | Option | Description |
 |---|---|
-| `--model <path>` | GGUF file to host (required for inference; if omitted, the server starts but `/api/models/load` will report no hosted model) |
+| `--model <path>` | GGUF file to host (required for inference; when other options are passed without it, the server starts but `/api/models/load` will report no hosted model) |
 | `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
-| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda` |
+| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
+| `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
+| `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
+| `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
 | `--max-tokens <N>` | Default maximum tokens to generate when a request omits the limit (default: `20000`) |
 | `--temperature <f>` | Default sampling temperature when a request does not provide one (`0` = greedy) |
 | `--top-k <N>` | Default top-K filtering when a request does not provide one (`0` = disabled) |
@@ -697,7 +708,9 @@ Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted
 | `--frequency-penalty <f>` | Default frequency penalty when a request does not provide one (`0` = disabled) |
 | `--seed <N>` | Default random seed when a request does not provide one (`-1` = non-deterministic) |
 | `--stop <string>` | Default stop sequence (can be repeated). Per-request `stop`/`stop_sequences` fully replace the default list rather than merge with it. |
+| `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
+| `--prefill-chunk-size <N>` | Chunked-prefill granularity under contention — the maximum prefill tokens scheduled per step while other requests are running, so parallel decodes get frequent turns at the GPU (default: `1024`). Env: `TS_SCHED_PREFILL_CHUNK`. |
 | `--mtp-spec` / `--no-mtp-spec` | Enable NextN/MTP speculative decoding (default off) on models that ship a multi-token-prediction draft head (Qwen 3.6's embedded NextN block, or a Gemma 4 `gemma4-assistant` draft loaded via `--mtp-draft-model`). Engages for solo (non-concurrent) sequences: the draft head proposes up to `--mtp-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode. Engaged automatically only where profitable (ggml backends and the pure-C# `cuda` backend); CPU / MLX serve standard decode. Env: `TS_MTP_SPEC`. |
 | `--mtp-draft <N>` | Maximum tokens drafted per speculative step (default `8`). Env: `TS_MTP_DRAFT`. |
 | `--mtp-pmin <f>` | Minimum draft-head confidence in `(0, 1]` for a drafted token to be kept; drafting stops at the first low-confidence token (default `0.75`). Env: `TS_MTP_PMIN`. |
@@ -718,7 +731,7 @@ server-wide defaults; the defaults only fill in fields the client omits.
 
 | Variable | Description |
 |---|---|
-| `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
+| `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Default maximum generation length when neither `--max-tokens` nor a request-level limit is set (default: `20000`) |
 | `MAX_TEXT_FILE_CHARS` | Character cap used to truncate plain-text uploads when no tokenizer is available (default: `8000`) |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second of video for video prompts; time-based extraction (default: `1`) |
@@ -1212,6 +1225,8 @@ Where TensorSharp pulls clearly ahead:
 - **Tool-calling turns fly on the MoE flagship.** Function-call decode on 26B-A4B runs **2.37×** faster (174.3 vs 73.4 tok/s), with a lower time-to-first-token on top.
 - **E4B out-prefills llama.cpp on every text scenario.** Short prompts **1.22×**, multi-turn chat **1.16×**, tool-call **1.12×**, long context **1.08×** — with first tokens landing up to **1.20×** sooner.
 - **Parity even at extreme quantization.** The aggressively quantized IQ2_XXS Qwen 3.6 35B-A3B MoE holds decode within ~8% (0.92×) and prefill at parity (0.99×) — a pure-.NET engine keeping pace with hand-tuned C++ on 2-bit weights.
+
+**GGML Vulkan backend** — the vendor-neutral GPU path was benchmarked the same way (same host, both engines on their Vulkan builds, Gemma 4 E4B + 12B). Text-scenario decode sits within a few percent of llama.cpp (0.91–1.02× per scenario, with 12B tool-call turns decoding **1.96×** faster), and text prefill reaches parity on short prompts, JSON mode, and multi-turn chat (up to **1.20×**). The sub-1.0× prefill geomeans (0.68× E4B / 0.70× 12B) are dominated by the image/audio prefill path, which is not yet optimized on Vulkan. Per-scenario tables are in the report's Vulkan section.
 
 Outside these standout cells, decode sits within a few percent of llama.cpp, so the prefill, TTFT, tool-call, and structured-output wins come on top of competitive token generation. The remaining sub-1.0× cells — chiefly 26B-A4B plain-text decode and E4B JSON-mode prefill — are active optimization targets rather than finished results. Every cell, wins and gaps alike, is in the [full report](docs/engine_comparison_report.md).
 

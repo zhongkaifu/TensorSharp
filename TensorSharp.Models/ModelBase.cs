@@ -443,6 +443,10 @@ namespace TensorSharp.Models
                     _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Cuda);
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
+                case BackendType.GgmlVulkan:
+                    _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Vulkan);
+                    _allocator = new GgmlAllocator(_ggmlContext, 0);
+                    break;
                 case BackendType.Cuda:
                     _allocator = new CudaAllocator(0);
                     break;
@@ -473,6 +477,7 @@ namespace TensorSharp.Models
                 BackendType.GgmlCpu => GgmlBackendType.Cpu,
                 BackendType.GgmlMetal => GgmlBackendType.Metal,
                 BackendType.GgmlCuda => GgmlBackendType.Cuda,
+                BackendType.GgmlVulkan => GgmlBackendType.Vulkan,
                 _ => throw new InvalidOperationException($"No GGML backend is associated with {_backend}."),
             };
             GgmlBasicOps.EnsureBackendAvailable(backendType);
@@ -537,6 +542,7 @@ namespace TensorSharp.Models
                 backend == BackendType.Cuda ||
                 backend == BackendType.Mlx ||
                 backend == BackendType.GgmlCuda ||
+                backend == BackendType.GgmlVulkan ||
                 backend == BackendType.GgmlMetal;
             if (isGpuBackend &&
                 string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
@@ -571,12 +577,19 @@ namespace TensorSharp.Models
             return requestedContextLength;
         }
 
+        // GgmlVulkan follows GgmlCuda here: the fused prefill/decode paths mask or
+        // overwrite every cache position they read, so zero-filling 100s of MB of
+        // host KV arrays on every request reset is pure waste.
         protected bool ShouldZeroFillCacheTensors =>
-            _backend != BackendType.GgmlCuda && _backend != BackendType.Mlx;
+            _backend != BackendType.GgmlCuda && _backend != BackendType.Mlx &&
+            _backend != BackendType.GgmlVulkan;
 
         protected void InitializeCacheTensor(Tensor tensor)
         {
-            if (tensor != null && ShouldZeroFillCacheTensors)
+            // First allocation still zero-fills on every backend that keeps a host
+            // copy (including Vulkan): the fused kernels' flash-padding may read
+            // never-written cache rows, which must be finite.
+            if (tensor != null && (ShouldZeroFillCacheTensors || _backend == BackendType.GgmlVulkan))
                 Ops.Fill(tensor, 0f);
         }
 
@@ -588,7 +601,16 @@ namespace TensorSharp.Models
             if (ShouldZeroFillCacheTensors)
                 Ops.Fill(tensor, 0f);
 
-            InvalidateTensorDeviceCache(tensor);
+            // On GgmlVulkan keep the resident device copy VALID across resets: the
+            // host copy was not touched above, so host and device stay consistent
+            // (both hold the previous request's bytes — semantically "empty"
+            // because _cacheSeqLen gates every read, exactly like GgmlCuda which
+            // has never zero-filled). Invalidation here caused every new request's
+            // first prefill to free + reallocate + re-upload the ENTIRE KV cache
+            // (~470 MB / ~170 ms per request on gemma4-12B over PCIe), which was
+            // the dominant server-TTFT overhead on the Vulkan backend.
+            if (_backend != BackendType.GgmlVulkan)
+                InvalidateTensorDeviceCache(tensor);
         }
 
         internal static int ResolveConfiguredContextLength(
@@ -845,6 +867,7 @@ namespace TensorSharp.Models
         /// </summary>
         protected bool CanUseFileMappedQuantizedWeights
             => _backend == BackendType.GgmlCuda
+            || _backend == BackendType.GgmlVulkan
             || _backend == BackendType.Cuda
             || _backend == BackendType.Mlx
             || _backend == BackendType.GgmlMetal
@@ -1014,7 +1037,11 @@ namespace TensorSharp.Models
                 return;
             }
 
-            if (_backend != BackendType.GgmlCuda || _cudaQuantWeightsPrepared || _quantWeights.Count == 0)
+            // GgmlCuda and GgmlVulkan share this path: the preload below goes through
+            // the backend-agnostic GGML device buffer API (TSGgml_PreloadQuantizedWeight),
+            // which gives both discrete-GPU backends device-resident weights.
+            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan) ||
+                _cudaQuantWeightsPrepared || _quantWeights.Count == 0)
                 return;
 
             EnsureQuantBackendAvailable();
@@ -1066,7 +1093,7 @@ namespace TensorSharp.Models
             _cudaQuantWeightsPrepared = true;
 
             if (preloadedCount > 0)
-                Console.WriteLine($"  CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
+                Console.WriteLine($"  Device-resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors");
         }
 
         private void PrepareMlxQuantizedWeightsForInference()
@@ -1390,9 +1417,18 @@ namespace TensorSharp.Models
                 Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors (host copies released)");
         }
 
+        // TS_GGML_RETAIN_HOST_WEIGHTS=1 keeps every quantized weight's host copy
+        // alive after the device preload instead of releasing it. Costs the model's
+        // full host footprint in RAM; diagnostic/workaround knob for any native
+        // path that still reads weight bytes through the original host pointer
+        // after preload (symptom: memcpy access violation on first forward).
+        private static readonly bool s_retainAllHostQuantWeights =
+            Environment.GetEnvironmentVariable("TS_GGML_RETAIN_HOST_WEIGHTS") == "1";
+
         private static bool ShouldRetainCudaHostQuantWeight(string weightName)
         {
-            return string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
+            return s_retainAllHostQuantWeights ||
+                string.Equals(weightName, "token_embd.weight", StringComparison.Ordinal) ||
                 string.Equals(weightName, "per_layer_token_embd.weight", StringComparison.Ordinal);
         }
 
@@ -3325,7 +3361,14 @@ namespace TensorSharp.Models
                 // near-full GPU because the legacy ForwardRefill warmup graph sizes
                 // the reused gallocr differently than the engine prefill graph.
                 bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu;
-                int warmupLength = conservativeWarmup ? 32 : 1024;
+                // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
+                // fused verify chunk at the largest legacy-chunk shape: the shared
+                // reuse-gallocr is pre-grown (and its device memory first-touched)
+                // for every prompt up to 2048 tokens, which covers typical chat
+                // prompts. Measured on gemma4-12B/Vulkan: first ~2k-token request
+                // was ~300-500 ms slower than warm (gallocr growth + residency)
+                // with the old 1024 warmup; with 2048 it starts warm.
+                int warmupLength = conservativeWarmup ? 32 : 2048;
                 {
                     string wl = Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP_LEN");
                     if (!string.IsNullOrEmpty(wl) && int.TryParse(wl, out int wlv) && wlv >= 2)

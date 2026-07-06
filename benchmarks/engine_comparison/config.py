@@ -5,7 +5,9 @@ Configuration loader for the cross-engine inference benchmark.
 Three engines (TensorSharp, llama.cpp, vLLM) are compared on the *same* GGUF
 files, the *same* host, through one uniform OpenAI `/v1/chat/completions`
 surface, across text / image / audio / video / single-turn / multi-turn /
-function-call / structured-output scenarios, on GPU and CPU backends.
+function-call / structured-output scenarios, on any compute backend declared
+in the config's `backends` registry (ggml_cuda / ggml_vulkan / ggml_metal /
+ggml_cpu / cpu / ...).
 
 Nothing here is hardcoded: every setting — host paths, the model / scenario /
 engine / backend registries, and the run defaults — is read from a JSON config
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -269,7 +271,8 @@ class EngineSpec:
     engine_id: str
     display: str
     transport: str                 # "server" (we launch it) | "connect" (external)
-    backends: tuple                # subset of ("gpu", "cpu")
+    backends: tuple                # backend ids and/or kinds ("gpu"/"cpu") this
+                                   # engine may run on; empty = no restriction
 
 
 def _build_engines(cfg: dict) -> dict:
@@ -286,12 +289,123 @@ def _build_engines(cfg: dict) -> dict:
 
 ENGINES: dict = _build_engines(_CFG)
 
-# Map our abstract backend -> concrete per-engine selector.
-_maps = _CFG.get("maps", {}) or {}
-TENSORSHARP_BACKEND = dict(_maps.get("tensorsharp_backend",
-                                     {"gpu": "ggml_cuda", "cpu": "ggml_cpu"}))
-LLAMA_NGL = {k: int(v) for k, v in
-             (_maps.get("llama_ngl", {"gpu": 999, "cpu": 0})).items()}
+
+@dataclass
+class BackendSpec:
+    """One concrete compute backend the matrix can run on (one column in the
+    report). `kind` drives the generic gating rules (large models skip
+    cpu-kind backends; vLLM columns are gpu-kind); the per-engine fields say
+    how each engine is launched on this backend — an engine with no mapping
+    cannot run it and its cells are recorded as skipped."""
+    backend_id: str                    # e.g. "ggml_cuda", "ggml_vulkan", "cpu"
+    display: str                       # column label in the report
+    kind: str                          # "gpu" | "cpu"
+    aliases: tuple = ()                # alternate --backends names (e.g. legacy "gpu")
+    # TensorSharp.Server mapping (ts_backend None = TensorSharp cannot run it).
+    ts_backend: Optional[str] = None   # value passed to `--backend`
+    ts_extra_args: tuple = ()          # extra server CLI args (e.g. --gpu-device 1)
+    ts_env: dict = field(default_factory=dict)   # extra env vars for the server process
+    # llama.cpp mapping (llama_ngl None = llama.cpp cannot run it).
+    llama_ngl: Optional[int] = None    # value passed to `-ngl`
+    llama_server_exe: Optional[Path] = None      # per-backend build (e.g. a Vulkan
+                                                 # llama-server); None = paths.llama_server_exe
+    llama_extra_args: tuple = ()
+    llama_env: dict = field(default_factory=dict)
+    # vLLM is connect-only: nothing is launched, this flag just says the
+    # external endpoint's numbers belong in this backend's column.
+    vllm: bool = False
+
+
+def _build_backend(bid: str, b: dict) -> BackendSpec:
+    ts = b.get("tensorsharp")
+    if isinstance(ts, str):                  # shorthand: "tensorsharp": "ggml_vulkan"
+        ts = {"backend": ts}
+    ts = ts or {}
+    llama = b.get("llamacpp")
+    if isinstance(llama, (int, float)):      # shorthand: "llamacpp": 999  (the -ngl value)
+        llama = {"ngl": int(llama)}
+    llama = llama or {}
+    return BackendSpec(
+        backend_id=bid,
+        display=b.get("display", bid),
+        kind=b.get("kind", "gpu"),
+        aliases=tuple(str(a) for a in b.get("aliases", [])),
+        ts_backend=ts.get("backend"),
+        ts_extra_args=tuple(str(a) for a in ts.get("extra_args", [])),
+        ts_env={str(k): str(v) for k, v in (ts.get("env") or {}).items()},
+        llama_ngl=(int(llama["ngl"]) if llama.get("ngl") is not None else None),
+        llama_server_exe=_path(llama.get("server_exe")),
+        llama_extra_args=tuple(str(a) for a in llama.get("extra_args", [])),
+        llama_env={str(k): str(v) for k, v in (llama.get("env") or {}).items()},
+        vllm=bool(b.get("vllm", False)),
+    )
+
+
+def _build_backends(cfg: dict) -> dict:
+    raw = cfg.get("backends")
+    if isinstance(raw, dict) and raw:
+        return {bid: _build_backend(bid, b or {}) for bid, b in raw.items()
+                if not bid.startswith("_")}     # "_comment" etc. are not backends
+    # Legacy config form: `backends` is a list of abstract ids (["gpu", "cpu"])
+    # mapped per-engine through the `maps` section. Synthesize the equivalent
+    # registry so old config files keep working unchanged.
+    ids = [str(x) for x in (raw or ["gpu", "cpu"])]
+    maps = cfg.get("maps", {}) or {}
+    ts_map = dict(maps.get("tensorsharp_backend",
+                           {"gpu": "ggml_cuda", "cpu": "ggml_cpu"}))
+    ngl_map = {k: int(v) for k, v in
+               (maps.get("llama_ngl", {"gpu": 999, "cpu": 0})).items()}
+    out: dict = {}
+    for bid in ids:
+        kind = "cpu" if "cpu" in bid.lower() else "gpu"
+        out[bid] = BackendSpec(
+            backend_id=bid, display=bid.upper(), kind=kind,
+            ts_backend=ts_map.get(bid),
+            llama_ngl=ngl_map.get(bid),
+            vllm=(kind == "gpu"))
+    return out
+
+
+BACKENDS: dict = _build_backends(_CFG)
+
+_BACKEND_ALIASES: dict = {}
+for _b in BACKENDS.values():
+    for _a in _b.aliases:
+        _BACKEND_ALIASES.setdefault(_a.lower(), _b.backend_id)
+
+
+def resolve_backend(name: str) -> Optional[str]:
+    """Canonical backend id for a --backends token (case-insensitive, resolves
+    aliases like the legacy `gpu`). Returns None when unknown."""
+    if not name:
+        return None
+    if name in BACKENDS:
+        return name
+    n = name.strip().lower()
+    for bid in BACKENDS:
+        if bid.lower() == n:
+            return bid
+    return _BACKEND_ALIASES.get(n)
+
+
+def _resolve_backend_list(names) -> list:
+    """Alias-resolve a backend selection, preserving order and dropping dupes.
+    Unknown names pass through unchanged so the caller can report them."""
+    out: list = []
+    for n in names:
+        rid = resolve_backend(str(n)) or str(n)
+        if rid not in out:
+            out.append(rid)
+    return out
+
+
+def llama_server_exe_for(backend: str) -> Path:
+    """The llama-server binary for a backend: its per-backend build when
+    configured (e.g. a Vulkan build), else the global paths.llama_server_exe."""
+    spec = BACKENDS.get(backend)
+    exe = spec.llama_server_exe if spec is not None else None
+    return exe or LLAMA_SERVER_EXE
+
 
 # llama.cpp server launch options.
 _llama = _CFG.get("llama", {}) or {}
@@ -302,8 +416,6 @@ LLAMA_EXTRA_ARGS = list(_llama.get("extra_args", ["--jinja"]))
 READY_TIMEOUT_S = {k: float(v) for k, v in
                    (_CFG.get("ready_timeout_s", {"small": 600, "medium": 900, "large": 1200})).items()}
 
-BACKENDS = list(_CFG.get("backends", ["gpu", "cpu"]))
-
 # ---------------------------------------------------------------------------
 # Run defaults (used when a command-line flag is not supplied)
 # ---------------------------------------------------------------------------
@@ -311,7 +423,7 @@ _defaults = _CFG.get("defaults", {}) or {}
 DEFAULT_ENGINES = list(_defaults.get("engines") or list(ENGINES.keys()))
 DEFAULT_MODELS = list(_defaults.get("models") or list(MODELS.keys()))
 DEFAULT_SCENARIOS = list(_defaults.get("scenarios") or list(SCENARIOS.keys()))
-DEFAULT_BACKENDS = list(_defaults.get("backends") or BACKENDS)
+DEFAULT_BACKENDS = _resolve_backend_list(_defaults.get("backends") or list(BACKENDS.keys()))
 
 # Extra benchmark axes (default to the single baseline point so existing
 # invocations are unchanged):
@@ -335,8 +447,21 @@ def applies(engine: str, backend: str, model: ModelSpec,
     as a skip in the result set rather than silently dropped."""
     eng = ENGINES[engine]
 
-    if backend not in eng.backends:
-        return False, f"{eng.display} has no {backend} backend"
+    b = BACKENDS.get(backend) or BACKENDS.get(resolve_backend(backend) or "")
+    if b is None:
+        return False, f"unknown backend '{backend}' (known: {', '.join(BACKENDS)})"
+
+    # An engine may restrict itself to backend ids and/or kinds ("gpu"/"cpu")
+    # via `engines.*.backends`; on top of that the backend entry itself must
+    # carry a launch mapping for the engine.
+    if eng.backends and not ({b.backend_id, b.kind} & set(eng.backends)):
+        return False, f"{eng.display} is not configured for the {b.backend_id} backend"
+    if engine == "tensorsharp" and not b.ts_backend:
+        return False, f"{b.backend_id} has no TensorSharp launch mapping"
+    if engine == "llamacpp" and b.llama_ngl is None:
+        return False, f"{b.backend_id} has no llama.cpp launch mapping"
+    if engine == "vllm" and not b.vllm:
+        return False, f"vLLM endpoint is not comparable on the {b.backend_id} backend"
 
     # MTP / NextN speculative decoding is a TensorSharp feature (Qwen 3.6's
     # embedded NextN block, or a Gemma 4 gemma4-assistant draft GGUF). When MTP
@@ -349,8 +474,9 @@ def applies(engine: str, backend: str, model: ModelSpec,
         if model.mtp_draft is not None and not model.mtp_draft.exists():
             return False, f"MTP draft GGUF not found: {model.mtp_draft}"
 
-    # CPU is restricted to small/medium models (large MoE on CPU is impractically slow).
-    if backend == "cpu" and model.size_class == "large":
+    # CPU-kind backends are restricted to small/medium models (large MoE on
+    # CPU is impractically slow).
+    if b.kind == "cpu" and model.size_class == "large":
         return False, "CPU skipped for large model (impractically slow)"
 
     # Scenario needs a modality the model does not have.

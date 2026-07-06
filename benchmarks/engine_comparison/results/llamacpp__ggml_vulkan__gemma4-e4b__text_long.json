@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "text_long",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 3115,
+  "completion_tokens": 578,
+  "ttft_ms": 1766.0,
+  "prefill_tps": 1763.9,
+  "decode_tps": 46.4,
+  "total_wall_ms": 14172.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The history of computing progressed from ancient mechanical aids to theoretical breakthroughs like the Turing machine, which defined the limits of computation, and the stored-program concept, which made machines flexible and general-purpose. Driven by the transistor and Moore's Law, this evolution a",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 46.4,
+  "requests_ok": 1
+}

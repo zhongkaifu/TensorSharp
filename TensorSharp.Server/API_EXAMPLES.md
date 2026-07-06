@@ -17,7 +17,7 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 |---|---|
 | Hosted models | One GGUF file, selected with `--model`; requests must name that hosted file or its basename |
 | Projectors | Optional single projector, selected with `--mmproj`; used for multimodal-capable models |
-| Backends | `mlx`, `cuda`, `ggml_metal`, `ggml_cuda`, `ggml_cpu`, `cpu`; `/api/models` reports which are available on the host |
+| Backends | `mlx`, `cuda`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, `cpu`; `/api/models` reports which are available on the host |
 | Concurrency | Autoregressive chat uses the continuous-batching engine. The legacy queue API remains for status/compatibility fields; DiffusionGemma Web UI requests use a separate block-boundary diffusion scheduler. |
 | Generation modes | Autoregressive models stream appended token chunks. DiffusionGemma returns final text on append-only compatibility endpoints and exposes live whole-message denoising previews on Web UI `/api/chat`. |
 | Sessions | Web UI uses per-tab sessions; Ollama/OpenAI compatibility endpoints share the default session |
@@ -34,6 +34,9 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 
 # Windows/Linux + NVIDIA, GGML CUDA backend
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_cuda
+
+# Windows/Linux + AMD/Intel/NVIDIA GPU, GGML Vulkan backend (pick the device on multi-GPU hosts with --gpu-device; see --list-gpus)
+./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
 
 # Apple Silicon, MLX backend
 ./TensorSharp.Server --model ~/work/model/Qwen3-4B-Q8_0.gguf --backend mlx
@@ -64,6 +67,7 @@ Backend quick reference:
 | `ggml_cpu` | Native GGML CPU backend |
 | `ggml_metal` | GGML Metal backend for macOS |
 | `ggml_cuda` | GGML CUDA backend for NVIDIA GPUs |
+| `ggml_vulkan` | GGML Vulkan backend for AMD / Intel / NVIDIA GPUs (vendor-neutral; requires a native build with Vulkan enabled) |
 
 ---
 
@@ -598,7 +602,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -837,6 +841,7 @@ print()
 Notes:
 
 - `response_format.type = "json_schema"` currently cannot be combined with `tools` or `think`.
+- `json_object` / `json_schema` requests constrain the **first sampled token** to a `{`-opening candidate (the same effect llama.cpp gets from its JSON grammar), so chatty models cannot emit prose before the object and streamed time-to-first-token reflects prefill latency instead of suppressed preamble. Subsequent tokens sample normally. Set `TS_JSON_FORCE_OPEN=0` to disable.
 - Streaming `json_object` requests stream the JSON object token-by-token (code fences and stray tags are stripped on the fly), so time-to-first-token reflects prefill latency. Streaming `json_schema` (strict) requests are still buffered and schema-normalized before the single chunk is emitted. Set `TS_STRUCTURED_STREAM_BUFFER=1` to force the legacy buffer-everything behavior for both. Non-streaming requests are always normalized.
 - Invalid schemas return HTTP `400`; non-streaming / `json_schema` responses that still fail validation return HTTP `422` (a `json_object` stream that has already started cannot change its status code).
 

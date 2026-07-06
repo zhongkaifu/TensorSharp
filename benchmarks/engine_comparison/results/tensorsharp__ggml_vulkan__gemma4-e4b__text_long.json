@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "text_long",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 3146,
+  "completion_tokens": 320,
+  "ttft_ms": 2438.0,
+  "prefill_tps": 1290.4,
+  "decode_tps": 42.9,
+  "total_wall_ms": 9891.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The user wants a two-sentence summary of the provided text, which details the history of computing.\n\n1.  **Analyze the source material:** The text traces computing from ancient mechanical aids (abacus) through theoretical breakthroughs (Turing machine), hardware revolutions (vacuum tubes to transist",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 42.9,
+  "requests_ok": 1
+}

@@ -37,6 +37,23 @@ namespace TensorSharp.Runtime
         {
             int vocabSize = logits.Length;
 
+            // First-token constraint (structured output): pick the most probable
+            // of the allowed ids. Applies only before anything has been generated;
+            // later tokens sample normally.
+            var allow = _config.FirstTokenAllowList;
+            if (allow != null && allow.Count > 0
+                && (generatedTokenIds == null || generatedTokenIds.Count == 0))
+            {
+                int best = -1;
+                foreach (int id in allow)
+                {
+                    if (id < 0 || id >= vocabSize) continue;
+                    if (best < 0 || logits[id] > logits[best]) best = id;
+                }
+                if (best >= 0)
+                    return best;
+            }
+
             // Greedy (temperature <= 0) reduces to an argmax over the penalized
             // logits — top-k / top-p / min-p are never applied on this branch.
             // Penalties only adjust the handful of distinct already-generated

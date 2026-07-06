@@ -874,6 +874,10 @@ namespace TensorSharp.Cli
                 case "ggml-cuda":
                     backend = BackendType.GgmlCuda;
                     return true;
+                case "ggml_vulkan":
+                case "ggml-vulkan":
+                    backend = BackendType.GgmlVulkan;
+                    return true;
                 default:
                     backend = BackendType.Cpu;
                     return false;

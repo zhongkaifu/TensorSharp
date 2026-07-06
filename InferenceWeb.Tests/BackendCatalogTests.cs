@@ -12,6 +12,7 @@ public class BackendCatalogTests
             {
                 GgmlBackendType.Metal => false,
                 GgmlBackendType.Cuda => true,
+                GgmlBackendType.Vulkan => true,
                 GgmlBackendType.Cpu => true,
                 _ => false,
             },
@@ -33,6 +34,11 @@ public class BackendCatalogTests
             {
                 Assert.Equal("ggml_cuda", backend.Value);
                 Assert.Equal("GGML CUDA (GPU)", backend.Label);
+            },
+            backend =>
+            {
+                Assert.Equal("ggml_vulkan", backend.Value);
+                Assert.Equal("GGML Vulkan (GPU)", backend.Label);
             },
             backend =>
             {
@@ -97,6 +103,7 @@ public class BackendCatalogTests
     [InlineData(BackendType.Cuda, "cuda")]
     [InlineData(BackendType.GgmlMetal, "ggml_metal")]
     [InlineData(BackendType.GgmlCuda, "ggml_cuda")]
+    [InlineData(BackendType.GgmlVulkan, "ggml_vulkan")]
     [InlineData(BackendType.GgmlCpu, "ggml_cpu")]
     [InlineData(BackendType.Cpu, "cpu")]
     public void ToBackendValue_ReturnsCanonicalBackendString(BackendType backendType, string expected)

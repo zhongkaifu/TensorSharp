@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "multi_turn",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 2094,
+  "completion_tokens": 1169,
+  "ttft_ms": 1156.0,
+  "prefill_tps": 1811.4,
+  "decode_tps": 43.6,
+  "total_wall_ms": 27953.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "Here's a thinking process to arrive at the suggested budget split:\n\n1.  **Analyze the Request:** The user is asking for a rough spending allocation between Kyoto and Tokyo, given a total budget of $3000 for a trip during cherry blossom season.\n2.  **Identify Key Variables/Assumptions (Implicit):**\n ",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 43.6,
+  "requests_ok": 1
+}

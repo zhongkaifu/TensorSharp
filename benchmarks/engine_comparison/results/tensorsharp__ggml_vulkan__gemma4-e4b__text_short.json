@@ -1,0 +1,21 @@
+{
+  "engine": "tensorsharp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-e4b",
+  "scenario": "text_short",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 1975,
+  "completion_tokens": 239,
+  "ttft_ms": 1125.0,
+  "prefill_tps": 1755.6,
+  "decode_tps": 44.4,
+  "total_wall_ms": 6516.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "The user wants a three-sentence explanation of a transformer neural network based on the provided text.\n\n1.  **Scan the text for \"transformer architecture.\"**\n2.  **Identify key characteristics:** It was introduced in 2017, it replaced sequential reading with an attention mechanism, and this allows ",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 44.4,
+  "requests_ok": 1
+}

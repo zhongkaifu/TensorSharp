@@ -14,8 +14,18 @@
 #include <unistd.h>
 #endif
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #if defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
+#endif
+
+#if defined(GGML_USE_VULKAN)
+#include "ggml-vulkan.h"
 #endif
 
 #include <cstdio>
@@ -102,6 +112,12 @@ namespace tsg
     std::once_flag g_backend_init_once;
     ggml_backend_t g_backend = nullptr;
     int g_backend_type = 0;
+    // Vulkan device index requested via TSGgml_SetVulkanDeviceIndex. Must be set
+    // before the first backend init (create_backend_instance runs once under
+    // g_backend_init_once); later calls with a different index fail. Indices are
+    // positions in ggml-vulkan's enumeration order (after any
+    // GGML_VK_VISIBLE_DEVICES filtering applied at process launch).
+    std::atomic<int> g_vulkan_device_index{0};
 
     std::mutex g_host_buffer_cache_mutex;
     std::unordered_map<void*, CachedHostBuffer> g_host_buffer_cache;
@@ -140,6 +156,85 @@ namespace tsg
     static bool ggml_debug_logging_enabled()
     {
         return is_truthy_env(std::getenv("TENSORSHARP_GGML_DEBUG"));
+    }
+
+#if defined(_WIN32)
+    // Crash triage aid: with TS_GGML_VEH_DEBUG=1 a vectored exception handler
+    // prints the faulting module + offset of any access violation to stderr
+    // before the process dies. .NET's managed stack trace only shows the
+    // TSGgml_* entry point; this tells you whether the fault is inside
+    // GgmlOps.dll, a GPU driver DLL, or the runtime. First-chance handler,
+    // EXCEPTION_CONTINUE_SEARCH: the CLR's own AV-based null-ref machinery
+    // still works (those prints are recognizable by their coreclr/jit module).
+    static LONG WINAPI tsg_veh_log_access_violation(PEXCEPTION_POINTERS info)
+    {
+        if (info != nullptr && info->ExceptionRecord != nullptr &&
+            info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+        {
+            void* ip = info->ExceptionRecord->ExceptionAddress;
+            const ULONG_PTR is_write = info->ExceptionRecord->NumberParameters > 1
+                ? info->ExceptionRecord->ExceptionInformation[0] : 0;
+            const ULONG_PTR target = info->ExceptionRecord->NumberParameters > 1
+                ? info->ExceptionRecord->ExceptionInformation[1] : 0;
+            HMODULE mod = nullptr;
+            char mod_name[MAX_PATH] = { 0 };
+            if (GetModuleHandleExA(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCSTR>(ip), &mod) && mod != nullptr)
+            {
+                GetModuleFileNameA(mod, mod_name, MAX_PATH);
+            }
+            std::fprintf(stderr, "[tsg-veh] ACCESS_VIOLATION ip=%p (%s+0x%llx) %s addr=%p\n",
+                ip,
+                mod_name[0] != '\0' ? mod_name : "(jit/unknown)",
+                mod != nullptr
+                    ? static_cast<unsigned long long>(
+                        reinterpret_cast<char*>(ip) - reinterpret_cast<char*>(mod))
+                    : 0ULL,
+                is_write ? "writing" : "reading",
+                reinterpret_cast<void*>(target));
+
+            // Poor-man's backtrace: scan the faulting thread's stack for
+            // quadwords that land inside a loaded module and print module+offset.
+            // No frame pointers / PDBs needed; noisy but enough to identify the
+            // native caller chain of a memcpy fault.
+            if (info->ContextRecord != nullptr)
+            {
+                const ULONG_PTR* sp = reinterpret_cast<const ULONG_PTR*>(info->ContextRecord->Rsp);
+                int printed = 0;
+                for (int slot = 0; slot < 256 && printed < 12; ++slot)
+                {
+                    ULONG_PTR value = 0;
+                    __try { value = sp[slot]; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+                    if (value < 0x10000)
+                        continue;
+                    HMODULE frame_mod = nullptr;
+                    if (!GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(value), &frame_mod) || frame_mod == nullptr)
+                        continue;
+                    char frame_name[MAX_PATH] = { 0 };
+                    GetModuleFileNameA(frame_mod, frame_name, MAX_PATH);
+                    std::fprintf(stderr, "[tsg-veh]   stack[%3d] %s+0x%llx\n", slot,
+                        frame_name,
+                        static_cast<unsigned long long>(
+                            value - reinterpret_cast<ULONG_PTR>(frame_mod)));
+                    ++printed;
+                }
+            }
+            std::fflush(stderr);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+#endif
+
+    static void install_crash_triage_handler_if_requested()
+    {
+#if defined(_WIN32)
+        if (is_truthy_env(std::getenv("TS_GGML_VEH_DEBUG")))
+            AddVectoredExceptionHandler(1, tsg_veh_log_access_violation);
+#endif
     }
 
     static void filtered_ggml_log(enum ggml_log_level level, const char* text, void* user_data)
@@ -213,6 +308,39 @@ namespace tsg
 #endif
         }
 
+        if (backend_type == BACKEND_TYPE_VULKAN)
+        {
+#if defined(GGML_USE_VULKAN)
+            // Init by the Vulkan-specific API rather than dev_by_type(GPU): when
+            // several GPU backends are compiled into one binary (CUDA + Vulkan),
+            // dev_by_type returns the first registered GPU device, which is
+            // ggml-cuda's. The CUDA branch above keeps that behaviour; here the
+            // Vulkan device must be picked explicitly.
+            const int device_count = ggml_backend_vk_get_device_count();
+            if (device_count <= 0)
+            {
+                set_last_error("No Vulkan device is available for ggml-vulkan.");
+                return nullptr;
+            }
+
+            const int device_index = g_vulkan_device_index.load(std::memory_order_acquire);
+            if (device_index < 0 || device_index >= device_count)
+            {
+                set_last_error("Vulkan device index " + std::to_string(device_index) +
+                    " is out of range: " + std::to_string(device_count) + " Vulkan device(s) available.");
+                return nullptr;
+            }
+
+            ggml_backend_t backend = ggml_backend_vk_init(static_cast<size_t>(device_index));
+            if (backend == nullptr)
+                set_last_error("ggml-vulkan backend initialization failed.");
+            return backend;
+#else
+            set_last_error("The ggml-vulkan backend is not available in this build.");
+            return nullptr;
+#endif
+        }
+
         set_last_error("Unknown GGML backend type requested.");
         return nullptr;
     }
@@ -221,6 +349,7 @@ namespace tsg
     {
         clear_last_error();
         configure_ggml_logging();
+        install_crash_triage_handler_if_requested();
         g_backend = create_backend_instance(g_backend_type);
         if (g_backend == nullptr)
             return;
@@ -231,7 +360,8 @@ namespace tsg
     {
         if (backend_type != BACKEND_TYPE_METAL &&
             backend_type != BACKEND_TYPE_CPU &&
-            backend_type != BACKEND_TYPE_CUDA)
+            backend_type != BACKEND_TYPE_CUDA &&
+            backend_type != BACKEND_TYPE_VULKAN)
         {
             set_last_error("Invalid GGML backend type.");
             return false;
@@ -283,6 +413,16 @@ namespace tsg
             return true;
 #else
             set_last_error("The ggml-cuda backend is not available in this build.");
+            return false;
+#endif
+        }
+
+        if (backend_type == BACKEND_TYPE_VULKAN)
+        {
+#if defined(GGML_USE_VULKAN)
+            return true;
+#else
+            set_last_error("The ggml-vulkan backend is not available in this build.");
             return false;
 #endif
         }
@@ -567,12 +707,25 @@ namespace tsg
         return 16384;
     }
 
+    DeviceStaticProps get_device_static_props(ggml_backend_dev_t dev)
+    {
+        static std::mutex s_mutex;
+        static std::unordered_map<ggml_backend_dev_t, DeviceStaticProps> s_cache;
+        std::lock_guard<std::mutex> lock(s_mutex);
+        auto it = s_cache.find(dev);
+        if (it != s_cache.end())
+            return it->second;
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        DeviceStaticProps s{ props.type, props.caps.buffer_from_host_ptr };
+        s_cache.emplace(dev, s);
+        return s;
+    }
+
     bool prefers_device_local_cache(ggml_backend_dev_t dev)
     {
         if (dev == nullptr)
             return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
         // Upstream ggml's ggml_backend_dev_props has no `integrated` field (that was an
         // ollama-fork extension). On the backends we use the field was effectively always
         // 0 anyway -- the Metal backend reports type=GPU and never set it -- so the
@@ -587,7 +740,18 @@ namespace tsg
         // handled separately and ARE wrapped zero-copy on Metal -- see the
         // unified-memory weight branch in try_get_cacheable_tensor_buffer,
         // which is where the model-weight memory duplication is avoided.
-        return props.type == GGML_BACKEND_DEVICE_TYPE_GPU;
+        //
+        // Integrated GPUs count as GPUs here. Upstream ggml now reports them as
+        // GGML_BACKEND_DEVICE_TYPE_IGPU (ggml-vulkan for iGPUs behind e.g.
+        // --gpu-device, ggml-cuda for Tegra). Excluding IGPU broke the preload
+        // contract: TSGgml_PreloadQuantizedWeight early-returns success when
+        // this predicate is false WITHOUT caching anything, the managed side
+        // then releases the host weight copies, and the first forward's cache
+        // miss dereferenced the opaque GCHandle cache key as if it were weight
+        // bytes -> access violation on Intel iGPUs (their UMA device buffers
+        // work exactly like discrete ones for our binding purposes).
+        const enum ggml_backend_dev_type type = get_device_static_props(dev).type;
+        return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
     }
 
     // Capability-only test: can this host pointer be wrapped as a device-visible
@@ -600,9 +764,7 @@ namespace tsg
     {
         if (dev == nullptr || ptr == nullptr || size == 0)
             return false;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.buffer_from_host_ptr)
+        if (!get_device_static_props(dev).buffer_from_host_ptr)
             return false;
         const std::size_t alignment = get_host_ptr_alignment(backend, dev);
         return is_pointer_aligned(ptr, alignment);
@@ -847,6 +1009,8 @@ namespace tsg
 
         const bool use_device_copy = prefers_device_local_cache(dev) && !unified_weight;
 
+        static const bool s_bind_debug = is_truthy_env(std::getenv("TS_GGML_BIND_DEBUG"));
+
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
             auto it = g_preloaded_buffer_cache.find(data);
@@ -860,8 +1024,26 @@ namespace tsg
                     out_addr = ggml_backend_buffer_get_base(out_buffer);
                     return true;
                 }
+                if (s_bind_debug)
+                {
+                    std::fprintf(stderr,
+                        "[bind-debug] preload entry REJECTED key=%p bytes=%zu(entry %zu) required=%zu buffer=%zu type=%s ne=[%lld,%lld]\n",
+                        data, bytes, it->second.bytes, required_size, it->second.buffer_size,
+                        ggml_type_name(tensor->type),
+                        (long long)tensor->ne[0], (long long)tensor->ne[1]);
+                    std::fflush(stderr);
+                }
                 ggml_backend_buffer_free(it->second.buffer);
                 g_preloaded_buffer_cache.erase(it);
+            }
+            else if (s_bind_debug && bytes >= 4096)
+            {
+                std::fprintf(stderr,
+                    "[bind-debug] preload MISS key=%p bytes=%zu type=%s ne=[%lld,%lld] map_size=%zu\n",
+                    data, bytes, ggml_type_name(tensor->type),
+                    (long long)tensor->ne[0], (long long)tensor->ne[1],
+                    g_preloaded_buffer_cache.size());
+                std::fflush(stderr);
             }
         }
 
@@ -1622,6 +1804,66 @@ TSG_EXPORT int TSGgml_IsBackendAvailable(int backendType)
 {
     clear_last_error();
     return ensure_backend(backendType) ? 1 : 0;
+}
+
+// Selects which Vulkan device ggml-vulkan initializes on (multi-GPU hosts, e.g.
+// an iGPU next to a discrete GPU). Must be called before the first GGML op /
+// TSGgml_IsBackendAvailable; once the backend singleton exists the device can
+// no longer change, so a differing late call fails instead of silently
+// binding to the wrong GPU.
+TSG_EXPORT int TSGgml_SetVulkanDeviceIndex(int deviceIndex)
+{
+    clear_last_error();
+    if (deviceIndex < 0)
+    {
+        set_last_error("Vulkan device index must be non-negative.");
+        return 0;
+    }
+
+    if (g_backend != nullptr &&
+        g_backend_type == BACKEND_TYPE_VULKAN &&
+        g_vulkan_device_index.load(std::memory_order_acquire) != deviceIndex)
+    {
+        set_last_error("The ggml-vulkan backend was already initialized on a different device.");
+        return 0;
+    }
+
+    g_vulkan_device_index.store(deviceIndex, std::memory_order_release);
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_GetVulkanDeviceCount()
+{
+    clear_last_error();
+#if defined(GGML_USE_VULKAN)
+    return ggml_backend_vk_get_device_count();
+#else
+    set_last_error("The ggml-vulkan backend is not available in this build.");
+    return 0;
+#endif
+}
+
+TSG_EXPORT int TSGgml_GetVulkanDeviceDescription(int deviceIndex, char* description, int descriptionSize)
+{
+    clear_last_error();
+    if (description == nullptr || descriptionSize <= 0)
+    {
+        set_last_error("Invalid description buffer.");
+        return 0;
+    }
+#if defined(GGML_USE_VULKAN)
+    if (deviceIndex < 0 || deviceIndex >= ggml_backend_vk_get_device_count())
+    {
+        set_last_error("Vulkan device index " + std::to_string(deviceIndex) + " is out of range.");
+        return 0;
+    }
+    ggml_backend_vk_get_device_description(deviceIndex, description, static_cast<size_t>(descriptionSize));
+    return 1;
+#else
+    (void) deviceIndex;
+    set_last_error("The ggml-vulkan backend is not available in this build.");
+    return 0;
+#endif
 }
 
 TSG_EXPORT void* TSGgml_AlignedAlloc(size_t size)

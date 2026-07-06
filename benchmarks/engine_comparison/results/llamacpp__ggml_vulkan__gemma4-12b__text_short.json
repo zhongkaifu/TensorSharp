@@ -1,0 +1,21 @@
+{
+  "engine": "llamacpp",
+  "backend": "ggml_vulkan",
+  "model": "gemma4-12b",
+  "scenario": "text_short",
+  "status": "ok",
+  "detail": "",
+  "prompt_tokens": 1949,
+  "completion_tokens": 557,
+  "ttft_ms": 2532.0,
+  "prefill_tps": 769.7,
+  "decode_tps": 33.4,
+  "total_wall_ms": 19094.0,
+  "finish_reason": "stop",
+  "tool_call_ok": null,
+  "output_preview": "Introduced in 2017, the transformer architecture serves as a catalyst for the current era of machine learning. It replaces older methods of processing sequences one element at a time with a mechanism called \"attention.\" This mechanism allows every position in a sequence to directly consult every oth",
+  "mtp": false,
+  "concurrency": 1,
+  "aggregate_decode_tps": 33.4,
+  "requests_ok": 1
+}

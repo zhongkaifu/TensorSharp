@@ -68,11 +68,50 @@
     "vllm": {"display": "vLLM", "transport": "connect", "backends": ["gpu"]}
   },
 
-  "backends": ["gpu", "cpu"],
-
-  "maps": {
-    "tensorsharp_backend": {"gpu": "ggml_cuda", "cpu": "ggml_cpu"},
-    "llama_ngl": {"gpu": 999, "cpu": 0}
+  "backends": {
+    "_comment": "Concrete-backend registry (same format as benchmark_config.json — see the _comment there). Select with --backends; the legacy alias `gpu` resolves to ggml_cuda.",
+    "ggml_cuda": {
+      "display": "CUDA",
+      "kind": "gpu",
+      "aliases": ["gpu"],
+      "tensorsharp": {"backend": "ggml_cuda"},
+      "llamacpp": {"ngl": 999},
+      "vllm": true
+    },
+    "ggml_vulkan": {
+      "display": "Vulkan",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "ggml_vulkan"},
+      "llamacpp": {"ngl": 999, "server_exe": {"path": "C:/Works/llama.cpp/build-vulkan/bin/Release/llama-server.exe", "env": "BENCH_LLAMA_SERVER_VULKAN"}, "extra_args": ["--device", "Vulkan0"]}
+    },
+    "ggml_metal": {
+      "display": "Metal",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "ggml_metal"},
+      "llamacpp": {"ngl": 999, "server_exe": {"path": null, "env": "BENCH_LLAMA_SERVER_METAL"}}
+    },
+    "cuda": {
+      "display": "Direct CUDA",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "cuda"}
+    },
+    "mlx": {
+      "display": "MLX Metal",
+      "kind": "gpu",
+      "tensorsharp": {"backend": "mlx"}
+    },
+    "ggml_cpu": {
+      "display": "GGML CPU",
+      "kind": "cpu",
+      "tensorsharp": {"backend": "ggml_cpu"},
+      "llamacpp": {"ngl": 0}
+    },
+    "cpu": {
+      "display": "C# CPU",
+      "kind": "cpu",
+      "tensorsharp": {"backend": "cpu"},
+      "llamacpp": {"ngl": 0}
+    }
   },
 
   "llama": {
@@ -86,7 +125,7 @@
     "engines": ["tensorsharp", "llamacpp"],
     "models": ["gemma4-e4b", "gemma4-12b", "gemma4-26b-a4b", "qwen36-35b-a3b"],
     "scenarios": ["prefill_2k", "prefill_4k", "prefill_8k", "prefill_16k", "prefill_32k", "prefill_64k", "prefill_128k"],
-    "backends": ["gpu"],
+    "backends": ["ggml_cuda"],
     "mtp_modes": [false],
     "concurrency": [1],
     "max_tokens": 8,

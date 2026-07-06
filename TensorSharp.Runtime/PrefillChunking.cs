@@ -34,7 +34,7 @@ namespace TensorSharp.Runtime
             if (tokenCount <= 0)
                 return 0;
 
-            return backend == BackendType.GgmlCuda
+            return backend == BackendType.GgmlCuda || backend == BackendType.GgmlVulkan
                 ? Math.Min(tokenCount, 5120)
                 : Math.Min(tokenCount, 2048);
         }
