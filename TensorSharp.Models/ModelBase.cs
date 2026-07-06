@@ -3422,7 +3422,35 @@ namespace TensorSharp.Models
                     Console.WriteLine(
                         "  Integrated GPU detected: using a lightweight startup warmup (skipping the full multi-token prefill warmup, which is far too slow on unified-memory GPUs). Large prompts will still be slow here; use a discrete GPU (e.g. --gpu-device <dGPU index>) for full performance.");
                 }
-                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu || integratedGpu;
+                // Native CUDA models whose weights are mostly a CUDA-unsupported quant
+                // type never become GPU-resident: their matmuls dequantize on the CPU,
+                // and a 2048-token prefill warmup then pegs every core for MINUTES while
+                // the server prints "Startup model loaded" and looks hung (observed on a
+                // Qwen3.5-9B IQ4_XS build before IQ4_XS residency was added). Detect that
+                // up front and use the short warmup instead so startup stays responsive;
+                // the inference itself is still slow, so point the operator at a
+                // supported quant / backend.
+                double hostBackedFrac = HostBackedQuantWeightFraction();
+                bool mostlyHostBacked = hostBackedFrac >= 0.5;
+                if (mostlyHostBacked)
+                {
+                    Console.WriteLine(
+                        $"  {hostBackedFrac * 100:F0}% of quantized weights use a CUDA-unsupported quant type and stay host-backed (CPU matmul); using a lightweight startup warmup. Inference will be slow — prefer a quant the direct CUDA backend supports (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0/IQ2/IQ3/IQ4_XS) or run with --backend ggml_cuda.");
+                }
+                // The long (2048-token) warmup only pays off on backends that BUILD
+                // AND CAPTURE a fused whole-model prefill graph and pre-grow its
+                // gallocr on the first prompt (ggml_cuda / ggml_vulkan). The native
+                // CUDA backend has no captured verify prefill (CanUsePrefillVerify is
+                // GGML-only), so a 2048-token warmup there only runs the per-op prefill
+                // once at full cost — on a hybrid GatedDeltaNet model that is tens of
+                // seconds to minutes — with no lasting benefit, and the server looks
+                // hung after "Startup model loaded". A short warmup still JITs the
+                // prefill kernels and primes the captured DECODE graph (via the
+                // 1-token Forward above) cheaply; the first real large prompt only
+                // pays a one-time activation-scratch growth.
+                bool nativeCudaNoCapturedPrefill = _backend == BackendType.Cuda;
+                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu
+                    || integratedGpu || mostlyHostBacked || nativeCudaNoCapturedPrefill;
                 // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
                 // fused verify chunk at the largest legacy-chunk shape: the shared
                 // reuse-gallocr is pre-grown (and its device memory first-touched)
@@ -3479,6 +3507,30 @@ namespace TensorSharp.Models
                 return false;
             try { return GgmlBasicOps.IsActiveDeviceIntegrated(); }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// Fraction (0..1) of quantized weight bytes whose quant type the direct
+        /// CUDA backend cannot make GPU-resident (<see cref="CudaQuantizedOps.SupportsQuantizedType"/>).
+        /// Such weights stay host-backed and their matmuls dequantize on the CPU, so a
+        /// large fraction means a multi-token prefill (including the startup warmup)
+        /// runs CPU-bound. Only the native <see cref="BackendType.Cuda"/> backend is
+        /// evaluated (GGML backends upload weights to the device themselves); every
+        /// other backend reports 0. Computed from the quant TYPE, not the live
+        /// host-data flag, so it is unaffected by TS_GGML_RETAIN_HOST_WEIGHTS.
+        /// </summary>
+        private double HostBackedQuantWeightFraction()
+        {
+            if (_backend != BackendType.Cuda || _quantWeights.Count == 0)
+                return 0.0;
+            long total = 0, hostBacked = 0;
+            foreach (QuantizedWeight qw in _quantWeights.Values)
+            {
+                total += qw.RawBytes;
+                if (!CudaQuantizedOps.SupportsQuantizedType(qw.GgmlType))
+                    hostBacked += qw.RawBytes;
+            }
+            return total > 0 ? (double)hostBacked / total : 0.0;
         }
 
         private static bool IsMlxKernelWarmupEnabled()

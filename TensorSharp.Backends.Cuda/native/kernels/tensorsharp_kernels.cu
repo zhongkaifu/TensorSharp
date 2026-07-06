@@ -23,7 +23,16 @@
 #define GGML_IQ3_XXS 18
 #define GGML_IQ3_S 21
 #define GGML_IQ2_S 22
+#define GGML_IQ4_XS 23
 #define TS_QK8_1 32
+
+// IQ4_XS / IQ4_NL non-linear 4-bit codebook (ggml kvalues_iq4nl). Each 4-bit
+// index maps to one of these 16 reconstruction levels; the per-sub-block scale
+// multiplies the looked-up level. Matches ManagedQuantizedOps.Iq4NlValues so the
+// device dequant is bit-for-bit consistent with the host reference.
+__device__ static const int8_t ts_kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
 
 struct ts_block_q8_1
 {
@@ -84,6 +93,7 @@ __device__ __forceinline__ int qrow_bytes(int type, int cols)
         case GGML_IQ3_XXS: return (cols / 256) * 98;
         case GGML_IQ2_S: return (cols / 256) * 82;
         case GGML_IQ3_S: return (cols / 256) * 110;
+        case GGML_IQ4_XS: return (cols / 256) * 136;
         default: return 0;
     }
 }
@@ -389,6 +399,29 @@ __device__ __forceinline__ float qvalue_at(const uint8_t* row, int type, int col
         uint8_t sign_byte = signs[ib32 * 4 + l];
         float v = db * (float)gv;
         return (sign_byte & (1u << p)) ? -v : v;
+    }
+
+    if (type == GGML_IQ4_XS)
+    {
+        // block_iq4_xs: d (half), scales_h (uint16), scales_l[4], qs[128] = 136 bytes.
+        // 8 sub-blocks of 32 elements each; per-sub-block 6-bit scale ls is split
+        // between the low nibble in scales_l[ib/2] and 2 high bits in scales_h.
+        // Within a sub-block, elements 0..15 read the low nibble of qs[j] and
+        // 16..31 read the high nibble (ggml dequantize_row_iq4_xs).
+        const uint8_t* block = row + (col / 256) * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        int scales_h = (int)block[2] | ((int)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+        int t = col & 255;
+        int ib = t >> 5;             // 0..7 sub-block
+        int within = t & 31;         // 0..31 position in sub-block
+        int j = within & 15;         // 0..15 byte index within the sub-block's 16 bytes
+        int ls = ((scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+        float dl = d * (float)(ls - 32);
+        uint8_t packed = qs[ib * 16 + j];
+        int nib = (within < 16) ? (packed & 0xF) : (packed >> 4);
+        return dl * (float)ts_kvalues_iq4nl[nib];
     }
 
     return 0.0f;

@@ -78,7 +78,8 @@ namespace TensorSharp.Cuda
                 ggmlType == 16 ||    // IQ2_XXS
                 ggmlType == 18 ||    // IQ3_XXS
                 ggmlType == 21 ||    // IQ3_S
-                ggmlType == 22;      // IQ2_S
+                ggmlType == 22 ||    // IQ2_S
+                ggmlType == 23;      // IQ4_XS
         }
 
         public static void PreloadQuantizedWeight(
@@ -192,7 +193,16 @@ namespace TensorSharp.Cuda
             //   * IQ2_XXS / Q8_0 keep their own multi-row paths (the q8_1 dp4a/MMA
             //     GEMM and the IQ2_XXS q8_1 kernel) which already read the weight
             //     once per tile and beat the scalar batched kernel for those types.
-            if (BatchedMatmulEnabled && rows >= 2 && rows <= CudaKernels.QuantMatmulBatchMaxRows
+            // The batched kernel tiles rows down grid.y (any row count), so it also
+            // covers LARGE prefill batches: the generic quant types here (K-quants,
+            // IQ2_S / IQ3_S / IQ3_XXS / IQ4_XS) have no specialized large-batch GEMM,
+            // and the per-row scalar fallback re-dequantizes the whole weight for
+            // EVERY output row -- a 2048-token prefill then costs ~2048x the (memory-
+            // bound) weight traffic and dominates TTFT (and the startup warmup). Route
+            // all batch sizes (not just <=QuantMatmulBatchMaxRows) through the tiled
+            // kernel so weight traffic drops ~TS_QMM_ROW_TILE x; it is numerically
+            // identical (verified by the K-quant / IQ4_XS matmul tests).
+            if (BatchedMatmulEnabled && rows >= 2
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
                 kernels.LaunchQuantMatmulBatchedF32(

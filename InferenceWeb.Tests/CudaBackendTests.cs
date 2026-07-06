@@ -884,6 +884,117 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaQuantizedMatmulAndRows_IQ4XSMatchNativeReferenceAfterHostRelease()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        // IQ4_XS (ggml type 23) is a mixed-quant staple (e.g. Qwen3.5-9B-IQ4_XS).
+        // Before device residency was wired in, its weights stayed host-backed and
+        // the matmul dequantized on the CPU. This exercises the device-resident
+        // path (dequant on-GPU via qvalue_at) against the ggml dequant reference.
+        const int rows = 3;
+        const int inDim = 512;   // multiple of the 256-element IQ4_XS super-block
+        const int outDim = 5;
+        byte[] weights = CreateIq4XsRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 1) * 0.011f) + MathF.Cos((r + 2) * (c + 3) * 0.005f) * 0.3f;
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x767000 + (int)GgmlTensorType.IQ4_XS);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(allocator, cacheKey, host, (int)GgmlTensorType.IQ4_XS, inDim, outDim, weights.Length);
+
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, rows, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output,
+                    inputTensor,
+                    cacheKey,
+                    IntPtr.Zero,
+                    (int)GgmlTensorType.IQ4_XS,
+                    inDim,
+                    outDim,
+                    weights.Length));
+
+                float[] expected = DequantizedMatmulNative(weights, GgmlTensorType.IQ4_XS, outDim, inDim, input);
+                // Both sides accumulate in FP32; the only divergence is summation order,
+                // so scale the tolerance by the result magnitude (IQ4_XS levels reach
+                // ~127, so raw sums can be large).
+                float maxAbs = 0f;
+                foreach (float e in expected)
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(e));
+                AssertClose(expected, output.GetElementsAsFloat(rows * outDim), MathF.Max(5e-2f, maxAbs * 3e-4f));
+
+                int[] selected = { 4, 1, 3 };
+                using var indices = Tensor.FromArray(allocator, selected);
+                using var rowOutput = new Tensor(allocator, DType.Float32, selected.Length, inDim);
+                Assert.True(CudaQuantizedOps.TryGetRowsQuantizedToFloat32(
+                    rowOutput,
+                    cacheKey,
+                    IntPtr.Zero,
+                    (int)GgmlTensorType.IQ4_XS,
+                    inDim,
+                    outDim,
+                    weights.Length,
+                    indices));
+
+                // getrows is a pure dequant (no accumulation) so it should match the
+                // reference to a couple of ULPs even at the largest magnitudes.
+                float[] expectedRows = DequantizeNativeRows(weights, GgmlTensorType.IQ4_XS, inDim, selected);
+                float maxRowAbs = 0f;
+                foreach (float e in expectedRows)
+                    maxRowAbs = MathF.Max(maxRowAbs, MathF.Abs(e));
+                AssertClose(expectedRows, rowOutput.GetElementsAsFloat(selected.Length * inDim), MathF.Max(5e-3f, maxRowAbs * 1e-5f));
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    // Builds a byte-valid IQ4_XS weight buffer (any bit pattern is a legal block).
+    // block_iq4_xs = d(half) @0, scales_h(uint16) @2, scales_l[4] @4, qs[128] @8 => 136 bytes / 256 elems.
+    private static byte[] CreateIq4XsRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 136;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.0078125f + r * 0.001953125f + b * 0.0009765625f);
+                // scales_h (2 bytes) + scales_l (4 bytes) + qs (128 bytes): a varied,
+                // deterministic pattern covering the full 4-/6-bit ranges.
+                raw[offset + 2] = (byte)((r * 13 + b * 7 + 3) & 0xFF);
+                raw[offset + 3] = (byte)((r * 5 + b * 11 + 9) & 0xFF);
+                for (int i = 0; i < 4; i++)
+                    raw[offset + 4 + i] = (byte)((r * 17 + b * 3 + i * 23 + 5) & 0xFF);
+                for (int i = 0; i < 128; i++)
+                    raw[offset + 8 + i] = (byte)((r * 29 + b * 17 + i * 11 + 7) & 0xFF);
+            }
+        }
+
+        return raw;
+    }
+
+    [Fact]
     public void CudaScaledDotProductAttention_WithMaskMatchesReference()
     {
         if (!CudaBackend.IsAvailable())
