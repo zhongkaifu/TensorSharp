@@ -1314,9 +1314,14 @@ namespace TensorSharp.GGML
             GgmlNative.AddmmQuantBatch(resultView, m1View, weightData, ggmlType, ne0, rawBytes, batchCount, weightOffsets, weightNe1Arr);
         }
 
-        public static void PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        /// <summary>
+        /// See <see cref="GgmlNative.PreloadQuantizedWeight"/>: returns false when
+        /// the weight exceeds the device's single-buffer size limit and must stay
+        /// host-resident; throws on any other native failure.
+        /// </summary>
+        public static bool PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
         {
-            GgmlNative.PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            return GgmlNative.PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
         }
 
         public static void RegisterOffloadable(IntPtr key) => GgmlNative.RegisterOffloadable(key);

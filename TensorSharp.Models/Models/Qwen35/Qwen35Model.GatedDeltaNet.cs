@@ -947,9 +947,12 @@ namespace TensorSharp.Models
             _bfdPoolSeeded = false;
             if (_backend == BackendType.GgmlCuda)
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
-            // The persistent (CUDA-graph-captured) decode graph pins the GDN
-            // conv/delta device-buffer addresses; a re-seed can move them, so drop
-            // the cached graph too. No-op when persist mode is off.
+            // The persistent decode graph (CUDA-graph-captured on CUDA, replayed on
+            // Vulkan) pins the GDN conv/delta device-buffer addresses AND holds the
+            // last-seeded GDN state device-resident; the persist replay fast-path does
+            // NOT re-run the bind loop, so once the host state changes (prefill / per-op
+            // recurrence advanced it) the cached graph must be dropped or it replays
+            // stale state. Drop it on both persist backends. No-op when persist is off.
             //
             // NOTE: the fused VERIFY cache is NOT reset here. InvalidateFullDecodeState
             // runs on every EnterSpecSession (i.e. every spec step), but the verify
@@ -957,7 +960,7 @@ namespace TensorSharp.Models
             // (ResetKVCache / EnsureCacheCapacity grow) — it uploads fresh GDN state
             // each call, so a per-step reset would defeat the whole cache. Those two
             // call sites reset it explicitly via InvalidateVerifyCache().
-            if (_backend == BackendType.GgmlCuda)
+            if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan)
                 GgmlBasicOps.Qwen35ResetDecodeCache();
         }
 
@@ -1001,14 +1004,19 @@ namespace TensorSharp.Models
             // Fold final-norm + lm_head into the graph requires both present.
             if ((_lmHeadQW == null && _lmHeadF32 == null) || _finalNormW == null)
                 return false;
-            // The whole-model single-graph decode now runs on BOTH ggml_cuda (with a
-            // persistent CUDA-graph-captured replay) AND ggml_metal (non-persist: cpy
-            // KV write + reused gallocr; the native kernel forces non-persist when the
-            // backend is Metal). On Metal this collapses the ~145 op-by-op graph_compute
-            // submits/token (the dispatch-overhead ceiling, ~6.9 tok/s) into ONE graph,
-            // with the GDN recurrence + MoE top-K routing fully in-graph (no host drain).
+            // The whole-model single-graph decode now runs on ggml_cuda + ggml_vulkan
+            // (persistent replay: build the fixed-topology graph once, replay it each
+            // token via set_rows KV write — CUDA also captures a CUDA graph) AND
+            // ggml_metal (non-persist: cpy KV write + per-call scratch buffer, since
+            // ggml_metal_op_set_rows SEGFAULTs). All three collapse the ~145 op-by-op
+            // graph_compute submits/token — the dispatch ceiling that leaves the GPU
+            // ~10% utilized — into ONE graph, with the GDN recurrence + MoE top-K
+            // routing fully in-graph (no host drain). ggml-vulkan v0.15.3 implements
+            // every op the graph needs (gated_delta_net / ssm_conv / ssm_scan /
+            // argsort-top_k / mul_mat_id + set_rows), matching llama.cpp Vulkan decode.
             if (!_fullDecodeEnabled || _fdUnsupported || _fdSpecSessionActive
-                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal))
+                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
+                    && _backend != BackendType.GgmlVulkan))
                 return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.Sizes[0] != 1
                 || hidden.ElementType != DType.Float32)
@@ -1305,15 +1313,18 @@ namespace TensorSharp.Models
 
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0)
         {
-            // CUDA-only: the whole-model verify graph uses ggml_set_rows KV writes +
-            // a persistent reuse gallocr. On Metal a cpy-based non-persist variant
-            // hit a VRAM wall (fresh alloc OOMs the 40-layer MoE graph) AND a
-            // gallocr "tensor buffer not set" assert (the lifetime-packing does not
-            // compose with the cpy-into-cacheable-cache write) — see the deferred
-            // OPT-1 design notes. Metal prefill instead uses the per-GDN-layer
-            // device-resident fused prefill (TryFusedRecLayerPrefill, now enabled
-            // on Metal) plus op-by-op attention.
-            if (!_fusedVerifyEnabled || _fvUnsupported || _backend != BackendType.GgmlCuda)
+            // CUDA + Vulkan: the whole-model verify graph writes KV via ggml_set_rows
+            // (per-head 2D shape, a Vulkan-supported op in ggml v0.15.3) and, for
+            // PREFILL (n_logits < N), allocates activations through the reuse gallocr
+            // (lifetime-packing, backend-agnostic). This collapses the per-GDN-layer +
+            // op-by-op attention prefill (≈22 tok/s / 23 s for a 512-tok prompt on
+            // Vulkan) into ONE graph for the whole prompt. Metal stays OFF: an older
+            // cpy-based variant hit a VRAM wall + a gallocr "tensor buffer not set"
+            // assert on Metal (and ggml_metal_op_set_rows SEGFAULTs), so Metal prefill
+            // keeps the per-GDN-layer device-resident fused prefill (TryFusedRecLayerPrefill)
+            // plus op-by-op attention.
+            if (!_fusedVerifyEnabled || _fvUnsupported
+                || (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan))
                 return false;
             if (seqLen < 1 || hidden == null)
                 return false;

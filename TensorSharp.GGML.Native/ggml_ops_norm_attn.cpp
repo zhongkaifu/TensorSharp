@@ -134,48 +134,16 @@ namespace {
             return 0;
         }
 
-        ggml_tensor* value_tensor = make_norm_tensor(context.value, op, contiguous_src, eps);
-        if (value_tensor == nullptr)
-        {
-            if (g_last_error.empty())
-            {
-                set_last_error("Failed to create ggml norm node.");
-            }
-            return 0;
-        }
-
-        value_tensor = ggml_mul(context.value, value_tensor, contiguous_gamma);
-        if (value_tensor == nullptr)
-        {
-            set_last_error("Failed to create ggml norm scale node.");
-            return 0;
-        }
-
+        ggml_tensor* contiguous_beta = nullptr;
         if (has_beta)
         {
-            ggml_tensor* contiguous_beta = ggml_cont(context.value, beta_binding.tensor);
+            contiguous_beta = ggml_cont(context.value, beta_binding.tensor);
             if (contiguous_beta == nullptr)
             {
                 set_last_error("Failed to create ggml contiguous beta tensor.");
                 return 0;
             }
-
-            value_tensor = ggml_add(context.value, value_tensor, contiguous_beta);
-            if (value_tensor == nullptr)
-            {
-                set_last_error("Failed to create ggml norm bias node.");
-                return 0;
-            }
         }
-
-        ggml_tensor* output_tensor = ggml_cpy(context.value, value_tensor, result_binding.tensor);
-        if (output_tensor == nullptr)
-        {
-            set_last_error("Failed to create ggml norm output copy node.");
-            return 0;
-        }
-
-        ggml_set_output(output_tensor);
 
         ggml_cgraph* graph = ggml_new_graph(context.value);
         if (graph == nullptr)
@@ -184,7 +152,95 @@ namespace {
             return 0;
         }
 
-        ggml_build_forward_expand(graph, output_tensor);
+        // Builds norm(src_part) * gamma (+ beta) copied into dst_part and adds
+        // the chain to the graph.
+        auto build_norm_chain = [&](ggml_tensor* src_part, ggml_tensor* dst_part) -> bool {
+            ggml_tensor* value_tensor = make_norm_tensor(context.value, op, src_part, eps);
+            if (value_tensor == nullptr)
+            {
+                if (g_last_error.empty())
+                {
+                    set_last_error("Failed to create ggml norm node.");
+                }
+                return false;
+            }
+
+            value_tensor = ggml_mul(context.value, value_tensor, contiguous_gamma);
+            if (value_tensor == nullptr)
+            {
+                set_last_error("Failed to create ggml norm scale node.");
+                return false;
+            }
+
+            if (has_beta)
+            {
+                value_tensor = ggml_add(context.value, value_tensor, contiguous_beta);
+                if (value_tensor == nullptr)
+                {
+                    set_last_error("Failed to create ggml norm bias node.");
+                    return false;
+                }
+            }
+
+            ggml_tensor* output_tensor = ggml_cpy(context.value, value_tensor, dst_part);
+            if (output_tensor == nullptr)
+            {
+                set_last_error("Failed to create ggml norm output copy node.");
+                return false;
+            }
+
+            ggml_set_output(output_tensor);
+            ggml_build_forward_expand(graph, output_tensor);
+            return true;
+        };
+
+        // ggml-vulkan dispatches the row-wise norm family with one workgroup per
+        // dim-1 row (GGML_OP_RMS_NORM uses {ne01, ne02, ne03} verbatim), and
+        // Vulkan only guarantees 65535 workgroups per dispatch dimension. WSL's
+        // dzn layer and Intel iGPUs report exactly that minimum, and e.g. the
+        // Gemma E4B PLE projection norm (seqLen*42 rows) exceeds it for chunks
+        // over ~1560 tokens, tripping a GGML_ASSERT. Split row-heavy 2D norms
+        // into <=32768-row sub-norms inside the same graph; backends with larger
+        // dispatch limits are indifferent to the few extra nodes.
+        const int64_t kMaxNormRowsPerOp = 32768;
+        ggml_tensor* result_tensor = result_binding.tensor;
+        const bool split_rows =
+            contiguous_src->ne[1] > kMaxNormRowsPerOp &&
+            contiguous_src->ne[2] == 1 && contiguous_src->ne[3] == 1 &&
+            result_tensor->ne[2] == 1 && result_tensor->ne[3] == 1 &&
+            result_tensor->ne[0] == contiguous_src->ne[0] &&
+            result_tensor->ne[1] == contiguous_src->ne[1];
+
+        if (!split_rows)
+        {
+            if (!build_norm_chain(contiguous_src, result_tensor))
+                return 0;
+        }
+        else
+        {
+            const int64_t total_rows = contiguous_src->ne[1];
+            for (int64_t row0 = 0; row0 < total_rows; row0 += kMaxNormRowsPerOp)
+            {
+                const int64_t chunk_rows = std::min<int64_t>(kMaxNormRowsPerOp, total_rows - row0);
+                ggml_tensor* src_part = ggml_view_2d(
+                    context.value, contiguous_src,
+                    contiguous_src->ne[0], chunk_rows,
+                    contiguous_src->nb[1],
+                    static_cast<std::size_t>(row0) * contiguous_src->nb[1]);
+                ggml_tensor* dst_part = ggml_view_2d(
+                    context.value, result_tensor,
+                    result_tensor->ne[0], chunk_rows,
+                    result_tensor->nb[1],
+                    static_cast<std::size_t>(row0) * result_tensor->nb[1]);
+                if (src_part == nullptr || dst_part == nullptr)
+                {
+                    set_last_error("Failed to create ggml norm row-chunk views.");
+                    return 0;
+                }
+                if (!build_norm_chain(src_part, dst_part))
+                    return 0;
+            }
+        }
 
         BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
         if (buffer.value == nullptr)

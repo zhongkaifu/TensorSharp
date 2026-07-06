@@ -1287,12 +1287,21 @@ namespace TensorSharp.Models
         // over PCIe (~3.5x collapse across the whole server until restart). Splitting
         // prefill into sub-chunks bounds the scratch at the ubatch peak instead of
         // scaling with prompt length. 0 disables the cap.
-        private static int ResolvePrefillVerifyUbatch()
+        private int ResolvePrefillVerifyUbatch()
         {
             string env = Environment.GetEnvironmentVariable("TS_QWEN35_PREFILL_UBATCH");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v >= 0)
                 return v;
-            return 1024;
+            // Vulkan has a sharper VRAM cliff than CUDA: the reuse gallocr grows to the
+            // ubatch peak and, once it exceeds the card, WDDM demotes it permanently to
+            // shared memory. On a 16 GB card with the 27B (~9 GB weights) a 1024-token
+            // chunk spills hard (pp2048 358->104, pp4096 345->83 tok/s). 768 stays
+            // resident with a clear margin at every length (pp512/2048/4096 = 368/358/345,
+            // matching llama.cpp's 360/352/344); 512 is safe too but its extra chunks add
+            // per-chunk overhead at long prompts (pp4096 only 215). The MoE-activation
+            // peak scales with the ubatch, not the prompt length (KV is pre-allocated), so
+            // 768's headroom holds across contexts. CUDA keeps 1024 (more headroom).
+            return _backend == BackendType.GgmlVulkan ? 768 : 1024;
         }
 
         // Gates the whole-model fused prefill path (TSGgml_Qwen35ModelVerify, one
@@ -1312,7 +1321,7 @@ namespace TensorSharp.Models
         private bool CanUsePrefillVerify(int startPos, int seqLen)
         {
             if (!_prefillVerifyEnabled || _fvUnsupported) return false;
-            if (_backend != BackendType.GgmlCuda || seqLen <= 1) return false;
+            if ((_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan) || seqLen <= 1) return false;
             // Vision embeddings must already be injected into the hidden tensor
             // (Forward injects before the verify branch and clears the list).
             if (_visionEmbeddingsList.Count > 0) return false;

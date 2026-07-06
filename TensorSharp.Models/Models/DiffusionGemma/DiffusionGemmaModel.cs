@@ -465,10 +465,13 @@ namespace TensorSharp.Models
                 {
                     try
                     {
-                        GgmlBasicOps.PreloadQuantizedWeight(w.key, w.host, w.type, w.ne0, w.ne1, w.bytes);
-                        preloadedBytes += w.bytes;
-                        preloadedCount++;
-                        continue;
+                        if (GgmlBasicOps.PreloadQuantizedWeight(w.key, w.host, w.type, w.ne0, w.ne1, w.bytes))
+                        {
+                            preloadedBytes += w.bytes;
+                            preloadedCount++;
+                            continue;
+                        }
+                        // false: exceeds the device's single-buffer size limit; stream it per step.
                     }
                     catch (Exception)
                     {

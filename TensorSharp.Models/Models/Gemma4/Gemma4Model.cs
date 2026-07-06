@@ -2897,7 +2897,8 @@ namespace TensorSharp.Models
         {
             if (!s_pleInKernelEnabled || !IsGgmlBackend || _pleDim <= 0) return false;
             if (!_quantWeights.TryGetValue("per_layer_token_embd.weight", out var tok)
-                || !CanUseGgmlQuantizedGetRows(tok.GgmlType))
+                || !CanUseGgmlQuantizedGetRows(tok.GgmlType)
+                || tok.DevicePreloadTooLarge)
                 return false;
             bool hasProj = _quantWeights.ContainsKey("per_layer_model_proj.weight")
                            || _weights.ContainsKey("per_layer_model_proj.weight");
@@ -3683,7 +3684,8 @@ namespace TensorSharp.Models
                 using var pleIdx = CreateIntTensor(tokens, seqLen);
                 if (IsGgmlBackend)
                 {
-                    bool canUseGgmlLookup = CanUseGgmlQuantizedGetRows(pleQw.GgmlType);
+                    bool canUseGgmlLookup = CanUseGgmlQuantizedGetRows(pleQw.GgmlType)
+                        && !pleQw.DevicePreloadTooLarge;
                     if ((!canUseGgmlLookup || seqLen == 1) && pleQw.HasHostData)
                     {
                         PopulateQuantizedRows(pleTokenEmb, pleQw, tokens);

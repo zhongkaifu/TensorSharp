@@ -3915,12 +3915,22 @@ internal enum GgmlIndexReductionOp
             TSGgml_HostReadBarrier();
         }
 
-        public static void PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
+        /// <summary>
+        /// Preload a quantized weight into a device-resident buffer keyed by
+        /// <paramref name="cacheKey"/>. Returns true when the weight is (now)
+        /// device-resident; false when the device cannot hold it in a single
+        /// backend buffer (e.g. ggml-vulkan's per-buffer maxBufferSize cap) —
+        /// the caller must keep the host copy and use its host fallback path.
+        /// Throws on any other native failure.
+        /// </summary>
+        public static bool PreloadQuantizedWeight(IntPtr cacheKey, IntPtr hostData, int ggmlType, long ne0, long ne1, long rawBytes)
         {
             if (cacheKey == IntPtr.Zero || hostData == IntPtr.Zero || rawBytes <= 0)
                 throw new ArgumentException("PreloadQuantizedWeight requires valid cache key, host data, and size.");
 
-            CheckResult(TSGgml_PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes), "preload_quantized_weight");
+            int result = TSGgml_PreloadQuantizedWeight(cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+            CheckResult(result, "preload_quantized_weight");
+            return result != 2;
         }
 
         /// <summary>

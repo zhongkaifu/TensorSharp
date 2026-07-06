@@ -41,6 +41,16 @@ namespace TensorSharp.Models
         public bool HasHostData => _data != IntPtr.Zero;
         public bool HasExternalHostView => _data != IntPtr.Zero && !_ownsBuffer && _ownerToken != null;
 
+        /// <summary>
+        /// True when the active device could not hold this weight in a single
+        /// backend buffer (e.g. ggml-vulkan rejects any buffer above the driver's
+        /// maxBufferSize; WSL's dzn layer caps it under 3 GB), so the device
+        /// preload was skipped and the host copy retained. Consumers must serve
+        /// this weight through their host-gather/dequant fallback instead of
+        /// device-side lookups keyed by <see cref="CacheKey"/>.
+        /// </summary>
+        public bool DevicePreloadTooLarge { get; private set; }
+
         public QuantizedWeight(byte[] raw, int ggmlType, long ne0, long ne1)
         {
             GgmlType = ggmlType;
@@ -166,10 +176,35 @@ namespace TensorSharp.Models
             if (_ownsCacheKeyHandle)
                 return CacheKey;
 
+            // Once flagged too-large the cache key must stay the host data
+            // pointer: no device-resident entry exists for this weight, and a
+            // native cache miss on an opaque GCHandle key would dereference it
+            // as if it were weight bytes.
+            if (DevicePreloadTooLarge)
+                return CacheKey;
+
             _cacheKeyHandle = GCHandle.Alloc(this, GCHandleType.Normal);
             CacheKey = GCHandle.ToIntPtr(_cacheKeyHandle);
             _ownsCacheKeyHandle = true;
             return CacheKey;
+        }
+
+        /// <summary>
+        /// Record that the device preload was skipped because this weight exceeds
+        /// the device's single-buffer size limit. Frees any GCHandle-based device
+        /// cache key and restores <see cref="CacheKey"/> to the host data pointer,
+        /// so a native call that still receives the key resolves through the
+        /// host-pointer path instead of dereferencing an opaque GCHandle.
+        /// </summary>
+        public void MarkDevicePreloadTooLarge()
+        {
+            DevicePreloadTooLarge = true;
+            if (_ownsCacheKeyHandle)
+            {
+                _cacheKeyHandle.Free();
+                _ownsCacheKeyHandle = false;
+            }
+            CacheKey = _data;
         }
 
         public void ReleaseHostData()
@@ -1074,7 +1109,18 @@ namespace TensorSharp.Models
                     continue;
 
                 IntPtr cacheKey = qw.EnsureDeviceCacheKey();
-                GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                if (!GgmlBasicOps.PreloadQuantizedWeight(cacheKey, qw.Data, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes))
+                {
+                    // The device cannot hold this weight in a single backend buffer
+                    // (e.g. ggml-vulkan's per-buffer maxBufferSize cap; WSL's dzn
+                    // Vulkan layer caps it under 3 GB, below Gemma E4B's ~2.9 GB
+                    // Q8_0 per_layer_token_embd). Keep the host copy and let the
+                    // model's host-gather fallbacks serve it.
+                    qw.MarkDevicePreloadTooLarge();
+                    Console.WriteLine(
+                        $"  {weightName}: {qw.RawBytes / 1024 / 1024} MB exceeds the {_backend} device's single-buffer limit; keeping host copy (device lookups fall back to host).");
+                    continue;
+                }
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
 
@@ -1634,8 +1680,9 @@ namespace TensorSharp.Models
 
                     // A direct host dequant is faster for single-token decode, and it is
                     // also the compatibility path for CUDA quant types whose get_rows
-                    // kernel is not implemented upstream.
-                    if ((tokens.Length == 1 || !canUseGgmlLookup) && qw.HasHostData)
+                    // kernel is not implemented upstream, and for a table too large to
+                    // be device-resident (DevicePreloadTooLarge).
+                    if ((tokens.Length == 1 || !canUseGgmlLookup || qw.DevicePreloadTooLarge) && qw.HasHostData)
                     {
                         var result = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
                         PopulateQuantizedRows(result, qw, tokens);

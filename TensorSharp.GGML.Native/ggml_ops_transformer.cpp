@@ -1290,16 +1290,21 @@ namespace
         const int head_tile = (num_k_heads > 0) ? (num_v_heads / num_k_heads) : 1;
 
         static const bool fd_timing = std::getenv("TS_QWEN35_FD_TIMING") != nullptr;
-        // Persistent capturable decode graph: default ON; TS_QWEN35_FD_PERSIST=0 disables.
-        // Persist mode uses ggml_set_rows (KV write) + a CUDA-graph-captured replay,
-        // both of which are CUDA-only — set_rows SEGFAULTs in ggml_metal_op_set_rows
-        // and there is no Metal graph capture. So gate persist to CUDA; Metal runs
-        // the whole-model decode through the NON-persist path (cpy KV write + reused
-        // gallocr, every op — incl. ggml_gated_delta_net / ssm_conv / top_k — has a
-        // Metal kernel in ggml v0.15.3). Exact analogue of the dense Gemma4 decode's
-        // `can_persist = g4_persist && g_backend_type == BACKEND_TYPE_CUDA`.
+        // Persistent decode graph: default ON; TS_QWEN35_FD_PERSIST=0 disables.
+        // Persist mode uses ggml_set_rows (KV write) + a fixed-topology graph that is
+        // built once and REPLAYED each token (upload 4 dynamic inputs + graph_compute,
+        // no per-token graph rebuild / backend-buffer alloc+free / weight re-upload).
+        //   - CUDA: the static graph additionally lets ggml-cuda capture+replay a CUDA
+        //     graph (cuts per-node launch latency).
+        //   - Vulkan: no graph capture, but the replay still skips the ~120ms/token
+        //     non-persist rebuild churn (fresh vkAllocateMemory + re-record of 4200+
+        //     nodes + 176 norm-weight re-uploads every token). set_rows has a Vulkan
+        //     kernel in ggml v0.15.3 (unlike Metal, where ggml_metal_op_set_rows
+        //     SEGFAULTs — Metal stays on the non-persist cpy path).
+        // Exact analogue of the dense Gemma4 decode's persist gate.
         static const bool persist_cfg = []{ const char* e = std::getenv("TS_QWEN35_FD_PERSIST"); return e == nullptr || e[0] != '0'; }();
-        const bool persist = persist_cfg && g_backend_type == BACKEND_TYPE_CUDA;
+        const bool persist = persist_cfg &&
+            (g_backend_type == BACKEND_TYPE_CUDA || g_backend_type == BACKEND_TYPE_VULKAN);
         // Persist mode pads the attention window to a fixed stride so the graph is
         // identical token-to-token (CUDA-graph capture); the F16 mask zeroes valid
         // positions and -inf's the padding. Non-persist keeps the exact window.
@@ -1973,8 +1978,8 @@ namespace
         {
             auto t_end = std::chrono::high_resolution_clock::now();
             auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
-            fprintf(stderr, "[fd-timing] %s setup=%.1f compute=%.1f download=%.1f total=%.1f ms (upload_list=%zu state_uploads=%d)\n",
-                persist ? "BUILD" : "", ms(t_start, t_setup), ms(t_setup, t_compute), ms(t_compute, t_end), ms(t_start, t_end), upload_list.size(), state_uploads);
+            fprintf(stderr, "[fd-timing] %s setup=%.1f compute=%.1f download=%.1f total=%.1f ms (upload_list=%zu state_uploads=%d nodes=%d)\n",
+                persist ? "BUILD" : "", ms(t_start, t_setup), ms(t_setup, t_compute), ms(t_compute, t_end), ms(t_start, t_end), upload_list.size(), state_uploads, ggml_graph_n_nodes(graph));
             fflush(stderr);
         }
         clear_last_error();

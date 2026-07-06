@@ -2260,6 +2260,20 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
         ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
         if (buffer == nullptr)
         {
+            // A ggml tensor must live in ONE backend buffer, and some devices cap
+            // a single buffer well below total VRAM (ggml-vulkan rejects anything
+            // above the driver's maxBufferSize; WSL's dzn layer caps it under
+            // 3 GB, which e.g. Gemma E4B's Q8_0 per_layer_token_embd exceeds).
+            // When the failed request is larger than the buffer type's advertised
+            // max size, report "too large to preload" (2) so the managed side
+            // keeps the host copy and serves the weight through its host-gather
+            // fallback instead of failing the whole model load. Failures at or
+            // below the advertised max stay hard errors (genuine OOM).
+            if (alloc_size > ggml_backend_buft_get_max_size(buft))
+            {
+                clear_last_error();
+                return 2;
+            }
             set_last_error("Failed to allocate GGML backend buffer for quantized weight preload.");
             return 0;
         }
