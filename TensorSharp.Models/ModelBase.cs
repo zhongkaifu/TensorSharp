@@ -3407,7 +3407,22 @@ namespace TensorSharp.Models
                 // gallocr on roomy GPUs); a larger value does NOT reliably help a
                 // near-full GPU because the legacy ForwardRefill warmup graph sizes
                 // the reused gallocr differently than the engine prefill graph.
-                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu;
+                // Integrated GPUs (unified-memory iGPUs: Intel UHD / AMD APU via
+                // ggml-vulkan, Tegra via ggml-cuda) are memory-bandwidth bound and
+                // run the fused multi-token prefill an order of magnitude slower than
+                // a discrete GPU. A 2048-token verify-prefill warmup there takes
+                // MINUTES (measured ~6+ min on Intel UHD with Qwen3.6-27B), during
+                // which the server prints "Startup model loaded" then appears hung
+                // before it ever starts listening. They also get no CUDA-graph
+                // capture benefit from the long warmup. Treat them like MLX/CPU: a
+                // short warmup that still primes the fused-verify graph once, cheaply.
+                bool integratedGpu = IsIntegratedGgmlGpu();
+                if (integratedGpu)
+                {
+                    Console.WriteLine(
+                        "  Integrated GPU detected: using a lightweight startup warmup (skipping the full multi-token prefill warmup, which is far too slow on unified-memory GPUs). Large prompts will still be slow here; use a discrete GPU (e.g. --gpu-device <dGPU index>) for full performance.");
+                }
+                bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu || integratedGpu;
                 // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
                 // fused verify chunk at the largest legacy-chunk shape: the shared
                 // reuse-gallocr is pre-grown (and its device memory first-touched)
@@ -3448,6 +3463,22 @@ namespace TensorSharp.Models
 
         public virtual void WarmUpMultimodalKernels()
         {
+        }
+
+        /// <summary>
+        /// True when the active GGML device (ggml_cuda / ggml_vulkan) is an
+        /// integrated, unified-memory GPU (Intel UHD / AMD APU / Tegra). Such
+        /// devices are memory-bandwidth bound and cannot afford the heavy
+        /// multi-token prefill warmup; startup warmup falls back to the short
+        /// conservative path for them. Only ggml backends are queried; every other
+        /// backend (and any query failure) reports false.
+        /// </summary>
+        private bool IsIntegratedGgmlGpu()
+        {
+            if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan)
+                return false;
+            try { return GgmlBasicOps.IsActiveDeviceIntegrated(); }
+            catch { return false; }
         }
 
         private static bool IsMlxKernelWarmupEnabled()

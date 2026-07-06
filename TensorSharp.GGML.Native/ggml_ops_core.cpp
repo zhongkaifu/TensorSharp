@@ -2150,6 +2150,22 @@ TSG_EXPORT int TSGgml_GetBackendMemory(int64_t* free_bytes, int64_t* total_bytes
     return 1;
 }
 
+// Returns 1 if the active backend's device is an integrated GPU (unified-memory
+// iGPU: Intel UHD / AMD APU via ggml-vulkan, Tegra via ggml-cuda), else 0. ggml
+// reports these as GGML_BACKEND_DEVICE_TYPE_IGPU (see ggml-vulkan device_type()).
+// The managed startup warmup uses this to skip the heavy multi-token prefill
+// warmup on memory-bandwidth-bound integrated GPUs, where a 2048-token fused
+// prefill takes minutes and makes the server look hung during initialization.
+TSG_EXPORT int TSGgml_IsActiveDeviceIntegrated()
+{
+    if (!ensure_backend() || g_backend == nullptr)
+        return 0;
+    ggml_backend_dev_t dev = ggml_backend_get_device(g_backend);
+    if (dev == nullptr)
+        return 0;
+    return get_device_static_props(dev).type == GGML_BACKEND_DEVICE_TYPE_IGPU ? 1 : 0;
+}
+
 // Toggle the lazy-sync code path on the per-op kernels. When enabled, ops that
 // wrote their result to host-mapped memory (zero-copy) on the Metal backend skip
 // the trailing ggml_backend_synchronize so the next op's command buffer can be

@@ -2154,6 +2154,9 @@ internal enum GgmlIndexReductionOp
         [DllImport(DllName, CallingConvention = CallingConventionType)]
         private static extern int TSGgml_GetBackendMemory(out long freeBytes, out long totalBytes);
 
+        [DllImport(DllName, CallingConvention = CallingConventionType)]
+        private static extern int TSGgml_IsActiveDeviceIntegrated();
+
         // Async dispatch (deferred ggml_backend_synchronize). When enabled, per-op
         // kernels return without waiting on the Metal command buffer; subsequent ops
         // chain through the Metal command queue, and host-side reads must call
@@ -3871,6 +3874,18 @@ internal enum GgmlIndexReductionOp
         /// so (total - free) is the bytes currently resident. Returns false if unavailable.</summary>
         public static bool TryGetBackendMemory(out long freeBytes, out long totalBytes)
             => TSGgml_GetBackendMemory(out freeBytes, out totalBytes) != 0;
+
+        /// <summary>True if the active GGML backend device is an integrated GPU
+        /// (unified-memory iGPU, e.g. Intel UHD / AMD APU via ggml-vulkan). Such
+        /// devices are memory-bandwidth bound; callers use this to skip heavy
+        /// startup warmup that would otherwise take minutes. Returns false when the
+        /// backend is unavailable or the query is not supported.</summary>
+        public static bool IsActiveDeviceIntegrated()
+        {
+            try { return TSGgml_IsActiveDeviceIntegrated() != 0; }
+            catch (EntryPointNotFoundException) { return false; }
+            catch (DllNotFoundException) { return false; }
+        }
 
         public static void SyncHostBuffer(IntPtr ptr, long byteCount)
         {
