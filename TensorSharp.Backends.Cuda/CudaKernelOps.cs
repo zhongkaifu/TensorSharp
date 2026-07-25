@@ -47,8 +47,70 @@ namespace TensorSharp.Cuda
     internal static class CudaKernelOps
     {
         private const int DecodeAttentionPartitionSize = 512;
-        private const int DecodeAttentionPartitionThreshold = 2048;
+        // The group4 kernels map one WARP to a key row (vs the generic partition
+        // kernel's one THREAD per key), so they stay fully populated at much
+        // smaller partitions. Smaller partitions matter because Gemma-class
+        // models have very few KV heads (2): the grid is
+        // (kv_heads x partitions) and at 512-token partitions a 2048-token
+        // context ran on 8 CTAs of a 48-SM GPU.
+        private const int Group4DecodeAttentionPartitionSize = 128;
+        // Circular SWA ring (d=256): partition the physical ring so the window
+        // stops serializing behind num_kv_heads CTAs. 64-token partitions put a
+        // 512-token ring on 8 partitions x kv_heads CTAs.
+        private const int Group4RingPartitionSize = 64;
+        // Below this live window the single-block kernel's lower fixed overhead
+        // (no partial scratch + reduce pass) wins over partitioning.
+        private const int Group4RingPartitionMinTokens = 128;
+        // Keep the ring partition grid bounded if a model ever runs a large
+        // circular cache through this route.
+        private const int Group4RingMaxPartitions = 64;
+        // A/B-tunable because the crossover depends on head width, context and
+        // GPU SM count. The default preserves the established route; model
+        // benchmarks can lower it without recompiling.
         internal const int DecodeAttentionSingleBlockMaxTokens = 8192;
+        // The grouped d=512 kernel keeps four score rows plus four query rows
+        // in dynamic shared memory. At 2,048 tokens this is 40 KiB, below the
+        // portable 48-KiB per-block limit; larger contexts use partitioning
+        // even when the diagnostic threshold is raised.
+        private const int GqaDecodeGroup4D512SingleBlockMaxTokens = 2048;
+        private static readonly int DecodeAttentionPartitionThreshold =
+            Math.Min(
+                ReadPositiveEnvInt("TS_CUDA_DECODE_ATTN_PARTITION_THRESHOLD", 2048),
+                DecodeAttentionSingleBlockMaxTokens);
+
+        private static int ReadPositiveEnvInt(string name, int fallback)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            return !string.IsNullOrEmpty(value) && int.TryParse(value, out int parsed) && parsed > 0
+                ? parsed
+                : fallback;
+        }
+
+        internal static int GetGqaDecodeAttentionRouteTier(
+            bool keyIsHalf,
+            bool circular,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendLen,
+            int cacheSize,
+            int hasSinks)
+        {
+            int effectiveAttendLen = circular ? Math.Min(attendLen, cacheSize) : attendLen;
+            bool useGroup4D512 =
+                keyIsHalf &&
+                CudaKernels.GqaDecodeGroup4Enabled &&
+                !circular &&
+                hasSinks == 0 &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 512;
+            int partitionThreshold = useGroup4D512
+                ? Math.Min(
+                    DecodeAttentionPartitionThreshold,
+                    GqaDecodeGroup4D512SingleBlockMaxTokens)
+                : DecodeAttentionPartitionThreshold;
+            return effectiveAttendLen <= partitionThreshold ? 0 : 1;
+        }
 
         public static bool TryFill(Tensor result, float value)
         {
@@ -138,6 +200,71 @@ namespace TensorSharp.Cuda
                 return false;
 
             long innerBytes = checked(dtype.ByteLengthFor(innerElems));
+
+            // Fold the innermost surviving loop dimension into the copy kernel's
+            // "rows" axis: one pitched 2D device copy per remaining outer group,
+            // instead of one cuMemcpyDtoDAsync per single row. For the dominant
+            // 2D NewContiguous/Narrow case (outerDims == 1) that is a SINGLE
+            // kernel launch covering every row — replacing what used to be
+            // thousands of driver submissions per prefill forward pass.
+            int rowDim = outerDims - 1;
+            long rowCount = resultSizes[rowDim];
+            bool pitchOk = dtype != DType.Q8_0
+                || ((srcStrides[rowDim] % 32) == 0 && (resultStrides[rowDim] % 32) == 0);
+
+            if (pitchOk)
+            {
+                long srcRowPitch = ElementOffsetToBytes(srcStrides[rowDim], dtype);
+                long dstRowPitch = ElementOffsetToBytes(resultStrides[rowDim], dtype);
+                int groupDims = rowDim; // host-looped dims are [0, rowDim)
+                long[] gcounter = groupDims > 0 ? new long[groupDims] : Array.Empty<long>();
+
+                while (true)
+                {
+                    long resultElemOffset = result.StorageOffset;
+                    long srcElemOffset = src.StorageOffset;
+                    for (int d = 0; d < groupDims; d++)
+                    {
+                        resultElemOffset = checked(resultElemOffset + gcounter[d] * resultStrides[d]);
+                        srcElemOffset = checked(srcElemOffset + gcounter[d] * srcStrides[d]);
+                    }
+
+                    long resultByteOffset = ElementOffsetToBytes(resultElemOffset, dtype);
+                    long srcByteOffset = ElementOffsetToBytes(srcElemOffset, dtype);
+
+                    bool copied = resultStorage.TryCopyDeviceFrom2D(
+                        srcStorage, resultByteOffset, srcByteOffset,
+                        rowCount, innerBytes, dstRowPitch, srcRowPitch);
+                    if (!copied)
+                    {
+                        // Cross-allocator storage pair: per-row driver copies.
+                        for (long r = 0; r < rowCount; r++)
+                            resultStorage.CopyDeviceFrom(
+                                srcStorage,
+                                resultByteOffset + r * dstRowPitch,
+                                srcByteOffset + r * srcRowPitch,
+                                innerBytes);
+                    }
+
+                    int dim = groupDims - 1;
+                    while (dim >= 0)
+                    {
+                        gcounter[dim]++;
+                        if (gcounter[dim] < resultSizes[dim])
+                            break;
+                        gcounter[dim] = 0;
+                        dim--;
+                    }
+
+                    if (dim < 0)
+                        break;
+                }
+
+                return true;
+            }
+
+            // Fallback: original one-row-per-driver-copy loop (Q8_0 with a
+            // non-block-aligned row stride, so a byte pitch can't be formed).
             long[] counter = outerDims > 0 ? new long[outerDims] : Array.Empty<long>();
 
             while (true)
@@ -931,7 +1058,184 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            if (keyIsHalf)
+            bool useGroup4D256 =
+                CudaKernels.GqaPrefillGroup4Enabled &&
+                CudaKernels.GqaPrefillWarpCooperativeEnabled &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 256 &&
+                seqLen >= 32 &&
+                windowSize > 0 &&
+                windowSize <= 512 &&
+                (long)maskStart + seqLen <= kvLen;
+            bool useGroup4D512 =
+                CudaKernels.GqaPrefillGroup4Enabled &&
+                CudaKernels.GqaPrefillWarpCooperativeEnabled &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 512 &&
+                seqLen >= 128 &&
+                kvLen <= 2048 &&
+                windowSize == 0 &&
+                (long)maskStart + seqLen <= kvLen;
+            bool useGroup4OnlineD512 =
+                CudaKernels.GqaPrefillGroup4Enabled &&
+                CudaKernels.GqaPrefillWarpCooperativeEnabled &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 512 &&
+                kvLen > 2048 &&
+                kvLen <= 8192 &&
+                windowSize == 0 &&
+                (long)maskStart + seqLen <= kvLen;
+            // Flash-style tiled kernel: same routing eligibility as the two-pass
+            // group4 kernels it replaces (both f16 and f32 K/V), but the Q tile
+            // is staged once and K/V traffic is amortized across 16-32 score
+            // rows per CTA.
+            if (CudaKernels.GqaPrefillFlashEnabled &&
+                (useGroup4D256 || useGroup4D512 || useGroup4OnlineD512))
+            {
+                // flash2 = flash1 with a larger K chunk (fewer sync rounds); same
+                // f32 math, so it serves both cache dtypes.
+                if (CudaKernels.GqaPrefillFlash2Enabled && kernels.Flash2Supports(headDim))
+                {
+                    kernels.LaunchGqaPrefillFlash2Group4(
+                        queryPtr, keyPtr, valuePtr, IntPtr.Zero, resultPtr,
+                        numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
+                        scale, kStride, hasSinks: 0, keyIsHalf, allocator.Stream.Handle);
+                    resultStorage.MarkDeviceModified();
+                    return true;
+                }
+                kernels.LaunchGqaPrefillFlashGroup4(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    IntPtr.Zero,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    kStride,
+                    hasSinks: 0,
+                    keyIsHalf,
+                    allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+            if (useGroup4OnlineD512)
+            {
+                if (keyIsHalf)
+                {
+                    kernels.LaunchGqaPrefillAttentionGroup4OnlineD512F16(
+                        queryPtr,
+                        keyPtr,
+                        valuePtr,
+                        resultPtr,
+                        numQHeads,
+                        numKVHeads,
+                        seqLen,
+                        kvLen,
+                        headDim,
+                        maskStart,
+                        windowSize,
+                        scale,
+                        kStride,
+                        allocator.Stream.Handle);
+                }
+                else
+                {
+                    kernels.LaunchGqaPrefillAttentionGroup4OnlineD512F32(
+                        queryPtr,
+                        keyPtr,
+                        valuePtr,
+                        resultPtr,
+                        numQHeads,
+                        numKVHeads,
+                        seqLen,
+                        kvLen,
+                        headDim,
+                        maskStart,
+                        windowSize,
+                        scale,
+                        kStride,
+                        allocator.Stream.Handle);
+                }
+            }
+            else if (useGroup4D512 && keyIsHalf)
+            {
+                kernels.LaunchGqaPrefillAttentionGroup4D512F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    kStride,
+                    allocator.Stream.Handle);
+            }
+            else if (useGroup4D512)
+            {
+                kernels.LaunchGqaPrefillAttentionGroup4D512F32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    kStride,
+                    allocator.Stream.Handle);
+            }
+            else if (useGroup4D256 && keyIsHalf)
+            {
+                kernels.LaunchGqaPrefillAttentionGroup4D256F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    kStride,
+                    allocator.Stream.Handle);
+            }
+            else if (useGroup4D256)
+            {
+                kernels.LaunchGqaPrefillAttentionGroup4D256F32(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    kStride,
+                    allocator.Stream.Handle);
+            }
+            else if (keyIsHalf)
             {
                 kernels.LaunchGqaPrefillAttentionF16(
                     queryPtr,
@@ -1048,6 +1352,49 @@ namespace TensorSharp.Cuda
             valueStorage.EnsureDeviceCurrent();
             sinksStorage?.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
+            // Flash-style tiled kernel for the 4-queries-per-KV-head layouts
+            // (Qwen 3.5 full attention: 16q/4kv, d=256, no window). The
+            // one-CTA-per-(q_head, position) sinks kernels walk the whole
+            // visible K/V serially per query (~38 ms per 2k-token layer);
+            // the flash tile amortizes K/V across 32 score rows.
+            if (CudaKernels.GqaPrefillFlashEnabled &&
+                CudaKernels.GqaPrefillGroup4Enabled &&
+                numQHeads == numKVHeads * 4 &&
+                (headDim == 256 || headDim == 512) &&
+                seqLen >= 16 &&
+                (long)maskStart + seqLen <= kvLen)
+            {
+                // flash2 = flash1 with a larger K chunk (fewer sync rounds).
+                if (CudaKernels.GqaPrefillFlash2Enabled && kernels.Flash2Supports(headDim))
+                {
+                    kernels.LaunchGqaPrefillFlash2Group4(
+                        queryPtr, keyPtr, valuePtr, sinksPtr, resultPtr,
+                        numQHeads, numKVHeads, seqLen, kvLen, headDim, maskStart, windowSize,
+                        scale, cacheSize, hasSinks, keyIsHalf, allocator.Stream.Handle);
+                    resultStorage.MarkDeviceModified();
+                    return true;
+                }
+                kernels.LaunchGqaPrefillFlashGroup4(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    resultPtr,
+                    numQHeads,
+                    numKVHeads,
+                    seqLen,
+                    kvLen,
+                    headDim,
+                    maskStart,
+                    windowSize,
+                    scale,
+                    cacheSize,
+                    hasSinks,
+                    keyIsHalf,
+                    allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
             if (keyIsHalf)
             {
                 kernels.LaunchGqaPrefillAttentionSinksF16(
@@ -1148,7 +1495,13 @@ namespace TensorSharp.Cuda
             keyStorage.EnsureDeviceCurrent();
             valueStorage.EnsureDeviceCurrent();
             allocator.Context.MakeCurrent();
-            IntPtr dyn = CudaDecodeDynParams.ActiveDevicePtr;
+            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator);
+            bool useGroup4D512 =
+                keyIsHalf &&
+                CudaKernels.GqaDecodeGroup4Enabled &&
+                !circular &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 512;
             if (TryLaunchPartitionedGqaDecodeAttention(
                     kernels,
                     allocator,
@@ -1184,11 +1537,59 @@ namespace TensorSharp.Cuda
             int smemTokens = 0;
             if (dyn != IntPtr.Zero)
             {
-                smemTokens = Math.Min(DecodeAttentionPartitionThreshold, cacheSize);
-                CudaDecodeDynParams.LimitCaptureAttendLen(smemTokens);
+                int captureTokenLimit = useGroup4D512
+                    ? Math.Min(
+                        DecodeAttentionPartitionThreshold,
+                        GqaDecodeGroup4D512SingleBlockMaxTokens)
+                    : DecodeAttentionPartitionThreshold;
+                int availableCacheTokens = circular
+                    ? cacheSize
+                    : cacheSize - attendStart;
+                smemTokens = Math.Min(captureTokenLimit, availableCacheTokens);
+                // A circular cache no larger than this single-block allocation
+                // clamps safely forever. A larger window must expire at the
+                // partition threshold and recapture on the partitioned route.
+                if (!circular || cacheSize > captureTokenLimit)
+                    CudaDecodeDynParams.LimitCaptureAttendLen(smemTokens);
             }
 
-            if (keyIsHalf)
+            if (keyIsHalf &&
+                CudaKernels.GqaDecodeGroup4Enabled &&
+                circular &&
+                (attendLen >= cacheSize || attendStart == 0) &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 256)
+            {
+                kernels.LaunchGqaDecodeAttentionGroup4D256F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numKVHeads,
+                    attendLen,
+                    cacheSize,
+                    scale,
+                    allocator.Stream.Handle,
+                    dyn,
+                    smemTokens);
+            }
+            else if (useGroup4D512)
+            {
+                kernels.LaunchGqaDecodeAttentionGroup4D512F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    resultPtr,
+                    numKVHeads,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    scale,
+                    allocator.Stream.Handle,
+                    dyn,
+                    smemTokens);
+            }
+            else if (keyIsHalf)
             {
                 kernels.LaunchGqaDecodeAttentionF16(
                     queryPtr,
@@ -1250,8 +1651,96 @@ namespace TensorSharp.Cuda
             bool keyIsHalf,
             IntPtr dyn = default)
         {
-            if (attendLen <= DecodeAttentionPartitionThreshold)
+            // A circular SWA cache never attends more than its physical
+            // capacity. Do not route it through the partition+reduce path just
+            // because the model's logical sequence length has grown large.
+            bool useGroup4D512 =
+                keyIsHalf &&
+                CudaKernels.GqaDecodeGroup4Enabled &&
+                !circular &&
+                hasSinks == 0 &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 512;
+            // d=256 grouped decode attention, partitioned. Covers BOTH the
+            // circular SWA ring (Gemma local layers; softmax is invariant to
+            // the ring permutation) and the linear attend-from-0 case with
+            // optional attention sinks (Qwen 3.5 full-attention layers) -- the
+            // kernel walks physical positions [0, min(attend_len, cache_size))
+            // either way. Partitioning matters because these models have very
+            // few KV heads (2-4): the single-block kernels strand the GPU on
+            // that many CTAs. Under decode-graph capture (dyn present) this
+            // route is unconditional so ONE captured kernel sequence stays
+            // valid for every live length; uncaptured short windows keep the
+            // lower-overhead single-block kernels.
+            bool useGroup4D256Ring =
+                keyIsHalf &&
+                CudaKernels.GqaDecodeGroup4Enabled &&
+                numQHeads == numKVHeads * 4 &&
+                headDim == 256 &&
+                (circular
+                    ? hasSinks == 0 && (attendLen >= cacheSize || attendStart == 0)
+                    : attendStart == 0);
+            if (useGroup4D256Ring)
+            {
+                int ringLen = Math.Min(attendLen, cacheSize);
+                if (dyn == IntPtr.Zero && ringLen <= Group4RingPartitionMinTokens)
+                    return false;
+                int ringPartSize = Math.Max(
+                    Group4RingPartitionSize,
+                    (cacheSize + Group4RingMaxPartitions - 1) / Group4RingMaxPartitions);
+                ringPartSize = (ringPartSize + 31) & ~31;
+                int coveredLen = dyn != IntPtr.Zero ? cacheSize : ringLen;
+                int ringParts = (coveredLen + ringPartSize - 1) / ringPartSize;
+                using var ringPartial = new Tensor(
+                    allocator, DType.Float32, numQHeads, ringParts, headDim + 2);
+                if (!TryGetContiguousFloat(ringPartial, out _, out IntPtr ringPartialPtr, out _))
+                    return false;
+                kernels.LaunchGqaDecodeAttentionPartitionGroup4D256F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    sinksPtr,
+                    ringPartialPtr,
+                    numKVHeads,
+                    attendLen,
+                    cacheSize,
+                    scale,
+                    hasSinks,
+                    ringParts,
+                    ringPartSize,
+                    allocator.Stream.Handle,
+                    dyn);
+                kernels.LaunchGqaDecodeAttentionPartitionReduceF32(
+                    ringPartialPtr,
+                    resultPtr,
+                    numQHeads,
+                    headDim,
+                    ringParts,
+                    allocator.Stream.Handle);
+                return true;
+            }
+            if (GetGqaDecodeAttentionRouteTier(
+                    keyIsHalf,
+                    circular,
+                    numQHeads,
+                    numKVHeads,
+                    headDim,
+                    attendLen,
+                    cacheSize,
+                    hasSinks) == 0)
                 return false;
+
+            int partitionSize = useGroup4D512
+                ? Group4DecodeAttentionPartitionSize
+                : DecodeAttentionPartitionSize;
+            if (useGroup4D512 && dyn != IntPtr.Zero)
+            {
+                // Keep the capacity-sized capture grid bounded: empty partitions
+                // still write their partial rows and the reduce still reads them,
+                // so a huge KV capacity must not explode the partition count.
+                int minSize = (cacheSize + Group4RingMaxPartitions - 1) / Group4RingMaxPartitions;
+                partitionSize = Math.Max(partitionSize, (minSize + 31) & ~31);
+            }
 
             // Decode-graph capture: the partition grid and scratch are baked into
             // the graph, so size them for the cache CAPACITY and let the kernels
@@ -1259,13 +1748,30 @@ namespace TensorSharp.Cuda
             // live length write (max=-inf, sum=0) rows the reduce kernel skips,
             // which keeps the result bit-identical to the exact-partition launch.
             int numPartitions = dyn != IntPtr.Zero
-                ? (cacheSize + DecodeAttentionPartitionSize - 1) / DecodeAttentionPartitionSize
-                : (attendLen + DecodeAttentionPartitionSize - 1) / DecodeAttentionPartitionSize;
+                ? (cacheSize + partitionSize - 1) / partitionSize
+                : (attendLen + partitionSize - 1) / partitionSize;
             using var partial = new Tensor(allocator, DType.Float32, numQHeads, numPartitions, headDim + 2);
             if (!TryGetContiguousFloat(partial, out _, out IntPtr partialPtr, out _))
                 return false;
 
-            if (keyIsHalf)
+            if (useGroup4D512)
+            {
+                kernels.LaunchGqaDecodeAttentionPartitionGroup4D512F16(
+                    queryPtr,
+                    keyPtr,
+                    valuePtr,
+                    partialPtr,
+                    numKVHeads,
+                    attendStart,
+                    attendLen,
+                    cacheSize,
+                    scale,
+                    numPartitions,
+                    partitionSize,
+                    allocator.Stream.Handle,
+                    dyn);
+            }
+            else if (keyIsHalf)
             {
                 kernels.LaunchGqaDecodeAttentionPartitionF16(
                     queryPtr,
@@ -1283,7 +1789,7 @@ namespace TensorSharp.Cuda
                     scale,
                     hasSinks,
                     numPartitions,
-                    DecodeAttentionPartitionSize,
+                    partitionSize,
                     allocator.Stream.Handle,
                     dyn);
             }
@@ -1305,7 +1811,7 @@ namespace TensorSharp.Cuda
                     scale,
                     hasSinks,
                     numPartitions,
-                    DecodeAttentionPartitionSize,
+                    partitionSize,
                     allocator.Stream.Handle,
                     dyn);
             }
@@ -1451,7 +1957,9 @@ namespace TensorSharp.Cuda
             allocator.Context.MakeCurrent();
             // Decode-graph capture: the single-token append re-reads its write
             // position from the dyn block on every replay.
-            IntPtr dyn = seqLen == 1 && !circular ? CudaDecodeDynParams.ActiveDevicePtr : IntPtr.Zero;
+            IntPtr dyn = seqLen == 1
+                ? CudaDecodeDynParams.GetActiveDevicePtr(allocator)
+                : IntPtr.Zero;
             if (cacheIsHalf)
             {
                 kernels.LaunchCopyHeadFirstToCacheF16(
@@ -1531,6 +2039,105 @@ namespace TensorSharp.Cuda
                     cacheSize,
                     allocator.Stream.Handle);
             }
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryExpandKvHeads(Tensor result, Tensor cache, int groupSize, int seqLen)
+        {
+            if (!TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
+                !TryGetContiguousFloatOrHalf(cache, out CudaStorage cacheStorage, out IntPtr cachePtr, out _, out bool cacheIsHalf) ||
+                result.DimensionCount != 3 ||
+                cache.DimensionCount != 3 ||
+                groupSize <= 0 ||
+                seqLen <= 0 ||
+                seqLen > cache.Sizes[1] ||
+                result.Sizes[0] != cache.Sizes[0] * groupSize ||
+                result.Sizes[1] != seqLen ||
+                result.Sizes[2] != cache.Sizes[2] ||
+                resultCount != result.Sizes[0] * seqLen * result.Sizes[2])
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!ReferenceEquals(allocator, cacheStorage.AllocatorImpl) ||
+                !TryGetKernels(allocator, out CudaKernels kernels))
+            {
+                return false;
+            }
+
+            cacheStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchExpandKvHeads(
+                cachePtr,
+                resultPtr,
+                checked((int)cache.Sizes[0]),
+                seqLen,
+                checked((int)cache.Sizes[1]),
+                checked((int)cache.Sizes[2]),
+                groupSize,
+                cacheIsHalf,
+                allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryRepeatInterleave(Tensor result, Tensor src, int repeats, int dim)
+        {
+            if (result == null || src == null ||
+                result.Storage is not CudaStorage resultStorage ||
+                src.Storage is not CudaStorage srcStorage ||
+                result.ElementType != src.ElementType ||
+                (src.ElementType != DType.Float32 && src.ElementType != DType.Float16) ||
+                !result.IsContiguous() ||
+                !src.IsContiguous() ||
+                repeats <= 0 ||
+                dim < 0 ||
+                dim >= src.DimensionCount ||
+                result.DimensionCount != src.DimensionCount)
+            {
+                return false;
+            }
+
+            long outer = 1;
+            long inner = 1;
+            for (int d = 0; d < src.DimensionCount; d++)
+            {
+                long expected = src.Sizes[d] * (d == dim ? repeats : 1);
+                if (result.Sizes[d] != expected)
+                    return false;
+                if (d < dim)
+                    outer = checked(outer * src.Sizes[d]);
+                else if (d > dim)
+                    inner = checked(inner * src.Sizes[d]);
+            }
+
+            long total = checked(outer * src.Sizes[dim] * repeats * inner);
+            if (outer > int.MaxValue || inner > int.MaxValue ||
+                src.Sizes[dim] > int.MaxValue || total > int.MaxValue)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!ReferenceEquals(allocator, srcStorage.AllocatorImpl) ||
+                !TryGetKernels(allocator, out CudaKernels kernels))
+            {
+                return false;
+            }
+
+            srcStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchRepeatInterleave(
+                srcStorage.DevicePtrAtElement(src.StorageOffset),
+                resultStorage.DevicePtrAtElement(result.StorageOffset),
+                (int)outer,
+                checked((int)src.Sizes[dim]),
+                repeats,
+                (int)inner,
+                src.ElementType == DType.Float16,
+                allocator.Stream.Handle);
             resultStorage.MarkDeviceModified();
             return true;
         }
@@ -1688,6 +2295,70 @@ namespace TensorSharp.Cuda
                 ropeHalf,
                 allocator.Stream.Handle);
             dataStorage.MarkDeviceModified();
+            return true;
+        }
+
+        public static bool TryFillNeoXRopeTablesDynamic(
+            Tensor localCos,
+            Tensor localSin,
+            Tensor localFrequencies,
+            Tensor globalCos,
+            Tensor globalSin,
+            Tensor globalFrequencies)
+        {
+            if (!TryGetContiguousFloat(localCos, out CudaStorage localCosStorage, out IntPtr localCosPtr, out int localCosCount) ||
+                !TryGetContiguousFloat(localSin, out CudaStorage localSinStorage, out IntPtr localSinPtr, out int localSinCount) ||
+                !TryGetContiguousFloat(localFrequencies, out CudaStorage localFreqStorage, out IntPtr localFreqPtr, out int localFreqCount) ||
+                !TryGetContiguousFloat(globalCos, out CudaStorage globalCosStorage, out IntPtr globalCosPtr, out int globalCosCount) ||
+                !TryGetContiguousFloat(globalSin, out CudaStorage globalSinStorage, out IntPtr globalSinPtr, out int globalSinCount) ||
+                !TryGetContiguousFloat(globalFrequencies, out CudaStorage globalFreqStorage, out IntPtr globalFreqPtr, out int globalFreqCount) ||
+                localCosCount <= 0 ||
+                localSinCount != localCosCount ||
+                localFreqCount != localCosCount ||
+                globalCosCount <= 0 ||
+                globalSinCount != globalCosCount ||
+                globalFreqCount != globalCosCount)
+            {
+                return false;
+            }
+
+            CudaAllocator allocator = localCosStorage.AllocatorImpl;
+            if (!ReferenceEquals(localSinStorage.AllocatorImpl, allocator) ||
+                !ReferenceEquals(localFreqStorage.AllocatorImpl, allocator) ||
+                !ReferenceEquals(globalCosStorage.AllocatorImpl, allocator) ||
+                !ReferenceEquals(globalSinStorage.AllocatorImpl, allocator) ||
+                !ReferenceEquals(globalFreqStorage.AllocatorImpl, allocator))
+            {
+                return false;
+            }
+            IntPtr dyn = CudaDecodeDynParams.GetActiveDevicePtr(allocator);
+            if (dyn == IntPtr.Zero)
+                return false;
+            if (!TryGetKernels(allocator, out CudaKernels kernels))
+                return false;
+
+            localCosStorage.EnsureDeviceCurrent();
+            localSinStorage.EnsureDeviceCurrent();
+            localFreqStorage.EnsureDeviceCurrent();
+            globalCosStorage.EnsureDeviceCurrent();
+            globalSinStorage.EnsureDeviceCurrent();
+            globalFreqStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchFillNeoXRopeTablesDynamicF32(
+                localCosPtr,
+                localSinPtr,
+                localFreqPtr,
+                localCosCount,
+                globalCosPtr,
+                globalSinPtr,
+                globalFreqPtr,
+                globalCosCount,
+                dyn,
+                allocator.Stream.Handle);
+            localCosStorage.MarkDeviceModified();
+            localSinStorage.MarkDeviceModified();
+            globalCosStorage.MarkDeviceModified();
+            globalSinStorage.MarkDeviceModified();
             return true;
         }
 
@@ -2000,7 +2671,9 @@ namespace TensorSharp.Cuda
             // Decode-graph capture: the single-token step re-reads the conv ring
             // write index from the dyn block on every replay (it advances mod
             // convDim each token).
-            IntPtr dyn = seqLen == 1 ? CudaDecodeDynParams.ActiveDevicePtr : IntPtr.Zero;
+            IntPtr dyn = seqLen == 1
+                ? CudaDecodeDynParams.GetActiveDevicePtr(allocator)
+                : IntPtr.Zero;
             kernels.LaunchQwen35GatedDeltaNetPackedF32(
                 packedPtr,
                 convStatePtr,

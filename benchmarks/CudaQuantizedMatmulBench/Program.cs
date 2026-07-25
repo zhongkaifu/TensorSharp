@@ -14,6 +14,9 @@ if (!CudaBackend.IsAvailable())
 
 int iterations = GetArg("--iterations", 30);
 int warmup = GetArg("--warmup", 5);
+bool f16PrefillOnly = HasArg("--f16-prefill");
+bool q8PrefillOnly = HasArg("--q8-prefill");
+bool gqaDecodeGroup4Only = HasArg("--gqa-decode-group4");
 var cases = new[]
 {
     new BenchCase("decode-q8_0-4096x4096-r1", 1, 4096, 4096),
@@ -22,6 +25,46 @@ var cases = new[]
 
 using var allocator = new CudaAllocator();
 Console.WriteLine($"CUDA quantized matmul benchmark, iterations={iterations}, warmup={warmup}");
+
+if (f16PrefillOnly)
+{
+    RunF16PrefillCase(
+        allocator,
+        new BenchCase(
+            "prefill-f16-q8_0",
+            GetArg("--rows", 1024),
+            GetArg("--in-dim", 2560),
+            GetArg("--out-dim", 10240)),
+        warmup,
+        iterations,
+        forceF16: true);
+    return 0;
+}
+
+if (q8PrefillOnly)
+{
+    RunF16PrefillCase(
+        allocator,
+        new BenchCase(
+            "prefill-q8_0",
+            GetArg("--rows", 1024),
+            GetArg("--in-dim", 2560),
+            GetArg("--out-dim", 10240)),
+        warmup,
+        iterations,
+        forceF16: false);
+    return 0;
+}
+
+if (gqaDecodeGroup4Only)
+{
+    RunGqaGlobalGroup4DecodeCase(
+        allocator,
+        GetArg("--ctx", 2304),
+        warmup,
+        iterations);
+    return 0;
+}
 
 foreach (BenchCase bench in cases)
 {
@@ -37,6 +80,83 @@ RunElementwiseCase(allocator, warmup, iterations);
 RunFusedElementwiseCase(allocator, warmup, iterations);
 
 return 0;
+
+static void RunF16PrefillCase(
+    CudaAllocator allocator,
+    BenchCase bench,
+    int warmup,
+    int iterations,
+    bool forceF16)
+{
+    byte[] weights = CreateQ8_0Rows(bench.OutDim, bench.InDim);
+    float[,] inputValues = CreateInput(bench.Rows, bench.InDim);
+    IntPtr hostWeights = Marshal.AllocHGlobal(weights.Length);
+    bool savedMmq = CudaQuantizedOps.Q80MmqEnabled;
+
+    try
+    {
+        Marshal.Copy(weights, 0, hostWeights, weights.Length);
+        using var input = Tensor.FromArray(allocator, inputValues);
+        using var output = new Tensor(allocator, DType.Float32, bench.Rows, bench.OutDim);
+
+        // Pin RunF16Gemm for --f16-prefill even when a caller supplies a row
+        // count below the normal Q8 MMQ crossover. --q8-prefill leaves the
+        // production dispatcher intact so TS_CUDA_Q80_MMQ_MAX_ROWS can be swept.
+        if (forceF16)
+            CudaQuantizedOps.Q80MmqEnabled = false;
+        for (int i = 0; i < warmup; i++)
+        {
+            if (!CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output,
+                    input,
+                    hostWeights,
+                    hostWeights,
+                    GgmlTypeQ8_0,
+                    bench.InDim,
+                    bench.OutDim,
+                    weights.Length))
+            {
+                throw new InvalidOperationException("CUDA F16 prefill matmul dispatch failed.");
+            }
+        }
+        allocator.Synchronize();
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < iterations; i++)
+        {
+            CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                output,
+                input,
+                hostWeights,
+                hostWeights,
+                GgmlTypeQ8_0,
+                bench.InDim,
+                bench.OutDim,
+                weights.Length);
+        }
+        allocator.Synchronize();
+        sw.Stop();
+
+        float first = output.GetElementsAsFloat(1)[0];
+        double ms = sw.Elapsed.TotalMilliseconds / iterations;
+        double gflops =
+            (2.0 * bench.Rows * bench.InDim * bench.OutDim) / (ms * 1.0e6);
+        string implementation = forceF16
+            ? CudaQuantizedOps.Q80F16DequantEnabled
+                ? "f16-q8-specialized"
+                : "f16-legacy-generic"
+            : "auto-dispatch";
+        Console.WriteLine(
+            $"{bench.Name}-{bench.InDim}x{bench.OutDim}-r{bench.Rows}-{implementation}: " +
+            $"{ms:F3} ms/op, {gflops:F1} GFLOP/s, first={first:G9}");
+    }
+    finally
+    {
+        CudaQuantizedOps.Q80MmqEnabled = savedMmq;
+        CudaQuantizedOps.ReleaseQuantizedWeight(allocator, hostWeights);
+        Marshal.FreeHGlobal(hostWeights);
+    }
+}
 
 static void RunCase(CudaAllocator allocator, BenchCase bench, int warmup, int iterations)
 {
@@ -197,6 +317,12 @@ static int GetArg(string name, int defaultValue)
     }
 
     return defaultValue;
+}
+
+static bool HasArg(string name)
+{
+    return Environment.GetCommandLineArgs().Any(
+        arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
 }
 
 static byte[] CreateQ8_0Rows(int rows, int cols)
@@ -464,8 +590,87 @@ static void RunScaledDotProductAttentionCase(CudaAllocator allocator, int warmup
 
 static void RunGqaAttentionCases(CudaAllocator allocator, int warmup, int iterations)
 {
+    RunGqaLocalGroup4PrefillCase(allocator, warmup, iterations);
     RunGqaPrefillCase(allocator, warmup, iterations);
     RunGqaDecodeCase(allocator, warmup, iterations);
+}
+
+static void RunGqaLocalGroup4PrefillCase(CudaAllocator allocator, int warmup, int iterations)
+{
+    const int numQHeads = 8;
+    const int numKVHeads = 2;
+    const int headDim = 256;
+    const int seqLen = 128;
+    const int windowSize = 512;
+    const int kvLen = windowSize + seqLen;
+    const int cacheSize = 768;
+    const int maskStart = kvLen - seqLen;
+    float scale = 1.0f / MathF.Sqrt(headDim);
+
+    using var query = new Tensor(allocator, DType.Float32, numQHeads, seqLen, headDim);
+    using var keyF32 = new Tensor(allocator, DType.Float32, numKVHeads, kvLen, headDim);
+    using var valueF32 = new Tensor(allocator, DType.Float32, numKVHeads, kvLen, headDim);
+    FillTensor(query, 0.00031f, 0.01f);
+    FillTensor(keyF32, -0.00019f, -0.02f);
+    FillTensor(valueF32, 0.00023f, 0.03f);
+
+    using var keyF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+    using var valueF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+    if (!CudaFusedOps.TryCopyHeadFirstToCache(
+            keyF16, keyF32, 0, kvLen, cacheSize, circular: false) ||
+        !CudaFusedOps.TryCopyHeadFirstToCache(
+            valueF16, valueF32, 0, kvLen, cacheSize, circular: false))
+    {
+        throw new InvalidOperationException("CUDA local GQA prefill cache conversion failed.");
+    }
+
+    using var output = new Tensor(allocator, DType.Float32, seqLen, numQHeads * headDim);
+    bool ok = CudaFusedOps.TryGqaPrefillAttention(
+        output, query, keyF16, valueF16,
+        numQHeads, numKVHeads, headDim, seqLen, kvLen,
+        maskStart, windowSize, scale, kvStride: cacheSize);
+    if (!ok)
+        throw new InvalidOperationException("CUDA local group-4 GQA prefill dispatch failed.");
+
+    allocator.Synchronize();
+    int prefixLength = Math.Min(256, (int)output.ElementCount());
+    float[] actualPrefix = output.GetElementsAsFloat(prefixLength);
+    float[] expectedPrefix = GqaPrefillAttentionPrefix(
+        query.GetElementsAsFloat((int)query.ElementCount()),
+        keyF32.GetElementsAsFloat((int)keyF32.ElementCount()),
+        valueF32.GetElementsAsFloat((int)valueF32.ElementCount()),
+        null,
+        numQHeads, numKVHeads, headDim, seqLen, kvLen, kvLen,
+        maskStart, windowSize, scale, prefixLength);
+    float maxAbsDiff = MaxAbsDiff(expectedPrefix, actualPrefix);
+
+    for (int i = 0; i < warmup; i++)
+    {
+        CudaFusedOps.TryGqaPrefillAttention(
+            output, query, keyF16, valueF16,
+            numQHeads, numKVHeads, headDim, seqLen, kvLen,
+            maskStart, windowSize, scale, kvStride: cacheSize);
+    }
+    allocator.Synchronize();
+
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < iterations; i++)
+    {
+        CudaFusedOps.TryGqaPrefillAttention(
+            output, query, keyF16, valueF16,
+            numQHeads, numKVHeads, headDim, seqLen, kvLen,
+            maskStart, windowSize, scale, kvStride: cacheSize);
+    }
+    allocator.Synchronize();
+    sw.Stop();
+
+    double ms = sw.Elapsed.TotalMilliseconds / iterations;
+    double flops = 4.0 * numQHeads * seqLen * windowSize * headDim;
+    double gflops = flops / (ms * 1.0e6);
+    Console.WriteLine(
+        $"gqa-prefill-local-group4-f16kv-h{numQHeads}/{numKVHeads}" +
+        $"-s{seqLen}x{kvLen}-w{windowSize}-d{headDim}: {ms:F3} ms/op, " +
+        $"approx {gflops:F1} GFLOP/s, prefix_max_abs_diff={maxAbsDiff:G6}");
 }
 
 static void RunGqaPrefillCase(CudaAllocator allocator, int warmup, int iterations)
@@ -605,6 +810,77 @@ static void RunGqaDecodeCase(CudaAllocator allocator, int warmup, int iterations
     double valueFlops = 2.0 * numQHeads * attendLen * headDim;
     double gflops = (scoreFlops + valueFlops) / (ms * 1.0e6);
     Console.WriteLine($"gqa-decode-sinks-f16kv-h{numQHeads}/{numKVHeads}-ctx{attendLen}-d{headDim}: {ms:F3} ms/op, approx {gflops:F1} GFLOP/s, max_abs_diff={maxAbsDiff:G6}");
+}
+
+static void RunGqaGlobalGroup4DecodeCase(
+    CudaAllocator allocator, int attendLen, int warmup, int iterations)
+{
+    const int numQHeads = 8;
+    const int numKVHeads = 2;
+    const int headDim = 512;
+    int cacheSize = Math.Max(attendLen, 4096);
+    float scale = 1.0f / MathF.Sqrt(headDim);
+
+    using var query = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+    using var keyF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+    using var valueF32 = new Tensor(allocator, DType.Float32, numKVHeads, cacheSize, headDim);
+    FillTensor(query, 0.00017f, 0.01f);
+    FillTensor(keyF32, -0.000021f, -0.02f);
+    FillTensor(valueF32, 0.000027f, 0.03f);
+
+    using var keyF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+    using var valueF16 = new Tensor(allocator, DType.Float16, numKVHeads, cacheSize, headDim);
+    if (!CudaFusedOps.TryCopyHeadFirstToCache(
+            keyF16, keyF32, 0, cacheSize, cacheSize, circular: false) ||
+        !CudaFusedOps.TryCopyHeadFirstToCache(
+            valueF16, valueF32, 0, cacheSize, cacheSize, circular: false))
+    {
+        throw new InvalidOperationException("CUDA global group-4 GQA decode cache conversion failed.");
+    }
+
+    using var output = new Tensor(allocator, DType.Float32, 1, numQHeads * headDim);
+    bool ok = CudaFusedOps.TryGqaDecodeAttention(
+        output, query, keyF16, valueF16, numQHeads, numKVHeads, headDim,
+        attendStart: 0, attendLen, cacheSize, circular: false, scale);
+    if (!ok)
+        throw new InvalidOperationException("CUDA global group-4 GQA decode dispatch failed.");
+
+    allocator.Synchronize();
+    float[] expected = GqaDecodeAttentionReference(
+        query.GetElementsAsFloat(numQHeads * headDim),
+        keyF32.GetElementsAsFloat((int)keyF32.ElementCount()),
+        valueF32.GetElementsAsFloat((int)valueF32.ElementCount()),
+        null,
+        numQHeads, numKVHeads, headDim, 0, attendLen, cacheSize,
+        circular: false, scale);
+    float maxAbsDiff = MaxAbsDiff(
+        expected,
+        output.GetElementsAsFloat(numQHeads * headDim));
+
+    for (int i = 0; i < warmup; i++)
+    {
+        CudaFusedOps.TryGqaDecodeAttention(
+            output, query, keyF16, valueF16, numQHeads, numKVHeads, headDim,
+            attendStart: 0, attendLen, cacheSize, circular: false, scale);
+    }
+    allocator.Synchronize();
+
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < iterations; i++)
+    {
+        CudaFusedOps.TryGqaDecodeAttention(
+            output, query, keyF16, valueF16, numQHeads, numKVHeads, headDim,
+            attendStart: 0, attendLen, cacheSize, circular: false, scale);
+    }
+    allocator.Synchronize();
+    sw.Stop();
+
+    double ms = sw.Elapsed.TotalMilliseconds / iterations;
+    double flops = 4.0 * numQHeads * attendLen * headDim;
+    Console.WriteLine(
+        $"gqa-decode-global-group4-f16kv-h{numQHeads}/{numKVHeads}" +
+        $"-ctx{attendLen}-d{headDim}: {ms:F3} ms/op, " +
+        $"approx {flops / (ms * 1.0e6):F1} GFLOP/s, max_abs_diff={maxAbsDiff:G6}");
 }
 
 static void RunElementwiseCase(CudaAllocator allocator, int warmup, int iterations)
@@ -760,7 +1036,7 @@ static float[] GqaPrefillAttentionPrefix(
     float[] q,
     float[] k,
     float[] v,
-    float[] sinks,
+    float[]? sinks,
     int numQHeads,
     int numKVHeads,
     int headDim,
@@ -787,7 +1063,7 @@ static float[] GqaPrefillAttentionPrefix(
             int visible = Math.Min(maskStart + tq, kvLen - 1);
             int minVisible = windowSize > 0 ? Math.Max(0, visible - windowSize + 1) : 0;
             float[] scores = new float[kvLen];
-            float max = sinks[h];
+            float max = sinks != null ? sinks[h] : float.NegativeInfinity;
             for (int tk = minVisible; tk <= visible; tk++)
             {
                 float dot = 0;
@@ -797,7 +1073,7 @@ static float[] GqaPrefillAttentionPrefix(
                 max = MathF.Max(max, scores[tk]);
             }
 
-            float sum = MathF.Exp(sinks[h] - max);
+            float sum = sinks != null ? MathF.Exp(sinks[h] - max) : 0.0f;
             for (int tk = minVisible; tk <= visible; tk++)
             {
                 scores[tk] = MathF.Exp(scores[tk] - max);
@@ -822,7 +1098,7 @@ static float[] GqaDecodeAttentionReference(
     float[] q,
     float[] k,
     float[] v,
-    float[] sinks,
+    float[]? sinks,
     int numQHeads,
     int numKVHeads,
     int headDim,
@@ -839,7 +1115,7 @@ static float[] GqaDecodeAttentionReference(
     {
         int kvHead = h / groupSize;
         float[] scores = new float[attendLen];
-        float max = sinks[h];
+        float max = sinks != null ? sinks[h] : float.NegativeInfinity;
         for (int t = 0; t < attendLen; t++)
         {
             int logical = attendStart + t;
@@ -851,7 +1127,7 @@ static float[] GqaDecodeAttentionReference(
             max = MathF.Max(max, scores[t]);
         }
 
-        float sum = MathF.Exp(sinks[h] - max);
+        float sum = sinks != null ? MathF.Exp(sinks[h] - max) : 0.0f;
         for (int t = 0; t < attendLen; t++)
         {
             scores[t] = MathF.Exp(scores[t] - max);

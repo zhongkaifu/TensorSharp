@@ -57,12 +57,39 @@ public class ModelContextLengthTests
             Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
             Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 4096));
             Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
+            Assert.Equal(
+                8192,
+                ModelBase.ResolveInitialCacheAllocationLength(
+                    BackendType.Cuda,
+                    262144,
+                    gpuDefault: 8192,
+                    nativeCudaDefault: 8192));
             Assert.Equal(8192, ModelBase.ResolveInitialCacheAllocationLength(BackendType.GgmlCuda, 262144));
             Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cpu, 262144));
+
+            // Invalid values are ignored by context resolution and must not
+            // accidentally disable the GPU's safe initial-allocation cap.
+            Environment.SetEnvironmentVariable("MAX_CONTEXT", "invalid");
+            Assert.Equal(2048, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
 
             Environment.SetEnvironmentVariable("MAX_CONTEXT", "262144");
             Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Mlx, 262144));
             Assert.Equal(262144, ModelBase.ResolveInitialCacheAllocationLength(BackendType.Cuda, 262144));
+
+            Assert.Equal(
+                2049,
+                ModelBase.ResolvePrefillWarmupInputLength(
+                    targetLength: 2048,
+                    maxContextLength: 8192,
+                    tokenOverhead: 1,
+                    explicitLength: false));
+            Assert.Equal(
+                2048,
+                ModelBase.ResolvePrefillWarmupInputLength(
+                    targetLength: 2048,
+                    maxContextLength: 8192,
+                    tokenOverhead: 1,
+                    explicitLength: true));
         }
         finally
         {

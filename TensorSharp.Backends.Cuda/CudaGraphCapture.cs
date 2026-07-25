@@ -165,15 +165,33 @@ namespace TensorSharp.Cuda
         private IntPtr devicePtr;
         private IntPtr hostPtr;
 
-        /// <summary>Ambient device pointer read by the decode-path kernel
-        /// launchers while a decode-graph capture is running; IntPtr.Zero
-        /// outside capture (kernels then use their scalar arguments).</summary>
-        internal static IntPtr ActiveDevicePtr { get; private set; }
+        // Capture launchers are synchronous on one host thread, but unrelated
+        // allocators may launch ordinary work concurrently. Keep the ambient
+        // source thread-local and retain the owning instance so a launcher can
+        // reject a dynamic pointer that belongs to another allocator/stream.
+        [ThreadStatic]
+        private static CudaDecodeDynParams activeInstance;
+
+        [ThreadStatic]
+        private static int captureMaxAttendLen;
 
         /// <summary>Largest attention length the graph being captured stays
         /// valid for (0 = unlimited). Set by launchers that bake a
         /// length-dependent launch configuration (shared memory, grid).</summary>
-        public static int CaptureMaxAttendLen { get; private set; }
+        public static int CaptureMaxAttendLen => captureMaxAttendLen;
+
+        /// <summary>Returns the ambient dynamic-parameter pointer only when it
+        /// belongs to the allocator issuing this launch. Otherwise the caller
+        /// must use its ordinary scalar kernel arguments.</summary>
+        internal static IntPtr GetActiveDevicePtr(CudaAllocator launchAllocator)
+        {
+            CudaDecodeDynParams active = activeInstance;
+            return active != null &&
+                ReferenceEquals(active.allocator, launchAllocator) &&
+                active.devicePtr != IntPtr.Zero
+                    ? active.devicePtr
+                    : IntPtr.Zero;
+        }
 
         public CudaDecodeDynParams(IAllocator allocator)
         {
@@ -224,27 +242,31 @@ namespace TensorSharp.Cuda
         /// <see cref="Deactivate"/> in a finally).</summary>
         public void Activate()
         {
-            ActiveDevicePtr = devicePtr;
-            CaptureMaxAttendLen = 0;
+            activeInstance = this;
+            captureMaxAttendLen = 0;
         }
 
         public static void Deactivate()
         {
-            ActiveDevicePtr = IntPtr.Zero;
+            activeInstance = null;
         }
 
         internal static void LimitCaptureAttendLen(int limit)
         {
-            if (limit > 0 && (CaptureMaxAttendLen == 0 || limit < CaptureMaxAttendLen))
-                CaptureMaxAttendLen = limit;
+            if (activeInstance != null &&
+                limit > 0 &&
+                (captureMaxAttendLen == 0 || limit < captureMaxAttendLen))
+            {
+                captureMaxAttendLen = limit;
+            }
         }
 
         public void Dispose()
         {
             if (devicePtr != IntPtr.Zero)
             {
-                if (ActiveDevicePtr == devicePtr)
-                    ActiveDevicePtr = IntPtr.Zero;
+                if (ReferenceEquals(activeInstance, this))
+                    activeInstance = null;
                 allocator?.Context.MakeCurrent();
                 CudaDriverApi.cuMemFree(devicePtr);
                 devicePtr = IntPtr.Zero;

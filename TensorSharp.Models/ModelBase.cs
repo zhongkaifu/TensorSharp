@@ -567,12 +567,50 @@ namespace TensorSharp.Models
             return resolved;
         }
 
+        /// <summary>
+        /// Initial direct-CUDA KV allocation used when the GGUF advertises a much
+        /// larger context and MAX_CONTEXT was not supplied. Models may raise this
+        /// when their cache is compact enough that avoiding an in-request resize is
+        /// a better trade than the extra resident memory.
+        /// </summary>
+        protected virtual int NativeCudaInitialCacheAllocationLength => 2048;
+
+        /// <summary>
+        /// Multi-token direct-CUDA startup warmup. Most architectures stay at a
+        /// lightweight shape; models with persistent prefill scratch may override.
+        /// TS_PREFILL_WARMUP_LEN remains the explicit operator override.
+        /// </summary>
+        protected virtual int NativeCudaPrefillWarmupLength => 32;
+
+        /// <summary>
+        /// Additional input tokens a model needs beyond its target prefill rows.
+        /// For example, a refill implementation may reserve one final token for
+        /// the logits-producing decode pass. Applied after the startup-cost cap;
+        /// an explicit TS_PREFILL_WARMUP_LEN receives no model-specific overhead.
+        /// </summary>
+        protected virtual int NativeCudaPrefillWarmupTokenOverhead => 0;
+
+        /// <summary>
+        /// Some direct-CUDA models cache different decode graphs on opposite
+        /// sides of an attention launch crossover. Revisit the one-token shape
+        /// after a long prefill warmup so startup leaves the short graph captured.
+        /// </summary>
+        protected virtual bool NativeCudaPrimeShortDecodeGraphAfterPrefill => false;
+
         protected int ResolveInitialCacheAllocationLength(int requestedContextLength, int gpuDefault = 8192)
         {
-            return ResolveInitialCacheAllocationLength(_backend, requestedContextLength, gpuDefault);
+            return ResolveInitialCacheAllocationLength(
+                _backend,
+                requestedContextLength,
+                gpuDefault,
+                NativeCudaInitialCacheAllocationLength);
         }
 
-        internal static int ResolveInitialCacheAllocationLength(BackendType backend, int requestedContextLength, int gpuDefault = 8192)
+        internal static int ResolveInitialCacheAllocationLength(
+            BackendType backend,
+            int requestedContextLength,
+            int gpuDefault = 8192,
+            int nativeCudaDefault = 2048)
         {
             // GPU backends can be sensitive to allocating a multi-gigabyte KV
             // cache up-front when the model advertises a 256K+ context window. Cap the initial
@@ -584,8 +622,12 @@ namespace TensorSharp.Models
                 backend == BackendType.GgmlCuda ||
                 backend == BackendType.GgmlVulkan ||
                 backend == BackendType.GgmlMetal;
-            if (isGpuBackend &&
-                string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
+            string maxContextOverride = Environment.GetEnvironmentVariable("MAX_CONTEXT");
+            bool hasValidExplicitContext =
+                !string.IsNullOrWhiteSpace(maxContextOverride) &&
+                int.TryParse(maxContextOverride, out int explicitContext) &&
+                explicitContext > 0;
+            if (isGpuBackend && !hasValidExplicitContext)
             {
                 // Direct GPU backends benefit from a smaller initial KV allocation so
                 // huge advertised contexts (for example 262k) do not reserve the entire
@@ -596,7 +638,7 @@ namespace TensorSharp.Models
                 int effectiveDefault = backend switch
                 {
                     BackendType.Mlx => Math.Min(gpuDefault, 2048),
-                    BackendType.Cuda => Math.Min(gpuDefault, 2048),
+                    BackendType.Cuda => Math.Min(gpuDefault, Math.Max(1, nativeCudaDefault)),
                     // GgmlMetal: cap the up-front KV allocation too. On Apple
                     // Silicon the GPU working set is small (e.g. ~19 GB) and a
                     // big model (gpt-oss 20B Q8_0 ≈ 12 GB) plus a full 8192-token
@@ -615,6 +657,25 @@ namespace TensorSharp.Models
             }
 
             return requestedContextLength;
+        }
+
+        internal static int ResolvePrefillWarmupInputLength(
+            int targetLength,
+            int maxContextLength,
+            int tokenOverhead,
+            bool explicitLength)
+        {
+            int length = Math.Max(2, targetLength);
+            if (maxContextLength > 0)
+                length = Math.Min(length, Math.Max(2, maxContextLength / 4));
+
+            if (!explicitLength && tokenOverhead > 0)
+            {
+                length += tokenOverhead;
+                if (maxContextLength > 0)
+                    length = Math.Min(length, maxContextLength);
+            }
+            return length;
         }
 
         // GgmlVulkan follows GgmlCuda here: the fused prefill/decode paths mask or
@@ -2473,6 +2534,18 @@ namespace TensorSharp.Models
         /// </summary>
         protected unsafe Tensor ExpandKVHeads(Tensor cache, int groupSize, int totalSeqLen)
         {
+            if (cache.ElementType == DType.Float16 || cache.ElementType == DType.Float32)
+            {
+                int numKVHeads = (int)cache.Sizes[0];
+                int headDim = (int)cache.Sizes[2];
+                var expanded = new Tensor(
+                    _allocator, DType.Float32,
+                    numKVHeads * groupSize, totalSeqLen, headDim);
+                if (CudaFusedOps.TryExpandKvHeads(expanded, cache, groupSize, totalSeqLen))
+                    return expanded;
+                expanded.Dispose();
+            }
+
             if (cache.ElementType == DType.Float16)
                 return ExpandKVHeadsF16(cache, groupSize, totalSeqLen);
             if (IsBlockQuantCacheDType(cache.ElementType))
@@ -3551,20 +3624,15 @@ namespace TensorSharp.Models
                     Console.WriteLine(
                         $"  {hostBackedFrac * 100:F0}% of quantized weights use a CUDA-unsupported quant type and stay host-backed (CPU matmul); using a lightweight startup warmup. Inference will be slow — prefer a quant the direct CUDA backend supports (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0/IQ2/IQ3/IQ4_XS) or run with --backend ggml_cuda.");
                 }
-                // The long (2048-token) warmup only pays off on backends that BUILD
-                // AND CAPTURE a fused whole-model prefill graph and pre-grow its
-                // gallocr on the first prompt (ggml_cuda / ggml_vulkan). The native
-                // CUDA backend has no captured verify prefill (CanUsePrefillVerify is
-                // GGML-only), so a 2048-token warmup there only runs the per-op prefill
-                // once at full cost — on a hybrid GatedDeltaNet model that is tens of
-                // seconds to minutes — with no lasting benefit, and the server looks
-                // hung after "Startup model loaded". A short warmup still JITs the
-                // prefill kernels and primes the captured DECODE graph (via the
-                // 1-token Forward above) cheaply; the first real large prompt only
-                // pays a one-time activation-scratch growth.
-                bool nativeCudaNoCapturedPrefill = _backend == BackendType.Cuda;
+                // GGML builds/captures a fused whole-model prefill graph and pre-grows
+                // its gallocr. Native CUDA has no captured verify-prefill graph, so its
+                // architecture default remains a lightweight 32-token shape. A model
+                // may opt into a larger direct-CUDA warmup when it has persistent
+                // activation/QMM scratch that is expensive to grow during the first
+                // real request. Hybrid GatedDeltaNet models intentionally retain the
+                // lightweight base default because a 2K warmup can take minutes.
                 bool conservativeWarmup = _backend == BackendType.Mlx || _backend == BackendType.Cpu
-                    || integratedGpu || mostlyHostBacked || nativeCudaNoCapturedPrefill;
+                    || integratedGpu || mostlyHostBacked;
                 // 2048 matches ComputePrefillChunkSize, so the warmup runs ONE
                 // fused verify chunk at the largest legacy-chunk shape: the shared
                 // reuse-gallocr is pre-grown (and its device memory first-touched)
@@ -3572,14 +3640,29 @@ namespace TensorSharp.Models
                 // prompts. Measured on gemma4-12B/Vulkan: first ~2k-token request
                 // was ~300-500 ms slower than warm (gallocr growth + residency)
                 // with the old 1024 warmup; with 2048 it starts warm.
-                int warmupLength = conservativeWarmup ? 32 : 2048;
+                int warmupLength = conservativeWarmup
+                    ? 32
+                    : _backend == BackendType.Cuda
+                        ? Math.Max(2, NativeCudaPrefillWarmupLength)
+                        : 2048;
+                bool explicitWarmupLength = false;
                 {
                     string wl = Environment.GetEnvironmentVariable("TS_PREFILL_WARMUP_LEN");
                     if (!string.IsNullOrEmpty(wl) && int.TryParse(wl, out int wlv) && wlv >= 2)
+                    {
                         warmupLength = wlv;
+                        explicitWarmupLength = true;
+                    }
                 }
-                if (MaxContextLength > 0)
-                    warmupLength = Math.Min(warmupLength, Math.Max(2, MaxContextLength / 4));
+                int warmupTokenOverhead =
+                    _backend == BackendType.Cuda && !conservativeWarmup
+                        ? NativeCudaPrefillWarmupTokenOverhead
+                        : 0;
+                warmupLength = ResolvePrefillWarmupInputLength(
+                    warmupLength,
+                    MaxContextLength,
+                    warmupTokenOverhead,
+                    explicitWarmupLength);
 
                 int[] warmupPrompt = new int[warmupLength];
                 Array.Fill(warmupPrompt, safeToken);
@@ -3596,6 +3679,29 @@ namespace TensorSharp.Models
                 finally
                 {
                     ResetKVCache();
+                }
+
+                if (_backend == BackendType.Cuda &&
+                    NativeCudaPrimeShortDecodeGraphAfterPrefill &&
+                    CudaPrefillGraphCache.Enabled &&
+                    CudaPrefillGraphCache.DecodeEnabled)
+                {
+                    try
+                    {
+                        // The one-token pass at the beginning of WarmUpKernels
+                        // registered this graph key once. If the long prefill used
+                        // a different attention tier, this second sighting captures
+                        // the short route instead of charging the first request.
+                        Forward(new[] { safeToken });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"  Short decode-graph warmup skipped: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        ResetKVCache();
+                    }
                 }
             }
 

@@ -28,31 +28,44 @@ namespace TensorSharp.Cuda
         private static readonly object Sync = new object();
         private static readonly Dictionary<CacheKey, DeviceWeight> Cache = new Dictionary<CacheKey, DeviceWeight>();
 
-        // Per-device reusable scratch for q8_1-quantized activations (the dp4a Q8_0
-        // matmul path). Grown on demand; reused across calls (one stream per allocator
-        // ⇒ each matmul's read completes before the next quantize overwrites it).
-        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> Q81Scratch = new();
-        private static IntPtr EnsureQ81Scratch(CudaAllocator allocator, long bytes)
+        private sealed class ScratchAllocation
         {
-            lock (Sync)
-            {
-                if (Q81Scratch.TryGetValue(allocator.DeviceId, out var s) && s.bytes >= bytes)
-                    return s.ptr;
-                allocator.Context.MakeCurrent();
-                if (s.ptr != IntPtr.Zero)
-                    CudaDriverApi.cuMemFree(s.ptr);
-                long alloc = Math.Max(bytes, 64 * 1024);
-                CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc)).ThrowOnError();
-                Q81Scratch[allocator.DeviceId] = (ptr, alloc);
-                return ptr;
-            }
+            public IntPtr Ptr;
+            public long Bytes;
+            public readonly List<IntPtr> Retired = new List<IntPtr>();
         }
+
+        private sealed class ScratchPool
+        {
+            public readonly Dictionary<CudaAllocator, ScratchAllocation> Allocations =
+                new Dictionary<CudaAllocator, ScratchAllocation>();
+        }
+
+        // Scratch is allocator-owned rather than device-owned: different
+        // allocators have different streams and may execute concurrently.
+        // Growth retains the previous generation because CUDA graphs bake raw
+        // scratch pointers into kernel nodes. Geometric growth bounds all
+        // retained generations to less than the current allocation for gradual
+        // growth; CudaAllocator.Dispose releases them after synchronizing.
+        //
+        // q8_1-quantized activation scratch for the dp4a Q8_0 matmul path.
+        private static readonly ScratchPool Q81Scratch = new ScratchPool();
+        private static IntPtr EnsureQ81Scratch(CudaAllocator allocator, long bytes)
+            => EnsureScratch(Q81Scratch, allocator, bytes);
 
         // Row-batched quantized matmul (weight-reuse across small row counts).
         // On by default; set TS_CUDA_QMM_BATCHED=0 to force the legacy per-row
         // kernels (A/B benchmarking).
         internal static readonly bool BatchedMatmulEnabled =
             !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QMM_BATCHED"), "0", StringComparison.Ordinal);
+
+        // Single-row (decode) quantized matmul for generic quant types (K-quants,
+        // IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS -- anything without its own dedicated decode
+        // kernel). One block per output column (full blockDim threads), not one
+        // warp: see the TS_CUDA_QMM_VEC=0 A/B note at its call site for why the
+        // row-batched kernel's warp-per-column design loses here. On by default.
+        internal static readonly bool VecMatmulEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_QMM_VEC"), "0", StringComparison.Ordinal);
 
         // Large-row (prefill-sized) matmuls: dequantize the weight ONCE to f16 and
         // run a tensor-core cuBLAS GEMM (mirrors ggml_cuda's dequant+cuBLAS route).
@@ -66,36 +79,84 @@ namespace TensorSharp.Cuda
         internal static readonly int F16GemmMinRows = EnvInt("TS_CUDA_QMM_F16GEMM_MIN_ROWS", 32);
         internal static readonly long F16GemmMaxWeightBytes = EnvInt("TS_CUDA_QMM_F16GEMM_MAX_MB", 768) * 1024L * 1024L;
 
+        // ggml-style warp-cooperative Q8_0 -> F16 whole-weight conversion for
+        // RunF16Gemm. Set TS_CUDA_Q80_F16_DEQUANT=0 to retain the generic
+        // one-thread-per-scalar dequantizer for controlled A/B comparisons.
+        public static bool Q80F16DequantEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q80_F16_DEQUANT"), "0", StringComparison.Ordinal);
+
         private static int EnvInt(string name, int fallback)
         {
             string s = Environment.GetEnvironmentVariable(name);
             return !string.IsNullOrEmpty(s) && int.TryParse(s, out int v) && v > 0 ? v : fallback;
         }
 
-        // Per-device reusable f16 scratch for the dequant+GEMM path (weight and
-        // activation panels). Same single-stream reuse contract as Q81Scratch.
-        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> WF16Scratch = new();
-        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> AF16Scratch = new();
+        // Per-allocator reusable f16 scratch for the dequant+GEMM path (weight
+        // and activation panels).
+        private static readonly ScratchPool WF16Scratch = new ScratchPool();
+        private static readonly ScratchPool AF16Scratch = new ScratchPool();
 
         // Split q8_1 activation scratch for the cp.async MMQ path: dense qs byte
         // rows + separate float scales (see ts_quantize_q8_1_split_rows_f32).
-        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> Q81SplitQsScratch = new();
-        private static readonly Dictionary<int, (IntPtr ptr, long bytes)> Q81SplitDScratch = new();
+        private static readonly ScratchPool Q81SplitQsScratch = new ScratchPool();
+        private static readonly ScratchPool Q81SplitDScratch = new ScratchPool();
 
-        private static IntPtr EnsureScratch(Dictionary<int, (IntPtr ptr, long bytes)> pool, CudaAllocator allocator, long bytes)
+        private static IntPtr EnsureScratch(ScratchPool pool, CudaAllocator allocator, long bytes)
         {
             lock (Sync)
             {
-                if (pool.TryGetValue(allocator.DeviceId, out var s) && s.bytes >= bytes)
-                    return s.ptr;
+                if (pool.Allocations.TryGetValue(allocator, out ScratchAllocation scratch) &&
+                    scratch.Bytes >= bytes)
+                {
+                    return scratch.Ptr;
+                }
+
                 allocator.Context.MakeCurrent();
-                if (s.ptr != IntPtr.Zero)
-                    CudaDriverApi.cuMemFree(s.ptr);
-                long alloc = Math.Max(bytes, 64 * 1024);
+                long doubled = scratch == null || scratch.Bytes > long.MaxValue / 2
+                    ? 0
+                    : scratch.Bytes * 2;
+                long alloc = Math.Max(bytes, Math.Max(64 * 1024L, doubled));
                 CudaDriverApi.cuMemAlloc(out IntPtr ptr, new UIntPtr((ulong)alloc)).ThrowOnError();
-                pool[allocator.DeviceId] = (ptr, alloc);
+
+                if (scratch == null)
+                {
+                    scratch = new ScratchAllocation();
+                    pool.Allocations.Add(allocator, scratch);
+                }
+                else if (scratch.Ptr != IntPtr.Zero)
+                {
+                    scratch.Retired.Add(scratch.Ptr);
+                }
+
+                scratch.Ptr = ptr;
+                scratch.Bytes = alloc;
                 return ptr;
             }
+        }
+
+        internal static void ReleaseScratch(CudaAllocator allocator)
+        {
+            lock (Sync)
+            {
+                allocator.Context.MakeCurrent();
+                ReleaseScratch(Q81Scratch, allocator);
+                ReleaseScratch(WF16Scratch, allocator);
+                ReleaseScratch(AF16Scratch, allocator);
+                ReleaseScratch(Q81SplitQsScratch, allocator);
+                ReleaseScratch(Q81SplitDScratch, allocator);
+            }
+        }
+
+        private static void ReleaseScratch(ScratchPool pool, CudaAllocator allocator)
+        {
+            if (!pool.Allocations.TryGetValue(allocator, out ScratchAllocation scratch))
+                return;
+
+            pool.Allocations.Remove(allocator);
+            if (scratch.Ptr != IntPtr.Zero)
+                CudaDriverApi.cuMemFree(scratch.Ptr);
+            foreach (IntPtr ptr in scratch.Retired)
+                CudaDriverApi.cuMemFree(ptr);
         }
 
         private static void RunF16Gemm(
@@ -105,11 +166,25 @@ namespace TensorSharp.Cuda
         {
             long wElems = (long)inDim * outDim;
             long aElems = (long)rows * inDim;
-            IntPtr wF16 = EnsureScratch(WF16Scratch, allocator, wElems * 2);
             IntPtr aF16 = EnsureScratch(AF16Scratch, allocator, aElems * 2);
             allocator.Context.MakeCurrent();
             IntPtr stream = allocator.Stream.Handle;
-            kernels.LaunchDequantWeightF16(weightPtr, wF16, ggmlType, inDim, wElems, stream);
+            IntPtr wF16;
+            if (ggmlType == 1)
+            {
+                // F16 weights are already the cuBLAS operand in the same
+                // [outDim, inDim] row-major layout the dequant kernels emit --
+                // use the resident weight directly, no scratch or dequant pass.
+                wF16 = weightPtr;
+            }
+            else
+            {
+                wF16 = EnsureScratch(WF16Scratch, allocator, wElems * 2);
+                if (ggmlType == 8 && Q80F16DequantEnabled)
+                    kernels.LaunchDequantWeightQ80F16(weightPtr, wF16, wElems, stream);
+                else
+                    kernels.LaunchDequantWeightF16(weightPtr, wF16, ggmlType, inDim, wElems, stream);
+            }
             kernels.LaunchConvertF32F16(inputPtr, aF16, aElems, stream);
 
             // C[rows, outDim] (row-major) == C_col[outDim, rows]:
@@ -144,6 +219,14 @@ namespace TensorSharp.Cuda
         // the same exact-vs-int8-tolerance test split as Q40Dp4aEnabled.
         public static bool Q80VecDp4aEnabled { get; set; } =
             !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q80_VEC"), "0", StringComparison.Ordinal);
+
+        // Quantize each 32-value activation block cooperatively with one warp.
+        // This mirrors ggml_cuda's q8_1 quantizer and replaces the legacy
+        // one-thread-per-block implementation, whose 32 serial loads/stores are
+        // poorly coalesced for decode-sized rows. Set TS_CUDA_Q81_WARP=0 to keep
+        // the legacy kernel for A/B testing.
+        public static bool Q81WarpQuantizeEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q81_WARP"), "0", StringComparison.Ordinal);
 
         // Diagnostic/tuning gate: only use the q8_1 vec matvec when the output is at
         // least this wide (0 = always). Lets A/B runs isolate which decode
@@ -252,7 +335,13 @@ namespace TensorSharp.Cuda
             long rawBytes,
             int q8Kernel = 0)
         {
-            if (!SupportsQuantizedType(ggmlType))
+            // ggmlType 1 (F16) is not a block-quantized type but is accepted
+            // here: the resident weight bytes already ARE the f16 cuBLAS
+            // operand (see RunF16Gemm). Without this, an F16 tensor inside a
+            // quantized GGUF (e.g. Gemma E4B's 55 MB per_layer_model_proj)
+            // fell to the managed CPU matmul on EVERY prefill chunk and decode
+            // token, with DtoH/HtoD mirror churn on top.
+            if (ggmlType != 1 && !SupportsQuantizedType(ggmlType))
                 return false;
 
             if (!CudaKernelOps.TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out int resultCount) ||
@@ -280,6 +369,16 @@ namespace TensorSharp.Cuda
             int outDim = checked((int)ne1);
             int rows = checked((int)input.Sizes[0]);
 
+            // F16 weights: the resident bytes are already the GEMM operand, so
+            // every row count (a rows==1 decode is just a GEMV) goes straight
+            // to cuBLAS with only the activation's f32->f16 convert on top.
+            if (ggmlType == 1)
+            {
+                RunF16Gemm(allocator, kernels, weight.DevicePtr, ggmlType, inputPtr, resultPtr, inDim, outDim, rows);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+
             // Q8_0 prefill-sized batches: direct int8 tensor-core GEMM over the raw
             // Q8_0 blocks (mma.m16n8k32, ggml MMQ-style). Weight DRAM traffic is
             // ceil(rows/128) sweeps with NO f16 dequant round trip, so it beats the
@@ -302,7 +401,8 @@ namespace TensorSharp.Cuda
                 {
                     long mmqScratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
                     IntPtr mmqXq = EnsureQ81Scratch(allocator, mmqScratchBytes);
-                    kernels.LaunchQuantizeQ81Rows(inputPtr, mmqXq, inDim, rows, allocator.Stream.Handle);
+                    kernels.LaunchQuantizeQ81Rows(
+                        inputPtr, mmqXq, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                     kernels.LaunchQuantMatmulQ80Mmq(
                         weight.DevicePtr, mmqXq, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                 }
@@ -346,12 +446,45 @@ namespace TensorSharp.Cuda
             // all batch sizes (not just <=QuantMatmulBatchMaxRows) through the tiled
             // kernel so weight traffic drops ~TS_QMM_ROW_TILE x; it is numerically
             // identical (verified by the K-quant / IQ4_XS matmul tests).
+            //
+            // rows == 1 (single-token decode) deliberately stays OUT of this path.
+            // Mixed "unsloth dynamic" quants (e.g. UD-IQ2_XXS) keep a large share
+            // of tensors at Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_XXS/IQ3_S/IQ2_S/IQ4_XS,
+            // and at rows==1 this kernel's one-warp-per-column design (32 threads
+            // striding in_dim, TS_QMM_ROW_TILE amortization providing zero benefit
+            // with only one row) has LESS per-column parallelism than the scalar
+            // path's cols_per_block=4/blockDim=256 split -- measured on
+            // Qwen3.6-27B-UD-IQ2_XXS: routing rows==1 here made decode SLOWER
+            // (5.18 -> 4.54 tok/s) despite the scalar kernel's 76% GPU-time share,
+            // because the wide lm_head/large-in_dim tensors dominate that share
+            // and regressed further under 32-thread columns. See
+            // ts_quant_matmul_vec_f32 below for the actual decode fix: one BLOCK
+            // (not one warp) per output column, matching the scalar path's
+            // per-column thread budget without its 4-columns-per-block
+            // serialization.
             if (BatchedMatmulEnabled && rows >= 2
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
                 kernels.LaunchQuantMatmulBatchedF32(
                     weight.DevicePtr, inputPtr, resultPtr,
                     ggmlType, inDim, outDim, rows, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+            // Single-token decode for the same generic quant-type set: one BLOCK
+            // per output column (full blockDim.x threads via block_reduce_sum),
+            // not the row-batched kernel's one-WARP-per-column (32 threads). At
+            // rows==1 there is no cross-row weight reuse to amortize, so the
+            // batched kernel's only advantage disappears and its 8x-narrower
+            // per-column thread count directly costs latency on wide tensors
+            // (e.g. a K-quant lm_head/large-in_dim projection) -- TS_CUDA_QMM_VEC=0
+            // falls back to the scalar per-4-columns kernel for A/B comparison.
+            if (VecMatmulEnabled && rows == 1
+                && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
+            {
+                kernels.LaunchQuantMatmulVecF32(
+                    weight.DevicePtr, inputPtr, resultPtr,
+                    ggmlType, inDim, outDim, allocator.Stream.Handle);
                 resultStorage.MarkDeviceModified();
                 return true;
             }
@@ -368,7 +501,8 @@ namespace TensorSharp.Cuda
                 {
                     long scratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
                     IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
-                    kernels.LaunchQuantizeQ81Rows(inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle);
+                    kernels.LaunchQuantizeQ81Rows(
+                        inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                     kernels.LaunchQuantMatmulQ40Dp4a(
                         weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);
                     resultStorage.MarkDeviceModified();
@@ -410,7 +544,8 @@ namespace TensorSharp.Cuda
                 bool useMma = q8Kernel == 2 || (q8Kernel == 0 && CudaKernels.Q8MmaEnabled && rows >= 2);
                 long scratchBytes = (long)rows * (inDim / 32) * CudaKernels.Q81BlockBytes;
                 IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
-                kernels.LaunchQuantizeQ81Rows(inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle);
+                kernels.LaunchQuantizeQ81Rows(
+                    inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
                 if (useMma)
                     kernels.LaunchQuantMatmulQ80Mma(
                         weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, rows, allocator.Stream.Handle);

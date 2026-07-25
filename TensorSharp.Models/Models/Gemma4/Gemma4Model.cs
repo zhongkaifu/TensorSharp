@@ -11,6 +11,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
@@ -99,11 +100,92 @@ namespace TensorSharp.Models
         private int _neoXRopeDeviceCacheSeqLen, _neoXRopeDeviceCacheStartPos = -1;
         private float[] _neoXRopeDeviceCacheFreqs;
 
+        // The single-slot cache above thrashes when a forward pass alternates
+        // between the LOCAL and GLOBAL frequency sets (Gemma interleaves 5
+        // local : 1 global layers): every freqs switch re-ran the host cos/sin
+        // build AND re-uploaded a multi-MB table through a pageable memcpy that
+        // drains the busy compute stream (~190 ms of a 2,048-token direct-CUDA
+        // prefill). Keep one full slot per freqs identity instead; switching
+        // just swaps the active fields.
+        private sealed class NeoXRopeSlot
+        {
+            public float[] Cos, Sin;
+            public int SeqLen, StartPos = -1;
+            public float[] Freqs;
+            public Tensor CosTensor, SinTensor;
+            public int DeviceSeqLen, DeviceStartPos = -1;
+            public float[] DeviceFreqs;
+        }
+
+        private readonly Dictionary<float[], NeoXRopeSlot> _neoXRopeSlotByFreqs = new();
+        private float[] _neoXRopeActiveSlotFreqs;
+
+        /// <summary>Make the cache fields point at the slot for this freqs
+        /// array (reference identity). Ownership of the tensors moves with the
+        /// fields: the parked slot holds them while inactive, so Dispose must
+        /// release both the active fields and every parked slot.</summary>
+        private void SelectNeoXRopeSlot(float[] freqs)
+        {
+            if (ReferenceEquals(_neoXRopeActiveSlotFreqs, freqs))
+                return;
+            if (_neoXRopeActiveSlotFreqs != null)
+            {
+                if (!_neoXRopeSlotByFreqs.TryGetValue(_neoXRopeActiveSlotFreqs, out NeoXRopeSlot park))
+                {
+                    park = new NeoXRopeSlot();
+                    _neoXRopeSlotByFreqs[_neoXRopeActiveSlotFreqs] = park;
+                }
+                park.Cos = _neoXRopeCos;
+                park.Sin = _neoXRopeSin;
+                park.SeqLen = _neoXRopeCacheSeqLen;
+                park.StartPos = _neoXRopeCacheStartPos;
+                park.Freqs = _neoXRopeCacheFreqs;
+                park.CosTensor = _neoXRopeCosTensor;
+                park.SinTensor = _neoXRopeSinTensor;
+                park.DeviceSeqLen = _neoXRopeDeviceCacheSeqLen;
+                park.DeviceStartPos = _neoXRopeDeviceCacheStartPos;
+                park.DeviceFreqs = _neoXRopeDeviceCacheFreqs;
+            }
+            _neoXRopeSlotByFreqs.TryGetValue(freqs, out NeoXRopeSlot slot);
+            _neoXRopeCos = slot?.Cos;
+            _neoXRopeSin = slot?.Sin;
+            _neoXRopeCacheSeqLen = slot?.SeqLen ?? 0;
+            _neoXRopeCacheStartPos = slot?.StartPos ?? -1;
+            _neoXRopeCacheFreqs = slot?.Freqs;
+            _neoXRopeCosTensor = slot?.CosTensor;
+            _neoXRopeSinTensor = slot?.SinTensor;
+            _neoXRopeDeviceCacheSeqLen = slot?.DeviceSeqLen ?? 0;
+            _neoXRopeDeviceCacheStartPos = slot?.DeviceStartPos ?? -1;
+            _neoXRopeDeviceCacheFreqs = slot?.DeviceFreqs;
+            if (slot != null)
+            {
+                // Tensor ownership transferred to the active fields.
+                slot.CosTensor = null;
+                slot.SinTensor = null;
+            }
+            _neoXRopeActiveSlotFreqs = freqs;
+        }
+
         // Cached RoPE position tensors for local layers.
         // All local layers in a forward pass share the same (seqLen, startPos),
         // so we precompute once and reuse.
         private Tensor _cachedRoPEPosQ, _cachedRoPEPosK;
         private int _cachedRoPEPosSeqLen, _cachedRoPEPosStartPos = -1;
+
+        // Direct-CUDA decode graph state. Gemma's global RoPE uses learned,
+        // per-pair frequency factors, so a captured kernel builds these stable
+        // local/global cos/sin tables once per replay from the live position.
+        // Every layer then reuses the appropriate table.
+        private Tensor _cudaDecodeRopeFreqsLocal, _cudaDecodeRopeFreqsGlobal;
+        private Tensor _cudaDecodeRopeCosLocal, _cudaDecodeRopeSinLocal;
+        private Tensor _cudaDecodeRopeCosGlobal, _cudaDecodeRopeSinGlobal;
+        private bool _cudaDecodeGraphCaptureActive;
+        private CudaPrefillGraphCache _cudaDecodeGraphs;
+        private CudaDecodeDynParams _cudaDecodeDynParams;
+        // PLE is freshly allocated by ComputePLE for every token. Captured
+        // kernels instead bind this model-owned buffer, refreshed DtoD before
+        // each replay, so no transient pointer is baked into the graph.
+        private Tensor _cudaDecodeGraphPleInput;
 
         private int _numExperts;
         private int _numExpertsUsed;
@@ -402,6 +484,39 @@ namespace TensorSharp.Models
             BuildGemma4DecodeArrays();
         }
 
+        // The E4B cache is compact (about 148 MiB at 8K) and its direct-CUDA
+        // prefill reuses sizeable QMM/activation scratch. Keeping the report-sized
+        // prompts inside the initial cache avoids a synchronized resize, while a
+        // single 2K-row startup pass pre-grows the persistent scratch and JITs the
+        // long-shape kernels. Larger Gemma 4 variants retain ModelBase's conservative
+        // direct-CUDA defaults to avoid unnecessary startup time and VRAM pressure.
+        private bool IsE4BPerformanceProfile =>
+            Config != null &&
+            Config.NumLayers == 42 &&
+            Config.HiddenSize == 2560 &&
+            Config.NumHeads == 8 &&
+            Config.NumKVHeads == 2 &&
+            _numGlobalKVHeads == 2 &&
+            _localHeadDim == 256 &&
+            _globalHeadDim == 512 &&
+            _slidingWindow == 512 &&
+            _pleDim == 256 &&
+            _sharedKVLayers == 18;
+
+        protected override int NativeCudaInitialCacheAllocationLength =>
+            IsE4BPerformanceProfile ? 8192 : base.NativeCudaInitialCacheAllocationLength;
+
+        protected override int NativeCudaPrefillWarmupLength =>
+            // ForwardRefill reserves the final token for its decode/logits pass,
+            // so request 2,048 rows plus the one-token overhead below.
+            IsE4BPerformanceProfile ? 2048 : base.NativeCudaPrefillWarmupLength;
+
+        protected override int NativeCudaPrefillWarmupTokenOverhead =>
+            IsE4BPerformanceProfile ? 1 : base.NativeCudaPrefillWarmupTokenOverhead;
+
+        protected override bool NativeCudaPrimeShortDecodeGraphAfterPrefill =>
+            IsE4BPerformanceProfile;
+
         /// <summary>
         /// On <c>ggml_cuda</c>, Gemma 4 MoE decode (<see cref="TryFusedMoEModelDecode"/>)
         /// and prefill (<see cref="TryMoEFusedGEGLU"/>) read the experts exclusively
@@ -635,6 +750,11 @@ namespace TensorSharp.Models
             int newCapacity = Math.Max(_kvCacheGlobalCapacity, 1);
             while (newCapacity < requiredSeqLen)
                 newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
+
+            // Captured direct-CUDA decode graphs bind every KV device address.
+            // Tear them down before replacing any global-cache storage; a new
+            // graph will be captured against the resized buffers.
+            InvalidateCudaDecodeGraphs();
 
             DType kvDtype = _kvCacheDtype.ToDType();
             var resized = new HashSet<int>();
@@ -1179,57 +1299,64 @@ namespace TensorSharp.Models
                 // layers see the full chunk's K/V rather than a partial rolling
                 // cache. Real-world prompts get a 45-50% speedup (chunked) over
                 // the per-op C# path. Set TS_FUSED_LAYER_PREFILL=0 to disable.
-                for (int l = 0; l < Config.NumLayers; l++)
+                if (CanUseCudaDecodeGraph(seqLen, exceptPositions, _g4ForceUnfused))
                 {
-                    Tensor perLayerInput = null;
-                    if (perLayerInputs != null)
-                        perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
-
-                    bool isShared = _kvDonorMap.ContainsKey(l);
-
-                    bool canUseLayerGraph = useFusedLayerGraph && !HasMoE(l);
-                    // Shared global layers must attend the donor's full prefix.
-                    // The fused layer graph currently accepts only donor K/V for
-                    // the current token/chunk, so keep that case on the C# path.
-                    if (canUseLayerGraph && seqLen == 1 && isShared && !IsLocalLayer(l) && startPos > 0)
-                        canUseLayerGraph = false;
-
-                    if (canUseLayerGraph)
+                    hidden = RunCudaDecodeLayerLoop(hidden, startPos, ref perLayerInputs);
+                }
+                else
+                {
+                    for (int l = 0; l < Config.NumLayers; l++)
                     {
-                        if (TryFusedLayerPrefill(hidden, l, seqLen, startPos, perLayerInput))
+                        Tensor perLayerInput = null;
+                        if (perLayerInputs != null)
+                            perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, seqLen);
+
+                        bool isShared = _kvDonorMap.ContainsKey(l);
+
+                        bool canUseLayerGraph = useFusedLayerGraph && !HasMoE(l);
+                        // Shared global layers must attend the donor's full prefix.
+                        // The fused layer graph currently accepts only donor K/V for
+                        // the current token/chunk, so keep that case on the C# path.
+                        if (canUseLayerGraph && seqLen == 1 && isShared && !IsLocalLayer(l) && startPos > 0)
+                            canUseLayerGraph = false;
+
+                        if (canUseLayerGraph)
                         {
-                            perLayerInput?.Dispose();
+                            if (TryFusedLayerPrefill(hidden, l, seqLen, startPos, perLayerInput))
+                            {
+                                perLayerInput?.Dispose();
+                                continue;
+                            }
+                        }
+
+                        // Fused single-graph MoE layer decode (attention + dense FFN
+                        // + in-graph-routed experts) on GGML. Collapses ~18-20 per-op
+                        // dispatches per MoE layer (each allocating/freeing a Metal
+                        // buffer and synchronising) into one GPU graph, which is the
+                        // dominant decode cost for MoE Gemma 4 (e.g. 26B-A4B). Only
+                        // for the plain decode shape (no PLE / vision injection).
+                        if (seqLen == 1 && HasMoE(l) && perLayerInput == null
+                            && exceptPositions == null && _moeFusedDecodeEnabled
+                            && TryFusedMoELayerDecode(hidden, l, startPos))
+                        {
                             continue;
                         }
-                    }
 
-                    // Fused single-graph MoE layer decode (attention + dense FFN
-                    // + in-graph-routed experts) on GGML. Collapses ~18-20 per-op
-                    // dispatches per MoE layer (each allocating/freeing a Metal
-                    // buffer and synchronising) into one GPU graph, which is the
-                    // dominant decode cost for MoE Gemma 4 (e.g. 26B-A4B). Only
-                    // for the plain decode shape (no PLE / vision injection).
-                    if (seqLen == 1 && HasMoE(l) && perLayerInput == null
-                        && exceptPositions == null && _moeFusedDecodeEnabled
-                        && TryFusedMoELayerDecode(hidden, l, startPos))
-                    {
-                        continue;
-                    }
-
-                    hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
-                    TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
-                    perLayerInput?.Dispose();
-                    if (_g4ForceUnfused)
-                    {
-                        // Force a CPU read between layers when the test-only
-                        // FORCE_UNFUSED mode is on. Metal queues ops async by
-                        // default; without flushing, parallel reductions in
-                        // RMSNorm/softmax can give bit-different results
-                        // between runs and the test loses comparability with
-                        // the (eagerly-synced) batched path. The pinged byte
-                        // is discarded; only the implicit download-barrier
-                        // matters.
-                        _ = hidden.GetElementsAsFloat(1);
+                        hidden = TransformerBlock(hidden, l, seqLen, startPos, isShared, perLayerInput, exceptPositions);
+                        TryEvaluateMlxLayerBoundary(hidden, l, seqLen);
+                        perLayerInput?.Dispose();
+                        if (_g4ForceUnfused)
+                        {
+                            // Force a CPU read between layers when the test-only
+                            // FORCE_UNFUSED mode is on. Metal queues ops async by
+                            // default; without flushing, parallel reductions in
+                            // RMSNorm/softmax can give bit-different results
+                            // between runs and the test loses comparability with
+                            // the (eagerly-synced) batched path. The pinged byte
+                            // is discarded; only the implicit download-barrier
+                            // matters.
+                            _ = hidden.GetElementsAsFloat(1);
+                        }
                     }
                 }
 
@@ -1597,7 +1724,15 @@ namespace TensorSharp.Models
             // entirely through the fused whole-model verify kernel (one GGML graph),
             // whereas a smaller chunk would push the remainder into a start_pos>0
             // chunk that falls back to the per-op path. See CanUseWholeModelPrefillVerify.
-            int prefillChunkSize = 2048;
+            // E4B direct CUDA uses flash-style group-4 attention for both F32
+            // first-chunk K/V and F16 cached K/V, so it does not materialize the
+            // quadratic score tensor described above. A 4K chunk avoids repeating
+            // every projection/PLE setup for report-sized 2K-4K prompts; larger
+            // Gemma variants and other backends retain the conservative 2K cap.
+            int prefillChunkSize =
+                _backend == BackendType.Cuda && IsE4BPerformanceProfile
+                    ? 4096
+                    : 2048;
             string chunkOverride = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(chunkOverride) && int.TryParse(chunkOverride, out int chunkOv) && chunkOv > 0)
                 prefillChunkSize = chunkOv;
@@ -1848,6 +1983,354 @@ namespace TensorSharp.Models
                 && seqLen > 0
                 && exceptPositions == null
                 && _canUseFusedDecode;
+        }
+
+        private bool CanUseCudaDecodeGraph(int seqLen, HashSet<int> exceptPositions, bool forceUnfused)
+        {
+            if (_backend != BackendType.Cuda ||
+                seqLen != 1 ||
+                exceptPositions != null ||
+                forceUnfused ||
+                _kvCacheK == null ||
+                _kvCacheV == null ||
+                !CudaPrefillGraphCache.Enabled ||
+                !CudaPrefillGraphCache.DecodeEnabled)
+            {
+                return false;
+            }
+
+            // Direct-CUDA MoE routing currently reads router results on the
+            // host. That synchronization is intentionally not capturable.
+            // Dense Gemma variants (including PLE + shared KV) are graphable.
+            if (_numExperts > 0)
+                return false;
+
+            return true;
+        }
+
+        private Tensor RunCudaDecodePerOpLoop(Tensor hidden, int startPos, Tensor perLayerInputs)
+        {
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                Tensor perLayerInput = null;
+                if (perLayerInputs != null)
+                    perLayerInput = ExtractPerLayerSlice(perLayerInputs, l, 1);
+
+                bool isShared = _kvDonorMap.ContainsKey(l);
+                hidden = TransformerBlock(hidden, l, 1, startPos, isShared, perLayerInput);
+                perLayerInput?.Dispose();
+            }
+            return hidden;
+        }
+
+        private Tensor RunCudaDecodeLayerLoop(
+            Tensor hidden,
+            int startPos,
+            ref Tensor perLayerInputs)
+        {
+            _cudaDecodeGraphs ??= new CudaPrefillGraphCache(_allocator);
+            CudaPrefillGraphCache graphs = _cudaDecodeGraphs;
+            if (!graphs.IsUsable)
+                return RunCudaDecodePerOpLoop(hidden, startPos, perLayerInputs);
+
+            _cudaDecodeDynParams ??= new CudaDecodeDynParams(_allocator);
+            CudaDecodeDynParams dyn = _cudaDecodeDynParams;
+            if (!dyn.IsValid || !EnsureCudaDecodeRopeFrequenciesResident())
+                return RunCudaDecodePerOpLoop(hidden, startPos, perLayerInputs);
+
+            // Replace the transient ComputePLE allocation with one stable input
+            // whose pointer is safe to bind into the graph.
+            Tensor graphPle = null;
+            if (perLayerInputs != null)
+            {
+                graphPle = PrepareCudaDecodeGraphPleInput(perLayerInputs);
+                perLayerInputs.Dispose();
+                perLayerInputs = null;
+            }
+
+            EnsureCudaDecodeGraphStateResident();
+            int attendLen = startPos + 1;
+            string key = BuildCudaDecodeGraphKey(graphPle, attendLen);
+
+            if (graphs.TryGetReplayInput(key, attendLen, out Tensor pinned))
+            {
+                Ops.Copy(pinned, hidden);
+                hidden.Dispose();
+                if (graphPle != null)
+                    CudaFusedOps.TryEnsureDeviceResident(graphPle);
+                dyn.Write(attendLen, startPos, 0, startPos);
+                graphs.Replay(key);
+                MarkCudaDecodeGraphStateModified();
+                return pinned;
+            }
+
+            if (!graphs.ShouldCapture(key))
+                return RunCudaDecodePerOpLoop(hidden, startPos, graphPle);
+
+            // All persistent inputs must be device-current before capture; a
+            // pageable HtoD upload inside stream capture is illegal.
+            EnsureCudaDecodeGraphStateResident();
+            EnsureCudaDecodeRopeFrequenciesResident();
+            if (graphPle != null)
+                CudaFusedOps.TryEnsureDeviceResident(graphPle);
+
+            var pinnedIn = new Tensor(_allocator, DType.Float32, hidden.Sizes);
+            Ops.Copy(pinnedIn, hidden);
+            hidden.Dispose();
+
+            if (!graphs.BeginCapture(key))
+                return RunCudaDecodePerOpLoop(pinnedIn, startPos, graphPle);
+
+            bool captured = false;
+            try
+            {
+                dyn.Write(attendLen, startPos, 0, startPos);
+                dyn.EnqueueUpload();
+                dyn.Activate();
+                if (!CudaFusedOps.TryFillNeoXRopeTablesDynamic(
+                    _cudaDecodeRopeCosLocal,
+                    _cudaDecodeRopeSinLocal,
+                    _cudaDecodeRopeFreqsLocal,
+                    _cudaDecodeRopeCosGlobal,
+                    _cudaDecodeRopeSinGlobal,
+                    _cudaDecodeRopeFreqsGlobal))
+                {
+                    throw new CudaGraphCaptureAbortedException(
+                        "Gemma dynamic NeoX RoPE table fill kernel unavailable.");
+                }
+
+                _cudaDecodeGraphCaptureActive = true;
+                Tensor result;
+                try
+                {
+                    result = RunCudaDecodePerOpLoop(pinnedIn, startPos, graphPle);
+                }
+                finally
+                {
+                    _cudaDecodeGraphCaptureActive = false;
+                }
+                CudaDecodeDynParams.Deactivate();
+                if (ReferenceEquals(result, pinnedIn))
+                {
+                    captured = graphs.EndCaptureAndLaunch(
+                        key,
+                        pinnedIn,
+                        GetCudaDecodeGraphKeepAlive(graphPle),
+                        CudaDecodeDynParams.CaptureMaxAttendLen);
+                }
+                else
+                {
+                    graphs.AbortCapture(
+                        key,
+                        "Gemma CUDA decode did not preserve the graph-owned residual input.");
+                }
+            }
+            catch (CudaGraphCaptureAbortedException ex)
+            {
+                graphs.AbortCapture(key, ex.Message);
+            }
+            catch (TensorSharp.Cuda.Interop.CudaException ex)
+            {
+                graphs.AbortCapture(key, ex.ToString());
+            }
+            catch
+            {
+                graphs.AbortCapture(key);
+                throw;
+            }
+            finally
+            {
+                _cudaDecodeGraphCaptureActive = false;
+                CudaDecodeDynParams.Deactivate();
+            }
+
+            if (!captured)
+            {
+                // A failed capture executes no kernels. Run the same step
+                // plainly; the key is blacklisted so future tokens stay safe.
+                return RunCudaDecodePerOpLoop(pinnedIn, startPos, graphPle);
+            }
+
+            return pinnedIn;
+        }
+
+        private Tensor PrepareCudaDecodeGraphPleInput(Tensor source)
+        {
+            bool sameShape = _cudaDecodeGraphPleInput != null &&
+                _cudaDecodeGraphPleInput.ElementType == source.ElementType &&
+                _cudaDecodeGraphPleInput.DimensionCount == source.DimensionCount;
+            if (sameShape)
+            {
+                for (int d = 0; d < source.DimensionCount; d++)
+                {
+                    if (_cudaDecodeGraphPleInput.Sizes[d] != source.Sizes[d])
+                    {
+                        sameShape = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!sameShape)
+            {
+                InvalidateCudaDecodeGraphs();
+                _cudaDecodeGraphPleInput?.Dispose();
+                _cudaDecodeGraphPleInput = new Tensor(_allocator, source.ElementType, source.Sizes);
+            }
+
+            Ops.Copy(_cudaDecodeGraphPleInput, source);
+            return _cudaDecodeGraphPleInput;
+        }
+
+        private bool EnsureCudaDecodeRopeFrequenciesResident()
+        {
+            if (_backend != BackendType.Cuda ||
+                _ropeFreqsLocal == null ||
+                _ropeFreqsGlobal == null)
+            {
+                return false;
+            }
+
+            if (_cudaDecodeRopeFreqsLocal == null)
+            {
+                _cudaDecodeRopeFreqsLocal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsLocal.Length);
+                _cudaDecodeRopeFreqsLocal.SetElementsAsFloat(_ropeFreqsLocal);
+            }
+            if (_cudaDecodeRopeFreqsGlobal == null)
+            {
+                _cudaDecodeRopeFreqsGlobal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsGlobal.Length);
+                _cudaDecodeRopeFreqsGlobal.SetElementsAsFloat(_ropeFreqsGlobal);
+            }
+
+            if (_cudaDecodeRopeCosLocal == null)
+            {
+                _cudaDecodeRopeCosLocal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsLocal.Length);
+                _cudaDecodeRopeCosLocal.SetElementsAsFloat(new float[_ropeFreqsLocal.Length]);
+                _cudaDecodeRopeSinLocal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsLocal.Length);
+                _cudaDecodeRopeSinLocal.SetElementsAsFloat(new float[_ropeFreqsLocal.Length]);
+            }
+            if (_cudaDecodeRopeCosGlobal == null)
+            {
+                _cudaDecodeRopeCosGlobal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsGlobal.Length);
+                _cudaDecodeRopeCosGlobal.SetElementsAsFloat(new float[_ropeFreqsGlobal.Length]);
+                _cudaDecodeRopeSinGlobal = new Tensor(
+                    _allocator, DType.Float32, _ropeFreqsGlobal.Length);
+                _cudaDecodeRopeSinGlobal.SetElementsAsFloat(new float[_ropeFreqsGlobal.Length]);
+            }
+
+            return CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeFreqsLocal) &&
+                CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeFreqsGlobal) &&
+                CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeCosLocal) &&
+                CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeSinLocal) &&
+                CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeCosGlobal) &&
+                CudaFusedOps.TryEnsureDeviceResident(_cudaDecodeRopeSinGlobal);
+        }
+
+        private void EnsureCudaDecodeGraphStateResident()
+        {
+            if (_kvCacheK == null || _kvCacheV == null)
+                return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l))
+                    continue;
+                CudaFusedOps.TryEnsureDeviceResident(_kvCacheK[l]);
+                CudaFusedOps.TryEnsureDeviceResident(_kvCacheV[l]);
+            }
+        }
+
+        private void MarkCudaDecodeGraphStateModified()
+        {
+            if (_kvCacheK == null || _kvCacheV == null)
+                return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l))
+                    continue;
+                CudaFusedOps.TryMarkDeviceModified(_kvCacheK[l]);
+                CudaFusedOps.TryMarkDeviceModified(_kvCacheV[l]);
+            }
+        }
+
+        private string BuildCudaDecodeGraphKey(Tensor graphPle, int attendLen)
+        {
+            var key = new StringBuilder(64 + Config.NumLayers * 36);
+            // A graph captured above the global-attention crossover contains the
+            // partition+reduce route and must not replay for a short context (or
+            // vice versa). Keep both tiers cached so a long startup warmup cannot
+            // replace the fast single-block graph used by short requests.
+            int attentionRouteTier = CudaFusedOps.GetGqaDecodeAttentionRouteTier(
+                _kvCacheDtype.ToDType() == DType.Float16,
+                circular: false,
+                Config.NumHeads,
+                _numGlobalKVHeads,
+                _globalHeadDim,
+                attendLen,
+                _kvCacheGlobalCapacity);
+            key.Append("g4dec|").Append(_kvCacheGlobalCapacity)
+                .Append("|attn=").Append(attentionRouteTier);
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l))
+                    continue;
+                key.Append('|')
+                    .Append(CudaFusedOps.GetDevicePointer(_kvCacheK[l]).ToInt64().ToString("x"))
+                    .Append(',')
+                    .Append(CudaFusedOps.GetDevicePointer(_kvCacheV[l]).ToInt64().ToString("x"));
+            }
+            key.Append("|ple=")
+                .Append(CudaFusedOps.GetDevicePointer(graphPle).ToInt64().ToString("x"))
+                .Append("|rl=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeFreqsLocal).ToInt64().ToString("x"))
+                .Append("|rg=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeFreqsGlobal).ToInt64().ToString("x"))
+                .Append("|rcl=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeCosLocal).ToInt64().ToString("x"))
+                .Append("|rsl=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeSinLocal).ToInt64().ToString("x"))
+                .Append("|rcg=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeCosGlobal).ToInt64().ToString("x"))
+                .Append("|rsg=")
+                .Append(CudaFusedOps.GetDevicePointer(_cudaDecodeRopeSinGlobal).ToInt64().ToString("x"));
+            return key.ToString();
+        }
+
+        private IEnumerable<Tensor> GetCudaDecodeGraphKeepAlive(Tensor graphPle)
+        {
+            if (_cudaDecodeRopeFreqsLocal != null)
+                yield return _cudaDecodeRopeFreqsLocal;
+            if (_cudaDecodeRopeFreqsGlobal != null)
+                yield return _cudaDecodeRopeFreqsGlobal;
+            if (_cudaDecodeRopeCosLocal != null)
+                yield return _cudaDecodeRopeCosLocal;
+            if (_cudaDecodeRopeSinLocal != null)
+                yield return _cudaDecodeRopeSinLocal;
+            if (_cudaDecodeRopeCosGlobal != null)
+                yield return _cudaDecodeRopeCosGlobal;
+            if (_cudaDecodeRopeSinGlobal != null)
+                yield return _cudaDecodeRopeSinGlobal;
+            if (graphPle != null)
+                yield return graphPle;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_kvDonorMap.ContainsKey(l))
+                    continue;
+                if (_kvCacheK?[l] != null)
+                    yield return _kvCacheK[l];
+                if (_kvCacheV?[l] != null)
+                    yield return _kvCacheV[l];
+            }
+        }
+
+        private void InvalidateCudaDecodeGraphs()
+        {
+            _cudaDecodeGraphs?.Dispose();
+            _cudaDecodeGraphs = null;
         }
 
         #region Fused Decode
@@ -3646,8 +4129,20 @@ namespace TensorSharp.Models
             else
             {
                 Ops.RMSNorm(attnOut, attnOut, _weights[$"{prefix}.post_attention_norm.weight"], null, Config.Eps);
-                Ops.Add(attnOut, attnOut, hidden);
-                hidden.Dispose();
+                // A CUDA decode graph owns one stable residual tensor. Preserve
+                // that tensor even when the fused norm+add kernel declines, so
+                // the layer stack's output pointer remains its input pointer.
+                if (_backend == BackendType.Cuda && seqLen == 1)
+                {
+                    Ops.Add(hidden, hidden, attnOut);
+                    attnOut.Dispose();
+                    attnOut = hidden;
+                }
+                else
+                {
+                    Ops.Add(attnOut, attnOut, hidden);
+                    hidden.Dispose();
+                }
             }
 
             Tensor result;
@@ -5092,9 +5587,27 @@ namespace TensorSharp.Models
             {
                 if (!isShared)
                 {
-                    int cachePos = isLocal ? (startPos % _kvCacheSize[layer]) : startPos;
-                    CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
-                        kvHeads, hd, cachePos);
+                    bool copiedCircularCuda = false;
+                    if (isLocal && _backend == BackendType.Cuda)
+                    {
+                        using var kHeads = k.View(kvHeads, 1, hd);
+                        using var vHeads = v.View(kvHeads, 1, hd);
+                        int cacheSize = _kvCacheSize[layer];
+                        // Pass the absolute position and let the CUDA kernel
+                        // apply modulo addressing. During graph replay it reads
+                        // that position from CudaDecodeDynParams.
+                        copiedCircularCuda =
+                            CudaFusedOps.TryCopyHeadFirstToCache(
+                                _kvCacheK[layer], kHeads, startPos, 1, cacheSize, true) &&
+                            CudaFusedOps.TryCopyHeadFirstToCache(
+                                _kvCacheV[layer], vHeads, startPos, 1, cacheSize, true);
+                    }
+                    if (!copiedCircularCuda)
+                    {
+                        int cachePos = isLocal ? (startPos % _kvCacheSize[layer]) : startPos;
+                        CopyToCacheDecode(_kvCacheK[layer], k, _kvCacheV[layer], v,
+                            kvHeads, hd, cachePos);
+                    }
                     // Periodically materialize the KV cache to break the
                     // unbounded slice_update chain that MLX's lazy graph
                     // builds up one node per decode step. Without this,
@@ -5261,8 +5774,20 @@ namespace TensorSharp.Models
                 // applies a plain causal+window mask and cannot honour the
                 // bidirectional image span, so fall back to the full O(n┬▓)
                 // ApplyCausalMask path which does.
+                //
+                // On CUDA the fused GQA prefill kernel applies the sliding window
+                // in-kernel (flash-style: no O(n^2) score tensor, GQA read in place),
+                // so it is both faster and just as memory-safe as this block path —
+                // and critically it stays on the GPU. The block path here uses
+                // Ops.RepeatInterleave (ExpandKVHeads) + ApplyCausalMask, both of which
+                // fall back to the CPU on the direct CUDA backend (host round-trips
+                // that dominated long-prompt prefill; see PrefillBench). So prefer the
+                // fused kernel on CUDA whenever it can take the sequence (kvLen <= 8192),
+                // keeping the CPU block path only for other backends / longer sequences.
+                bool cudaFusedCanWindow = _backend == BackendType.Cuda && kvIsSeqHeads
+                    && exceptPositions == null && kvLen <= 8192;
                 bool useWindowedAttn = isLocal && kvIsSeqHeads && seqLen > _slidingWindow * 4
-                    && exceptPositions == null;
+                    && exceptPositions == null && !cudaFusedCanWindow;
 
                 // Fused prefill attention: run Q*K^T ÔåÆ mask ÔåÆ softmax ÔåÆ *V as a
                 // a fused backend kernel where available, eliminating several dispatches
@@ -5270,7 +5795,20 @@ namespace TensorSharp.Models
                 bool canUseFusedPrefillAttn = !useWindowedAttn && kvIsSeqHeads && exceptPositions == null;
                 result = null;
 
-                if (IsGgmlBackend && canUseFusedPrefillAttn)
+                // Full global attention has enough arithmetic intensity to benefit from
+                // cuBLAS once the prompt has a few hundred rows. Expand grouped K/V
+                // on-device, then use batched GEMMs around the fused causal softmax.
+                // Route this before the scalar CUDA fused kernel for both compact
+                // current-chunk K/V and the strided live cache.
+                if (_backend == BackendType.Cuda && !isLocal && exceptPositions == null
+                    && TryGlobalMaterializedAttentionCuda(qHeads, kvSrcK, kvSrcV,
+                        Config.NumHeads, kvHeads, hd, seqLen, kvLen,
+                        checked((int)kvSrcK.Sizes[1]), out result))
+                {
+                    qHeads.Dispose();
+                }
+
+                if (result == null && IsGgmlBackend && canUseFusedPrefillAttn)
                 {
                     int windowSize = isLocal ? _slidingWindow : 0;
                     int maskStart = kvLen - seqLen;
@@ -5284,7 +5822,7 @@ namespace TensorSharp.Models
                         maskStart, windowSize, 1.0f);
                     qHeads.Dispose();
                 }
-                else if (_backend == BackendType.Cuda && canUseFusedPrefillAttn)
+                else if (result == null && _backend == BackendType.Cuda && canUseFusedPrefillAttn)
                 {
                     int windowSize = isLocal ? _slidingWindow : 0;
                     int maskStart = kvLen - seqLen;
@@ -5303,7 +5841,7 @@ namespace TensorSharp.Models
                         fusedResult.Dispose();
                     }
                 }
-                else if (_backend == BackendType.Mlx && canUseFusedPrefillAttn)
+                else if (result == null && _backend == BackendType.Mlx && canUseFusedPrefillAttn)
                 {
                     int windowSize = isLocal ? _slidingWindow : 0;
                     int maskStart = kvLen - seqLen;
@@ -5323,16 +5861,8 @@ namespace TensorSharp.Models
                     }
                 }
 
-                // CUDA global (full-attention) verify: the K/V live in the linear cache
-                // (kvIsSeqHeads == false), so the seq-heads fused prefill above can't take
-                // it without a contiguous repack. Run the fused GQA prefill kernel against
-                // the live cache in place (kvStride = cacheLen) ÔÇö ONE launch, cache read
-                // once ÔÇö replacing the legacy ExpandKVHeads + batched-matmul + separate-
-                // softmax path that materializes [numHeads,kvLen,hd] + an
-                // [numHeads,seqLen,kvLen] score tensor and scales poorly with the verify
-                // window. Local/SWA layers keep their windowed/seq-heads paths; multimodal
-                // (exceptPositions) keeps the masked path. Bounded to the verify window so
-                // large chunked-prefill chunks stay on the legacy path (no prefill churn).
+                // For small prompts, or when materializing the score matrix would exceed
+                // the bounded workspace, keep the flash-style live-cache kernel.
                 if (result == null && _backend == BackendType.Cuda && !isLocal
                     && seqLen <= GlobalLiveCacheAttnMaxSeqLen && exceptPositions == null
                     && TryGlobalLiveCacheAttentionCuda(qHeads, kvSrcK, kvSrcV,
@@ -5594,6 +6124,7 @@ namespace TensorSharp.Models
         private unsafe void ApplyNeoXRoPEHeadFirst(Tensor data, int numHeads, int headDim,
             int seqLen, int startPos, float[] freqs)
         {
+            SelectNeoXRopeSlot(freqs);
             int ropeHalf = freqs.Length;
             bool rebuiltTables = false;
 
@@ -5827,6 +6358,7 @@ namespace TensorSharp.Models
             if (rotHalf <= 0 || rotHalf * 2 > headDim) return false;
 
             // Build cos/sin tables for the scalar decode position.
+            SelectNeoXRopeSlot(freqs);
             int tableSize = rotHalf;
             if (_neoXRopeCos == null || _neoXRopeCos.Length != tableSize)
             {
@@ -5874,6 +6406,35 @@ namespace TensorSharp.Models
         private unsafe void ApplyNeoXRoPEDecode(Tensor data, int numHeads, int headDim, int position, float[] freqs)
         {
             int ropeHalf = freqs.Length;
+
+            // Capture binds stable tables populated once at the head of the
+            // graph from the live dynamic position. Reusing them here mirrors
+            // eager decode and avoids doing sincosf for every head and layer.
+            if (_backend == BackendType.Cuda && _cudaDecodeGraphCaptureActive)
+            {
+                Tensor graphCos = ReferenceEquals(freqs, _ropeFreqsLocal)
+                    ? _cudaDecodeRopeCosLocal
+                    : ReferenceEquals(freqs, _ropeFreqsGlobal)
+                        ? _cudaDecodeRopeCosGlobal
+                        : null;
+                Tensor graphSin = ReferenceEquals(freqs, _ropeFreqsLocal)
+                    ? _cudaDecodeRopeSinLocal
+                    : ReferenceEquals(freqs, _ropeFreqsGlobal)
+                        ? _cudaDecodeRopeSinGlobal
+                        : null;
+                if (graphCos != null &&
+                    graphSin != null &&
+                    CudaFusedOps.TryNeoXRoPEFlatInPlace(
+                        data, graphCos, graphSin, numHeads, 1, headDim, ropeHalf))
+                {
+                    return;
+                }
+
+                throw new CudaGraphCaptureAbortedException(
+                    "Gemma graph-stable NeoX RoPE tables unavailable.");
+            }
+
+            SelectNeoXRopeSlot(freqs);
             bool rebuiltTables = false;
             if (_neoXRopeCos == null || _neoXRopeCacheSeqLen != 1 ||
                 _neoXRopeCacheStartPos != position || _neoXRopeCacheFreqs != freqs)
@@ -5928,6 +6489,7 @@ namespace TensorSharp.Models
         private unsafe Tensor ApplyNeoXRoPEPrefill(Tensor data, int numHeads, int headDim,
             int seqLen, int startPos, float[] freqs)
         {
+            SelectNeoXRopeSlot(freqs);
             int ropeHalf = freqs.Length;
             bool rebuiltTables = false;
 
@@ -6017,11 +6579,100 @@ namespace TensorSharp.Models
             return data;
         }
 
-        // Max query rows routed to the global live-cache prefill attention. The MTP
-        // verify window is <= MtpMaxDraftTokens+1 (well under this); larger multi-row
-        // batches (chunked prefill chunk 2+) keep the legacy path, so this stays a
-        // contained verify-window fast path with no prefill blast radius.
-        private const int GlobalLiveCacheAttnMaxSeqLen = 32;
+        // Max query rows routed to the global live-cache prefill attention. The fused
+        // GQA kernel reads the F16 cache in place and does GQA + causal masking in one
+        // launch (no ExpandKVHeads / score-matrix materialization), and is numerically
+        // identical to the legacy path — so it is the right choice for chunked-prefill
+        // chunk 2+ (kvIsSeqHeads == false) too, not just the small MTP verify window.
+        // Without it, global chunk-2 layers fell to the materialized fallback whose
+        // ExpandKVHeads (repeat_interleave) runs on the CPU and dominated long-prompt
+        // prefill (7s+ of CPU fallback on a 3k-token prompt; see PrefillBench). The
+        // kernel itself caps kvLen at 8192 and declines beyond that, so sequences past
+        // the cap still fall through to the legacy path.
+        private const int GlobalLiveCacheAttnMaxSeqLen = 8192;
+
+        private const int GlobalMaterializedAttnMinSeqLen = 256;
+        private const int GlobalMaterializedAttnMaxSeqLen = 2048;
+        private const long GlobalMaterializedAttnMaxScoreBytes = 192L * 1024 * 1024;
+        private static readonly bool GlobalMaterializedAttnEnabled =
+            string.Equals(
+                Environment.GetEnvironmentVariable("TS_CUDA_GEMMA4_GLOBAL_GEMM_ATTN"),
+                "1",
+                StringComparison.Ordinal);
+
+        // Experimental GEMM-based global attention for medium/large prefill chunks
+        // (opt in with TS_CUDA_GEMMA4_GLOBAL_GEMM_ATTN=1):
+        //   Q [H,S,D] * K^T [H,D,K] -> scores [H,S,K]
+        //   fused causal mask + softmax
+        //   scores [H,S,K] * V [H,K,D] -> output [H,S,D]
+        // K/V expansion (including F16->F32) is a single CUDA kernel and never
+        // synchronizes through host memory. The bounded score workspace avoids the
+        // quadratic-memory cliff; larger contexts use the flash-style path below.
+        private bool TryGlobalMaterializedAttentionCuda(
+            Tensor qHeads,
+            Tensor kCache,
+            Tensor vCache,
+            int numHeads,
+            int kvHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            int cacheLen,
+            out Tensor result)
+        {
+            result = null;
+            if (!GlobalMaterializedAttnEnabled ||
+                _backend != BackendType.Cuda ||
+                qHeads == null ||
+                kCache == null ||
+                vCache == null ||
+                seqLen < GlobalMaterializedAttnMinSeqLen ||
+                seqLen > GlobalMaterializedAttnMaxSeqLen ||
+                kvLen < seqLen ||
+                kvLen > cacheLen ||
+                kvLen > 8192 ||
+                numHeads <= 0 ||
+                kvHeads <= 0 ||
+                numHeads % kvHeads != 0)
+            {
+                return false;
+            }
+
+            long scoreElements = (long)numHeads * seqLen * kvLen;
+            if (scoreElements > int.MaxValue ||
+                scoreElements * sizeof(float) > GlobalMaterializedAttnMaxScoreBytes)
+            {
+                return false;
+            }
+
+            int groupSize = numHeads / kvHeads;
+            using var scores = new Tensor(
+                _allocator, DType.Float32, numHeads, seqLen, kvLen);
+
+            using (Tensor kExpanded = ExpandKVHeads(kCache, groupSize, kvLen))
+            using (Tensor kT = kExpanded.Transpose(1, 2))
+            {
+                Ops.AddmmBatch(scores, 0f, scores, 1f, qHeads, kT);
+            }
+
+            int maskStart = kvLen - seqLen;
+            if (!CudaFusedOps.TryAttentionSoftmaxWithSinks(
+                    scores, null, numHeads, seqLen, kvLen,
+                    maskStart, windowSize: 0, scale: 1f))
+            {
+                return false;
+            }
+
+            using var attnOut = new Tensor(
+                _allocator, DType.Float32, numHeads, seqLen, headDim);
+            using (Tensor vExpanded = ExpandKVHeads(vCache, groupSize, kvLen))
+            {
+                Ops.AddmmBatch(attnOut, 0f, attnOut, 1f, scores, vExpanded);
+            }
+
+            result = ReshapeFromHeadsEx(attnOut, numHeads, seqLen, headDim);
+            return true;
+        }
 
         // Global (full-attention) multi-row attention on CUDA in ONE launch against
         // the LIVE linear cache (no per-row decode loop, no ExpandKVHeads/score-tensor
@@ -6668,9 +7319,35 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            // Graph entries own captured scratch blocks and refs to KV/PLE/RoPE
+            // inputs; release them before tearing down those model tensors.
+            InvalidateCudaDecodeGraphs();
+            _cudaDecodeDynParams?.Dispose();
+            _cudaDecodeDynParams = null;
+            _cudaDecodeGraphPleInput?.Dispose();
+            _cudaDecodeGraphPleInput = null;
+            _cudaDecodeRopeFreqsLocal?.Dispose();
+            _cudaDecodeRopeFreqsLocal = null;
+            _cudaDecodeRopeFreqsGlobal?.Dispose();
+            _cudaDecodeRopeFreqsGlobal = null;
+            _cudaDecodeRopeCosLocal?.Dispose();
+            _cudaDecodeRopeCosLocal = null;
+            _cudaDecodeRopeSinLocal?.Dispose();
+            _cudaDecodeRopeSinLocal = null;
+            _cudaDecodeRopeCosGlobal?.Dispose();
+            _cudaDecodeRopeCosGlobal = null;
+            _cudaDecodeRopeSinGlobal?.Dispose();
+            _cudaDecodeRopeSinGlobal = null;
+
             _onesForVNorm?.Dispose();
             _neoXRopeCosTensor?.Dispose();
             _neoXRopeSinTensor?.Dispose();
+            foreach (NeoXRopeSlot slot in _neoXRopeSlotByFreqs.Values)
+            {
+                slot.CosTensor?.Dispose();
+                slot.SinTensor?.Dispose();
+            }
+            _neoXRopeSlotByFreqs.Clear();
             _visionEncoder?.Dispose();
             _audioEncoder?.Dispose();
             foreach (var (emb, _) in _pendingVisionEmbeddingsList)

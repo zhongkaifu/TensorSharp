@@ -25,6 +25,8 @@
 #define GGML_IQ2_S 22
 #define GGML_IQ4_XS 23
 #define TS_QK8_1 32
+#define TS_Q80_F16_CHUNK 2048
+#define TS_Q80_BLOCK_BYTES 34
 
 // Decode-graph dynamic parameter block (device int32[4], see CudaDecodeDynParams):
 // dyn[0] = attend_len (kv length), dyn[1] = kv cache write position,
@@ -583,6 +585,50 @@ extern "C" __global__ void ts_fill_f16(half* output, int count, float value)
         output[i] = __float2half_rn(value);
 }
 
+// Generic 2D strided copy: `rows` rows of `innerBytes` bytes with independent
+// src/dst row pitches. Replaces the per-row cuMemcpyDtoDAsync loop the strided
+// tensor-copy fallback used to issue (one driver call per row; at prefill
+// sizes that was tens of thousands of WDDM submissions per forward pass).
+extern "C" __global__ void ts_copy2d_bytes(
+    const unsigned char* __restrict__ src,
+    unsigned char* __restrict__ dst,
+    long long rows,
+    long long innerBytes,
+    long long srcPitch,
+    long long dstPitch)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long r = blockIdx.y; r < rows; r += gridDim.y)
+    {
+        const unsigned char* s = src + r * srcPitch;
+        unsigned char* d = dst + r * dstPitch;
+        unsigned long long align =
+            (unsigned long long)(size_t)s | (unsigned long long)(size_t)d | (unsigned long long)innerBytes;
+        if ((align & 15ULL) == 0ULL)
+        {
+            const int4* s4 = (const int4*)s;
+            int4* d4 = (int4*)d;
+            long long n = innerBytes >> 4;
+            for (long long j = i; j < n; j += stride)
+                d4[j] = s4[j];
+        }
+        else if ((align & 3ULL) == 0ULL)
+        {
+            const int* s1 = (const int*)s;
+            int* d1 = (int*)d;
+            long long n = innerBytes >> 2;
+            for (long long j = i; j < n; j += stride)
+                d1[j] = s1[j];
+        }
+        else
+        {
+            for (long long j = i; j < innerBytes; j += stride)
+                d[j] = s[j];
+        }
+    }
+}
+
 extern "C" __global__ void ts_unary_f32(const float* input, float* output, int count, int op)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -701,6 +747,54 @@ extern "C" __global__ void ts_dequant_weight_f16(
     int col = (int)(i - (long long)row * in_dim);
     const uint8_t* wrow = weights + (size_t)row * qrow_bytes(type, in_dim);
     output[i] = __float2half(qvalue_at(wrow, type, col));
+}
+
+// Q8_0-specialized whole-weight conversion for the large-row cuBLAS path.
+// Mirroring ggml_cuda's dequantize_block_q8_0_f16, one warp stages 2048
+// quantized values (64 blocks, 2176 raw bytes) exactly once and emits packed
+// half2 output. This removes the generic kernel's per-scalar 64-bit row
+// division, runtime quant-type branch tree, and repeated block-scale loads.
+//
+// The multiply remains in FP32 before the F16 round so this is bit-identical to
+// ts_dequant_weight_f16's Q8_0 branch, including subnormal scales. DeviceWeight
+// allocations carry 16 slack bytes, making the final 4-byte staging load safe
+// when an odd number of 34-byte blocks leaves a two-byte raw tail.
+extern "C" __global__ void ts_dequant_weight_q8_0_f16(
+    const uint8_t* weights, half* output, long long total)
+{
+    constexpr int q8_blocks_per_chunk = TS_Q80_F16_CHUNK / 32;
+    constexpr int raw_bytes_per_chunk = q8_blocks_per_chunk * TS_Q80_BLOCK_BYTES;
+    constexpr int raw_ints_per_chunk = raw_bytes_per_chunk / (int)sizeof(int);
+
+    long long elem_base = (long long)blockIdx.x * TS_Q80_F16_CHUNK;
+    long long raw_base = (elem_base / 32) * TS_Q80_BLOCK_BYTES;
+    long long total_raw_bytes = (total / 32) * TS_Q80_BLOCK_BYTES;
+    const int* src = reinterpret_cast<const int*>(weights + raw_base);
+
+    __shared__ int packed[raw_ints_per_chunk];
+#pragma unroll
+    for (int i = threadIdx.x; i < raw_ints_per_chunk; i += 32)
+    {
+        long long byte_offset = raw_base + (long long)i * sizeof(int);
+        packed[i] = byte_offset < total_raw_bytes ? src[i] : 0;
+    }
+    __syncthreads();
+
+    const uint8_t* staged = reinterpret_cast<const uint8_t*>(packed);
+#pragma unroll
+    for (int local = 2 * threadIdx.x; local < TS_Q80_F16_CHUNK; local += 64)
+    {
+        long long out_idx = elem_base + local;
+        if (out_idx >= total)
+            break;
+
+        const uint8_t* qblock =
+            staged + (local / 32) * TS_Q80_BLOCK_BYTES;
+        float d = __half2float(*reinterpret_cast<const half*>(qblock));
+        char2 qs = *reinterpret_cast<const char2*>(qblock + 2 + (local & 31));
+        half2 result = __floats2half2_rn(d * (float)qs.x, d * (float)qs.y);
+        *reinterpret_cast<half2*>(output + out_idx) = result;
+    }
 }
 
 extern "C" __global__ void ts_convert_f32_f16(const float* src, half* dst, long long count)
@@ -1551,7 +1645,209 @@ extern "C" __global__ void ts_scaled_dot_product_attention_f32(
 // CONTIGUOUS [num_kv_heads, kv_len, head_dim] tensor (the seq-heads case), or the
 // cache capacity for the LIVE cache [num_kv_heads, cache_size, head_dim] read in
 // place (global full-attention verify ÔÇö kv_len <= kv_stride logical positions).
-extern "C" __global__ void ts_gqa_prefill_attention_f32(
+__device__ __forceinline__ float ts_gqa_prefill_cache_to_float(float v)
+{
+    return v;
+}
+
+__device__ __forceinline__ float ts_gqa_prefill_cache_to_float(half v)
+{
+    return __half2float(v);
+}
+
+template <typename cache_t>
+__device__ __forceinline__ float ts_gqa_prefill_warp_dot(
+    const float* q,
+    const cache_t* k,
+    int head_dim)
+{
+    int lane = threadIdx.x & 31;
+    float dot = 0.0f;
+    for (int d = lane; d < head_dim; d += 32)
+        dot += q[d] * ts_gqa_prefill_cache_to_float(k[d]);
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dot += __shfl_down_sync(0xFFFFFFFF, dot, offset);
+    return dot;
+}
+
+// Gemma 4 E4B's local-attention shape is fixed at four Q heads per KV head,
+// d=256 and a <=512-token sliding window.  Tile four adjacent query positions
+// into one CTA as well as all four heads in a GQA group.  The old specialization
+// used one CTA per query position and consequently re-read the same 512 K/V rows
+// four times.  This tile loads each K/V element once and applies it to eight
+// query rows, which is the same reuse principle as a small flash-attention tile.
+//
+// The compact shared score matrix contains 4 heads * 2 queries and at most
+// window+1 key positions.  At the production 512-token window that is 16.1 KiB,
+// comfortably below the 48-KiB per-block limit on the oldest supported devices.
+#define TS_GQA_GROUP4_Q_TILE 2
+template <typename cache_t>
+__device__ __forceinline__ void ts_gqa_prefill_attention_group4_d256_impl(
+    const float* query,
+    const cache_t* key,
+    const cache_t* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    float* scores)
+{
+    constexpr int group_size = 4;
+    constexpr int fixed_head_dim = 256;
+
+    int kv_head = blockIdx.x;
+    int q_start = blockIdx.y * TS_GQA_GROUP4_Q_TILE;
+    if (kv_head >= num_kv_heads || q_start >= seq_len ||
+        num_q_heads != num_kv_heads * group_size ||
+        head_dim != fixed_head_dim || window_size <= 0)
+    {
+        return;
+    }
+
+    int q_count = min(TS_GQA_GROUP4_Q_TILE, seq_len - q_start);
+    int first_visible = mask_start + q_start;
+    int last_visible = first_visible + q_count - 1;
+    int min_visible = max(0, first_visible - window_size + 1);
+    int max_visible = min(last_visible, kv_len - 1);
+    if (min_visible > max_visible)
+        return;
+
+    int score_count = max_visible - min_visible + 1;
+    int score_stride = min(kv_len, window_size + TS_GQA_GROUP4_Q_TILE - 1);
+    int q_head_base = kv_head * group_size;
+    int score_rows = q_count * group_size;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+
+    // One warp owns one key at a time.  A lane loads K[d] once and applies it
+    // to the 4-head x up-to-4-query tile before independent warp reductions.
+    for (int t = warp; t < score_count; t += num_warps)
+    {
+        int k_pos = min_visible + t;
+        const cache_t* k =
+            key + ((size_t)kv_head * kv_stride + k_pos) * fixed_head_dim;
+        float dots[TS_GQA_GROUP4_Q_TILE * group_size] = { 0.0f };
+#pragma unroll
+        for (int d = lane; d < fixed_head_dim; d += 32)
+        {
+            float kv = ts_gqa_prefill_cache_to_float(k[d]);
+#pragma unroll
+            for (int qi = 0; qi < TS_GQA_GROUP4_Q_TILE; qi++)
+            {
+                if (qi >= q_count)
+                    continue;
+#pragma unroll
+                for (int h = 0; h < group_size; h++)
+                {
+                    const float* q =
+                        query + ((size_t)(q_head_base + h) * seq_len + q_start + qi) * fixed_head_dim;
+                    dots[qi * group_size + h] += q[d] * kv;
+                }
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+#pragma unroll
+            for (int r = 0; r < TS_GQA_GROUP4_Q_TILE * group_size; r++)
+                dots[r] += __shfl_down_sync(0xFFFFFFFF, dots[r], offset);
+        }
+        if (lane == 0)
+        {
+#pragma unroll
+            for (int qi = 0; qi < TS_GQA_GROUP4_Q_TILE; qi++)
+            {
+                if (qi >= q_count)
+                    continue;
+                int visible = first_visible + qi;
+                int row_min = max(0, visible - window_size + 1);
+                bool allowed = k_pos >= row_min && k_pos <= min(visible, kv_len - 1);
+#pragma unroll
+                for (int h = 0; h < group_size; h++)
+                {
+                    int r = qi * group_size + h;
+                    scores[r * score_stride + t] =
+                        allowed ? dots[r] * scale : -FLT_MAX;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Normalize all score rows concurrently. Store normalized probabilities so
+    // the V phase avoids reapplying inv_sum for every output dimension.
+    for (int r = warp; r < score_rows; r += num_warps)
+    {
+        float* row = scores + r * score_stride;
+        float max_v = -FLT_MAX;
+        for (int t = lane; t < score_count; t += 32)
+            max_v = fmaxf(max_v, row[t]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            max_v = fmaxf(max_v, __shfl_down_sync(0xFFFFFFFF, max_v, offset));
+        max_v = __shfl_sync(0xFFFFFFFF, max_v, 0);
+
+        float sum = 0.0f;
+        for (int t = lane; t < score_count; t += 32)
+        {
+            float p = expf(row[t] - max_v);
+            row[t] = p;
+            sum += p;
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum = __shfl_sync(0xFFFFFFFF, sum, 0);
+        float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int t = lane; t < score_count; t += 32)
+            row[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // d=256 matches the 256-thread block, so every thread owns one V column.
+    // It fetches V[d] once per key and updates the full query/head tile.
+    int d = threadIdx.x;
+    if (d < fixed_head_dim)
+    {
+        float acc[TS_GQA_GROUP4_Q_TILE * group_size] = { 0.0f };
+        const cache_t* v =
+            value + ((size_t)kv_head * kv_stride + min_visible) * fixed_head_dim + d;
+        for (int t = 0; t < score_count; t++, v += fixed_head_dim)
+        {
+            float vv = ts_gqa_prefill_cache_to_float(*v);
+#pragma unroll
+            for (int r = 0; r < TS_GQA_GROUP4_Q_TILE * group_size; r++)
+            {
+                if (r < score_rows)
+                    acc[r] += scores[r * score_stride + t] * vv;
+            }
+        }
+
+#pragma unroll
+        for (int qi = 0; qi < TS_GQA_GROUP4_Q_TILE; qi++)
+        {
+            if (qi >= q_count)
+                continue;
+            size_t out_base =
+                ((size_t)(q_start + qi) * num_q_heads + q_head_base) * fixed_head_dim + d;
+#pragma unroll
+            for (int h = 0; h < group_size; h++)
+                output[out_base + (size_t)h * fixed_head_dim] = acc[qi * group_size + h];
+        }
+    }
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_d256_f32(
     const float* query,
     const float* key,
     const float* value,
@@ -1565,6 +1861,1009 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     int window_size,
     float scale,
     int kv_stride)
+{
+    extern __shared__ float scores[];
+    ts_gqa_prefill_attention_group4_d256_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        scores);
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_d256_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    extern __shared__ float scores[];
+    ts_gqa_prefill_attention_group4_d256_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        scores);
+}
+
+// Gemma 4 global attention uses the same four-query-head GQA group as local
+// attention, but d=512 and no sliding window. One CTA computes all four query
+// heads for a (query position, KV head) pair, so every K/V value is fetched once
+// instead of four times by the generic one-CTA-per-query-head kernel. The score
+// workspace is 4*kv_len floats; dispatch caps kv_len at 2048 (32 KiB).
+template <typename cache_t>
+__device__ __forceinline__ void ts_gqa_prefill_attention_group4_d512_impl(
+    const float* query,
+    const cache_t* key,
+    const cache_t* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    float* scores)
+{
+    constexpr int group_size = 4;
+    constexpr int fixed_head_dim = 512;
+
+    int kv_head = blockIdx.x;
+    int q_pos = blockIdx.y;
+    if (kv_head >= num_kv_heads || q_pos >= seq_len ||
+        num_q_heads != num_kv_heads * group_size ||
+        head_dim != fixed_head_dim || window_size != 0 || kv_len > 2048)
+    {
+        return;
+    }
+
+    int visible = min(mask_start + q_pos, kv_len - 1);
+    int score_count = visible + 1;
+    if (score_count <= 0)
+        return;
+
+    int q_head_base = kv_head * group_size;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+
+    // One warp owns one key at a time. K[d] is shared across all four query
+    // heads before the four independent warp reductions.
+    for (int k_pos = warp; k_pos < score_count; k_pos += num_warps)
+    {
+        const cache_t* k =
+            key + ((size_t)kv_head * kv_stride + k_pos) * fixed_head_dim;
+        float dots[group_size] = { 0.0f };
+#pragma unroll
+        for (int d = lane; d < fixed_head_dim; d += 32)
+        {
+            float kv = ts_gqa_prefill_cache_to_float(k[d]);
+#pragma unroll
+            for (int h = 0; h < group_size; h++)
+            {
+                const float* q =
+                    query + ((size_t)(q_head_base + h) * seq_len + q_pos) * fixed_head_dim;
+                dots[h] += q[d] * kv;
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+#pragma unroll
+            for (int h = 0; h < group_size; h++)
+                dots[h] += __shfl_down_sync(0xFFFFFFFF, dots[h], offset);
+        }
+        if (lane == 0)
+        {
+#pragma unroll
+            for (int h = 0; h < group_size; h++)
+                scores[h * kv_len + k_pos] = dots[h] * scale;
+        }
+    }
+    __syncthreads();
+
+    // Four warps normalize the four query-head score rows concurrently.
+    if (warp < group_size)
+    {
+        float* row = scores + warp * kv_len;
+        float max_v = -FLT_MAX;
+        for (int k_pos = lane; k_pos < score_count; k_pos += 32)
+            max_v = fmaxf(max_v, row[k_pos]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            max_v = fmaxf(max_v, __shfl_down_sync(0xFFFFFFFF, max_v, offset));
+        max_v = __shfl_sync(0xFFFFFFFF, max_v, 0);
+
+        float sum = 0.0f;
+        for (int k_pos = lane; k_pos < score_count; k_pos += 32)
+        {
+            float p = expf(row[k_pos] - max_v);
+            row[k_pos] = p;
+            sum += p;
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum = __shfl_sync(0xFFFFFFFF, sum, 0);
+        float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int k_pos = lane; k_pos < score_count; k_pos += 32)
+            row[k_pos] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Each thread owns two output dimensions. V[d] is reused for all four
+    // query heads, cutting the dominant global-memory traffic by 4x.
+    for (int d = threadIdx.x; d < fixed_head_dim; d += blockDim.x)
+    {
+        float acc[group_size] = { 0.0f };
+        const cache_t* v =
+            value + (size_t)kv_head * kv_stride * fixed_head_dim + d;
+        for (int k_pos = 0; k_pos < score_count; k_pos++, v += fixed_head_dim)
+        {
+            float vv = ts_gqa_prefill_cache_to_float(*v);
+#pragma unroll
+            for (int h = 0; h < group_size; h++)
+                acc[h] += scores[h * kv_len + k_pos] * vv;
+        }
+
+        size_t out_base =
+            ((size_t)q_pos * num_q_heads + q_head_base) * fixed_head_dim + d;
+#pragma unroll
+        for (int h = 0; h < group_size; h++)
+            output[out_base + (size_t)h * fixed_head_dim] = acc[h];
+    }
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_d512_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    extern __shared__ float scores[];
+    ts_gqa_prefill_attention_group4_d512_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        scores);
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_d512_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    extern __shared__ float scores[];
+    ts_gqa_prefill_attention_group4_d512_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        scores);
+}
+
+// Long-context d=512 variant. One warp owns one query head and maintains a
+// numerically stable online softmax while walking the visible K/V rows. This
+// removes the 4*kv_len score workspace (and its 2,048-token shared-memory
+// ceiling) while keeping Q and the output accumulators resident in registers.
+// The four warps read the same GQA K/V row together, so the duplicate loads hit
+// the same cache lines even though each warp advances its own softmax state.
+template <typename cache_t>
+__device__ __forceinline__ void ts_gqa_prefill_attention_group4_online_d512_impl(
+    const float* query,
+    const cache_t* key,
+    const cache_t* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    constexpr int group_size = 4;
+    constexpr int fixed_head_dim = 512;
+    constexpr int values_per_lane = fixed_head_dim / 32;
+
+    const int kv_head = blockIdx.x;
+    const int q_pos = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (kv_head >= num_kv_heads || q_pos >= seq_len ||
+        warp >= group_size ||
+        num_q_heads != num_kv_heads * group_size ||
+        head_dim != fixed_head_dim || window_size != 0)
+    {
+        return;
+    }
+
+    const int visible = min(mask_start + q_pos, kv_len - 1);
+    if (visible < 0)
+        return;
+
+    const int q_head = kv_head * group_size + warp;
+    const float* q =
+        query + ((size_t)q_head * seq_len + q_pos) * fixed_head_dim;
+    float q_values[values_per_lane];
+    float acc[values_per_lane] = { 0.0f };
+#pragma unroll
+    for (int i = 0; i < values_per_lane; i++)
+        q_values[i] = q[lane + i * 32];
+
+    float running_max = -FLT_MAX;
+    float running_sum = 0.0f;
+    for (int k_pos = 0; k_pos <= visible; k_pos++)
+    {
+        const cache_t* k =
+            key + ((size_t)kv_head * kv_stride + k_pos) * fixed_head_dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < values_per_lane; i++)
+            dot = fmaf(q_values[i],
+                ts_gqa_prefill_cache_to_float(k[lane + i * 32]), dot);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(0xFFFFFFFF, dot, offset);
+        dot = __shfl_sync(0xFFFFFFFF, dot, 0) * scale;
+
+        const float next_max = fmaxf(running_max, dot);
+        const float old_scale =
+            running_max == -FLT_MAX ? 0.0f : expf(running_max - next_max);
+        const float new_scale = expf(dot - next_max);
+        const cache_t* v =
+            value + ((size_t)kv_head * kv_stride + k_pos) * fixed_head_dim;
+#pragma unroll
+        for (int i = 0; i < values_per_lane; i++)
+        {
+            const float vv =
+                ts_gqa_prefill_cache_to_float(v[lane + i * 32]);
+            acc[i] = fmaf(new_scale, vv, old_scale * acc[i]);
+        }
+        running_sum = fmaf(old_scale, running_sum, new_scale);
+        running_max = next_max;
+    }
+
+    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    float* out =
+        output + ((size_t)q_pos * num_q_heads + q_head) * fixed_head_dim;
+#pragma unroll
+    for (int i = 0; i < values_per_lane; i++)
+        out[lane + i * 32] = acc[i] * inv_sum;
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_online_d512_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    ts_gqa_prefill_attention_group4_online_d512_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride);
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_group4_online_d512_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride)
+{
+    ts_gqa_prefill_attention_group4_online_d512_impl(
+        query, key, value, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride);
+}
+
+// ---------------------------------------------------------------------------
+// Flash-style tiled GQA prefill attention (f16 K/V, group-of-4 query heads).
+//
+// The older group4 prefill kernels above process at most 4 queries per CTA and
+// re-read the query vectors from GLOBAL memory for every visible key, so a
+// 2048-token Gemma prefill spent 6.7 ms per SWA layer / 26 ms per global layer
+// on this GPU. This kernel follows the ggml_cuda flash-attention structure
+// instead:
+//   * one CTA owns a (kv_head, QROWS-query) tile; its 4*QROWS score rows share
+//     every K/V row the CTA reads;
+//   * the Q tile is staged in shared memory ONCE (f32, no precision change);
+//   * softmax is the numerically stable online variant (running max m and
+//     normalizer l per row), so no kv_len-sized score workspace exists and the
+//     kernel has no window-size or kv_len ceiling from shared memory;
+//   * K is read with half2 loads by a warp per (key, query) task; V is read
+//     once per CTA with thread-per-column coalesced rows.
+// Numerics match the two-pass kernels to FP-reassociation order (same
+// f16->f32 promotion of K/V, f32 accumulation, exp in f32).
+//
+// The causal/SWA mask matches ts_gqa_prefill_attention_group4_d256_impl:
+// row qi attends k in [max(0, mask_start+q0+qi-window+1), min(mask_start+q0+qi,
+// kv_len-1)] for window>0, and [0, min(mask_start+q0+qi, kv_len-1)] for
+// window==0. Requires blockDim.x == 256.
+#define TS_FLASH_KCHUNK 32
+
+// Two consecutive cache values as floats (half2 load for f16, float2 for f32),
+// so the flash kernel below can run on both the f16 KV cache and the current
+// chunk's still-f32 K/V tensors with identical structure.
+__device__ __forceinline__ float2 ts_flash_load2(const half* p)
+{
+    return __half22float2(*reinterpret_cast<const half2*>(p));
+}
+
+__device__ __forceinline__ float2 ts_flash_load2(const float* p)
+{
+    return *reinterpret_cast<const float2*>(p);
+}
+
+__device__ __forceinline__ float ts_flash_load1(const half* p)
+{
+    return __half2float(*p);
+}
+
+__device__ __forceinline__ float ts_flash_load1(const float* p)
+{
+    return *p;
+}
+
+template <int HEAD_DIM, int QROWS, typename cache_t>
+__device__ __forceinline__ void ts_gqa_prefill_flash_group4_impl(
+    const float* __restrict__ query,
+    const cache_t* __restrict__ key,
+    const cache_t* __restrict__ value,
+    const float* __restrict__ sinks,
+    float* __restrict__ output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    constexpr int group_size = 4;
+    constexpr int ROWS = QROWS * group_size;
+    constexpr int COLS_PER_THREAD = HEAD_DIM / 256;
+    constexpr int half_dim = HEAD_DIM / 2;
+
+    int kv_head = blockIdx.x;
+    int q0 = blockIdx.y * QROWS;
+    if (kv_head >= num_kv_heads || q0 >= seq_len ||
+        num_q_heads != num_kv_heads * group_size || head_dim != HEAD_DIM)
+    {
+        return;
+    }
+
+    int q_count = min(QROWS, seq_len - q0);
+    int q_head_base = kv_head * group_size;
+
+    extern __shared__ float ws[];
+    float* q_s = ws;                                   // ROWS * HEAD_DIM
+    float* scores = q_s + ROWS * HEAD_DIM;             // ROWS * TS_FLASH_KCHUNK
+    float* m_s = scores + ROWS * TS_FLASH_KCHUNK;      // ROWS
+    float* l_s = m_s + ROWS;                           // ROWS
+    float* alpha_s = l_s + ROWS;                       // ROWS
+
+    for (int i = threadIdx.x; i < ROWS * HEAD_DIM; i += blockDim.x)
+    {
+        int r = i / HEAD_DIM;
+        int qi = r >> 2;
+        int h = r & 3;
+        int d = i - r * HEAD_DIM;
+        q_s[i] = qi < q_count
+            ? query[((size_t)(q_head_base + h) * seq_len + q0 + qi) * HEAD_DIM + d]
+            : 0.0f;
+    }
+    if (threadIdx.x < ROWS)
+    {
+        // An attention sink is one extra per-head logit in the softmax
+        // denominator with no V row: seed the running max with it and the
+        // normalizer with its exp(sink - m) == 1. Every later chunk's alpha
+        // rescaling then carries exp(sink - m_final) forward exactly like the
+        // two-pass sinks kernels' explicit term.
+        float m0 = -FLT_MAX;
+        float l0 = 0.0f;
+        if (has_sinks)
+        {
+            m0 = sinks[q_head_base + (threadIdx.x & 3)];
+            l0 = 1.0f;
+        }
+        m_s[threadIdx.x] = m0;
+        l_s[threadIdx.x] = l0;
+    }
+    __syncthreads();
+
+    int first_visible = mask_start + q0;
+    int lo = window_size > 0 ? max(0, first_visible - window_size + 1) : 0;
+    int hi = min(first_visible + q_count - 1, kv_len - 1);
+
+    float o_acc[ROWS * COLS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < ROWS * COLS_PER_THREAD; i++)
+        o_acc[i] = 0.0f;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+
+    for (int kc = lo; kc <= hi; kc += TS_FLASH_KCHUNK)
+    {
+        int chunk_len = min(TS_FLASH_KCHUNK, hi - kc + 1);
+
+        // Phase A: one warp per (key, query) task; the query's 4 heads share
+        // the half2 K row the warp streams in.
+        int tasks = chunk_len * QROWS;
+        for (int t = warp; t < tasks; t += num_warps)
+        {
+            int ki = t % chunk_len;
+            int qi = t / chunk_len;
+            int k_pos = kc + ki;
+            const cache_t* krow =
+                key + ((size_t)kv_head * kv_stride + k_pos) * HEAD_DIM;
+            const float* qrow = q_s + (size_t)(qi * group_size) * HEAD_DIM;
+            float dot0 = 0.0f;
+            float dot1 = 0.0f;
+            float dot2 = 0.0f;
+            float dot3 = 0.0f;
+#pragma unroll
+            for (int d2 = lane; d2 < half_dim; d2 += 32)
+            {
+                float2 kf = ts_flash_load2(krow + d2 * 2);
+                int d = d2 * 2;
+                dot0 = fmaf(qrow[0 * HEAD_DIM + d], kf.x, dot0);
+                dot0 = fmaf(qrow[0 * HEAD_DIM + d + 1], kf.y, dot0);
+                dot1 = fmaf(qrow[1 * HEAD_DIM + d], kf.x, dot1);
+                dot1 = fmaf(qrow[1 * HEAD_DIM + d + 1], kf.y, dot1);
+                dot2 = fmaf(qrow[2 * HEAD_DIM + d], kf.x, dot2);
+                dot2 = fmaf(qrow[2 * HEAD_DIM + d + 1], kf.y, dot2);
+                dot3 = fmaf(qrow[3 * HEAD_DIM + d], kf.x, dot3);
+                dot3 = fmaf(qrow[3 * HEAD_DIM + d + 1], kf.y, dot3);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                dot0 += __shfl_down_sync(0xFFFFFFFF, dot0, offset);
+                dot1 += __shfl_down_sync(0xFFFFFFFF, dot1, offset);
+                dot2 += __shfl_down_sync(0xFFFFFFFF, dot2, offset);
+                dot3 += __shfl_down_sync(0xFFFFFFFF, dot3, offset);
+            }
+            if (lane == 0)
+            {
+                int visible = first_visible + qi;
+                int row_lo = window_size > 0
+                    ? max(0, visible - window_size + 1)
+                    : 0;
+                bool allowed = qi < q_count &&
+                    k_pos >= row_lo &&
+                    k_pos <= min(visible, kv_len - 1);
+                int r = qi * group_size;
+                scores[(r + 0) * TS_FLASH_KCHUNK + ki] =
+                    allowed ? dot0 * scale : -FLT_MAX;
+                scores[(r + 1) * TS_FLASH_KCHUNK + ki] =
+                    allowed ? dot1 * scale : -FLT_MAX;
+                scores[(r + 2) * TS_FLASH_KCHUNK + ki] =
+                    allowed ? dot2 * scale : -FLT_MAX;
+                scores[(r + 3) * TS_FLASH_KCHUNK + ki] =
+                    allowed ? dot3 * scale : -FLT_MAX;
+            }
+        }
+        __syncthreads();
+
+        // Phase B: per-row online-softmax state update; one warp per row, one
+        // score lane each (TS_FLASH_KCHUNK == warp width).
+        for (int r = warp; r < ROWS; r += num_warps)
+        {
+            float sc = lane < chunk_len
+                ? scores[r * TS_FLASH_KCHUNK + lane]
+                : -FLT_MAX;
+            float mx = sc;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFF, mx, offset));
+            float m_old = m_s[r];
+            float m_new = fmaxf(m_old, mx);
+            // Masked lanes (sc == -FLT_MAX) underflow expf to exactly 0.
+            float p = (lane < chunk_len && m_new > -FLT_MAX)
+                ? expf(sc - m_new)
+                : 0.0f;
+            if (lane < chunk_len)
+                scores[r * TS_FLASH_KCHUNK + lane] = p;
+            float sum = p;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+            if (lane == 0)
+            {
+                float alpha = expf(m_old - m_new);
+                alpha_s[r] = alpha;
+                m_s[r] = m_new;
+                l_s[r] = l_s[r] * alpha + sum;
+            }
+        }
+        __syncthreads();
+
+        // Phase C: rescale accumulators by this chunk's alpha, then add the
+        // chunk's probability-weighted V rows. Thread t owns output columns
+        // t, t+256, ... so each V row is one (or two) coalesced 512 B reads.
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+        {
+            float a = alpha_s[r];
+#pragma unroll
+            for (int c = 0; c < COLS_PER_THREAD; c++)
+                o_acc[r * COLS_PER_THREAD + c] *= a;
+        }
+        for (int ki = 0; ki < chunk_len; ki++)
+        {
+            const cache_t* vrow =
+                value + ((size_t)kv_head * kv_stride + kc + ki) * HEAD_DIM;
+            float vv[COLS_PER_THREAD];
+#pragma unroll
+            for (int c = 0; c < COLS_PER_THREAD; c++)
+                vv[c] = ts_flash_load1(vrow + threadIdx.x + c * 256);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+            {
+                float p = scores[r * TS_FLASH_KCHUNK + ki];
+#pragma unroll
+                for (int c = 0; c < COLS_PER_THREAD; c++)
+                    o_acc[r * COLS_PER_THREAD + c] =
+                        fmaf(p, vv[c], o_acc[r * COLS_PER_THREAD + c]);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++)
+    {
+        int qi = r >> 2;
+        if (qi >= q_count)
+            continue;
+        int h = r & 3;
+        float l = l_s[r];
+        float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        size_t out_base =
+            ((size_t)(q0 + qi) * num_q_heads + q_head_base + h) * HEAD_DIM;
+#pragma unroll
+        for (int c = 0; c < COLS_PER_THREAD; c++)
+            output[out_base + threadIdx.x + c * 256] =
+                o_acc[r * COLS_PER_THREAD + c] * inv;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// flash2: flash1's exact warp-cooperative online-softmax structure, but with a
+// LARGER K chunk (KC=64 vs 32). flash1 was neither FLOP- nor occupancy-bound
+// (doubling occupancy via a smaller Q tile changed nothing); it is bound by the
+// SERIAL per-chunk loop -- three __syncthreads plus a cross-chunk online-softmax
+// dependency, repeated once per chunk. Halving the chunk count (KC 32->64) halves
+// those sync rounds. Phase B folds KC/32 scores per lane so a warp still owns a
+// full row. Numerics are byte-for-byte flash1 (f32 Q, f32 accumulation); only the
+// score-reassociation width changes, which stays within the f16/f32 tolerances.
+template <int HEAD_DIM, int QROWS, int KC, typename cache_t>
+__device__ __forceinline__ void ts_gqa_prefill_flash2_group4_impl(
+    const float* __restrict__ query,
+    const cache_t* __restrict__ key,
+    const cache_t* __restrict__ value,
+    const float* __restrict__ sinks,
+    float* __restrict__ output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    constexpr int group_size = 4;
+    constexpr int ROWS = QROWS * group_size;
+    constexpr int COLS_PER_THREAD = HEAD_DIM / 256;
+    constexpr int half_dim = HEAD_DIM / 2;
+
+    int kv_head = blockIdx.x;
+    int q0 = blockIdx.y * QROWS;
+    if (kv_head >= num_kv_heads || q0 >= seq_len ||
+        num_q_heads != num_kv_heads * group_size || head_dim != HEAD_DIM)
+    {
+        return;
+    }
+
+    int q_count = min(QROWS, seq_len - q0);
+    int q_head_base = kv_head * group_size;
+
+    extern __shared__ float ws[];
+    float* q_s = ws;                                   // ROWS * HEAD_DIM
+    float* scores = q_s + ROWS * HEAD_DIM;             // ROWS * KC
+    float* m_s = scores + ROWS * KC;                   // ROWS
+    float* l_s = m_s + ROWS;                           // ROWS
+    float* alpha_s = l_s + ROWS;                       // ROWS
+
+    for (int i = threadIdx.x; i < ROWS * HEAD_DIM; i += blockDim.x)
+    {
+        int r = i / HEAD_DIM;
+        int qi = r >> 2;
+        int h = r & 3;
+        int d = i - r * HEAD_DIM;
+        q_s[i] = qi < q_count
+            ? query[((size_t)(q_head_base + h) * seq_len + q0 + qi) * HEAD_DIM + d]
+            : 0.0f;
+    }
+    if (threadIdx.x < ROWS)
+    {
+        float m0 = -FLT_MAX;
+        float l0 = 0.0f;
+        if (has_sinks)
+        {
+            m0 = sinks[q_head_base + (threadIdx.x & 3)];
+            l0 = 1.0f;
+        }
+        m_s[threadIdx.x] = m0;
+        l_s[threadIdx.x] = l0;
+    }
+    __syncthreads();
+
+    int first_visible = mask_start + q0;
+    int lo = window_size > 0 ? max(0, first_visible - window_size + 1) : 0;
+    int hi = min(first_visible + q_count - 1, kv_len - 1);
+
+    float o_acc[ROWS * COLS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < ROWS * COLS_PER_THREAD; i++)
+        o_acc[i] = 0.0f;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = blockDim.x >> 5;
+
+    for (int kc = lo; kc <= hi; kc += KC)
+    {
+        int chunk_len = min(KC, hi - kc + 1);
+
+        // Phase A: warp per (key, query) task; the query's 4 heads share the
+        // half2/float2 K row the warp streams in — byte-for-byte flash1.
+        int tasks = chunk_len * QROWS;
+        for (int t = warp; t < tasks; t += num_warps)
+        {
+            int ki = t % chunk_len;
+            int qi = t / chunk_len;
+            int k_pos = kc + ki;
+            const cache_t* krow =
+                key + ((size_t)kv_head * kv_stride + k_pos) * HEAD_DIM;
+            const float* qrow = q_s + (size_t)(qi * group_size) * HEAD_DIM;
+            float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+#pragma unroll
+            for (int d2 = lane; d2 < half_dim; d2 += 32)
+            {
+                float2 kf = ts_flash_load2(krow + d2 * 2);
+                int d = d2 * 2;
+                dot0 = fmaf(qrow[0 * HEAD_DIM + d], kf.x, dot0);
+                dot0 = fmaf(qrow[0 * HEAD_DIM + d + 1], kf.y, dot0);
+                dot1 = fmaf(qrow[1 * HEAD_DIM + d], kf.x, dot1);
+                dot1 = fmaf(qrow[1 * HEAD_DIM + d + 1], kf.y, dot1);
+                dot2 = fmaf(qrow[2 * HEAD_DIM + d], kf.x, dot2);
+                dot2 = fmaf(qrow[2 * HEAD_DIM + d + 1], kf.y, dot2);
+                dot3 = fmaf(qrow[3 * HEAD_DIM + d], kf.x, dot3);
+                dot3 = fmaf(qrow[3 * HEAD_DIM + d + 1], kf.y, dot3);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                dot0 += __shfl_down_sync(0xFFFFFFFF, dot0, offset);
+                dot1 += __shfl_down_sync(0xFFFFFFFF, dot1, offset);
+                dot2 += __shfl_down_sync(0xFFFFFFFF, dot2, offset);
+                dot3 += __shfl_down_sync(0xFFFFFFFF, dot3, offset);
+            }
+            if (lane == 0)
+            {
+                int visible = first_visible + qi;
+                int row_lo = window_size > 0
+                    ? max(0, visible - window_size + 1)
+                    : 0;
+                bool allowed = qi < q_count &&
+                    k_pos >= row_lo &&
+                    k_pos <= min(visible, kv_len - 1);
+                int r = qi * group_size;
+                scores[(r + 0) * KC + ki] = allowed ? dot0 * scale : -FLT_MAX;
+                scores[(r + 1) * KC + ki] = allowed ? dot1 * scale : -FLT_MAX;
+                scores[(r + 2) * KC + ki] = allowed ? dot2 * scale : -FLT_MAX;
+                scores[(r + 3) * KC + ki] = allowed ? dot3 * scale : -FLT_MAX;
+            }
+        }
+        __syncthreads();
+
+        // Phase B: per-row online-softmax update. One warp owns a row; KC can
+        // exceed the warp width (fewer, larger chunks = fewer sync rounds, which
+        // is what this kernel is bound by), so each lane folds SLOTS scores.
+        constexpr int SLOTS = KC / 32;
+        for (int r = warp; r < ROWS; r += num_warps)
+        {
+            float sc[SLOTS];
+            float mx = -FLT_MAX;
+#pragma unroll
+            for (int s = 0; s < SLOTS; s++)
+            {
+                int c = lane + s * 32;
+                sc[s] = c < chunk_len ? scores[r * KC + c] : -FLT_MAX;
+                mx = fmaxf(mx, sc[s]);
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFF, mx, offset));
+            float m_old = m_s[r];
+            float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int s = 0; s < SLOTS; s++)
+            {
+                int c = lane + s * 32;
+                float p = (c < chunk_len && m_new > -FLT_MAX) ? expf(sc[s] - m_new) : 0.0f;
+                if (c < chunk_len)
+                    scores[r * KC + c] = p;
+                sum += p;
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+            if (lane == 0)
+            {
+                float alpha = expf(m_old - m_new);
+                alpha_s[r] = alpha;
+                m_s[r] = m_new;
+                l_s[r] = l_s[r] * alpha + sum;
+            }
+        }
+        __syncthreads();
+
+        // Phase C: rescale + probability-weighted V — identical to flash1.
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+        {
+            float a = alpha_s[r];
+#pragma unroll
+            for (int cc = 0; cc < COLS_PER_THREAD; cc++)
+                o_acc[r * COLS_PER_THREAD + cc] *= a;
+        }
+        for (int ki = 0; ki < chunk_len; ki++)
+        {
+            const cache_t* vrow =
+                value + ((size_t)kv_head * kv_stride + kc + ki) * HEAD_DIM;
+            float vv[COLS_PER_THREAD];
+#pragma unroll
+            for (int cc = 0; cc < COLS_PER_THREAD; cc++)
+                vv[cc] = ts_flash_load1(vrow + threadIdx.x + cc * 256);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++)
+            {
+                float p = scores[r * KC + ki];
+#pragma unroll
+                for (int cc = 0; cc < COLS_PER_THREAD; cc++)
+                    o_acc[r * COLS_PER_THREAD + cc] =
+                        fmaf(p, vv[cc], o_acc[r * COLS_PER_THREAD + cc]);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++)
+    {
+        int qi = r >> 2;
+        if (qi >= q_count)
+            continue;
+        int h = r & 3;
+        float l = l_s[r];
+        float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        size_t out_base =
+            ((size_t)(q0 + qi) * num_q_heads + q_head_base + h) * HEAD_DIM;
+#pragma unroll
+        for (int cc = 0; cc < COLS_PER_THREAD; cc++)
+            output[out_base + threadIdx.x + cc * 256] =
+                o_acc[r * COLS_PER_THREAD + cc] * inv;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash2_group4_d256_f16(
+    const float* query, const half* key, const half* value, const float* sinks,
+    float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
+    int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
+{
+    ts_gqa_prefill_flash2_group4_impl<256, 8, 64, half>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash2_group4_d256_f32(
+    const float* query, const float* key, const float* value, const float* sinks,
+    float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
+    int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
+{
+    ts_gqa_prefill_flash2_group4_impl<256, 8, 64, float>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash2_group4_d512_f16(
+    const float* query, const half* key, const half* value, const float* sinks,
+    float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
+    int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
+{
+    ts_gqa_prefill_flash2_group4_impl<512, 4, 64, half>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash2_group4_d512_f32(
+    const float* query, const float* key, const float* value, const float* sinks,
+    float* output, int num_q_heads, int num_kv_heads, int seq_len, int kv_len,
+    int head_dim, int mask_start, int window_size, float scale, int kv_stride, int has_sinks)
+{
+    ts_gqa_prefill_flash2_group4_impl<512, 4, 64, float>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride, has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash_group4_d256_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    ts_gqa_prefill_flash_group4_impl<256, 8, half>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash_group4_d512_f16(
+    const float* query,
+    const half* key,
+    const half* value,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    ts_gqa_prefill_flash_group4_impl<512, 4, half>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash_group4_d256_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    ts_gqa_prefill_flash_group4_impl<256, 8, float>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        has_sinks);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+ts_gqa_prefill_flash_group4_d512_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    const float* sinks,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int has_sinks)
+{
+    ts_gqa_prefill_flash_group4_impl<512, 4, float>(
+        query, key, value, sinks, output, num_q_heads, num_kv_heads,
+        seq_len, kv_len, head_dim, mask_start, window_size, scale, kv_stride,
+        has_sinks);
+}
+
+extern "C" __global__ void ts_gqa_prefill_attention_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    float* output,
+    int num_q_heads,
+    int num_kv_heads,
+    int seq_len,
+    int kv_len,
+    int head_dim,
+    int mask_start,
+    int window_size,
+    float scale,
+    int kv_stride,
+    int warp_cooperative)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1583,15 +2882,35 @@ extern "C" __global__ void ts_gqa_prefill_attention_f32(
     extern __shared__ float scores[];
 
     float max_v = -FLT_MAX;
-    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    if (warp_cooperative)
     {
-        const float* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[d] * k[d];
-        float score = dot * scale;
-        max_v = fmaxf(max_v, score);
-        scores[k_pos] = score;
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int num_warps = blockDim.x >> 5;
+        for (int k_pos = min_visible + warp; k_pos <= max_visible; k_pos += num_warps)
+        {
+            const float* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
+            float dot = ts_gqa_prefill_warp_dot(q, k, head_dim);
+            if (lane == 0)
+            {
+                float score = dot * scale;
+                max_v = fmaxf(max_v, score);
+                scores[k_pos] = score;
+            }
+        }
+    }
+    else
+    {
+        for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+        {
+            const float* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[d] * k[d];
+            float score = dot * scale;
+            max_v = fmaxf(max_v, score);
+            scores[k_pos] = score;
+        }
     }
 
     max_v = block_reduce_max(max_v);
@@ -1803,7 +3122,8 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     int mask_start,
     int window_size,
     float scale,
-    int kv_stride)
+    int kv_stride,
+    int warp_cooperative)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1822,15 +3142,35 @@ extern "C" __global__ void ts_gqa_prefill_attention_f16(
     extern __shared__ float scores[];
 
     float max_v = -FLT_MAX;
-    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    if (warp_cooperative)
     {
-        const half* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[d] * __half2float(k[d]);
-        float score = dot * scale;
-        max_v = fmaxf(max_v, score);
-        scores[k_pos] = score;
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int num_warps = blockDim.x >> 5;
+        for (int k_pos = min_visible + warp; k_pos <= max_visible; k_pos += num_warps)
+        {
+            const half* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
+            float dot = ts_gqa_prefill_warp_dot(q, k, head_dim);
+            if (lane == 0)
+            {
+                float score = dot * scale;
+                max_v = fmaxf(max_v, score);
+                scores[k_pos] = score;
+            }
+        }
+    }
+    else
+    {
+        for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+        {
+            const half* k = key + ((size_t)kv_head * kv_stride + k_pos) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[d] * __half2float(k[d]);
+            float score = dot * scale;
+            max_v = fmaxf(max_v, score);
+            scores[k_pos] = score;
+        }
     }
 
     max_v = block_reduce_max(max_v);
@@ -1882,7 +3222,8 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f32(
     int mask_start,
     int window_size,
     float scale,
-    int has_sinks)
+    int has_sinks,
+    int warp_cooperative)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1901,15 +3242,35 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f32(
     extern __shared__ float scores[];
 
     float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
-    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    if (warp_cooperative)
     {
-        const float* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[d] * k[d];
-        float score = dot * scale;
-        max_v = fmaxf(max_v, score);
-        scores[k_pos] = score;
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int num_warps = blockDim.x >> 5;
+        for (int k_pos = min_visible + warp; k_pos <= max_visible; k_pos += num_warps)
+        {
+            const float* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            float dot = ts_gqa_prefill_warp_dot(q, k, head_dim);
+            if (lane == 0)
+            {
+                float score = dot * scale;
+                max_v = fmaxf(max_v, score);
+                scores[k_pos] = score;
+            }
+        }
+    }
+    else
+    {
+        for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+        {
+            const float* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[d] * k[d];
+            float score = dot * scale;
+            max_v = fmaxf(max_v, score);
+            scores[k_pos] = score;
+        }
     }
 
     max_v = block_reduce_max(max_v);
@@ -1961,7 +3322,8 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f16(
     int mask_start,
     int window_size,
     float scale,
-    int has_sinks)
+    int has_sinks,
+    int warp_cooperative)
 {
     int q_head = blockIdx.x;
     int q_pos = blockIdx.y;
@@ -1980,15 +3342,35 @@ extern "C" __global__ void ts_gqa_prefill_attention_sinks_f16(
     extern __shared__ float scores[];
 
     float max_v = has_sinks ? sinks[q_head] : -FLT_MAX;
-    for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+    if (warp_cooperative)
     {
-        const half* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[d] * __half2float(k[d]);
-        float score = dot * scale;
-        max_v = fmaxf(max_v, score);
-        scores[k_pos] = score;
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        int num_warps = blockDim.x >> 5;
+        for (int k_pos = min_visible + warp; k_pos <= max_visible; k_pos += num_warps)
+        {
+            const half* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            float dot = ts_gqa_prefill_warp_dot(q, k, head_dim);
+            if (lane == 0)
+            {
+                float score = dot * scale;
+                max_v = fmaxf(max_v, score);
+                scores[k_pos] = score;
+            }
+        }
+    }
+    else
+    {
+        for (int k_pos = min_visible + threadIdx.x; k_pos <= max_visible; k_pos += blockDim.x)
+        {
+            const half* k = key_cache + ((size_t)kv_head * cache_size + k_pos) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[d] * __half2float(k[d]);
+            float score = dot * scale;
+            max_v = fmaxf(max_v, score);
+            scores[k_pos] = score;
+        }
     }
 
     max_v = block_reduce_max(max_v);
@@ -2044,7 +3426,13 @@ extern "C" __global__ void ts_gqa_decode_attention_f32(
     if (q_head >= num_q_heads)
         return;
     if (dyn)
+    {
         attend_len = dyn[TS_DYN_ATTEND_LEN];
+        if (circular && attend_len > cache_size)
+            attend_len = cache_size;
+        if (circular)
+            attend_start = max(0, dyn[TS_DYN_KV_WRITE_POS] + 1 - attend_len);
+    }
 
     int group_size = num_q_heads / num_kv_heads;
     int kv_head = q_head / group_size;
@@ -2126,7 +3514,13 @@ extern "C" __global__ void ts_gqa_decode_attention_f16(
     if (q_head >= num_q_heads)
         return;
     if (dyn)
+    {
         attend_len = dyn[TS_DYN_ATTEND_LEN];
+        if (circular && attend_len > cache_size)
+            attend_len = cache_size;
+        if (circular)
+            attend_start = max(0, dyn[TS_DYN_KV_WRITE_POS] + 1 - attend_len);
+    }
 
     int group_size = num_q_heads / num_kv_heads;
     int kv_head = q_head / group_size;
@@ -2189,6 +3583,441 @@ extern "C" __global__ void ts_gqa_decode_attention_f16(
     }
 }
 
+#define TS_GQA_DECODE_GROUP4_HEAD_DIM 512
+#define TS_GQA_DECODE_GROUP4_HEADS 4
+
+// Gemma 4 local/global attention has four query heads for each KV head. The
+// generic decode kernel launches one CTA per query head, so it reads every K/V
+// row four times and maps one thread to an entire d=256/d=512 QK dot product
+// (strided loads across the warp). These specializations map one warp to a key
+// row and share its coalesced K/V loads across all four query heads.
+__device__ __forceinline__ void ts_gqa_decode_group4_scores_f16(
+    const float* query,
+    const half* key_cache,
+    int kv_head,
+    int cache_size,
+    int logical_start,
+    int token_count,
+    float scale,
+    int head_dim,
+    int score_stride,
+    float* scores,
+    float* query_shared,
+    float* shared_max,
+    float* shared_sum)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps = blockDim.x >> 5;
+    const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
+
+    for (int i = tid;
+         i < TS_GQA_DECODE_GROUP4_HEADS * head_dim;
+         i += blockDim.x)
+    {
+        query_shared[i] =
+            query[(size_t)q_head_base * head_dim + i];
+    }
+    __syncthreads();
+
+    const int half_dim = head_dim >> 1;
+    for (int i = warp; i < token_count; i += warps)
+    {
+        // K rows are head_dim halves (512 B / 1 KiB) apart, so half2 loads stay
+        // aligned; a warp pulls 128 B per instruction instead of 64 B.
+        const half2* k2 = reinterpret_cast<const half2*>(key_cache +
+            ((size_t)kv_head * cache_size + logical_start + i) *
+                head_dim);
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        float dot3 = 0.0f;
+        for (int d2 = lane; d2 < half_dim; d2 += 32)
+        {
+            float2 kf = __half22float2(k2[d2]);
+            int d = d2 * 2;
+            dot0 = fmaf(query_shared[0 * head_dim + d], kf.x, dot0);
+            dot0 = fmaf(query_shared[0 * head_dim + d + 1], kf.y, dot0);
+            dot1 = fmaf(query_shared[1 * head_dim + d], kf.x, dot1);
+            dot1 = fmaf(query_shared[1 * head_dim + d + 1], kf.y, dot1);
+            dot2 = fmaf(query_shared[2 * head_dim + d], kf.x, dot2);
+            dot2 = fmaf(query_shared[2 * head_dim + d + 1], kf.y, dot2);
+            dot3 = fmaf(query_shared[3 * head_dim + d], kf.x, dot3);
+            dot3 = fmaf(query_shared[3 * head_dim + d + 1], kf.y, dot3);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            dot0 += __shfl_down_sync(0xFFFFFFFF, dot0, offset);
+            dot1 += __shfl_down_sync(0xFFFFFFFF, dot1, offset);
+            dot2 += __shfl_down_sync(0xFFFFFFFF, dot2, offset);
+            dot3 += __shfl_down_sync(0xFFFFFFFF, dot3, offset);
+        }
+        if (lane == 0)
+        {
+            scores[0 * score_stride + i] = dot0 * scale;
+            scores[1 * score_stride + i] = dot1 * scale;
+            scores[2 * score_stride + i] = dot2 * scale;
+            scores[3 * score_stride + i] = dot3 * scale;
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int h = 0; h < TS_GQA_DECODE_GROUP4_HEADS; h++)
+    {
+        float max_v = -FLT_MAX;
+        for (int i = tid; i < token_count; i += blockDim.x)
+            max_v = fmaxf(max_v, scores[h * score_stride + i]);
+        max_v = block_reduce_max(max_v);
+        if (tid == 0)
+            shared_max[h] = max_v;
+        __syncthreads();
+
+        float sum = 0.0f;
+        for (int i = tid; i < token_count; i += blockDim.x)
+        {
+            float p = expf(scores[h * score_stride + i] - shared_max[h]);
+            scores[h * score_stride + i] = p;
+            sum += p;
+        }
+        sum = block_reduce_sum(sum);
+        if (tid == 0)
+            shared_sum[h] = sum;
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_group4_d512_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    float* output,
+    int num_kv_heads,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    float scale,
+    int score_capacity,
+    const int* dyn)
+{
+    const int kv_head = blockIdx.x;
+    if (kv_head >= num_kv_heads)
+        return;
+    if (dyn)
+        attend_len = dyn[TS_DYN_ATTEND_LEN];
+    attend_len = max(0, min(
+        attend_len,
+        min(score_capacity, cache_size - attend_start)));
+
+    extern __shared__ float workspace[];
+    float* scores = workspace;
+    float* query_shared =
+        scores + TS_GQA_DECODE_GROUP4_HEADS * score_capacity;
+    __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
+    __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
+
+    ts_gqa_decode_group4_scores_f16(
+        query, key_cache, kv_head, cache_size, attend_start, attend_len,
+        scale, TS_GQA_DECODE_GROUP4_HEAD_DIM, score_capacity,
+        scores, query_shared, shared_max, shared_sum);
+
+    const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
+    for (int d = threadIdx.x; d < TS_GQA_DECODE_GROUP4_HEAD_DIM; d += blockDim.x)
+    {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (int i = 0; i < attend_len; i++)
+        {
+            float vv = __half2float(value_cache[
+                ((size_t)kv_head * cache_size + attend_start + i) *
+                    TS_GQA_DECODE_GROUP4_HEAD_DIM + d]);
+            acc0 = fmaf(scores[0 * score_capacity + i], vv, acc0);
+            acc1 = fmaf(scores[1 * score_capacity + i], vv, acc1);
+            acc2 = fmaf(scores[2 * score_capacity + i], vv, acc2);
+            acc3 = fmaf(scores[3 * score_capacity + i], vv, acc3);
+        }
+        float* out = output +
+            (size_t)q_head_base * TS_GQA_DECODE_GROUP4_HEAD_DIM + d;
+        out[0 * TS_GQA_DECODE_GROUP4_HEAD_DIM] =
+            shared_sum[0] > 0.0f ? acc0 / shared_sum[0] : 0.0f;
+        out[1 * TS_GQA_DECODE_GROUP4_HEAD_DIM] =
+            shared_sum[1] > 0.0f ? acc1 / shared_sum[1] : 0.0f;
+        out[2 * TS_GQA_DECODE_GROUP4_HEAD_DIM] =
+            shared_sum[2] > 0.0f ? acc2 / shared_sum[2] : 0.0f;
+        out[3 * TS_GQA_DECODE_GROUP4_HEAD_DIM] =
+            shared_sum[3] > 0.0f ? acc3 / shared_sum[3] : 0.0f;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_group4_d256_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    float* output,
+    int num_kv_heads,
+    int attend_len,
+    int cache_size,
+    float scale,
+    int score_capacity,
+    const int* dyn)
+{
+    const int kv_head = blockIdx.x;
+    if (kv_head >= num_kv_heads)
+        return;
+    if (dyn)
+        attend_len = dyn[TS_DYN_ATTEND_LEN];
+    // Before the first wrap the valid cache prefix is physically linear. Once
+    // the SWA ring is full, chronological rotation is irrelevant: softmax
+    // attention is invariant to applying the same permutation to K/V.
+    attend_len = max(0, min(attend_len, min(cache_size, score_capacity)));
+
+    const int head_dim = 256;
+    extern __shared__ float workspace[];
+    float* scores = workspace;
+    float* query_shared =
+        scores + TS_GQA_DECODE_GROUP4_HEADS * score_capacity;
+    __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
+    __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
+
+    ts_gqa_decode_group4_scores_f16(
+        query, key_cache, kv_head, cache_size, 0, attend_len,
+        scale, head_dim, score_capacity,
+        scores, query_shared, shared_max, shared_sum);
+
+    const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (int i = 0; i < attend_len; i++)
+        {
+            float vv = __half2float(value_cache[
+                ((size_t)kv_head * cache_size + i) * head_dim + d]);
+            acc0 = fmaf(scores[0 * score_capacity + i], vv, acc0);
+            acc1 = fmaf(scores[1 * score_capacity + i], vv, acc1);
+            acc2 = fmaf(scores[2 * score_capacity + i], vv, acc2);
+            acc3 = fmaf(scores[3 * score_capacity + i], vv, acc3);
+        }
+        float* out = output + (size_t)q_head_base * head_dim + d;
+        out[0 * head_dim] = shared_sum[0] > 0.0f ? acc0 / shared_sum[0] : 0.0f;
+        out[1 * head_dim] = shared_sum[1] > 0.0f ? acc1 / shared_sum[1] : 0.0f;
+        out[2 * head_dim] = shared_sum[2] > 0.0f ? acc2 / shared_sum[2] : 0.0f;
+        out[3 * head_dim] = shared_sum[3] > 0.0f ? acc3 / shared_sum[3] : 0.0f;
+    }
+}
+
+extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d512_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    float* partial,
+    int num_kv_heads,
+    int attend_start,
+    int attend_len,
+    int cache_size,
+    float scale,
+    int num_partitions,
+    int partition_size,
+    const int* dyn)
+{
+    const int kv_head = blockIdx.x;
+    const int partition = blockIdx.y;
+    if (kv_head >= num_kv_heads || partition >= num_partitions)
+        return;
+    if (dyn)
+        attend_len = dyn[TS_DYN_ATTEND_LEN];
+    attend_len = max(0, min(attend_len, cache_size - attend_start));
+
+    const int part_start = partition * partition_size;
+    int part_len = attend_len - part_start;
+    if (part_len > partition_size)
+        part_len = partition_size;
+    if (part_len < 0)
+        part_len = 0;
+
+    extern __shared__ float workspace[];
+    float* scores = workspace;
+    float* query_shared =
+        scores + TS_GQA_DECODE_GROUP4_HEADS * partition_size;
+    __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
+    __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
+
+    ts_gqa_decode_group4_scores_f16(
+        query, key_cache, kv_head, cache_size,
+        attend_start + part_start, part_len, scale,
+        TS_GQA_DECODE_GROUP4_HEAD_DIM, partition_size,
+        scores, query_shared, shared_max, shared_sum);
+
+    const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
+    const int partial_stride = TS_GQA_DECODE_GROUP4_HEAD_DIM + 2;
+    if (threadIdx.x == 0)
+    {
+#pragma unroll
+        for (int h = 0; h < TS_GQA_DECODE_GROUP4_HEADS; h++)
+        {
+            float* row = partial +
+                ((size_t)(q_head_base + h) * num_partitions + partition) *
+                    partial_stride;
+            row[0] = shared_max[h];
+            row[1] = shared_sum[h];
+        }
+    }
+
+    for (int d = threadIdx.x; d < TS_GQA_DECODE_GROUP4_HEAD_DIM; d += blockDim.x)
+    {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (int i = 0; i < part_len; i++)
+        {
+            float vv = __half2float(value_cache[
+                ((size_t)kv_head * cache_size + attend_start + part_start + i) *
+                    TS_GQA_DECODE_GROUP4_HEAD_DIM + d]);
+            acc0 = fmaf(scores[0 * partition_size + i], vv, acc0);
+            acc1 = fmaf(scores[1 * partition_size + i], vv, acc1);
+            acc2 = fmaf(scores[2 * partition_size + i], vv, acc2);
+            acc3 = fmaf(scores[3 * partition_size + i], vv, acc3);
+        }
+        partial[
+            ((size_t)(q_head_base + 0) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc0;
+        partial[
+            ((size_t)(q_head_base + 1) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc1;
+        partial[
+            ((size_t)(q_head_base + 2) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc2;
+        partial[
+            ((size_t)(q_head_base + 3) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc3;
+    }
+}
+
+// Partitioned counterpart of ts_gqa_decode_attention_group4_d256_f16 for the
+// circular SWA ring. The single-block kernel's grid is num_kv_heads CTAs --
+// TWO on Gemma 4 -- which strands the rest of the GPU while every SWA decode
+// layer serializes its whole window behind one CTA per KV head (~99 us/layer
+// measured on a 48-SM RTX 3080). This kernel splits the physical ring
+// [0, min(attend_len, cache_size)) across blockIdx.y partitions (softmax is
+// invariant to the ring permutation, exactly as for the single-block kernel)
+// and writes the same (max, sum, unnormalized acc) partial rows as the d512
+// partition kernel above, combined by ts_gqa_decode_attention_partition_reduce_f32.
+// Grid: (num_kv_heads, num_partitions).
+extern "C" __global__ void ts_gqa_decode_attention_partition_group4_d256_f16(
+    const float* query,
+    const half* key_cache,
+    const half* value_cache,
+    const float* sinks,
+    float* partial,
+    int num_kv_heads,
+    int attend_len,
+    int cache_size,
+    float scale,
+    int has_sinks,
+    int num_partitions,
+    int partition_size,
+    const int* dyn)
+{
+    const int kv_head = blockIdx.x;
+    const int partition = blockIdx.y;
+    if (kv_head >= num_kv_heads || partition >= num_partitions)
+        return;
+    if (dyn)
+        attend_len = dyn[TS_DYN_ATTEND_LEN];
+    attend_len = max(0, min(attend_len, cache_size));
+
+    const int head_dim = 256;
+    const int part_start = partition * partition_size;
+    int part_len = attend_len - part_start;
+    if (part_len > partition_size)
+        part_len = partition_size;
+    if (part_len < 0)
+        part_len = 0;
+
+    extern __shared__ float workspace[];
+    float* scores = workspace;
+    float* query_shared =
+        scores + TS_GQA_DECODE_GROUP4_HEADS * partition_size;
+    __shared__ float shared_max[TS_GQA_DECODE_GROUP4_HEADS];
+    __shared__ float shared_sum[TS_GQA_DECODE_GROUP4_HEADS];
+    __shared__ float sink_scale[TS_GQA_DECODE_GROUP4_HEADS];
+
+    ts_gqa_decode_group4_scores_f16(
+        query, key_cache, kv_head, cache_size,
+        part_start, part_len, scale,
+        head_dim, partition_size,
+        scores, query_shared, shared_max, shared_sum);
+
+    const int q_head_base = kv_head * TS_GQA_DECODE_GROUP4_HEADS;
+    const int partial_stride = head_dim + 2;
+    if (threadIdx.x == 0)
+    {
+#pragma unroll
+        for (int h = 0; h < TS_GQA_DECODE_GROUP4_HEADS; h++)
+        {
+            // Fold the per-head attention sink (an extra logit with no V row)
+            // into partition 0's (max, sum) header. The scores stashed in
+            // shared reference the pre-sink max, so the V accumulators below
+            // are rescaled by exp(m_old - m_new) to match, exactly like an
+            // online-softmax chunk step.
+            float m = shared_max[h];
+            float sum = shared_sum[h];
+            float scl = 1.0f;
+            if (has_sinks && partition == 0)
+            {
+                float s = sinks[q_head_base + h];
+                float m_new = fmaxf(m, s);
+                scl = expf(m - m_new);
+                sum = sum * scl + expf(s - m_new);
+                m = m_new;
+            }
+            sink_scale[h] = scl;
+            float* row = partial +
+                ((size_t)(q_head_base + h) * num_partitions + partition) *
+                    partial_stride;
+            row[0] = m;
+            row[1] = sum;
+        }
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (int i = 0; i < part_len; i++)
+        {
+            float vv = __half2float(value_cache[
+                ((size_t)kv_head * cache_size + part_start + i) *
+                    head_dim + d]);
+            acc0 = fmaf(scores[0 * partition_size + i], vv, acc0);
+            acc1 = fmaf(scores[1 * partition_size + i], vv, acc1);
+            acc2 = fmaf(scores[2 * partition_size + i], vv, acc2);
+            acc3 = fmaf(scores[3 * partition_size + i], vv, acc3);
+        }
+        partial[
+            ((size_t)(q_head_base + 0) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc0 * sink_scale[0];
+        partial[
+            ((size_t)(q_head_base + 1) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc1 * sink_scale[1];
+        partial[
+            ((size_t)(q_head_base + 2) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc2 * sink_scale[2];
+        partial[
+            ((size_t)(q_head_base + 3) * num_partitions + partition) *
+                partial_stride + 2 + d] = acc3 * sink_scale[3];
+    }
+}
+
 template <typename cache_t>
 __device__ __forceinline__ float ts_cache_to_float(cache_t v)
 {
@@ -2227,7 +4056,13 @@ __device__ __forceinline__ void ts_gqa_decode_attention_partition_impl(
     if (q_head >= num_q_heads || partition >= num_partitions)
         return;
     if (dyn)
+    {
         attend_len = dyn[TS_DYN_ATTEND_LEN];
+        if (circular && attend_len > cache_size)
+            attend_len = cache_size;
+        if (circular)
+            attend_start = max(0, dyn[TS_DYN_KV_WRITE_POS] + 1 - attend_len);
+    }
 
     int part_start = partition * partition_size;
     int part_len = attend_len - part_start;
@@ -2589,6 +4424,108 @@ extern "C" __global__ void ts_gather_circular_head_first_f16(
     output[idx] = __half2float(cache[((size_t)head * cache_size + cache_pos) * head_dim + d]);
 }
 
+// Expand a head-first GQA cache [kv_heads, cache_size, head_dim] into a
+// contiguous F32 tensor [kv_heads * group_size, seq_len, head_dim].  Combining
+// the active-window gather, F16 conversion and head broadcast in one pass keeps
+// materialized cuBLAS attention entirely on the GPU.
+template <typename cache_t>
+__device__ __forceinline__ void ts_expand_kv_heads_impl(
+    const cache_t* cache,
+    float* output,
+    int num_kv_heads,
+    int seq_len,
+    int cache_size,
+    int head_dim,
+    int group_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_heads = num_kv_heads * group_size;
+    int total = out_heads * seq_len * head_dim;
+    if (idx >= total)
+        return;
+
+    int d = idx % head_dim;
+    int tmp = idx / head_dim;
+    int seq = tmp % seq_len;
+    int out_head = tmp / seq_len;
+    int kv_head = out_head / group_size;
+    output[idx] = (float)cache[((size_t)kv_head * cache_size + seq) * head_dim + d];
+}
+
+extern "C" __global__ void ts_expand_kv_heads_f32(
+    const float* cache,
+    float* output,
+    int num_kv_heads,
+    int seq_len,
+    int cache_size,
+    int head_dim,
+    int group_size)
+{
+    ts_expand_kv_heads_impl(
+        cache, output, num_kv_heads, seq_len, cache_size, head_dim, group_size);
+}
+
+extern "C" __global__ void ts_expand_kv_heads_f16(
+    const half* cache,
+    float* output,
+    int num_kv_heads,
+    int seq_len,
+    int cache_size,
+    int head_dim,
+    int group_size)
+{
+    ts_expand_kv_heads_impl(
+        cache, output, num_kv_heads, seq_len, cache_size, head_dim, group_size);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void ts_repeat_interleave_impl(
+    const scalar_t* source,
+    scalar_t* output,
+    int outer_size,
+    int dim_size,
+    int repeats,
+    int inner_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_dim_size = dim_size * repeats;
+    int out_outer_stride = out_dim_size * inner_size;
+    int total = outer_size * out_outer_stride;
+    if (idx >= total)
+        return;
+
+    int outer = idx / out_outer_stride;
+    int within_outer = idx - outer * out_outer_stride;
+    int repeated_dim = within_outer / inner_size;
+    int inner = within_outer - repeated_dim * inner_size;
+    int source_dim = repeated_dim / repeats;
+    output[idx] = source[((size_t)outer * dim_size + source_dim) * inner_size + inner];
+}
+
+extern "C" __global__ void ts_repeat_interleave_f32(
+    const float* source,
+    float* output,
+    int outer_size,
+    int dim_size,
+    int repeats,
+    int inner_size)
+{
+    ts_repeat_interleave_impl(
+        source, output, outer_size, dim_size, repeats, inner_size);
+}
+
+extern "C" __global__ void ts_repeat_interleave_f16(
+    const half* source,
+    half* output,
+    int outer_size,
+    int dim_size,
+    int repeats,
+    int inner_size)
+{
+    ts_repeat_interleave_impl(
+        source, output, outer_size, dim_size, repeats, inner_size);
+}
+
 extern "C" __global__ void ts_concat_head_first_f32(
     const float* a,
     const float* b,
@@ -2676,6 +4613,34 @@ extern "C" __global__ void ts_neox_rope_flat_f32(
     float x1 = data[base + j + rope_half];
     data[base + j] = x0 * cos_v - x1 * sin_v;
     data[base + j + rope_half] = x0 * sin_v + x1 * cos_v;
+}
+
+// Builds Gemma 4's local/global single-token NeoX RoPE lookup tables from the
+// live CUDA-graph position.  The tables are produced once per replay and then
+// reused by every attention layer, avoiding repeated sincosf work per head and
+// layer.  Frequencies already include the learned global proportional-RoPE
+// factors, which cannot be represented by a single base/scale pair.
+extern "C" __global__ void ts_fill_neox_rope_tables_dyn_f32(
+    float* local_cos,
+    float* local_sin,
+    const float* local_frequencies,
+    int local_half,
+    float* global_cos,
+    float* global_sin,
+    const float* global_frequencies,
+    int global_half,
+    const int* dyn)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = max(local_half, global_half);
+    if (idx >= total || !dyn)
+        return;
+
+    float position = (float)dyn[TS_DYN_ROPE_POS];
+    if (idx < local_half)
+        sincosf(position * local_frequencies[idx], &local_sin[idx], &local_cos[idx]);
+    if (idx < global_half)
+        sincosf(position * global_frequencies[idx], &global_sin[idx], &global_cos[idx]);
 }
 
 extern "C" __global__ void ts_index_select_f32(
@@ -2932,6 +4897,39 @@ extern "C" __global__ void ts_quant_matmul_f32(
     acc3 = block_reduce_sum(acc3);
     if (threadIdx.x == 0 && w_row3 != 0)
         output[(size_t)row * out_dim + out_col0 + 3] = acc3;
+}
+
+// Single-token decode (rows==1) generic quant matmul: one BLOCK per output
+// column instead of ts_quant_matmul_f32's four-columns-per-block split. Same
+// blockDim.x thread budget per column as that kernel, but a single
+// block_reduce_sum (no repeated __syncthreads()-separated reductions) and no
+// row-tile machinery (nothing to amortize with only one row) -- see the
+// TS_CUDA_QMM_VEC call site for why this beats both ts_quant_matmul_f32 (whose
+// 4-way column split still costs 4 serialized block reductions) and
+// ts_quant_matmul_batched_f32 (whose one-warp-per-column split under-uses the
+// SM for a single row on wide tensors).
+extern "C" __global__ void ts_quant_matmul_vec_f32(
+    const uint8_t* weights,
+    const float* input,
+    float* output,
+    int type,
+    int in_dim,
+    int out_dim)
+{
+    int out_col = blockIdx.x;
+    if (out_col >= out_dim)
+        return;
+
+    int row_bytes = qrow_bytes(type, in_dim);
+    const uint8_t* w_row = weights + (size_t)out_col * row_bytes;
+
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < in_dim; k += blockDim.x)
+        acc += qvalue_at(w_row, type, k) * input[k];
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        output[out_col] = acc;
 }
 
 // Row tile height for the row-batched quantized matmul kernels below. Each
@@ -3497,6 +5495,55 @@ extern "C" __global__ void ts_quantize_q8_1_rows_f32(
     int r = (int)(idx / q8_blocks);
     int qb = (int)(idx - (long)r * q8_blocks);
     quantize_q8_1_block(input + (size_t)r * in_dim + (size_t)qb * TS_QK8_1, out + idx);
+}
+
+// Decode-oriented q8_1 activation quantizer: one warp cooperatively handles one
+// 32-value block. The legacy kernel above assigns an entire block to one thread,
+// serializing 32 loads and stores while neighboring lanes walk different,
+// 128-byte-strided blocks. This mapping makes the input and q-byte accesses
+// coalesced and exposes all 32 values to the SM at once.
+//
+// Keep the arithmetic/layout identical to quantize_q8_1_block: rintf rounding,
+// int8 clamp, half-rounded d, and half-rounded s = d * sum(q). That lets callers
+// switch between kernels without changing Q8_0/Q4_0 matmul results.
+extern "C" __global__ void ts_quantize_q8_1_rows_warp_f32(
+    const float* input,
+    ts_block_q8_1* out,
+    int in_dim,
+    int rows)
+{
+    int lane = threadIdx.x & 31;
+    long long warp_idx =
+        (((long long)blockIdx.x * blockDim.x) + threadIdx.x) >> 5;
+    long long total_blocks = (long long)rows * (in_dim / TS_QK8_1);
+    if (warp_idx >= total_blocks)
+        return;
+
+    float x = input[(size_t)warp_idx * TS_QK8_1 + lane];
+    // Starting from zero preserves the legacy fmaxf behavior for NaN inputs.
+    float amax = fmaxf(0.0f, fabsf(x));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(0xFFFFFFFF, amax, offset));
+    amax = __shfl_sync(0xFFFFFFFF, amax, 0);
+
+    float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = (int)rintf(x * id);
+    q = max(-127, min(127, q));
+
+    ts_block_q8_1* dst = out + warp_idx;
+    dst->qs[lane] = (int8_t)q;
+
+    int sum = q;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    if (lane == 0)
+    {
+        dst->d = __float2half_rn(d);
+        dst->s = __float2half_rn(d * (float)sum);
+    }
 }
 
 // Split-layout q8_1 row quantization for the MMQ cp.async staging path: the qs
@@ -4168,13 +6215,13 @@ extern "C" __global__ void __launch_bounds__(TS_MMQ_THREADS, 2) ts_quant_matmul_
 #endif
 }
 
-// Single-row (decode) Q8_0 matvec: one WARP per output column, q8_1-quantized
-// activation row (xq), dp4a int8 dot (mirrors ggml's mul_mat_vec_q). Each lane
-// owns whole 32-element blocks (34 B of weights loaded as one half + 8 aligned
-// uint16-pair ints), so the warp streams the weight row with far fewer load
-// instructions than the per-byte scalar kernel and no block-wide reductions.
-// The int32 dot within a block is exact; only the activation's q8_1 round-trip
-// differs from the f32 path (same tradeoff ggml makes).
+// Single-row (decode) Q8_0 matvec: four warps cooperate on one output column,
+// following ggml MMVQ's four-adjacent-lanes-per-Q8-block mapping. A 4-lane
+// group owns one 32-element block and each lane evaluates two dp4a groups
+// (8 values), so 128 threads issue coalesced loads across 32 consecutive
+// blocks instead of 32 lanes each serializing all eight dp4a instructions for
+// one block. The final CTA reduction is small relative to the improved weight
+// bandwidth. The activation is pre-quantized once to q8_1, as in ggml.
 extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32(
     const uint8_t* weights,
     const ts_block_q8_1* xq,
@@ -4182,10 +6229,7 @@ extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32(
     int in_dim,
     int out_dim)
 {
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int warps_per_block = blockDim.x >> 5;
-    int col = blockIdx.x * warps_per_block + warp;
+    int col = blockIdx.x;
     if (col >= out_dim)
         return;
 
@@ -4193,22 +6237,29 @@ extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32(
     const uint8_t* w_row = weights + (size_t)col * (size_t)q8_blocks * 34;
 
     float acc = 0.0f;
-    for (int ib = lane; ib < q8_blocks; ib += 32)
+    int lane_in_block = threadIdx.x & 3;
+    int block_group = threadIdx.x >> 2;
+    int groups_per_cta = blockDim.x >> 2;
+    for (int ib = block_group; ib < q8_blocks; ib += groups_per_cta)
     {
         const uint8_t* wblk = w_row + (size_t)ib * 34;
         float dw = __half2float(*reinterpret_cast<const half*>(wblk));
         const ts_block_q8_1* ablk = &xq[ib];
         float dact = __half2float(ablk->d);
-        int s = 0;
-#pragma unroll
-        for (int g = 0; g < 8; g++)
-            s = dp4a_i8(get_int_b2(wblk + 2, g), get_int_b4(ablk->qs, g), s);
+        int g = lane_in_block * 2;
+        int s = dp4a_i8(
+            get_int_b2(wblk + 2, g),
+            get_int_b4(ablk->qs, g),
+            0);
+        s = dp4a_i8(
+            get_int_b2(wblk + 2, g + 1),
+            get_int_b4(ablk->qs, g + 1),
+            s);
         acc += dw * dact * (float)s;
     }
 
-    for (int off = 16; off > 0; off >>= 1)
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, off);
-    if (lane == 0)
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
         output[col] = acc;
 }
 

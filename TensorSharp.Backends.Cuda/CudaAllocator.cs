@@ -157,6 +157,7 @@ namespace TensorSharp.Cuda
 
             Context.MakeCurrent();
             Stream.Synchronize();
+            CudaQuantizedOps.ReleaseScratch(this);
             pool.DrainAndFree();
             Kernels?.Dispose();
             Blas.Dispose();

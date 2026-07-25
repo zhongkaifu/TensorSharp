@@ -205,6 +205,33 @@ namespace TensorSharp.Cuda
         }
 
         /// <summary>
+        /// Returns the decode-attention launch tier used by a CUDA graph:
+        /// 0 for the single-block route and 1 for partition-and-reduce.
+        /// Graph keys must include this value because the two routes bake
+        /// different grids and scratch allocations into the captured graph.
+        /// </summary>
+        public static int GetGqaDecodeAttentionRouteTier(
+            bool keyIsHalf,
+            bool circular,
+            int numQHeads,
+            int numKVHeads,
+            int headDim,
+            int attendLen,
+            int cacheSize,
+            int hasSinks = 0)
+        {
+            return CudaKernelOps.GetGqaDecodeAttentionRouteTier(
+                keyIsHalf,
+                circular,
+                numQHeads,
+                numKVHeads,
+                headDim,
+                attendLen,
+                cacheSize,
+                hasSinks);
+        }
+
+        /// <summary>
         /// Low-level GQA decode attention that accepts raw device pointers +
         /// a <see cref="CudaAllocator"/>. Skips CudaStorage extraction for backends
         /// that use GgmlStorage with CUDA UVA (e.g. GgmlCuda).
@@ -384,6 +411,11 @@ namespace TensorSharp.Cuda
             return CudaKernelOps.TryGatherCircularHeadFirst(result, cache, startPos, seqLen, cacheSize);
         }
 
+        public static bool TryExpandKvHeads(Tensor result, Tensor cache, int groupSize, int seqLen)
+        {
+            return CudaKernelOps.TryExpandKvHeads(result, cache, groupSize, seqLen);
+        }
+
         public static bool TryConcatHeadFirst(Tensor result, Tensor a, Tensor b)
         {
             return CudaKernelOps.TryConcatHeadFirst(result, a, b);
@@ -397,6 +429,23 @@ namespace TensorSharp.Cuda
         public static bool TryNeoXRoPEFlatInPlace(Tensor data, Tensor cosTable, Tensor sinTable, int numHeads, int seqLen, int headDim, int ropeHalf)
         {
             return CudaKernelOps.TryNeoXRoPEFlatInPlace(data, cosTable, sinTable, numHeads, seqLen, headDim, ropeHalf);
+        }
+
+        /// <summary>
+        /// Builds stable local/global single-token NeoX RoPE tables using the
+        /// live position from <see cref="CudaDecodeDynParams"/>.
+        /// </summary>
+        public static bool TryFillNeoXRopeTablesDynamic(
+            Tensor localCos,
+            Tensor localSin,
+            Tensor localFrequencies,
+            Tensor globalCos,
+            Tensor globalSin,
+            Tensor globalFrequencies)
+        {
+            return CudaKernelOps.TryFillNeoXRopeTablesDynamic(
+                localCos, localSin, localFrequencies,
+                globalCos, globalSin, globalFrequencies);
         }
 
         /// <summary>

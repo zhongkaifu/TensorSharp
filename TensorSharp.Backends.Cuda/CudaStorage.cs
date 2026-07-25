@@ -194,6 +194,45 @@ namespace TensorSharp.Cuda
             MarkDeviceModified();
         }
 
+        /// <summary>
+        /// Device-to-device copy of <paramref name="rows"/> rows of
+        /// <paramref name="innerBytes"/> contiguous bytes each, with independent
+        /// source/destination row pitches, in a SINGLE strided kernel launch.
+        /// Replaces the per-row <c>cuMemcpyDtoDAsync</c> loop the strided tensor
+        /// copy used to issue (one driver submission per row — tens of thousands
+        /// per prefill forward on WDDM). Same allocator only.
+        /// </summary>
+        internal bool TryCopyDeviceFrom2D(
+            CudaStorage src,
+            long destByteOffset, long srcByteOffset,
+            long rows, long innerBytes,
+            long destPitchBytes, long srcPitchBytes)
+        {
+            if (src == null || !ReferenceEquals(AllocatorImpl, src.AllocatorImpl))
+                return false;
+            var kernels = AllocatorImpl.Kernels;
+            if (kernels == null)
+                return false;
+            if (rows <= 0 || innerBytes <= 0)
+                return true;
+
+            // Bounds: the last row's inner span must stay inside both buffers.
+            long srcLast = checked(srcByteOffset + (rows - 1) * srcPitchBytes + innerBytes);
+            long dstLast = checked(destByteOffset + (rows - 1) * destPitchBytes + innerBytes);
+            if (srcByteOffset < 0 || destByteOffset < 0 || srcLast > src.ByteLength || dstLast > ByteLength)
+                return false;
+
+            src.EnsureDeviceCurrent();
+            AllocatorImpl.Context.MakeCurrent();
+            IntPtr dst = AddBytes(deviceBuffer, destByteOffset);
+            IntPtr source = AddBytes(src.deviceBuffer, srcByteOffset);
+            kernels.LaunchCopy2DBytes(
+                source, dst, rows, innerBytes, srcPitchBytes, destPitchBytes,
+                AllocatorImpl.Stream.Handle);
+            MarkDeviceModified();
+            return true;
+        }
+
         internal void SynchronizeDeviceWork()
         {
             ThrowIfDisposed();

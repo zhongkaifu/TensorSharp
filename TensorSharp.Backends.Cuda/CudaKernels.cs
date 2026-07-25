@@ -15,6 +15,7 @@ namespace TensorSharp.Cuda
         private const int GdnBlockSize = 512;
 
         private readonly CudaModule module;
+        private readonly IntPtr copy2DBytes;
         private readonly IntPtr fillF32;
         private readonly IntPtr fillF16;
         private readonly IntPtr unaryF32;
@@ -43,14 +44,34 @@ namespace TensorSharp.Cuda
         private readonly IntPtr scaledDotProductAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF32;
         private readonly IntPtr gqaPrefillAttentionF16;
+        private readonly IntPtr gqaPrefillAttentionGroup4D256F32;
+        private readonly IntPtr gqaPrefillAttentionGroup4D256F16;
+        private readonly IntPtr gqaPrefillAttentionGroup4D512F32;
+        private readonly IntPtr gqaPrefillAttentionGroup4D512F16;
+        private readonly IntPtr gqaPrefillAttentionGroup4OnlineD512F32;
+        private readonly IntPtr gqaPrefillAttentionGroup4OnlineD512F16;
+        private readonly IntPtr gqaPrefillFlashGroup4D256F16;
+        private readonly IntPtr gqaPrefillFlashGroup4D512F16;
+        private readonly IntPtr gqaPrefillFlashGroup4D256F32;
+        private readonly IntPtr gqaPrefillFlashGroup4D512F32;
+        private readonly IntPtr gqaPrefillFlash2Group4D256F16;
+        private readonly IntPtr gqaPrefillFlash2Group4D512F16;
+        private readonly IntPtr gqaPrefillFlash2Group4D256F32;
+        private readonly IntPtr gqaPrefillFlash2Group4D512F32;
+        private uint flash2SharedCapacityD256 = 48 * 1024;
+        private uint flash2SharedCapacityD512 = 48 * 1024;
         private readonly IntPtr gqaPrefillAttentionSinksF32;
         private readonly IntPtr gqaPrefillAttentionSinksF16;
         private readonly IntPtr gqaDecodeAttentionF32;
         private readonly IntPtr gqaDecodeAttentionF16;
+        private readonly IntPtr gqaDecodeAttentionGroup4D256F16;
+        private readonly IntPtr gqaDecodeAttentionGroup4D512F16;
+        private readonly IntPtr gqaDecodeAttentionPartitionGroup4D256F16;
         private readonly IntPtr gqaDecodeAttentionSinksF32;
         private readonly IntPtr gqaDecodeAttentionSinksF16;
         private readonly IntPtr gqaDecodeAttentionPartitionF32;
         private readonly IntPtr gqaDecodeAttentionPartitionF16;
+        private readonly IntPtr gqaDecodeAttentionPartitionGroup4D512F16;
         private readonly IntPtr gqaDecodeAttentionPartitionReduceF32;
         private readonly IntPtr sliceColumnsF32;
         private readonly IntPtr flatToHeadFirstF32;
@@ -60,15 +81,21 @@ namespace TensorSharp.Cuda
         private readonly IntPtr copyHeadFirstToCacheF16;
         private readonly IntPtr gatherCircularHeadFirstF32;
         private readonly IntPtr gatherCircularHeadFirstF16;
+        private readonly IntPtr expandKvHeadsF32;
+        private readonly IntPtr expandKvHeadsF16;
+        private readonly IntPtr repeatInterleaveF32;
+        private readonly IntPtr repeatInterleaveF16;
         private readonly IntPtr concatHeadFirstF32;
         private readonly IntPtr neoxRopeHeadFirstF32;
         private readonly IntPtr neoxRopeFlatF32;
+        private readonly IntPtr fillNeoXRopeTablesDynamicF32;
         private readonly IntPtr indexSelectF32;
         private readonly IntPtr addCausalMaskF32;
         private readonly IntPtr ropeF32;
         private readonly IntPtr ropeExF32;
         private readonly IntPtr quantMatmulF32;
         private readonly IntPtr quantMatmulBatchedF32;
+        private readonly IntPtr quantMatmulVecF32;
         private readonly IntPtr quantMatmulIq2XxsQ81F32;
         private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ40BatchedF32;
@@ -82,7 +109,9 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulQ80Dp4aF32;
         private readonly IntPtr quantMatmulQ80MmaF32;
         private readonly IntPtr quantizeQ81RowsF32;
+        private readonly IntPtr quantizeQ81RowsWarpF32;
         private readonly IntPtr dequantWeightF16;
+        private readonly IntPtr dequantWeightQ80F16;
         private readonly IntPtr convertF32F16;
         private readonly IntPtr qkNormRopeNeoxF32;
         private readonly IntPtr qwen35GdnFusedF32;
@@ -98,11 +127,36 @@ namespace TensorSharp.Cuda
         // Opt-in tensor-core (wmma int8 MMA) multi-row Q8_0 path: TS_CUDA_Q8_MMA=1.
         public static readonly bool Q8MmaEnabled =
             string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q8_MMA"), "1", StringComparison.Ordinal);
+        // The GQA prefill QK phase maps one warp to each key for coalesced Q/K loads.
+        // TS_CUDA_GQA_PREFILL_WARP=0 keeps the legacy one-thread-per-key path for A/B.
+        public static readonly bool GqaPrefillWarpCooperativeEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_GQA_PREFILL_WARP"), "0", StringComparison.Ordinal);
+        // Gemma 4 local attention has four Q heads per KV head, d=256, and a
+        // bounded sliding window.  Share each K/V load across the four heads.
+        // TS_CUDA_GQA_PREFILL_GROUP4=0 keeps the generic warp kernel for A/B.
+        public static readonly bool GqaPrefillGroup4Enabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_GQA_PREFILL_GROUP4"), "0", StringComparison.Ordinal);
+        // Flash-style tiled prefill attention (f16 K/V, group4): stages the Q
+        // tile in shared memory once and walks K/V with an online softmax, so
+        // K/V traffic is amortized over 4x-8x more score rows than the two-pass
+        // group4 kernels. TS_CUDA_FLASH_PREFILL=0 keeps the two-pass kernels
+        // for A/B.
+        public static readonly bool GqaPrefillFlashEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_FLASH_PREFILL"), "0", StringComparison.Ordinal);
+        // flash2: thread-per-score QK (no warp-shuffle reduction, transposed-K
+        // shared staging). Default on; TS_CUDA_FLASH2=0 reverts to flash1 for A/B.
+        public static readonly bool GqaPrefillFlash2Enabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_FLASH2"), "0", StringComparison.Ordinal);
+        // Gemma 4 local/global decode has four d=256/d=512 Q heads sharing each
+        // F16 KV head. Share coalesced K/V reads across the group (ggml-style GQA).
+        public static readonly bool GqaDecodeGroup4Enabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_GQA_DECODE_GROUP4"), "0", StringComparison.Ordinal);
         private readonly IntPtr quantGetRowsF32;
 
         private CudaKernels(CudaModule module)
         {
             this.module = module;
+            copy2DBytes = module.GetFunction("ts_copy2d_bytes");
             fillF32 = module.GetFunction("ts_fill_f32");
             fillF16 = module.GetFunction("ts_fill_f16");
             unaryF32 = module.GetFunction("ts_unary_f32");
@@ -131,14 +185,43 @@ namespace TensorSharp.Cuda
             scaledDotProductAttentionF32 = module.GetFunction("ts_scaled_dot_product_attention_f32");
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
+            gqaPrefillAttentionGroup4D256F32 = module.GetFunction("ts_gqa_prefill_attention_group4_d256_f32");
+            gqaPrefillAttentionGroup4D256F16 = module.GetFunction("ts_gqa_prefill_attention_group4_d256_f16");
+            gqaPrefillAttentionGroup4D512F32 = module.GetFunction("ts_gqa_prefill_attention_group4_d512_f32");
+            gqaPrefillAttentionGroup4D512F16 = module.GetFunction("ts_gqa_prefill_attention_group4_d512_f16");
+            gqaPrefillAttentionGroup4OnlineD512F32 =
+                module.GetFunction("ts_gqa_prefill_attention_group4_online_d512_f32");
+            gqaPrefillAttentionGroup4OnlineD512F16 =
+                module.GetFunction("ts_gqa_prefill_attention_group4_online_d512_f16");
+            gqaPrefillFlashGroup4D256F16 =
+                module.GetFunction("ts_gqa_prefill_flash_group4_d256_f16");
+            gqaPrefillFlashGroup4D512F16 =
+                module.GetFunction("ts_gqa_prefill_flash_group4_d512_f16");
+            gqaPrefillFlashGroup4D256F32 =
+                module.GetFunction("ts_gqa_prefill_flash_group4_d256_f32");
+            gqaPrefillFlashGroup4D512F32 =
+                module.GetFunction("ts_gqa_prefill_flash_group4_d512_f32");
+            gqaPrefillFlash2Group4D256F16 =
+                module.GetFunction("ts_gqa_prefill_flash2_group4_d256_f16");
+            gqaPrefillFlash2Group4D512F16 =
+                module.GetFunction("ts_gqa_prefill_flash2_group4_d512_f16");
+            gqaPrefillFlash2Group4D256F32 =
+                module.GetFunction("ts_gqa_prefill_flash2_group4_d256_f32");
+            gqaPrefillFlash2Group4D512F32 =
+                module.GetFunction("ts_gqa_prefill_flash2_group4_d512_f32");
             gqaPrefillAttentionSinksF32 = module.GetFunction("ts_gqa_prefill_attention_sinks_f32");
             gqaPrefillAttentionSinksF16 = module.GetFunction("ts_gqa_prefill_attention_sinks_f16");
             gqaDecodeAttentionF32 = module.GetFunction("ts_gqa_decode_attention_f32");
             gqaDecodeAttentionF16 = module.GetFunction("ts_gqa_decode_attention_f16");
+            gqaDecodeAttentionGroup4D256F16 = module.GetFunction("ts_gqa_decode_attention_group4_d256_f16");
+            gqaDecodeAttentionGroup4D512F16 = module.GetFunction("ts_gqa_decode_attention_group4_d512_f16");
+            gqaDecodeAttentionPartitionGroup4D256F16 = module.GetFunction("ts_gqa_decode_attention_partition_group4_d256_f16");
             gqaDecodeAttentionSinksF32 = module.GetFunction("ts_gqa_decode_attention_sinks_f32");
             gqaDecodeAttentionSinksF16 = module.GetFunction("ts_gqa_decode_attention_sinks_f16");
             gqaDecodeAttentionPartitionF32 = module.GetFunction("ts_gqa_decode_attention_partition_f32");
             gqaDecodeAttentionPartitionF16 = module.GetFunction("ts_gqa_decode_attention_partition_f16");
+            gqaDecodeAttentionPartitionGroup4D512F16 =
+                module.GetFunction("ts_gqa_decode_attention_partition_group4_d512_f16");
             gqaDecodeAttentionPartitionReduceF32 = module.GetFunction("ts_gqa_decode_attention_partition_reduce_f32");
             sliceColumnsF32 = module.GetFunction("ts_slice_columns_f32");
             flatToHeadFirstF32 = module.GetFunction("ts_flat_to_head_first_f32");
@@ -148,15 +231,21 @@ namespace TensorSharp.Cuda
             fillRopePositionsI32 = module.GetFunction("ts_fill_rope_positions_i32");
             gatherCircularHeadFirstF32 = module.GetFunction("ts_gather_circular_head_first_f32");
             gatherCircularHeadFirstF16 = module.GetFunction("ts_gather_circular_head_first_f16");
+            expandKvHeadsF32 = module.GetFunction("ts_expand_kv_heads_f32");
+            expandKvHeadsF16 = module.GetFunction("ts_expand_kv_heads_f16");
+            repeatInterleaveF32 = module.GetFunction("ts_repeat_interleave_f32");
+            repeatInterleaveF16 = module.GetFunction("ts_repeat_interleave_f16");
             concatHeadFirstF32 = module.GetFunction("ts_concat_head_first_f32");
             neoxRopeHeadFirstF32 = module.GetFunction("ts_neox_rope_head_first_f32");
             neoxRopeFlatF32 = module.GetFunction("ts_neox_rope_flat_f32");
+            fillNeoXRopeTablesDynamicF32 = module.GetFunction("ts_fill_neox_rope_tables_dyn_f32");
             indexSelectF32 = module.GetFunction("ts_index_select_f32");
             addCausalMaskF32 = module.GetFunction("ts_add_causal_mask_f32");
             ropeF32 = module.GetFunction("ts_rope_f32");
             ropeExF32 = module.GetFunction("ts_rope_ex_f32");
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
             quantMatmulBatchedF32 = module.GetFunction("ts_quant_matmul_batched_f32");
+            quantMatmulVecF32 = module.GetFunction("ts_quant_matmul_vec_f32");
             quantMatmulIq2XxsQ81F32 = module.GetFunction("ts_quant_matmul_iq2_xxs_q8_1_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ40BatchedF32 = module.GetFunction("ts_quant_matmul_q4_0_batched_f32");
@@ -169,8 +258,10 @@ namespace TensorSharp.Cuda
             quantMatmulQ80Dp4aF32 = module.GetFunction("ts_quant_matmul_q8_0_dp4a_f32");
             quantMatmulQ80MmaF32 = module.GetFunction("ts_quant_matmul_q8_0_mma_f32");
             quantizeQ81RowsF32 = module.GetFunction("ts_quantize_q8_1_rows_f32");
+            quantizeQ81RowsWarpF32 = module.GetFunction("ts_quantize_q8_1_rows_warp_f32");
             quantizeQ81SplitRowsF32 = module.GetFunction("ts_quantize_q8_1_split_rows_f32");
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
+            dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
             convertF32F16 = module.GetFunction("ts_convert_f32_f16");
             quantGetRowsF32 = module.GetFunction("ts_quant_get_rows_f32");
             qkNormRopeNeoxF32 = module.GetFunction("ts_qk_norm_rope_neox_f32");
@@ -222,6 +313,23 @@ namespace TensorSharp.Cuda
             {
                 // Diagnostics must never break model initialization.
             }
+        }
+
+        public void LaunchCopy2DBytes(
+            IntPtr src, IntPtr dst, long rows, long innerBytes, long srcPitch, long dstPitch, IntPtr stream)
+        {
+            IntPtr srcArg = src;
+            IntPtr dstArg = dst;
+            long rowsArg = rows;
+            long innerArg = innerBytes;
+            long srcPitchArg = srcPitch;
+            long dstPitchArg = dstPitch;
+            void** args = stackalloc void*[] { &srcArg, &dstArg, &rowsArg, &innerArg, &srcPitchArg, &dstPitchArg };
+            // Rows spread over grid.y (kernel row-loops past 65535); grid.x
+            // covers the row bytes with a strided per-thread loop.
+            uint gx = (uint)Math.Min(Math.Max(1, (innerBytes / 16 + BlockSize - 1) / BlockSize), 8);
+            uint gy = (uint)Math.Min(rows, 65535);
+            Launch(copy2DBytes, gx, gy, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         public void LaunchFillF32(IntPtr output, int count, float value, IntPtr stream)
@@ -789,10 +897,12 @@ namespace TensorSharp.Cuda
             int windowSizeArg = windowSize;
             float scaleArg = scale;
             int kvStrideArg = kvStride;
+            int warpCooperativeArg = GqaPrefillWarpCooperativeEnabled ? 1 : 0;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
-                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg,
+                &warpCooperativeArg
             };
             Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
@@ -826,12 +936,436 @@ namespace TensorSharp.Cuda
             int windowSizeArg = windowSize;
             float scaleArg = scale;
             int kvStrideArg = kvStride;
+            int warpCooperativeArg = GqaPrefillWarpCooperativeEnabled ? 1 : 0;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
-                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg,
+                &warpCooperativeArg
             };
             Launch(gqaPrefillAttentionF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4D256F32(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4D256(
+                gqaPrefillAttentionGroup4D256F32,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4D256F16(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4D256(
+                gqaPrefillAttentionGroup4D256F16,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4D512F32(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4D512(
+                gqaPrefillAttentionGroup4D512F32,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4D512F16(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4D512(
+                gqaPrefillAttentionGroup4D512F16,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4OnlineD512F32(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4OnlineD512(
+                gqaPrefillAttentionGroup4OnlineD512F32,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        public void LaunchGqaPrefillAttentionGroup4OnlineD512F16(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            LaunchGqaPrefillAttentionGroup4OnlineD512(
+                gqaPrefillAttentionGroup4OnlineD512F16,
+                query, key, value, output,
+                numQHeads, numKVHeads, seqLen, kvLen, headDim,
+                maskStart, windowSize, scale, kvStride, stream);
+        }
+
+        private void LaunchGqaPrefillAttentionGroup4OnlineD512(
+            IntPtr function,
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int kvStrideArg = kvStride;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &outputArg,
+                &numQHeadsArg, &numKVHeadsArg, &seqLenArg, &kvLenArg,
+                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg,
+                &kvStrideArg
+            };
+            const int onlineBlockSize = 128;
+            Launch(
+                function,
+                (uint)numKVHeads,
+                (uint)seqLen,
+                1,
+                onlineBlockSize,
+                1,
+                1,
+                0,
+                stream,
+                args);
+        }
+
+        /// <summary>Queries per CTA of the flash prefill kernels; must match the
+        /// QROWS template arguments of ts_gqa_prefill_flash_group4_d256/d512_f16.</summary>
+        internal const int FlashPrefillQRowsD256 = 8;
+        internal const int FlashPrefillQRowsD512 = 4;
+        private const int FlashPrefillKChunk = 32;
+
+        public void LaunchGqaPrefillFlashGroup4(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr sinksPtr,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            int hasSinks,
+            bool cacheIsHalf,
+            IntPtr stream)
+        {
+            IntPtr function = headDim == 256
+                ? (cacheIsHalf ? gqaPrefillFlashGroup4D256F16 : gqaPrefillFlashGroup4D256F32)
+                : (cacheIsHalf ? gqaPrefillFlashGroup4D512F16 : gqaPrefillFlashGroup4D512F32);
+            int qRows = headDim == 256 ? FlashPrefillQRowsD256 : FlashPrefillQRowsD512;
+            int rows = qRows * 4;
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr sinksArg = sinksPtr;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int kvStrideArg = kvStride;
+            int hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &sinksArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg,
+                &kvStrideArg, &hasSinksArg
+            };
+            // Workspace: Q tile (rows*headDim) + score tile (rows*KCHUNK) + the
+            // per-row m/l/alpha state (3*rows), all f32.
+            uint sharedBytes = checked((uint)(
+                ((long)rows * headDim + (long)rows * FlashPrefillKChunk + 3L * rows) * sizeof(float)));
+            uint qTiles = (uint)((seqLen + qRows - 1) / qRows);
+            Launch(
+                function, (uint)numKVHeads, qTiles, 1,
+                BlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
+        // flash2 KCHUNK (must match the KC template args of
+        // ts_gqa_prefill_flash2_group4_d256/d512_*).
+        private const int Flash2KChunk = 64;
+
+        /// <summary>Whether the flash2 kernel supports this head dim (and its
+        /// shared footprint fits the per-block cap on this GPU).</summary>
+        public bool Flash2Supports(int headDim)
+        {
+            if (headDim != 256 && headDim != 512)
+                return false;
+            return Flash2SharedBytes(headDim) <= 100 * 1024;
+        }
+
+        private static uint Flash2SharedBytes(int headDim)
+        {
+            int qRows = headDim == 256 ? FlashPrefillQRowsD256 : FlashPrefillQRowsD512;
+            int rows = qRows * 4;
+            int kc = Flash2KChunk;
+            // q_s (rows*headDim) + scores (rows*kc) + m/l/alpha (3*rows), all f32.
+            long floats = (long)rows * headDim + (long)rows * kc + 3L * rows;
+            return checked((uint)(floats * sizeof(float)));
+        }
+
+        public void LaunchGqaPrefillFlash2Group4(
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr sinksPtr,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            int hasSinks,
+            bool cacheIsHalf,
+            IntPtr stream)
+        {
+            IntPtr function = headDim == 256
+                ? (cacheIsHalf ? gqaPrefillFlash2Group4D256F16 : gqaPrefillFlash2Group4D256F32)
+                : (cacheIsHalf ? gqaPrefillFlash2Group4D512F16 : gqaPrefillFlash2Group4D512F32);
+            int qRows = headDim == 256 ? FlashPrefillQRowsD256 : FlashPrefillQRowsD512;
+            uint sharedBytes = Flash2SharedBytes(headDim);
+            EnsureFlash2SharedCapacity(headDim, sharedBytes);
+
+            IntPtr queryArg = query, keyArg = key, valueArg = value, sinksArg = sinksPtr, outputArg = output;
+            int numQHeadsArg = numQHeads, numKVHeadsArg = numKVHeads, seqLenArg = seqLen, kvLenArg = kvLen;
+            int headDimArg = headDim, maskStartArg = maskStart, windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int kvStrideArg = kvStride, hasSinksArg = hasSinks;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &sinksArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg,
+                &kvStrideArg, &hasSinksArg
+            };
+            uint qTiles = (uint)((seqLen + qRows - 1) / qRows);
+            Launch(function, (uint)numKVHeads, qTiles, 1, BlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
+        private void EnsureFlash2SharedCapacity(int headDim, uint sharedBytes)
+        {
+            if (headDim == 256)
+            {
+                if (sharedBytes <= flash2SharedCapacityD256) return;
+                CudaDriverApi.cuFuncSetAttribute(gqaPrefillFlash2Group4D256F16,
+                    CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, checked((int)sharedBytes)).ThrowOnError();
+                CudaDriverApi.cuFuncSetAttribute(gqaPrefillFlash2Group4D256F32,
+                    CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, checked((int)sharedBytes)).ThrowOnError();
+                flash2SharedCapacityD256 = sharedBytes;
+            }
+            else
+            {
+                if (sharedBytes <= flash2SharedCapacityD512) return;
+                CudaDriverApi.cuFuncSetAttribute(gqaPrefillFlash2Group4D512F16,
+                    CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, checked((int)sharedBytes)).ThrowOnError();
+                CudaDriverApi.cuFuncSetAttribute(gqaPrefillFlash2Group4D512F32,
+                    CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, checked((int)sharedBytes)).ThrowOnError();
+                flash2SharedCapacityD512 = sharedBytes;
+            }
+        }
+
+        private void LaunchGqaPrefillAttentionGroup4D512(
+            IntPtr function,
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int kvStrideArg = kvStride;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg,
+                &kvStrideArg
+            };
+            uint sharedBytes = (uint)(4 * kvLen * sizeof(float));
+            Launch(
+                function, (uint)numKVHeads, (uint)seqLen, 1,
+                BlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
+        private void LaunchGqaPrefillAttentionGroup4D256(
+            IntPtr function,
+            IntPtr query,
+            IntPtr key,
+            IntPtr value,
+            IntPtr output,
+            int numQHeads,
+            int numKVHeads,
+            int seqLen,
+            int kvLen,
+            int headDim,
+            int maskStart,
+            int windowSize,
+            float scale,
+            int kvStride,
+            IntPtr stream)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyArg = key;
+            IntPtr valueArg = value;
+            IntPtr outputArg = output;
+            int numQHeadsArg = numQHeads;
+            int numKVHeadsArg = numKVHeads;
+            int seqLenArg = seqLen;
+            int kvLenArg = kvLen;
+            int headDimArg = headDim;
+            int maskStartArg = maskStart;
+            int windowSizeArg = windowSize;
+            float scaleArg = scale;
+            int kvStrideArg = kvStride;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyArg, &valueArg, &outputArg, &numQHeadsArg, &numKVHeadsArg,
+                &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg,
+                &kvStrideArg
+            };
+            const int queryTile = 2;
+            int scoreStride = Math.Min(kvLen, windowSize + queryTile - 1);
+            uint sharedBytes = (uint)(4 * queryTile * scoreStride * sizeof(float));
+            Launch(
+                function, (uint)numKVHeads, (uint)((seqLen + queryTile - 1) / queryTile), 1,
+                BlockSize, 1, 1, sharedBytes, stream, args);
         }
 
         public void LaunchGqaPrefillAttentionSinksF32(
@@ -867,11 +1401,13 @@ namespace TensorSharp.Cuda
             int windowSizeArg = windowSize;
             float scaleArg = scale;
             int hasSinksArg = hasSinks;
+            int warpCooperativeArg = GqaPrefillWarpCooperativeEnabled ? 1 : 0;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
                 &numQHeadsArg, &numKVHeadsArg, &seqLenArg, &kvLenArg, &cacheSizeArg,
-                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg
+                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg,
+                &warpCooperativeArg
             };
             Launch(gqaPrefillAttentionSinksF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
@@ -909,11 +1445,13 @@ namespace TensorSharp.Cuda
             int windowSizeArg = windowSize;
             float scaleArg = scale;
             int hasSinksArg = hasSinks;
+            int warpCooperativeArg = GqaPrefillWarpCooperativeEnabled ? 1 : 0;
             void** args = stackalloc void*[]
             {
                 &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &outputArg,
                 &numQHeadsArg, &numKVHeadsArg, &seqLenArg, &kvLenArg, &cacheSizeArg,
-                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg
+                &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &hasSinksArg,
+                &warpCooperativeArg
             };
             Launch(gqaPrefillAttentionSinksF16, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
         }
@@ -999,6 +1537,96 @@ namespace TensorSharp.Cuda
             };
             int smem = smemTokens > 0 ? smemTokens : attendLen;
             Launch(gqaDecodeAttentionF16, (uint)numQHeads, 1, 1, BlockSize, 1, 1, (uint)(smem * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionGroup4D256F16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr output,
+            int numKVHeads,
+            int attendLen,
+            int cacheSize,
+            float scale,
+            IntPtr stream,
+            IntPtr dynParams = default,
+            int smemTokens = 0)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr outputArg = output;
+            int numKVHeadsArg = numKVHeads;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            float scaleArg = scale;
+            int scoreCapacityArg = smemTokens > 0 ? smemTokens : Math.Min(attendLen, cacheSize);
+            IntPtr dynArg = dynParams;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &outputArg,
+                &numKVHeadsArg, &attendLenArg, &cacheSizeArg,
+                &scaleArg, &scoreCapacityArg, &dynArg
+            };
+            uint sharedBytes = checked((uint)(
+                (4L * scoreCapacityArg + 4L * 256) * sizeof(float)));
+            Launch(
+                gqaDecodeAttentionGroup4D256F16,
+                (uint)numKVHeads,
+                1,
+                1,
+                BlockSize,
+                1,
+                1,
+                sharedBytes,
+                stream,
+                args);
+        }
+
+        public void LaunchGqaDecodeAttentionGroup4D512F16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr output,
+            int numKVHeads,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            float scale,
+            IntPtr stream,
+            IntPtr dynParams = default,
+            int smemTokens = 0)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr outputArg = output;
+            int numKVHeadsArg = numKVHeads;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            float scaleArg = scale;
+            int scoreCapacityArg = smemTokens > 0 ? smemTokens : attendLen;
+            IntPtr dynArg = dynParams;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &outputArg,
+                &numKVHeadsArg, &attendStartArg, &attendLenArg, &cacheSizeArg,
+                &scaleArg, &scoreCapacityArg, &dynArg
+            };
+            uint sharedBytes = checked((uint)(
+                (4L * scoreCapacityArg + 4L * 512) * sizeof(float)));
+            Launch(
+                gqaDecodeAttentionGroup4D512F16,
+                (uint)numKVHeads,
+                1,
+                1,
+                BlockSize,
+                1,
+                1,
+                sharedBytes,
+                stream,
+                args);
         }
 
         public void LaunchGqaDecodeAttentionSinksF32(
@@ -1173,6 +1801,109 @@ namespace TensorSharp.Cuda
                 &numPartitionsArg, &partitionSizeArg, &dynArg
             };
             Launch(gqaDecodeAttentionPartitionF16, (uint)numQHeads, (uint)numPartitions, 1, BlockSize, 1, 1, (uint)(partitionSize * sizeof(float)), stream, args);
+        }
+
+        public void LaunchGqaDecodeAttentionPartitionGroup4D512F16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr partial,
+            int numKVHeads,
+            int attendStart,
+            int attendLen,
+            int cacheSize,
+            float scale,
+            int numPartitions,
+            int partitionSize,
+            IntPtr stream,
+            IntPtr dynParams = default)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr partialArg = partial;
+            int numKVHeadsArg = numKVHeads;
+            int attendStartArg = attendStart;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            float scaleArg = scale;
+            int numPartitionsArg = numPartitions;
+            int partitionSizeArg = partitionSize;
+            IntPtr dynArg = dynParams;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &partialArg,
+                &numKVHeadsArg, &attendStartArg, &attendLenArg, &cacheSizeArg,
+                &scaleArg, &numPartitionsArg, &partitionSizeArg, &dynArg
+            };
+            uint sharedBytes = checked((uint)(
+                (4L * partitionSize + 4L * 512) * sizeof(float)));
+            Launch(
+                gqaDecodeAttentionPartitionGroup4D512F16,
+                (uint)numKVHeads,
+                (uint)numPartitions,
+                1,
+                BlockSize,
+                1,
+                1,
+                sharedBytes,
+                stream,
+                args);
+        }
+
+        /// <summary>Partitioned SWA-ring counterpart of
+        /// <see cref="LaunchGqaDecodeAttentionGroup4D256F16"/>: splits the physical
+        /// ring across gridDim.y partitions so a 2-KV-head model no longer runs its
+        /// whole decode window on two CTAs. Pair with
+        /// <see cref="LaunchGqaDecodeAttentionPartitionReduceF32"/>.</summary>
+        public void LaunchGqaDecodeAttentionPartitionGroup4D256F16(
+            IntPtr query,
+            IntPtr keyCache,
+            IntPtr valueCache,
+            IntPtr sinksPtr,
+            IntPtr partial,
+            int numKVHeads,
+            int attendLen,
+            int cacheSize,
+            float scale,
+            int hasSinks,
+            int numPartitions,
+            int partitionSize,
+            IntPtr stream,
+            IntPtr dynParams = default)
+        {
+            IntPtr queryArg = query;
+            IntPtr keyCacheArg = keyCache;
+            IntPtr valueCacheArg = valueCache;
+            IntPtr sinksArg = sinksPtr;
+            IntPtr partialArg = partial;
+            int numKVHeadsArg = numKVHeads;
+            int attendLenArg = attendLen;
+            int cacheSizeArg = cacheSize;
+            float scaleArg = scale;
+            int hasSinksArg = hasSinks;
+            int numPartitionsArg = numPartitions;
+            int partitionSizeArg = partitionSize;
+            IntPtr dynArg = dynParams;
+            void** args = stackalloc void*[]
+            {
+                &queryArg, &keyCacheArg, &valueCacheArg, &sinksArg, &partialArg,
+                &numKVHeadsArg, &attendLenArg, &cacheSizeArg,
+                &scaleArg, &hasSinksArg, &numPartitionsArg, &partitionSizeArg, &dynArg
+            };
+            uint sharedBytes = checked((uint)(
+                (4L * partitionSize + 4L * 256) * sizeof(float)));
+            Launch(
+                gqaDecodeAttentionPartitionGroup4D256F16,
+                (uint)numKVHeads,
+                (uint)numPartitions,
+                1,
+                BlockSize,
+                1,
+                1,
+                sharedBytes,
+                stream,
+                args);
         }
 
         public void LaunchGqaDecodeAttentionPartitionReduceF32(
@@ -1388,6 +2119,62 @@ namespace TensorSharp.Cuda
             Launch(gatherCircularHeadFirstF16, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        public void LaunchExpandKvHeads(
+            IntPtr cache,
+            IntPtr output,
+            int numKvHeads,
+            int seqLen,
+            int cacheSize,
+            int headDim,
+            int groupSize,
+            bool cacheIsHalf,
+            IntPtr stream)
+        {
+            IntPtr cacheArg = cache;
+            IntPtr outputArg = output;
+            int numKvHeadsArg = numKvHeads;
+            int seqLenArg = seqLen;
+            int cacheSizeArg = cacheSize;
+            int headDimArg = headDim;
+            int groupSizeArg = groupSize;
+            int count = checked(numKvHeads * groupSize * seqLen * headDim);
+            void** args = stackalloc void*[]
+            {
+                &cacheArg, &outputArg, &numKvHeadsArg, &seqLenArg,
+                &cacheSizeArg, &headDimArg, &groupSizeArg
+            };
+            Launch(
+                cacheIsHalf ? expandKvHeadsF16 : expandKvHeadsF32,
+                Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchRepeatInterleave(
+            IntPtr source,
+            IntPtr output,
+            int outerSize,
+            int dimSize,
+            int repeats,
+            int innerSize,
+            bool isHalf,
+            IntPtr stream)
+        {
+            IntPtr sourceArg = source;
+            IntPtr outputArg = output;
+            int outerSizeArg = outerSize;
+            int dimSizeArg = dimSize;
+            int repeatsArg = repeats;
+            int innerSizeArg = innerSize;
+            int count = checked(outerSize * dimSize * repeats * innerSize);
+            void** args = stackalloc void*[]
+            {
+                &sourceArg, &outputArg, &outerSizeArg, &dimSizeArg,
+                &repeatsArg, &innerSizeArg
+            };
+            Launch(
+                isHalf ? repeatInterleaveF16 : repeatInterleaveF32,
+                Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchConcatHeadFirstF32(
             IntPtr a,
             IntPtr b,
@@ -1456,6 +2243,37 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[]
             { &dataArg, &cosTableArg, &sinTableArg, &numHeadsArg, &seqLenArg, &headDimArg, &ropeHalfArg };
             Launch(neoxRopeFlatF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchFillNeoXRopeTablesDynamicF32(
+            IntPtr localCos,
+            IntPtr localSin,
+            IntPtr localFrequencies,
+            int localHalf,
+            IntPtr globalCos,
+            IntPtr globalSin,
+            IntPtr globalFrequencies,
+            int globalHalf,
+            IntPtr dynParams,
+            IntPtr stream)
+        {
+            IntPtr localCosArg = localCos;
+            IntPtr localSinArg = localSin;
+            IntPtr localFrequenciesArg = localFrequencies;
+            int localHalfArg = localHalf;
+            IntPtr globalCosArg = globalCos;
+            IntPtr globalSinArg = globalSin;
+            IntPtr globalFrequenciesArg = globalFrequencies;
+            int globalHalfArg = globalHalf;
+            IntPtr dynParamsArg = dynParams;
+            int count = Math.Max(localHalf, globalHalf);
+            void** args = stackalloc void*[]
+            {
+                &localCosArg, &localSinArg, &localFrequenciesArg, &localHalfArg,
+                &globalCosArg, &globalSinArg, &globalFrequenciesArg, &globalHalfArg,
+                &dynParamsArg
+            };
+            Launch(fillNeoXRopeTablesDynamicF32, Grid(count), 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         /// <summary>
@@ -1639,6 +2457,24 @@ namespace TensorSharp.Cuda
             Launch(quantMatmulBatchedF32, gridX, gridY, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        /// <summary>Single-token decode (rows==1) generic quant matmul: one block
+        /// per output column at the same blockDim.x thread budget as
+        /// <see cref="LaunchQuantMatmulF32"/>'s per-column split, but without its
+        /// 4-columns-per-block serialization or the row-batched kernel's
+        /// under-populated one-warp-per-column split (which has nothing to
+        /// amortize at a single row).</summary>
+        public void LaunchQuantMatmulVecF32(IntPtr weights, IntPtr input, IntPtr output, int type, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr inputArg = input;
+            IntPtr outputArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &weightsArg, &inputArg, &outputArg, &typeArg, &inDimArg, &outDimArg };
+            Launch(quantMatmulVecF32, (uint)outDim, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchQuantMatmulIq2XxsQ81F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
         {
             IntPtr weightsArg = weights;
@@ -1732,18 +2568,24 @@ namespace TensorSharp.Cuda
                 Launch(quantMatmulQ80F32, gridX, (uint)((rows + 3) / 4), 1, BlockSize, 1, 1, 0, stream, args);
         }
 
-        // Quantize `rows` activation rows ([rows, inDim] f32) to q8_1 into `outScratch`
-        // (rows * inDim/32 ts_block_q8_1). One thread per (row, 32-block).
-        public void LaunchQuantizeQ81Rows(IntPtr input, IntPtr outScratch, int inDim, int rows, IntPtr stream)
+        // Quantize `rows` activation rows ([rows, inDim] f32) to q8_1 into
+        // `outScratch` (rows * inDim/32 ts_block_q8_1). The default warp path
+        // assigns one 32-lane warp to each 32-value block; the legacy path keeps
+        // one thread per block for controlled A/B comparisons.
+        public void LaunchQuantizeQ81Rows(
+            IntPtr input, IntPtr outScratch, int inDim, int rows, IntPtr stream, bool warpCooperative)
         {
             IntPtr inputArg = input;
             IntPtr outArg = outScratch;
             int inDimArg = inDim;
             int rowsArg = rows;
             void** args = stackalloc void*[] { &inputArg, &outArg, &inDimArg, &rowsArg };
-            long total = (long)rows * (inDim / 32);
-            uint grid = (uint)((total + BlockSize - 1) / BlockSize);
-            Launch(quantizeQ81RowsF32, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
+            long totalBlocks = (long)rows * (inDim / 32);
+            long workItems = warpCooperative ? totalBlocks * 32 : totalBlocks;
+            uint grid = (uint)((workItems + BlockSize - 1) / BlockSize);
+            Launch(
+                warpCooperative ? quantizeQ81RowsWarpF32 : quantizeQ81RowsF32,
+                grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         // Split-layout q8_1 quantization (dense qs rows + separate float scales)
@@ -1775,6 +2617,19 @@ namespace TensorSharp.Cuda
             Launch(dequantWeightF16, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        // Q8_0-specialized whole-weight dequantizer: one 32-thread block handles
+        // 2048 values using coalesced raw staging and packed half2 stores.
+        public void LaunchDequantWeightQ80F16(
+            IntPtr weights, IntPtr outputF16, long totalElements, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr outArg = outputF16;
+            long totalArg = totalElements;
+            void** args = stackalloc void*[] { &weightsArg, &outArg, &totalArg };
+            uint grid = (uint)((totalElements + 2047) / 2048);
+            Launch(dequantWeightQ80F16, grid, 1, 1, 32, 1, 1, 0, stream, args);
+        }
+
         public void LaunchConvertF32F16(IntPtr src, IntPtr dstF16, long count, IntPtr stream)
         {
             IntPtr srcArg = src;
@@ -1785,8 +2640,8 @@ namespace TensorSharp.Cuda
             Launch(convertF32F16, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
-        // Single-row Q8_0 dp4a matvec: one warp per output column over the
-        // pre-quantized q8_1 activation row (decode's dominant kernel).
+        // Single-row Q8_0 dp4a matvec: four warps cooperate on each output
+        // column over the pre-quantized q8_1 activation row.
         public void LaunchQuantMatmulQ80Vec(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, IntPtr stream)
         {
             IntPtr weightsArg = weights;
@@ -1795,9 +2650,8 @@ namespace TensorSharp.Cuda
             int inDimArg = inDim;
             int outDimArg = outDim;
             void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg };
-            const int warpsPerBlock = BlockSize / 32;
-            uint gridX = (uint)((outDim + warpsPerBlock - 1) / warpsPerBlock);
-            Launch(quantMatmulQ80VecF32, gridX, 1, 1, BlockSize, 1, 1, 0, stream, args);
+            const int vecBlockSize = 128;
+            Launch(quantMatmulQ80VecF32, (uint)outDim, 1, 1, vecBlockSize, 1, 1, 0, stream, args);
         }
 
         // Block-tile dp4a Q8_0 GEMM: weights (q8_0) x pre-quantized q8_1 activations

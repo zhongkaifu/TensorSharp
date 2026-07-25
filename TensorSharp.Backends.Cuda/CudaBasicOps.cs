@@ -339,7 +339,24 @@ namespace TensorSharp.Cuda
         [RegisterOpStorageType("repeat_interleave", typeof(CudaStorage))]
         public static Tensor RepeatInterleave(Tensor result, Tensor src, int repeats, int dim)
         {
-            return CudaCpuFallback.InvokeTensor("repeat_interleave", result, result, src, repeats, dim);
+            if (src == null)
+                throw new ArgumentNullException(nameof(src));
+            if (repeats <= 0)
+                throw new ArgumentOutOfRangeException(nameof(repeats));
+            if (dim < 0)
+                dim += src.DimensionCount;
+            if (dim < 0 || dim >= src.DimensionCount)
+                throw new ArgumentOutOfRangeException(nameof(dim));
+
+            long[] outputSizes = src.Sizes.ToArray();
+            outputSizes[dim] = checked(outputSizes[dim] * repeats);
+            Tensor writeTarget = TensorResultBuilder.GetWriteTarget(
+                result, src.Allocator, src.ElementType, false, outputSizes);
+            if (CudaKernelOps.TryRepeatInterleave(writeTarget, src, repeats, dim))
+                return writeTarget;
+
+            return CudaCpuFallback.InvokeTensor(
+                "repeat_interleave", writeTarget, writeTarget, src, repeats, dim);
         }
 
         [RegisterOpStorageType("add_causal_mask", typeof(CudaStorage))]

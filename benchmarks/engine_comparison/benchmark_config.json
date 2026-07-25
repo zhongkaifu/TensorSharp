@@ -79,6 +79,16 @@
       "mtp_supported": true,
       "mtp_draft": null
     },
+    "qwen35-9b": {
+      "display": "Qwen 3.5 9B (Q8_0, dense)",
+      "family": "qwen35",
+      "gguf": {"path": "${model_root}/Qwen3.5-9B-Q8_0.gguf", "env": "BENCH_QWEN35_9B_GGUF"},
+      "mmproj": null,
+      "modalities": ["text"],
+      "size_class": "small",
+      "mtp_supported": true,
+      "mtp_draft": null
+    },
     "qwen-image-edit": {
       "display": "Qwen-Image-Edit 2511 (Q2_K DiT + Lightning 4-step LoRA)",
       "family": "qwenimage",
