@@ -14,19 +14,85 @@ namespace TensorSharp.Cuda
             public long Ne0;
             public long Ne1;
             public int DeviceId;
+            /// <summary>When true the bytes live inside a <see cref="WeightArena"/>
+            /// slab (bump-suballocated), so this weight must NOT be individually
+            /// cuMemFree'd — the arena owns and frees the whole slab.</summary>
+            public bool ArenaBacked;
 
             public void Dispose()
             {
                 if (DevicePtr != IntPtr.Zero)
                 {
-                    CudaDriverApi.cuMemFree(DevicePtr);
+                    if (!ArenaBacked)
+                        CudaDriverApi.cuMemFree(DevicePtr);
                     DevicePtr = IntPtr.Zero;
                 }
             }
         }
 
+        // Model weights are allocated in bulk at load and freed together at
+        // unload. Handing each of the (7000+ for a big MoE) weight tensors its
+        // own cuMemAlloc wastes ~1.6 GB on a 26B model: every driver allocation
+        // is rounded up to the device page granularity, and those roundings add
+        // up until the model no longer fits and inference spills into WDDM shared
+        // memory. Packing weights into a few large slabs (like ggml's model
+        // buffers) removes that rounding waste almost entirely.
+        private sealed class WeightArena
+        {
+            // 256 MB slabs: large enough that per-tensor rounding disappears, small
+            // enough that the final slab wastes little tail and never fails to
+            // allocate late in the preload when free VRAM is low.
+            private const long SlabBytes = 256L << 20;
+            private readonly CudaAllocator allocator;
+            private readonly List<IntPtr> slabs = new List<IntPtr>();
+            private IntPtr currentSlab;
+            private long currentSlabSize;
+            private long currentOffset;
+
+            public WeightArena(CudaAllocator allocator) => this.allocator = allocator;
+
+            /// <summary>Bump-suballocate <paramref name="rawBytes"/> from a slab.
+            /// Each block is 256-byte aligned and carries 16 trailing slack bytes
+            /// (the cp.async MMQ kernel over-reads up to 8 bytes past the last
+            /// block), matching the old per-tensor <c>cuMemAlloc(rawBytes + 16)</c>.</summary>
+            public IntPtr Allocate(long rawBytes)
+            {
+                const long align = 256;
+                long need = ((rawBytes + 16 + align - 1) / align) * align;
+                if (currentSlab == IntPtr.Zero || currentOffset + need > currentSlabSize)
+                {
+                    long slabSize = Math.Max(SlabBytes, need);
+                    allocator.Context.MakeCurrent();
+                    CudaDriverApi.cuMemAlloc(out IntPtr slab, new UIntPtr((ulong)slabSize)).ThrowOnError();
+                    slabs.Add(slab);
+                    currentSlab = slab;
+                    currentSlabSize = slabSize;
+                    currentOffset = 0;
+                }
+
+                IntPtr ptr = new IntPtr(currentSlab.ToInt64() + currentOffset);
+                currentOffset += need;
+                return ptr;
+            }
+
+            public void FreeAll()
+            {
+                allocator.Context.MakeCurrent();
+                foreach (IntPtr slab in slabs)
+                {
+                    if (slab != IntPtr.Zero)
+                        CudaDriverApi.cuMemFree(slab);
+                }
+                slabs.Clear();
+                currentSlab = IntPtr.Zero;
+                currentSlabSize = 0;
+                currentOffset = 0;
+            }
+        }
+
         private static readonly object Sync = new object();
         private static readonly Dictionary<CacheKey, DeviceWeight> Cache = new Dictionary<CacheKey, DeviceWeight>();
+        private static readonly Dictionary<CudaAllocator, WeightArena> Arenas = new Dictionary<CudaAllocator, WeightArena>();
 
         private sealed class ScratchAllocation
         {
@@ -220,6 +286,66 @@ namespace TensorSharp.Cuda
         public static bool Q80VecDp4aEnabled { get; set; } =
             !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q80_VEC"), "0", StringComparison.Ordinal);
 
+        // Q4_K single-token decode via q8_1-quantized activation + dp4a (ggml
+        // mul_mat_vec_q4_K). The generic scalar vec kernel re-parses the Q4_K
+        // super-block header per nibble; on a Q4_K-heavy model (every projection
+        // in the 26B-A4B is Q4_K) that leaves decode ~2x behind ggml. On by
+        // default; TS_CUDA_Q4K_DP4A=0 reverts to the exact scalar kernel (the
+        // exact-reference tests pin it off, then a separate test checks the dp4a
+        // path against the looser int8 tolerance). Settable for that test split.
+        public static bool Q4KDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q4K_DP4A"), "0", StringComparison.Ordinal);
+
+        // Q5_K / Q6_K single-token decode via ggml-style q8_1 activation dots.
+        // The scalar fallback calls qvalue_at for every weight, repeatedly parsing
+        // K-quant headers and bitfields. These paths quantize the activation once
+        // and use packed dp4a dots. Each flag is independently settable for parity
+        // tests and A/B profiling.
+        public static bool Q5KDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q5K_DP4A"), "0", StringComparison.Ordinal);
+
+        public static bool Q6KDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_Q6K_DP4A"), "0", StringComparison.Ordinal);
+
+        // IQ2_XXS on-device MoE experts via q8_1-quantized activation + the existing
+        // dot_iq2_xxs_q8_1 dp4a dot (ggml vec_dot_iq2_xxs_q8_1), replacing the
+        // per-element scalar grid-lookup path for the gate/up expert projections of
+        // UD-IQ2_XXS MoE models (Qwen3.6-35B-A3B). On by default; TS_CUDA_IQ2XXS_DP4A=0
+        // reverts to the scalar MoE kernels for A/B testing.
+        public static bool Iq2xxsDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_IQ2XXS_DP4A"), "0", StringComparison.Ordinal);
+
+        // IQ2_S on-device MoE experts via q8_1 + the ggml-compatible
+        // vec_dot_iq2_s_q8_1 dp4a dot. The Qwen3.6-35B-A3B UD-IQ2_XXS file uses
+        // IQ2_XXS for expert gate/up but IQ2_S for expert down, so both formats
+        // need a device vec-dot to keep the full MoE decode on the fast path.
+        // TS_CUDA_IQ2S_DP4A=0 keeps the scalar expert kernel for A/B testing.
+        public static bool Iq2sDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_IQ2S_DP4A"), "0", StringComparison.Ordinal);
+
+        // Single-row IQ2_XXS/IQ2_S matvec using one global q8_1 scratch row.
+        // This quantizes the activation once per projection instead of once per
+        // output CTA. TS_CUDA_IQ2_VEC=0 restores the previous decode paths.
+        public static bool Iq2VecDp4aEnabled { get; set; } =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_IQ2_VEC"), "0", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Returns whether the q8_1 + dp4a MoE projection is enabled for the
+        /// specified quantized weight type. The gate/up and down stages may use
+        /// different quant types, so callers must query each stage independently.
+        /// </summary>
+        public static bool IsMoeDp4aEnabledForType(int ggmlType)
+        {
+            return ggmlType switch
+            {
+                2 => Q40Dp4aEnabled,
+                12 => Q4KDp4aEnabled,
+                16 => Iq2xxsDp4aEnabled,
+                22 => Iq2sDp4aEnabled,
+                _ => false,
+            };
+        }
+
         // Quantize each 32-value activation block cooperatively with one warp.
         // This mirrors ggml_cuda's q8_1 quantizer and replaces the legacy
         // one-thread-per-block implementation, whose 32 serial loads/stores are
@@ -287,7 +413,7 @@ namespace TensorSharp.Cuda
             if (allocator == null || cacheKey == IntPtr.Zero)
                 return;
 
-            var key = new CacheKey(allocator.DeviceId, cacheKey);
+            var key = new CacheKey(allocator, cacheKey);
             lock (Sync)
             {
                 if (Cache.TryGetValue(key, out DeviceWeight entry))
@@ -310,7 +436,7 @@ namespace TensorSharp.Cuda
                 var remove = new List<CacheKey>();
                 foreach (var kv in Cache)
                 {
-                    if (kv.Key.DeviceId == allocator.DeviceId)
+                    if (ReferenceEquals(kv.Key.Allocator, allocator))
                     {
                         kv.Value.Dispose();
                         remove.Add(kv.Key);
@@ -319,7 +445,107 @@ namespace TensorSharp.Cuda
 
                 foreach (CacheKey key in remove)
                     Cache.Remove(key);
+
+                ReleaseArenaLocked(allocator);
             }
+        }
+
+        /// <summary>Frees the arena slabs backing this allocator's resident weights.
+        /// Call once all weight pointers are done being used (model unload /
+        /// allocator dispose). Cache entries that point into the freed slabs are
+        /// purged so a later lookup re-uploads instead of returning a dangling
+        /// pointer.</summary>
+        public static void ReleaseArena(CudaAllocator allocator)
+        {
+            if (allocator == null)
+                return;
+            lock (Sync)
+            {
+                allocator.Context.MakeCurrent();
+                // Drop only entries owned by this allocator's arena. Other
+                // allocators on the same device have independent slabs/streams
+                // and must remain resident when this model is unloaded.
+                var remove = new List<CacheKey>();
+                foreach (var kv in Cache)
+                {
+                    if (ReferenceEquals(kv.Key.Allocator, allocator) && kv.Value.ArenaBacked)
+                        remove.Add(kv.Key);
+                }
+                foreach (CacheKey key in remove)
+                    Cache.Remove(key);
+
+                ReleaseArenaLocked(allocator);
+            }
+        }
+
+        private static void ReleaseArenaLocked(CudaAllocator allocator)
+        {
+            if (Arenas.TryGetValue(allocator, out WeightArena arena))
+            {
+                arena.FreeAll();
+                Arenas.Remove(allocator);
+            }
+        }
+
+        /// <summary>Returns the device pointer of an already-preloaded quantized
+        /// weight (by its host cache key), so callers can build a device-side
+        /// table of per-expert weight pointers for the on-device MoE kernels.</summary>
+        public static bool TryGetResidentDevicePtr(CudaAllocator allocator, IntPtr cacheKey, out IntPtr devicePtr, out int ggmlType)
+        {
+            devicePtr = IntPtr.Zero;
+            ggmlType = 0;
+            if (allocator == null || cacheKey == IntPtr.Zero)
+                return false;
+
+            var key = new CacheKey(allocator, cacheKey);
+            lock (Sync)
+            {
+                if (Cache.TryGetValue(key, out DeviceWeight w) && w.DevicePtr != IntPtr.Zero)
+                {
+                    devicePtr = w.DevicePtr;
+                    ggmlType = w.GgmlType;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Uploads a small array of device pointers to a device buffer
+        /// (used by the on-device MoE kernels to index per-expert weights by the
+        /// device-computed expert id). Free with <see cref="FreeDeviceBuffer"/>.</summary>
+        public static unsafe IntPtr CreateDevicePointerTable(CudaAllocator allocator, IntPtr[] hostPtrs)
+        {
+            if (allocator == null)
+                throw new ArgumentNullException(nameof(allocator));
+            if (hostPtrs == null || hostPtrs.Length == 0)
+                throw new ArgumentException("Pointer table must be non-empty.", nameof(hostPtrs));
+
+            long bytes = (long)hostPtrs.Length * sizeof(ulong);
+            var tmp = new ulong[hostPtrs.Length];
+            for (int i = 0; i < hostPtrs.Length; i++)
+                tmp[i] = (ulong)hostPtrs[i].ToInt64();
+
+            allocator.Context.MakeCurrent();
+            CudaDriverApi.cuMemAlloc(out IntPtr dev, new UIntPtr((ulong)bytes)).ThrowOnError();
+            try
+            {
+                fixed (ulong* p = tmp)
+                    CudaDriverApi.cuMemcpyHtoD(dev, (IntPtr)p, new UIntPtr((ulong)bytes)).ThrowOnError();
+            }
+            catch
+            {
+                CudaDriverApi.cuMemFree(dev);
+                throw;
+            }
+            return dev;
+        }
+
+        public static void FreeDeviceBuffer(CudaAllocator allocator, IntPtr ptr)
+        {
+            if (allocator == null || ptr == IntPtr.Zero)
+                return;
+            allocator.Context.MakeCurrent();
+            CudaDriverApi.cuMemFree(ptr);
         }
 
         // q8Kernel override for the multi-row Q8_0 path (lets a test drive MMA and dp4a
@@ -479,6 +705,66 @@ namespace TensorSharp.Cuda
             // per-column thread count directly costs latency on wide tensors
             // (e.g. a K-quant lm_head/large-in_dim projection) -- TS_CUDA_QMM_VEC=0
             // falls back to the scalar per-4-columns kernel for A/B comparison.
+            // Q4_K single-token decode: q8_1 activation + dp4a (see the kernel).
+            // inDim % 256 == 0 holds for every real model dim (Q4_K is a 256-block
+            // quant); the fallbacks below cover any exotic shape.
+            if (Q4KDp4aEnabled && ggmlType == 12 && rows == 1 && (inDim & 255) == 0)
+            {
+                long scratchBytes = (long)(inDim / 32) * CudaKernels.Q81BlockBytes;
+                IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                kernels.LaunchQuantizeQ81Rows(
+                    inputPtr, xqScratch, inDim, rows, allocator.Stream.Handle, Q81WarpQuantizeEnabled);
+                kernels.LaunchQuantMatmulQ4KDp4a(
+                    weight.DevicePtr, xqScratch, resultPtr, inDim, outDim, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+            // Q5_K/Q6_K decode: use the same global q8_1 scratch as Q4_K, with
+            // format-specific packed dp4a vec-dots. Keep this strictly rows==1;
+            // batched prefill retains its weight-reusing row-tiled path.
+            if (rows == 1 && (inDim & 255) == 0
+                && ((ggmlType == 13 && Q5KDp4aEnabled)
+                    || (ggmlType == 14 && Q6KDp4aEnabled)))
+            {
+                long scratchBytes = (long)(inDim / 32) * CudaKernels.Q81BlockBytes;
+                IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                kernels.LaunchQuantizeQ81Rows(
+                    inputPtr, xqScratch, inDim, 1,
+                    allocator.Stream.Handle, Q81WarpQuantizeEnabled);
+                if (ggmlType == 13)
+                {
+                    kernels.LaunchQuantMatmulQ5KDp4a(
+                        weight.DevicePtr, xqScratch, resultPtr,
+                        inDim, outDim, allocator.Stream.Handle);
+                }
+                else
+                {
+                    kernels.LaunchQuantMatmulQ6KDp4a(
+                        weight.DevicePtr, xqScratch, resultPtr,
+                        inDim, outDim, allocator.Stream.Handle);
+                }
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
+            // Decode IQ2 matvec: quantize the activation row once into the global
+            // allocator scratch, then four warp-owned output columns per CTA reuse
+            // it. The older IQ2_XXS kernel rebuilt the same q8_1 row in shared
+            // memory in every CTA; IQ2_S otherwise fell through to scalar qvalue_at.
+            if (Iq2VecDp4aEnabled && rows == 1
+                && (ggmlType == 16 || ggmlType == 22)
+                && (inDim & 255) == 0)
+            {
+                long scratchBytes = (long)(inDim / 32) * CudaKernels.Q81BlockBytes;
+                IntPtr xqScratch = EnsureQ81Scratch(allocator, scratchBytes);
+                kernels.LaunchQuantizeQ81Rows(
+                    inputPtr, xqScratch, inDim, 1,
+                    allocator.Stream.Handle, Q81WarpQuantizeEnabled);
+                kernels.LaunchQuantMatmulIq2VecQ81F32(
+                    weight.DevicePtr, xqScratch, resultPtr,
+                    ggmlType, inDim, outDim, allocator.Stream.Handle);
+                resultStorage.MarkDeviceModified();
+                return true;
+            }
             if (VecMatmulEnabled && rows == 1
                 && ggmlType != 2 && ggmlType != 8 && ggmlType != 16)
             {
@@ -653,7 +939,7 @@ namespace TensorSharp.Cuda
             if (cacheKey == IntPtr.Zero)
                 throw new ArgumentException("CUDA quantized weight cache key cannot be zero.", nameof(cacheKey));
 
-            var key = new CacheKey(allocator.DeviceId, cacheKey);
+            var key = new CacheKey(allocator, cacheKey);
             lock (Sync)
             {
                 if (Cache.TryGetValue(key, out DeviceWeight existing))
@@ -663,47 +949,49 @@ namespace TensorSharp.Cuda
                     throw new InvalidOperationException("Quantized weight is not preloaded on this CUDA device and no host data was provided.");
 
                 allocator.Context.MakeCurrent();
-                // +16 slack bytes: the cp.async MMQ kernel stages weight windows as
-                // 16-byte-aligned chunks whose final chunk may reach up to 8 bytes
-                // past the last block of the last row (the bytes are never read).
-                CudaDriverApi.cuMemAlloc(out IntPtr devicePtr, new UIntPtr((ulong)(rawBytes + 16))).ThrowOnError();
-                try
+                // Suballocate from the per-allocator weight arena instead of one
+                // cuMemAlloc per tensor: model weights live for the model's whole
+                // lifetime and are freed together at unload, so packing them into
+                // large slabs removes the per-tensor driver rounding that otherwise
+                // wastes ~1.6 GB on a 26B MoE (the +16 trailing slack the cp.async
+                // MMQ kernel needs is reserved inside Allocate).
+                if (!Arenas.TryGetValue(allocator, out WeightArena arena))
                 {
-                    CudaDriverApi.cuMemcpyHtoD(devicePtr, hostData, new UIntPtr((ulong)rawBytes)).ThrowOnError();
-                    var entry = new DeviceWeight
-                    {
-                        DevicePtr = devicePtr,
-                        RawBytes = rawBytes,
-                        GgmlType = ggmlType,
-                        Ne0 = ne0,
-                        Ne1 = ne1,
-                        DeviceId = allocator.DeviceId,
-                    };
-                    Cache.Add(key, entry);
-                    return entry;
+                    arena = new WeightArena(allocator);
+                    Arenas.Add(allocator, arena);
                 }
-                catch
+
+                IntPtr devicePtr = arena.Allocate(rawBytes);
+                CudaDriverApi.cuMemcpyHtoD(devicePtr, hostData, new UIntPtr((ulong)rawBytes)).ThrowOnError();
+                var entry = new DeviceWeight
                 {
-                    CudaDriverApi.cuMemFree(devicePtr);
-                    throw;
-                }
+                    DevicePtr = devicePtr,
+                    RawBytes = rawBytes,
+                    GgmlType = ggmlType,
+                    Ne0 = ne0,
+                    Ne1 = ne1,
+                    DeviceId = allocator.DeviceId,
+                    ArenaBacked = true,
+                };
+                Cache.Add(key, entry);
+                return entry;
             }
         }
 
         private readonly struct CacheKey : IEquatable<CacheKey>
         {
-            public CacheKey(int deviceId, IntPtr key)
+            public CacheKey(CudaAllocator allocator, IntPtr key)
             {
-                DeviceId = deviceId;
+                Allocator = allocator ?? throw new ArgumentNullException(nameof(allocator));
                 Key = key;
             }
 
-            public int DeviceId { get; }
+            public CudaAllocator Allocator { get; }
             public IntPtr Key { get; }
 
             public bool Equals(CacheKey other)
             {
-                return DeviceId == other.DeviceId && Key == other.Key;
+                return ReferenceEquals(Allocator, other.Allocator) && Key == other.Key;
             }
 
             public override bool Equals(object obj)
@@ -713,7 +1001,8 @@ namespace TensorSharp.Cuda
 
             public override int GetHashCode()
             {
-                return HashCode.Combine(DeviceId, Key);
+                // CudaAllocator is sealed and uses object-identity equality/hash.
+                return HashCode.Combine(Allocator, Key);
             }
         }
     }

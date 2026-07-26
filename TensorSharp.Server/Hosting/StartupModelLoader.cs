@@ -82,6 +82,7 @@ namespace TensorSharp.Server.Hosting
                 warmupSw.Stop();
                 logger.LogInformation(LogEventIds.HostConfiguration,
                     "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
+                modelService.Model.LogVramSnapshot("after kernel warmup");
             }
         }
     }

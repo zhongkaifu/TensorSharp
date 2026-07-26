@@ -26,6 +26,12 @@ namespace TensorSharp.Cuda
             // chunk's transients all pool, which also keeps CUDA-graph captures
             // of the prefill loop allocation-free.
             long largeCachedBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_LARGE_MB", 1024L) * 1024L * 1024L;
+            // Keep at least this much dedicated VRAM free: once the pool would push
+            // free VRAM below it, returned blocks go back to the driver instead of
+            // into the cache. Prevents the pool from being the thing that tips a
+            // nearly-full device (a big model on a small card) into WDDM shared
+            // memory. 0 disables the valve (unbounded caching, the old behaviour).
+            long minFreeReserveBytes = ReadPoolLimit("TENSORSHARP_CUDA_POOL_MIN_FREE_MB", 256L) * 1024L * 1024L;
 
             CudaContext context = null;
             CudaStream stream = null;
@@ -62,7 +68,9 @@ namespace TensorSharp.Cuda
                 poolEnabled,
                 backingAllocate: AllocateDeviceMemory,
                 backingFree: FreeDeviceMemory,
-                largeCachedBytesCap: largeCachedBytes);
+                largeCachedBytesCap: largeCachedBytes,
+                queryFreeBytes: QueryFreeDeviceBytes,
+                minFreeReserveBytes: minFreeReserveBytes);
         }
 
         public BlasEnum BlasEnum => BlasEnum.CUDA;
@@ -127,6 +135,17 @@ namespace TensorSharp.Cuda
             CudaDriverApi.cuMemFree(ptr);
         }
 
+        /// <summary>Free dedicated device memory in bytes, for the pool's
+        /// VRAM-pressure valve. Sampled at most every ~10 ms, so the MakeCurrent +
+        /// cuMemGetInfo cost stays off the hot return path.</summary>
+        private long QueryFreeDeviceBytes()
+        {
+            Context.MakeCurrent();
+            if (CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr _) != 0)
+                return long.MaxValue; // on query failure, don't throttle caching
+            return (long)free.ToUInt64();
+        }
+
         public float GetAllocatedMemoryRatio()
         {
             Context.MakeCurrent();
@@ -137,6 +156,32 @@ namespace TensorSharp.Cuda
 
             ulong freeBytes = free.ToUInt64();
             return (float)(1.0 - (double)freeBytes / totalBytes);
+        }
+
+        /// <summary>Free / total device memory in bytes (driver view, i.e. dedicated
+        /// VRAM only — WDDM shared-memory spillover shows up as this staying pinned
+        /// near zero while performance collapses).</summary>
+        public (long freeBytes, long totalBytes) GetMemoryInfo()
+        {
+            Context.MakeCurrent();
+            CudaDriverApi.cuMemGetInfo(out UIntPtr free, out UIntPtr total).ThrowOnError();
+            return ((long)free.ToUInt64(), (long)total.ToUInt64());
+        }
+
+        internal static readonly bool VramLogEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("TS_CUDA_LOG_VRAM"), "1", StringComparison.Ordinal);
+
+        /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): prints free/used dedicated VRAM
+        /// plus the pool's currently-cached idle bytes at <paramref name="label"/>.</summary>
+        public void LogVram(string label)
+        {
+            if (!VramLogEnabled)
+                return;
+            (long free, long total) = GetMemoryInfo();
+            long cached = pool.GetStats().CachedBytes;
+            Console.WriteLine(
+                $"[vram] {label}: free={free / (1024 * 1024)} MB used={(total - free) / (1024 * 1024)} MB " +
+                $"pool_cached={cached / (1024 * 1024)} MB");
         }
 
         /// <summary>
@@ -158,6 +203,7 @@ namespace TensorSharp.Cuda
             Context.MakeCurrent();
             Stream.Synchronize();
             CudaQuantizedOps.ReleaseScratch(this);
+            CudaQuantizedOps.ReleaseArena(this);
             pool.DrainAndFree();
             Kernels?.Dispose();
             Blas.Dispose();

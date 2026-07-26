@@ -500,6 +500,578 @@ namespace TensorSharp.Cuda
             return CudaKernelOps.TryGELUMulSplit(result, gateUp, halfDim);
         }
 
+        private static IntPtr DeviceBufferOf(Tensor t)
+        {
+            return t?.Storage is CudaStorage cs
+                ? cs.DevicePtrAtElement(t.StorageOffset)
+                : IntPtr.Zero;
+        }
+
+        private static bool IsCudaVector(
+            Tensor tensor, DType elementType, long length,
+            CudaAllocator allocator, out CudaStorage storage)
+        {
+            storage = tensor?.Storage as CudaStorage;
+            return storage != null
+                && (allocator == null || ReferenceEquals(storage.AllocatorImpl, allocator))
+                && tensor.ElementType == elementType
+                && tensor.DimensionCount == 1
+                && tensor.Sizes[0] == length
+                && tensor.IsContiguous();
+        }
+
+        private static bool IsCudaMatrix(
+            Tensor tensor, DType elementType, long rows, long columns,
+            CudaAllocator allocator, out CudaStorage storage)
+        {
+            storage = tensor?.Storage as CudaStorage;
+            return storage != null
+                && (allocator == null || ReferenceEquals(storage.AllocatorImpl, allocator))
+                && tensor.ElementType == elementType
+                && tensor.DimensionCount == 2
+                && tensor.Sizes[0] == rows
+                && tensor.Sizes[1] == columns
+                && tensor.IsContiguous();
+        }
+
+        /// <summary>Bytes per q8_1 activation block (ts_block_q8_1): a 32-value
+        /// block = two fp16 (scale + d*sum) + 32 int8. Callers sizing q8_1 scratch
+        /// for the dp4a paths use this.</summary>
+        public const int Q81BlockBytes = CudaKernels.Q81BlockBytes;
+
+        /// <summary>Maximum top-k width supported by the fixed-size local arrays
+        /// in the native on-device MoE router kernels.</summary>
+        public const int MaxMoEExpertsUsed = 32;
+
+        internal static bool IsMoERouterConfigurationSupported(int numExperts, int nUsed)
+            => numExperts > 0 && nUsed > 0
+               && nUsed <= numExperts && nUsed <= MaxMoEExpertsUsed;
+
+        internal static bool IsMoeDp4aDimensionSupported(int type, int inDim)
+        {
+            if (inDim <= 0)
+                return false;
+            return type switch
+            {
+                2 => (inDim & 31) == 0,                       // Q4_0 block
+                12 or 16 or 22 => (inDim & 255) == 0,        // Q4_K / IQ2_XXS / IQ2_S
+                _ => false,
+            };
+        }
+
+        private static bool MoeStageDp4aOk(bool requested, int type, int inDim, Tensor scratch)
+            => requested
+               && IsMoeDp4aDimensionSupported(type, inDim)
+               && scratch?.Storage is CudaStorage;
+
+        /// <summary>Device pointer of a CUDA-resident tensor, flushing any pending
+        /// host upload first. Returns <see cref="IntPtr.Zero"/> for a non-CUDA
+        /// tensor. Lets callers in other assemblies (e.g. the models) hand a
+        /// device-resident buffer (a per-expert scale vector) to a raw kernel.</summary>
+        public static IntPtr GetDeviceResidentPtr(Tensor t)
+        {
+            if (t?.Storage is CudaStorage cs)
+            {
+                cs.EnsureDeviceCurrent();
+                return cs.DevicePtrAtElement(t.StorageOffset);
+            }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Fully on-device Gemma 4 MoE expert FFN for decode (seqLen == 1): router
+        /// top-k + softmax, per-expert gate/up matvec, GEGLU, per-expert down
+        /// matvec and routing-weighted accumulation — all as device kernels with
+        /// NO host readback, so a decode layer loop using it is CUDA-graph
+        /// capturable. The per-expert quantized weights are addressed through the
+        /// device pointer tables (<paramref name="gateUpPtrTable"/> /
+        /// <paramref name="downPtrTable"/>) indexed by the on-device expert id, so
+        /// one captured graph replays for every token regardless of routing.
+        /// </summary>
+        public static bool TryMoEExpertFFNDecode(
+            Tensor logits,            // [1, numExperts] F32 router logits (device)
+            Tensor moeInput,          // [1, hiddenDim] F32 RMSNorm'd MoE input (device)
+            Tensor output,            // [1, hiddenDim] F32 result (written)
+            Tensor selectedExperts,   // [nUsed] Int32 scratch
+            Tensor routingWeights,    // [nUsed] F32 scratch
+            Tensor gateUpOut,         // [nUsed, 2*nFf] F32 scratch
+            Tensor hAll,              // [nUsed, nFf] F32 scratch
+            IntPtr perExpertScalePtr, // device [numExperts] F32 or IntPtr.Zero
+            IntPtr gateUpPtrTable,    // device [numExperts] u64
+            IntPtr downPtrTable,      // device [numExperts] u64
+            int quantType, int numExperts, int nUsed, int hiddenDim, int nFf,
+            // Q4_K dp4a fast path (see the ts_moe_expert_*_q4k_dp4a kernels): q8_1
+            // scratch for the MoE input (moeInputQ8, hiddenDim/32 blocks) and the
+            // GEGLU output (hAllQ8, nUsed * nFf/32 blocks). Both null -> the generic
+            // scalar-dequant kernels run instead (any quant type).
+            Tensor moeInputQ8 = null,
+            Tensor hAllQ8 = null,
+            bool useDp4a = false)
+        {
+            // The native router uses fixed-size local arrays (MAX_K == 32).
+            // Reject invalid configurations here, before any kernel is enqueued:
+            // otherwise nUsed > 32 leaves downstream route slots uninitialized,
+            // while nUsed == 0 produces an invalid zero-height expert launch.
+            if (!IsMoERouterConfigurationSupported(numExperts, nUsed)
+                || hiddenDim <= 0 || nFf <= 0 || nFf > int.MaxValue / 2
+                || !CudaQuantizedOps.SupportsQuantizedType(quantType))
+            {
+                return false;
+            }
+
+            if (!IsCudaMatrix(output, DType.Float32, 1, hiddenDim, null, out CudaStorage outStorage))
+            {
+                return false;
+            }
+            CudaAllocator allocator = outStorage.AllocatorImpl;
+            int twoNff = nFf * 2;
+            if (!IsCudaMatrix(logits, DType.Float32, 1, numExperts, allocator, out CudaStorage logitsStorage)
+                || !IsCudaMatrix(moeInput, DType.Float32, 1, hiddenDim, allocator, out CudaStorage moeInStorage)
+                || !IsCudaVector(selectedExperts, DType.Int32, nUsed, allocator, out _)
+                || !IsCudaVector(routingWeights, DType.Float32, nUsed, allocator, out _)
+                || !IsCudaMatrix(gateUpOut, DType.Float32, nUsed, twoNff, allocator, out _)
+                || !IsCudaMatrix(hAll, DType.Float32, nUsed, nFf, allocator, out _))
+            {
+                return false;
+            }
+            long moeInputQ8Bytes = (long)(hiddenDim / 32) * Q81BlockBytes;
+            long hAllQ8Bytes = (long)nUsed * (nFf / 32) * Q81BlockBytes;
+            if (moeInputQ8 != null
+                && !IsCudaVector(moeInputQ8, DType.UInt8, moeInputQ8Bytes, allocator, out _))
+                return false;
+            if (hAllQ8 != null
+                && !IsCudaVector(hAllQ8, DType.UInt8, hAllQ8Bytes, allocator, out _))
+                return false;
+            if (gateUpPtrTable == IntPtr.Zero || downPtrTable == IntPtr.Zero)
+                return false;
+
+            var kernels = allocator?.Kernels;
+            if (kernels == null)
+                return false;
+
+            IntPtr logitsPtr = DeviceBufferOf(logits);
+            IntPtr moeInPtr = DeviceBufferOf(moeInput);
+            IntPtr outPtr = DeviceBufferOf(output);
+            IntPtr selPtr = DeviceBufferOf(selectedExperts);
+            IntPtr rwPtr = DeviceBufferOf(routingWeights);
+            IntPtr guPtr = DeviceBufferOf(gateUpOut);
+            IntPtr hPtr = DeviceBufferOf(hAll);
+
+            // Router logits / MoE input are device-produced upstream; ensure any
+            // pending upload is flushed (no-op when already device-current, so it
+            // stays capture-safe).
+            logitsStorage.EnsureDeviceCurrent();
+            moeInStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            IntPtr stream = allocator.Stream.Handle;
+
+            kernels.LaunchMoERouterF32(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, stream);
+
+            // Q4_0 / Q4_K experts: dp4a over q8_1-quantized activations (~2x the
+            // scalar qvalue_at path; the expert FFN is the bulk of MoE decode).
+            // Both dims are a multiple of 32 (block size) for these quants; falls
+            // back to the generic kernels for any other quant type or missing
+            // scratch.
+            bool dp4a = useDp4a && (quantType == 2 || quantType == 12)
+                && moeInputQ8?.Storage is CudaStorage && hAllQ8?.Storage is CudaStorage
+                && (hiddenDim & 31) == 0 && (nFf & 31) == 0;
+
+            if (dp4a)
+            {
+                IntPtr moeInQ8 = DeviceBufferOf(moeInputQ8);
+                IntPtr hQ8 = DeviceBufferOf(hAllQ8);
+                kernels.LaunchQuantizeQ81Rows(moeInPtr, moeInQ8, hiddenDim, 1, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertGateUpDp4a(gateUpPtrTable, selPtr, moeInQ8, guPtr, quantType, hiddenDim, twoNff, nUsed, stream);
+                kernels.LaunchGELUMulSplitF32(guPtr, hPtr, nUsed, nFf, stream);
+                kernels.LaunchQuantizeQ81Rows(hPtr, hQ8, nFf, nUsed, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertDownDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, quantType, nFf, hiddenDim, nUsed, stream);
+            }
+            else
+            {
+                kernels.LaunchMoEExpertGateUpVecF32(gateUpPtrTable, selPtr, moeInPtr, guPtr, quantType, hiddenDim, twoNff, nUsed, stream);
+                kernels.LaunchGELUMulSplitF32(guPtr, hPtr, nUsed, nFf, stream);
+                kernels.LaunchMoEExpertDownAccumF32(downPtrTable, selPtr, rwPtr, hPtr, outPtr, quantType, nFf, hiddenDim, nUsed, stream);
+            }
+
+            outStorage.MarkDeviceModified();
+            ((CudaStorage)selectedExperts.Storage).MarkDeviceModified();
+            ((CudaStorage)routingWeights.Storage).MarkDeviceModified();
+            ((CudaStorage)gateUpOut.Storage).MarkDeviceModified();
+            ((CudaStorage)hAll.Storage).MarkDeviceModified();
+            if (dp4a)
+            {
+                ((CudaStorage)moeInputQ8.Storage).MarkDeviceModified();
+                ((CudaStorage)hAllQ8.Storage).MarkDeviceModified();
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// On-device SwiGLU MoE expert FFN for direct-CUDA decode (Qwen3.5/3.6 MoE).
+        /// Router top-k + softmax-over-selected, separate gate/up expert projections,
+        /// SwiGLU (silu(gate)*up), down + routing-weighted accumulate, and an optional
+        /// gated shared expert — all device kernels with no host readback, so the
+        /// enclosing decode layer loop stays CUDA-graph capturable. Numerically mirrors
+        /// SelectTopKRouteWeights (normalized top-k softmax) + RunMoEExpertsReused
+        /// (SiLUMul) + the shared-expert SigmoidScalar(VecDot) gate.
+        ///
+        /// Unlike <see cref="TryMoEExpertFFNDecode"/> (Gemma, fused gate_up + GEGLU),
+        /// gate and up are separate weights/tables here. The gate/up and down
+        /// projections independently use q8_1+dp4a (Q4_0=2 / Q4_K=12 /
+        /// IQ2_XXS=16 / IQ2_S=22) when requested; otherwise they use the generic
+        /// scalar-dequant kernels. <paramref name="sharedDown"/> is the
+        /// already-computed shared-expert down output ([1, hiddenDim]) or null.
+        /// </summary>
+        public static bool TryMoEExpertFFNDecodeSwiGLU(
+            Tensor logits, Tensor moeInput, Tensor output,
+            Tensor selectedExperts, Tensor routingWeights, Tensor gateOut, Tensor upOut,
+            IntPtr perExpertScalePtr,
+            IntPtr gatePtrTable, IntPtr upPtrTable, IntPtr downPtrTable,
+            int gateUpType, int downType, int numExperts, int nUsed, int hiddenDim, int nFf,
+            Tensor sharedDown, IntPtr sharedGateVecPtr,
+            Tensor moeInputQ8 = null, Tensor gateOutQ8 = null,
+            bool useGateUpDp4a = false, bool useDownDp4a = false)
+        {
+            if (!IsMoERouterConfigurationSupported(numExperts, nUsed)
+                || hiddenDim <= 0 || nFf <= 0
+                || !CudaQuantizedOps.SupportsQuantizedType(gateUpType)
+                || !CudaQuantizedOps.SupportsQuantizedType(downType))
+            {
+                return false;
+            }
+
+            if (!IsCudaMatrix(output, DType.Float32, 1, hiddenDim, null, out CudaStorage outStorage))
+            {
+                return false;
+            }
+            CudaAllocator allocator = outStorage.AllocatorImpl;
+            if (!IsCudaMatrix(logits, DType.Float32, 1, numExperts, allocator, out CudaStorage logitsStorage)
+                || !IsCudaMatrix(moeInput, DType.Float32, 1, hiddenDim, allocator, out CudaStorage moeInStorage)
+                || !IsCudaVector(selectedExperts, DType.Int32, nUsed, allocator, out _)
+                || !IsCudaVector(routingWeights, DType.Float32, nUsed, allocator, out _)
+                || !IsCudaMatrix(gateOut, DType.Float32, nUsed, nFf, allocator, out _)
+                || !IsCudaMatrix(upOut, DType.Float32, nUsed, nFf, allocator, out _))
+            {
+                return false;
+            }
+            if (sharedDown != null
+                && !IsCudaMatrix(sharedDown, DType.Float32, 1, hiddenDim, allocator, out _))
+                return false;
+            long moeInputQ8Bytes = (long)(hiddenDim / 32) * Q81BlockBytes;
+            long gateOutQ8Bytes = (long)nUsed * (nFf / 32) * Q81BlockBytes;
+            if (moeInputQ8 != null
+                && !IsCudaVector(moeInputQ8, DType.UInt8, moeInputQ8Bytes, allocator, out _))
+                return false;
+            if (gateOutQ8 != null
+                && !IsCudaVector(gateOutQ8, DType.UInt8, gateOutQ8Bytes, allocator, out _))
+                return false;
+            if (gatePtrTable == IntPtr.Zero || upPtrTable == IntPtr.Zero || downPtrTable == IntPtr.Zero)
+                return false;
+
+            var kernels = allocator?.Kernels;
+            if (kernels == null)
+                return false;
+
+            IntPtr logitsPtr = DeviceBufferOf(logits);
+            IntPtr moeInPtr = DeviceBufferOf(moeInput);
+            IntPtr outPtr = DeviceBufferOf(output);
+            IntPtr selPtr = DeviceBufferOf(selectedExperts);
+            IntPtr rwPtr = DeviceBufferOf(routingWeights);
+            IntPtr gPtr = DeviceBufferOf(gateOut);
+            IntPtr uPtr = DeviceBufferOf(upOut);
+
+            logitsStorage.EnsureDeviceCurrent();
+            moeInStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            IntPtr stream = allocator.Stream.Handle;
+
+            kernels.LaunchMoERouterF32(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, stream);
+
+            // Each projection dp4a's over q8_1-quantized activations when its quant
+            // type has a MoE dp4a dot
+            // (Q4_0=2 / Q4_K=12 / IQ2_XXS=16 / IQ2_S=22) and the q8_1
+            // scratch is present; else the generic scalar-dequant kernel runs (any
+            // qvalue_at type, e.g. IQ3_S down experts in UD dynamic quants).
+            // gate/up in_dim is hidden, down in_dim is n_ff; both are multiples of 32
+            // (256 additionally required for the K/IQ 256-value super-blocks).
+            bool gateUpDp4a = MoeStageDp4aOk(useGateUpDp4a, gateUpType, hiddenDim, moeInputQ8);
+            bool downDp4a = MoeStageDp4aOk(useDownDp4a, downType, nFf, gateOutQ8);
+
+            if (gateUpDp4a)
+            {
+                IntPtr moeInQ8 = DeviceBufferOf(moeInputQ8);
+                kernels.LaunchQuantizeQ81Rows(moeInPtr, moeInQ8, hiddenDim, 1, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertGateUpDp4a(gatePtrTable, selPtr, moeInQ8, gPtr, gateUpType, hiddenDim, nFf, nUsed, stream);
+                kernels.LaunchMoEExpertGateUpDp4a(upPtrTable, selPtr, moeInQ8, uPtr, gateUpType, hiddenDim, nFf, nUsed, stream);
+            }
+            else
+            {
+                kernels.LaunchMoEExpertGateUpVecF32(gatePtrTable, selPtr, moeInPtr, gPtr, gateUpType, hiddenDim, nFf, nUsed, stream);
+                kernels.LaunchMoEExpertGateUpVecF32(upPtrTable, selPtr, moeInPtr, uPtr, gateUpType, hiddenDim, nFf, nUsed, stream);
+            }
+
+            kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)nUsed * nFf, stream);
+
+            if (downDp4a)
+            {
+                IntPtr hQ8 = DeviceBufferOf(gateOutQ8);
+                kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, nUsed, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertDownDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, downType, nFf, hiddenDim, nUsed, stream);
+            }
+            else
+            {
+                kernels.LaunchMoEExpertDownAccumF32(downPtrTable, selPtr, rwPtr, gPtr, outPtr, downType, nFf, hiddenDim, nUsed, stream);
+            }
+
+            // Shared expert: output[j] += sigmoid(moeInput . gateVec) * sharedDown[j].
+            if (sharedDown?.Storage is CudaStorage sharedStorage)
+            {
+                sharedStorage.EnsureDeviceCurrent();
+                IntPtr sdPtr = DeviceBufferOf(sharedDown);
+                IntPtr gateInput = sharedGateVecPtr != IntPtr.Zero ? moeInPtr : IntPtr.Zero;
+                kernels.LaunchMoESharedGatedAdd(outPtr, sdPtr, gateInput, sharedGateVecPtr, hiddenDim, hiddenDim, stream);
+            }
+
+            outStorage.MarkDeviceModified();
+            ((CudaStorage)selectedExperts.Storage).MarkDeviceModified();
+            ((CudaStorage)routingWeights.Storage).MarkDeviceModified();
+            ((CudaStorage)gateOut.Storage).MarkDeviceModified();
+            ((CudaStorage)upOut.Storage).MarkDeviceModified();
+            if (gateUpDp4a)
+                ((CudaStorage)moeInputQ8.Storage).MarkDeviceModified();
+            if (downDp4a)
+                ((CudaStorage)gateOutQ8.Storage).MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// Batched (multi-token) on-device SwiGLU MoE for PREFILL (seqLen == numTokens
+        /// > 1). Same math and correctness as <see cref="TryMoEExpertFFNDecodeSwiGLU"/>,
+        /// with a token dimension added to every kernel so the whole prefill MoE runs on
+        /// device with no host gather/scatter/routing round-trip (which dominated the
+        /// old host prefill path and blocked the prefill CUDA-graph capture). Scratch
+        /// tensors are [numTokens, ...]; <paramref name="sharedDown"/> is [numTokens,
+        /// hiddenDim] or null. Weights are re-read per (token, expert) — no cross-token
+        /// batched GEMM reuse yet.
+        /// </summary>
+        public static bool TryMoEExpertFFNPrefillSwiGLU(
+            Tensor logits, Tensor moeInput, Tensor output,
+            Tensor selectedExperts, Tensor routingWeights, Tensor gateOut, Tensor upOut,
+            IntPtr perExpertScalePtr,
+            IntPtr gatePtrTable, IntPtr upPtrTable, IntPtr downPtrTable,
+            int gateUpType, int downType, int numExperts, int nUsed, int hiddenDim, int nFf, int numTokens,
+            Tensor sharedDown, IntPtr sharedGateVecPtr,
+            Tensor moeInputQ8 = null, Tensor gateOutQ8 = null,
+            bool useGateUpDp4a = false, bool useDownDp4a = false)
+        {
+            if (!IsMoERouterConfigurationSupported(numExperts, nUsed)
+                || hiddenDim <= 0 || nFf <= 0
+                || numTokens <= 0 || numTokens > 65535
+                || !CudaQuantizedOps.SupportsQuantizedType(gateUpType)
+                || !CudaQuantizedOps.SupportsQuantizedType(downType))
+            {
+                return false;
+            }
+
+            if (!IsCudaMatrix(output, DType.Float32, numTokens, hiddenDim, null, out CudaStorage outStorage))
+            {
+                return false;
+            }
+            CudaAllocator allocator = outStorage.AllocatorImpl;
+            long routedRows = (long)numTokens * nUsed;
+            if (!IsCudaMatrix(logits, DType.Float32, numTokens, numExperts, allocator, out CudaStorage logitsStorage)
+                || !IsCudaMatrix(moeInput, DType.Float32, numTokens, hiddenDim, allocator, out CudaStorage moeInStorage)
+                || !IsCudaVector(selectedExperts, DType.Int32, routedRows, allocator, out _)
+                || !IsCudaVector(routingWeights, DType.Float32, routedRows, allocator, out _)
+                || !IsCudaMatrix(gateOut, DType.Float32, routedRows, nFf, allocator, out _)
+                || !IsCudaMatrix(upOut, DType.Float32, routedRows, nFf, allocator, out _))
+            {
+                return false;
+            }
+            if (sharedDown != null
+                && !IsCudaMatrix(sharedDown, DType.Float32, numTokens, hiddenDim, allocator, out _))
+                return false;
+            long moeInputQ8Bytes = (long)numTokens * (hiddenDim / 32) * Q81BlockBytes;
+            long gateOutQ8Bytes = routedRows * (nFf / 32) * Q81BlockBytes;
+            if (moeInputQ8 != null
+                && !IsCudaVector(moeInputQ8, DType.UInt8, moeInputQ8Bytes, allocator, out _))
+                return false;
+            if (gateOutQ8 != null
+                && !IsCudaVector(gateOutQ8, DType.UInt8, gateOutQ8Bytes, allocator, out _))
+                return false;
+            if (gatePtrTable == IntPtr.Zero || upPtrTable == IntPtr.Zero || downPtrTable == IntPtr.Zero)
+                return false;
+
+            var kernels = allocator?.Kernels;
+            if (kernels == null)
+                return false;
+
+            IntPtr logitsPtr = DeviceBufferOf(logits);
+            IntPtr moeInPtr = DeviceBufferOf(moeInput);
+            IntPtr outPtr = DeviceBufferOf(output);
+            IntPtr selPtr = DeviceBufferOf(selectedExperts);
+            IntPtr rwPtr = DeviceBufferOf(routingWeights);
+            IntPtr gPtr = DeviceBufferOf(gateOut);
+            IntPtr uPtr = DeviceBufferOf(upOut);
+
+            logitsStorage.EnsureDeviceCurrent();
+            moeInStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            IntPtr stream = allocator.Stream.Handle;
+
+            kernels.LaunchMoERouterBatched(logitsPtr, perExpertScalePtr, selPtr, rwPtr, numExperts, nUsed, numTokens, stream);
+
+            bool gateUpDp4a = MoeStageDp4aOk(useGateUpDp4a, gateUpType, hiddenDim, moeInputQ8);
+            bool downDp4a = MoeStageDp4aOk(useDownDp4a, downType, nFf, gateOutQ8);
+
+            if (gateUpDp4a)
+            {
+                IntPtr moeInQ8 = DeviceBufferOf(moeInputQ8);
+                kernels.LaunchQuantizeQ81Rows(moeInPtr, moeInQ8, hiddenDim, numTokens, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertGateUpBatchedDp4a(gatePtrTable, selPtr, moeInQ8, gPtr, gateUpType, hiddenDim, nFf, nUsed, numTokens, stream);
+                kernels.LaunchMoEExpertGateUpBatchedDp4a(upPtrTable, selPtr, moeInQ8, uPtr, gateUpType, hiddenDim, nFf, nUsed, numTokens, stream);
+            }
+            else
+            {
+                kernels.LaunchMoEExpertGateUpBatchedVec(gatePtrTable, selPtr, moeInPtr, gPtr, gateUpType, hiddenDim, nFf, nUsed, numTokens, stream);
+                kernels.LaunchMoEExpertGateUpBatchedVec(upPtrTable, selPtr, moeInPtr, uPtr, gateUpType, hiddenDim, nFf, nUsed, numTokens, stream);
+            }
+
+            kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)numTokens * nUsed * nFf, stream);
+
+            if (downDp4a)
+            {
+                IntPtr hQ8 = DeviceBufferOf(gateOutQ8);
+                kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, numTokens * nUsed, stream, warpCooperative: true);
+                kernels.LaunchMoEExpertDownBatchedDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, downType, nFf, hiddenDim, nUsed, numTokens, stream);
+            }
+            else
+            {
+                kernels.LaunchMoEExpertDownBatchedAccum(downPtrTable, selPtr, rwPtr, gPtr, outPtr, downType, nFf, hiddenDim, nUsed, numTokens, stream);
+            }
+
+            if (sharedDown?.Storage is CudaStorage sharedStorage)
+            {
+                sharedStorage.EnsureDeviceCurrent();
+                IntPtr sdPtr = DeviceBufferOf(sharedDown);
+                IntPtr gateInput = sharedGateVecPtr != IntPtr.Zero ? moeInPtr : IntPtr.Zero;
+                kernels.LaunchMoESharedGatedAddBatched(outPtr, sdPtr, gateInput, sharedGateVecPtr, hiddenDim, hiddenDim, numTokens, stream);
+            }
+
+            outStorage.MarkDeviceModified();
+            ((CudaStorage)selectedExperts.Storage).MarkDeviceModified();
+            ((CudaStorage)routingWeights.Storage).MarkDeviceModified();
+            ((CudaStorage)gateOut.Storage).MarkDeviceModified();
+            ((CudaStorage)upOut.Storage).MarkDeviceModified();
+            if (gateUpDp4a)
+                ((CudaStorage)moeInputQ8.Storage).MarkDeviceModified();
+            if (downDp4a)
+                ((CudaStorage)gateOutQ8.Storage).MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>
+        /// Scatter one expert's grouped rows into a token-major MoE accumulator.
+        /// Row indices must be unique within this call; expert groups are issued
+        /// serially on the allocator stream.
+        /// </summary>
+        public static bool TryMoEScatterAddWeightedRows(
+            Tensor output, Tensor expertOutput, Tensor rowIndices, Tensor routingWeights)
+        {
+            if (output?.Storage is not CudaStorage outStorage
+                || output.ElementType != DType.Float32
+                || output.DimensionCount != 2
+                || !output.IsContiguous())
+            {
+                return false;
+            }
+
+            int numTokens = checked((int)output.Sizes[0]);
+            int hidden = checked((int)output.Sizes[1]);
+            if (numTokens <= 0 || hidden <= 0
+                || expertOutput == null || expertOutput.DimensionCount != 2)
+            {
+                return false;
+            }
+            int batchSize = checked((int)expertOutput.Sizes[0]);
+
+            CudaAllocator allocator = outStorage.AllocatorImpl;
+            if (batchSize <= 0
+                || !IsCudaMatrix(expertOutput, DType.Float32, batchSize, hidden, allocator, out CudaStorage expertStorage)
+                || !IsCudaVector(rowIndices, DType.Int32, batchSize, allocator, out CudaStorage rowsStorage)
+                || !IsCudaVector(routingWeights, DType.Float32, batchSize, allocator, out CudaStorage weightsStorage))
+            {
+                return false;
+            }
+            CudaKernels kernels = allocator?.Kernels;
+            if (kernels == null)
+                return false;
+
+            outStorage.EnsureDeviceCurrent();
+            expertStorage.EnsureDeviceCurrent();
+            rowsStorage.EnsureDeviceCurrent();
+            weightsStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchMoEScatterAddWeightedRows(
+                DeviceBufferOf(output), DeviceBufferOf(expertOutput),
+                DeviceBufferOf(rowIndices), DeviceBufferOf(routingWeights),
+                batchSize, numTokens, hidden, allocator.Stream.Handle);
+            outStorage.MarkDeviceModified();
+            return true;
+        }
+
+        /// <summary>Add a dense shared-expert result to every token on device,
+        /// optionally gated by sigmoid(input dot gateVector).</summary>
+        public static bool TryMoEAddSharedExpertBatched(
+            Tensor output, Tensor sharedDown, Tensor input, Tensor gateVector = null)
+        {
+            if (output?.Storage is not CudaStorage outStorage
+                || output.ElementType != DType.Float32
+                || output.DimensionCount != 2
+                || !output.IsContiguous())
+            {
+                return false;
+            }
+
+            int numTokens = checked((int)output.Sizes[0]);
+            int hidden = checked((int)output.Sizes[1]);
+            if (numTokens <= 0 || hidden <= 0)
+                return false;
+
+            CudaAllocator allocator = outStorage.AllocatorImpl;
+            if (!IsCudaMatrix(sharedDown, DType.Float32, numTokens, hidden, allocator, out CudaStorage sharedStorage)
+                || !IsCudaMatrix(input, DType.Float32, numTokens, hidden, allocator, out CudaStorage inputStorage))
+            {
+                return false;
+            }
+            CudaStorage gateStorage = null;
+            if (gateVector != null)
+            {
+                if (!IsCudaVector(gateVector, DType.Float32, hidden, allocator, out CudaStorage gs))
+                {
+                    return false;
+                }
+                gateStorage = gs;
+            }
+
+            CudaKernels kernels = allocator?.Kernels;
+            if (kernels == null)
+                return false;
+
+            outStorage.EnsureDeviceCurrent();
+            sharedStorage.EnsureDeviceCurrent();
+            inputStorage.EnsureDeviceCurrent();
+            gateStorage?.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchMoESharedGatedAddBatched(
+                DeviceBufferOf(output), DeviceBufferOf(sharedDown),
+                gateStorage != null ? DeviceBufferOf(input) : IntPtr.Zero,
+                gateStorage != null ? DeviceBufferOf(gateVector) : IntPtr.Zero,
+                hidden, hidden, numTokens, allocator.Stream.Handle);
+            outStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TrySwiGluOaiSplit(Tensor result, Tensor gateUp, int halfDim, float alpha, float limit)
         {
             return CudaKernelOps.TrySwiGluOaiSplit(result, gateUp, halfDim, alpha, limit);

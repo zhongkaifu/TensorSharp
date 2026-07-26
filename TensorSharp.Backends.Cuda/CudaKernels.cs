@@ -96,12 +96,30 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulF32;
         private readonly IntPtr quantMatmulBatchedF32;
         private readonly IntPtr quantMatmulVecF32;
+        private readonly IntPtr moeRouterF32;
+        private readonly IntPtr moeExpertGateUpVecF32;
+        private readonly IntPtr moeExpertDownAccumF32;
+        private readonly IntPtr moeExpertGateUpDp4aF32;
+        private readonly IntPtr moeExpertDownDp4aF32;
+        private readonly IntPtr siluMulF32;
+        private readonly IntPtr moeSharedGatedAddF32;
+        private readonly IntPtr moeRouterBatchedF32;
+        private readonly IntPtr moeExpertGateUpBatchedDp4aF32;
+        private readonly IntPtr moeExpertGateUpBatchedVecF32;
+        private readonly IntPtr moeExpertDownBatchedDp4aF32;
+        private readonly IntPtr moeExpertDownBatchedAccumF32;
+        private readonly IntPtr moeSharedGatedAddBatchedF32;
+        private readonly IntPtr moeScatterAddWeightedRowsF32;
         private readonly IntPtr quantMatmulIq2XxsQ81F32;
+        private readonly IntPtr quantMatmulIq2VecQ81F32;
         private readonly IntPtr quantMatmulQ40F32;
         private readonly IntPtr quantMatmulQ40BatchedF32;
         private readonly IntPtr quantMatmulQ40Dp4aF32;
         private readonly IntPtr quantMatmulQ80SingleF32;
         private readonly IntPtr quantMatmulQ80VecF32;
+        private readonly IntPtr quantMatmulQ4KDp4aF32;
+        private readonly IntPtr quantMatmulQ5KDp4aF32;
+        private readonly IntPtr quantMatmulQ6KDp4aF32;
         private readonly IntPtr quantMatmulQ80MmqF32;
         private readonly IntPtr quantMatmulQ80Mmq2F32;
         private readonly IntPtr quantizeQ81SplitRowsF32;
@@ -246,12 +264,30 @@ namespace TensorSharp.Cuda
             quantMatmulF32 = module.GetFunction("ts_quant_matmul_f32");
             quantMatmulBatchedF32 = module.GetFunction("ts_quant_matmul_batched_f32");
             quantMatmulVecF32 = module.GetFunction("ts_quant_matmul_vec_f32");
+            moeRouterF32 = module.GetFunction("ts_moe_router_f32");
+            moeExpertGateUpVecF32 = module.GetFunction("ts_moe_expert_gate_up_vec_f32");
+            moeExpertDownAccumF32 = module.GetFunction("ts_moe_expert_down_accum_f32");
+            moeExpertGateUpDp4aF32 = module.GetFunction("ts_moe_expert_gate_up_dp4a_f32");
+            moeExpertDownDp4aF32 = module.GetFunction("ts_moe_expert_down_dp4a_f32");
+            siluMulF32 = module.GetFunction("ts_silu_mul_f32");
+            moeSharedGatedAddF32 = module.GetFunction("ts_moe_shared_gated_add");
+            moeRouterBatchedF32 = module.GetFunction("ts_moe_router_batched_f32");
+            moeExpertGateUpBatchedDp4aF32 = module.GetFunction("ts_moe_expert_gate_up_batched_dp4a_f32");
+            moeExpertGateUpBatchedVecF32 = module.GetFunction("ts_moe_expert_gate_up_batched_vec_f32");
+            moeExpertDownBatchedDp4aF32 = module.GetFunction("ts_moe_expert_down_batched_dp4a_f32");
+            moeExpertDownBatchedAccumF32 = module.GetFunction("ts_moe_expert_down_batched_accum_f32");
+            moeSharedGatedAddBatchedF32 = module.GetFunction("ts_moe_shared_gated_add_batched");
+            moeScatterAddWeightedRowsF32 = module.GetFunction("ts_moe_scatter_add_weighted_rows_f32");
             quantMatmulIq2XxsQ81F32 = module.GetFunction("ts_quant_matmul_iq2_xxs_q8_1_f32");
+            quantMatmulIq2VecQ81F32 = module.GetFunction("ts_quant_matmul_iq2_vec_q8_1_f32");
             quantMatmulQ40F32 = module.GetFunction("ts_quant_matmul_q4_0_f32");
             quantMatmulQ40BatchedF32 = module.GetFunction("ts_quant_matmul_q4_0_batched_f32");
             quantMatmulQ40Dp4aF32 = module.GetFunction("ts_quant_matmul_q4_0_dp4a_f32");
             quantMatmulQ80SingleF32 = module.GetFunction("ts_quant_matmul_q8_0_single_f32");
             quantMatmulQ80VecF32 = module.GetFunction("ts_quant_matmul_q8_0_vec_f32");
+            quantMatmulQ4KDp4aF32 = module.GetFunction("ts_quant_matmul_q4k_dp4a_f32");
+            quantMatmulQ5KDp4aF32 = module.GetFunction("ts_quant_matmul_q5k_dp4a_f32");
+            quantMatmulQ6KDp4aF32 = module.GetFunction("ts_quant_matmul_q6k_dp4a_f32");
             quantMatmulQ80MmqF32 = module.GetFunction("ts_quant_matmul_q8_0_mmq_f32");
             quantMatmulQ80Mmq2F32 = module.GetFunction("ts_quant_matmul_q8_0_mmq2_f32");
             quantMatmulQ80F32 = module.GetFunction("ts_quant_matmul_q8_0_f32");
@@ -2475,6 +2511,250 @@ namespace TensorSharp.Cuda
             Launch(quantMatmulVecF32, (uint)outDim, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
+        // On-device MoE decode (see the ts_moe_* kernels). All three run without
+        // any host readback, so a Gemma 4 MoE decode layer loop that uses them is
+        // fully CUDA-graph capturable.
+
+        public void LaunchMoERouterF32(
+            IntPtr logits, IntPtr perExpertScale, IntPtr selectedExperts, IntPtr routingWeights,
+            int numExperts, int nUsed, IntPtr stream)
+        {
+            IntPtr logitsArg = logits;
+            IntPtr scaleArg = perExpertScale;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            int numExpertsArg = numExperts;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &logitsArg, &scaleArg, &selArg, &weightsArg, &numExpertsArg, &nUsedArg };
+            // Single block; the router's serial top-k runs in thread 0.
+            Launch(moeRouterF32, 1, 1, 1, 32, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertGateUpVecF32(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr input, IntPtr gateUpOut,
+            int type, int inDim, int outDim, int nUsed, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr inputArg = input;
+            IntPtr outArg = gateUpOut;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &inputArg, &outArg, &typeArg, &inDimArg, &outDimArg };
+            const int threads = 128;
+            const uint warps = threads / 32;
+            uint blocks = ((uint)outDim + warps - 1) / warps;
+            Launch(moeExpertGateUpVecF32, blocks, (uint)nUsed, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertDownAccumF32(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr routingWeights, IntPtr hAll, IntPtr output,
+            int type, int inDim, int outDim, int nUsed, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            IntPtr hArg = hAll;
+            IntPtr outArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &weightsArg, &hArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            const int threads = 128;
+            const uint warps = threads / 32;
+            uint blocks = ((uint)outDim + warps - 1) / warps;
+            Launch(moeExpertDownAccumF32, blocks, 1, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertGateUpDp4a(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr xqInput, IntPtr gateUpOut,
+            int type, int inDim, int outDim, int nUsed, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr xqArg = xqInput;
+            IntPtr outArg = gateUpOut;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &xqArg, &outArg, &typeArg, &inDimArg, &outDimArg };
+            // Four warp-owned output rows per CTA. Each warp independently walks
+            // in_dim/32 quant blocks, avoiding idle lanes and cutting CTA count 4x.
+            const int threads = 128;
+            const uint warps = threads / 32;
+            uint blocks = ((uint)outDim + warps - 1) / warps;
+            Launch(moeExpertGateUpDp4aF32, blocks, (uint)nUsed, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertDownDp4a(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr routingWeights, IntPtr xqH, IntPtr output,
+            int type, int inDim, int outDim, int nUsed, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            IntPtr xqArg = xqH;
+            IntPtr outArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &weightsArg, &xqArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            const int threads = 128;
+            const uint warps = threads / 32;
+            uint blocks = ((uint)outDim + warps - 1) / warps;
+            Launch(moeExpertDownDp4aF32, blocks, 1, 1, threads, 1, 1, 0, stream, args);
+        }
+
+        // dst[i] = silu(a[i]) * b[i] over n elements (SwiGLU combine of two
+        // separate gate/up buffers). In-place safe when dst == a.
+        public void LaunchSiluMulF32(IntPtr dst, IntPtr a, IntPtr b, long n, IntPtr stream)
+        {
+            IntPtr dstArg = dst;
+            IntPtr aArg = a;
+            IntPtr bArg = b;
+            long nArg = n;
+            void** args = stackalloc void*[] { &dstArg, &aArg, &bArg, &nArg };
+            uint blocks = (uint)((n + BlockSize - 1) / BlockSize);
+            if (blocks == 0) blocks = 1;
+            Launch(siluMulF32, blocks, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // output[j] += sigmoid(input . gate_vec) * shared_down[j], gate computed
+        // on device (one block). gateVec == IntPtr.Zero => ungated (gate = 1).
+        public void LaunchMoESharedGatedAdd(
+            IntPtr output, IntPtr sharedDown, IntPtr input, IntPtr gateVec,
+            int hidden, int gateDim, IntPtr stream)
+        {
+            IntPtr outArg = output;
+            IntPtr sdArg = sharedDown;
+            IntPtr inArg = input;
+            IntPtr gvArg = gateVec;
+            int hiddenArg = hidden;
+            int gateDimArg = gateDim;
+            void** args = stackalloc void*[] { &outArg, &sdArg, &inArg, &gvArg, &hiddenArg, &gateDimArg };
+            Launch(moeSharedGatedAddF32, 1, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        // ---- Batched (multi-token) MoE prefill launchers ----
+
+        public void LaunchMoERouterBatched(
+            IntPtr logits, IntPtr perExpertScale, IntPtr selectedExperts, IntPtr routingWeights,
+            int numExperts, int nUsed, int numTokens, IntPtr stream)
+        {
+            IntPtr logitsArg = logits;
+            IntPtr scaleArg = perExpertScale;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            int numExpertsArg = numExperts;
+            int nUsedArg = nUsed;
+            int numTokensArg = numTokens;
+            void** args = stackalloc void*[] { &logitsArg, &scaleArg, &selArg, &weightsArg, &numExpertsArg, &nUsedArg, &numTokensArg };
+            // One block per token; each token's serial top-k runs in its thread 0.
+            Launch(moeRouterBatchedF32, (uint)numTokens, 1, 1, 32, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertGateUpBatchedDp4a(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr xqInput, IntPtr gateUpOut,
+            int type, int inDim, int outDim, int nUsed, int numTokens, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr xqArg = xqInput;
+            IntPtr outArg = gateUpOut;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &xqArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            Launch(moeExpertGateUpBatchedDp4aF32, (uint)outDim, (uint)nUsed, (uint)numTokens, 128, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertGateUpBatchedVec(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr input, IntPtr gateUpOut,
+            int type, int inDim, int outDim, int nUsed, int numTokens, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr inputArg = input;
+            IntPtr outArg = gateUpOut;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &inputArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            Launch(moeExpertGateUpBatchedVecF32, (uint)outDim, (uint)nUsed, (uint)numTokens, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertDownBatchedDp4a(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr routingWeights, IntPtr xqH, IntPtr output,
+            int type, int inDim, int outDim, int nUsed, int numTokens, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            IntPtr xqArg = xqH;
+            IntPtr outArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &weightsArg, &xqArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            Launch(moeExpertDownBatchedDp4aF32, (uint)outDim, (uint)numTokens, 1, 128, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEExpertDownBatchedAccum(
+            IntPtr expertWeightPtrs, IntPtr selectedExperts, IntPtr routingWeights, IntPtr hAll, IntPtr output,
+            int type, int inDim, int outDim, int nUsed, int numTokens, IntPtr stream)
+        {
+            IntPtr ptrsArg = expertWeightPtrs;
+            IntPtr selArg = selectedExperts;
+            IntPtr weightsArg = routingWeights;
+            IntPtr hArg = hAll;
+            IntPtr outArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            int nUsedArg = nUsed;
+            void** args = stackalloc void*[] { &ptrsArg, &selArg, &weightsArg, &hArg, &outArg, &typeArg, &inDimArg, &outDimArg, &nUsedArg };
+            Launch(moeExpertDownBatchedAccumF32, (uint)outDim, (uint)numTokens, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoESharedGatedAddBatched(
+            IntPtr output, IntPtr sharedDown, IntPtr input, IntPtr gateVec,
+            int hidden, int gateDim, int numTokens, IntPtr stream)
+        {
+            IntPtr outArg = output;
+            IntPtr sdArg = sharedDown;
+            IntPtr inArg = input;
+            IntPtr gvArg = gateVec;
+            int hiddenArg = hidden;
+            int gateDimArg = gateDim;
+            int numTokensArg = numTokens;
+            void** args = stackalloc void*[] { &outArg, &sdArg, &inArg, &gvArg, &hiddenArg, &gateDimArg, &numTokensArg };
+            Launch(moeSharedGatedAddBatchedF32, (uint)numTokens, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchMoEScatterAddWeightedRows(
+            IntPtr output, IntPtr expertOutput, IntPtr rowIndices, IntPtr routingWeights,
+            int batchSize, int numTokens, int hidden, IntPtr stream)
+        {
+            IntPtr outArg = output;
+            IntPtr expertArg = expertOutput;
+            IntPtr rowsArg = rowIndices;
+            IntPtr weightsArg = routingWeights;
+            int batchArg = batchSize;
+            int tokensArg = numTokens;
+            int hiddenArg = hidden;
+            void** args = stackalloc void*[] {
+                &outArg, &expertArg, &rowsArg, &weightsArg,
+                &batchArg, &tokensArg, &hiddenArg
+            };
+            Launch(moeScatterAddWeightedRowsF32, (uint)batchSize, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
         public void LaunchQuantMatmulIq2XxsQ81F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
         {
             IntPtr weightsArg = weights;
@@ -2489,6 +2769,25 @@ namespace TensorSharp.Cuda
             uint gridX = ((uint)outDim + warpsPerBlock - 1) / warpsPerBlock;
             uint sharedBytes = checked((uint)((inDim / 32) * 36));
             Launch(quantMatmulIq2XxsQ81F32, gridX, (uint)rows, 1, BlockSize, 1, 1, sharedBytes, stream, args);
+        }
+
+        public void LaunchQuantMatmulIq2VecQ81F32(
+            IntPtr weights, IntPtr xqInput, IntPtr output,
+            int type, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqInput;
+            IntPtr outputArg = output;
+            int typeArg = type;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] {
+                &weightsArg, &xqArg, &outputArg, &typeArg, &inDimArg, &outDimArg
+            };
+            const int threads = 128;
+            const uint warps = threads / 32;
+            uint gridX = ((uint)outDim + warps - 1) / warps;
+            Launch(quantMatmulIq2VecQ81F32, gridX, 1, 1, threads, 1, 1, 0, stream, args);
         }
 
         public void LaunchQuantMatmulQ40F32(IntPtr weights, IntPtr input, IntPtr output, int inDim, int outDim, int rows, IntPtr stream)
@@ -2652,6 +2951,42 @@ namespace TensorSharp.Cuda
             void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg };
             const int vecBlockSize = 128;
             Launch(quantMatmulQ80VecF32, (uint)outDim, 1, 1, vecBlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQuantMatmulQ4KDp4a(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg };
+            const int vecBlockSize = 128;
+            Launch(quantMatmulQ4KDp4aF32, (uint)outDim, 1, 1, vecBlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQuantMatmulQ5KDp4a(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg };
+            const int vecBlockSize = 128;
+            Launch(quantMatmulQ5KDp4aF32, (uint)outDim, 1, 1, vecBlockSize, 1, 1, 0, stream, args);
+        }
+
+        public void LaunchQuantMatmulQ6KDp4a(IntPtr weights, IntPtr xqScratch, IntPtr output, int inDim, int outDim, IntPtr stream)
+        {
+            IntPtr weightsArg = weights;
+            IntPtr xqArg = xqScratch;
+            IntPtr outputArg = output;
+            int inDimArg = inDim;
+            int outDimArg = outDim;
+            void** args = stackalloc void*[] { &weightsArg, &xqArg, &outputArg, &inDimArg, &outDimArg };
+            const int vecBlockSize = 128;
+            Launch(quantMatmulQ6KDp4aF32, (uint)outDim, 1, 1, vecBlockSize, 1, 1, 0, stream, args);
         }
 
         // Block-tile dp4a Q8_0 GEMM: weights (q8_0) x pre-quantized q8_1 activations

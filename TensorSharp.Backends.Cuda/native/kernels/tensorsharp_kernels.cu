@@ -60,6 +60,14 @@ struct ts_block_iq2_xxs
     uint16_t qs[32];
 };
 
+struct ts_block_iq2_s
+{
+    half d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t scales[8];
+};
+
 __device__ __forceinline__ unsigned int read_u32_unaligned(const uint8_t* p)
 {
     return (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
@@ -491,6 +499,66 @@ __device__ __forceinline__ float dot_iq2_xxs_q8_1(const uint8_t* iq_block, const
 
     int ls = aux32 >> 28;
     sumi = (ls * sumi + sumi / 2) / 4;
+    float d = __half2float(bq2->d) * __half2float(q8_blocks[group].d);
+    return d * (float)sumi;
+}
+
+// One IQ2_S 32-value group dotted against one q8_1 activation block. This is
+// the direct-CUDA equivalent of ggml-cuda's vec_dot_iq2_s_q8_1. IQ2_S stores
+// four 8-value grid indices/sign bytes per group and two 4-bit scales; doing
+// the lookup once per 8 values and using dp4a avoids the scalar qvalue_at path
+// re-reading the same 82-byte super-block metadata for every element.
+__device__ __forceinline__ float dot_iq2_s_q8_1(
+    const uint8_t* iq_block, const ts_block_q8_1* q8_blocks, int group)
+{
+    const ts_block_iq2_s* bq2 = reinterpret_cast<const ts_block_iq2_s*>(iq_block);
+
+    // Four low grid-index bytes and four sign bytes for this 32-value group.
+    const int qs_packed = get_int_b2(bq2->qs, group);
+    const uint8_t* qs = reinterpret_cast<const uint8_t*>(&qs_packed);
+    const int qh = bq2->qh[group];
+    const int signs_packed = get_int_b2(bq2->qs, 8 + group);
+    const uint8_t* signs = reinterpret_cast<const uint8_t*>(&signs_packed);
+
+    const int ls0 = bq2->scales[group] & 0x0F;
+    const int ls1 = bq2->scales[group] >> 4;
+    int sumi0 = 0;
+    int sumi1 = 0;
+
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2)
+    {
+        int grid_index = qs[l0 / 2] | ((qh << (8 - l0)) & 0x300);
+        const int* grid_pos = reinterpret_cast<const int*>(iq2s_grid + grid_index);
+        uint8_t sign_byte = signs[l0 / 2];
+
+        int signs0 = __vcmpne4(
+            ((sign_byte & 0x03) << 7) | ((sign_byte & 0x0C) << 21),
+            0x00000000);
+        int grid0 = __vsub4(grid_pos[0] ^ signs0, signs0);
+        int u0 = get_int_b4(q8_blocks[group].qs, l0 + 0);
+
+        int signs1 = __vcmpne4(
+            ((sign_byte & 0x30) << 3) | ((sign_byte & 0xC0) << 17),
+            0x00000000);
+        int grid1 = __vsub4(grid_pos[1] ^ signs1, signs1);
+        int u1 = get_int_b4(q8_blocks[group].qs, l0 + 1);
+
+        if (l0 < 4)
+        {
+            sumi0 = dp4a_i8(grid0, u0, sumi0);
+            sumi0 = dp4a_i8(grid1, u1, sumi0);
+        }
+        else
+        {
+            sumi1 = dp4a_i8(grid0, u0, sumi1);
+            sumi1 = dp4a_i8(grid1, u1, sumi1);
+        }
+    }
+
+    // Algebraically (ls + 0.5)/4 for each 16-value half, with the exact
+    // integer rounding order used by ggml's IQ2_S CUDA vec-dot.
+    int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
     float d = __half2float(bq2->d) * __half2float(q8_blocks[group].d);
     return d * (float)sumi;
 }
@@ -5063,6 +5131,61 @@ extern "C" __global__ void ts_quant_matmul_iq2_xxs_q8_1_f32(
         output[(size_t)row * out_dim + out_col] = acc;
 }
 
+// Decode-only IQ2 matvec over a globally pre-quantized q8_1 activation row.
+// Unlike ts_quant_matmul_iq2_xxs_q8_1_f32, this kernel does not rebuild the
+// q8_1 row in per-CTA shared memory: the caller quantizes it once, then four
+// warp-owned output columns per CTA reuse that stable scratch. Supports the two
+// IQ2 formats used most heavily by the Qwen3.6 dynamic quant (gate/up IQ2_XXS
+// and expert-down IQ2_S). Multi-row matmul keeps the existing tiled paths.
+extern "C" __global__ void ts_quant_matmul_iq2_vec_q8_1_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int type,
+    int in_dim,
+    int out_dim)
+{
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    if (out_col >= out_dim || (in_dim & 255) != 0)
+        return;
+
+    int iq_blocks = in_dim / 256;
+    int dot_groups = iq_blocks * 8;
+    int row_bytes = iq_blocks * (type == GGML_IQ2_XXS ? 66 : 82);
+    const uint8_t* w_row = weights + (size_t)out_col * row_bytes;
+
+    float acc = 0.0f;
+    if (type == GGML_IQ2_XXS)
+    {
+        for (int g = lane; g < dot_groups; g += 32)
+        {
+            int ib = g >> 3;
+            int group = g & 7;
+            acc += dot_iq2_xxs_q8_1(w_row + (size_t)ib * 66, xq + (size_t)ib * 8, group);
+        }
+    }
+    else if (type == GGML_IQ2_S)
+    {
+        for (int g = lane; g < dot_groups; g += 32)
+        {
+            int ib = g >> 3;
+            int group = g & 7;
+            acc += dot_iq2_s_q8_1(w_row + (size_t)ib * 82, xq + (size_t)ib * 8, group);
+        }
+    }
+    else
+    {
+        return;
+    }
+
+    acc = warp_allreduce_sum(acc);
+    if (lane == 0)
+        output[out_col] = acc;
+}
+
 extern "C" __global__ void ts_quant_matmul_q4_0_f32(
     const uint8_t* weights,
     const float* input,
@@ -6263,6 +6386,210 @@ extern "C" __global__ void ts_quant_matmul_q8_0_vec_f32(
         output[col] = acc;
 }
 
+// dp4a (int8) Q4_K single-token decode matvec. The generic scalar path
+// (ts_quant_matmul_vec_f32 -> qvalue_at) re-parses the Q4_K super-block header
+// (d/dmin + the 6-bit sub-block scale/min) for EVERY weight nibble, which
+// dominates decode on a Q4_K-heavy model (all of the 26B-A4B's projections are
+// Q4_K) and leaves it ~2x behind ggml. This mirrors ggml's vec_dot_q4_K_q8_1:
+// quantize the activation to q8_1 (32-value blocks aligned to Q4_K's 32-value
+// sub-blocks) ONCE, then per sub-block s of super-block sb:
+//   sumi_s = dp4a(nibbles_s, q8_s)                        (int8 SIMD dot)
+//   y += d_sb * sc_s * d8_s * sumi_s  -  dmin_sb * m_s * s8_s
+// (d8_s / s8_s are the q8_1 block's stored scale / d*sum). The min term is
+// independent of the 4-bit value, so it is added once per sub-block (lane 0).
+// Layout mirrors ts_quant_matmul_q8_0_vec_f32: 4 threads cooperate on one
+// 32-value block (8 ints, 2 per thread). Numerically within the 8-bit activation
+// round-trip of the scalar dequant path (same tolerance as the Q4_0/Q8_0 dp4a
+// paths); TS_CUDA_Q4K_DP4A=0 reverts to the exact scalar kernel.
+extern "C" __global__ void ts_quant_matmul_q4k_dp4a_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim)
+{
+    int col = blockIdx.x;
+    if (col >= out_dim)
+        return;
+
+    int n_super = in_dim / 256;   // Q4_K super-blocks (256 values, 144 B each)
+    int n_sub = in_dim / 32;      // 32-value sub-blocks == q8_1 blocks
+    const uint8_t* w_row = weights + (size_t)col * (size_t)n_super * 144;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    int lane_in_block = threadIdx.x & 3;   // 4 threads cooperate on one sub-block
+    int block_group = threadIdx.x >> 2;
+    int groups_per_cta = blockDim.x >> 2;
+
+    for (int ib = block_group; ib < n_sub; ib += groups_per_cta)
+    {
+        int sb = ib >> 3;          // super-block index
+        int ls = ib & 7;           // sub-block within the super-block (0..7)
+        const uint8_t* sblock = w_row + (size_t)sb * 144;
+        float d_sb = __half2float(*reinterpret_cast<const half*>(sblock));
+        float dmin_sb = __half2float(*reinterpret_cast<const half*>(sblock + 2));
+        const uint8_t* scales = sblock + 4;
+        const uint8_t* qs = sblock + 16;
+
+        int pair = ls >> 1;
+        int shift = (ls & 1) * 4;                 // low nibble (even ls) / high (odd)
+        const uint8_t* w4 = qs + (size_t)pair * 32;   // 32 bytes = 8 ints
+
+        const ts_block_q8_1* ablk = &xq[ib];
+        int g = lane_in_block * 2;
+        int w0 = (get_int_b4(w4, g)     >> shift) & 0x0F0F0F0F;
+        int w1 = (get_int_b4(w4, g + 1) >> shift) & 0x0F0F0F0F;
+        int sumi = dp4a_i8(w0, get_int_b4(ablk->qs, g), 0);
+        sumi = dp4a_i8(w1, get_int_b4(ablk->qs, g + 1), sumi);
+
+        int sc = get_scale_min_k4(scales, ls);
+        float d8 = __half2float(ablk->d);
+        sumf_d += d_sb * (float)sc * d8 * (float)sumi;
+
+        if (lane_in_block == 0)
+        {
+            int m = get_min_k4(scales, ls);
+            float s8 = __half2float(ablk->s);
+            sumf_m += dmin_sb * (float)m * s8;
+        }
+    }
+
+    float acc = sumf_d - sumf_m;
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        output[col] = acc;
+}
+
+// Decode-only Q5_K matvec over one globally quantized q8_1 activation row.
+// Q5_K uses the same eight 32-value sub-block scales/mins as Q4_K, plus one
+// high bit per value. Four neighboring threads reconstruct and dot one
+// sub-block with dp4a, matching ggml-cuda's vec_dot_q5_K_q8_1 layout.
+extern "C" __global__ void ts_quant_matmul_q5k_dp4a_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim)
+{
+    int col = blockIdx.x;
+    if (col >= out_dim)
+        return;
+
+    int n_super = in_dim / 256;
+    int n_sub = in_dim / 32;
+    const uint8_t* w_row = weights + (size_t)col * (size_t)n_super * 176;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+    int lane_in_block = threadIdx.x & 3;
+    int block_group = threadIdx.x >> 2;
+    int groups_per_cta = blockDim.x >> 2;
+
+    for (int ib = block_group; ib < n_sub; ib += groups_per_cta)
+    {
+        int sb = ib >> 3;
+        int ls = ib & 7;
+        const uint8_t* sblock = w_row + (size_t)sb * 176;
+        float d_sb = __half2float(*reinterpret_cast<const half*>(sblock));
+        float dmin_sb = __half2float(*reinterpret_cast<const half*>(sblock + 2));
+        const uint8_t* scales = sblock + 4;
+        const uint8_t* qh = sblock + 16;
+        const uint8_t* qs = sblock + 48;
+
+        int pair = ls >> 1;
+        int shift = (ls & 1) * 4;
+        const uint8_t* w4 = qs + (size_t)pair * 32;
+        const ts_block_q8_1* ablk = &xq[ib];
+        int g = lane_in_block * 2;
+
+        int high0 = ((get_int_b4(qh, g) >> ls) & 0x01010101) << 4;
+        int high1 = ((get_int_b4(qh, g + 1) >> ls) & 0x01010101) << 4;
+        int w0 = ((get_int_b4(w4, g) >> shift) & 0x0F0F0F0F) | high0;
+        int w1 = ((get_int_b4(w4, g + 1) >> shift) & 0x0F0F0F0F) | high1;
+        int sumi = dp4a_i8(w0, get_int_b4(ablk->qs, g), 0);
+        sumi = dp4a_i8(w1, get_int_b4(ablk->qs, g + 1), sumi);
+
+        int sc = get_scale_min_k4(scales, ls);
+        float d8 = __half2float(ablk->d);
+        sumf_d += d_sb * (float)sc * d8 * (float)sumi;
+
+        if (lane_in_block == 0)
+        {
+            int m = get_min_k4(scales, ls);
+            sumf_m += dmin_sb * (float)m * __half2float(ablk->s);
+        }
+    }
+
+    float acc = block_reduce_sum(sumf_d - sumf_m);
+    if (threadIdx.x == 0)
+        output[col] = acc;
+}
+
+// Decode-only Q6_K matvec. Each q8_1 block spans two independently scaled
+// 16-value Q6_K groups. A four-thread group reconstructs the signed 6-bit
+// values in packed bytes and executes two dp4a instructions per thread.
+extern "C" __global__ void ts_quant_matmul_q6k_dp4a_f32(
+    const uint8_t* weights,
+    const ts_block_q8_1* xq,
+    float* output,
+    int in_dim,
+    int out_dim)
+{
+    int col = blockIdx.x;
+    if (col >= out_dim)
+        return;
+
+    int n_super = in_dim / 256;
+    int n_sub = in_dim / 32;
+    const uint8_t* w_row = weights + (size_t)col * (size_t)n_super * 210;
+
+    float acc = 0.0f;
+    int lane_in_block = threadIdx.x & 3;
+    int block_group = threadIdx.x >> 2;
+    int groups_per_cta = blockDim.x >> 2;
+
+    for (int ib = block_group; ib < n_sub; ib += groups_per_cta)
+    {
+        int sb = ib >> 3;
+        int ls = ib & 7;
+        const uint8_t* sblock = w_row + (size_t)sb * 210;
+        const uint8_t* ql = sblock;
+        const uint8_t* qh = sblock + 128;
+        const int8_t* scales = reinterpret_cast<const int8_t*>(sblock + 192);
+        float d_sb = __half2float(*reinterpret_cast<const half*>(sblock + 208));
+
+        int half_idx = ls >> 2;
+        int group = ls & 3;
+        const uint8_t* ql_group = ql + half_idx * 64 + ((group & 1) ? 32 : 0);
+        const uint8_t* qh_group = qh + half_idx * 32;
+        int ql_shift = group >= 2 ? 4 : 0;
+        int qh_shift = group * 2;
+
+        const ts_block_q8_1* ablk = &xq[ib];
+        int g = lane_in_block * 2;
+        // block_q6_K is 210 bytes, so odd super-blocks are only 2-byte
+        // aligned. Assemble these packed words bytewise rather than issuing
+        // potentially misaligned 32-bit loads.
+        int raw0 = ((read_u32_unaligned(ql_group + 4 * g) >> ql_shift) & 0x0F0F0F0F)
+                 | (((read_u32_unaligned(qh_group + 4 * g) >> qh_shift) & 0x03030303) << 4);
+        int raw1 = ((read_u32_unaligned(ql_group + 4 * (g + 1)) >> ql_shift) & 0x0F0F0F0F)
+                 | (((read_u32_unaligned(qh_group + 4 * (g + 1)) >> qh_shift) & 0x03030303) << 4);
+        int w0 = __vsubss4(raw0, 0x20202020);
+        int w1 = __vsubss4(raw1, 0x20202020);
+        int sumi = dp4a_i8(w0, get_int_b4(ablk->qs, g), 0);
+        sumi = dp4a_i8(w1, get_int_b4(ablk->qs, g + 1), sumi);
+
+        int sc = scales[half_idx * 8 + group * 2 + (lane_in_block >= 2 ? 1 : 0)];
+        acc += d_sb * (float)sc * __half2float(ablk->d) * (float)sumi;
+    }
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        output[col] = acc;
+}
+
 // dp4a (int8) Q4_0 GEMM ÔÇö the fast path for BOTH single-token decode (rows == 1)
 // and the MTP verify window (rows 2-9) on the dominant dense quant. Mirrors the
 // Q8_0 dp4a kernel above (256 threads compute a ROWS x COLS output tile from the
@@ -6832,4 +7159,644 @@ extern "C" __global__ void ts_quant_get_rows_f32(
 
     for (int col = threadIdx.x; col < cols; col += blockDim.x)
         out_row[col] = qvalue_at(w_row, type, col);
+}
+
+// ============================================================================
+// On-device MoE decode (Gemma 4). Routing AND the expert FFN run entirely on the
+// GPU so the whole decode layer loop is CUDA-graph capturable: no host readback
+// of the router logits (the old MoERoute did a DtoH sync + CPU softmax/top-k)
+// and no host gather/scatter of expert rows. The per-expert quantized weights
+// stay device-resident exactly as preloaded; the FFN kernels pick the active
+// expert's weight base pointer from a device pointer table indexed by the
+// on-device top-k result, so a single captured graph replays for every token
+// regardless of which experts it routes to.
+// ============================================================================
+
+// Router: top-k over the expert logits with the weights renormalized over the
+// selected experts (== softmax over the selected logits) and the per-expert
+// output scale folded in. Mirrors Gemma4Model.MoERoute's selected set + weights
+// exactly (SelectTopKInPlace's strict-'>' first-seen-wins tie-break; softmax
+// over selected == full-softmax-then-renormalize-over-selected). One block; the
+// serial scan runs in thread 0 (num_experts is small, e.g. 128), which keeps the
+// tie-break bit-identical to the CPU reference.
+extern "C" __global__ void ts_moe_router_f32(
+    const float* logits,            // [num_experts]
+    const float* per_expert_scale,  // [num_experts] or nullptr
+    int* selected_experts,          // [n_used]
+    float* routing_weights,         // [n_used]
+    int num_experts,
+    int n_used)
+{
+    if (threadIdx.x != 0)
+        return;
+
+    const int MAX_K = 32;
+    float top_val[MAX_K];
+    int   top_idx[MAX_K];
+    int k = n_used < MAX_K ? n_used : MAX_K;
+    for (int i = 0; i < k; i++) { top_val[i] = -FLT_MAX; top_idx[i] = -1; }
+
+    for (int e = 0; e < num_experts; e++)
+    {
+        float v = logits[e];
+        int min_slot = 0;
+        for (int j = 1; j < k; j++)
+            if (top_val[j] < top_val[min_slot]) min_slot = j;
+        if (v > top_val[min_slot]) { top_val[min_slot] = v; top_idx[min_slot] = e; }
+    }
+
+    float max_sel = -FLT_MAX;
+    for (int i = 0; i < k; i++) max_sel = fmaxf(max_sel, top_val[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) { float ex = expf(top_val[i] - max_sel); top_val[i] = ex; sum += ex; }
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    for (int i = 0; i < k; i++)
+    {
+        int e = top_idx[i];
+        float w = top_val[i] * inv;
+        if (per_expert_scale != nullptr && e >= 0)
+            w *= per_expert_scale[e];
+        selected_experts[i] = e;
+        routing_weights[i] = w;
+    }
+}
+
+// Gate/up projection for the selected experts. Each warp computes one output
+// column and a CTA computes blockDim.x/32 adjacent columns. The old
+// one-CTA-per-column layout used 128-256 threads for a dot with only 40-90
+// quant blocks, leaving most lanes idle and creating hundreds of thousands of
+// tiny CTAs per decoded token. Warp-owned rows match the organization of the
+// mature mul_mat_vec kernels and keep several independent weight streams in
+// flight per CTA. The expert weight base pointer is read from a device pointer
+// table indexed by the on-device expert id, so nothing about the launch depends
+// on a host-side router result.
+extern "C" __global__ void ts_moe_expert_gate_up_vec_f32(
+    const unsigned long long* expert_weight_ptrs, // [num_experts]
+    const int* selected_experts,                  // [n_used]
+    const float* input,                           // [in_dim] (RMSNorm'd MoE input row)
+    float* gate_up_out,                           // [n_used * out_dim]
+    int type,
+    int in_dim,
+    int out_dim)
+{
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    int slot = blockIdx.y;
+    if (out_col >= out_dim)
+        return;
+
+    int e = selected_experts[slot];
+    if (e < 0)
+    {
+        if (lane == 0)
+            gate_up_out[(size_t)slot * out_dim + out_col] = 0.0f;
+        return;
+    }
+
+    const uint8_t* w = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e]);
+    int row_bytes = qrow_bytes(type, in_dim);
+    const uint8_t* w_row = w + (size_t)out_col * row_bytes;
+
+    float acc = 0.0f;
+    for (int kk = lane; kk < in_dim; kk += 32)
+        acc += qvalue_at(w_row, type, kk) * input[kk];
+
+    acc = warp_allreduce_sum(acc);
+    if (lane == 0)
+        gate_up_out[(size_t)slot * out_dim + out_col] = acc;
+}
+
+// Down projection for the selected experts + weighted accumulation into the
+// MoE output. Each warp owns one output element and loops the n_used experts,
+// accumulating routing_weight[slot] * (W_down[e_slot] . h_slot).
+// Looping the experts inside the warp (rather than scattering with atomics)
+// keeps the accumulation deterministic and matches the CPU reference's order.
+extern "C" __global__ void ts_moe_expert_down_accum_f32(
+    const unsigned long long* expert_weight_ptrs, // [num_experts]
+    const int* selected_experts,                  // [n_used]
+    const float* routing_weights,                 // [n_used]
+    const float* h_all,                           // [n_used * in_dim]
+    float* output,                                // [out_dim]
+    int type,
+    int in_dim,
+    int out_dim,
+    int n_used)
+{
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    if (out_col >= out_dim)
+        return;
+
+    int row_bytes = qrow_bytes(type, in_dim);
+    float acc = 0.0f;
+
+    for (int slot = 0; slot < n_used; slot++)
+    {
+        int e = selected_experts[slot];
+        if (e < 0)
+            continue;
+        float w = routing_weights[slot];
+        const uint8_t* wp = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e]);
+        const uint8_t* w_row = wp + (size_t)out_col * row_bytes;
+        const float* h = h_all + (size_t)slot * in_dim;
+
+        float partial = 0.0f;
+        for (int kk = lane; kk < in_dim; kk += 32)
+            partial += qvalue_at(w_row, type, kk) * h[kk];
+        acc += w * partial;
+    }
+
+    acc = warp_allreduce_sum(acc);
+    if (lane == 0)
+        output[out_col] = acc;
+}
+
+// One Q4_K 32-value sub-block dot against a q8_1 activation block, returning the
+// fully-scaled contribution d_sb*sc_ls*d8*sumi - dmin_sb*m_ls*s8 (see
+// ts_quant_matmul_q4k_dp4a_f32 for the derivation). Shared by the on-device MoE
+// dp4a kernels; `sblock` points at the 144-byte Q4_K super-block, `ls` is the
+// 0..7 sub-block index within it.
+__device__ __forceinline__ float q4k_subblock_dot_q8(
+    const uint8_t* sblock, int ls, const ts_block_q8_1* ablk)
+{
+    float d_sb = __half2float(*reinterpret_cast<const half*>(sblock));
+    float dmin_sb = __half2float(*reinterpret_cast<const half*>(sblock + 2));
+    const uint8_t* scales = sblock + 4;
+    const uint8_t* qs = sblock + 16;
+    int pair = ls >> 1;
+    int shift = (ls & 1) * 4;
+    const uint8_t* w4 = qs + (size_t)pair * 32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int g = 0; g < 8; g++)
+        sumi = dp4a_i8((get_int_b4(w4, g) >> shift) & 0x0F0F0F0F, get_int_b4(ablk->qs, g), sumi);
+
+    int sc = get_scale_min_k4(scales, ls);
+    int m = get_min_k4(scales, ls);
+    float d8 = __half2float(ablk->d);
+    float s8 = __half2float(ablk->s);
+    return d_sb * (float)sc * d8 * (float)sumi - dmin_sb * (float)m * s8;
+}
+
+// One Q4_0 32-value block dot against a q8_1 activation block: d_w*(d8*dp4a - 8*s8)
+// (the -8 zero-point carried through the q8_1 sum), mirroring
+// ts_quant_matmul_q4_0_dp4a_f32 / ggml vec_dot_q4_0_q8_1. `block` is the 18-byte
+// Q4_0 block (2-byte d + 16-byte qs).
+__device__ __forceinline__ float q40_block_dot_q8(const uint8_t* block, const ts_block_q8_1* ablk)
+{
+    float dw = __half2float(*reinterpret_cast<const half*>(block));
+    float dact = __half2float(ablk->d);
+    float sact = __half2float(ablk->s);
+    int s = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int w = get_int_b2(block + 2, j);            // 4 bytes = 8 nibbles
+        int wlo = w & 0x0F0F0F0F;                     // low nibbles  -> q8[4j..4j+3]
+        int whi = (w >> 4) & 0x0F0F0F0F;              // high nibbles -> q8[16+4j..]
+        s = dp4a_i8(wlo, get_int_b4(ablk->qs, j), s);
+        s = dp4a_i8(whi, get_int_b4(ablk->qs, j + 4), s);
+    }
+    return dw * (dact * (float)s - 8.0f * sact);
+}
+
+// One 32-value weight block dot against a q8_1 activation block, dispatching on
+// the quant type (2 = Q4_0, 12 = Q4_K, 16 = IQ2_XXS, 22 = IQ2_S). `w_base` is the weight ROW
+// base and `ib` the global 32-value sub-block index; `xq_row` is the ROW base of
+// the q8_1 activation blocks (indexed by ib internally, so each type can also
+// reach the enclosing super-block it belongs to). For Q4_0 each 32-value block is
+// 18 bytes at ib. For Q4_K the 144-byte super-block holds 8 sub-blocks (ib & 7).
+// For IQ2_XXS/IQ2_S the 66/82-byte super-block holds 8 groups (ib & 7); the
+// vec-dots index the group's q8_1 block as
+// xq_row[(ib>>3)*8 + group] == xq_row[ib].
+__device__ __forceinline__ float moe_block_dot_q8(
+    int type, const uint8_t* w_base, int ib, const ts_block_q8_1* xq_row)
+{
+    if (type == GGML_Q4_0)
+        return q40_block_dot_q8(w_base + (size_t)ib * 18, &xq_row[ib]);
+    if (type == GGML_IQ2_XXS)
+        return dot_iq2_xxs_q8_1(w_base + (size_t)(ib >> 3) * 66, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
+    if (type == GGML_IQ2_S)
+        return dot_iq2_s_q8_1(w_base + (size_t)(ib >> 3) * 82, xq_row + (size_t)(ib >> 3) * 8, ib & 7);
+    // GGML_Q4_K
+    return q4k_subblock_dot_q8(w_base + (size_t)(ib >> 3) * 144, ib & 7, &xq_row[ib]);
+}
+
+// dp4a gate/up projection for the selected experts (bulk of MoE decode cost).
+// Each warp computes one (expert-slot, output-column) dot and a CTA computes
+// blockDim.x/32 adjacent columns. The RMSNorm'd MoE input is pre-quantized to
+// q8_1 once (xq_input, in_dim/32 blocks) and the expert's
+// Q4_0/Q4_K/IQ2_XXS/IQ2_S
+// weight is dp4a-dotted against it. in_dim is a multiple of the block size.
+extern "C" __global__ void ts_moe_expert_gate_up_dp4a_f32(
+    const unsigned long long* expert_weight_ptrs, // [num_experts]
+    const int* selected_experts,                  // [n_used]
+    const ts_block_q8_1* xq_input,                // [in_dim/32] q8_1 of the MoE input
+    float* gate_up_out,                           // [n_used * out_dim]
+    int type,
+    int in_dim,
+    int out_dim)
+{
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    int slot = blockIdx.y;
+    if (out_col >= out_dim)
+        return;
+
+    int e = selected_experts[slot];
+    if (e < 0)
+    {
+        if (lane == 0)
+            gate_up_out[(size_t)slot * out_dim + out_col] = 0.0f;
+        return;
+    }
+
+    const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e])
+        + (size_t)out_col * (size_t)qrow_bytes(type, in_dim);
+    int n_sub = in_dim / 32;
+
+    float acc = 0.0f;
+    for (int ib = lane; ib < n_sub; ib += 32)
+        acc += moe_block_dot_q8(type, w_row, ib, xq_input);
+
+    acc = warp_allreduce_sum(acc);
+    if (lane == 0)
+        gate_up_out[(size_t)slot * out_dim + out_col] = acc;
+}
+
+// dp4a down projection + routing-weighted accumulation. Each warp owns one
+// output element and loops the selected experts, dp4a-dotting each expert's
+// Q4_0/Q4_K/IQ2_XXS/IQ2_S down weight against that expert's q8_1-quantized activation
+// (xq_h, laid out [n_used][in_dim/32]).
+extern "C" __global__ void ts_moe_expert_down_dp4a_f32(
+    const unsigned long long* expert_weight_ptrs, // [num_experts]
+    const int* selected_experts,                  // [n_used]
+    const float* routing_weights,                 // [n_used]
+    const ts_block_q8_1* xq_h,                    // [n_used * (in_dim/32)]
+    float* output,                                // [out_dim]
+    int type,
+    int in_dim,
+    int out_dim,
+    int n_used)
+{
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps_per_block = blockDim.x >> 5;
+    int out_col = blockIdx.x * warps_per_block + warp;
+    if (out_col >= out_dim)
+        return;
+
+    int n_sub = in_dim / 32;
+    size_t row_bytes = (size_t)qrow_bytes(type, in_dim);
+    float acc = 0.0f;
+
+    for (int slot = 0; slot < n_used; slot++)
+    {
+        int e = selected_experts[slot];
+        if (e < 0)
+            continue;
+        float rw = routing_weights[slot];
+        const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e])
+            + (size_t)out_col * row_bytes;
+        const ts_block_q8_1* xqs = xq_h + (size_t)slot * n_sub;
+
+        float partial = 0.0f;
+        for (int ib = lane; ib < n_sub; ib += 32)
+            partial += moe_block_dot_q8(type, w_row, ib, xqs);
+        acc += rw * partial;
+    }
+
+    acc = warp_allreduce_sum(acc);
+    if (lane == 0)
+        output[out_col] = acc;
+}
+
+// Elementwise SwiGLU combine over two SEPARATE buffers (Qwen MoE keeps gate and
+// up expert weights unfused): dst[i] = silu(a[i]) * b[i]. Used by the on-device
+// SwiGLU MoE decode after the gate and up projections write distinct [n_used,n_ff]
+// tensors. In-place safe when dst == a.
+extern "C" __global__ void ts_silu_mul_f32(float* dst, const float* a, const float* b, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    float x = a[i];
+    dst[i] = silu(x) * b[i];
+}
+
+// Shared-expert gated accumulate for the on-device SwiGLU MoE decode. Computes the
+// per-token gate scalar g = sigmoid(sum_i input[i]*gate_vec[i]) entirely on device
+// (one block, block_reduce_sum over gate_dim) and folds output[j] += g*shared_down[j].
+// gate_vec == nullptr => ungated shared expert (g = 1). Mirrors the host
+// SigmoidScalar(VecDot(...)) + VecScaleAdd path in Qwen35Model.MoEForward without a
+// host round-trip, so the decode layer loop stays CUDA-graph capturable.
+extern "C" __global__ void ts_moe_shared_gated_add(
+    float* output,             // [hidden] accumulate into
+    const float* shared_down,  // [hidden]
+    const float* input,        // [gate_dim] MoE input row (nullptr if ungated)
+    const float* gate_vec,     // [gate_dim] shared-gate weights (nullptr if ungated)
+    int hidden,
+    int gate_dim)
+{
+    __shared__ float g_shared;
+    if (gate_vec != nullptr && input != nullptr)
+    {
+        float s = 0.0f;
+        for (int i = threadIdx.x; i < gate_dim; i += blockDim.x)
+            s += input[i] * gate_vec[i];
+        s = block_reduce_sum(s);
+        if (threadIdx.x == 0)
+            g_shared = 1.0f / (1.0f + __expf(-s));
+    }
+    else if (threadIdx.x == 0)
+    {
+        g_shared = 1.0f;
+    }
+    __syncthreads();
+
+    float g = g_shared;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x)
+        output[j] += g * shared_down[j];
+}
+
+// ============================================================================
+// Batched (multi-token) on-device SwiGLU MoE for PREFILL. Same math as the
+// single-token decode kernels above, with a token dimension added so the whole
+// prefill MoE (routing + gate/up + SwiGLU + down + shared) runs on device with no
+// host gather/scatter/routing round-trip. Each token independently routes its
+// top-k experts; weights are re-read per (token, expert) — no cross-token batched
+// reuse yet, but the elimination of the per-expert host readbacks (which were 82%
+// of MoE time) and the resulting graph-capturability are the win.
+// ============================================================================
+
+// Per-token router: grid.x = num_tokens, one block per token (serial top-k in
+// thread 0, matching SelectTopKInPlace's strict-'>' first-seen-wins).
+extern "C" __global__ void ts_moe_router_batched_f32(
+    const float* logits,            // [num_tokens * num_experts]
+    const float* per_expert_scale,  // [num_experts] or nullptr
+    int* selected_experts,          // [num_tokens * n_used]
+    float* routing_weights,         // [num_tokens * n_used]
+    int num_experts,
+    int n_used,
+    int num_tokens)
+{
+    int t = blockIdx.x;
+    if (t >= num_tokens || threadIdx.x != 0)
+        return;
+
+    const float* tlogits = logits + (size_t)t * num_experts;
+    int* tsel = selected_experts + (size_t)t * n_used;
+    float* trw = routing_weights + (size_t)t * n_used;
+
+    const int MAX_K = 32;
+    float top_val[MAX_K];
+    int   top_idx[MAX_K];
+    int k = n_used < MAX_K ? n_used : MAX_K;
+    for (int i = 0; i < k; i++) { top_val[i] = -FLT_MAX; top_idx[i] = -1; }
+
+    for (int e = 0; e < num_experts; e++)
+    {
+        float v = tlogits[e];
+        int min_slot = 0;
+        for (int j = 1; j < k; j++)
+            if (top_val[j] < top_val[min_slot]) min_slot = j;
+        if (v > top_val[min_slot]) { top_val[min_slot] = v; top_idx[min_slot] = e; }
+    }
+
+    float max_sel = -FLT_MAX;
+    for (int i = 0; i < k; i++) max_sel = fmaxf(max_sel, top_val[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) { float ex = expf(top_val[i] - max_sel); top_val[i] = ex; sum += ex; }
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    for (int i = 0; i < k; i++)
+    {
+        int e = top_idx[i];
+        float w = top_val[i] * inv;
+        if (per_expert_scale != nullptr && e >= 0)
+            w *= per_expert_scale[e];
+        tsel[i] = e;
+        trw[i] = w;
+    }
+}
+
+// Gate/up projection, dp4a. grid = (out_dim, n_used, num_tokens).
+extern "C" __global__ void ts_moe_expert_gate_up_batched_dp4a_f32(
+    const unsigned long long* expert_weight_ptrs,
+    const int* selected_experts,   // [num_tokens * n_used]
+    const ts_block_q8_1* xq_input, // [num_tokens * (in_dim/32)]
+    float* gate_up_out,            // [num_tokens * n_used * out_dim]
+    int type, int in_dim, int out_dim, int n_used)
+{
+    int out_col = blockIdx.x;
+    int slot = blockIdx.y;
+    int t = blockIdx.z;
+    if (out_col >= out_dim)
+        return;
+
+    int e = selected_experts[(size_t)t * n_used + slot];
+    size_t out_off = ((size_t)t * n_used + slot) * out_dim + out_col;
+    if (e < 0)
+    {
+        if (threadIdx.x == 0) gate_up_out[out_off] = 0.0f;
+        return;
+    }
+
+    const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e])
+        + (size_t)out_col * (size_t)qrow_bytes(type, in_dim);
+    const ts_block_q8_1* xq_row = xq_input + (size_t)t * (in_dim / 32);
+    int n_sub = in_dim / 32;
+
+    float acc = 0.0f;
+    for (int ib = threadIdx.x; ib < n_sub; ib += blockDim.x)
+        acc += moe_block_dot_q8(type, w_row, ib, xq_row);
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        gate_up_out[out_off] = acc;
+}
+
+// Gate/up projection, scalar dequant. grid = (out_dim, n_used, num_tokens).
+extern "C" __global__ void ts_moe_expert_gate_up_batched_vec_f32(
+    const unsigned long long* expert_weight_ptrs,
+    const int* selected_experts,   // [num_tokens * n_used]
+    const float* input,            // [num_tokens * in_dim]
+    float* gate_up_out,            // [num_tokens * n_used * out_dim]
+    int type, int in_dim, int out_dim, int n_used)
+{
+    int out_col = blockIdx.x;
+    int slot = blockIdx.y;
+    int t = blockIdx.z;
+    if (out_col >= out_dim)
+        return;
+
+    int e = selected_experts[(size_t)t * n_used + slot];
+    size_t out_off = ((size_t)t * n_used + slot) * out_dim + out_col;
+    if (e < 0)
+    {
+        if (threadIdx.x == 0) gate_up_out[out_off] = 0.0f;
+        return;
+    }
+
+    const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e])
+        + (size_t)out_col * (size_t)qrow_bytes(type, in_dim);
+    const float* in_row = input + (size_t)t * in_dim;
+
+    float acc = 0.0f;
+    for (int kk = threadIdx.x; kk < in_dim; kk += blockDim.x)
+        acc += qvalue_at(w_row, type, kk) * in_row[kk];
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        gate_up_out[out_off] = acc;
+}
+
+// Down projection + routing-weighted accumulate, dp4a. grid = (out_dim, num_tokens).
+extern "C" __global__ void ts_moe_expert_down_batched_dp4a_f32(
+    const unsigned long long* expert_weight_ptrs,
+    const int* selected_experts,   // [num_tokens * n_used]
+    const float* routing_weights,  // [num_tokens * n_used]
+    const ts_block_q8_1* xq_h,     // [num_tokens * n_used * (in_dim/32)]
+    float* output,                 // [num_tokens * out_dim]
+    int type, int in_dim, int out_dim, int n_used)
+{
+    int out_col = blockIdx.x;
+    int t = blockIdx.y;
+    if (out_col >= out_dim)
+        return;
+
+    int n_sub = in_dim / 32;
+    size_t row_bytes = (size_t)qrow_bytes(type, in_dim);
+    const int* sel = selected_experts + (size_t)t * n_used;
+    const float* rw = routing_weights + (size_t)t * n_used;
+    float acc = 0.0f;
+
+    for (int slot = 0; slot < n_used; slot++)
+    {
+        int e = sel[slot];
+        if (e < 0) continue;
+        const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e]) + (size_t)out_col * row_bytes;
+        const ts_block_q8_1* xqs = xq_h + ((size_t)t * n_used + slot) * n_sub;
+        float partial = 0.0f;
+        for (int ib = threadIdx.x; ib < n_sub; ib += blockDim.x)
+            partial += moe_block_dot_q8(type, w_row, ib, xqs);
+        acc += rw[slot] * partial;
+    }
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        output[(size_t)t * out_dim + out_col] = acc;
+}
+
+// Down projection + routing-weighted accumulate, scalar. grid = (out_dim, num_tokens).
+extern "C" __global__ void ts_moe_expert_down_batched_accum_f32(
+    const unsigned long long* expert_weight_ptrs,
+    const int* selected_experts,   // [num_tokens * n_used]
+    const float* routing_weights,  // [num_tokens * n_used]
+    const float* h_all,            // [num_tokens * n_used * in_dim]
+    float* output,                 // [num_tokens * out_dim]
+    int type, int in_dim, int out_dim, int n_used)
+{
+    int out_col = blockIdx.x;
+    int t = blockIdx.y;
+    if (out_col >= out_dim)
+        return;
+
+    size_t row_bytes = (size_t)qrow_bytes(type, in_dim);
+    const int* sel = selected_experts + (size_t)t * n_used;
+    const float* rw = routing_weights + (size_t)t * n_used;
+    float acc = 0.0f;
+
+    for (int slot = 0; slot < n_used; slot++)
+    {
+        int e = sel[slot];
+        if (e < 0) continue;
+        const uint8_t* w_row = reinterpret_cast<const uint8_t*>(expert_weight_ptrs[e]) + (size_t)out_col * row_bytes;
+        const float* h = h_all + ((size_t)t * n_used + slot) * in_dim;
+        float partial = 0.0f;
+        for (int kk = threadIdx.x; kk < in_dim; kk += blockDim.x)
+            partial += qvalue_at(w_row, type, kk) * h[kk];
+        acc += rw[slot] * partial;
+    }
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0)
+        output[(size_t)t * out_dim + out_col] = acc;
+}
+
+// Batched shared-expert gated accumulate. grid.x = num_tokens, one block per token.
+// input/output/shared_down rows are hidden-wide; the gate dots the first gate_dim.
+extern "C" __global__ void ts_moe_shared_gated_add_batched(
+    float* output,             // [num_tokens * hidden]
+    const float* shared_down,  // [num_tokens * hidden]
+    const float* input,        // [num_tokens * hidden] (nullptr if ungated)
+    const float* gate_vec,     // [gate_dim] (nullptr if ungated)
+    int hidden,
+    int gate_dim,
+    int num_tokens)
+{
+    int t = blockIdx.x;
+    if (t >= num_tokens)
+        return;
+
+    float* out_row = output + (size_t)t * hidden;
+    const float* sd_row = shared_down + (size_t)t * hidden;
+
+    __shared__ float g_shared;
+    if (gate_vec != nullptr && input != nullptr)
+    {
+        const float* in_row = input + (size_t)t * hidden;
+        float s = 0.0f;
+        for (int i = threadIdx.x; i < gate_dim; i += blockDim.x)
+            s += in_row[i] * gate_vec[i];
+        s = block_reduce_sum(s);
+        if (threadIdx.x == 0)
+            g_shared = 1.0f / (1.0f + __expf(-s));
+    }
+    else if (threadIdx.x == 0)
+    {
+        g_shared = 1.0f;
+    }
+    __syncthreads();
+
+    float g = g_shared;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x)
+        out_row[j] += g * sd_row[j];
+}
+
+// Scatter one expert's grouped output rows back into the token-major MoE
+// accumulator. row_indices are unique within one expert batch (top-k routing
+// selects an expert at most once for a token), and expert batches are launched
+// serially on one stream, so the non-atomic add is both safe and substantially
+// cheaper than an atomic scatter.
+extern "C" __global__ void ts_moe_scatter_add_weighted_rows_f32(
+    float* output,                // [num_tokens * hidden]
+    const float* expert_output,   // [batch_size * hidden]
+    const int* row_indices,       // [batch_size]
+    const float* routing_weights, // [batch_size]
+    int batch_size,
+    int num_tokens,
+    int hidden)
+{
+    int row = blockIdx.x;
+    if (row >= batch_size)
+        return;
+
+    int token = row_indices[row];
+    if (token < 0 || token >= num_tokens)
+        return;
+
+    float* dst = output + (size_t)token * hidden;
+    const float* src = expert_output + (size_t)row * hidden;
+    float weight = routing_weights[row];
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x)
+        dst[col] += weight * src[col];
 }

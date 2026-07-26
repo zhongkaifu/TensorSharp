@@ -362,6 +362,83 @@ public class CudaBackendTests
     }
 
     [Fact]
+    public void CudaMoEGroupedScatterAdd_MatchesHostReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var output = new Tensor(allocator, DType.Float32, 3, 4);
+        Ops.Fill(output, 0f);
+
+        using var expert0 = Tensor.FromArray(allocator, new float[,]
+        {
+            { 1, 2, 3, 4 },
+            { 5, 6, 7, 8 },
+        });
+        using var rows0 = Tensor.FromArray(allocator, new[] { 2, 0 });
+        using var weights0 = Tensor.FromArray(allocator, new[] { 0.5f, -2f });
+        Assert.True(CudaFusedOps.TryMoEScatterAddWeightedRows(
+            output, expert0, rows0, weights0));
+
+        using var expert1 = Tensor.FromArray(allocator, new float[,]
+        {
+            { 2, 4, 6, 8 },
+            { -4, -8, -12, -16 },
+        });
+        using var rows1 = Tensor.FromArray(allocator, new[] { 2, 1 });
+        using var weights1 = Tensor.FromArray(allocator, new[] { 1.5f, 0.25f });
+        Assert.True(CudaFusedOps.TryMoEScatterAddWeightedRows(
+            output, expert1, rows1, weights1));
+
+        AssertClose(new[]
+        {
+            -10f, -12f, -14f, -16f,
+            -1f, -2f, -3f, -4f,
+            3.5f, 7f, 10.5f, 14f,
+        }, output.GetElementsAsFloat(12));
+    }
+
+    [Fact]
+    public void CudaMoEGroupedScatterAdd_HonorsContiguousViewOffsets()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var outputBacking = new Tensor(allocator, DType.Float32, 3, 4);
+        Ops.Fill(outputBacking, 9f);
+        using var output = outputBacking.Narrow(0, 1, 2);
+        Ops.Fill(output, 0f);
+
+        using var expertBacking = Tensor.FromArray(allocator, new float[,]
+        {
+            { 90, 90, 90, 90 },
+            { 1, 2, 3, 4 },
+            { 5, 6, 7, 8 },
+        });
+        using var expert = expertBacking.Narrow(0, 1, 2);
+        using var rowsBacking = Tensor.FromArray(allocator, new[] { -1, 0, 1 });
+        using var rows = rowsBacking.Narrow(0, 1, 2);
+        using var weightsBacking = Tensor.FromArray(allocator, new[] { 9f, 1f, 0.5f });
+        using var weights = weightsBacking.Narrow(0, 1, 2);
+
+        Assert.True(output.IsContiguous());
+        Assert.True(expert.IsContiguous());
+        Assert.NotEqual(0, output.StorageOffset);
+        Assert.NotEqual(0, expert.StorageOffset);
+        Assert.True(CudaFusedOps.TryMoEScatterAddWeightedRows(
+            output, expert, rows, weights));
+
+        AssertClose(new[]
+        {
+            9f, 9f, 9f, 9f,
+            1f, 2f, 3f, 4f,
+            2.5f, 3f, 3.5f, 4f,
+        }, outputBacking.GetElementsAsFloat(12));
+    }
+
+    [Fact]
     public void CudaQwen35GatedDeltaNetPacked_MatchesCpuReference()
     {
         if (!CudaBackend.IsAvailable())
@@ -1239,7 +1316,8 @@ public class CudaBackendTests
     [Fact]
     public void CudaGqaDecodeAttention_DynAttendLen_MatchesPlainLaunch()
     {
-        // Gemma E4B's d=512 GQA switches launch topology at 2K. Captured
+        // Gemma E4B's d=512 GQA switches launch topology above the tuned
+        // 512-token crossover. Captured
         // whole-model graphs include this tier in their key so a long-context
         // partition graph can never replay for short-context decode.
         Assert.Equal(0, CudaFusedOps.GetGqaDecodeAttentionRouteTier(
@@ -1249,7 +1327,7 @@ public class CudaBackendTests
         Assert.Equal(1, CudaFusedOps.GetGqaDecodeAttentionRouteTier(
             keyIsHalf: true, circular: false,
             numQHeads: 8, numKVHeads: 2, headDim: 512,
-            attendLen: 2049, cacheSize: 8192));
+            attendLen: 513, cacheSize: 8192));
 
         if (!CudaBackend.IsAvailable())
             return;
@@ -1310,7 +1388,7 @@ public class CudaBackendTests
 
         // Single-block route (scalarLen <= partition threshold).
         RunCase(cacheSize: 64, scalarLen: 48, dynLen: 17);
-        // Partitioned route (scalarLen > 2048): capacity-sized grid, dyn length
+        // Partitioned route: capacity-sized grid, dyn length
         // shorter than the captured one, non-multiple of the partition size.
         RunCase(cacheSize: 6144, scalarLen: 3000, dynLen: 2500);
     }
@@ -1343,6 +1421,179 @@ public class CudaBackendTests
         }
 
         AssertClose(expected, rope.GetElementsAsFloat(8), 1e-4f);
+    }
+
+    [Theory]
+    [InlineData(256, 8, true)]
+    [InlineData(32, 32, true)]
+    [InlineData(32, 0, false)]
+    [InlineData(32, 33, false)]
+    [InlineData(40, 33, false)]
+    [InlineData(0, 0, false)]
+    public void CudaMoERouterConfiguration_EnforcesNativeTopKBounds(
+        int numExperts, int nUsed, bool expected)
+    {
+        Assert.Equal(expected,
+            CudaFusedOps.IsMoERouterConfigurationSupported(numExperts, nUsed));
+    }
+
+    [Theory]
+    [InlineData(32, 0)]
+    [InlineData(0, 1)]
+    public void CudaMoEExpertFFNDecode_RejectsInvalidRouterBeforeLaunch(
+        int numExperts, int nUsed)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        using var allocator = new CudaAllocator();
+        using var logits = new Tensor(allocator, DType.Float32, 1, 1);
+        using var moeInput = new Tensor(allocator, DType.Float32, 1, 32);
+        using var output = new Tensor(allocator, DType.Float32, 1, 32);
+        using var selected = new Tensor(allocator, DType.Int32, Math.Max(1, nUsed));
+        using var routingWeights = new Tensor(allocator, DType.Float32, Math.Max(1, nUsed));
+        using var gateUp = new Tensor(allocator, DType.Float32, Math.Max(1, nUsed), 64);
+        using var hidden = new Tensor(allocator, DType.Float32, Math.Max(1, nUsed), 32);
+
+        // Non-zero sentinels make the pointer-table precondition pass. A correct
+        // implementation rejects the invalid router geometry before dereferencing
+        // either value or enqueueing any native kernel.
+        IntPtr sentinel = new(1);
+        Assert.False(CudaFusedOps.TryMoEExpertFFNDecode(
+            logits, moeInput, output, selected, routingWeights, gateUp, hidden,
+            IntPtr.Zero, sentinel, sentinel,
+            quantType: 2, numExperts, nUsed, hiddenDim: 32, nFf: 32));
+    }
+
+    [Fact]
+    public void CudaMoEWrappers_RejectInvalidTensorContractsBeforeLaunch()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int numExperts = 2;
+        const int nUsed = 1;
+        const int hiddenDim = 32;
+        const int nFf = 32;
+        IntPtr sentinel = new(1);
+
+        using var allocator = new CudaAllocator();
+        using var otherAllocator = new CudaAllocator();
+        using var logits = new Tensor(allocator, DType.Float32, 1, numExperts);
+        using var wrongLogits = new Tensor(allocator, DType.Float32, 1, numExperts + 1);
+        using var input = new Tensor(allocator, DType.Float32, 1, hiddenDim);
+        using var output = new Tensor(allocator, DType.Float32, 1, hiddenDim);
+        using var outputOther = new Tensor(otherAllocator, DType.Float32, 1, hiddenDim);
+        using var selected = new Tensor(allocator, DType.Int32, nUsed);
+        using var selectedWrongType = new Tensor(allocator, DType.Float32, nUsed);
+        using var routeWeights = new Tensor(allocator, DType.Float32, nUsed);
+        using var gate = new Tensor(allocator, DType.Float32, nUsed, nFf);
+        using var up = new Tensor(allocator, DType.Float32, nUsed, nFf);
+
+        Assert.False(CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
+            wrongLogits, input, output, selected, routeWeights, gate, up,
+            IntPtr.Zero, sentinel, sentinel, sentinel,
+            2, 2, numExperts, nUsed, hiddenDim, nFf,
+            null, IntPtr.Zero));
+        Assert.False(CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
+            logits, input, output, selectedWrongType, routeWeights, gate, up,
+            IntPtr.Zero, sentinel, sentinel, sentinel,
+            2, 2, numExperts, nUsed, hiddenDim, nFf,
+            null, IntPtr.Zero));
+        Assert.False(CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
+            logits, input, outputOther, selected, routeWeights, gate, up,
+            IntPtr.Zero, sentinel, sentinel, sentinel,
+            2, 2, numExperts, nUsed, hiddenDim, nFf,
+            null, IntPtr.Zero));
+
+        const int tokens = 2;
+        using var wideInput = new Tensor(allocator, DType.Float32, tokens, hiddenDim * 2);
+        using var nonContiguousInput = wideInput.Narrow(1, 0, hiddenDim);
+        Assert.False(nonContiguousInput.IsContiguous());
+        using var prefillLogits = new Tensor(allocator, DType.Float32, tokens, numExperts);
+        using var prefillOutput = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
+        using var prefillSelected = new Tensor(allocator, DType.Int32, tokens * nUsed);
+        using var prefillWeights = new Tensor(allocator, DType.Float32, tokens * nUsed);
+        using var prefillGate = new Tensor(allocator, DType.Float32, tokens * nUsed, nFf);
+        using var prefillUp = new Tensor(allocator, DType.Float32, tokens * nUsed, nFf);
+        Assert.False(CudaFusedOps.TryMoEExpertFFNPrefillSwiGLU(
+            prefillLogits, nonContiguousInput, prefillOutput,
+            prefillSelected, prefillWeights, prefillGate, prefillUp,
+            IntPtr.Zero, sentinel, sentinel, sentinel,
+            2, 2, numExperts, nUsed, hiddenDim, nFf, tokens,
+            null, IntPtr.Zero));
+
+        using var scatterOutput = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
+        using var wideExpert = new Tensor(allocator, DType.Float32, tokens, hiddenDim * 2);
+        using var nonContiguousExpert = wideExpert.Narrow(1, 0, hiddenDim);
+        using var scatterRows = new Tensor(allocator, DType.Int32, tokens);
+        using var scatterWeights = new Tensor(allocator, DType.Float32, tokens);
+        using var scatterWeightsOther = new Tensor(otherAllocator, DType.Float32, tokens);
+        Assert.False(CudaFusedOps.TryMoEScatterAddWeightedRows(
+            scatterOutput, nonContiguousExpert, scatterRows, scatterWeights));
+        using var scatterExpert = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
+        Assert.False(CudaFusedOps.TryMoEScatterAddWeightedRows(
+            scatterOutput, scatterExpert, scatterRows, scatterWeightsOther));
+
+        using var sharedDown = new Tensor(allocator, DType.Float32, tokens, hiddenDim);
+        using var sharedInputOther = new Tensor(otherAllocator, DType.Float32, tokens, hiddenDim);
+        using var shortGate = new Tensor(allocator, DType.Float32, hiddenDim - 1);
+        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
+            scatterOutput, sharedDown, sharedInputOther));
+        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
+            scatterOutput, sharedDown, scatterExpert, shortGate));
+        Assert.False(CudaFusedOps.TryMoEAddSharedExpertBatched(
+            scatterOutput, sharedDown, nonContiguousExpert));
+    }
+
+    [Theory]
+    [InlineData(2, 32, true)]
+    [InlineData(2, 288, true)]
+    [InlineData(2, 704, true)]
+    [InlineData(2, 2816, true)]
+    [InlineData(2, 31, false)]
+    [InlineData(12, 256, true)]
+    [InlineData(12, 512, true)]
+    [InlineData(12, 288, false)]
+    [InlineData(16, 256, true)]
+    [InlineData(16, 32, false)]
+    [InlineData(22, 512, true)]
+    [InlineData(22, 32, false)]
+    [InlineData(8, 256, false)]
+    public void CudaMoEDp4aDimensionValidation_UsesQuantBlockGeometry(
+        int ggmlType, int inDim, bool expected)
+    {
+        Assert.Equal(expected,
+            CudaFusedOps.IsMoeDp4aDimensionSupported(ggmlType, inDim));
+    }
+
+    [Fact]
+    public void CudaMoEDp4aEnablement_IsIndependentForEachQuantType()
+    {
+        bool savedQ40 = CudaQuantizedOps.Q40Dp4aEnabled;
+        bool savedQ4K = CudaQuantizedOps.Q4KDp4aEnabled;
+        bool savedIq2 = CudaQuantizedOps.Iq2xxsDp4aEnabled;
+        bool savedIq2S = CudaQuantizedOps.Iq2sDp4aEnabled;
+        try
+        {
+            CudaQuantizedOps.Q40Dp4aEnabled = false;
+            CudaQuantizedOps.Q4KDp4aEnabled = true;
+            CudaQuantizedOps.Iq2xxsDp4aEnabled = false;
+            CudaQuantizedOps.Iq2sDp4aEnabled = true;
+
+            Assert.False(CudaQuantizedOps.IsMoeDp4aEnabledForType(2));
+            Assert.True(CudaQuantizedOps.IsMoeDp4aEnabledForType(12));
+            Assert.False(CudaQuantizedOps.IsMoeDp4aEnabledForType(16));
+            Assert.True(CudaQuantizedOps.IsMoeDp4aEnabledForType(22));
+            Assert.False(CudaQuantizedOps.IsMoeDp4aEnabledForType(8));
+        }
+        finally
+        {
+            CudaQuantizedOps.Q40Dp4aEnabled = savedQ40;
+            CudaQuantizedOps.Q4KDp4aEnabled = savedQ4K;
+            CudaQuantizedOps.Iq2xxsDp4aEnabled = savedIq2;
+            CudaQuantizedOps.Iq2sDp4aEnabled = savedIq2S;
+        }
     }
 
     [Fact]
@@ -1426,6 +1677,53 @@ public class CudaBackendTests
         Assert.Equal(32f, actualRows[63]);
 
         CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+    }
+
+    [Fact]
+    public void CudaQuantizedWeightArena_IsOwnedByAllocator()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        byte[] weights = CreateQ8_0Rows(new[]
+        {
+            Enumerable.Range(1, 32).Select(i => (sbyte)i).ToArray(),
+        });
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x5A17);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocatorA = new CudaAllocator();
+            using var allocatorB = new CudaAllocator();
+
+            // Even with the same public cache key and physical device, each
+            // allocator owns an independent arena lifetime.
+            CudaQuantizedOps.PreloadQuantizedWeight(
+                allocatorA, cacheKey, host, 8, 32, 1, weights.Length);
+            CudaQuantizedOps.PreloadQuantizedWeight(
+                allocatorB, cacheKey, host, 8, 32, 1, weights.Length);
+
+            Assert.True(CudaQuantizedOps.TryGetResidentDevicePtr(
+                allocatorA, cacheKey, out IntPtr ptrA, out int typeA));
+            Assert.True(CudaQuantizedOps.TryGetResidentDevicePtr(
+                allocatorB, cacheKey, out IntPtr ptrB, out int typeB));
+            Assert.Equal(8, typeA);
+            Assert.Equal(8, typeB);
+            Assert.NotEqual(ptrA, ptrB);
+
+            CudaQuantizedOps.ReleaseArena(allocatorA);
+            Assert.False(CudaQuantizedOps.TryGetResidentDevicePtr(
+                allocatorA, cacheKey, out _, out _));
+            Assert.True(CudaQuantizedOps.TryGetResidentDevicePtr(
+                allocatorB, cacheKey, out IntPtr ptrBAfter, out int typeBAfter));
+            Assert.Equal(ptrB, ptrBAfter);
+            Assert.Equal(8, typeBAfter);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
     }
 
     [Fact]
@@ -2035,6 +2333,74 @@ public class CudaBackendTests
     }
 
     [Theory]
+    [InlineData((int)GgmlTensorType.Q5_K)]
+    [InlineData((int)GgmlTensorType.Q6_K)]
+    public void CudaQuantizedMatmul_KQuantDecodeDp4aMatchesQ8ActivationReference(int ggmlType)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 512; // two super-blocks exercises row/block addressing
+        const int outDim = 7;  // non-power-of-two grid edge
+        byte[] weights = CreateKQuantRows(ggmlType, outDim, inDim);
+        float[,] input = new float[1, inDim];
+        for (int c = 0; c < inDim; c++)
+            input[0, c] = MathF.Sin((c + 1) * 0.017f)
+                + 0.375f * MathF.Cos((c + 11) * 0.029f);
+
+        bool savedQ5K = CudaQuantizedOps.Q5KDp4aEnabled;
+        bool savedQ6K = CudaQuantizedOps.Q6KDp4aEnabled;
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x764100 + ggmlType);
+        try
+        {
+            CudaQuantizedOps.Q5KDp4aEnabled = ggmlType == (int)GgmlTensorType.Q5_K;
+            CudaQuantizedOps.Q6KDp4aEnabled = ggmlType == (int)GgmlTensorType.Q6_K;
+            Marshal.Copy(weights, 0, host, weights.Length);
+
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(
+                allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, 1, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output,
+                    inputTensor,
+                    cacheKey,
+                    IntPtr.Zero,
+                    ggmlType,
+                    inDim,
+                    outDim,
+                    weights.Length));
+
+                float[] expected = DequantizedMatmulNative(
+                    weights,
+                    (GgmlTensorType)ggmlType,
+                    outDim,
+                    inDim,
+                    QuantizeDequantizeQ8_1(input));
+                float maxAbs = expected.Max(MathF.Abs);
+                AssertClose(
+                    expected,
+                    output.GetElementsAsFloat(outDim),
+                    0.003f * MathF.Max(1.0f, maxAbs));
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            CudaQuantizedOps.Q5KDp4aEnabled = savedQ5K;
+            CudaQuantizedOps.Q6KDp4aEnabled = savedQ6K;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Theory]
     [InlineData((int)GgmlTensorType.Q4_K)]
     [InlineData((int)GgmlTensorType.Q5_K)]
     [InlineData((int)GgmlTensorType.Q6_K)]
@@ -2151,6 +2517,217 @@ public class CudaBackendTests
         finally
         {
             Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Theory]
+    [InlineData((int)GgmlTensorType.IQ2_XXS)]
+    [InlineData((int)GgmlTensorType.IQ2_S)]
+    public void CudaQuantizedMatmul_IQ2DecodeGlobalQ81MatchesNativeReference(int ggmlType)
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int inDim = 512;
+        const int outDim = 5;
+        byte[] weights = ggmlType == (int)GgmlTensorType.IQ2_XXS
+            ? CreateIq2XxsRows(outDim, inDim)
+            : CreateIq2SRows(outDim, inDim);
+        float[,] input = new float[1, inDim];
+        for (int c = 0; c < inDim; c++)
+            input[0, c] = MathF.Sin((c + 1) * 0.013f) + 0.25f * MathF.Cos((c + 7) * 0.031f);
+
+        bool savedVec = CudaQuantizedOps.Iq2VecDp4aEnabled;
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        IntPtr cacheKey = new(0x766100 + ggmlType);
+        try
+        {
+            CudaQuantizedOps.Iq2VecDp4aEnabled = true;
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new CudaAllocator();
+            CudaQuantizedOps.PreloadQuantizedWeight(
+                allocator, cacheKey, host, ggmlType, inDim, outDim, weights.Length);
+
+            try
+            {
+                using var inputTensor = Tensor.FromArray(allocator, input);
+                using var output = new Tensor(allocator, DType.Float32, 1, outDim);
+                Assert.True(CudaQuantizedOps.TryAddmmQuantizedToFloat32(
+                    output,
+                    inputTensor,
+                    cacheKey,
+                    IntPtr.Zero,
+                    ggmlType,
+                    inDim,
+                    outDim,
+                    weights.Length));
+
+                GgmlTensorType tensorType = (GgmlTensorType)ggmlType;
+                float[] expected = DequantizedMatmulNative(
+                    weights, tensorType, outDim, inDim, QuantizeDequantizeQ8_1(input));
+                AssertClose(expected, output.GetElementsAsFloat(outDim), 5e-3f);
+            }
+            finally
+            {
+                CudaQuantizedOps.ReleaseQuantizedWeight(allocator, cacheKey);
+            }
+        }
+        finally
+        {
+            CudaQuantizedOps.Iq2VecDp4aEnabled = savedVec;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [Fact]
+    public void CudaMoEDecode_MixedIq2StagesMatchQuantizedCpuReference()
+    {
+        if (!CudaBackend.IsAvailable())
+            return;
+
+        const int hiddenDim = 256;
+        const int nFf = 256;
+        const int numExperts = 2;
+        const int nUsed = 2;
+
+        byte[][] weights =
+        {
+            CreateIq2XxsRows(nFf, hiddenDim),
+            CreateIq2XxsRows(nFf, hiddenDim),
+            CreateIq2XxsRows(nFf, hiddenDim),
+            CreateIq2XxsRows(nFf, hiddenDim),
+            CreateIq2SRows(hiddenDim, nFf),
+            CreateIq2SRows(hiddenDim, nFf),
+        };
+        ScaleQuantBlockD(weights[1], 66, 0.75f);
+        ScaleQuantBlockD(weights[2], 66, 1.10f);
+        ScaleQuantBlockD(weights[3], 66, 0.60f);
+        ScaleQuantBlockD(weights[4], 82, 0.90f);
+        ScaleQuantBlockD(weights[5], 82, 1.20f);
+
+        int[] types = { 16, 16, 16, 16, 22, 22 };
+        IntPtr[] hosts = new IntPtr[weights.Length];
+        IntPtr[] keys = new IntPtr[weights.Length];
+        IntPtr gateTable = IntPtr.Zero;
+        IntPtr upTable = IntPtr.Zero;
+        IntPtr downTable = IntPtr.Zero;
+        try
+        {
+            using var allocator = new CudaAllocator();
+            var resident = new IntPtr[weights.Length];
+            for (int i = 0; i < weights.Length; i++)
+            {
+                hosts[i] = Marshal.AllocHGlobal(weights[i].Length);
+                Marshal.Copy(weights[i], 0, hosts[i], weights[i].Length);
+                keys[i] = new IntPtr(0x720000 + i);
+                CudaQuantizedOps.PreloadQuantizedWeight(
+                    allocator, keys[i], hosts[i], types[i],
+                    i < 4 ? hiddenDim : nFf,
+                    i < 4 ? nFf : hiddenDim,
+                    weights[i].Length);
+                Assert.True(CudaQuantizedOps.TryGetResidentDevicePtr(
+                    allocator, keys[i], out resident[i], out int residentType));
+                Assert.Equal(types[i], residentType);
+            }
+
+            gateTable = CudaQuantizedOps.CreateDevicePointerTable(
+                allocator, new[] { resident[0], resident[1] });
+            upTable = CudaQuantizedOps.CreateDevicePointerTable(
+                allocator, new[] { resident[2], resident[3] });
+            downTable = CudaQuantizedOps.CreateDevicePointerTable(
+                allocator, new[] { resident[4], resident[5] });
+
+            try
+            {
+                float[,] inputHost = new float[1, hiddenDim];
+                for (int i = 0; i < hiddenDim; i++)
+                    inputHost[0, i] = 0.35f * MathF.Sin((i + 1) * 0.037f)
+                        + 0.15f * MathF.Cos((i + 3) * 0.019f);
+
+                using var logits = Tensor.FromArray(allocator, new float[,] { { 0.7f, -0.2f } });
+                using var input = Tensor.FromArray(allocator, inputHost);
+                using var output = new Tensor(allocator, DType.Float32, 1, hiddenDim);
+                using var selected = new Tensor(allocator, DType.Int32, nUsed);
+                using var routeWeights = new Tensor(allocator, DType.Float32, nUsed);
+                using var gate = new Tensor(allocator, DType.Float32, nUsed, nFf);
+                using var up = new Tensor(allocator, DType.Float32, nUsed, nFf);
+                using var inputQ8 = new Tensor(
+                    allocator, DType.UInt8,
+                    (long)(hiddenDim / 32) * CudaFusedOps.Q81BlockBytes);
+                using var hiddenQ8 = new Tensor(
+                    allocator, DType.UInt8,
+                    (long)nUsed * (nFf / 32) * CudaFusedOps.Q81BlockBytes);
+
+                Assert.True(CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
+                    logits, input, output, selected, routeWeights, gate, up,
+                    IntPtr.Zero, gateTable, upTable, downTable,
+                    gateUpType: 16, downType: 22,
+                    numExperts, nUsed, hiddenDim, nFf,
+                    sharedDown: null, sharedGateVecPtr: IntPtr.Zero,
+                    inputQ8, hiddenQ8,
+                    useGateUpDp4a: true, useDownDp4a: true));
+
+                Assert.Equal(new[] { 0, 1 }, selected.GetElementsAsInt(nUsed));
+                float exp0 = MathF.Exp(0.7f);
+                float exp1 = MathF.Exp(-0.2f);
+                float[] expectedRoute = { exp0 / (exp0 + exp1), exp1 / (exp0 + exp1) };
+                AssertClose(expectedRoute, routeWeights.GetElementsAsFloat(nUsed), 2e-5f);
+
+                float[,] qInput = QuantizeDequantizeQ8_1StoredScale(inputHost);
+                var expected = new float[hiddenDim];
+                for (int expert = 0; expert < numExperts; expert++)
+                {
+                    float[] gateProjected = DequantizedMatmulNative(
+                        weights[expert], GgmlTensorType.IQ2_XXS,
+                        nFf, hiddenDim, qInput);
+                    float[] upProjected = DequantizedMatmulNative(
+                        weights[2 + expert], GgmlTensorType.IQ2_XXS,
+                        nFf, hiddenDim, qInput);
+                    var activated = new float[1, nFf];
+                    for (int i = 0; i < nFf; i++)
+                    {
+                        float x = gateProjected[i];
+                        activated[0, i] = x / (1.0f + MathF.Exp(-x)) * upProjected[i];
+                    }
+
+                    float[,] qActivated = QuantizeDequantizeQ8_1StoredScale(activated);
+                    float[] projectedDown = DequantizedMatmulNative(
+                        weights[4 + expert], GgmlTensorType.IQ2_S,
+                        hiddenDim, nFf, qActivated);
+                    for (int i = 0; i < hiddenDim; i++)
+                        expected[i] += expectedRoute[expert] * projectedDown[i];
+                }
+
+                float[] actual = output.GetElementsAsFloat(hiddenDim);
+                float maxExpected = 0.0f;
+                float maxError = 0.0f;
+                for (int i = 0; i < hiddenDim; i++)
+                {
+                    maxExpected = MathF.Max(maxExpected, MathF.Abs(expected[i]));
+                    maxError = MathF.Max(maxError, MathF.Abs(actual[i] - expected[i]));
+                }
+                Assert.True(
+                    maxError <= MathF.Max(0.05f, maxExpected * 0.003f),
+                    $"Mixed MoE max error {maxError} for max reference magnitude {maxExpected}.");
+            }
+            finally
+            {
+                allocator.Synchronize();
+                if (gateTable != IntPtr.Zero)
+                    CudaQuantizedOps.FreeDeviceBuffer(allocator, gateTable);
+                if (upTable != IntPtr.Zero)
+                    CudaQuantizedOps.FreeDeviceBuffer(allocator, upTable);
+                if (downTable != IntPtr.Zero)
+                    CudaQuantizedOps.FreeDeviceBuffer(allocator, downTable);
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < hosts.Length; i++)
+            {
+                if (hosts[i] != IntPtr.Zero)
+                    Marshal.FreeHGlobal(hosts[i]);
+            }
         }
     }
 
@@ -3524,6 +4101,32 @@ public class CudaBackendTests
         return raw;
     }
 
+    private static byte[] CreateIq2SRows(int rows, int cols)
+    {
+        const int blockSize = 256;
+        const int blockBytes = 82;
+        Assert.Equal(0, cols % blockSize);
+        int blocksPerRow = cols / blockSize;
+        byte[] raw = new byte[rows * blocksPerRow * blockBytes];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int offset = (r * blocksPerRow + b) * blockBytes;
+                WriteHalf(raw, offset, 0.0078125f + r * 0.001953125f + b * 0.0009765625f);
+                for (int i = 0; i < 64; i++)
+                    raw[offset + 2 + i] = (byte)((r * 29 + b * 17 + i * 11 + 7) & 0xFF);
+                for (int i = 0; i < 8; i++)
+                {
+                    raw[offset + 66 + i] = (byte)((r * 19 + b * 13 + i * 23 + 5) & 0xFF);
+                    raw[offset + 74 + i] = (byte)((r * 31 + b * 7 + i * 29 + 3) & 0xFF);
+                }
+            }
+        }
+
+        return raw;
+    }
+
     private static void WriteQ6Value(byte[] raw, int qlBase, int qhBase, int sub, int index, int unsignedValue)
     {
         int half = sub / 8;
@@ -3546,6 +4149,18 @@ public class CudaBackendTests
         ushort bits = BitConverter.HalfToUInt16Bits((System.Half)value);
         data[offset] = (byte)(bits & 0xFF);
         data[offset + 1] = (byte)(bits >> 8);
+    }
+
+    private static void ScaleQuantBlockD(byte[] raw, int blockBytes, float factor)
+    {
+        Assert.True(blockBytes >= 2);
+        Assert.Equal(0, raw.Length % blockBytes);
+        for (int offset = 0; offset < raw.Length; offset += blockBytes)
+        {
+            ushort bits = (ushort)(raw[offset] | (raw[offset + 1] << 8));
+            float d = (float)BitConverter.UInt16BitsToHalf(bits);
+            WriteHalf(raw, offset, d * factor);
+        }
     }
 
     private static float[] DequantizedMatmulQ80(byte[] weights, int outDim, int inDim, float[,] input, int rows)
@@ -3665,6 +4280,35 @@ public class CudaBackendTests
                     int q = (int)MathF.Round(input[r, block + i] * id, MidpointRounding.ToEven);
                     q = Math.Max(-127, Math.Min(127, q));
                     result[r, block + i] = d * q;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static float[,] QuantizeDequantizeQ8_1StoredScale(float[,] input)
+    {
+        int rows = input.GetLength(0);
+        int cols = input.GetLength(1);
+        Assert.Equal(0, cols % 32);
+        float[,] result = new float[rows, cols];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int block = 0; block < cols; block += 32)
+            {
+                float amax = 0;
+                for (int i = 0; i < 32; i++)
+                    amax = MathF.Max(amax, MathF.Abs(input[r, block + i]));
+
+                float d = amax > 0 ? amax / 127.0f : 0;
+                float id = d > 0 ? 1.0f / d : 0;
+                float storedD = (float)(System.Half)d;
+                for (int i = 0; i < 32; i++)
+                {
+                    int q = (int)MathF.Round(input[r, block + i] * id, MidpointRounding.ToEven);
+                    q = Math.Max(-127, Math.Min(127, q));
+                    result[r, block + i] = storedD * q;
                 }
             }
         }

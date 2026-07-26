@@ -1565,6 +1565,18 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): logs dedicated-VRAM free/used at
+        /// <paramref name="label"/> when the active allocator is the direct-CUDA one.</summary>
+        internal static void LogCudaVram(IAllocator allocator, string label)
+        {
+            if (allocator is CudaAllocator cuda)
+                cuda.LogVram(label);
+        }
+
+        /// <summary>Diagnostic (TS_CUDA_LOG_VRAM=1): logs the model allocator's
+        /// dedicated-VRAM free/used at <paramref name="label"/>.</summary>
+        public void LogVramSnapshot(string label) => LogCudaVram(_allocator, label);
+
         private void PrepareDirectCudaQuantizedWeightsForInference()
         {
             if (_cudaQuantWeightsPrepared || _quantWeights.Count == 0)
@@ -1572,6 +1584,8 @@ namespace TensorSharp.Models
 
             if (_allocator is not CudaAllocator cudaAllocator)
                 return;
+
+            cudaAllocator.LogVram("before direct-CUDA quant weight preload");
 
             long preloadedBytes = 0;
             int preloadedCount = 0;
@@ -1611,6 +1625,8 @@ namespace TensorSharp.Models
 
             if (preloadedCount > 0)
                 Console.WriteLine($"  Direct CUDA resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors (host copies released)");
+
+            cudaAllocator.LogVram("after direct-CUDA quant weight preload");
         }
 
         // TS_GGML_RETAIN_HOST_WEIGHTS=1 keeps every quantized weight's host copy
@@ -4053,6 +4069,10 @@ namespace TensorSharp.Models
             {
                 foreach (var qw in _quantWeights.Values)
                     CudaQuantizedOps.ReleaseQuantizedWeight(cudaAllocator, qw.CacheKey);
+                // Weights are suballocated from arena slabs; free the slabs now
+                // that every resident weight has been released (individual
+                // releases only drop cache entries — the slabs are freed here).
+                CudaQuantizedOps.ReleaseArena(cudaAllocator);
             }
 
             if (_backend == BackendType.Mlx && _allocator is MlxAllocator mlxAllocator)

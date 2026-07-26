@@ -4253,6 +4253,21 @@ namespace TensorSharp.Models
 
             bool routeRowsAreLogits = _normTopKProb;
 
+            // Direct-CUDA on-device MoE decode: router + expert FFN + shared expert
+            // entirely on the GPU (no per-expert host readback), so the decode layer
+            // loop stays CUDA-graph capturable. Requires the normalized top-k softmax
+            // routing (== the on-device ts_moe_router_f32); other routings fall through
+            // to the host path below. routerLogits stays alive on a fall-through.
+            if (_backend == BackendType.Cuda && routeRowsAreLogits && CanUseQwenCudaMoEOnDevice(layer)
+                && (seqLen == 1 || s_qwenCudaMoePrefillOnDevice))
+            {
+                Tensor onDevice = seqLen == 1
+                    ? TryCudaMoEForwardOnDevice(input, routerLogits, layer)
+                    : TryCudaMoEForwardPrefillOnDevice(input, routerLogits, layer, seqLen);
+                if (onDevice != null)
+                    return onDevice;
+            }
+
             // Device-routing fast path: skip the per-MoE-layer routerData
             // host sync entirely. Compute top-K + softmax on the device and
             // feed the resulting [K] int32 + [1, K] float32 device tensors
@@ -4294,6 +4309,21 @@ namespace TensorSharp.Models
             }
 
             float* routePtr = GetFloatPtr(routerData);
+
+            // Direct CUDA prefill: retain host top-k grouping, but gather input
+            // rows and scatter weighted expert outputs on device. This preserves
+            // the legacy expert-batched math while removing its per-expert
+            // activation round-trips.
+            if (_backend == BackendType.Cuda && seqLen > 1)
+            {
+                Tensor groupedCuda = TryCudaMoEForwardPrefillGrouped(
+                    input, routePtr, routeRowsAreLogits, layer, seqLen);
+                if (groupedCuda != null)
+                {
+                    routerData.Dispose();
+                    return groupedCuda;
+                }
+            }
 
             // GGML stacked-MoE fast path (CUDA / CPU / Metal). Route top-K on
             // host, then run EVERY routed expert for ALL tokens through ONE
@@ -5438,6 +5468,9 @@ namespace TensorSharp.Models
             _cudaPrefillGraphs = null;
             _cudaDecodeDynParams?.Dispose();
             _cudaDecodeDynParams = null;
+
+            // Free the on-device MoE decode pointer tables (device u64 buffers).
+            FreeQwenCudaMoETables();
 
             VisionEncoder?.Dispose();
             foreach (var (visionEmbeddings, _) in _visionEmbeddingsList)

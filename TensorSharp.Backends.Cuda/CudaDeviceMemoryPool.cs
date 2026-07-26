@@ -71,6 +71,25 @@ namespace TensorSharp.Cuda
         [ThreadStatic] private static int t_shardSeed;
         private static int s_shardSeedCounter;
 
+        // VRAM-pressure safety valve. On a device that is nearly full (e.g. a 26B
+        // model on a 16 GB card, which fits in dedicated VRAM only with a few
+        // hundred MB to spare), letting the pool hoard up to ~1.5 GB of idle freed
+        // blocks pushes the working set past physical VRAM and the driver silently
+        // spills into WDDM shared (system) memory — inference then reads weights
+        // over PCIe and collapses to a fraction of its speed. When set, the pool
+        // stops caching returned blocks (frees them straight back to the driver)
+        // once free VRAM drops below minFreeReserveBytes, keeping headroom so real
+        // allocations stay resident. On a roomy card free VRAM never drops that low
+        // and the valve never fires, so behaviour there is unchanged. The free
+        // reading is sampled at most once per FreeSampleIntervalTicks to keep the
+        // hot return path from calling cuMemGetInfo on every block.
+        private readonly Func<long> queryFreeBytes;
+        private readonly long minFreeReserveBytes;
+        private static readonly long FreeSampleIntervalTicks =
+            System.Diagnostics.Stopwatch.Frequency / 100; // ~10 ms
+        private long lastFreeReading;
+        private long lastFreeReadTicks;
+
         public CudaDeviceMemoryPool(
             long maxCachedBytes,
             long maxCachedBlockBytes,
@@ -78,7 +97,9 @@ namespace TensorSharp.Cuda
             Func<long, IntPtr> backingAllocate,
             Action<IntPtr> backingFree,
             int shardCount = 0,
-            long largeCachedBytesCap = 0)
+            long largeCachedBytesCap = 0,
+            Func<long> queryFreeBytes = null,
+            long minFreeReserveBytes = 0)
         {
             this.maxCachedBytes = maxCachedBytes;
             this.maxCachedBlockBytes = maxCachedBlockBytes;
@@ -86,6 +107,8 @@ namespace TensorSharp.Cuda
             largeCap = largeCachedBytesCap > 0 ? largeCachedBytesCap : maxCachedBytes;
             this.backingAllocate = backingAllocate ?? throw new ArgumentNullException(nameof(backingAllocate));
             this.backingFree = backingFree ?? throw new ArgumentNullException(nameof(backingFree));
+            this.queryFreeBytes = queryFreeBytes;
+            this.minFreeReserveBytes = minFreeReserveBytes;
 
             int count = shardCount > 0 ? shardCount : DefaultShardCount();
             count = RoundUpToPowerOfTwo(count);
@@ -169,12 +192,39 @@ namespace TensorSharp.Cuda
         /// Used during CUDA graph capture, where blocks referenced by the graph
         /// must never be cuMemFree'd.
         /// </summary>
+        /// <summary>True when the device is close enough to full that the pool
+        /// should stop hoarding freed blocks and hand them back to the driver so
+        /// live allocations do not spill into shared memory. Samples free VRAM at
+        /// most once per <see cref="FreeSampleIntervalTicks"/> to stay off the hot
+        /// path; always false when no query / reserve is configured (roomy cards).</summary>
+        private bool UnderVramPressure()
+        {
+            if (queryFreeBytes == null || minFreeReserveBytes <= 0)
+                return false;
+
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long last = Volatile.Read(ref lastFreeReadTicks);
+            if (last == 0 || now - last >= FreeSampleIntervalTicks)
+            {
+                long free = queryFreeBytes();
+                Volatile.Write(ref lastFreeReading, free);
+                Volatile.Write(ref lastFreeReadTicks, now);
+                return free < minFreeReserveBytes;
+            }
+
+            return Volatile.Read(ref lastFreeReading) < minFreeReserveBytes;
+        }
+
         public bool TryReturnToPool(IntPtr ptr, long allocationBytes)
         {
             if (ptr == IntPtr.Zero)
                 return true;
 
             if (!enabled || allocationBytes <= 0)
+                return false;
+
+            // Near-full device: keep headroom instead of caching this block.
+            if (UnderVramPressure())
                 return false;
 
             if (allocationBytes >= LargeBlockThreshold)

@@ -164,7 +164,7 @@ namespace TensorSharp.Models
                 }
             }
             Console.WriteLine($" done ({count} tensors, {_clampParams.Count} clampable linears)");
-
+            ModelBase.LogCudaVram(_allocator, "after audio encoder weight load");
         }
 
         public unsafe Tensor Encode(float[] melData, int numFrames)

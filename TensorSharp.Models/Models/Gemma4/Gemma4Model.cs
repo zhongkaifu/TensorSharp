@@ -216,6 +216,21 @@ namespace TensorSharp.Models
         private StackedExpertWeights[] _layerStackedDown;
         private float[][] _layerPerExpertScale;
 
+        // On-device direct-CUDA MoE decode (TS_CUDA_MOE_ONDEVICE=0 to disable). Runs
+        // routing + the expert FFN entirely on the GPU so the MoE decode layer loop
+        // is CUDA-graph capturable (see TryCudaMoEForwardOnDevice / the ts_moe_*
+        // kernels). Per-layer device pointer tables address the resident per-expert
+        // gate_up / down weights by the on-device expert id.
+        private static readonly bool s_cudaMoeOnDeviceEnabled =
+            Environment.GetEnvironmentVariable("TS_CUDA_MOE_ONDEVICE") != "0";
+        private IntPtr[] _cudaMoEGateUpPtrTable;   // per layer: device u64[numExperts]
+        private IntPtr[] _cudaMoEDownPtrTable;      // per layer: device u64[numExperts]
+        private IntPtr[] _cudaMoEScalePtr;          // per layer: device f32[numExperts] or Zero
+        private int[] _cudaMoEQuantType;            // per layer expert quant type
+        private int[] _cudaMoENff;                  // per layer per-expert intermediate dim
+        private bool _cudaMoETablesReady;           // all layers built (or unavailable)
+        private bool _cudaMoEUsable;                // tables built successfully for every MoE layer
+
         private bool _canUseFusedDecode;
         // Gates the model-wide single-graph decode kernel (NativeGemma4ModelDecode).
         // When any layer is MoE this stays false because the model-wide kernel has
@@ -1999,10 +2014,13 @@ namespace TensorSharp.Models
                 return false;
             }
 
-            // Direct-CUDA MoE routing currently reads router results on the
-            // host. That synchronization is intentionally not capturable.
-            // Dense Gemma variants (including PLE + shared KV) are graphable.
-            if (_numExperts > 0)
+            // MoE layers are graphable only when the on-device MoE decode path is
+            // active: it runs routing + the expert FFN as device kernels (no host
+            // readback of the router logits, no host gather/scatter), so the whole
+            // decode layer loop can be captured. Without it (tables unavailable, or
+            // TS_CUDA_MOE_ONDEVICE=0) the host MoERoute sync is not capturable, so
+            // fall back to the per-op decode loop.
+            if (_numExperts > 0 && !AllMoELayersOnDeviceCapable())
                 return false;
 
             return true;
@@ -4168,7 +4186,23 @@ namespace TensorSharp.Models
                 // pattern. Falls back to the legacy split path when the
                 // stacked expert weights aren't built (e.g. F32-only model)
                 // or when the kernel rejects the layout.
-                if (!TryMoEForwardResidual(attnOut, mlpOut, layer, prefix, seqLen, postMoeNormKey))
+                // Direct-CUDA decode: fully on-device MoE (routing + expert FFN) so
+                // the decode layer loop is CUDA-graph capturable. Returns null (and
+                // falls through to the host path) for prefill, non-CUDA backends, or
+                // when the per-expert device tables aren't available.
+                Tensor cudaMoeOut = TryCudaMoEForwardOnDevice(attnOut, layer, prefix, seqLen);
+                if (cudaMoeOut != null)
+                {
+                    using (cudaMoeOut)
+                    {
+                        if (!TryRmsNormAddInPlaceMlx(mlpOut, cudaMoeOut, postMoeNormKey))
+                        {
+                            using var postMoeNormed = RMSNormOp(cudaMoeOut, postMoeNormKey);
+                            Ops.Add(mlpOut, mlpOut, postMoeNormed);
+                        }
+                    }
+                }
+                else if (!TryMoEForwardResidual(attnOut, mlpOut, layer, prefix, seqLen, postMoeNormKey))
                 {
                     using var moeOut = MoEForward(attnOut, layer, prefix, seqLen);
                     if (!TryRmsNormAddInPlaceMlx(mlpOut, moeOut, postMoeNormKey))
@@ -4311,6 +4345,198 @@ namespace TensorSharp.Models
 
         #region MoE
 
+        /// <summary>
+        /// Builds the per-layer device pointer tables the on-device MoE kernels use
+        /// to address the resident per-expert weights by the device-computed expert
+        /// id. Runs once (before any CUDA-graph capture, since capture happens on the
+        /// second decode of a shape and this runs on the first). Sets
+        /// <see cref="_cudaMoEUsable"/> only if every MoE layer's experts are
+        /// device-resident; otherwise the host <see cref="MoEForward"/> path is kept.
+        /// </summary>
+        private void EnsureCudaMoETablesBuilt()
+        {
+            if (_cudaMoETablesReady)
+                return;
+            _cudaMoETablesReady = true;
+            _cudaMoEUsable = false;
+
+            if (_backend != BackendType.Cuda || !s_cudaMoeOnDeviceEnabled
+                || _numExperts <= 0 || _allocator is not CudaAllocator cudaAllocator)
+                return;
+
+            int numLayers = Config.NumLayers;
+            _cudaMoEGateUpPtrTable = new IntPtr[numLayers];
+            _cudaMoEDownPtrTable = new IntPtr[numLayers];
+            _cudaMoEScalePtr = new IntPtr[numLayers];
+            _cudaMoEQuantType = new int[numLayers];
+            _cudaMoENff = new int[numLayers];
+
+            for (int l = 0; l < numLayers; l++)
+            {
+                if (!HasMoE(l))
+                    continue;
+
+                string prefix = $"blk.{l}";
+                var guPtrs = new IntPtr[_numExperts];
+                var downPtrs = new IntPtr[_numExperts];
+                int quantType = -1;
+                long gateUpNe1 = 0;
+                bool ok = true;
+
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    if (!_quantWeights.TryGetValue($"{prefix}.ffn_gate_up_exps.{e}.weight", out var guw)
+                        || !_quantWeights.TryGetValue($"{prefix}.ffn_down_exps.{e}.weight", out var dw))
+                    {
+                        ok = false;
+                        break;
+                    }
+
+                    if (!CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, guw.EnsureDeviceCacheKey(), out IntPtr guDev, out int guType)
+                        || !CudaQuantizedOps.TryGetResidentDevicePtr(cudaAllocator, dw.EnsureDeviceCacheKey(), out IntPtr dDev, out int dType)
+                        || guType != dType)
+                    {
+                        ok = false;
+                        break;
+                    }
+
+                    if (quantType < 0) { quantType = guType; gateUpNe1 = guw.Ne1; }
+                    else if (quantType != guType || gateUpNe1 != guw.Ne1) { ok = false; break; }
+
+                    guPtrs[e] = guDev;
+                    downPtrs[e] = dDev;
+                }
+
+                if (!ok || quantType < 0 || (gateUpNe1 & 1) != 0)
+                    return; // any gap -> keep the host path for the whole model
+
+                _cudaMoEGateUpPtrTable[l] = CudaQuantizedOps.CreateDevicePointerTable(cudaAllocator, guPtrs);
+                _cudaMoEDownPtrTable[l] = CudaQuantizedOps.CreateDevicePointerTable(cudaAllocator, downPtrs);
+                _cudaMoEQuantType[l] = quantType;
+                _cudaMoENff[l] = (int)(gateUpNe1 / 2);
+
+                string scaleKey = $"{prefix}.ffn_down_exps.scale";
+                if (!_weights.ContainsKey(scaleKey))
+                    scaleKey = $"{prefix}.ffn_gate_inp.per_expert_scale";
+                _cudaMoEScalePtr[l] = _weights.TryGetValue(scaleKey, out var scaleT)
+                    ? CudaFusedOps.GetDeviceResidentPtr(scaleT)
+                    : IntPtr.Zero;
+            }
+
+            _cudaMoEUsable = true;
+        }
+
+        /// <summary>
+        /// Whether the on-device MoE decode path is available for <paramref name="layer"/>
+        /// (direct CUDA, seqLen == 1, tables built). Used both by the decode call site
+        /// and by <see cref="CanUseCudaDecodeGraph"/> to decide graph eligibility.
+        /// </summary>
+        private bool CanUseCudaMoEOnDevice(int layer)
+        {
+            EnsureCudaMoETablesBuilt();
+            return _cudaMoEUsable
+                && _cudaMoEGateUpPtrTable != null
+                && layer < _cudaMoEGateUpPtrTable.Length
+                && _cudaMoEGateUpPtrTable[layer] != IntPtr.Zero;
+        }
+
+        private static void FreeCudaMoEPtrTables(IntPtr[] tables, CudaAllocator allocator)
+        {
+            if (tables == null)
+                return;
+            for (int i = 0; i < tables.Length; i++)
+            {
+                if (tables[i] != IntPtr.Zero)
+                {
+                    CudaQuantizedOps.FreeDeviceBuffer(allocator, tables[i]);
+                    tables[i] = IntPtr.Zero;
+                }
+            }
+        }
+
+        /// <summary>Every MoE layer can run its decode on-device (so the whole
+        /// decode loop is CUDA-graph capturable). Builds the tables on first call.</summary>
+        private bool AllMoELayersOnDeviceCapable()
+        {
+            EnsureCudaMoETablesBuilt();
+            if (!_cudaMoEUsable || _cudaMoEGateUpPtrTable == null)
+                return false;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (HasMoE(l) && _cudaMoEGateUpPtrTable[l] == IntPtr.Zero)
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// On-device MoE expert FFN for direct-CUDA decode: routing + gate/up +
+        /// GEGLU + down + weighted accumulate as device kernels, with no host
+        /// readback (so the enclosing decode layer loop stays CUDA-graph
+        /// capturable). Returns the MoE output tensor, or null to fall back to the
+        /// host <see cref="MoEForward"/> path. Numerically mirrors MoERoute +
+        /// MoEForward (softmax top-k, per-expert scale, GEGLU).
+        /// </summary>
+        private Tensor TryCudaMoEForwardOnDevice(Tensor hiddenState, int layer, string prefix, int seqLen)
+        {
+            if (seqLen != 1 || !CanUseCudaMoEOnDevice(layer))
+                return null;
+
+            Tensor logits = ComputeExpertScoresDevice(hiddenState, prefix, seqLen);
+
+            string moeNormKey = $"{prefix}.pre_ffw_norm_2.weight";
+            if (!_weights.ContainsKey(moeNormKey))
+                moeNormKey = $"{prefix}.ffn_pre_norm_2.weight";
+            Tensor moeInput = RMSNormOp(hiddenState, moeNormKey);
+
+            int hiddenDim = (int)moeInput.Sizes[1];
+            int nFf = _cudaMoENff[layer];
+            int nUsed = _numExpertsUsed;
+
+            var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+            var selected = new Tensor(_allocator, DType.Int32, nUsed);
+            var routeW = new Tensor(_allocator, DType.Float32, nUsed);
+            var gateUpOut = new Tensor(_allocator, DType.Float32, nUsed, nFf * 2);
+            var hAll = new Tensor(_allocator, DType.Float32, nUsed, nFf);
+
+            // q8_1 activation scratch for the Q4_0/Q4_K dp4a expert path (UInt8 byte
+            // buffers holding ts_block_q8_1 blocks: 36 B per 32-value block).
+            int expertType = _cudaMoEQuantType[layer];
+            bool useDp4a = (expertType == 2 && CudaQuantizedOps.Q40Dp4aEnabled)
+                || (expertType == 12 && CudaQuantizedOps.Q4KDp4aEnabled);
+            Tensor moeInputQ8 = null, hAllQ8 = null;
+            if (useDp4a)
+            {
+                moeInputQ8 = new Tensor(_allocator, DType.UInt8, (long)(hiddenDim / 32) * CudaFusedOps.Q81BlockBytes);
+                hAllQ8 = new Tensor(_allocator, DType.UInt8, (long)nUsed * (nFf / 32) * CudaFusedOps.Q81BlockBytes);
+            }
+
+            bool ok = CudaFusedOps.TryMoEExpertFFNDecode(
+                logits, moeInput, output, selected, routeW, gateUpOut, hAll,
+                _cudaMoEScalePtr[layer], _cudaMoEGateUpPtrTable[layer], _cudaMoEDownPtrTable[layer],
+                _cudaMoEQuantType[layer], _numExperts, nUsed, hiddenDim, nFf,
+                moeInputQ8, hAllQ8, useDp4a);
+
+            // Intermediates are disposed here: inside a graph capture the pool
+            // quarantines them (kept alive for the graph, rewritten each replay),
+            // exactly like the dense decode-graph intermediates.
+            hAllQ8?.Dispose();
+            moeInputQ8?.Dispose();
+            hAll.Dispose();
+            gateUpOut.Dispose();
+            routeW.Dispose();
+            selected.Dispose();
+            moeInput.Dispose();
+            logits.Dispose();
+
+            if (!ok)
+            {
+                output.Dispose();
+                return null;
+            }
+            return output;
+        }
+
         private unsafe Tensor MoEForward(Tensor hiddenState, int layer, string prefix, int seqLen)
         {
             var (routingWeights, selectedExperts) = MoERoute(hiddenState, prefix, seqLen);
@@ -4322,6 +4548,13 @@ namespace TensorSharp.Models
 
             int hiddenDim = (int)moeInput.Sizes[1];
             var output = new Tensor(_allocator, DType.Float32, seqLen, hiddenDim);
+
+            if (TryMoEGroupedCudaPrefill(
+                moeInput, output, selectedExperts, routingWeights,
+                layer, prefix, seqLen, hiddenDim))
+            {
+                return output;
+            }
 
             if (_backend == BackendType.Mlx &&
                 TryMoEFusedGEGLUMlx(moeInput, output, selectedExperts, routingWeights,
@@ -4809,26 +5042,55 @@ namespace TensorSharp.Models
             return true;
         }
 
-        private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(
-            Tensor input, string prefix, int seqLen)
+        /// <summary>
+        /// Router logit projection, entirely on-device (no host readback): the
+        /// unweighted RMSNorm + 1/sqrt(hidden) + optional gate-input scale + the
+        /// <c>ffn_gate_inp</c> projection. Shared by <see cref="MoERoute"/> (which
+        /// then host-syncs for the CPU softmax/top-k) and the on-device CUDA MoE
+        /// decode path (which feeds the result straight into the router kernel),
+        /// so both see byte-identical logits.
+        /// </summary>
+        private Tensor ComputeExpertScoresDevice(Tensor input, string prefix, int seqLen)
         {
             int hiddenDim = (int)input.Sizes[1];
 
             // Unweighted RMSNorm on a copy (input is used elsewhere)
-            using var normed = Ops.NewContiguous(input);
+            var normed = Ops.NewContiguous(input);
             ApplyUnweightedRMSNorm(normed, 1, hiddenDim, seqLen);
 
             // Scale by 1/sqrt(hidden_size)
             float invSqrtHidden = 1f / MathF.Sqrt(hiddenDim);
             Ops.Mul(normed, normed, invSqrtHidden);
 
-            // Multiply by learned scale parameter (broadcast per-dim scale across tokens)
+            // Multiply by learned scale parameter (broadcast per-dim scale across tokens).
+            // For decode (seqLen == 1) multiply the single row as a 1-D vector against
+            // the [hidden] scale so it stays a same-shape device elementwise op — the
+            // 2-D-row-by-1-D broadcast form falls back to the CPU (a host sync that
+            // would abort CUDA-graph capture of the decode loop).
             string scaleKey = $"{prefix}.ffn_gate_inp.scale";
             if (_weights.TryGetValue(scaleKey, out var scaleTensor))
-                Ops.Mul(normed, normed, scaleTensor);
+            {
+                if (seqLen == 1)
+                {
+                    using var normedRow = normed.View(hiddenDim);
+                    Ops.Mul(normedRow, normedRow, scaleTensor);
+                }
+                else
+                {
+                    Ops.Mul(normed, normed, scaleTensor);
+                }
+            }
 
             // Project to expert logits
-            using var expertScores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");
+            Tensor expertScores = LinearForward(normed, $"{prefix}.ffn_gate_inp.weight");
+            normed.Dispose();
+            return expertScores;
+        }
+
+        private unsafe (float[] routingWeights, int[] selectedExperts) MoERoute(
+            Tensor input, string prefix, int seqLen)
+        {
+            using var expertScores = ComputeExpertScoresDevice(input, prefix, seqLen);
 
             float* scoresPtr = GetFloatPtr(expertScores);
             int numExperts = (int)expertScores.Sizes[1];
@@ -7322,6 +7584,16 @@ namespace TensorSharp.Models
             // Graph entries own captured scratch blocks and refs to KV/PLE/RoPE
             // inputs; release them before tearing down those model tensors.
             InvalidateCudaDecodeGraphs();
+
+            // Free the on-device MoE per-expert pointer tables (raw device buffers)
+            // while the allocator is still alive (base.Dispose frees the arena).
+            if (_allocator is CudaAllocator moeCudaAllocator)
+            {
+                FreeCudaMoEPtrTables(_cudaMoEGateUpPtrTable, moeCudaAllocator);
+                FreeCudaMoEPtrTables(_cudaMoEDownPtrTable, moeCudaAllocator);
+                _cudaMoEGateUpPtrTable = null;
+                _cudaMoEDownPtrTable = null;
+            }
             _cudaDecodeDynParams?.Dispose();
             _cudaDecodeDynParams = null;
             _cudaDecodeGraphPleInput?.Dispose();

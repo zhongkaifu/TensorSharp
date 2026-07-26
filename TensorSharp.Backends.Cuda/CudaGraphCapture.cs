@@ -140,7 +140,8 @@ namespace TensorSharp.Cuda
             CaptureContext ctx = active;
             if (ctx != null && ctx.Allocator.Stream.Handle == streamHandle)
                 throw new CudaGraphCaptureAbortedException(
-                    "Stream synchronization (host read of device data) is not permitted while a CUDA graph capture is active.");
+                    "Stream synchronization (host read of device data) is not permitted while a CUDA graph capture is active."
+                    + (DiagnosticLog ? "\n" + Environment.StackTrace : string.Empty));
         }
     }
 

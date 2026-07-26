@@ -65,8 +65,9 @@ namespace TensorSharp.Cuda
         // circular cache through this route.
         private const int Group4RingMaxPartitions = 64;
         // A/B-tunable because the crossover depends on head width, context and
-        // GPU SM count. The default preserves the established route; model
-        // benchmarks can lower it without recompiling.
+        // GPU SM count. On the RTX 3080 report system, partitioning from 512
+        // tokens keeps the small-KV-head Gemma/Qwen grids populated and improved
+        // ~2K-context decode by 17% / 7% respectively.
         internal const int DecodeAttentionSingleBlockMaxTokens = 8192;
         // The grouped d=512 kernel keeps four score rows plus four query rows
         // in dynamic shared memory. At 2,048 tokens this is 40 KiB, below the
@@ -75,7 +76,7 @@ namespace TensorSharp.Cuda
         private const int GqaDecodeGroup4D512SingleBlockMaxTokens = 2048;
         private static readonly int DecodeAttentionPartitionThreshold =
             Math.Min(
-                ReadPositiveEnvInt("TS_CUDA_DECODE_ATTN_PARTITION_THRESHOLD", 2048),
+                ReadPositiveEnvInt("TS_CUDA_DECODE_ATTN_PARTITION_THRESHOLD", 512),
                 DecodeAttentionSingleBlockMaxTokens);
 
         private static int ReadPositiveEnvInt(string name, int fallback)
