@@ -58,6 +58,8 @@ hf download unsloth/gemma-4-12B-it-qat-GGUF mtp-gemma-4-12B-it.gguf --local-dir 
 [`ggml-org/gemma-4-E4B-it-GGUF`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)
 文件，完成正常原生构建后选择原生 GGML GPU 后端。这里不声称基准输入对应某个公开文件的
 特定校验和。下面的可复制命令面向 Linux + NVIDIA；其他平台的后端选择见代码块之后。
+全新机器请先按平台安装并验证完整的 [.NET 10 SDK](../../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)；
+仅安装 Runtime 无法执行构建命令。
 
 ```bash
 python -m pip install -U huggingface_hub

@@ -28,7 +28,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 
 ### 按模型下载并运行
 
-以下命令从仓库根目录运行；先执行 `dotnet build TensorSharp.slnx -c Release`。`hf` 来自 Hugging Face CLI（`pip install -U huggingface_hub`）。单次文本提示词必须通过 `--input` 文件传入，`--prompt` 仅用于 Qwen-Image-Edit。按硬件把示例的 `ggml_cuda` 换成 `ggml_metal`、`ggml_vulkan` 或 `ggml_cpu`。
+以下命令从仓库根目录运行；请先按平台安装完整的 [.NET 10 SDK](DEVELOPMENT_zh-cn.md#安装-net-10-sdk)，再执行 `dotnet build TensorSharp.slnx -c Release`。仅安装 Runtime 无法构建下方使用的二进制文件。`hf` 来自 Hugging Face CLI（`pip install -U huggingface_hub`）。单次文本提示词必须通过 `--input` 文件传入，`--prompt` 仅用于 Qwen-Image-Edit。按硬件把示例的 `ggml_cuda` 换成 `ggml_metal`、`ggml_vulkan` 或 `ggml_cpu`。
 
 ```bash
 echo "列出三条关于月球的事实。" > prompt.txt

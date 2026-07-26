@@ -25,8 +25,8 @@
 1. 在仓库根目录下载推荐的公开 Gemma 4 E4B 模型，并通过已验证的原生 GGML
    快速路径启动 TensorSharp.Server，使用
    [ggml-org 仓库](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)
-   中的 E4B Q8_0 家族。此方式需要 .NET 10 SDK、Git 以及 Python（用于 `hf`
-   下载命令行工具）。复制并运行这些命令约需 30 秒；下载 7.48 GiB 模型以及
+   中的 E4B Q8_0 家族。此方式需要完整的 [.NET 10 SDK](../../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)
+   而不只是 Runtime，此外还需要 Git 与 Python（用于 `hf` 下载命令行工具）。复制并运行这些命令约需 30 秒；下载 7.48 GiB 模型以及
    首次还原与原生构建耗时更长，取决于网络速度与机器性能。下面的可复制命令
    面向 Linux + NVIDIA；其他后端选择见代码块之后：
 

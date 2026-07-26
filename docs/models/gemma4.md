@@ -61,7 +61,9 @@ uses the public
 artifact, a normal native build, and a native GGML GPU backend. Verification is
 at the E4B Q8_0 family/path level; it does not assert that a particular public
 file checksum was the benchmark input. This copy/paste block is for
-Linux + NVIDIA; platform-specific backend choices follow it.
+Linux + NVIDIA; platform-specific backend choices follow it. On a new machine,
+install and verify the [.NET 10 SDK](../../DEVELOPMENT.md#install-the-net-10-sdk)
+before running the build command; the runtime alone is not sufficient.
 
 ```bash
 python -m pip install -U huggingface_hub

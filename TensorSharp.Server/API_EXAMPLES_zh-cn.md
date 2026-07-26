@@ -32,7 +32,7 @@ TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
 
 ### 约 30 秒快速开始
 
-已验证的快速路径是在原生 GGML 后端上运行 Gemma 4 E4B Q8_0。下面的命令复制并运行大约只需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络速度与机器性能。除 [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)、Git 与 `curl` 外，这条路径还需要所选后端对应的常规原生 GGML 构建依赖。模型是推荐的公开制品，来自 [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)；同一仓库还提供更省内存的 `gemma-4-E4B-it-Q4_K_M.gguf`。下面的可复制命令面向 Linux + NVIDIA；其他平台的后端选择见代码块之后：
+已验证的快速路径是在原生 GGML 后端上运行 Gemma 4 E4B Q8_0。下面的命令复制并运行大约只需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络速度与机器性能。除 [.NET 10 SDK](../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)、Git 与 `curl` 外，这条路径还需要所选后端对应的常规原生 GGML 构建依赖。全新机器请先按链接中的 Windows、macOS 或 Linux 说明安装 SDK；仅安装 Runtime 无法构建 TensorSharp。模型是推荐的公开制品，来自 [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)；同一仓库还提供更省内存的 `gemma-4-E4B-it-Q4_K_M.gguf`。下面的可复制命令面向 Linux + NVIDIA；其他平台的后端选择见代码块之后：
 
 ```bash
 git clone https://github.com/zhongkaifu/TensorSharp.git

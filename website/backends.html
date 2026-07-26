@@ -72,7 +72,7 @@
   <div class="callout note"><div class="ic">🔎</div><p>The server reports which backends are actually available on the host in <code>GET /api/models</code> (<code>supportedBackends</code>). If a CUDA or MLX backend is missing, the host did not detect a usable driver/runtime at startup. If <code>ggml_vulkan</code> is missing, the native bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found.</p></div>
 
   <h2 id="native-build">Building the native libraries</h2>
-  <p>The native GGML library is built automatically on the first <code>dotnet build</code>. To build it manually or with CUDA:</p>
+  <p>First install and verify the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>. The native GGML library is built automatically on the first <code>dotnet build</code>. To build it manually or with CUDA:</p>
   <pre data-lang="bash"><code>cd TensorSharp.GGML.Native
 
 # macOS (Metal)

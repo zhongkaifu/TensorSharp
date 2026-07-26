@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. Run source commands from the repository root with the .NET 10 SDK. A normal native build also needs Git, network access, CMake, and a C++ toolchain; replace `ggml_metal` with `mlx`, `cuda`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, or `cpu` to match your machine.
+These examples cover the current thinking/tool-call surface for the CLI and the two server compatibility APIs. Run source commands from the repository root with the full [.NET 10 SDK](../../DEVELOPMENT.md#install-the-net-10-sdk), not only the runtime. A normal native build also needs Git, network access, CMake, and a C++ toolchain; replace `ggml_metal` with `mlx`, `cuda`, `ggml_cuda`, `ggml_vulkan`, `ggml_cpu`, or `cpu` to match your machine.
 
 | Architecture | Thinking | Tool calls | Notes |
 |---|---|---|---|

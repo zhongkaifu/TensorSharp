@@ -26,7 +26,8 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
    start TensorSharp.Server on the verified native GGML fast path, using the
    E4B Q8_0 family from the
    [ggml-org repository](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF).
-   This needs the .NET 10 SDK, Git, and Python (for the `hf` download CLI).
+   This needs the [.NET 10 SDK](../../DEVELOPMENT.md#install-the-net-10-sdk),
+   not only the runtime, plus Git and Python (for the `hf` download CLI).
    Copying and running the commands takes about 30 seconds; downloading the
    7.48 GiB model and the first restore and native build take longer and depend
    on the network connection and machine. This copy/paste block is for

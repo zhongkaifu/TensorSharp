@@ -23,6 +23,8 @@ affect — keep them in sync when you add a new flag.
 
 ## Building
 
+Building requires the [.NET 10 SDK](../DEVELOPMENT.md#install-the-net-10-sdk), not only the runtime. The linked guide covers installation on Windows, macOS, and Linux and SDK verification on a new machine.
+
 ```bash
 dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
 dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release   # required: subprocess driver target

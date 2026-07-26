@@ -72,7 +72,7 @@
   <div class="callout note"><div class="ic">🔎</div><p>服务器会在 <code>GET /api/models</code>（<code>supportedBackends</code>）中报告主机上实际可用的后端。如果缺少 CUDA 或 MLX 后端，说明主机在启动时未检测到可用的驱动 / 运行时。如果缺少 <code>ggml_vulkan</code>，说明原生桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。</p></div>
 
   <h2 id="native-build">构建原生库</h2>
-  <p>原生 GGML 库会在首次 <code>dotnet build</code> 时自动构建。要手动构建或启用 CUDA：</p>
+  <p>请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。原生 GGML 库会在首次 <code>dotnet build</code> 时自动构建。要手动构建或启用 CUDA：</p>
   <pre data-lang="bash"><code>cd TensorSharp.GGML.Native
 
 # macOS（Metal）

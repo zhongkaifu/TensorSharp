@@ -51,6 +51,7 @@
   <div class="callout note"><div class="ic">⚖️</div><p>An honest comparison shows the gaps as well as the wins. These figures are one machine (RTX 3080 Laptop, single-stream); your hardware, model, and quantization will shift them. Run the built-in benchmark and the engine-comparison harness on your own box for the numbers that matter to you.</p></div>
 
   <h2 id="testing">Testing</h2>
+  <p>The build and test commands below require the <a href="getting-started.html#install-dotnet">.NET 10 SDK for your platform</a>; verify the installation before running them.</p>
   <h3>Unit tests (xUnit)</h3>
   <p><code>InferenceWeb.Tests</code> exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA and MLX backend kernels (when the hardware is available), paged-KV scheduling, batched-executor correctness, per-model batched-forward correctness against the legacy path, MTP / NextN speculative-decoding correctness, DiffusionGemma probes, codec round-trips, prompt rendering, and the server CLI options builder.</p>
   <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>

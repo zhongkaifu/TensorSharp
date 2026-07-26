@@ -2,7 +2,7 @@
 
 [English](example_api_thinking_tools.md) | [中文](example_api_thinking_tools_zh-cn.md)
 
-这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。请在仓库根目录使用 .NET 10 SDK 运行源码命令。常规原生构建还需要 Git、网络访问、CMake 与 C++ 工具链；请根据机器把 `ggml_metal` 替换为 `mlx`、`cuda`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu` 或 `cpu`。
+这些示例覆盖当前 CLI 以及两个服务端兼容 API 的思维链/工具调用能力。请在仓库根目录使用完整的 [.NET 10 SDK](../../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)运行源码命令，不能只安装 Runtime。常规原生构建还需要 Git、网络访问、CMake 与 C++ 工具链；请根据机器把 `ggml_metal` 替换为 `mlx`、`cuda`、`ggml_cuda`、`ggml_vulkan`、`ggml_cpu` 或 `cpu`。
 
 | 架构 | 思维链 | 工具调用 | 说明 |
 |---|---|---|---|

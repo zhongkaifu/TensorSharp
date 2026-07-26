@@ -20,8 +20,22 @@
   <div class="callout note"><div class="ic">📘</div><p><strong>正在沿着 Gemma 4 E4B 路径动手实践？</strong>《From Tensors to Tokens》把这份快速开始扩展成一条从零出发的系统讲解，带你理解每一步背后的推理引擎。<a href="book_zh-cn.html">了解 TensorSharp 配套图书 →</a></p></div>
 
   <h2 id="prerequisites">1 · 环境要求</h2>
+  <h3 id="install-dotnet">安装 .NET 10 SDK</h3>
+  <p>TensorSharp 面向 <code>net10.0</code>，因此从源码构建必须安装完整的 <strong>.NET 10 SDK</strong>；只安装 .NET Runtime 或 ASP.NET Core Runtime 并不足够。SDK 已包含运行 CLI 与服务器所需的运行时。请先查看 Microsoft 的 <a href="https://learn.microsoft.com/zh-cn/dotnet/core/install/" target="_blank" rel="noopener">.NET 跨平台安装指南</a>，再按操作系统选择安装方式：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>平台</th><th>安装 SDK</th><th>官方说明</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Windows</strong></td><td>打开 PowerShell 或命令提示符，运行 <code>winget install Microsoft.DotNet.SDK.10</code>。</td><td><a href="https://learn.microsoft.com/zh-cn/dotnet/core/install/windows" target="_blank" rel="noopener">在 Windows 上安装 .NET</a></td></tr>
+      <tr><td><strong>macOS</strong></td><td>下载与处理器匹配的 .NET 10 SDK 安装程序：Apple Silicon 选择 <strong>Arm64</strong>，Intel Mac 选择 <strong>x64</strong>。</td><td><a href="https://learn.microsoft.com/zh-cn/dotnet/core/install/macos" target="_blank" rel="noopener">在 macOS 上安装 .NET</a></td></tr>
+      <tr><td><strong>Linux</strong></td><td>按对应发行版的说明配置软件源（若需要），再安装 <code>dotnet-sdk-10.0</code>。在 Ubuntu 上完成当前版本所需的软件源设置后，先运行 <code>sudo apt-get update</code>，再运行 <code>sudo apt-get install -y dotnet-sdk-10.0</code>。</td><td><a href="https://learn.microsoft.com/zh-cn/dotnet/core/install/linux" target="_blank" rel="noopener">选择 Linux 发行版</a>（例如 <a href="https://learn.microsoft.com/zh-cn/dotnet/core/install/linux-ubuntu-install" target="_blank" rel="noopener">Ubuntu</a>）</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>安装后请打开一个新终端，并确认列表中包含 <code>10.0.x</code> SDK：</p>
+  <pre data-lang="bash"><code>dotnet --list-sdks</code></pre>
+  <h3>其他前置要求</h3>
   <ul>
-    <li><a href="https://dotnet.microsoft.com/download/dotnet/10.0" target="_blank" rel="noopener"><strong>.NET 10 SDK</strong></a> —— 必需。</li>
     <li><strong><code>git</code>、<code>curl</code> 与网络访问</strong> —— 用于克隆 TensorSharp 与下载模型。完整原生构建还会把 <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> 克隆到 <code>ExternalProjects/ggml/</code>；之后可设置 <code>TENSORSHARP_GGML_NO_UPDATE=1</code> 跳过网络更新。</li>
     <li><strong>一个 GGUF 模型文件</strong> —— 例如来自 <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>。见<a href="models_zh-cn.html#downloads">模型下载</a>。</li>
   </ul>

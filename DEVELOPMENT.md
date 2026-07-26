@@ -5,7 +5,26 @@
 
 ## Prerequisites
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+### Install the .NET 10 SDK
+
+Every TensorSharp project targets `net10.0`. To build from source, install the full **.NET 10 SDK**; a runtime-only installation is not sufficient. Installing the SDK also installs the .NET and ASP.NET Core runtimes needed by the CLI and server.
+
+| Platform | Recommended installation |
+|---|---|
+| **Windows** | Open PowerShell and run `winget install Microsoft.DotNet.SDK.10`. Alternatively, choose the .NET 10 **SDK** installer for your architecture in Microsoft's [Windows installation guide](https://learn.microsoft.com/en-us/dotnet/core/install/windows). |
+| **macOS** | Download and run the [.NET 10 SDK installer](https://dotnet.microsoft.com/en-us/download/dotnet/10.0). Choose **Arm64** for Apple silicon or **x64** for an Intel Mac; see Microsoft's [macOS installation guide](https://learn.microsoft.com/en-us/dotnet/core/install/macos). |
+| **Linux** | Use Microsoft's [Linux installation guide](https://learn.microsoft.com/en-us/dotnet/core/install/linux) to select your distribution and release, configure its package source, and install the .NET 10 SDK package (commonly `dotnet-sdk-10.0`). Package feeds and supported architectures vary by distribution, so follow the linked distro-specific steps. |
+
+After installation, open a new terminal and verify that a `10.0.x` SDK appears:
+
+```bash
+dotnet --list-sdks
+```
+
+See Microsoft's [cross-platform .NET installation overview](https://learn.microsoft.com/en-us/dotnet/core/install/) for installer, package-manager, manual, and non-admin options.
+
+### Other build prerequisites
+
 - **`git` and network access:** the GGML/CUDA native builds clone the ggml sources from [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) into `ExternalProjects/ggml/` on first build (see `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`). The clone tracks ggml's default branch (`master`); pin a different ref with `TENSORSHARP_GGML_GIT_REF`, or set `TENSORSHARP_GGML_NO_UPDATE=1` to skip the network update once cloned (offline rebuilds)
 - **macOS (Metal backend):** CMake 3.20+ and Xcode command-line tools for building the native GGML library; the MLX backend additionally builds `libmlxc` from `TensorSharp.Backends.MLX/Native/` via `bash TensorSharp.Backends.MLX/build-native-macos.sh`
 - **Windows (GGML CPU / CUDA backends):** CMake 3.20+ and Visual Studio 2022 C++ build tools; for `ggml_cuda` or `cuda`, install an NVIDIA driver plus CUDA Toolkit 12.x or another compatible CUDA toolkit with cuBLAS

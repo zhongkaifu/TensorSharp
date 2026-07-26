@@ -5,7 +5,26 @@
 
 ## 前置要求
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+### 安装 .NET 10 SDK
+
+TensorSharp 的所有项目都面向 `net10.0`。从源码构建必须安装完整的 **.NET 10 SDK**；仅安装 Runtime 不够。安装 SDK 时也会安装 CLI 与服务器运行所需的 .NET 和 ASP.NET Core Runtime。
+
+| 平台 | 推荐安装方式 |
+|---|---|
+| **Windows** | 打开 PowerShell 并运行 `winget install Microsoft.DotNet.SDK.10`。也可以按 Microsoft 的 [Windows 安装指南](https://learn.microsoft.com/zh-cn/dotnet/core/install/windows)，选择适合当前架构的 .NET 10 **SDK** 安装程序。 |
+| **macOS** | 下载并运行 [.NET 10 SDK 安装程序](https://dotnet.microsoft.com/zh-cn/download/dotnet/10.0)。Apple 芯片选择 **Arm64**，Intel Mac 选择 **x64**；另见 Microsoft 的 [macOS 安装指南](https://learn.microsoft.com/zh-cn/dotnet/core/install/macos)。 |
+| **Linux** | 使用 Microsoft 的 [Linux 安装指南](https://learn.microsoft.com/zh-cn/dotnet/core/install/linux)选择发行版和版本、配置相应软件源，再安装 .NET 10 SDK 包（通常名为 `dotnet-sdk-10.0`）。各发行版的软件源与架构支持不同，请以链接中的发行版专用步骤为准。 |
+
+安装后打开新终端，确认列表中包含 `10.0.x` SDK：
+
+```bash
+dotnet --list-sdks
+```
+
+安装程序、包管理器、手动安装和非管理员安装方式见 Microsoft 的 [.NET 跨平台安装概览](https://learn.microsoft.com/zh-cn/dotnet/core/install/)。
+
+### 其他构建前置
+
 - **`git` 与网络访问：** GGML/CUDA 原生构建会在首次构建时从 [github.com/ggml-org/ggml](https://github.com/ggml-org/ggml) 克隆 ggml 源码到 `ExternalProjects/ggml/`（参见 `eng/fetch-ggml.sh` / `eng/fetch-ggml.ps1`）。克隆默认跟踪 ggml 的默认分支（`master`）；可用 `TENSORSHARP_GGML_GIT_REF` 指定其他引用，或在克隆完成后设置 `TENSORSHARP_GGML_NO_UPDATE=1` 跳过网络更新（用于离线重建）
 - **macOS（Metal 后端）：** 用于构建原生 GGML 库的 CMake 3.20+ 与 Xcode 命令行工具；若需使用 MLX 后端，还需通过 `bash TensorSharp.Backends.MLX/build-native-macos.sh` 从 `TensorSharp.Backends.MLX/Native/` 构建 `libmlxc`
 - **Windows（GGML CPU / CUDA 后端）：** CMake 3.20+ 与 Visual Studio 2022 C++ 构建工具；若使用 `ggml_cuda` 或 `cuda`，还需要 NVIDIA 驱动和带 cuBLAS 的 CUDA Toolkit 12.x 或其他兼容版本

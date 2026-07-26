@@ -20,8 +20,22 @@
   <div class="callout note"><div class="ic">📘</div><p><strong>Following the Gemma 4 E4B path?</strong> <em>From Tensors to Tokens</em> turns this quick start into a guided, from-scratch explanation of the engine behind every step. <a href="book.html">Explore the TensorSharp book →</a></p></div>
 
   <h2 id="prerequisites">1 · Prerequisites</h2>
+  <h3 id="install-dotnet">Install the .NET 10 SDK</h3>
+  <p>TensorSharp targets <code>net10.0</code>, so a source build requires the full <strong>.NET 10 SDK</strong>—installing only the .NET Runtime or ASP.NET Core Runtime is not enough. The SDK includes the runtimes needed to run the CLI and server. Start with Microsoft's <a href="https://learn.microsoft.com/en-us/dotnet/core/install/" target="_blank" rel="noopener">cross-platform .NET installation guide</a>, then use the instructions for your operating system:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Platform</th><th>Install the SDK</th><th>Official instructions</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Windows</strong></td><td>Open PowerShell or Command Prompt and run <code>winget install Microsoft.DotNet.SDK.10</code>.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/windows" target="_blank" rel="noopener">Install .NET on Windows</a></td></tr>
+      <tr><td><strong>macOS</strong></td><td>Download the .NET 10 SDK installer for your processor: <strong>Arm64</strong> for Apple Silicon or <strong>x64</strong> for an Intel Mac.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/macos" target="_blank" rel="noopener">Install .NET on macOS</a></td></tr>
+      <tr><td><strong>Linux</strong></td><td>Follow the page for your distribution, configure its package feed if directed, and install <code>dotnet-sdk-10.0</code>. On Ubuntu, after completing the repository setup for your release: <code>sudo apt-get update</code>, then <code>sudo apt-get install -y dotnet-sdk-10.0</code>.</td><td><a href="https://learn.microsoft.com/en-us/dotnet/core/install/linux" target="_blank" rel="noopener">Choose a Linux distribution</a> (for example, <a href="https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install" target="_blank" rel="noopener">Ubuntu</a>)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Open a new terminal after installation and confirm that a <code>10.0.x</code> SDK is listed:</p>
+  <pre data-lang="bash"><code>dotnet --list-sdks</code></pre>
+  <h3>Other prerequisites</h3>
   <ul>
-    <li><a href="https://dotnet.microsoft.com/download/dotnet/10.0" target="_blank" rel="noopener"><strong>.NET 10 SDK</strong></a> — required.</li>
     <li><strong><code>git</code>, <code>curl</code>, and network access</strong> — used to clone TensorSharp and download a model. A full native build also clones <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml</a> into <code>ExternalProjects/ggml/</code>; set <code>TENSORSHARP_GGML_NO_UPDATE=1</code> to skip later network updates.</li>
     <li><strong>A GGUF model file</strong> — e.g. from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. See <a href="models.html#downloads">Model downloads</a>.</li>
   </ul>

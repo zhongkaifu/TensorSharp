@@ -20,6 +20,8 @@ TensorSharp 推理测试与基准矩阵运行器。它通过把 `TensorSharp.Cli
 
 ## 构建
 
+构建需要完整的 [.NET 10 SDK](../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)，不能只安装 Runtime。链接中的指南包含全新机器上的 Windows、macOS、Linux 安装方式与 SDK 验证步骤。
+
 ```bash
 dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
 dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release   # 必需：子进程驱动目标

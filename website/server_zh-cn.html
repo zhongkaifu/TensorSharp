@@ -20,7 +20,7 @@
 
   <h2 id="start">启动服务器</h2>
   <h3 id="e4b-fast-lane">约 30 秒快速开始（Gemma 4 E4B）</h3>
-  <p>安装 <a href="https://dotnet.microsoft.com/download/dotnet/10.0" target="_blank" rel="noopener">.NET 10 SDK</a>、Git、CMake 与 <code>curl</code>，然后在终端粘贴下面的命令。复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次还原/构建耗时更长，取决于网络速度与机器性能。它会通过原生 GGML 桥接托管仓库基准已验证的 Gemma 4 E4B Q8_0，使用推荐的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> 文件</a>。下面的代码块面向 Linux + NVIDIA（CUDA 构建还需要 CUDA Toolkit）：</p>
+  <p><a href="getting-started_zh-cn.html#install-dotnet">按平台安装 .NET 10 SDK</a>、Git、CMake 与 <code>curl</code>，然后在终端粘贴下面的命令。复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次还原/构建耗时更长，取决于网络速度与机器性能。它会通过原生 GGML 桥接托管仓库基准已验证的 Gemma 4 E4B Q8_0，使用推荐的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>ggml-org</code> 文件</a>。下面的代码块面向 Linux + NVIDIA（CUDA 构建还需要 CUDA Toolkit）：</p>
   <pre data-lang="bash"><code>git clone https://github.com/zhongkaifu/TensorSharp.git
 cd TensorSharp
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true

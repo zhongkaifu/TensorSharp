@@ -33,7 +33,7 @@ Start the server with the exact hosted model via `--model` and, when needed, the
 
 ### Quick start in ~30 seconds
 
-The verified fast path hosts Gemma 4 E4B Q8_0 on a native GGML backend. The commands below take about 30 seconds to copy and run; the 7.48 GiB model download and the first restore/build take longer and depend on the network connection and machine. Besides the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0), Git, and `curl`, this path needs the normal native GGML build prerequisites for the chosen backend. The model is the recommended public artifact from [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF); a lower-memory `gemma-4-E4B-it-Q4_K_M.gguf` is in the same repository. The copy/paste block below is for Linux + NVIDIA; platform-specific backend choices follow it:
+The verified fast path hosts Gemma 4 E4B Q8_0 on a native GGML backend. The commands below take about 30 seconds to copy and run; the 7.48 GiB model download and the first restore/build take longer and depend on the network connection and machine. Besides the [.NET 10 SDK](../DEVELOPMENT.md#install-the-net-10-sdk), Git, and `curl`, this path needs the normal native GGML build prerequisites for the chosen backend. On a new machine, use the linked Windows, macOS, or Linux SDK instructions first; the runtime alone cannot build TensorSharp. The model is the recommended public artifact from [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF); a lower-memory `gemma-4-E4B-it-Q4_K_M.gguf` is in the same repository. The copy/paste block below is for Linux + NVIDIA; platform-specific backend choices follow it:
 
 ```bash
 git clone https://github.com/zhongkaifu/TensorSharp.git

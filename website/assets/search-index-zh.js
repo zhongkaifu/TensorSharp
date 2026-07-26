@@ -18,7 +18,7 @@ window.SEARCH_INDEX_ZH = [
   { t: "功能目录", p: "功能特性", u: "features.html#catalog", s: "多架构、多模态、思考、工具调用、量化、连续批处理、推测解码。", k: "capabilities 能力 列表 全部" },
 
   { t: "快速开始", p: "快速上手", u: "getting-started.html", s: "环境要求、构建、下载模型，并运行 CLI 或服务器。", k: "install 安装 setup 开始" },
-  { t: "环境要求", p: "快速上手", u: "getting-started.html#prerequisites", s: ".NET 10 SDK 加 git/curl 与网络访问；CMake 与 GPU 工具链仅用于原生加速。", k: "requirements dotnet 10 cmake cuda xcode 依赖" },
+  { t: "安装 .NET 10 SDK", p: "快速上手", u: "getting-started.html#install-dotnet", s: "在 Windows、macOS 或对应 Linux 发行版上安装完整 SDK（不只是运行时），再用 dotnet --list-sdks 验证。", k: "requirements install 安装 setup dotnet 10 sdk runtime 运行时 windows winget macos arm64 x64 linux ubuntu apt 依赖" },
   { t: "选择构建路径", p: "快速上手", u: "getting-started.html#build", s: "纯托管 CPU 跳过 GGML/MLX 原生构建；完整构建会编译加速后端。", k: "compile 编译 make native ggml TensorSharpSkipGgmlNative TensorSharpSkipMlxNative" },
   { t: "下载 GGUF 模型", p: "快速上手", u: "getting-started.html#download", s: "下载推荐的公开 Gemma 4 E4B Q8_0 文件（7.48 GiB），或 ggml-org 仓库中更省内存的 Q4_K_M。", k: "huggingface 权重 gguf 量化 gemma e4b q8 q4_k_m" },
   { t: "Gemma 4 E4B 后端与平台说明", p: "快速上手", u: "getting-started.html#e4b-fast-lane", s: "PowerShell CUDA 设置，ggml_metal、ggml_vulkan 与 ggml_cpu 变体，以及可选的 mmproj 投影器。", k: "gemma4 e4b 配置 powershell gpu metal vulkan mmproj 投影器 多模态" },

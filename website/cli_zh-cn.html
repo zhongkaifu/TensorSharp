@@ -19,7 +19,7 @@
   <p class="lede"><code>TensorSharp.Cli</code> 是用于本地提示词、多模态实验、提示词检查、JSONL 批处理工作流、交互式 REPL 与内置基准测试的控制台宿主。构建后二进制位于 <code>TensorSharp.Cli/bin/...</code>。</p>
 
   <h2 id="quickstart">约 30 秒快速开始</h2>
-  <p>请在 TensorSharp 仓库根目录执行，并先安装 <strong>.NET 10 SDK</strong>。已验证的快速开始会构建原生 GGML 后端，并运行仓库基准已验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>gemma-4-E4B-it-Q8_0.gguf</code></a>（7.48 GiB）。复制并运行这些命令约需 30 秒；模型下载与首次 restore/构建耗时更长，取决于网络速度与机器性能。原生源码构建还需要 Git、网络访问、CMake 与可用的 C++ 工具链。</p>
+  <p>请在 TensorSharp 仓库根目录执行，并先<a href="getting-started_zh-cn.html#install-dotnet"><strong>按平台安装 .NET 10 SDK</strong></a>。已验证的快速开始会构建原生 GGML 后端，并运行仓库基准已验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener"><code>gemma-4-E4B-it-Q8_0.gguf</code></a>（7.48 GiB）。复制并运行这些命令约需 30 秒；模型下载与首次 restore/构建耗时更长，取决于网络速度与机器性能。原生源码构建还需要 Git、网络访问、CMake 与可用的 C++ 工具链。</p>
   <h3>Linux + NVIDIA</h3>
   <pre data-lang="bash"><code>TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
 curl --create-dirs --fail -L "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" -o models/gemma-4-E4B-it-Q8_0.gguf

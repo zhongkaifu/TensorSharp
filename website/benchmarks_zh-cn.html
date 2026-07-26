@@ -51,6 +51,7 @@
   <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
 
   <h2 id="testing">测试</h2>
+  <p>下方构建与测试命令需要<a href="getting-started_zh-cn.html#install-dotnet">按平台安装的 .NET 10 SDK</a>；运行命令前请先验证安装。</p>
   <h3>单元测试（xUnit）</h3>
   <p><code>InferenceWeb.Tests</code> 测试无需运行服务器的进程内行为：托管量化运算、直接 CUDA 与 MLX 后端内核（在硬件可用时）、分页 KV 调度、批量执行器正确性、各模型批量前向与 legacy 路径的一致性、MTP / NextN 推测解码正确性、DiffusionGemma 探针、编解码器往返、提示词渲染，以及服务器 CLI 选项构建器。</p>
   <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>

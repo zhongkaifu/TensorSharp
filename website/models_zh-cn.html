@@ -70,7 +70,7 @@
   <div class="callout note"><div class="ic">🧩</div><p>多模态模型需要<strong>投影器（mmproj）</strong>文件。请下载匹配文件并显式传入 <code>--mmproj</code>；服务端不会自动检测，CLI 也只识别少数旧文件名。</p></div>
 
   <h2 id="download-run">下载并运行</h2>
-  <p>第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行；先把问题写入 <code>prompt.txt</code>，并按硬件把 <code>ggml_cuda</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。</p>
+  <p>运行构建命令前，请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行；先把问题写入 <code>prompt.txt</code>，并按硬件把 <code>ggml_cuda</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。</p>
 
   <h3 id="gemma4-fast-lane">约 30 秒快速上手：Gemma 4 E4B Q8_0（原生 GGML）</h3>
   <p>复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络与机器。仓库基准已经验证 TensorSharp 的 E4B Q8_0 家族与执行路径；链接的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org 仓库</a>是推荐下载源。下面的代码块面向 Linux + NVIDIA：</p>
