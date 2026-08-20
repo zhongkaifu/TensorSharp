@@ -216,10 +216,16 @@ namespace TensorSharp.Models
                 return;
 
             IntPtr currentData = _data;
-            bool wasExternalView = !_ownsBuffer && _ownerToken != null;
+            // Page-out advice is only valid for views into the GgufFile mmap,
+            // where MADV_DONTNEED just drops clean file-backed pages. On views
+            // into another weight's heap buffer (per-expert views of a stacked
+            // 3D tensor, TP shard views) the same call ZEROES the anonymous
+            // pages in place — including malloc metadata of whatever else
+            // shares them — and the next free() aborts the process.
+            bool wasFileBackedView = !_ownsBuffer && _ownerToken is GgufFile;
             if (_ownsBuffer)
                 FreeBuffer(currentData);
-            else if (wasExternalView)
+            else if (wasFileBackedView)
                 AdviseExternalViewCanBePagedOut(currentData, RawBytes);
 
             if (CacheKey == currentData)
