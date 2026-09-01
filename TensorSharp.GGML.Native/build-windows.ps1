@@ -411,10 +411,12 @@ if ($EnableVulkan -eq "ON") {
         if ($LASTEXITCODE -ne 0) { throw "fetch-vulkan-toolchain.ps1 failed with exit code $LASTEXITCODE" }
 
         $VulkanSdk = $env:VULKAN_SDK
+        $VulkanSdkIncompatibleMarker = Join-Path $ScriptDir "..\ExternalProjects\vulkan-toolchain\vulkan-sdk-glslc-incompatible.marker"
         $HasFullSdk = -not [string]::IsNullOrWhiteSpace($VulkanSdk) -and
             (Test-Path (Join-Path $VulkanSdk "Include\vulkan\vulkan.h")) -and
             (Test-Path (Join-Path $VulkanSdk "Lib\vulkan-1.lib")) -and
-            (Test-Path (Join-Path $VulkanSdk "Bin\glslc.exe"))
+            (Test-Path (Join-Path $VulkanSdk "Bin\glslc.exe")) -and
+            -not (Test-Path $VulkanSdkIncompatibleMarker)
         if (-not $HasFullSdk) {
             $ToolchainDir = (Resolve-Path (Join-Path $ScriptDir "..\ExternalProjects\vulkan-toolchain")).Path
             $VulkanCMakeArgs.Add("-DVulkan_INCLUDE_DIR=$(Join-Path $ToolchainDir 'Vulkan-Headers\include')")
