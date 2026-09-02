@@ -283,6 +283,16 @@ public class SkillCrossPlatformTests : IDisposable
         Assert.Contains("--unshare-pid", arguments);
     }
 
+    /// <summary>
+    /// Quote a path for SBPL. A path is host-controlled rather than model-controlled
+    /// (it is the skill root the operator configured plus a GUID), but a stray quote
+    /// would silently truncate the profile and widen the sandbox, so it is escaped
+    /// rather than trusted.
+    /// </summary>
+    /// <remarks>This is the same function the private one in <see cref="SeatbeltSandbox"/></remarks>
+    private static string Quote(string path) =>
+        "\"" + path.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
     [Fact]
     public void ExactReadableFilesAndAdditionalWritableRoots_ArePinnedOnEveryPlatform()
     {
@@ -303,11 +313,11 @@ public class SkillCrossPlatformTests : IDisposable
         };
 
         string profile = SeatbeltSandbox.BuildProfile(request);
-        Assert.Contains("(allow file-read* (literal \"" + ca, profile, StringComparison.Ordinal);
-        Assert.Contains("(deny file-write* (literal \"" + ca, profile, StringComparison.Ordinal);
-        Assert.Contains("(allow file-read* file-write* (subpath \"" + state,
+        Assert.Contains("(allow file-read* (literal " + Quote(ca), profile, StringComparison.Ordinal);
+        Assert.Contains("(deny file-write* (literal " + Quote(ca), profile, StringComparison.Ordinal);
+        Assert.Contains("(allow file-read* file-write* (subpath " + Quote(state),
             profile, StringComparison.Ordinal);
-        Assert.Contains("(allow network-bind (local unix-socket (subpath \"" + state,
+        Assert.Contains("(allow network-bind (local unix-socket (subpath " + Quote(state),
             profile, StringComparison.Ordinal);
 
         IReadOnlyList<string> arguments = BubblewrapSandbox.BuildArguments(request);
