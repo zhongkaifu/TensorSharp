@@ -796,6 +796,24 @@ namespace TensorSharp.Runtime.Scheduling
                 ctx.BlockTables[s] = table;
             }
 
+            // Models read the batch's input tokens from OverrideFlatTokens.
+            // For prefill chunks this is exactly what seq.TokenAt(startTok + i)
+            // returns (BuildPrefillChunk reads the same positions), and for
+            // decode steps it carries the sampled token that has NOT been
+            // committed to the sequence's token list yet (the executor appends
+            // it only after ForwardBatch accepts the batch, so a decline can
+            // fall back to per-sequence without double-appending). Without the
+            // override, TokenAt throws ArgumentOutOfRangeException on decode.
+            var flatTokens = new int[ctx.QueryStartLoc[ctx.QueryStartLoc.Count - 1]];
+            int ft = 0;
+            for (int s = 0; s < numSeqs; s++)
+            {
+                var inputTokens = pendingTokens[s];
+                for (int i = 0; i < inputTokens.Length; i++)
+                    flatTokens[ft++] = inputTokens[i];
+            }
+            ctx.OverrideFlatTokens = flatTokens;
+
             // Dispatch the entire batch.
             var swForward = Stopwatch.StartNew();
             IReadOnlyList<float[]> perSeqLogits;
@@ -2751,9 +2769,13 @@ namespace TensorSharp.Runtime.Scheduling
         // ---- NextN/MTP speculative-trunk extensions ----
 
         /// <summary>When set, these tokens are forwarded instead of reading
-        /// <c>seq.TokenAt(...)</c>. Speculative verify batches forward drafted
+        /// <c>seq.TokenAt(...)</c>. The batched executor always sets this for
+        /// plain steps (its content is identical to what <c>TokenAt</c> would
+        /// return for prefill chunks, and it carries the sampled-but-not-yet-
+        /// committed decode tokens that are absent from the sequence's token
+        /// list), and speculative verify batches use it to forward drafted
         /// tokens that are not (yet) part of the sequence's token list.</summary>
-        public int[] OverrideFlatTokens { get; init; }
+        public int[] OverrideFlatTokens { get; set; }
 
         /// <summary>When non-null, receives the post-final-norm hidden state of
         /// every row (numTokens ├ù hidden floats) ÔÇö llama.cpp's h_nextn, consumed

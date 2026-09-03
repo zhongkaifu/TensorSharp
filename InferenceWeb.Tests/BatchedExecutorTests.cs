@@ -207,6 +207,41 @@ public class BatchedExecutorTests
     }
 
     [Fact]
+    public async Task BatchExecutor_BatchedDecode_DeliversSampledTokensNotYetInTokenList()
+    {
+        // Regression: the executor commits a decode step's sampled token to
+        // the sequence ONLY after ForwardBatch accepts the batch (so a decline
+        // can fall back to per-sequence without double-appending). The batched
+        // models read the batch's input tokens from OverrideFlatTokens and
+        // would otherwise call seq.TokenAt(NumComputedTokens), which throws
+        // ArgumentOutOfRangeException because the sampled token is not in the
+        // sequence's token list yet.
+        var model = new StatefulMigrationStubModel("fp-decode-override", peakToken: 7);
+        using var engine = new InferenceEngine(model, SmallConfig(), NullLogger.Instance);
+
+        var sequences = Enumerable.Range(0, 3)
+            .Select(i => new SequenceState($"override-{i}", Enumerable.Range(1, 4).ToList(),
+                maxNewTokens: 4, BlockSize, SamplingConfig.Greedy))
+            .ToList();
+        var handles = sequences.Select(seq => engine.SubmitRequest(seq)).ToList();
+
+        foreach (var handle in handles)
+        {
+            var completion = await handle.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(SequenceStatus.FinishedLengthCapped, completion.Status);
+            Assert.Equal(4, completion.OutputTokenCount);
+            Assert.Equal(Enumerable.Repeat(7, 4), handle.Sequence.OutputTokens);
+        }
+
+        Assert.True(model.DecodeRowsServedFromOverride > 0,
+            "ForwardBatch never received a decode row's sampled token via OverrideFlatTokens.");
+        Assert.True(model.DecodeRowsMissingOverride == 0,
+            "A decode row reached ForwardBatch without the sampled token (the pre-fix crash path).");
+        Assert.True(model.PagedHistoryValidationFailures == 0);
+        Assert.True(model.LinearForwardCalls == 0);
+    }
+
+    [Fact]
     public void BatchExecutor_BatchDeclineAfterLinearMigration_PreservesOwnerTail()
     {
         using var model = new StatefulMigrationStubModel(
@@ -834,6 +869,8 @@ public class BatchedExecutorTests
         public int SingletonBatchCalls { get; private set; }
         public int LinearForwardCalls { get; private set; }
         public int PagedHistoryValidationFailures { get; private set; }
+        public int DecodeRowsServedFromOverride { get; private set; }
+        public int DecodeRowsMissingOverride { get; private set; }
         public bool SawMigratedOwnerFallbackForward { get; private set; }
         public bool LostMigratedOwnerTail { get; private set; }
         public bool SawAcceptedMultiBatchAfterDecline { get; private set; }
@@ -939,6 +976,10 @@ public class BatchedExecutorTests
             else
                 _multiBatchCalls++;
 
+            int numTokens = 0;
+            for (int i = 0; i < ctx.NumScheduledTokens.Count; i++)
+                numTokens += ctx.NumScheduledTokens[i];
+
             ValidatePagedPrefixes(ctx);
 
             if (isMulti
@@ -973,10 +1014,28 @@ public class BatchedExecutorTests
                             history.Add(int.MinValue);
                     }
 
-                    int token = position < seq.NumTotalTokens
-                        ? seq.TokenAt(position)
-                        : _peak;
-                    history.Add(token);
+                    // Production batched models read the batch's input tokens
+                    // from OverrideFlatTokens: decode steps forward the
+                    // sampled-but-not-yet-committed token, which does not
+                    // exist in the sequence's token list yet (seq.TokenAt
+                    // would throw ArgumentOutOfRangeException). Tally how
+                    // decode rows are served so tests can assert the contract.
+                    if (ctx.OverrideFlatTokens != null)
+                    {
+                        if (ctx.OverrideFlatTokens.Length != numTokens)
+                            PagedHistoryValidationFailures++;
+                        if (position >= seq.NumTotalTokens)
+                            DecodeRowsServedFromOverride++;
+                        history.Add(ctx.OverrideFlatTokens[q]);
+                    }
+                    else
+                    {
+                        if (position >= seq.NumTotalTokens)
+                            DecodeRowsMissingOverride++;
+                        history.Add(position < seq.NumTotalTokens
+                            ? seq.TokenAt(position)
+                            : _peak);
+                    }
                 }
             }
 

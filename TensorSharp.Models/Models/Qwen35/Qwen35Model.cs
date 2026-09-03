@@ -5893,6 +5893,8 @@ namespace TensorSharp.Models
                     GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 else
                     AddmmQuantManaged(result, input, qw);
+                if (qw.Scale != 1.0f)
+                    Ops.Mul(result, result, qw.Scale); // NVFP4 scale2 sidecar
                 _linearTicks += Stopwatch.GetTimestamp() - t0;
                 return result;
             }

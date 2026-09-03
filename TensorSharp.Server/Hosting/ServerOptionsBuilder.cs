@@ -582,6 +582,7 @@ namespace TensorSharp.Server.Hosting
                     Environment.SetEnvironmentVariable("TS_DSV4_DSPARK", dsparkOpt);
                     Environment.SetEnvironmentVariable("TS_QWEN35_DFLASH", dsparkOpt);
                     Environment.SetEnvironmentVariable("TS_MUSE_GLIMMER_DFLASH", dsparkOpt);
+                    Environment.SetEnvironmentVariable("TS_NEMOTRON_DFLASH", dsparkOpt);
                     changed = true;
                 }
             }

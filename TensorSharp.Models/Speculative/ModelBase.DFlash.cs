@@ -117,7 +117,10 @@ namespace TensorSharp.Models
         private protected const int DfAttnConvProj = 12;
         private protected const int DfFfnConvBase = 13;
         private protected const int DfFfnConvProj = 14;
-        private protected const int DfLayerNameCount = 15;
+        // DSpark only (the Nemotron-3.5 attention-sink module); absent in a
+        // plain DFlash / DFlash2 file.
+        private protected const int DfAttnSinks = 15;
+        private protected const int DfLayerNameCount = 16;
 
         /// <summary>
         /// Default prompt-prefill chunk the speculative executor should use, and
@@ -199,6 +202,11 @@ namespace TensorSharp.Models
         private Tensor[] _dflashRingV;
         private int _dflashRingRows;
 
+        /// <summary>Reused [vocab] scratch for the DSpark Markov chain (one block
+        /// row at a time); kept across calls because a draft step allocates none
+        /// of the hot buffers.</summary>
+        private float[] _dflashMarkovScratch;
+
         /// <summary>True when a usable DFlash drafter is attached to this model.</summary>
         public bool HasDFlash => _hasDFlash;
 
@@ -242,6 +250,7 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException($"DFlash block_size {cfg.BlockSize} exceeds the ring ({cfg.RingRows} rows).");
 
             LoadDFlashDraftTensors(draft);
+            AttachDFlashSidecarScales();
 
             _dflash = cfg;
             _dflashLayerNames = new string[cfg.NumLayers][];
@@ -267,6 +276,7 @@ namespace TensorSharp.Models
                     names[DfFfnConvBase] = p + "ffn_conv_base";
                     names[DfFfnConvProj] = p + "ffn_conv_proj.weight";
                 }
+                names[DfAttnSinks] = p + "attn_sinks";
                 _dflashLayerNames[il] = names;
             }
 
@@ -321,7 +331,17 @@ namespace TensorSharp.Models
                 string name = DFlashConfig.WeightPrefix + info.Name;
                 long byteCount = draft.GetTensorByteCount(info);
 
-                if (IsQuantizedLinearWeight(info))
+                // F16/BF16 linears are NOT "quantized" for this path: the GGML
+                // AddmmQuant family only implements block-quant types, and
+                // silently returns a zeroed output for anything else - the
+                // drafter's BF16 attention weights ran "fine" while contributing
+                // nothing at all. Dequantizing to F32 here keeps every drafter
+                // weight on a matmul path that is actually implemented.
+                bool isQuant = IsQuantizedLinearWeight(info)
+                    && info.Type != GgmlTensorType.F16
+                    && info.Type != GgmlTensorType.BF16;
+
+                if (isQuant)
                 {
                     if (IsGgmlBackend)
                         EnsureQuantBackendAvailable();
@@ -344,11 +364,17 @@ namespace TensorSharp.Models
                     }
                     else
                     {
+                        // Dequant with the MANAGED converter, not the GGML-native
+                        // one: the drafter's BF16 linears are common (the
+                        // Nemotron DSpark export keeps its attention path BF16,
+                        // and this converter's own BF16 output routes here too),
+                        // and the native dequant silently skips BF16, leaving the
+                        // F32 tensor all zeros.
                         IntPtr tempPtr = QuantizedWeight.AllocateBuffer(byteCount);
                         try
                         {
                             draft.ReadTensorDataToNative(info, tempPtr, byteCount);
-                            NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
+                            TensorSharp.Models.ManagedQuantizedOps.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
                         }
                         finally
                         {
@@ -358,6 +384,39 @@ namespace TensorSharp.Models
                     _weights[name] = tensor;
                 }
             }
+        }
+
+        /// <summary>
+        /// Attaches the drafter's own NVFP4 (scale2) sidecars to its merged
+        /// QuantizedWeights, mirroring the trunk's
+        /// <see cref="AttachSidecarWeightScales"/> for the "dflash." prefix. The
+        /// Nemotron-3.5 DSpark drafter stores fc, its FFN blocks and the Markov w2
+        /// in NVFP4 with a 1-element "&lt;base&gt;.scale" sidecar each; leaving them
+        /// unattached would run the drafter with unscaled weights.
+        /// </summary>
+        private void AttachDFlashSidecarScales()
+        {
+            int attached = 0;
+            foreach (var kv in _quantWeights)
+            {
+                if (!kv.Key.StartsWith(DFlashConfig.WeightPrefix, StringComparison.Ordinal)
+                    || !kv.Key.EndsWith(".weight", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                string scaleKey = kv.Key.Substring(0, kv.Key.Length - ".weight".Length) + ".scale";
+                if (_weights.TryGetValue(scaleKey, out var st) && st.ElementCount() == 1)
+                {
+                    float v = st.GetElementsAsFloat(1)[0];
+                    if (v != 1.0f)
+                    {
+                        kv.Value.Scale = v;
+                        attached++;
+                    }
+                }
+            }
+            if (attached > 0)
+                Console.WriteLine($"  DFlash drafter: {attached} NVFP4 scale2 sidecars attached.");
         }
 
         /// <summary>True when <paramref name="name"/> resolves to something
@@ -425,6 +484,45 @@ namespace TensorSharp.Models
                 })
                 {
                     if (!HasDFlashLinear(s)) { missing = s; return false; }
+                }
+            }
+
+            if (_dflash.MarkovRank > 0)
+            {
+                // The DSpark Markov head: w1 embeds the previous draft token,
+                // w2 maps it to a full-vocab logit bias. Exactly one generation is
+                // valid on one drafter - a Markov file with a selector (or vice
+                // versa) describes an export no runtime can execute as trained.
+                if (_dflash.HasSelector)
+                {
+                    missing = "both a Markov head and a DFlash2 selector";
+                    return false;
+                }
+                if (!HasDFlashLinear(DFlashConfig.WeightPrefix + "markov_w1.weight"))
+                {
+                    missing = DFlashConfig.WeightPrefix + "markov_w1.weight";
+                    return false;
+                }
+                if (!HasDFlashLinear(DFlashConfig.WeightPrefix + "markov_w2.weight"))
+                {
+                    missing = DFlashConfig.WeightPrefix + "markov_w2.weight";
+                    return false;
+                }
+                if (_dflash.HasAttentionSinks)
+                {
+                    // Attention sinks are all-or-nothing per drafter: a file with
+                    // the layer-0 sink but no others would silently drop the bias
+                    // from the remaining layers.
+                    for (int il = 0; il < _dflash.NumLayers; il++)
+                    {
+                        string sink = _dflashLayerNames[il][DfAttnSinks];
+                        if (!_weights.TryGetValue(sink, out var sinkW)
+                            || sinkW.ElementCount() != _dflash.NumHeads)
+                        {
+                            missing = $"{sink} (expected one value per drafter head, {_dflash.NumHeads})";
+                            return false;
+                        }
+                    }
                 }
             }
 
@@ -548,7 +646,13 @@ namespace TensorSharp.Models
             // the reference's ring[start_pos % win] = kv(main_x).
             DFlashEncodeAndInject(hPrev, 0, 1, position - 1);
 
-            int b = Math.Min(_dflash.BlockSize, draftOut.Length + 1);
+            // A plain DFlash block needs one extra row for the anchor (row 0 is the
+            // anchor's own prediction and is discarded). A Markov drafter is the
+            // opposite: the anchor's row IS its first draft, so the block width
+            // equals the number of drafts.
+            int b = _dflash.MarkovRank > 0
+                ? Math.Min(_dflash.BlockSize, draftOut.Length)
+                : Math.Min(_dflash.BlockSize, draftOut.Length + 1);
             return DFlashDraftBlockCore(lastToken, position, b, draftOut, confOut);
         }
 
@@ -762,6 +866,13 @@ namespace TensorSharp.Models
             Tensor logits = LinearForward(cur, DFlashTargetOutputWeightName);
             cur.Dispose();
 
+            // DSpark: every row's logits get the Markov bias chained from the
+            // previous draft (row 0 seeds from the anchor) and each row becomes a
+            // draft; no row is discarded. The chain makes each position's token
+            // depend on the one before it, which is the whole point of the head.
+            if (cfg.MarkovRank > 0)
+                return DFlashMarkovBlock(logits, b, anchorToken, draftOut, confOut);
+
             // Softmax on the backend, then a max scan per row: argmax is invariant
             // under softmax, and the winning probability IS the confidence the
             // executor multiplies cumulatively (a zero there drafts nothing).
@@ -781,6 +892,128 @@ namespace TensorSharp.Models
             }
             logits.Dispose();
             return n;
+        }
+
+        /// <summary>
+        /// DSpark block selection: turns the block's raw LM-head rows into one
+        /// draft per position with the Markov head (llama.cpp's
+        /// build_dspark_markov_head, sglang's VanillaMarkov):
+        ///
+        ///     bias_i = w2 @ w1[prev_i]      prev_0 = anchor, prev_{i+1} = argmax(col_i)
+        ///     col_i  = base_i + bias_i      (or base_i unbiased when the anchor row
+        ///                                    is a sample_from_anchor=false "bonus")
+        ///     draft_i = argmax(col_i)
+        ///
+        /// The acceptance estimate of position i is the softmax probability of its
+        /// argmax over col_i (the file's confidence head is not exported; the
+        /// executor's cumulative gate consumes these exactly like plain DFlash's).
+        ///
+        /// Runs with the backend for the rank-wide matmul (w2 is NVFP4 in the
+        /// shipped drafter; per-token row adds and the argmax/softmax scan stay on
+        /// the host, same as the plain DFlash row scan).
+        /// </summary>
+        private unsafe int DFlashMarkovBlock(Tensor logits, int b, int anchorToken, int[] draftOut, float[] confOut)
+        {
+            var cfg = _dflash;
+            int vocab = Config.VocabSize;
+            int rank = cfg.MarkovRank;
+            string w1Key = DFlashConfig.WeightPrefix + "markov_w1.weight";
+            string w2Key = DFlashConfig.WeightPrefix + "markov_w2.weight";
+
+            // w1 doubles as the Markov embedding: the chain reads w1[prev] as a
+            // host row every step. The loader routes 2D "*.weight" tensors into
+            // the QuantizedWeight table regardless of dtype (BF16 here), which is
+            // right for matmul consumers but useless for row lookup, so the first
+            // use dequantizes it into a plain F32 host tensor. F32-stored files
+            // land in _weights directly and skip the dequant.
+            Tensor w1 = null;
+            if (!_weights.TryGetValue(w1Key, out w1) && _quantWeights.TryGetValue(w1Key, out var qw1))
+            {
+                long n = qw1.Ne0 * qw1.Ne1;
+                var t = new Tensor(_allocator, DType.Float32, qw1.Ne1, qw1.Ne0);
+                IntPtr destPtr = TensorComputePrimitives.GetStoragePointer(t);
+                NativeDequant.DequantizeToFloat32Native((int)qw1.GgmlType, qw1.Data, destPtr, n);
+                _weights[w1Key] = w1 = t;
+            }
+            if (w1 == null)
+            {
+                throw new InvalidOperationException(
+                    $"DFlash Markov head: neither _weights nor _quantWeights has '{w1Key}'.");
+            }
+            if (w1.ElementCount() != (long)vocab * rank)
+            {
+                throw new InvalidOperationException(
+                    $"DFlash markov_w1 is {w1.ElementCount()} elements, expected vocab {vocab} x rank {rank}.");
+            }
+            float* w1p = GetFloatPtr(w1);
+            float* lp = GetFloatPtr(logits);
+            if (_dflashMarkovScratch == null || _dflashMarkovScratch.Length < vocab)
+                _dflashMarkovScratch = new float[vocab];
+            float[] col = _dflashMarkovScratch;
+
+            int prev = anchorToken < 0 ? 0 : anchorToken;
+            var prevEmb = new Tensor(_allocator, DType.Float32, 1, rank);
+            float* pep = GetFloatPtr(prevEmb);
+            try
+            {
+                for (int i = 0; i < b; i++)
+                {
+                    float* row = lp + (long)i * vocab;
+                    bool biased = cfg.SampleFromAnchor || i > 0;
+                    if (biased)
+                    {
+                        // prevEmb = w1[prev] (the last draft token's embedding).
+                        Buffer.MemoryCopy(w1p + (long)prev * rank, pep, (long)rank * 4, (long)rank * 4);
+                        InvalidateTensorDeviceCache(prevEmb);
+
+                        using (Tensor biasT = LinearForward(prevEmb, w2Key))
+                        {
+                            // bias = w2 @ w1[prev] + then col = base row + bias.
+                            float* bias = GetFloatPtr(biasT);
+                            for (int c = 0; c < vocab; c++)
+                                col[c] = row[c] + bias[c];
+                        }
+                    }
+                    else
+                    {
+                        // sample_from_anchor=false: row 0 is the bonus anchor, its
+                        // own (unbiased) prediction, and the chain starts from the
+                        // anchor token again for row 1 (llama.cpp leaves prev alone
+                        // for the bonus row).
+                        fixed (float* colp = col)
+                            Buffer.MemoryCopy(row, colp, (long)vocab * 4, (long)vocab * 4);
+                    }
+
+                    int best = 0;
+                    float bestVal = col[0];
+                    for (int c = 1; c < vocab; c++)
+                    {
+                        if (col[c] > bestVal)
+                        {
+                            bestVal = col[c];
+                            best = c;
+                        }
+                    }
+
+                    // Softmax probability of the winner: exp(col[best] - max) / sum.
+                    double sum = 0.0;
+                    for (int c = 0; c < vocab; c++)
+                        sum += Math.Exp(col[c] - bestVal);
+
+                    draftOut[i] = best;
+                    if (confOut != null && i < confOut.Length)
+                        confOut[i] = (float)(1.0 / sum);
+
+                    if (biased && i + 1 < b)
+                        prev = best;
+                }
+            }
+            finally
+            {
+                prevEmb.Dispose();
+                logits.Dispose();
+            }
+            return b;
         }
 
         private static unsafe int DFlashArgmaxRow(float* row, int n, out float best)
@@ -863,6 +1096,8 @@ namespace TensorSharp.Models
 
             DFlashApplyWindowMask(scores, b, groupSize, kvHeads, w, total, position, winStart);
             Ops.Softmax(scores, scores);
+            if (cfg.HasAttentionSinks)
+                DFlashApplyAttentionSinks(scores, il, b, groupSize, kvHeads, total);
 
             var attnGrouped = new Tensor(_allocator, DType.Float32, kvHeads, (long)groupSize * b, hd);
             Ops.AddmmBatch(attnGrouped, 0, attnGrouped, 1f, scores, gv);
@@ -915,6 +1150,43 @@ namespace TensorSharp.Models
                     int width = widths[j % b];
                     if (width > 0)
                         new Span<float>(groupScores + (long)j * total, width).Fill(float.NegativeInfinity);
+                }
+            }
+            InvalidateTensorDeviceCache(scores);
+        }
+
+        /// <summary>
+        /// Adds the drafter's per-head attention-sink bias to the normalized
+        /// attention weights, mirroring llama.cpp's build_attn (the sink lands on
+        /// the POST-softmax scores, a fixed attention-mass floor per head). The
+        /// sink is keyed on the QUERY head there, so query row (g, j) of the
+        /// grouped scores -- head g*groupSize + j/b, block slot j % b -- gets
+        /// sink[head] added to every key column.
+        /// </summary>
+        private unsafe void DFlashApplyAttentionSinks(Tensor scores, int il, int b, int groupSize, int kvHeads, int total)
+        {
+            Tensor sinkW = _weights[_dflashLayerNames[il][DfAttnSinks]];
+            if (sinkW.ElementCount() != (long)kvHeads * groupSize)
+            {
+                throw new InvalidOperationException(
+                    $"DFlash attn_sinks of draft layer {il} has {sinkW.ElementCount()} values "
+                    + $"for {kvHeads * groupSize} heads; refusing to run a half-wired sink.");
+            }
+
+            float* sp = GetFloatPtr(scores);
+            float* sink = GetFloatPtr(sinkW);
+            int rowsPerGroup = groupSize * b;
+            for (int g = 0; g < kvHeads; g++)
+            {
+                float* groupScores = sp + (long)g * rowsPerGroup * total;
+                for (int j = 0; j < rowsPerGroup; j++)
+                {
+                    float s = sink[g * groupSize + j / b];
+                    if (s == 0f)
+                        continue;
+                    float* row = groupScores + (long)j * total;
+                    for (int c = 0; c < total; c++)
+                        row[c] += s;
                 }
             }
             InvalidateTensorDeviceCache(scores);

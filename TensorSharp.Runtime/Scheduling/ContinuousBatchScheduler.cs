@@ -480,7 +480,22 @@ namespace TensorSharp.Runtime.Scheduling
             if (!_requiresPerBlockCapture || want <= 0)
                 return want;
 
-            int end = seq.NumComputedTokens + want;
+            int start = seq.NumComputedTokens;
+            int end = start + want;
+
+            // An explicit client breakpoint (cache_control / prompt_cache_breakpoint)
+            // caps both registration and adoption at its block boundary. For a
+            // recurrent model the blocks inside a fused round are non-restorable
+            // (they carry the round-end state), so without a real checkpoint at the
+            // marker the marked prefix stays in the index but is never adoptable -
+            // every follow-up request matches it and re-prefills it. Snap the round
+            // so it ends exactly at the last block boundary the breakpoint admits;
+            // the capture then records a genuine checkpoint there and the marked
+            // prefix becomes fully restorable.
+            int markerBoundary = (seq.CacheBreakpointLimit / _cfg.BlockSize) * _cfg.BlockSize;
+            if (markerBoundary > start && markerBoundary < end)
+                return markerBoundary - start;
+
             int tail = end % _cfg.BlockSize;
             bool reachesPromptEnd = want >= promptUncomputed;
             if (reachesPromptEnd && tail == 0)

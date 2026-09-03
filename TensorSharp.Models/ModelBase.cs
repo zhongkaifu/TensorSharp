@@ -1294,6 +1294,12 @@ namespace TensorSharp.Models
                     GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 else
                     AddmmQuantManaged(result, input, qw);
+                // NVFP4 scale2 sidecar ("<base>.scale"): the true weight is
+                // (quantized blocks) x Scale, so the projection output is scaled
+                // here, once, for every consumer that runs through the generic
+                // linear path (the DFlash drafter's NVFP4 weights included).
+                if (qw.Scale != 1.0f)
+                    Ops.Mul(result, result, qw.Scale);
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {

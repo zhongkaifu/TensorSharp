@@ -58,6 +58,10 @@ namespace TensorSharp.Models
         private int[] _layerNumHeads;
         private int[] _layerNumKVHeads;
 
+        /// <summary>Optional DFlash/DSpark drafter GGUF named at construction
+        /// (<c>--draft-model</c>), resolved after the trunk caches exist.</summary>
+        private string _draftModelPath;
+
         // Attention KV cache (only for attention layers)
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
@@ -301,9 +305,11 @@ namespace TensorSharp.Models
             }
         }
 
-        public NemotronModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
+        public NemotronModel(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            string draftModelPath = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
+            _draftModelPath = draftModelPath;
             string arch = _gguf.GetString("general.architecture") ?? "nemotron_h";
             Config = new ModelConfig { Architecture = arch };
             ParseBaseConfig();
@@ -563,6 +569,8 @@ namespace TensorSharp.Models
                 }
             }
             _cacheSeqLen = 0;
+
+            TryLoadNemotronDFlash(_draftModelPath);
         }
 
         // Set when the device-side decode attention (TryFlashAttnDecodeGgml) has
@@ -1245,6 +1253,8 @@ namespace TensorSharp.Models
                 int outDim = (int)qw.Ne1;
                 var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
                 AddmmQuantManaged(result, input, qw);
+                if (qw.Scale != 1.0f)
+                    Ops.Mul(result, result, qw.Scale); // NVFP4 scale2 sidecar
                 _linearTicks += Stopwatch.GetTimestamp() - t0;
                 return result;
             }
@@ -1262,6 +1272,8 @@ namespace TensorSharp.Models
             int outDim = (int)qw.Ne1;
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
             AddmmQuantManaged(result, input, qw);
+            if (qw.Scale != 1.0f)
+                Ops.Mul(result, result, qw.Scale); // NVFP4 scale2 sidecar
             _linearTicks += Stopwatch.GetTimestamp() - t0;
             return result;
         }
@@ -1280,6 +1292,8 @@ namespace TensorSharp.Models
                     GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
                 else
                     AddmmQuantManaged(result, input, qw);
+                if (qw.Scale != 1.0f)
+                    Ops.Mul(result, result, qw.Scale); // NVFP4 scale2 sidecar
             }
             else if (_weights.TryGetValue(weightName, out var w))
             {

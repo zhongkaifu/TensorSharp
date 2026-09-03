@@ -66,16 +66,30 @@ namespace TensorSharp.Models
             for (int s = 0; s < numSeqs; s++)
                 seqLens[s] = ctx.Sequences[s].NumComputedTokens + ctx.NumScheduledTokens[s];
 
-            // Concatenate input tokens.
-            int[] flatTokens = new int[numTokens];
-            int cursor = 0;
-            for (int s = 0; s < numSeqs; s++)
+            // Concatenate input tokens. The executor passes the batch's input
+            // tokens explicitly: decode steps forward the sampled-but-not-yet-
+            // committed token, which is absent from the sequence's token list
+            // (TokenAt would throw).
+            int[] flatTokens;
+            if (ctx.OverrideFlatTokens != null)
             {
-                var seq = ctx.Sequences[s];
-                int startTok = seq.NumComputedTokens;
-                int take = ctx.NumScheduledTokens[s];
-                for (int i = 0; i < take; i++)
-                    flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                if (ctx.OverrideFlatTokens.Length != numTokens)
+                    throw new ArgumentException(
+                        $"OverrideFlatTokens length {ctx.OverrideFlatTokens.Length} != numTokens {numTokens}.");
+                flatTokens = ctx.OverrideFlatTokens;
+            }
+            else
+            {
+                flatTokens = new int[numTokens];
+                int cursor = 0;
+                for (int s = 0; s < numSeqs; s++)
+                {
+                    var seq = ctx.Sequences[s];
+                    int startTok = seq.NumComputedTokens;
+                    int take = ctx.NumScheduledTokens[s];
+                    for (int i = 0; i < take; i++)
+                        flatTokens[cursor++] = seq.TokenAt(startTok + i);
+                }
             }
 
             // Embed + vision injection on rank 0, then broadcast.

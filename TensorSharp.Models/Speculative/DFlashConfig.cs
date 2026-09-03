@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Linq;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
@@ -154,6 +155,30 @@ namespace TensorSharp.Models
         /// candidate-selector lattice instead of a per-position argmax.</summary>
         public bool HasSelector => SelectorRank > 0 && SelectorTopK > 0;
 
+        /// <summary>dflash.markov_rank: width of the DSpark Markov head (w1 rows /
+        /// w2 columns) that conditions every draft position on the one before it,
+        /// like the DSV4 DSpark head. 0 = no Markov head (a plain DFlash / DFlash2
+        /// drafter). The Nemotron-3.5 DSpark drafter ships rank 512; llama.cpp
+        /// derives it from the markov_w1.weight tensor shape rather than a key,
+        /// which is why the shipped GGUF carries no dflash.markov_rank.</summary>
+        public int MarkovRank { get; private set; }
+
+        /// <summary>dflash.sample_from_anchor: true when EVERY block row (the
+        /// anchor's own prediction included) is a draft and gets the Markov bias
+        /// chained from the anchor; false when the anchor row is a "bonus" that
+        /// passes through unbiased and drafting starts at row 1. llama.cpp treats a
+        /// MISSING key as true; the key itself then means "the anchor's own row is
+        /// a full draft, Markov bias included", which is how the reference runtimes
+        /// drive the Nemotron-3.5 module (the checkpoint's own config field of the
+        /// same name is about sampling, not drafting, and is not exported).</summary>
+        public bool SampleFromAnchor { get; private set; } = true;
+
+        /// <summary>True when this drafter carries a per-head attention-sink bias
+        /// (blk.N.attn_sinks, e.g. the Nemotron-3.5 DSpark module). The sink is a
+        /// per-head constant added to the normalized attention weights, giving the
+        /// head a fixed attention-mass floor.</summary>
+        public bool HasAttentionSinks { get; private set; }
+
         /// <summary>
         /// dflash.logit_scale: the multiplier the TARGET applies to its LM-head
         /// output. Only the DFlash2 selector needs it, and it needs it badly: the
@@ -187,10 +212,12 @@ namespace TensorSharp.Models
         /// ISpeculativeModel.SpecFeatureSize.</summary>
         public int FeatureSize => TargetLayerIds.Length * HiddenSize;
 
-        /// <summary>Tokens a block actually proposes: the block is
-        /// [anchor, MASK x (BlockSize-1)] and row 0 (the anchor's own prediction)
-        /// is discarded by plain DFlash.</summary>
-        public int MaxDraftTokens => BlockSize - 1;
+        /// <summary>Tokens a block actually proposes. Plain DFlash / DFlash2:
+        /// the block is [anchor, MASK x (BlockSize-1)] and row 0 (the anchor's own
+        /// prediction) is discarded. A DSpark (Markov-head) drafter is the
+        /// opposite: row 0 IS the anchor's own prediction through the block and
+        /// every row is a draft, so the whole block width is usable.</summary>
+        public int MaxDraftTokens => MarkovRank > 0 ? BlockSize : BlockSize - 1;
 
         /// <summary>Rows of the drafter's KV ring: the SWA span plus one whole
         /// block plus the anchor, rounded up to 32 so a wrapped write never aliases
@@ -233,7 +260,11 @@ namespace TensorSharp.Models
                 Eps = gguf.GetFloat32($"{ArchName}.attention.layer_norm_rms_epsilon", 1e-5f),
                 BlockSize = (int)gguf.GetUint32($"{ArchName}.block_size"),
                 TargetLayerIds = gguf.GetInt32Array($"{ArchName}.target_layers") ?? Array.Empty<int>(),
-                SlidingWindow = (int)gguf.GetUint32($"{ArchName}.attention.sliding_window"),
+                // DSpark files (llama.cpp's export of the Nemotron-3.5 DSpark
+                // module) omit these keys entirely: the drafter is SWA-1024 with
+                // every layer sliding. SlidingWindow is resolved below once the
+                // Markov head (the DSpark discriminator) is known.
+                SlidingWindow = (int)gguf.GetUint32($"{ArchName}.attention.sliding_window", 0),
                 SwaPattern = gguf.GetBoolArray($"{ArchName}.attention.sliding_window_pattern") ?? Array.Empty<bool>(),
                 // A missing key yields uint.MaxValue, which casts to -1 and is
                 // rejected by ValidateSelfConsistent below.
@@ -247,6 +278,29 @@ namespace TensorSharp.Models
                 LogitScale = gguf.GetFloat32($"{ArchName}.logit_scale", 1f),
                 FinalLogitSoftcap = gguf.GetFloat32($"{ArchName}.final_logit_softcapping", 0f),
             };
+
+            // DSpark Markov head. The GGUF carries no dflash.markov_rank key
+            // (llama.cpp derives the rank from the markov_w1.weight shape) and its
+            // TENSOR names are bare ("markov_w1.weight") - the "dflash." prefix is
+            // applied when the loader merges them into the weight dictionaries, so
+            // the probes below look at the raw file, not the merged names.
+            if (gguf.Tensors.TryGetValue("markov_w1.weight", out var markovW1))
+                cfg.MarkovRank = (int)markovW1.Shape[0];
+            string sampleAnchor = gguf.GetString($"{ArchName}.sample_from_anchor");
+            cfg.SampleFromAnchor = sampleAnchor == null
+                || string.Equals(sampleAnchor.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+            cfg.HasAttentionSinks = gguf.Tensors.ContainsKey("blk.0.attn_sinks");
+            if (cfg.MarkovRank > 0 && cfg.SlidingWindow == 0)
+            {
+                // DSpark convention: the Nemotron-3.5 module trains with a 1024-token
+                // sliding window and the export omits the key. The mask is a no-op
+                // until the context passes 1024 tokens, so a wrong default is
+                // low-stakes, but matching the trained window is the faithful choice.
+                cfg.SlidingWindow = 1024;
+                Console.WriteLine("  DFlash: dflash.attention.sliding_window missing; defaulting to 1024 (DSpark convention).");
+            }
+            if (cfg.SwaPattern.Length == 0)
+                cfg.SwaPattern = Enumerable.Repeat(true, cfg.NumLayers).ToArray();
 
             cfg.ApplyDiagnosticOverrides();
             cfg.ValidateSelfConsistent();
@@ -357,10 +411,12 @@ namespace TensorSharp.Models
         }
 
         public override string ToString()
-            => $"{(IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
+            => $"{(MarkovRank > 0 ? "dspark" : IsDFlash2 ? "dflash2" : "dflash")}(layers={NumLayers}, hidden={HiddenSize}, " +
                $"ffn={IntermediateSize}, heads={NumHeads}/{NumKVHeads}x{HeadDim}, " +
                $"block={BlockSize}, drafts={MaxDraftTokens}, swa={SlidingWindow}, ring={RingRows}, " +
                $"targets=[{string.Join(",", TargetLayerIds)}], feature={FeatureSize}, mask={MaskTokenId}" +
+               (MarkovRank > 0 ? $", markov=r{MarkovRank}{(SampleFromAnchor ? "" : ", bonus-anchor")}" : string.Empty) +
+               (HasAttentionSinks ? ", attn-sinks" : string.Empty) +
                (HasConv ? $", conv={ConvKernelSize}x{ConvGroupSize}({ConvNumGroups}g)" : string.Empty) +
                (HasSelector ? $", selector=r{SelectorRank}/k{SelectorTopK}" : string.Empty) +
                (LogitScale != 1f ? $", logit_scale={LogitScale:G6}" : string.Empty) +

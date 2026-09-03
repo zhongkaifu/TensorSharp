@@ -424,9 +424,12 @@ namespace TensorSharp.Models
             // whole hybrid transformer as ONE batched graph (weights read once,
             // amortized across the batch) instead of the op-by-op layer loop below.
             // Declines (returns null) for prefill chunks, multimodal, spec capture,
-            // or any unsupported shape; the op-by-op loop then runs.
-            bool allDecodeBatch = ctx.OverrideFlatTokens == null
-                && ctx.CaptureHiddenAll == null && ctx.CaptureLogitsAll == null
+            // or any unsupported shape; the op-by-op loop then runs. Plain decode
+            // batches legitimately carry OverrideFlatTokens (the executor passes
+            // the sampled-but-uncommitted input tokens), so that is NOT a signal
+            // that this is a speculative verify batch — those are excluded by the
+            // capture fields below and by the per-sequence token-count check.
+            bool allDecodeBatch = ctx.CaptureHiddenAll == null && ctx.CaptureLogitsAll == null
                 && !anyMultimodal && IsBatchedFusedEnabled() && _backend == BackendType.GgmlCuda;
             if (allDecodeBatch)
                 for (int s = 0; s < numSeqs; s++)

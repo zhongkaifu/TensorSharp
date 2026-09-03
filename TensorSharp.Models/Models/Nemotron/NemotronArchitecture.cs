@@ -16,7 +16,7 @@ namespace TensorSharp.Models
             Id = "nemotron_h",
             DisplayName = "Nemotron-H",
             Aliases = new[] { "nemotron_h", "nemotron_h_moe", "nemotron_h_omni" },
-            Factory = c => new NemotronModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup),
+            Factory = c => new NemotronModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
             ProjectorFileHints = new[] { "*Nemotron*mmproj*.gguf", "*mmproj*Nemotron*.gguf" },
         };
     }

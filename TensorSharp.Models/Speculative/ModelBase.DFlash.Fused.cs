@@ -389,6 +389,13 @@ namespace TensorSharp.Models
                 return -1;
 
             var cfg = _dflash;
+
+            // The fused graph has no Markov-head or attention-sink arms; the
+            // per-op block draft covers both (their presence also changes the
+            // draft count, see DFlashMarkovBlock).
+            if (cfg.MarkovRank > 0 || cfg.HasAttentionSinks)
+                return -1;
+
             if (_dflashDraftIds == null || _dflashDraftIds.Length < b)
             {
                 _dflashDraftIds = new int[b];
