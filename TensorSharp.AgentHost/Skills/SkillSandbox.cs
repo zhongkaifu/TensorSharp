@@ -215,15 +215,38 @@ namespace TensorSharp.AgentHost.Skills
         {
             ISkillSandbox? sandbox = Detect();
             if (sandbox == null)
-                return OperatingSystem.IsLinux()
-                    ? "no safe OS sandbox available: " + BubblewrapSandbox.AvailabilityError
-                    : "no OS sandbox available on this platform";
+                return NoSandboxSummary(
+                    OperatingSystem.IsLinux() ? BubblewrapSandbox.AvailabilityError : string.Empty);
 
             IReadOnlyList<string> gaps = sandbox.Capabilities.Gaps();
             return gaps.Count == 0
                 ? $"{sandbox.Name}: {sandbox.Describe()}"
                 : $"{sandbox.Name}: {sandbox.Describe()}. NOT confined: {string.Join("; ", gaps)}";
         }
+
+        /// <summary>
+        /// The "nothing on this host can confine a child process" line. It always
+        /// carries the literal phrase <c>no OS sandbox</c> — the phrase the shell tool
+        /// and the skill runner also use, and the one an operator greps their logs for —
+        /// and names <paramref name="reason"/> whenever the host can say why.
+        ///
+        /// <para>
+        /// Split out of <see cref="DescribeHost"/> because each branch is reachable only
+        /// on one shape of host: the Linux wording can be edited on Windows or macOS
+        /// with nothing there to run it, which is how <c>"no safe OS sandbox available"</c>
+        /// shipped and broke the test that pins this phrase on a Linux box with no
+        /// bubblewrap. Here it is pinned by value on every platform. The distinction the
+        /// dropped adjective was reaching for survives in the reason: an unusably old
+        /// bubblewrap names its version, an absent one says it is not installed, and
+        /// those are different jobs to fix.
+        /// </para>
+        /// </summary>
+        /// <param name="reason">Why nothing is confining this host, or empty when there
+        /// is nothing to add beyond the platform having no mechanism at all.</param>
+        internal static string NoSandboxSummary(string reason) =>
+            string.IsNullOrWhiteSpace(reason)
+                ? "no OS sandbox available on this platform"
+                : "no OS sandbox available: " + reason;
     }
 
     /// <summary>
@@ -539,8 +562,16 @@ namespace TensorSharp.AgentHost.Skills
         /// (it is the skill root the operator configured plus a GUID), but a stray quote
         /// would silently truncate the profile and widen the sandbox, so it is escaped
         /// rather than trusted.
+        ///
+        /// <para>
+        /// Internal rather than private so a test can build the rule it expects with the
+        /// SAME escaping the profile was written with. A test that spelled the path out
+        /// raw matched on every platform whose separator is not itself the escape
+        /// character, and only on the one where it is did the expectation and the
+        /// profile disagree.
+        /// </para>
         /// </summary>
-        private static string Quote(string path) =>
+        internal static string Quote(string path) =>
             "\"" + path.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 
         private sealed class NullCleanup : IDisposable

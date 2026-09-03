@@ -268,10 +268,27 @@ public class SpawnedProcessTests
                 : null;
             if (setsid == null)
                 return;
-            command = setsid + " sleep 30 & echo child:$!; echo done";
+
+            // The escape is ASYNCHRONOUS, and the shell must outlive it. `sh -c` runs
+            // without job control, so the background job is forked INTO the launch group
+            // and only leaves it once it has exec'd setsid(1) and that has called
+            // setsid(2) — while StartReaper SIGKILLs the whole launch group the instant
+            // this shell exits. Written as `setsid sleep 30 & echo done`, the two race,
+            // and on a host where the reaper wins the grandchild dies, both pipes reach
+            // EOF, and the drain "succeeds" for a reason that has nothing to do with what
+            // is being tested. That is not hypothetical: it is why this test failed on
+            // Linux CI and passed locally.
+            //
+            // `sleep 1` is a FOREGROUND child, so the shell blocks on it for about a
+            // second — three orders of magnitude longer than execve + ld.so + setsid(2).
+            // `$$` inside the setsid'd sh is its post-setsid pid and `exec` keeps it, so
+            // the pid reported is the process that actually holds the pipe.
+            command = setsid + " /bin/sh -c 'echo child:$$; exec sleep 30' & sleep 1; echo done";
         }
         else if (OperatingSystem.IsMacOS())
         {
+            // Job control puts the job in its own group in the PARENT before it runs, so
+            // there is no window for the reaper here.
             command = "set -m; sleep 30 & echo child:$!; echo done";
         }
         else
@@ -280,20 +297,29 @@ public class SpawnedProcessTests
         }
 
         var lines = new ConcurrentQueue<string>();
+        var errors = new ConcurrentQueue<string>();
         Assert.True(
             SpawnedProcess.TryStart(
                 Request("/bin/sh", new[] { "-c", command },
-                    onOut: lines.Enqueue),
+                    onOut: lines.Enqueue, onErr: errors.Enqueue),
                 out SpawnedProcess? p, out string error),
             error);
 
         int escaped = -1;
         try
         {
-            Assert.True(p!.WaitForExit(20_000), "the shell itself should exit immediately");
-            Assert.True(SpinWait.SpinUntil(() => lines.Count >= 2, 5000));
+            Assert.True(p!.WaitForExit(20_000), "the shell should exit once its foreground child returns");
+            Assert.True(SpinWait.SpinUntil(() => lines.Count >= 2, 5000), string.Join("; ", lines));
             string childLine = lines.Single(line => line.StartsWith("child:", StringComparison.Ordinal));
             Assert.True(int.TryParse(childLine.AsSpan("child:".Length), out escaped));
+
+            // Fail HERE, naming the real cause, if the escape never happened. A child
+            // that lost the race or failed to exec otherwise surfaces as "the pipe cannot
+            // be at EOF", which points at the drain instead of at the child.
+            Assert.True(
+                PosixSpawn.kill(escaped, 0) == 0,
+                $"the escaped child {escaped} was already dead before the drain check; "
+                + $"stderr: {string.Join("; ", errors)}");
 
             var sw = Stopwatch.StartNew();
             bool drained = p.WaitForDrain(500);

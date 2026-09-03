@@ -309,6 +309,26 @@ public class SkillSandboxTests : IDisposable
     }
 
     [Fact]
+    public void TheNoSandboxSummary_CarriesTheGreppablePhrase_OnEveryPlatform()
+    {
+        // DescribeHost's no-sandbox branch runs only on a host that HAS no sandbox, so
+        // its wording goes unexercised everywhere else — which is how the Linux spelling
+        // drifted to "no SAFE OS sandbox available" without any test noticing, and why
+        // the test above passed on macOS and on Linux-with-bubblewrap while failing on
+        // the one host shape it describes. Both spellings are pinned by value here,
+        // where every platform runs them.
+        Assert.Equal(
+            "no OS sandbox available on this platform",
+            SkillSandboxFactory.NoSandboxSummary(string.Empty));
+        Assert.Equal(
+            "no OS sandbox available: bwrap (bubblewrap) is not installed on this host",
+            SkillSandboxFactory.NoSandboxSummary("bwrap (bubblewrap) is not installed on this host"));
+        // A reason must never replace the phrase, only follow it.
+        Assert.StartsWith(
+            "no OS sandbox", SkillSandboxFactory.NoSandboxSummary("anything"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ADetectedSandbox_DescribesWhatItActuallyEnforces()
     {
         ISkillSandbox? sandbox = SkillSandboxFactory.Detect();
