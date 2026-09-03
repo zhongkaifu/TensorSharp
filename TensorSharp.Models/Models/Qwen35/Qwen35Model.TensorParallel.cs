@@ -548,10 +548,12 @@ namespace TensorSharp.Models
                         }
                         qShards[r] = new QuantizedWeight(shardPtr, totalBytes,
                             q8Type, hiddenSize, rowIndices.Length);
-                        // A per-tensor scale is shard-invariant: it does not depend on
-                        // the output row, and it distributes over the row-parallel
-                        // AllReduce, so every shard carries the parent's value.
-                        qShards[r].Scale = qw.Scale;
+                        // The shard keeps the default scale of 1.0. There is no parent
+                        // QuantizedWeight here - this branch runs on the F32 pack that
+                        // TryFuseWeightsToFloat32 built, and that already MULTIPLIED each
+                        // source's sidecar per-tensor scale into the rows it dequantized.
+                        // Carrying a scale again (as the quantized branch above rightly
+                        // does from its own parent) would apply it twice.
                     }
                     _tpQuantWeights[weightName] = qShards;
                     RecordTpWeightScale(weightName, qw);
