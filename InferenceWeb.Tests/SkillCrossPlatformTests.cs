@@ -303,11 +303,21 @@ public class SkillCrossPlatformTests : IDisposable
         };
 
         string profile = SeatbeltSandbox.BuildProfile(request);
-        Assert.Contains("(allow file-read* (literal \"" + ca, profile, StringComparison.Ordinal);
-        Assert.Contains("(deny file-write* (literal \"" + ca, profile, StringComparison.Ordinal);
-        Assert.Contains("(allow file-read* file-write* (subpath \"" + state,
+        // Every path reaches the profile through SeatbeltSandbox.Quote, which doubles
+        // backslashes — so the raw host spelling of a Windows path never appears in it,
+        // and an assertion written against that spelling failed there while passing on
+        // every platform whose separator is not itself the escape character. Build the
+        // expected rule with the production quoter, and pin the WHOLE rule, closing
+        // parens included, so a truncated tail cannot satisfy Contains either. The
+        // quoting itself is pinned by value in the next test, so the two cannot drift
+        // into agreeing about something wrong.
+        Assert.Contains("(allow file-read* (literal " + SeatbeltSandbox.Quote(ca) + "))",
             profile, StringComparison.Ordinal);
-        Assert.Contains("(allow network-bind (local unix-socket (subpath \"" + state,
+        Assert.Contains("(deny file-write* (literal " + SeatbeltSandbox.Quote(ca) + "))",
+            profile, StringComparison.Ordinal);
+        Assert.Contains("(allow file-read* file-write* (subpath " + SeatbeltSandbox.Quote(state) + "))",
+            profile, StringComparison.Ordinal);
+        Assert.Contains("(allow network-bind (local unix-socket (subpath " + SeatbeltSandbox.Quote(state) + ")))",
             profile, StringComparison.Ordinal);
 
         IReadOnlyList<string> arguments = BubblewrapSandbox.BuildArguments(request);
@@ -316,6 +326,22 @@ public class SkillCrossPlatformTests : IDisposable
         int chdir = arguments.ToList().IndexOf("--chdir");
         Assert.InRange(chdir, 0, arguments.Count - 2);
         Assert.Equal(skill, arguments[chdir + 1]);
+    }
+
+    [Fact]
+    public void SbplPathQuoting_EscapesBackslashesBeforeQuotes()
+    {
+        // A profile rule is a string literal: a backslash has to be doubled and an
+        // embedded quote escaped, or a path ends the literal early, truncates the
+        // profile and silently WIDENS the sandbox. Pinned by value because on Linux and
+        // macOS a real path contains neither character, so nothing else on those hosts
+        // exercises the escaping at all.
+        Assert.Equal("\"/tmp/plain\"", SeatbeltSandbox.Quote("/tmp/plain"));
+        Assert.Equal("\"C:\\\\x\\\\y\"", SeatbeltSandbox.Quote(@"C:\x\y"));
+        Assert.Equal("\"a\\\"b\"", SeatbeltSandbox.Quote("a\"b"));
+        // Order matters: escaping quotes FIRST would turn \" into \\" and re-open the
+        // literal. Only a path carrying both characters catches a swapped pair.
+        Assert.Equal("\"a\\\\b\\\"c\"", SeatbeltSandbox.Quote("a\\b\"c"));
     }
 
     [Fact]

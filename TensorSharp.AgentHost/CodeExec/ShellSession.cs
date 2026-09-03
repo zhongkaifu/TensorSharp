@@ -64,6 +64,13 @@ namespace TensorSharp.AgentHost.CodeExec
             _shell.Kind == ShellKind.PowerShell ? "env.txt" : "env.sh");
 
         /// <summary>
+        /// The same path, for a test that has to corrupt the saved environment on
+        /// purpose. Exposed rather than letting a test re-spell the leaf name, which
+        /// would quietly stop testing anything the day the name changed.
+        /// </summary>
+        internal string EnvironmentFilePath => EnvFile;
+
+        /// <summary>
         /// The directory the next command will start in — the work directory until
         /// something <c>cd</c>s, and whatever it left behind after that.
         /// </summary>
@@ -601,7 +608,12 @@ namespace TensorSharp.AgentHost.CodeExec
         /// <summary>Forget the working directory and the environment. Used by tests and by a reset.</summary>
         public void Reset()
         {
-            foreach (string file in new[] { CwdFile, EnvFile })
+            // The reset marker goes with the file it describes. Left behind, a later
+            // command reads it as "the environment you exported was thrown away" when
+            // nothing of the sort happened on that command. The Exists probe stays: on
+            // Windows a File.Delete of a path that is not there costs more than asking
+            // whether it is, and the marker is normally not there.
+            foreach (string file in new[] { CwdFile, EnvFile, EnvFile + ".reset" })
             {
                 try { if (File.Exists(file)) File.Delete(file); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }

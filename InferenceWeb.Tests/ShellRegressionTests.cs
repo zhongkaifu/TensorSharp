@@ -301,21 +301,83 @@ public class ShellRegressionTests : IDisposable
     }
 
     [Fact]
-    public void AnEnvironmentValueWithANewline_DoesNotBreakTheNextCommand()
+    public void AnEnvironmentValueWithANewline_LeavesTheValueWholeOrGone_NeverHalf()
     {
         if (!HaveShell) return;
 
-        // `export -p` emits a multi-line record for such a value; the save-side filter
-        // cut it in half and left a dangling quote, which under sh aborted every later
-        // command and under bash silently swallowed the rest of the file.
+        // Under sh/dash `export -p` emits a MULTI-LINE record for such a value; the
+        // save-side line filter dropped only the line that matched (`PATH=b'`), and the
+        // dangling quote left behind aborted every later command under sh and silently
+        // swallowed the rest of the file under bash.
+        //
+        // What the shell does with that value is NOT the same on every POSIX host, which
+        // is why this asserts the outcome rather than the repair: bash 4.4 and newer
+        // write the whole value on ONE line, ANSI-C quoted as $'a\nPATH=b' (also under
+        // --posix), so nothing is ever cut and nothing is ever reset there, while dash
+        // and older bash take the multi-line path and the saved environment is thrown
+        // away. Asserting "was reset" here therefore only passed on a POSIX host with no
+        // modern bash: it failed on this repo's own Linux CI. The reset itself is pinned
+        // deterministically by the next test.
+        //
+        // What must hold on EVERY host: the next command still runs, the value comes
+        // back whole or not at all but never half, and the record's second line never
+        // becomes PATH.
         _runner.Run(
             new ShellRequest("export NOTE=\"$(printf 'a\\nPATH=b')\"; echo ok"), _workspace);
+        CodeExecResult after = _runner.Run(new ShellRequest(
+            "echo still-working; n=\"${NOTE-MISSING}\"; "
+            + "case \"$n\" in MISSING|\"\") echo NOTE=gone ;; a) echo NOTE=half ;; "
+            + "*) if [ \"$n\" = \"$(printf 'a\\nPATH=b')\" ]; then echo NOTE=whole; "
+            + "else echo NOTE=other; fi ;; esac; "
+            + "case \"$PATH\" in b) echo PATH_B=yes ;; *) echo PATH_B=no ;; esac"), _workspace);
+
+        Assert.True(after.Ok, after.Content);
+        Assert.Contains("still-working", after.Content, StringComparison.Ordinal);
+        // The half of the record that survives the filter is `PATH=b`, so a filter that
+        // let it through would hand the next command a one-letter PATH.
+        Assert.Contains("PATH_B=no", after.Content, StringComparison.Ordinal);
+        // "NOTE=half" IS the original defect: the value cut at the newline.
+        Assert.DoesNotContain("NOTE=half", after.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("NOTE=other", after.Content, StringComparison.Ordinal);
+        Assert.True(
+            after.Content.Contains("NOTE=whole", StringComparison.Ordinal)
+            || after.Content.Contains("NOTE=gone", StringComparison.Ordinal),
+            after.Content);
+    }
+
+    [Fact]
+    public void ACorruptSavedEnvironment_IsResetAndSaidOutLoud()
+    {
+        if (!HaveShell) return;
+
+        // The repair path itself — the wrapper's trial source in a subshell — pinned
+        // without depending on how THIS host's shell happens to quote a newline. The
+        // seeded file is exactly what the sh/dash save-side filter used to leave behind:
+        // a record cut in half, with a dangling quote. Sourcing that fails on bash and
+        // on dash alike, so the reset fires on every POSIX host.
+        //
+        // Resetting silently would mean a variable the model exported two calls ago is
+        // simply gone, with no way to tell that from having mistyped the name, so the
+        // note is the contract here rather than an implementation detail.
+        _runner.Run(new ShellRequest("export KEEP=1; echo ok"), _workspace);
+
+        string envFile = _runner.SessionFor(_workspace).EnvironmentFilePath;
+        Assert.True(File.Exists(envFile), envFile);
+        string marker = envFile + ".reset";
+        if (File.Exists(marker)) File.Delete(marker);
+        File.WriteAllText(envFile, "export NOTE='a\n");
+
         CodeExecResult after = _runner.Run(new ShellRequest("echo still-working"), _workspace);
 
         Assert.True(after.Ok, after.Content);
         Assert.Contains("still-working", after.Content, StringComparison.Ordinal);
-        // And the reset is stated rather than left as a variable that quietly vanished.
         Assert.Contains("was reset", after.Content, StringComparison.Ordinal);
+
+        // Once, not on every later call: the unusable file is replaced, not left to fail
+        // again. (The same command's EXIT trap rewrites it from a fresh `export -p`, so
+        // there is nothing to assert about it being left empty.)
+        CodeExecResult third = _runner.Run(new ShellRequest("echo again"), _workspace);
+        Assert.DoesNotContain("was reset", third.Content, StringComparison.Ordinal);
     }
 
     [Fact]
