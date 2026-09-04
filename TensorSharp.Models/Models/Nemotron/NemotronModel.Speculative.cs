@@ -159,7 +159,19 @@ namespace TensorSharp.Models
             }
         }
 
-        public void SpecEnsureCapacity(int requiredSeqLen) => EnsureCacheCapacity(requiredSeqLen);
+        // Under tensor parallelism the attention caches are _tpKvCacheK/_tpKvCacheV,
+        // one per rank; _kvCacheK/_kvCacheV are never allocated. Routing here is what
+        // stops the speculative path from dereferencing the null non-TP arrays.
+        /// <summary>Set once the speculative trunk has been entered; see SpecForward.</summary>
+        private bool _specTrunkUsed;
+
+        public void SpecEnsureCapacity(int requiredSeqLen)
+        {
+            if (IsTensorParallel)
+                EnsureNemotronTpCacheCapacity(requiredSeqLen);
+            else
+                EnsureCacheCapacity(requiredSeqLen);
+        }
 
         /// <summary>
         /// Trunk forward for speculative decoding: the ordinary per-op layer
@@ -173,6 +185,21 @@ namespace TensorSharp.Models
         /// </summary>
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            // Latch that the speculative trunk is in use. The Mamba2 native decode
+            // kernel keeps conv/SSM state device-side, which a verify batch cannot see
+            // (seqLen > 1, so it runs off the HOST arrays) - and speculation can be
+            // armed with NO drafter at all (--spec-type ngram), so keying that guard on
+            // HasDFlash alone would miss this entirely. The first call is always the
+            // prefill, which refreshes the host state, so the latch is set before any
+            // single-token step could leave it stale.
+            _specTrunkUsed = true;
+
+            if (IsTensorParallel)
+            {
+                SpecForwardTP(tokens, hAllOut, logitsOut, allLogitsRows);
+                return;
+            }
+
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -214,6 +241,83 @@ namespace TensorSharp.Models
             Tensor normed = RMSNormOp(hidden, "output_norm.weight");
             hidden.Dispose();
 
+            SpecEmitLogits(normed, seqLen, logitsOut, allLogitsRows);
+
+            _cacheSeqLen += seqLen;
+            _forwardCount++;
+        }
+
+        /// <summary>
+        /// Speculative-decoding trunk forward under tensor parallelism: the same
+        /// math as <see cref="ForwardTP"/> (sharded weights, per-rank KV caches,
+        /// Mamba2 replicated on rank 0) plus the DFlash residual taps and the
+        /// optional all-rows LM head that speculation needs.
+        ///
+        /// The non-TP <see cref="SpecForward"/> body cannot serve here: it walks the
+        /// per-op layer loop against unsharded weights and the non-TP KV caches,
+        /// neither of which exists once the model is sharded.
+        /// </summary>
+        private unsafe void SpecForwardTP(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
+        {
+            _forwardSw.Start();
+            int seqLen = tokens.Length;
+            int startPos = _cacheSeqLen;
+            int tp = TpDegree;
+            EnsureNemotronTpCacheCapacity(startPos + seqLen);
+
+            Tensor hidden0 = Embedding(tokens);
+            Tensor[] hidden = BroadcastTensorToAllRanks(hidden0);
+
+            bool captureAll = false, captureLast = false;
+            if (HasDFlash && hAllOut != null && hAllOut.Length > 0)
+            {
+                int feat = _dflash.FeatureSize;
+                captureAll = hAllOut.LongLength >= (long)seqLen * feat;
+                captureLast = !captureAll && hAllOut.LongLength >= feat;
+            }
+
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                // The drafter's encoder reads the residual ENTERING each tapped
+                // layer, which is replicated across ranks at this point, so rank 0
+                // is the authoritative copy.
+                int slot = _dflashCaptureSlot != null && (captureAll || captureLast)
+                    ? _dflashCaptureSlot[layer]
+                    : -1;
+                if (slot >= 0)
+                    DFlashCaptureFeature(hidden[0], slot, seqLen, hAllOut, captureLast);
+
+                switch (_layerTypes[layer])
+                {
+                    case LayerType.Mamba2:
+                        hidden = Mamba2BlockTP(hidden, layer, seqLen, isDecode: false);
+                        break;
+                    case LayerType.Attention:
+                        hidden = NemotronAttentionBlockTP(hidden, layer, seqLen, startPos, isDecode: false);
+                        break;
+                    case LayerType.FFN:
+                        hidden = NemotronFFNBlockTP(hidden, layer, seqLen, isDecode: false);
+                        break;
+                }
+            }
+            _forwardSw.Stop();
+
+            Tensor normedTp = RMSNormOp(hidden[0], "output_norm.weight");
+            for (int r = 0; r < tp; r++)
+                hidden[r].Dispose();
+
+            SpecEmitLogits(normedTp, seqLen, logitsOut, allLogitsRows);
+
+            _cacheSeqLen += seqLen;
+            _forwardCount++;
+        }
+
+        /// <summary>
+        /// LM head for the speculative trunk: either every row's logits (verify
+        /// batches) or just the last row. Consumes <paramref name="normed"/>.
+        /// </summary>
+        private unsafe void SpecEmitLogits(Tensor normed, int seqLen, float[] logitsOut, bool allLogitsRows)
+        {
             if (allLogitsRows)
             {
                 Tensor logitsT = LinearForward(normed, "output.weight")
@@ -255,9 +359,6 @@ namespace TensorSharp.Models
                 }
                 logitsT.Dispose();
             }
-
-            _cacheSeqLen += seqLen;
-            _forwardCount++;
         }
 
         // ====================================================================

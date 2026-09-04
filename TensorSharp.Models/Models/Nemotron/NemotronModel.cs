@@ -427,6 +427,7 @@ namespace TensorSharp.Models
             InitLayerInfo();
             CacheMamba2ConvWeights();
             InitMoEBuffers();
+            InitNemotronTpMoeBatchedDecode();
         }
 
         #region Initialization
@@ -770,8 +771,41 @@ namespace TensorSharp.Models
                     stackedCapable++;
             }
 
-            if (stackedCapable > 0)
-                Console.WriteLine($"  Nemotron batched MoE prefill kernel available on {stackedCapable}/{Config.NumLayers} layers (min tokens: {BatchedMoEPrefillMinTokens})");
+            // Report the path that will ACTUALLY serve MoE prefill. The old line
+            // counted stacked-expert tensors and announced a "batched MoE prefill
+            // kernel", which was misleading three ways: the kernel that consumes
+            // stacked weights (TryMoEPrefillFusedReluSquared) is opt-in and off by
+            // default; the one that does run by default drives per-expert views and
+            // needs no stacked weights at all; and under tensor parallelism neither is
+            // reachable, because ForwardTP routes the FFN to NemotronMoEBlockTP.
+            int moeLayerCount = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (_layerTypes[l] == LayerType.FFN) moeLayerCount++;
+
+            if (moeLayerCount > 0 && _numExperts > 0)
+            {
+                string moePrefillPath;
+                if (IsTensorParallel)
+                {
+                    moePrefillPath = UsesExpertParallelMoE
+                        ? $"expert-parallel batched kernel on {moeLayerCount} layer(s)"
+                        : $"per-expert tensor-parallel loop on {moeLayerCount} layer(s)";
+                }
+                else if (EnableFusedMoEPrefill && stackedCapable > 0)
+                {
+                    moePrefillPath = $"fused ReLU^2 stacked-expert kernel on {stackedCapable}/{moeLayerCount} layer(s)";
+                }
+                else if (!DisableBatchedMoEPrefill)
+                {
+                    moePrefillPath = $"batched-by-expert on {moeLayerCount} layer(s) (min tokens: {BatchedMoEPrefillMinTokens})"
+                        + (stackedCapable > 0 ? "; TS_NEMOTRON_MOE_PREFILL_FUSED=1 selects the fused stacked-expert kernel" : string.Empty);
+                }
+                else
+                {
+                    moePrefillPath = $"per-token fallback on {moeLayerCount} layer(s)";
+                }
+                Console.WriteLine($"  Nemotron MoE prefill: {moePrefillPath}.");
+            }
 
             // Diagnostic: also log Mamba2 ssm_in / ssm_out quant types.
             // These matmuls run on every Mamba2 layer (23 layers in Nemotron-H
@@ -2699,6 +2733,13 @@ namespace TensorSharp.Models
                 projected.Dispose();
                 InvalidateTensorDeviceCache(result);
 
+                // The native prefill just rewrote the host conv/SSM state, so the
+                // device-side decode shadow state is stale. Without this a chat turn
+                // that reuses the KV prefix decodes from the PREVIOUS turn's device
+                // state and answers the previous question.
+                if (_mamba2NativeDecodeStateInitialized != null)
+                    _mamba2NativeDecodeStateInitialized[layer] = false;
+
                 if (TryLinearAddInto(residual, result, prefix + "ssm_out.weight"))
                 {
                     result.Dispose();
@@ -2793,6 +2834,12 @@ namespace TensorSharp.Models
             projected.Dispose();
 
             InvalidateTensorDeviceCache(result);
+
+            // This path just rewrote the host conv/SSM state, so the native decode
+            // shadow state on the device is now stale. Same discipline as the reset
+            // and cache-move paths: force the next decode step to re-seed from host.
+            if (_mamba2NativeDecodeStateInitialized != null)
+                _mamba2NativeDecodeStateInitialized[layer] = false;
 
             if (TryLinearAddInto(residual, result, prefix + "ssm_out.weight"))
             {
@@ -2901,6 +2948,21 @@ namespace TensorSharp.Models
             // gated to Metal by development history, not by a constraint.
             if (DisableNativeMamba2Decode
                 || (_backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCuda)
+                // Speculation and this kernel disagree about where the recurrent
+                // state lives. The kernel keeps conv/SSM state ON THE DEVICE
+                // (downloadState: false) across decode steps, but a verify batch is
+                // seqLen > 1 and therefore runs the managed/prefill path off the HOST
+                // _convState/_ssmState arrays - which SpecSnapshotRecurrentState and
+                // SpecRestoreRecurrentState also snapshot and roll back. Interleaving
+                // them makes the verify batch start from stale host state and silently
+                // corrupts the accepted tokens. Draining the device state per token
+                // instead would cost ~2 MB per Mamba2 layer per token (48 MB/token
+                // here), far more than the kernel saves, so speculation simply keeps
+                // the recurrent state host-side.
+                // HasDFlash covers a DFlash/DSpark drafter; _specTrunkUsed also covers
+                // drafter-free speculation (--spec-type ngram), which routes its plain
+                // single-token steps through SpecForward just the same.
+                || HasDFlash || _specTrunkUsed
                 || seqLen != 1
                 || _mamba2NativeDecodeProjected == null
                 || _mamba2NativeDecodeHidden == null
@@ -2935,6 +2997,13 @@ namespace TensorSharp.Models
                     _convState[layer],
                     _ssmState[layer],
                     !_mamba2NativeDecodeStateInitialized[layer],
+                    // Left false deliberately. Draining the conv/SSM state to the host
+                    // every step is what a following multi-token forward would need
+                    // (see the flag reset below), but it costs ~46 MB/token here and
+                    // measured a NET LOSS: 55.6 vs 80.9 tok/s on one GPU. The device
+                    // state therefore stays authoritative between decode steps, and
+                    // the flag reset on the multi-token paths keeps the two directions
+                    // from silently disagreeing.
                     downloadState: false,
                     TensorComputePrimitives.GetStoragePointer(convW),
                     convBias == null ? IntPtr.Zero : TensorComputePrimitives.GetStoragePointer(convBias),

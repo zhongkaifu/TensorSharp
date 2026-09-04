@@ -1250,7 +1250,7 @@ namespace TensorSharp.Models
             // gpt-oss is the live example: 24 sharded vs 1538 replicated
             // (10.8 GB) measures 28 tok/s on two GPUs against 349 on one.
             // Say so, because the alternative is a silent 12x regression.
-            long shardedBytes = 0;
+            long shardedBytes = AdditionalTpShardedBytes;
             foreach (var kv in _tpQuantWeights)
                 if (kv.Value is { Length: > 0 } sh && sh[0] != null)
                     shardedBytes += sh[0].RawBytes * sh.Length;
@@ -1294,6 +1294,16 @@ namespace TensorSharp.Models
         /// rare non-TP reader can still stream it.
         /// </summary>
         protected virtual bool IsSupersededByTpShard(string weightName) => false;
+
+        /// <summary>
+        /// Bytes that tensor parallelism really did split but that do NOT live in
+        /// <see cref="_tpQuantWeights"/> - the expert-parallel stacked slices, for
+        /// instance, which are per-rank views rather than QuantizedWeight shards.
+        /// Counted alongside <see cref="_tpQuantWeights"/> when judging whether the
+        /// split was worthwhile, so an architecture that shards the bulk of its
+        /// weight through that route is not accused of having sharded almost nothing.
+        /// </summary>
+        protected virtual long AdditionalTpShardedBytes => 0;
 
         /// <summary>
         /// True when the MoE layers under TP fall back to the per-token,
