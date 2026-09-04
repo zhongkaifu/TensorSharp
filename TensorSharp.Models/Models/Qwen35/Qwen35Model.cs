@@ -3548,15 +3548,30 @@ namespace TensorSharp.Models
             {
                 string p = $"blk.{l}.";
                 int b = l * 16;
-                tbl[b + 0] = _quantWeights.ContainsKey(p + "attn_qkv.weight") ? S(p + "attn_qkv.weight") : S(p + "attn_q.weight"); // QKV (or Q when separate)
-                tbl[b + 1] = S(p + "attn_k.weight");        // K (separate only)
-                tbl[b + 2] = S(p + "attn_v.weight");        // V (separate only)
-                tbl[b + 3] = S(p + "attn_output.weight");   // O
-                tbl[b + 4] = S(p + "attn_qkv.weight");      // GDN in-proj (same GGUF name)
-                tbl[b + 5] = S(p + "attn_gate.weight");     // GDN z gate
-                tbl[b + 6] = S(p + "ssm_beta.weight");
-                tbl[b + 7] = S(p + "ssm_alpha.weight");
-                tbl[b + 8] = S(p + "ssm_out.weight");
+                // Slots are per LAYER KIND, and the two kinds share GGUF names:
+                // a GDN layer's in-projection is also called "attn_qkv.weight",
+                // and FuseAttentionProjectionWeights gives an ATTENTION layer a
+                // tensor of that name too (fusing q+k+v when their types and
+                // scales match). Filling both the attention and the GDN slot from
+                // it left every attention layer advertising a GDN in-proj scale
+                // that no graph reads - a scale for a projection this layer does
+                // not have. Fill only the slots this layer's kind consumes.
+                bool recurrent = _isRecurrent[l];
+                if (!recurrent)
+                {
+                    tbl[b + 0] = _quantWeights.ContainsKey(p + "attn_qkv.weight") ? S(p + "attn_qkv.weight") : S(p + "attn_q.weight"); // QKV (or Q when separate)
+                    tbl[b + 1] = S(p + "attn_k.weight");        // K (separate only)
+                    tbl[b + 2] = S(p + "attn_v.weight");        // V (separate only)
+                    tbl[b + 3] = S(p + "attn_output.weight");   // O
+                }
+                else
+                {
+                    tbl[b + 4] = S(p + "attn_qkv.weight");      // GDN in-proj (same GGUF name)
+                    tbl[b + 5] = S(p + "attn_gate.weight");     // GDN z gate
+                    tbl[b + 6] = S(p + "ssm_beta.weight");
+                    tbl[b + 7] = S(p + "ssm_alpha.weight");
+                    tbl[b + 8] = S(p + "ssm_out.weight");
+                }
                 tbl[b + 9] = S(p + "ffn_gate_up.weight");   // fused gate_up (gate==up scale)
                 tbl[b + 10] = S(p + "ffn_gate.weight");     // split fallback
                 tbl[b + 11] = S(p + "ffn_up.weight");

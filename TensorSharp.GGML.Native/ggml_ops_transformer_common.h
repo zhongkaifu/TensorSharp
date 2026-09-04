@@ -552,6 +552,34 @@ struct TSGgmlQwen35LayerDesc
     std::int32_t ffn_gate_type, ffn_up_type;
 };
 
+// This layer's sidecar scale tensor for slot `s`, CREATED the first time the
+// graph actually consumes it (null when the slot carries no scale).
+//
+// Creating every non-1.0 slot up front instead (the original shape of this
+// code) put slots the layer's branch never reads into the CONTEXT but not into
+// the GRAPH. The persistent builders allocate with ggml_backend_alloc_ctx_tensors
+// and so covered them by accident, but the non-persist builders allocate from
+// the graph (gallocr), leaving those tensors with a null buffer while they were
+// still queued for upload -> ggml_backend_tensor_set aborts on
+// GGML_ASSERT(buf != NULL && "tensor buffer not set"). A GGUF that carries a
+// `blk.N.attn_qkv.weight.scale` sidecar hits it on every layer, because the GDN
+// in-projection shares that tensor name: BuildProjScaleTable fills both
+// TSQ35_SC_QKV and TSQ35_SC_GDN_QKV from it while each layer kind reads only
+// one of the two. Creating on demand keeps "non-null" and "in the graph"
+// the same predicate, whatever the branch mix.
+template <class LayerTensorsT>
+static inline ggml_tensor* q35_psc(ggml_context* ctx, LayerTensorsT& t,
+                                   const TSGgmlQwen35LayerDesc& d, int s)
+{
+    if (d.proj_scales == nullptr)
+        return nullptr;
+    if (static_cast<const float*>(d.proj_scales)[s] == 1.0f)
+        return nullptr;
+    if (t.psc[s] == nullptr)
+        t.psc[s] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    return t.psc[s];
+}
+
 // Per-layer descriptor for the GPT-OSS whole-model decode kernel
 // (TSGgml_GptOssModelDecode). Passed by pointer from C#; layout MUST match
 // GptOssLayerDecodeArgs in GgmlNative.cs — pointers first, then int64, then

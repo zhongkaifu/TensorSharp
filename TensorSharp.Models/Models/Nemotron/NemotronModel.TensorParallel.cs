@@ -31,12 +31,27 @@ using System.Diagnostics;
 using System.Linq;
 using TensorSharp;
 using TensorSharp.Cuda;
+using TensorSharp.GGML;
 
 namespace TensorSharp.Models
 {
     public partial class NemotronModel
     {
         // Per-GPU KV caches for attention layers: [layer][rank]
+        // Per-rank expert shard tables for the batched decode kernel on the PER-EXPERT
+        // (Megatron) MoE path, indexed [layer][expert][rank]. Unused when expert
+        // parallelism takes: that path partitions whole experts and already covers
+        // decode with the same one-dispatch-per-rank kernel.
+        //
+        // Built from _tpQuantWeights, not _quantWeights, because the per-expert
+        // sharding REMOVES the expert weights from _quantWeights - which is why the
+        // non-TP _expertUpQW/_expertDownQW tables come up empty on that path.
+        private QuantizedWeight[][][] _tpExpertUpQW;
+        private QuantizedWeight[][][] _tpExpertDownQW;
+        private IntPtr[][] _tpMoeUpPtrs;
+        private IntPtr[][] _tpMoeDownPtrs;
+        private bool _tpMoeBatchedDecodeReady;
+
         private Tensor[][] _tpKvCacheK;
         private Tensor[][] _tpKvCacheV;
         private int _tpKvCacheCapacity;
@@ -150,6 +165,14 @@ namespace TensorSharp.Models
 
         private void ShardNemotronMoeWeightsForTP()
         {
+            // Whole-expert partitioning first. It keeps each layer to ONE batched
+            // dispatch per projection per rank; the per-expert Megatron slicing below
+            // leaves every rank holding a piece of all 128 experts, which forces a
+            // per-expert loop. All-or-nothing: if it takes, the per-expert shards must
+            // NOT also be built, or every expert byte ends up resident twice.
+            if (BuildNemotronExpertParallelShards())
+                return;
+
             int tp = TpDegree;
 
             for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -317,6 +340,16 @@ namespace TensorSharp.Models
             // host-side recurrent state arrays are the same full size as the non-TP
             // path. InitCaches (which normally allocates these) is skipped under TP,
             // so allocate them here for every Mamba2 layer.
+            //
+            // The native decode scratch tensors are deliberately NOT allocated here,
+            // which is what keeps TryMamba2NativeDecode off under TP. That kernel
+            // holds the conv/SSM state on the device between decode steps and never
+            // drains it, so the next multi-token forward - a chat turn that reuses the
+            // KV prefix, or a speculative verify batch - resumes from whatever the
+            // host arrays held before this turn generated anything. Keeping the state
+            // coherent instead (downloadState: true) costs ~46 MB/token and measured
+            // SLOWER than the managed path under TP: 49.0 vs 57.5 tok/s. So TP keeps
+            // the recurrent state host-side, which is both correct and faster here.
             int convDim = Math.Max(0, _ssmDConv - 1);
             int convChannels = _ssmDInner + 2 * _ssmNGroup * _ssmDState;
             int ssmStateSize = _ssmDState * _ssmHeadDim * _ssmNHead;
@@ -330,6 +363,11 @@ namespace TensorSharp.Models
             }
 
             Console.WriteLine($"  Nemotron TP caches initialized: {tp} GPUs");
+
+            // InitCaches does this for the non-TP path; without it the DFlash/DSpark
+            // drafter is never attached under TP, so speculation arms against a trunk
+            // that has no drafter.
+            TryLoadNemotronDFlash(_draftModelPath);
         }
 
         private void EnsureNemotronTpCacheCapacity(int requiredSeqLen)
@@ -526,7 +564,13 @@ namespace TensorSharp.Models
 
             // 3. Per-GPU attention.
             var attnResults = new Tensor[tp];
-            for (int r = 0; r < tp; r++)
+            // Fan the ranks out instead of walking them: GGML ops submit AND
+            // synchronize inside one call, so a sequential rank loop runs GPU 0 to
+            // completion before GPU 1 starts and the wall clock is the SUM of the
+            // ranks rather than the MAX. RunPerRank pins each worker to its own
+            // backend, which is also what lets the direct native calls below skip
+            // their own rank selection.
+            _tpGroup.RunPerRank(r =>
             {
                 var alloc = _tpGroup.GetAllocator(r);
 
@@ -602,7 +646,7 @@ namespace TensorSharp.Models
                     attnOut.Dispose();
                     attnResults[r] = flatOutput;
                 }
-            }
+            });
 
             // 4. Row-parallel output projection + AllReduce.
             Tensor reducedAttn = TpRowParallelLinear(attnResults, prefix + "attn_output.weight");
@@ -719,88 +763,110 @@ namespace TensorSharp.Models
                 }
             }
 
-            // Bucket the assignments by expert so each expert runs ONE batched
-            // matmul over its tokens instead of a per-token dispatch (the gpt-oss
-            // TP MoE shape; mirrors the non-TP batched path).
-            var expertCounts = new int[_numExperts];
-            for (int a = 0; a < totalAssignments; a++)
-                expertCounts[selectedExperts[a]]++;
-            var expertOffsets = new int[_numExperts];
-            for (int e = 1; e < _numExperts; e++)
-                expertOffsets[e] = expertOffsets[e - 1] + expertCounts[e - 1];
-            var tokenMap = new int[totalAssignments];
-            var weightMap = new float[totalAssignments];
-            var fillPos = (int[])expertOffsets.Clone();
-            for (int s = 0; s < seqLen; s++)
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int e = selectedExperts[s * nUsed + k];
-                    int pos = fillPos[e]++;
-                    tokenMap[pos] = s;
-                    weightMap[pos] = routeWeightsAll[s * nUsed + k];
-                }
+            // 3. Decode fast path: ONE GGML dispatch per rank covering every routed
+            //    expert, reusing the kernel the non-TP decode path already uses. The
+            //    per-expert fallback below costs two device dispatches plus a host
+            //    gather/scatter for EACH expert on EACH rank - at 24 MoE layers x
+            //    top-6 x 2 ranks that is 288 synchronous device round trips per token,
+            //    which is what pinned both GPUs at 10-20% utilisation during decode.
+            Tensor[] results =
+                TryNemotronMoEExpertParallel(layer, seqLen, expertOutDim, normed,
+                    selectedExperts, routeWeightsAll)
+                ?? TryTpMoeBatchedExpertDecode(
+                    layer, seqLen, expertOutDim, hasLatent, latentIn, normed,
+                    selectedExperts, routeWeightsAll);
 
-            // 3. Per-rank expert accumulation (column-parallel up + row-parallel down).
-            var results = new Tensor[tp];
-            for (int r = 0; r < tp; r++)
+            if (results == null)
             {
-                var alloc = _tpGroup.GetAllocator(r);
-                Tensor expertInput = hasLatent ? latentIn : normed[r];
-                int expertInDim = (int)expertInput.Sizes[1];
-                long inRowBytes = (long)expertInDim * sizeof(float);
-
-                var output = new Tensor(alloc, DType.Float32, seqLen, expertOutDim);
-
-                unsafe
-                {
-                    float* inPtr = GetFloatPtr(expertInput);
-                    float* outPtr = GetFloatPtr(output);
-                    for (long z = 0; z < (long)seqLen * expertOutDim; z++)
-                        outPtr[z] = 0f;
-
-                    for (int e = 0; e < _numExperts; e++)
+                // Bucket the assignments by expert so each expert runs ONE batched
+                // matmul over its tokens instead of a per-token dispatch (the gpt-oss
+                // TP MoE shape; mirrors the non-TP batched path).
+                var expertCounts = new int[_numExperts];
+                for (int a = 0; a < totalAssignments; a++)
+                    expertCounts[selectedExperts[a]]++;
+                var expertOffsets = new int[_numExperts];
+                for (int e = 1; e < _numExperts; e++)
+                    expertOffsets[e] = expertOffsets[e - 1] + expertCounts[e - 1];
+                var tokenMap = new int[totalAssignments];
+                var weightMap = new float[totalAssignments];
+                var fillPos = (int[])expertOffsets.Clone();
+                for (int s = 0; s < seqLen; s++)
+                    for (int k = 0; k < nUsed; k++)
                     {
-                        int count = expertCounts[e];
-                        if (count == 0) continue;
-                        int offset = expertOffsets[e];
-
-                        string upKey = prefix + $"ffn_up_exps.{e}.weight";
-                        string downKey = prefix + $"ffn_down_exps.{e}.weight";
-
-                        // Gather this expert's tokens into a [count, dim] batch.
-                        var batchInput = new Tensor(alloc, DType.Float32, count, expertInDim);
-                        float* bPtr = GetFloatPtr(batchInput);
-                        for (int i = 0; i < count; i++)
-                        {
-                            int tokenIdx = tokenMap[offset + i];
-                            Buffer.MemoryCopy(inPtr + (long)tokenIdx * expertInDim,
-                                bPtr + (long)i * expertInDim, inRowBytes, inRowBytes);
-                        }
-
-                        Tensor upOut = TpNemotronExpertLinear(batchInput, upKey, r, count);
-                        batchInput.Dispose();
-                        ReluSquaredInPlace(upOut);   // Nemotron MoE uses ReLU^2, not SiLU.
-                        Tensor downOut = TpNemotronExpertLinear(upOut, downKey, r, count);
-                        upOut.Dispose();
-
-                        // Weighted scatter-add back into each token's output row.
-                        float* dPtr = GetFloatPtr(downOut);
-                        for (int i = 0; i < count; i++)
-                        {
-                            int tokenIdx = tokenMap[offset + i];
-                            float w = weightMap[offset + i];
-                            float* src = dPtr + (long)i * expertOutDim;
-                            float* dst = outPtr + (long)tokenIdx * expertOutDim;
-                            for (int d = 0; d < expertOutDim; d++)
-                                dst[d] += w * src[d];
-                        }
-                        downOut.Dispose();
+                        int e = selectedExperts[s * nUsed + k];
+                        int pos = fillPos[e]++;
+                        tokenMap[pos] = s;
+                        weightMap[pos] = routeWeightsAll[s * nUsed + k];
                     }
-                }
 
-                // Host buffer is authoritative — push to device for the AllReduce.
-                output.EnsureDeviceCurrent();
-                results[r] = output;
+                // 3. Per-rank expert accumulation (column-parallel up + row-parallel down).
+                results = new Tensor[tp];
+                // Fan the ranks out instead of walking them: GGML ops submit AND
+                // synchronize inside one call, so a sequential rank loop runs GPU 0 to
+                // completion before GPU 1 starts and the wall clock is the SUM of the
+                // ranks rather than the MAX. RunPerRank pins each worker to its own
+                // backend, which is also what lets the direct native calls below skip
+                // their own rank selection.
+                _tpGroup.RunPerRank(r =>
+                {
+                    var alloc = _tpGroup.GetAllocator(r);
+                    Tensor expertInput = hasLatent ? latentIn : normed[r];
+                    int expertInDim = (int)expertInput.Sizes[1];
+                    long inRowBytes = (long)expertInDim * sizeof(float);
+
+                    var output = new Tensor(alloc, DType.Float32, seqLen, expertOutDim);
+
+                    unsafe
+                    {
+                        float* inPtr = GetFloatPtr(expertInput);
+                        float* outPtr = GetFloatPtr(output);
+                        for (long z = 0; z < (long)seqLen * expertOutDim; z++)
+                            outPtr[z] = 0f;
+
+                        for (int e = 0; e < _numExperts; e++)
+                        {
+                            int count = expertCounts[e];
+                            if (count == 0) continue;
+                            int offset = expertOffsets[e];
+
+                            string upKey = prefix + $"ffn_up_exps.{e}.weight";
+                            string downKey = prefix + $"ffn_down_exps.{e}.weight";
+
+                            // Gather this expert's tokens into a [count, dim] batch.
+                            var batchInput = new Tensor(alloc, DType.Float32, count, expertInDim);
+                            float* bPtr = GetFloatPtr(batchInput);
+                            for (int i = 0; i < count; i++)
+                            {
+                                int tokenIdx = tokenMap[offset + i];
+                                Buffer.MemoryCopy(inPtr + (long)tokenIdx * expertInDim,
+                                    bPtr + (long)i * expertInDim, inRowBytes, inRowBytes);
+                            }
+
+                            Tensor upOut = TpNemotronExpertLinear(batchInput, upKey, r, count);
+                            batchInput.Dispose();
+                            ReluSquaredInPlace(upOut);   // Nemotron MoE uses ReLU^2, not SiLU.
+                            Tensor downOut = TpNemotronExpertLinear(upOut, downKey, r, count);
+                            upOut.Dispose();
+
+                            // Weighted scatter-add back into each token's output row.
+                            float* dPtr = GetFloatPtr(downOut);
+                            for (int i = 0; i < count; i++)
+                            {
+                                int tokenIdx = tokenMap[offset + i];
+                                float w = weightMap[offset + i];
+                                float* src = dPtr + (long)i * expertOutDim;
+                                float* dst = outPtr + (long)tokenIdx * expertOutDim;
+                                for (int d = 0; d < expertOutDim; d++)
+                                    dst[d] += w * src[d];
+                            }
+                            downOut.Dispose();
+                        }
+                    }
+
+                    // Host buffer is authoritative — push to device for the AllReduce.
+                    output.EnsureDeviceCurrent();
+                    results[r] = output;
+                });
             }
 
             latentIn?.Dispose();
@@ -915,6 +981,141 @@ namespace TensorSharp.Models
                     topWeights[k] *= _expertWeightsScale;
 
             return (topExperts, topWeights);
+        }
+
+        // ====================================================================
+        // Batched MoE decode under TP
+        // ====================================================================
+
+        /// <summary>
+        /// Build the per-rank expert shard tables the batched MoE decode kernel
+        /// needs. Runs after ShardNemotronMoeWeightsForTP has moved every expert
+        /// into _tpQuantWeights.
+        /// </summary>
+        private void InitNemotronTpMoeBatchedDecode()
+        {
+            if (!IsTensorParallel || !IsGgmlBackend || _numExperts <= 0 || _numExpertsUsed <= 0)
+                return;
+
+            int tp = TpDegree;
+            _tpExpertUpQW = new QuantizedWeight[Config.NumLayers][][];
+            _tpExpertDownQW = new QuantizedWeight[Config.NumLayers][][];
+
+            int ready = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (_layerTypes[l] != LayerType.FFN)
+                    continue;
+
+                var up = new QuantizedWeight[_numExperts][];
+                var down = new QuantizedWeight[_numExperts][];
+                bool ok = true;
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    if (!_tpQuantWeights.TryGetValue($"blk.{l}.ffn_up_exps.{e}.weight", out up[e])
+                        || !_tpQuantWeights.TryGetValue($"blk.{l}.ffn_down_exps.{e}.weight", out down[e])
+                        || up[e] == null || down[e] == null
+                        || up[e].Length < tp || down[e].Length < tp)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok)
+                    continue;
+
+                _tpExpertUpQW[l] = up;
+                _tpExpertDownQW[l] = down;
+                ready++;
+            }
+
+            if (ready == 0)
+                return;
+
+            _tpMoeUpPtrs = new IntPtr[tp][];
+            _tpMoeDownPtrs = new IntPtr[tp][];
+            for (int r = 0; r < tp; r++)
+            {
+                _tpMoeUpPtrs[r] = new IntPtr[_numExpertsUsed];
+                _tpMoeDownPtrs[r] = new IntPtr[_numExpertsUsed];
+            }
+
+            _tpMoeBatchedDecodeReady = true;
+            Console.WriteLine($"  Nemotron TP batched MoE decode: {ready} layer(s), "
+                + $"1 dispatch per rank instead of {2 * _numExpertsUsed}.");
+        }
+
+        /// <summary>
+        /// Decode (seqLen == 1) fast path for the routed experts: ONE GGML graph
+        /// per rank covering all top-K experts - up, ReLU^2, down, route-weighted
+        /// accumulate - over that rank's column/row shards. Returns one partial
+        /// [1, expertOutDim] tensor per rank for the caller to AllReduce, or null
+        /// when this layer is not eligible and the caller must fall back to the
+        /// per-expert host loop.
+        ///
+        /// This is the same kernel the non-TP decode path uses. The fallback costs
+        /// two device dispatches plus a host gather/scatter PER EXPERT PER RANK.
+        /// </summary>
+        private Tensor[] TryTpMoeBatchedExpertDecode(
+            int layer, int seqLen, int expertOutDim, bool hasLatent,
+            Tensor latentIn, Tensor[] normed, int[] selectedExperts, float[] routeWeightsAll)
+        {
+            if (!_tpMoeBatchedDecodeReady || seqLen != 1)
+                return null;
+
+            var upShards = _tpExpertUpQW[layer];
+            var downShards = _tpExpertDownQW[layer];
+            if (upShards == null || downShards == null)
+                return null;
+
+            int tp = TpDegree;
+            int nUsed = _numExpertsUsed;
+
+            // Validate and collect every shard pointer BEFORE allocating anything,
+            // so a bail-out cannot leak a partially built result set.
+            for (int r = 0; r < tp; r++)
+            {
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int e = selectedExperts[k];
+                    if ((uint)e >= (uint)_numExperts)
+                        return null;
+                    QuantizedWeight uq = upShards[e]?[r];
+                    QuantizedWeight dq = downShards[e]?[r];
+                    if (uq == null || dq == null || dq.Ne1 != expertOutDim)
+                        return null;
+                    _tpMoeUpPtrs[r][k] = uq.CacheKey;
+                    _tpMoeDownPtrs[r][k] = dq.CacheKey;
+                }
+            }
+
+            // Shapes are shard-uniform, so the first selected expert describes them all.
+            var routeWeights = new float[nUsed];
+            Array.Copy(routeWeightsAll, routeWeights, nUsed);
+
+            var results = new Tensor[tp];
+            // Fan the ranks out instead of walking them: GGML ops submit AND
+            // synchronize inside one call, so a sequential rank loop runs GPU 0 to
+            // completion before GPU 1 starts and the wall clock is the SUM of the
+            // ranks rather than the MAX. RunPerRank pins each worker to its own
+            // backend, which is also what lets the direct native calls below skip
+            // their own rank selection.
+            _tpGroup.RunPerRank(r =>
+            {
+                QuantizedWeight up0 = upShards[selectedExperts[0]][r];
+                QuantizedWeight dn0 = downShards[selectedExperts[0]][r];
+
+                var output = new Tensor(_tpGroup.GetAllocator(r), DType.Float32, 1, expertOutDim);
+                GgmlBasicOps.MoEExpertsForward(
+                    output, hasLatent ? latentIn : normed[r],
+                    nUsed, _tpMoeUpPtrs[r], _tpMoeDownPtrs[r],
+                    up0.GgmlType, up0.Ne0, up0.Ne1, up0.RawBytes,
+                    dn0.GgmlType, dn0.Ne0, dn0.Ne1, dn0.RawBytes,
+                    routeWeights);
+                results[r] = output;
+            });
+
+            return results;
         }
 
         // ====================================================================

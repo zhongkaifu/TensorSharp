@@ -1385,6 +1385,15 @@ namespace TensorSharp.GGML
                 throw new NotSupportedException("MoEExpertsForward requires tensors with supported row-contiguous layouts.");
             }
 
+            // Route to the GPU that owns the result, exactly like AddmmQuant: this
+            // is a direct native entry point, so it never passes through
+            // OpRegistry.PreInvokeHook and would otherwise run on whatever rank the
+            // calling thread was last left on. The expert weight caches are per
+            // rank, so a call on the wrong rank misses every preloaded shard.
+            // Yields to an active RunPerRank pin, and is a no-op on one device.
+            if (result.Storage is GgmlStorage resultStorage)
+                GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
+
             GgmlNative.MoEExpertsForward(resultView, inputView, numExperts,
                 upDataPtrs, downDataPtrs,
                 upGgmlType, upNe0, upNe1, upRawBytesEach,
