@@ -9,6 +9,7 @@
   <Project Path="TensorSharp.Core/TensorSharp.Core.csproj" />
   <Project Path="TensorSharp.Distributed/TensorSharp.Distributed.csproj" />
   <Project Path="TensorSharp.Models/TensorSharp.Models.csproj" />
+  <Project Path="TensorSharp.Runtime.Logging/TensorSharp.Runtime.Logging.csproj" Id="987c8976-2d64-44fa-a929-6d10e691b0cc" />
   <Project Path="TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
   <Project Path="TensorSharp.Server/TensorSharp.Server.csproj" />
   <Project Path="TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj" />
