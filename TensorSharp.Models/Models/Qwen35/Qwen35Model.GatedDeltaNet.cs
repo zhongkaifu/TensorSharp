@@ -2114,8 +2114,13 @@ namespace TensorSharp.Models
             }
             if (!ok2)
             {
+                // Latched for the process lifetime, exactly like the weight/state
+                // check above - so it has to say why. The native side sets a message
+                // on every decline; without printing it a kernel-level refusal is
+                // indistinguishable from "prefill is just slow" (the per-op loop is
+                // ~50x slower on a 2K chunk).
                 _fvUnsupported = true;
-                return false;
+                return FvBail(GgmlBasicOps.LastNativeError("the native kernel declined"));
             }
 
             if (snapshotsUsed > 1)
