@@ -22,7 +22,7 @@ namespace TensorSharp.Server.Hosting
     /// (<c>--list-gpus</c>). Kept out of <see cref="ServerOptionsBuilder"/> so
     /// the option parser stays pure and testable.
     /// </summary>
-    internal static class ServerUsage
+    public static class ServerUsage
     {
         public static bool IsHelpRequested(string[] args)
         {
@@ -99,7 +99,7 @@ namespace TensorSharp.Server.Hosting
             ("Network", new[]
             {
                 new OptionHelp("--port <N>",
-                    "TCP port to listen on (1-65535). Default: 5000 (PORT env var overrides). On macOS, port 5000 is " +
+                    $"TCP port to listen on (1-65535). Default: {ServerHostingOptions.DefaultPort} (PORT env var overrides). On macOS, port 5000 is " +
                     "taken by the AirPlay Receiver in Control Center, so pick another port or turn that off.",
                     "--port 8080"),
                 new OptionHelp("--host <address>",

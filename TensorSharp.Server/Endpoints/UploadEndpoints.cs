@@ -19,7 +19,7 @@ namespace TensorSharp.Server.Endpoints
     /// Multipart file upload endpoint used by the Web UI (and indirectly by
     /// Ollama / OpenAI clients that prefer references to base64).
     /// </summary>
-    internal static class UploadEndpoints
+    public static class UploadEndpoints
     {
         public static IEndpointRouteBuilder MapUploadEndpoints(this IEndpointRouteBuilder endpoints)
         {

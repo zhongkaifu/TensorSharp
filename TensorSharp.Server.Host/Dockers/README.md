@@ -1,6 +1,6 @@
-# Deploying TensorSharp.Server to a Hugging Face Space (Docker, CPU)
+# Deploying TensorSharp.Server.Host to a Hugging Face Space (Docker, CPU)
 
-[`Dockerfile_CPU.txt`](Dockerfile_CPU.txt) builds and runs `TensorSharp.Server`
+[`Dockerfile_CPU.txt`](Dockerfile_CPU.txt) builds and runs `TensorSharp.Server.Host`
 on a Hugging Face **Docker** Space using the native **GGML CPU** backend. It is
 modeled after the Seq2SeqSharp `Dockerfile_CPU.txt` pattern (clone from GitHub,
 build .NET from source, download a model from the Hub at build time).
@@ -11,7 +11,7 @@ Target Space: <https://huggingface.co/spaces/zhongkaifu/tensorsharp>
 
 1. **Build stage** (`mcr.microsoft.com/dotnet/sdk:10.0`): installs `git`,
    `cmake`, and `build-essential`, clones TensorSharp, and runs
-   `dotnet build TensorSharp.Server -c Release`. That transitively compiles the
+   `dotnet build TensorSharp.Server.Host -c Release`. That transitively compiles the
    runtime/models/backends and the native GGML bridge (`libGgmlOps.so`). No
    CUDA toolchain is present, so ggml-cuda is auto-disabled and only the CPU
    backend is built.
@@ -24,7 +24,7 @@ Target Space: <https://huggingface.co/spaces/zhongkaifu/tensorsharp>
 
 ### Port
 
-`TensorSharp.Server` listens on `http://0.0.0.0:5000` by default and honours the
+`TensorSharp.Server.Host` listens on `http://0.0.0.0:5000` by default and honours the
 `PORT` environment variable (as well as `--port` / `--host` / `--urls` on the
 command line). The runtime stage sets `PORT=7860` — the Docker Space default
 port — so the app binds the port the Space routes to and **no `app_port` setting
@@ -50,11 +50,11 @@ git clone https://huggingface.co/spaces/zhongkaifu/tensorsharp
 cd tensorsharp
 
 # Add the Dockerfile (rename on copy) and the README with the YAML header below
-cp /path/to/TensorSharp/TensorSharp.Server/Dockers/Dockerfile_CPU.txt Dockerfile
+cp /path/to/TensorSharp/TensorSharp.Server.Host/Dockers/Dockerfile_CPU.txt Dockerfile
 #   ...create README.md using the template below...
 
 git add Dockerfile README.md
-git commit -m "Deploy TensorSharp.Server (CPU)"
+git commit -m "Deploy TensorSharp.Server.Host (CPU)"
 git push
 ```
 
@@ -64,7 +64,7 @@ Put this at the top of the Space's `README.md`. In the current server contract,
 `GET /` serves the chat UI, so the bare Space root
 (`https://<user>-<space>.hf.space/`) is the UI link; `/index.html` still works
 as an explicit alias. The plain liveness response
-(`"TensorSharp.Server is running"`) lives at `/health`.
+(`"TensorSharp.Server.Host is running"`) lives at `/health`.
 
 ```yaml
 ---
@@ -129,7 +129,7 @@ bridge with `bash build-linux.sh --cuda`, and run with `--backend ggml_cuda`.
 For a DiffusionGemma GGUF, also leave `MMPROJ_FILE` empty; the Web UI exposes
 live denoising previews while the compatibility APIs return final text.
 
-## Space root shows "TensorSharp.Server is running"
+## Space root shows "TensorSharp.Server.Host is running"
 
 That means the image is serving without the Web UI assets: `GET /` sends
 `wwwroot/index.html` when it is present and falls back to the liveness response
@@ -144,7 +144,7 @@ endpoint — the web UI calls it with POST; it is not a deployment error.
 ## Verifying locally
 
 ```bash
-docker build -f TensorSharp.Server/Dockers/Dockerfile_CPU.txt -t tensorsharp-server .
+docker build -f TensorSharp.Server.Host/Dockers/Dockerfile_CPU.txt -t tensorsharp-server .
 docker run --rm -p 7860:7860 tensorsharp-server
 # open http://localhost:7860
 
@@ -162,7 +162,7 @@ or two on CPU. The Space's `startup_duration_timeout` (default 30 min) is ample.
 # Deploying to a GPU Space ([`Dockerfile_GPU.txt`](Dockerfile_GPU.txt))
 
 [`Dockerfile_GPU.txt`](Dockerfile_GPU.txt) is the GPU counterpart of the CPU
-file. It builds and runs `TensorSharp.Server` on a **paid GPU** Docker Space
+file. It builds and runs `TensorSharp.Server.Host` on a **paid GPU** Docker Space
 using the native **GGML CUDA** backend (`--backend ggml_cuda`, the most-tested
 NVIDIA path).
 
@@ -266,7 +266,7 @@ Ollama-compatible HTTP APIs. See https://github.com/zhongkaifu/TensorSharp.
 ## Verifying locally (needs an NVIDIA GPU + nvidia-container-toolkit)
 
 ```bash
-docker build -f TensorSharp.Server/Dockers/Dockerfile_GPU.txt \
+docker build -f TensorSharp.Server.Host/Dockers/Dockerfile_GPU.txt \
   --build-arg CUDA_ARCHS=75-real -t tensorsharp-server-gpu .
 docker run --rm --gpus all -p 7860:7860 tensorsharp-server-gpu
 # open http://localhost:7860

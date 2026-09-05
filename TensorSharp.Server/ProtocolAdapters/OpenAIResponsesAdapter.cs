@@ -39,7 +39,7 @@ namespace TensorSharp.Server.ProtocolAdapters
     /// share one temporary request workspace, which is deleted before this method
     /// returns and never becomes cross-request state.
     /// </summary>
-    internal sealed class OpenAIResponsesAdapter
+    public sealed class OpenAIResponsesAdapter
     {
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;

@@ -20,7 +20,7 @@ namespace TensorSharp.Server.Endpoints
     /// the SSE chat stream. Kept as pure routing - all behaviour lives in
     /// <see cref="WebUiAdapter"/>.
     /// </summary>
-    internal static class WebUiEndpoints
+    public static class WebUiEndpoints
     {
         public static IEndpointRouteBuilder MapWebUiEndpoints(this IEndpointRouteBuilder endpoints)
         {

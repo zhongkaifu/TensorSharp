@@ -1,4 +1,4 @@
-# TensorSharp.Server on Hugging Face Spaces — Docker SDK, CPU-only (GGML CPU backend).
+# TensorSharp.Server.Host on Hugging Face Spaces — Docker SDK, CPU-only (GGML CPU backend).
 #
 # Read the docs: https://huggingface.co/docs/hub/spaces-sdks-docker
 #
@@ -44,7 +44,7 @@ RUN git clone --depth 1 --branch ${TENSORSHARP_REF} ${TENSORSHARP_REPO} .
 # native GGML CMake build. No nvcc is present, so ggml-cuda is auto-disabled and
 # only the CPU backend is compiled (this is what the ggml_cpu backend needs).
 # The native build fetches ggml sources over the network on first build.
-RUN dotnet build TensorSharp.Server/TensorSharp.Server.csproj -c Release
+RUN dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release
 
 ############################################################
 # Stage 2 — runtime image
@@ -72,7 +72,7 @@ WORKDIR /home/user/app
 
 # The Release build output is a runnable framework-dependent app: managed DLLs,
 # the native libGgmlOps.so, runtimes/<rid>/native/* and the wwwroot/ web UI.
-COPY --chown=1000:1000 --from=build /src/TensorSharp.Server/bin/ ./
+COPY --chown=1000:1000 --from=build /src/TensorSharp.Server.Host/bin/ ./
 
 # Download the GGUF model for the demo (gemma-4-E2B QAT Q4_0, ~3.4 GB) plus its
 # multimodal projector (mmproj, ~1 GB) so vision input works out of the box.
@@ -108,7 +108,7 @@ EXPOSE ${APP_PORT}
 
 # Shell form so the variables expand. Host the model (and its projector, when
 # MMPROJ_FILE is set) on the native GGML CPU backend.
-CMD dotnet TensorSharp.Server.dll \
+CMD dotnet TensorSharp.Server.Host.dll \
     --model "/home/user/app/models/${MODEL_FILE}" \
     ${MMPROJ_FILE:+--mmproj "/home/user/app/models/${MMPROJ_FILE}"} \
     --backend ggml_cpu \

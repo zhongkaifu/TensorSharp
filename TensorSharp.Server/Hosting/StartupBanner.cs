@@ -12,7 +12,6 @@ using System;
 using System.Globalization;
 using System.Linq;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Hosting
 {
@@ -21,7 +20,7 @@ namespace TensorSharp.Server.Hosting
     /// Centralised here so we can iterate on the operator-facing summary
     /// without touching <c>Program.cs</c>.
     /// </summary>
-    internal static class StartupBanner
+    public static class StartupBanner
     {
         private static readonly string[] EndpointSummary =
         {

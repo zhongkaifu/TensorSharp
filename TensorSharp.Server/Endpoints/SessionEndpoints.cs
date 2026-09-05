@@ -21,7 +21,7 @@ namespace TensorSharp.Server.Endpoints
     /// when the user clicks "New Chat" so the prior conversation's KV cache is
     /// released.
     /// </summary>
-    internal static class SessionEndpoints
+    public static class SessionEndpoints
     {
         public static IEndpointRouteBuilder MapSessionEndpoints(this IEndpointRouteBuilder endpoints)
         {

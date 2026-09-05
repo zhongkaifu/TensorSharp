@@ -1,15 +1,15 @@
-# TensorSharp.Server API Examples
+# TensorSharp.Server.Host API Examples
 
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
-TensorSharp.Server provides three API styles plus a few utility endpoints:
+TensorSharp.Server.Host provides three API styles plus a few utility endpoints:
 
 - **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
 - **OpenAI-compatible** (`/v1/chat/completions`, `/v1/responses`, `/v1/models`)
 - **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`, `/api/skills`, `/api/image-edit`, `/api/image-edit/stream`)
 - **Utilities** (`/api/version`, `/api/queue/status`)
 
-Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The projector is **not auto-detected** by `TensorSharp.Server`. The Web UI and compatibility endpoints expose only that startup model/projector pair; `/api/models/load` can reload the same pair on a supported backend, but it cannot choose a model on a model-less server or switch to another file at runtime.
+Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The projector is **not auto-detected** by `TensorSharp.Server.Host`. The Web UI and compatibility endpoints expose only that startup model/projector pair; `/api/models/load` can reload the same pair on a supported backend, but it cannot choose a model on a model-less server or switch to another file at runtime.
 
 ## Current Contract
 
@@ -44,7 +44,7 @@ cd TensorSharp
 mkdir -p models
 curl -L --fail "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" \
   -o models/gemma-4-E4B-it-Q8_0.gguf
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Server -c Release \
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Server.Host -c Release \
   -p:TensorSharpSkipMlxNative=true -- \
   --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 128
 ```
@@ -68,7 +68,7 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-Open the bundled UI at **<http://localhost:5000>** — `GET /` serves `index.html` (the explicit `/index.html` URL still works). `GET /health` is the liveness endpoint and returns `"TensorSharp.Server is running"`; `GET /` returns that same response only on headless deployments that ship no `wwwroot` content.
+Open the bundled UI at **<http://localhost:5000>** — `GET /` serves `index.html` (the explicit `/index.html` URL still works). `GET /health` is the liveness endpoint and returns `"TensorSharp.Server.Host is running"`; `GET /` returns that same response only on headless deployments that ship no `wwwroot` content.
 
 ### Already-built or extracted application folder
 
@@ -76,32 +76,32 @@ Run the commands below from the repository root after building, or adapt the DLL
 
 ```bash
 # Text-only model
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal
 
 # Windows/Linux + NVIDIA, direct CUDA/cuBLAS backend
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend cuda
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend cuda
 
 # Windows/Linux + NVIDIA, GGML CUDA backend
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_cuda
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_cuda
 
 # Windows/Linux + AMD/Intel/NVIDIA GPU, GGML Vulkan backend (pick the device on multi-GPU hosts with --gpu-device; see --list-gpus)
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
 
 # Apple Silicon, MLX backend
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend mlx
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend mlx
 
 # Multimodal model (explicit projector)
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
     --mmproj ~/work/model/mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
 
 # DiffusionGemma text-diffusion model
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
-  dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
 # Override the default token budget (default 20000). It applies to every
 # endpoint — Web UI, Ollama and OpenAI — whenever a request omits max_tokens /
 # num_predict, and caps requests that ask for more.
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
 The API starts on `http://localhost:5000`; the Web UI is served from that same
@@ -111,10 +111,10 @@ variables — the Docker Space images set `PORT=7860`:
 
 ```bash
 # macOS note: port 5000 is taken by the AirPlay Receiver, so pick another one.
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend ggml_metal --port 8080
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --backend ggml_metal --port 8080
 
 # Bind loopback only, so the server is not reachable from other machines.
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host 127.0.0.1 --port 8080
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --host 127.0.0.1 --port 8080
 ```
 
 `--model` is required for inference. Starting with only `--backend` produces a
@@ -131,7 +131,7 @@ offline; Linux needs `bwrap` 0.12.0 or newer, while macOS uses its built-in
 Seatbelt sandbox:
 
 ```bash
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model <model.gguf> --backend ggml_cpu --host 127.0.0.1 --code-exec
 ```
 
@@ -612,7 +612,7 @@ Response:
 
 ### Chat Completions with Structured Outputs (`json_schema`)
 
-TensorSharp.Server accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, and validates the final output before returning it.
+TensorSharp.Server.Host accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, and validates the final output before returning it.
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -1090,7 +1090,7 @@ elsewhere — the encoder additionally needs `vocab.json` and `merges.txt` besid
 it, because its GGUF ships no tokenizer:
 
 ```bash
-TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
 ```
 
@@ -1172,7 +1172,7 @@ requests that omit `frames`/`fps`. At the model's native 24 fps, 121 frames is
 about five seconds of playback:
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 

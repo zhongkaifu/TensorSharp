@@ -11,6 +11,7 @@
   <Project Path="TensorSharp.Models/TensorSharp.Models.csproj" />
   <Project Path="TensorSharp.Runtime.Logging/TensorSharp.Runtime.Logging.csproj" Id="987c8976-2d64-44fa-a929-6d10e691b0cc" />
   <Project Path="TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
+  <Project Path="TensorSharp.Server.Host/TensorSharp.Server.Host.csproj" Id="18a9c46e-d0e1-4d4d-8b4f-664ce9b97831" />
   <Project Path="TensorSharp.Server/TensorSharp.Server.csproj" />
   <Project Path="TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj" />
 </Solution>

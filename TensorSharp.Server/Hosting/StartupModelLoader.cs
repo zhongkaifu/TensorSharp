@@ -12,7 +12,6 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Hosting
 {
@@ -23,7 +22,7 @@ namespace TensorSharp.Server.Hosting
     /// backend isn't available) so the process fails fast rather than serving
     /// 4xx/5xx responses for every request.
     /// </summary>
-    internal static class StartupModelLoader
+    public static class StartupModelLoader
     {
         public static void LoadIfConfigured(
             ServerHostingOptions options,

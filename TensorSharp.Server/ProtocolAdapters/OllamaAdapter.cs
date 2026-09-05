@@ -17,10 +17,6 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Models;
-using TensorSharp.Runtime;
-using TensorSharp.Runtime.Logging;
-using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Skills;
@@ -39,7 +35,7 @@ namespace TensorSharp.Server.ProtocolAdapters
     ///   <item><c>POST /api/chat/ollama</c> - multi-turn chat (NDJSON or JSON)</item>
     /// </list>
     /// </summary>
-    internal sealed class OllamaAdapter
+    public sealed class OllamaAdapter
     {
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;

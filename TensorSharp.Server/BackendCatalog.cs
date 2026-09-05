@@ -7,7 +7,7 @@ using TensorSharp.MLX;
 
 namespace TensorSharp.Server
 {
-    internal sealed record BackendOption(string Value, string Label);
+    public sealed record BackendOption(string Value, string Label);
 
     internal static class BackendCatalog
     {

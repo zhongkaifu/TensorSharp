@@ -5,8 +5,6 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System.Threading.Tasks;
-
 namespace TensorSharp.Server.Responses
 {
     /// <summary>
@@ -17,7 +15,7 @@ namespace TensorSharp.Server.Responses
     /// interface so a durable store can be swapped in later via DI without
     /// touching the adapter.
     /// </summary>
-    internal interface IResponsesStore
+    public interface IResponsesStore
     {
         void Store(StoredResponse response);
 

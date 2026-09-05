@@ -36,7 +36,7 @@ namespace TensorSharp.Server.Endpoints
     /// trusting the route to have done it.
     /// </para>
     /// </summary>
-    internal static class CodeArtifactEndpoints
+    public static class CodeArtifactEndpoints
     {
         /// <summary>The route artifacts are served under. Must match the runner's prefix.</summary>
         public const string RoutePrefix = "/api/code/artifacts";

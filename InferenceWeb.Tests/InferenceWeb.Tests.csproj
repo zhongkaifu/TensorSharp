@@ -29,7 +29,7 @@
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
     <ProjectReference Include="..\TensorSharp.AgentHost\TensorSharp.AgentHost.csproj" />
     <ProjectReference Include="..\TensorSharp.Models\TensorSharp.Models.csproj" />
-    <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
+    <ProjectReference Include="..\TensorSharp.Server.Host\TensorSharp.Server.Host.csproj" />
     <ProjectReference Include="..\TensorSharp.Cli\TensorSharp.Cli.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
     <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
@@ -70,13 +70,10 @@
     <GgmlNativeBinaryNameForTests Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryNameForTests>
     <GgmlNativeBinaryNameForTests Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryNameForTests>
   </PropertyGroup>
-  <Target Name="CopyGgmlNativeBinaryForTests" AfterTargets="Build"
-          Condition="'$(GgmlNativeBinaryNameForTests)' != ''">
+  <Target Name="CopyGgmlNativeBinaryForTests" AfterTargets="Build" Condition="'$(GgmlNativeBinaryNameForTests)' != ''">
     <ItemGroup>
-      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)"
-                          Condition="Exists('$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)')" />
-      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)"
-                          Condition="Exists('$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)')" />
+      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)" Condition="Exists('$(GgmlNativeBuildDirForTests)/$(GgmlNativeBinaryNameForTests)')" />
+      <GgmlNativeForTests Include="$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)" Condition="Exists('$(GgmlNativeBuildDirForTests)/Release/$(GgmlNativeBinaryNameForTests)')" />
     </ItemGroup>
     <Copy SourceFiles="@(GgmlNativeForTests)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>

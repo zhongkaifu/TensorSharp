@@ -16,7 +16,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Endpoints
 {
@@ -27,7 +26,7 @@ namespace TensorSharp.Server.Endpoints
     /// ship no <c>wwwroot</c> content), plus a SPA-style fallback that serves
     /// <c>index.html</c> for any path that doesn't match a route or static file.
     /// </summary>
-    internal static class HealthEndpoints
+    public static class HealthEndpoints
     {
         private const string LivenessMessage = "TensorSharp.Server is running";
 

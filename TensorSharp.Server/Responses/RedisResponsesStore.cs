@@ -26,7 +26,7 @@ namespace TensorSharp.Server.Responses
     /// bound enforced by <see cref="InMemoryResponsesStore"/> is replaced by
     /// Redis's own <c>maxmemory</c> eviction policy.
     /// </summary>
-    internal sealed class RedisResponsesStore : IResponsesStore, IDisposable
+    public sealed class RedisResponsesStore : IResponsesStore, IDisposable
     {
         private const string KeyPrefix = "tsresp:";
         private static readonly TimeSpan DefaultTtl = TimeSpan.FromHours(1);

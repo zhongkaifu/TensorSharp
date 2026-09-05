@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -9,23 +9,11 @@
     <PackageTags>$(TensorSharpPackageTags);server;aspnetcore;openai;ollama;web</PackageTags>
   </PropertyGroup>
   <ItemGroup>
+     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
   </ItemGroup>
-  <PropertyGroup>
-    <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
-    <GgmlNativeBuildDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
-    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
-    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
-    <GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
-    <MlxNativeInstallDir>$(MSBuildProjectDirectory)/../TensorSharp.Backends.MLX/Native/dist</MlxNativeInstallDir>
-    <MlxNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlxc.dylib</MlxNativeBinaryName>
-    <MlxNativeDependencyName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlx.dylib</MlxNativeDependencyName>
-    <MlxNativeJacclName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libjaccl.dylib</MlxNativeJacclName>
-    <!-- MLX's precompiled Metal kernels; mlx loads it from the directory holding
-         libmlx.dylib, so it has to travel with the dylibs. See
-         TensorSharp.Backends.MLX.csproj for the full rationale. -->
-    <MlxNativeMetallibName Condition="$([MSBuild]::IsOSPlatform('OSX'))">mlx.metallib</MlxNativeMetallibName>
-  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Runtime.Logging\TensorSharp.Runtime.Logging.csproj" />
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
@@ -36,25 +24,4 @@
     <ProjectReference Include="..\TensorSharp.Backends.MLX\TensorSharp.Backends.MLX.csproj" />
     <ProjectReference Include="..\TensorSharp.Distributed\TensorSharp.Distributed.csproj" />
   </ItemGroup>
-  <ItemGroup>
-    <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-  <Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">
-    <ItemGroup>
-      <GgmlNativeBinary Include="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')" />
-      <GgmlNativeBinary Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')" />
-    </ItemGroup>
-    <Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-  </Target>
-  <Target Name="CopyMlxNativeBinary" AfterTargets="Build" Condition="'$(MlxNativeBinaryName)' != ''">
-    <ItemGroup>
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeBinaryName)" Condition="Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)')" />
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeDependencyName)" Condition="'$(MlxNativeDependencyName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeDependencyName)')" />
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeJacclName)')" />
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)')" />
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)')" />
-      <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And !Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)') And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)')" />
-    </ItemGroup>
-    <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
-  </Target>
 </Project>

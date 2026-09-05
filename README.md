@@ -128,7 +128,7 @@ TensorSharp.Cli/bin/TensorSharp.Cli --model models/gemma-4-E4B-it-Q8_0.gguf --ba
     --tp-node-id 1 --tp-peers "192.168.1.10:9500,192.168.1.11:9500"
 ```
 
-`TensorSharp.Server` takes the same `--tp`, `--tp-node-id`, and `--tp-peers`
+`TensorSharp.Server.Host` takes the same `--tp`, `--tp-node-id`, and `--tp-peers`
 flags (or the `TENSORSHARP_TP_*` environment variables); in a multi-node
 cluster the server is node `0` — the driver that serves HTTP — and every other
 node runs a `TensorSharp.Cli` worker. Full reference:
@@ -138,7 +138,7 @@ node runs a `TensorSharp.Cli` worker. Full reference:
 Host the same model as a server (browser UI at <http://localhost:5000>, plus Ollama/OpenAI APIs):
 
 ```bash
-dotnet run --project TensorSharp.Server -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 512
+dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNative=true -- --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 512
 ```
 
 > The server binds `0.0.0.0:5000` by default (change it with `--port` / `--host`, or the `PORT` / `HOST` environment variables; on macOS port 5000 is taken by the AirPlay Receiver) with no built-in auth or TLS — keep it behind a firewall or an authenticated HTTPS reverse proxy. For image/video/audio add the companion [`mmproj-gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf) with `--mmproj`.
@@ -147,7 +147,7 @@ Both executables print their full option reference — description, default, ran
 
 ```bash
 dotnet run --project TensorSharp.Cli -c Release -- --help
-dotnet run --project TensorSharp.Server -c Release -- --help
+dotnet run --project TensorSharp.Server.Host -c Release -- --help
 ```
 
 Full command reference: **[CLI](USAGE.md#console-application)** · **[Server](USAGE.md#web-application)** · more models to download: **[Model Downloads](MODEL_DOWNLOADS.md)** · prefer a config file? **[config/](config/README.md)**.
@@ -268,7 +268,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
 | [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp / stable-diffusion.cpp tables |
 | [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |
-| [Server API examples](TensorSharp.Server/API_EXAMPLES.md) | Complete curl and Python examples for the server surface |
+| [Server API examples](TensorSharp.Server.Host/API_EXAMPLES.md) | Complete curl and Python examples for the server surface |
 
 ## Current Status
 

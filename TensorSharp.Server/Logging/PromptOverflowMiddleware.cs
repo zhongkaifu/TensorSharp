@@ -12,7 +12,7 @@ namespace TensorSharp.Server.Logging
     /// settable. Once the response has started, the exception is left to
     /// propagate.
     /// </summary>
-    internal static class PromptOverflowMiddleware
+    public static class PromptOverflowMiddleware
     {
         public static IApplicationBuilder UsePromptOverflowHandling(this IApplicationBuilder app)
         {

@@ -1,15 +1,15 @@
-# TensorSharp.Server API 示例
+# TensorSharp.Server.Host API 示例
 
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
-TensorSharp.Server 提供三种 API 风格以及若干工具型接口：
+TensorSharp.Server.Host 提供三种 API 风格以及若干工具型接口：
 
 - **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`）
 - **兼容 OpenAI**（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）
 - **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`、`/api/skills`、`/api/image-edit`、`/api/image-edit/stream`）
 - **工具型接口**（`/api/version`、`/api/queue/status`）
 
-启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` **显式**指定多模态投影器；`TensorSharp.Server` 不会自动探测投影器。Web UI 与兼容接口仅暴露启动时指定的模型 / 投影器组合；`/api/models/load` 可以用受支持的后端重新加载同一组合，但无模型启动时不能用它选择模型，也不能在运行时切换到其他文件。
+启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` **显式**指定多模态投影器；`TensorSharp.Server.Host` 不会自动探测投影器。Web UI 与兼容接口仅暴露启动时指定的模型 / 投影器组合；`/api/models/load` 可以用受支持的后端重新加载同一组合，但无模型启动时不能用它选择模型，也不能在运行时切换到其他文件。
 
 ## 当前契约
 
@@ -43,7 +43,7 @@ cd TensorSharp
 mkdir -p models
 curl -L --fail "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf?download=true" \
   -o models/gemma-4-E4B-it-Q8_0.gguf
-TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Server -c Release \
+TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet run --project TensorSharp.Server.Host -c Release \
   -p:TensorSharpSkipMlxNative=true -- \
   --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 128
 ```
@@ -65,7 +65,7 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-内置 UI 的地址是 **<http://localhost:5000>** —— `GET /` 直接返回 `index.html`（显式的 `/index.html` 地址同样可用）。`GET /health` 是存活检查接口，返回 `"TensorSharp.Server is running"`；只有在没有 `wwwroot` 内容的无界面部署中，`GET /` 才会返回同样的响应。
+内置 UI 的地址是 **<http://localhost:5000>** —— `GET /` 直接返回 `index.html`（显式的 `/index.html` 地址同样可用）。`GET /health` 是存活检查接口，返回 `"TensorSharp.Server.Host is running"`；只有在没有 `wwwroot` 内容的无界面部署中，`GET /` 才会返回同样的响应。
 
 ### 已构建或已解压的应用目录
 
@@ -73,32 +73,32 @@ curl -s http://localhost:5000/v1/chat/completions \
 
 ```bash
 # 仅文本模型
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal
 
 # Windows/Linux + NVIDIA，Direct CUDA/cuBLAS 后端
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend cuda
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend cuda
 
 # Windows/Linux + NVIDIA，GGML CUDA 后端
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_cuda
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_cuda
 
 # Windows/Linux + AMD/Intel/NVIDIA GPU，GGML Vulkan 后端（多 GPU 主机用 --gpu-device 选择设备；见 --list-gpus）
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_vulkan --gpu-device 0
 
 # Apple Silicon，MLX 后端
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend mlx
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend mlx
 
 # 多模态模型（显式指定投影器）
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/gemma-4-E4B-it-Q8_0.gguf \
     --mmproj ~/work/model/mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal
 
 # DiffusionGemma 文本扩散模型
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
-  dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
 # 覆盖默认 token 预算（默认 20000）。它对每个端点都生效 —— Web UI、Ollama
 # 与 OpenAI —— 只要请求省略了 max_tokens / num_predict 就采用该值，并且会把
 # 要得更多的请求钳制到该值。
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
 API 默认监听 `http://localhost:5000`；Web UI 就在同一个根地址上提供。
@@ -108,10 +108,10 @@ API 默认监听 `http://localhost:5000`；Web UI 就在同一个根地址上提
 
 ```bash
 # macOS 注意：5000 端口已被 AirPlay 接收器占用，请换一个端口。
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --backend ggml_metal --port 8080
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --backend ggml_metal --port 8080
 
 # 仅绑定环回地址，使服务无法被其他机器访问。
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host 127.0.0.1 --port 8080
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --host 127.0.0.1 --port 8080
 ```
 
 推理必须在启动时提供 `--model`。只传 `--backend` 可以启动一个无模型的状态服务，
@@ -125,7 +125,7 @@ dotnet TensorSharp.Server/bin/TensorSharp.Server.dll --model <model.gguf> --host
 或更高版本，macOS 则使用系统自带的 Seatbelt 沙箱：
 
 ```bash
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model <model.gguf> --backend ggml_cpu --host 127.0.0.1 --code-exec
 ```
 
@@ -592,7 +592,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 
 ### Chat Completions + 结构化输出（`json_schema`）
 
-TensorSharp.Server 接收 OpenAI Chat Completions 的 `response_format` 形式，会向 prompt 中注入严格 JSON 指令，并在返回前对最终输出进行校验。
+TensorSharp.Server.Host 接收 OpenAI Chat Completions 的 `response_format` 形式，会向 prompt 中注入严格 JSON 指令，并在返回前对最终输出进行校验。
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -1044,7 +1044,7 @@ MiniMax-H3 把视频和 32 kHz 立体声音轨当作同一个打包潜变量一�
 `merges.txt` 放在它旁边：
 
 ```bash
-TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
 ```
 
@@ -1119,7 +1119,7 @@ Wan 2.2 TI2V-5B 或 Wan 2.2 A14B）时，输入提示词即可生成 H.264 MP4�
 24 fps 生成 121 帧，播放时长约为五秒：
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 

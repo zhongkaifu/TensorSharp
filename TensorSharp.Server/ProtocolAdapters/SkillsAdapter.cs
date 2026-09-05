@@ -15,7 +15,6 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Runtime.Logging;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.Hosting;
 
@@ -36,7 +35,7 @@ namespace TensorSharp.Server.ProtocolAdapters
     /// <c>{error:"..."}</c>.
     /// </para>
     /// </summary>
-    internal sealed class SkillsAdapter
+    public sealed class SkillsAdapter
     {
         private readonly SkillRegistry _skills;
         private readonly ServerHostingOptions _options;

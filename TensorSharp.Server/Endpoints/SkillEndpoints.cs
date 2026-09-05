@@ -26,7 +26,7 @@ namespace TensorSharp.Server.Endpoints
     /// client's delivery-mode probe rely on.
     /// </para>
     /// </summary>
-    internal static class SkillEndpoints
+    public static class SkillEndpoints
     {
         public static IEndpointRouteBuilder MapSkillEndpoints(this IEndpointRouteBuilder endpoints)
         {

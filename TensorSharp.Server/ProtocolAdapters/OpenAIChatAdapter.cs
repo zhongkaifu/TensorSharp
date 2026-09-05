@@ -17,10 +17,6 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Models;
-using TensorSharp.Runtime;
-using TensorSharp.Runtime.Logging;
-using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.Skills;
@@ -40,7 +36,7 @@ namespace TensorSharp.Server.ProtocolAdapters
     /// non-streaming returns a single <c>chat.completion</c>) are highly
     /// interdependent and easier to follow when kept together.
     /// </summary>
-    internal sealed class OpenAIChatAdapter
+    public sealed class OpenAIChatAdapter
     {
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;

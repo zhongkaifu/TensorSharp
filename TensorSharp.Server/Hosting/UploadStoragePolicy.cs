@@ -16,7 +16,7 @@ namespace TensorSharp.Server.Hosting
     /// what it deletes. Files removed behind the server's back are only
     /// reconciled at the next restart.
     /// </summary>
-    internal sealed class UploadStoragePolicy
+    public sealed class UploadStoragePolicy
     {
         /// <summary>Default per-file cap; equals the Kestrel request-body limit, so it changes nothing until lowered.</summary>
         public const long DefaultMaxFileBytes = 500L * 1024 * 1024;

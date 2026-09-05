@@ -15,7 +15,7 @@ namespace TensorSharp.Server.Responses
     /// JSON body rather than the anonymous object graph so retrieval is just an
     /// echo of exactly what the client originally received.
     /// </summary>
-    internal sealed class StoredResponse
+    public sealed class StoredResponse
     {
         public required string Id { get; init; }
         public required string Json { get; init; }
