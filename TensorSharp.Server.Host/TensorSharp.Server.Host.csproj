@@ -12,6 +12,10 @@
   </PropertyGroup>
 
 	<ItemGroup>
+		<InternalsVisibleTo Include="InferenceWeb.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 

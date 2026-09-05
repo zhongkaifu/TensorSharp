@@ -8,12 +8,10 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System;
 using TensorSharp.AgentHost.Skills;
-using System.Collections.Generic;
-using System.IO;
+using TensorSharp.Server.Hosting;
 
-namespace TensorSharp.Server.Hosting
+namespace TensorSharp.Server.Host.Hosting
 {
     /// <summary>
     /// Informational entry points that print and exit before the web host is
@@ -732,7 +730,7 @@ namespace TensorSharp.Server.Hosting
 
         public static void PrintUsage(TextWriter writer)
         {
-            writer.WriteLine("Usage: TensorSharp.Server [options]");
+            writer.WriteLine("Usage: TensorSharp.Server.Host [options]");
             writer.WriteLine();
             writer.WriteLine("Hosts an OpenAI- and Ollama-compatible inference server (plus a built-in web chat UI)");
             writer.WriteLine("on http://0.0.0.0:5000 by default (change it with --port / --host). Run with no");

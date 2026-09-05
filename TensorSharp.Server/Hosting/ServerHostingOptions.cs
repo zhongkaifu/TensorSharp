@@ -127,7 +127,7 @@ namespace TensorSharp.Server.Hosting
         public string DefaultBackend { get; }
 
         /// <summary>Backends actually supported by this host (after probing the GGML runtime).</summary>
-        internal IReadOnlyList<BackendOption> SupportedBackends { get; }
+        public IReadOnlyList<BackendOption> SupportedBackends { get; }
 
         /// <summary>Fast lookup over <see cref="SupportedBackends"/>.</summary>
         internal HashSet<string> SupportedBackendValues { get; }
