@@ -295,7 +295,7 @@ builder.Services.AddSingleton<ICodeRunner>(sp => codeExecOptions.Enabled
     ? new CodeRunnerAdapter(
         new ShellRunner(
             codeExecOptions,
-            sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.CodeExec"),
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Host.CodeExec"),
             codeArtifactStore),
         codeExecOptions)
     : null!);
@@ -327,7 +327,7 @@ if (!string.IsNullOrEmpty(responsesRedisUrl))
 {
     builder.Services.AddSingleton<IResponsesStore>(sp =>
     {
-        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Responses.RedisResponsesStore");
+        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Host.Responses.RedisResponsesStore");
         var redis = new RedisConnection(responsesRedisUrl, logger);
         return new RedisResponsesStore(redis, logger);
     });
@@ -343,7 +343,7 @@ WebRootSetup.Resolve(builder.Environment, baseDirectory);
 var app = builder.Build();
 
 ILogger startupLogger = app.Services.GetRequiredService<ILoggerFactory>()
-    .CreateLogger("TensorSharp.Server.Startup");
+    .CreateLogger("TensorSharp.Server.Host.Startup");
 startupLogger.LogInformation(LogEventIds.LoggingInitialized,
     "Logging initialized: minimumLevel={MinimumLevel} fileLogging={FileLogging} logDir={LogDir}",
     resolvedLogLevel, hostingOptions.FileLoggingEnabled,
