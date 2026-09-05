@@ -111,9 +111,9 @@ namespace TensorSharp
             }
         }
 
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
-            Tensor o = obj as Tensor;
+            Tensor? o = obj as Tensor;
             if (o == null)
             {
                 return false;

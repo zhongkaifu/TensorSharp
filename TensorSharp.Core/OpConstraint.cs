@@ -13,7 +13,7 @@ namespace TensorSharp
 {
     public abstract class OpConstraint
     {
-        public abstract bool SatisfiedFor(object[] args);
+        public abstract bool SatisfiedFor(object?[] args);
     }
 
     public class ArgCountConstraint : OpConstraint
@@ -22,7 +22,7 @@ namespace TensorSharp
 
         public ArgCountConstraint(int argCount) { this.argCount = argCount; }
 
-        public override bool SatisfiedFor(object[] args)
+        public override bool SatisfiedFor(object?[] args)
         {
             return args.Length == argCount;
         }
@@ -41,7 +41,7 @@ namespace TensorSharp
             this.allowNull = allowNull;
         }
 
-        public override bool SatisfiedFor(object[] args)
+        public override bool SatisfiedFor(object?[] args)
         {
             if (allowNull && args[argIndex] == null)
             {
@@ -52,8 +52,9 @@ namespace TensorSharp
                 return false;
             }
 
-            Storage argStorage = ((Tensor)args[argIndex]).Storage;
-            return argStorage.GetType() == requiredType;
+            // it could be that args[argIndex] is null and allowNull is true,
+            Storage? argStorage = ((Tensor?)args[argIndex])?.Storage;
+            return argStorage?.GetType() == requiredType;
         }
     }
 }

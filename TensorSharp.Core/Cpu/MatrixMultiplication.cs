@@ -913,7 +913,7 @@ namespace TensorSharp.Cpu
             }
             else
             {
-                throw new NotSupportedException("CPU vector dot product with element type " + result.ElementType + " not supported");
+                throw new NotSupportedException("CPU vector dot product with element type " + writeTarget.ElementType + " not supported");
             }
 
             return writeTarget;
@@ -949,11 +949,11 @@ namespace TensorSharp.Cpu
             }
         }
 
-        public static Tensor Mul_M_V(Tensor result, Tensor lhs, Tensor rhs)
+        public static Tensor Mul_M_V(Tensor? result, Tensor lhs, Tensor rhs)
         {
             if (lhs.ElementType != rhs.ElementType || (result != null && result.ElementType != lhs.ElementType))
             {
-                throw new InvalidOperationException($"All tensors must have the same element type  lhs = '{lhs.ElementType}', rhs = '{rhs.ElementType}' result = '{result.ElementType}'");
+                throw new InvalidOperationException($"All tensors must have the same element type  lhs = '{lhs.ElementType}', rhs = '{rhs.ElementType}' result = '{(result == null ? "null": result.ElementType.ToString())}'");
             }
 
             if (result != null && (result.Storage is CpuStorage))
@@ -1009,7 +1009,7 @@ namespace TensorSharp.Cpu
                 }
                 else
                 {
-                    throw new NotSupportedException("CPU Matrix-Vector multiplication with element type " + result.ElementType + " not supported");
+                    throw new NotSupportedException("CPU Matrix-Vector multiplication with element type " + writeTarget.ElementType + " not supported");
                 }
             }
             finally
@@ -1268,9 +1268,9 @@ namespace TensorSharp.Cpu
             BlasOp bOp = default(BlasOp);
             bool copyC = false;
 
-            Tensor aClone = null;
-            Tensor bClone = null;
-            Tensor cClone = null;
+            Tensor? aClone = null;
+            Tensor? bClone = null;
+            Tensor? cClone = null;
 
 
             if (c.Strides[1] == 1 &&

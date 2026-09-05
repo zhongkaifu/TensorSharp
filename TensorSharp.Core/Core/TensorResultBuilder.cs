@@ -14,12 +14,12 @@ namespace TensorSharp.Core
     public static class TensorResultBuilder
     {
         // If a maybeResult is null, a new tensor will be constructed using the device id and element type of newTemplate
-        public static Tensor GetWriteTarget(Tensor maybeResult, Tensor newTemplate, bool requireContiguous, params long[] requiredSizes)
+        public static Tensor GetWriteTarget(Tensor? maybeResult, Tensor newTemplate, bool requireContiguous, params long[] requiredSizes)
         {
             return GetWriteTarget(maybeResult, newTemplate.Allocator, newTemplate.ElementType, requireContiguous, (ReadOnlySpan<long>)requiredSizes);
         }
 
-        public static Tensor GetWriteTarget(Tensor maybeResult, Tensor newTemplate, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
+        public static Tensor GetWriteTarget(Tensor? maybeResult, Tensor newTemplate, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
         {
             return GetWriteTarget(maybeResult, newTemplate.Allocator, newTemplate.ElementType, requireContiguous, requiredSizes);
         }
@@ -29,7 +29,7 @@ namespace TensorSharp.Core
             return GetWriteTarget(maybeResult, allocatorForNew, elementTypeForNew, requireContiguous, (ReadOnlySpan<long>)requiredSizes);
         }
 
-        public static Tensor GetWriteTarget(Tensor maybeResult, IAllocator allocatorForNew, DType elementTypeForNew, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
+        public static Tensor GetWriteTarget(Tensor? maybeResult, IAllocator allocatorForNew, DType elementTypeForNew, bool requireContiguous, ReadOnlySpan<long> requiredSizes)
         {
             if (maybeResult != null)
             {
