@@ -6,7 +6,7 @@
 #   1. Vulkan headers (vulkan_core.h / vulkan.hpp)         -> KhronosGroup/Vulkan-Headers
 #   2. A vulkan-1 import library to link against            -> generated from the
 #      system C:\Windows\System32\vulkan-1.dll with dumpbin/lib (MSVC)
-#   3. The glslc GLSL->SPIR-V compiler                      -> Google shaderc CI prebuilt
+#   3. The glslc GLSL->SPIR-V compiler                      -> pinned Google shaderc CI prebuilt
 # plus the SPIRV-Headers CMake package (find_package(SPIRV-Headers) in ggml).
 #
 # When a LunarG Vulkan SDK is installed (VULKAN_SDK env var) all of the above are
@@ -22,6 +22,14 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $ToolchainDir = Join-Path $RepoRoot "ExternalProjects\vulkan-toolchain"
+$ShadercDir = Join-Path $ToolchainDir "shaderc"
+$ShadercArtifactId = "windows-vs2022-amd64-release/continuous/36/20260731-122731"
+$ShadercArchiveUrl = "https://storage.googleapis.com/shaderc/artifacts/prod/graphics_shader_compiler/shaderc/$ShadercArtifactId/install.zip?generation=1785527613445501"
+$ShadercArchiveSha256 = "E311E9B6872C099089FCD00C7A596BA04B9F8F8162F215421DE6C24B4D90AFE9"
+$ShadercExecutableSha256 = "D35943F6DED799E16CA0280205EF151A20ABCFC9177ECC3FB924AA1B66915189"
+$ShadercArtifactStamp = Join-Path $ShadercDir "tensorsharp-artifact.txt"
+$ShadercBackupDir = Join-Path $ToolchainDir "shaderc-replacement-backup"
+$VulkanSdkIncompatibleMarker = Join-Path $ToolchainDir "vulkan-sdk-glslc-incompatible.marker"
 
 # Get-VisualStudioInstallation / Import-VcVarsEnvironment. A bare
 # `vswhere -latest` cannot be trusted (it silently skips installer instances
@@ -61,7 +69,7 @@ function Invoke-CMakeDefanged([string] $FailureMessage, [string[]] $Arguments) {
     if ($LASTEXITCODE -ne 0) { throw $FailureMessage }
 }
 
-function Test-VulkanSdkComplete {
+function Test-VulkanSdkFilesComplete {
     $sdk = $env:VULKAN_SDK
     if ([string]::IsNullOrWhiteSpace($sdk)) { return $false }
     return (Test-Path (Join-Path $sdk "Include\vulkan\vulkan.h")) -and
@@ -69,16 +77,108 @@ function Test-VulkanSdkComplete {
            (Test-Path (Join-Path $sdk "Bin\glslc.exe"))
 }
 
+function Test-GlslcCompatible([string] $CompilerPath) {
+    if (-not (Test-Path $CompilerPath)) { return $false }
+
+    # ggml specializes many Vulkan workgroup sizes through local_size_*_id and
+    # optimizes the resulting SPIR-V. shaderc continuous build 38 regressed this
+    # exact combination: compilation succeeds, but its integrated optimizer
+    # rejects LocalSizeId for a Vulkan 1.2 target. Keep the probe semantic so a
+    # corrupt or otherwise incompatible compiler is rejected before CMake starts
+    # generating hundreds of shaders.
+    $probeSource = @(
+        "#version 450",
+        "layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;",
+        "void main() {}"
+    )
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $probeOutput = $probeSource | & $CompilerPath -fshader-stage=compute --target-env=vulkan1.2 -O - -o NUL 2>&1
+        $probeExitCode = $LASTEXITCODE
+    }
+    catch {
+        $probeExitCode = 1
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    return $probeExitCode -eq 0
+}
+
+function Test-VulkanSdkComplete {
+    if (-not (Test-VulkanSdkFilesComplete)) { return $false }
+    return Test-GlslcCompatible (Join-Path $env:VULKAN_SDK "Bin\glslc.exe")
+}
+
+function Test-PinnedShaderc {
+    $compilerPath = Join-Path $ShadercDir "bin\glslc.exe"
+    if (-not (Test-Path $compilerPath)) { return $false }
+
+    try {
+        $compilerHash = (Get-FileHash -Path $compilerPath -Algorithm SHA256).Hash
+    }
+    catch {
+        return $false
+    }
+    if ($compilerHash -ne $ShadercExecutableSha256 -or -not (Test-GlslcCompatible $compilerPath)) {
+        return $false
+    }
+
+    # Backfill the marker for toolchains downloaded before the artifact was
+    # pinned. The executable hash above proves that this is the same build.
+    $stampedArtifact = if (Test-Path $ShadercArtifactStamp) { (Get-Content $ShadercArtifactStamp -Raw).Trim() } else { "" }
+    if ($stampedArtifact -ne $ShadercArtifactId) {
+        Set-Content -Path $ShadercArtifactStamp -Encoding ascii -Value $ShadercArtifactId
+    }
+    return $true
+}
+
 function Test-ToolchainComplete {
     return (Test-Path (Join-Path $ToolchainDir "Vulkan-Headers\include\vulkan\vulkan.h")) -and
            (Test-Path (Join-Path $ToolchainDir "loader\vulkan-1.lib")) -and
-           (Test-Path (Join-Path $ToolchainDir "shaderc\bin\glslc.exe")) -and
+           (Test-PinnedShaderc) -and
            (Test-Path (Join-Path $ToolchainDir "spirv-headers-install\share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"))
 }
 
+function Test-CompatibleToolchainComplete {
+    return (Test-Path (Join-Path $ToolchainDir "Vulkan-Headers\include\vulkan\vulkan.h")) -and
+           (Test-Path (Join-Path $ToolchainDir "loader\vulkan-1.lib")) -and
+           (Test-GlslcCompatible (Join-Path $ShadercDir "bin\glslc.exe")) -and
+           (Test-Path (Join-Path $ToolchainDir "spirv-headers-install\share\cmake\SPIRV-Headers\SPIRV-HeadersConfig.cmake"))
+}
+
+# A same-volume directory rename keeps the previous compiler recoverable while
+# the validated replacement is installed. If a prior process was interrupted
+# between those two renames, finish the rollback (or cleanup) before deciding
+# whether the toolchain is complete.
+if (Test-Path $ShadercBackupDir) {
+    if (-not (Test-Path $ShadercDir)) {
+        Write-Host "vulkan-toolchain: restoring shaderc cache after an interrupted replacement"
+        Move-Item $ShadercBackupDir $ShadercDir
+    }
+    elseif (Test-PinnedShaderc) {
+        Remove-Item -Recurse -Force $ShadercBackupDir
+    }
+    else {
+        Remove-Item -Recurse -Force $ShadercDir
+        Move-Item $ShadercBackupDir $ShadercDir
+    }
+}
+
 if (Test-VulkanSdkComplete) {
+    if (Test-Path $VulkanSdkIncompatibleMarker) { Remove-Item -Force $VulkanSdkIncompatibleMarker }
     Write-Host "vulkan-toolchain: using installed Vulkan SDK at $env:VULKAN_SDK"
     exit 0
+}
+if (Test-VulkanSdkFilesComplete) {
+    New-Item -ItemType Directory -Force -Path $ToolchainDir | Out-Null
+    Set-Content -Path $VulkanSdkIncompatibleMarker -Encoding ascii -Value $env:VULKAN_SDK
+    Write-Host "vulkan-toolchain: installed Vulkan SDK glslc failed the Vulkan 1.2 compatibility probe; using the portable compiler"
+}
+elseif (Test-Path $VulkanSdkIncompatibleMarker) {
+    Remove-Item -Force $VulkanSdkIncompatibleMarker
 }
 
 if (Test-ToolchainComplete) {
@@ -89,6 +189,17 @@ if (Test-ToolchainComplete) {
         Write-Host "vulkan-toolchain: already populated at $ToolchainDir"
     }
     exit 0
+}
+if (Test-Truthy $env:TENSORSHARP_GGML_NO_UPDATE) {
+    if (Test-CompatibleToolchainComplete) {
+        Write-Host "vulkan-toolchain: TENSORSHARP_GGML_NO_UPDATE set; using compatible existing toolchain at $ToolchainDir"
+        exit 0
+    }
+    $cachedCompiler = Join-Path $ShadercDir "bin\glslc.exe"
+    if ((Test-Path $cachedCompiler) -and -not (Test-GlslcCompatible $cachedCompiler)) {
+        throw ("TENSORSHARP_GGML_NO_UPDATE is set, but the cached glslc is incompatible with ggml's Vulkan 1.2 " +
+            "shader optimization. Clear TENSORSHARP_GGML_NO_UPDATE to let TensorSharp install the pinned compiler.")
+    }
 }
 
 Write-Host "vulkan-toolchain: provisioning portable Vulkan toolchain in $ToolchainDir"
@@ -135,56 +246,78 @@ if (-not (Test-Path (Join-Path $SpirvInstallDir "share\cmake\SPIRV-Headers\SPIRV
     Invoke-CMakeDefanged "SPIRV-Headers cmake install failed" @("--install", $SpirvBuildDir, "--config", "Release")
 }
 
-# --- 3. glslc (Google shaderc CI prebuilt) -----------------------------------
-$ShadercDir = Join-Path $ToolchainDir "shaderc"
-if (-not (Test-Path (Join-Path $ShadercDir "bin\glslc.exe"))) {
-    # The badge HTML is a meta-refresh redirect to the latest continuous build's
-    # install archive; extract the target URL from it. The advertised file name
-    # has changed over time (install.zip, then install.tgz) and has been seen
-    # naming an extension that does not actually exist in the bucket while a
-    # sibling archive does, so try the advertised URL first and then the known
-    # sibling names.
-    $badgeUrl = "https://storage.googleapis.com/shaderc/badges/build_link_windows_vs2022_amd64_release.html"
-    $badge = (Invoke-WebRequest -UseBasicParsing -Uri $badgeUrl).Content
-    if ($badge -notmatch 'url=(https://[^"'']+/install\.[a-z0-9.]+)') {
-        throw "Could not resolve the shaderc prebuilt download URL from $badgeUrl"
+# --- 3. glslc (pinned Google shaderc CI prebuilt) ----------------------------
+if (-not (Test-PinnedShaderc)) {
+    $cachedCompiler = Join-Path $ShadercDir "bin\glslc.exe"
+    if (Test-Path $cachedCompiler) {
+        Write-Host "vulkan-toolchain: cached glslc is not the compatible pinned build; replacing it"
     }
-    $advertisedUrl = $Matches[1]
-    $buildDirUrl = $advertisedUrl.Substring(0, $advertisedUrl.LastIndexOf('/'))
-    $candidateUrls = @($advertisedUrl, "$buildDirUrl/install.zip", "$buildDirUrl/install.tgz") | Select-Object -Unique
-    $archivePath = $null
-    foreach ($candidateUrl in $candidateUrls) {
-        $ext = if ($candidateUrl.EndsWith(".zip")) { "zip" } else { "tgz" }
-        $tryPath = Join-Path $ToolchainDir "shaderc-install.$ext"
-        try {
-            Write-Host "vulkan-toolchain: downloading glslc from $candidateUrl"
-            Invoke-WebRequest -UseBasicParsing -Uri $candidateUrl -OutFile $tryPath
-            $archivePath = $tryPath
-            $archiveExt = $ext
-            break
-        }
-        catch {
-            Write-Host "vulkan-toolchain: $candidateUrl not available: $($_.Exception.Message)"
-        }
-    }
-    if ($null -eq $archivePath) {
-        throw "Could not download the shaderc prebuilt from any of: $($candidateUrls -join ', ')"
-    }
+
+    # Do not follow shaderc's rolling "latest continuous" badge here. Build 38
+    # includes a glslang regression that emits LocalSizeId in a form shaderc's
+    # Vulkan 1.2 optimization path rejects. Build 36 predates that regression;
+    # pinning it also makes clean TensorSharp builds reproducible.
+    $archivePath = Join-Path $ToolchainDir "shaderc-install.zip"
     $extractDir = Join-Path $ToolchainDir "shaderc-extract"
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-    if ($archiveExt -eq "zip") {
+    try {
+        if (Test-Path $archivePath) {
+            $cachedArchiveHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
+            if ($cachedArchiveHash -eq $ShadercArchiveSha256) {
+                Write-Host "vulkan-toolchain: using verified cached shaderc archive at $archivePath"
+            }
+            else {
+                Remove-Item -Force $archivePath
+            }
+        }
+        if (-not (Test-Path $archivePath)) {
+            Write-Host "vulkan-toolchain: downloading pinned glslc from $ShadercArchiveUrl"
+            Invoke-WebRequest -UseBasicParsing -Uri $ShadercArchiveUrl -OutFile $archivePath
+        }
+
+        $archiveHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
+        if ($archiveHash -ne $ShadercArchiveSha256) {
+            throw "Pinned shaderc archive checksum mismatch (expected $ShadercArchiveSha256, got $archiveHash)."
+        }
+
         Expand-Archive -Path $archivePath -DestinationPath $extractDir
+        $stagedShadercDir = Join-Path $extractDir "install"
+        $stagedCompiler = Join-Path $stagedShadercDir "bin\glslc.exe"
+        if (-not (Test-Path $stagedCompiler)) {
+            throw "Pinned shaderc archive does not contain install\bin\glslc.exe."
+        }
+        $stagedCompilerHash = (Get-FileHash -Path $stagedCompiler -Algorithm SHA256).Hash
+        if ($stagedCompilerHash -ne $ShadercExecutableSha256) {
+            throw "Pinned glslc executable checksum mismatch (expected $ShadercExecutableSha256, got $stagedCompilerHash)."
+        }
+        if (-not (Test-GlslcCompatible $stagedCompiler)) {
+            throw "Pinned glslc failed the Vulkan 1.2 LocalSizeId optimization compatibility probe."
+        }
+
+        # Keep the previous cache under a sibling name until the validated tree
+        # is installed. The recovery block above rolls this back on the next run
+        # if the process is interrupted between the two same-volume renames.
+        $hadPreviousShaderc = Test-Path $ShadercDir
+        if ($hadPreviousShaderc) {
+            Move-Item $ShadercDir $ShadercBackupDir
+        }
+        try {
+            Move-Item $stagedShadercDir $ShadercDir
+            Set-Content -Path $ShadercArtifactStamp -Encoding ascii -Value $ShadercArtifactId
+        }
+        catch {
+            if (Test-Path $ShadercDir) { Remove-Item -Recurse -Force $ShadercDir }
+            if ($hadPreviousShaderc -and (Test-Path $ShadercBackupDir)) {
+                Move-Item $ShadercBackupDir $ShadercDir
+            }
+            throw
+        }
+        if (Test-Path $ShadercBackupDir) { Remove-Item -Recurse -Force $ShadercBackupDir }
     }
-    else {
-        New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-        tar -xzf $archivePath -C $extractDir
-        if ($LASTEXITCODE -ne 0) { throw "Extracting $archivePath failed with exit code $LASTEXITCODE" }
+    finally {
+        if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+        if (Test-Path $archivePath) { Remove-Item -Force $archivePath }
     }
-    if (Test-Path $ShadercDir) { Remove-Item -Recurse -Force $ShadercDir }
-    # The archive contains a single top-level "install" folder with bin/lib/include.
-    Move-Item (Join-Path $extractDir "install") $ShadercDir
-    Remove-Item -Recurse -Force $extractDir
-    Remove-Item -Force $archivePath
 }
 
 # --- 4. vulkan-1.lib import library ------------------------------------------
