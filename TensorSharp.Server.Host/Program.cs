@@ -8,16 +8,9 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System;
-using System.IO;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http.Features;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Logging;
-using System.Collections.Generic;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime;
@@ -28,6 +21,7 @@ using TensorSharp.Server.Logging;
 using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.Responses;
 using TensorSharp.Runtime.Redis;
+using TensorSharp.Server.Host.Hosting;
 
 const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
 
@@ -301,7 +295,7 @@ builder.Services.AddSingleton<ICodeRunner>(sp => codeExecOptions.Enabled
     ? new CodeRunnerAdapter(
         new ShellRunner(
             codeExecOptions,
-            sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.CodeExec"),
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Host.CodeExec"),
             codeArtifactStore),
         codeExecOptions)
     : null!);
@@ -328,12 +322,12 @@ builder.Services.AddSingleton<OllamaAdapter>();
 builder.Services.AddSingleton<OpenAIChatAdapter>();
 // Responses API store: use Redis when TS_RESPONSES_STORE_REDIS_URL is set,
 // otherwise fall back to the bounded in-memory cache.
-string responsesRedisUrl = Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")?.Trim();
+string? responsesRedisUrl = Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")?.Trim();
 if (!string.IsNullOrEmpty(responsesRedisUrl))
 {
     builder.Services.AddSingleton<IResponsesStore>(sp =>
     {
-        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Responses.RedisResponsesStore");
+        var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Server.Host.Responses.RedisResponsesStore");
         var redis = new RedisConnection(responsesRedisUrl, logger);
         return new RedisResponsesStore(redis, logger);
     });
@@ -349,7 +343,7 @@ WebRootSetup.Resolve(builder.Environment, baseDirectory);
 var app = builder.Build();
 
 ILogger startupLogger = app.Services.GetRequiredService<ILoggerFactory>()
-    .CreateLogger("TensorSharp.Server.Startup");
+    .CreateLogger("TensorSharp.Server.Host.Startup");
 startupLogger.LogInformation(LogEventIds.LoggingInitialized,
     "Logging initialized: minimumLevel={MinimumLevel} fileLogging={FileLogging} logDir={LogDir}",
     resolvedLogLevel, hostingOptions.FileLoggingEnabled,
@@ -393,7 +387,7 @@ if (redisFlagsApplied)
 if (specFlagsApplied)
 {
     var schedCfg = TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment();
-    string blockDraft = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
+    string? blockDraft = Environment.GetEnvironmentVariable("TS_DSV4_DSPARK");
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
         "Speculative decoding configured via CLI: enabled={Enabled} algorithm={Algorithm} maxDraft={MaxDraft} " +
         "pMin={PMin} draftModel={DraftModel} (engages for solo sequences)",

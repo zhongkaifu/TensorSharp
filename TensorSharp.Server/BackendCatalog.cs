@@ -7,9 +7,9 @@ using TensorSharp.MLX;
 
 namespace TensorSharp.Server
 {
-    internal sealed record BackendOption(string Value, string Label);
+    public sealed record BackendOption(string Value, string Label);
 
-    internal static class BackendCatalog
+    public static class BackendCatalog
     {
         // TensorSharp.Server should always expose the two CPU choices distinctly:
         // `ggml_cpu` is the native GGML CPU backend, while `cpu` is the pure C# backend.
@@ -56,7 +56,7 @@ namespace TensorSharp.Server
             return supportedBackends.FirstOrDefault()?.Value ?? canonicalBackend ?? configuredBackend;
         }
 
-        internal static string Canonicalize(string backend)
+        public static string Canonicalize(string backend)
         {
             if (string.IsNullOrWhiteSpace(backend))
                 return null;
@@ -120,7 +120,7 @@ namespace TensorSharp.Server
         /// The probe exceptions swallowed above, one <c>"ggml_metal: reason"</c> line
         /// per backend, so the startup banner's backend list carries a cause.
         /// </summary>
-        internal static IReadOnlyList<string> DescribeProbeFailures()
+        public static IReadOnlyList<string> DescribeProbeFailures()
         {
             lock (ProbeFailures)
             {

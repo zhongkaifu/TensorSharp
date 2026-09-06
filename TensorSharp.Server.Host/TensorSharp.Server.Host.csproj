@@ -1,0 +1,60 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+	  <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+	  <OutputPath>bin\</OutputPath>
+	  <IsPackable>true</IsPackable>
+	  <Description>ASP.NET Core server host package for TensorSharp with web UI plus Ollama and OpenAI-compatible APIs.</Description>
+	  <PackageTags>$(TensorSharpPackageTags);server;host;aspnetcore;openai;ollama;web</PackageTags>
+  </PropertyGroup>
+
+	<ItemGroup>
+		<InternalsVisibleTo Include="InferenceWeb.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+
+	<PropertyGroup>
+		<GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>
+		<GgmlNativeBuildDir Condition="$([MSBuild]::IsOSPlatform('Windows'))">$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build-windows</GgmlNativeBuildDir>
+		<GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Windows'))">GgmlOps.dll</GgmlNativeBinaryName>
+		<GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libGgmlOps.dylib</GgmlNativeBinaryName>
+		<GgmlNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libGgmlOps.so</GgmlNativeBinaryName>
+		<MlxNativeInstallDir>$(MSBuildProjectDirectory)/../TensorSharp.Backends.MLX/Native/dist</MlxNativeInstallDir>
+		<MlxNativeBinaryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlxc.dylib</MlxNativeBinaryName>
+		<MlxNativeDependencyName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmlx.dylib</MlxNativeDependencyName>
+		<MlxNativeJacclName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libjaccl.dylib</MlxNativeJacclName>
+		<!-- MLX's precompiled Metal kernels; mlx loads it from the directory holding
+         libmlx.dylib, so it has to travel with the dylibs. See
+         TensorSharp.Backends.MLX.csproj for the full rationale. -->
+		<MlxNativeMetallibName Condition="$([MSBuild]::IsOSPlatform('OSX'))">mlx.metallib</MlxNativeMetallibName>
+	</PropertyGroup>
+	<Target Name="CopyGgmlNativeBinary" AfterTargets="Build" Condition="'$(GgmlNativeBinaryName)' != ''">
+		<ItemGroup>
+			<GgmlNativeBinary Include="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')" />
+			<GgmlNativeBinary Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')" />
+		</ItemGroup>
+		<Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+	</Target>
+	<Target Name="CopyMlxNativeBinary" AfterTargets="Build" Condition="'$(MlxNativeBinaryName)' != ''">
+		<ItemGroup>
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeBinaryName)" Condition="Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)')" />
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeDependencyName)" Condition="'$(MlxNativeDependencyName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeDependencyName)')" />
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeJacclName)')" />
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)" Condition="'$(MlxNativeJacclName)' != '' And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeJacclName)')" />
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)')" />
+			<MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And !Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)') And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)')" />
+		</ItemGroup>
+		<Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+	</Target>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TensorSharp.Server\TensorSharp.Server.csproj" />
+  </ItemGroup>
+
+</Project>

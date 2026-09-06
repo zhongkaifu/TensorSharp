@@ -20,7 +20,7 @@ namespace TensorSharp.Server.Endpoints
     /// an instance method on <see cref="OllamaAdapter"/>; behaviour lives in
     /// the adapter so the routing table stays trivially auditable.
     /// </summary>
-    internal static class OllamaEndpoints
+    public static class OllamaEndpoints
     {
         public static IEndpointRouteBuilder MapOllamaEndpoints(this IEndpointRouteBuilder endpoints)
         {

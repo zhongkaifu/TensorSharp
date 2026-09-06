@@ -22,7 +22,7 @@ namespace TensorSharp.Server.Hosting
     /// folder relative to the executable. If neither exists we fall back to a
     /// fresh empty directory so the server can still start.
     /// </summary>
-    internal static class WebRootSetup
+    public static class WebRootSetup
     {
         public static void Resolve(IWebHostEnvironment environment, string baseDirectory)
         {

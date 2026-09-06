@@ -20,9 +20,6 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Models;
-using TensorSharp.Runtime;
-using TensorSharp.Runtime.Logging;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.Endpoints;
@@ -48,7 +45,7 @@ namespace TensorSharp.Server.ProtocolAdapters
     /// service, queue, session manager, configuration, loggers). That means a
     /// single instance can be reused across requests and easily faked in tests.
     /// </summary>
-    internal sealed class WebUiAdapter
+    public sealed class WebUiAdapter
     {
         private readonly ModelService _svc;
         private readonly InferenceQueue _queue;

@@ -1,8 +1,8 @@
-# TensorSharp.Server 集成测试
+# TensorSharp.Server.Host 集成测试
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-这些测试套件用于覆盖 TensorSharp.Server 当前对外的兼容接口：
+这些测试套件用于覆盖 TensorSharp.Server.Host 当前对外的兼容接口：
 
 - Web UI SSE：`/api/chat`
 - Ollama 聊天兼容接口：`/api/chat/ollama`
@@ -23,7 +23,7 @@
 ## 快速开始
 
 1. 在仓库根目录下载推荐的公开 Gemma 4 E4B 模型，并通过已验证的原生 GGML
-   快速路径启动 TensorSharp.Server，使用
+   快速路径启动 TensorSharp.Server.Host，使用
    [ggml-org 仓库](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF)
    中的 E4B Q8_0 家族。此方式需要完整的 [.NET 10 SDK](../../DEVELOPMENT_zh-cn.md#安装-net-10-sdk)
    而不只是 Runtime，此外还需要 Git 与 Python（用于 `hf` 下载命令行工具）。复制并运行这些命令约需 30 秒；下载 7.48 GiB 模型以及
@@ -34,7 +34,7 @@
 python -m pip install -U huggingface_hub
 hf download ggml-org/gemma-4-E4B-it-GGUF gemma-4-E4B-it-Q8_0.gguf --local-dir models
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 128
 ```
 
@@ -54,7 +54,7 @@ Windows/Linux + NVIDIA 可使用 `--backend cuda` 或 `--backend ggml_cuda`，Wi
 2. 运行任一套件：
 
 ```bash
-cd TensorSharp.Server/testdata
+cd TensorSharp.Server.Host/testdata
 
 # Bash 套件（依赖 curl + jq）
 bash test_multiturn.sh
@@ -102,7 +102,7 @@ python3 test_multiturn.py
 
 ## 注意事项
 
-- 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server 当前模拟的兼容范围内。
+- 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server.Host 当前模拟的兼容范围内。
 - 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 或 `think` 同时使用时预期返回 HTTP `400`。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
 - DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。

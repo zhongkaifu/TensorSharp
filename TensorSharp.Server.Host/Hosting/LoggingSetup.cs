@@ -8,11 +8,10 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System;
-using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Logging;
+using TensorSharp.Server.Hosting;
 
-namespace TensorSharp.Server.Hosting
+namespace TensorSharp.Server.Host.Hosting
 {
     /// <summary>
     /// Wires up the application's logging providers. Console logging is left to
@@ -49,11 +48,11 @@ namespace TensorSharp.Server.Hosting
             builder.SetMinimumLevel(minimumLevel);
         }
 
-        private static LogLevel? ParseLogLevel(string raw)
+        private static LogLevel? ParseLogLevel(string? raw)
         {
             if (string.IsNullOrWhiteSpace(raw))
                 return null;
-            return Enum.TryParse(raw, ignoreCase: true, out LogLevel parsed) ? parsed : (LogLevel?)null;
+            return Enum.TryParse(raw, ignoreCase: true, out LogLevel parsed) ? parsed : null;
         }
     }
 }

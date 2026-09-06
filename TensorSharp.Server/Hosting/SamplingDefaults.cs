@@ -22,7 +22,7 @@ namespace TensorSharp.Server.Hosting
     /// value for it is never fighting an operator decision.
     /// </summary>
     [Flags]
-    internal enum SamplingField
+    public enum SamplingField
     {
         None = 0,
         Temperature = 1 << 0,
@@ -41,7 +41,7 @@ namespace TensorSharp.Server.Hosting
     /// Who wins when a request carries a sampling parameter the operator also
     /// pinned on the server.
     /// </summary>
-    internal enum SamplingPrecedence
+    public enum SamplingPrecedence
     {
         /// <summary>Server-pinned values win; unpinned parameters still come from the request.</summary>
         Config = 0,
@@ -70,7 +70,7 @@ namespace TensorSharp.Server.Hosting
     /// them), so under <see cref="SamplingPrecedence.Config"/> the pinned ones
     /// are added to the request's list instead of overwriting it.
     /// </summary>
-    internal sealed class SamplingDefaults
+    public sealed class SamplingDefaults
     {
         public SamplingDefaults(
             SamplingConfig values,

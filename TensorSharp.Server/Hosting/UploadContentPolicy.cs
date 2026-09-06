@@ -15,7 +15,7 @@ namespace TensorSharp.Server.Hosting
     /// server's origin — and unlisted extensions are rejected at upload and
     /// unmapped (404) when served.
     /// </summary>
-    internal static class UploadContentPolicy
+    public static class UploadContentPolicy
     {
         private const string TextPlain = "text/plain; charset=utf-8";
 
@@ -99,7 +99,7 @@ namespace TensorSharp.Server.Hosting
             new FileExtensionContentTypeProvider(Extensions.ToDictionary(
                 kv => kv.Key, kv => kv.Value.ContentType, StringComparer.OrdinalIgnoreCase));
 
-        internal static StaticFileOptions BuildStaticFileOptions(string uploadDirectory) => new()
+        public static StaticFileOptions BuildStaticFileOptions(string uploadDirectory) => new()
         {
             FileProvider = new PhysicalFileProvider(uploadDirectory),
             RequestPath = "/uploads",

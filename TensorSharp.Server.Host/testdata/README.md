@@ -1,8 +1,8 @@
-# TensorSharp.Server Integration Tests
+# TensorSharp.Server.Host Integration Tests
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-The test suites exercise TensorSharp.Server's current public compatibility surface:
+The test suites exercise TensorSharp.Server.Host's current public compatibility surface:
 
 - Web UI SSE: `/api/chat`
 - Ollama chat compatibility: `/api/chat/ollama`
@@ -23,7 +23,7 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 ## Quick Start
 
 1. From a checkout root, download the recommended public Gemma 4 E4B model and
-   start TensorSharp.Server on the verified native GGML fast path, using the
+   start TensorSharp.Server.Host on the verified native GGML fast path, using the
    E4B Q8_0 family from the
    [ggml-org repository](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF).
    This needs the [.NET 10 SDK](../../DEVELOPMENT.md#install-the-net-10-sdk),
@@ -37,7 +37,7 @@ The scripts auto-detect the loaded model architecture and skip thinking or tool-
 python -m pip install -U huggingface_hub
 hf download ggml-org/gemma-4-E4B-it-GGUF gemma-4-E4B-it-Q8_0.gguf --local-dir models
 TENSORSHARP_GGML_NATIVE_ENABLE_CUDA=ON dotnet build TensorSharp.slnx -c Release -p:TensorSharpSkipMlxNative=true
-dotnet TensorSharp.Server/bin/TensorSharp.Server.dll \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --max-tokens 128
 ```
 
@@ -59,7 +59,7 @@ projector explicitly with `--mmproj`.
 2. Run either suite:
 
 ```bash
-cd TensorSharp.Server/testdata
+cd TensorSharp.Server.Host/testdata
 
 # Bash suite (requires curl + jq)
 bash test_multiturn.sh
@@ -107,7 +107,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 
 ## Notes
 
-- The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server currently emulates here.
+- The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server.Host currently emulates here.
 - Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` or `think` are expected to return HTTP `400`.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
 - DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames.

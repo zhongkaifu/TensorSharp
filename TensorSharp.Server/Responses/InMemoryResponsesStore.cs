@@ -26,7 +26,7 @@ namespace TensorSharp.Server.Responses
     /// <see cref="MemoryCacheOptions.SizeLimit"/>, which evicts under memory
     /// pressure once the limit is hit.
     /// </summary>
-    internal sealed class InMemoryResponsesStore : IResponsesStore, IDisposable
+    public sealed class InMemoryResponsesStore : IResponsesStore, IDisposable
     {
         private const int DefaultMaxEntries = 1000;
         private static readonly TimeSpan DefaultTtl = TimeSpan.FromHours(1);

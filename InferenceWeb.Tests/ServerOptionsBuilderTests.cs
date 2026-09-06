@@ -8,16 +8,10 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using TensorSharp.Runtime;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.Runtime.Scheduling;
-using TensorSharp.AgentHost.Skills;
-using TensorSharp.Runtime.Speculative;
 using TensorSharp.Server.Hosting;
+using TensorSharp.Server.Host.Hosting;
 
 namespace InferenceWeb.Tests;
 

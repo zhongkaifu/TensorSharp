@@ -42,7 +42,7 @@ namespace TensorSharp.Server.Logging
     /// Nothing about the exception reaches the client.
     /// </para>
     /// </summary>
-    internal static class ApiExceptionMiddleware
+    public static class ApiExceptionMiddleware
     {
         /// <summary>
         /// Assembly prefix identifying a body the server could not read. Matched

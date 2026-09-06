@@ -14,7 +14,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using TensorSharp.Runtime;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.AgentHost.Skills;
@@ -27,7 +26,7 @@ namespace TensorSharp.Server.Hosting
     /// helpers and probing the host for supported backends), which makes it easy
     /// to test without spinning up a web app.
     /// </summary>
-    internal static class ServerOptionsBuilder
+    public static class ServerOptionsBuilder
     {
         private const int DefaultMaxTokensFallback = 20000;
 

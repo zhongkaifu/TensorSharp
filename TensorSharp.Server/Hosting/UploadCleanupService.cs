@@ -3,7 +3,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using TensorSharp.Runtime.Logging;
 
 namespace TensorSharp.Server.Hosting
 {
@@ -15,7 +14,7 @@ namespace TensorSharp.Server.Hosting
     /// one sweep also runs at startup to clear files that expired while the
     /// server was down.
     /// </summary>
-    internal sealed class UploadCleanupService : BackgroundService
+    public sealed class UploadCleanupService : BackgroundService
     {
         private readonly UploadStoragePolicy _uploads;
         private readonly ILogger _logger;

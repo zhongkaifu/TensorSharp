@@ -18,7 +18,7 @@ namespace TensorSharp.Server.Endpoints
     /// <summary>
     /// Routes for the OpenAI-compatible chat-completions surface.
     /// </summary>
-    internal static class OpenAIEndpoints
+    public static class OpenAIEndpoints
     {
         public static IEndpointRouteBuilder MapOpenAIEndpoints(this IEndpointRouteBuilder endpoints)
         {

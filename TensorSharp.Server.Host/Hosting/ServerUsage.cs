@@ -8,12 +8,10 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
-using System;
 using TensorSharp.AgentHost.Skills;
-using System.Collections.Generic;
-using System.IO;
+using TensorSharp.Server.Hosting;
 
-namespace TensorSharp.Server.Hosting
+namespace TensorSharp.Server.Host.Hosting
 {
     /// <summary>
     /// Informational entry points that print and exit before the web host is
@@ -22,7 +20,7 @@ namespace TensorSharp.Server.Hosting
     /// (<c>--list-gpus</c>). Kept out of <see cref="ServerOptionsBuilder"/> so
     /// the option parser stays pure and testable.
     /// </summary>
-    internal static class ServerUsage
+    public static class ServerUsage
     {
         public static bool IsHelpRequested(string[] args)
         {
@@ -99,7 +97,7 @@ namespace TensorSharp.Server.Hosting
             ("Network", new[]
             {
                 new OptionHelp("--port <N>",
-                    "TCP port to listen on (1-65535). Default: 5000 (PORT env var overrides). On macOS, port 5000 is " +
+                    $"TCP port to listen on (1-65535). Default: {ServerHostingOptions.DefaultPort} (PORT env var overrides). On macOS, port 5000 is " +
                     "taken by the AirPlay Receiver in Control Center, so pick another port or turn that off.",
                     "--port 8080"),
                 new OptionHelp("--host <address>",
@@ -732,7 +730,7 @@ namespace TensorSharp.Server.Hosting
 
         public static void PrintUsage(TextWriter writer)
         {
-            writer.WriteLine("Usage: TensorSharp.Server [options]");
+            writer.WriteLine("Usage: TensorSharp.Server.Host [options]");
             writer.WriteLine();
             writer.WriteLine("Hosts an OpenAI- and Ollama-compatible inference server (plus a built-in web chat UI)");
             writer.WriteLine("on http://0.0.0.0:5000 by default (change it with --port / --host). Run with no");
