@@ -29,7 +29,7 @@ namespace TensorSharp
             OpName = opName;
         }
 
-        protected static object InvokeRegisteredMethod(object instance, MethodInfo method, object[] args)
+        protected static object? InvokeRegisteredMethod(object instance, MethodInfo method, object?[] args)
         {
             try
             {

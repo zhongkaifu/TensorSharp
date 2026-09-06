@@ -24,7 +24,7 @@ namespace TensorSharp.Cpu
 
 
         // allArgs should start with a null placeholder for the RNG object
-        private static void InvokeWithRng(int? seed, MethodInfo method, params object[] allArgs)
+        private static void InvokeWithRng(int? seed, MethodInfo method, params object?[] allArgs)
         {
             if (!seed.HasValue)
             {

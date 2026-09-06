@@ -116,7 +116,7 @@ namespace TensorSharp
 
     public static class DTypeBuilder
     {
-        public static DType FromCLRType(Type type)
+        public static DType FromCLRType(Type? type)
         {
             if (type == typeof(Half))
             {

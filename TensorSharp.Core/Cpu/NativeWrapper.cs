@@ -20,7 +20,9 @@ namespace TensorSharp.Cpu
     {
         public static MethodInfo GetMethod(string name)
         {
-            return typeof(CpuOpsNative).GetMethod(name, BindingFlags.Public | BindingFlags.Static);
+            var method = typeof(CpuOpsNative).GetMethod(name, BindingFlags.Public | BindingFlags.Static);
+            ArgumentNullException.ThrowIfNull(method);
+            return method;
         }
 
         public static Tensor InvokeNullableResultElementwise(MethodInfo method, params object[] args)
@@ -80,7 +82,7 @@ namespace TensorSharp.Cpu
             return resultTensor;
         }
 
-        public static void InvokeTypeMatch(MethodInfo method, params object[] args)
+        public static void InvokeTypeMatch(MethodInfo method, params object?[] args)
         {
             IEnumerable<Tensor> tensors = args.OfType<Tensor>();
             if (tensors.Any())
@@ -112,7 +114,7 @@ namespace TensorSharp.Cpu
             });
         }
 
-        public static void Invoke(MethodInfo method, params object[] args)
+        public static void Invoke(MethodInfo method, params object?[] args)
         {
             List<TensorRef64> freeListTensor = new List<TensorRef64>();
             List<IntPtr> freeListPtr = new List<IntPtr>();
@@ -140,8 +142,7 @@ namespace TensorSharp.Cpu
                 }
 
                 //return method.Invoke(null, args);
-                int result = (int)method.Invoke(null, args);
-                if (result != 0)
+                if (method.Invoke(null, args) is not int result  || result != 0)
                 {
                     throw new ApplicationException(GetLastError());
                 }
@@ -168,7 +169,7 @@ namespace TensorSharp.Cpu
             }
         }
 
-        private static string GetLastError()
+        private static string? GetLastError()
         {
             IntPtr strPtr = CpuOpsNative.TS_GetLastError();
             return Marshal.PtrToStringAnsi(strPtr);

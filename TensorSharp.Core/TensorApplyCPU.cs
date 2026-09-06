@@ -710,7 +710,8 @@ namespace TensorSharp
 
 			}
 
-			ApplyDim2(result, indices, dim, func);
+			// the assumption here is that the result and indices are not null. The compiler can't guarantee this because of the null tests in the if() statement above.
+			ApplyDim2(result!, indices!, dim, func);
 		}
 
 

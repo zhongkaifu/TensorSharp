@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <OutputType>Library</OutputType>
@@ -13,7 +13,7 @@
          TensorSharp.Core, so consumer `using` statements are unaffected.
          Do not "fix" this back to the default without checking id ownership. -->
     <PackageId>TensorSharp.Tensors</PackageId>
-    <Nullable>disable</Nullable>
+    <Nullable>enable</Nullable>
     <Description>Core tensor primitives, CPU operations, memory management, storage, and device abstractions for TensorSharp.</Description>
     <PackageTags>$(TensorSharpPackageTags);core;ops;memory;device;cpu</PackageTags>
   </PropertyGroup>

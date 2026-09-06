@@ -14,14 +14,14 @@ using System.Reflection;
 
 namespace TensorSharp
 {
-    public delegate object OpHandler(object[] args);
+    public delegate object? OpHandler(object?[] args);
 
     public static class OpRegistry
     {
         private class OpInstance
         {
-            public OpHandler handler;
-            public IEnumerable<OpConstraint> constraints;
+            public required OpHandler handler;
+            public required IEnumerable<OpConstraint> constraints;
         }
 
         private static readonly Dictionary<string, List<OpInstance>> opInstances = new Dictionary<string, List<OpInstance>>();
@@ -38,7 +38,7 @@ namespace TensorSharp
         {
             OpInstance newInstance = new OpInstance() { handler = handler, constraints = constraints };
 
-            if (opInstances.TryGetValue(opName, out List<OpInstance> instanceList))
+            if (opInstances.TryGetValue(opName, out List<OpInstance>? instanceList))
             {
                 instanceList.Add(newInstance);
             }
@@ -61,13 +61,13 @@ namespace TensorSharp
         ///
         /// Null (and therefore free) unless a backend opts in.
         /// </summary>
-        public static Action<object[]> PreInvokeHook;
+        public static Action<object?[]>? PreInvokeHook;
 
-        public static object Invoke(string opName, params object[] args)
+        public static object? Invoke(string opName, params object?[] args)
         {
             PreInvokeHook?.Invoke(args);
 
-            if (opInstances.TryGetValue(opName, out List<OpInstance> instanceList))
+            if (opInstances.TryGetValue(opName, out List<OpInstance>? instanceList))
             {
                 foreach (OpInstance instance in instanceList)
                 {
@@ -96,7 +96,8 @@ namespace TensorSharp
 
                 foreach (Type type in types)
                 {
-                    object instance = Activator.CreateInstance(type);
+                    object? instance = Activator.CreateInstance(type);
+                    ArgumentNullException.ThrowIfNull(instance);
 
                     IEnumerable<Tuple<MethodInfo, IEnumerable<RegisterOp>>> methods = type.MethodsWithAttribute<RegisterOp>(false);
                     foreach (Tuple<MethodInfo, IEnumerable<RegisterOp>> method in methods)
