@@ -46,7 +46,8 @@ head 尺寸，而不是 576 宽的缓存行。
 要把 `glm5next` 跑到纯 C# 后端上，一共修了四处问题，其中三处是静默失败或干脆跑不完，
 而不是干净地报错：
 
-- **NoPE MLA。** GLM-5.3 的 `rope.dimension_count = 0`：任何地方都没有 rope 分量，
+- **NoPE MLA。** GLM-5.3-Flash 的 `rope.dimension_count = 0`：任何地方都没有 rope
+  分量（非 Flash 的 GLM-5.3 仍然是 base 8e6、`n_rot` 64 的 RoPE NORM），
   `n_nope == n_embd_head_k`，压缩后的 latent 本身就是整行缓存。GLM-5.2 的路径会把每个
   head 拆成 NoPE 段与 RoPE 段，于是切出了一个零宽切片并抛异常。现在
   `GlmDsaModel.Attention` 与 `ggml_ops_glm_dsa.cpp` 中的 `hp.n_rot == 0` 分支保持一致：
@@ -91,8 +92,8 @@ token 上比较两个执行器）：
 对 `This is a simple arithmetic question. The user wants a brief answer. 2`）而推理内容
 一致的原因。在 2 bit 下，逐算子执行器与融合执行器会因为很小的数值差异选到不同的专家，
 这与 `TS_BATCHED_FUSED_DECODE` 默认关闭是同一个效应。0.96 的余弦与这个解释相符，但并不
-构成证明：它低于更高精度 checkpoint 应有的 ~0.999，而机器上没有更高精度的 GLM-5.3 GGUF
-可作对照。请把托管路径当作用于 A/B 的参考实现，而不是逐位对齐的实现。
+构成证明：它低于更高精度 checkpoint 应有的 ~0.999，而机器上没有更高精度的
+GLM-5.3-Flash GGUF 可作对照。请把托管路径当作用于 A/B 的参考实现，而不是逐位对齐的实现。
 
 分片 GGUF 由 `GgufFile` 自己处理（`split.count` / `-00001-of-000NN`），因此仓库里
 任何模型现在都可以跨多个文件存放。
@@ -109,9 +110,10 @@ token 上比较两个执行器）：
 切分的是层*内部*的权重，于是 decode 时每张卡只需要读 1/N 的权重，而不是依次走完全部。
 切分方式沿用仓库其它模型一致的 Megatron column/row 模式：
 
-GLM 5.x 的原生张量并行执行器对 GLM-5.2 与 GLM-5.3-Flash **都只支持本地单进程**。
-它不会加入跨节点的 `ITensorParallelGroup`，因此 `--tp-node-id` / `--tp-peers`
-不能让这条路径变成分布式运行。
+GLM 5.x 的原生张量并行执行器对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
+**都只支持本地单进程**。它不会加入跨节点的 `ITensorParallelGroup`，因此
+`--tp-node-id` / `--tp-peers` 不能让这条路径变成分布式运行——整个 GLM 系列都会在
+构建模型之前直接拒绝这两个参数。
 
 | 部件 | 切法 | 集合通信 |
 |---|---|---|
@@ -417,7 +419,7 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 | `TS_GLM_MOE_MMAP` | 1 | 置 0 则复制主机端专家，而不是映射 GGUF |
 | `TS_GLM_TP_SHARD` | 3 | 张量并行切法：1 head，2 路由专家，3 两者 |
 | `TS_GLM_TP_OVERSUBSCRIBE` | 0 | 置 1 允许多个张量并行 rank 共用一张 GPU（仅用于正确性测试） |
-| `TS_GLM_TP_FUSED` | 自动 | GLM-5.3 的完整本地 GPU 配置满足条件时使用并发的按 rank 分段计算图；置 0 强制走组合调度器诊断回退。CPU MoE、tracing、部分切分、超额 rank 或缺少原生超连接内核时也会自动回退 |
+| `TS_GLM_TP_FUSED` | 自动 | GGML 上 GLM-5.3-Flash 的本地 TP：完整本地 GPU 配置满足条件时使用并发的按 rank 分段计算图；置 0 强制走组合调度器诊断回退。CPU MoE、tracing、部分切分、超额 rank 或缺少原生超连接内核时也会自动回退 |
 | `TS_GLM_BATCHED_DECODE` | 1 | 置 0 让原生侧拒绝所有批量 decode，强制走逐序列路径 |
 | `TS_GLM_TRACE` | — | 层号列表（或 `all`），按 `llama-eval-callback` 的排版打印逐层激活和 |
 | `TS_GLM_BD_DEBUG` | 0 | 置 1 打印每一步批量 decode 的过程（涉及哪些 slot、图是复用还是重建、走到哪一步） |
@@ -445,8 +447,12 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 GLM-5.3（非 Flash）与 GLM-5.2 是同一套架构，因此上文内容对它原样适用：
 `general.architecture` 为 `glm-dsa`，`block_count` 为 79（78 层主干 + 1 个
 NextN），256 个路由专家 top-8 外加 1 个共享专家，带 lightning indexer 的 MLA，
-`rope.freq_base` 8e6，`context_length` 1M。它不需要新代码路径，也不需要新开关
-——就是 GLM-5.2 的加载器。
+`rope.freq_base` 8e6，`context_length` 1M——这个对外宣称的数字只是上限，实际会被
+压到设备真正装得下的大小（见[上下文长度](#上下文长度)）。它不需要新代码路径，也
+不需要新开关——就是 GLM-5.2 的加载器。沿用过来的是架构，而不是那些数字：上文每一处
+实测都是在 GLM-5.2 的 checkpoint 上跑的；`--backend cpu` 那一节——那四处修复、
+0.9567 的 prefill 余弦以及那张 tok/s 表——是 GLM-5.3-**Flash**（`glm5next`）的数字，
+非 Flash 的 GLM-5.3 在托管路径上从来没有任何实测。
 
 实际使用中有两点差异，均直接读自已发布的 GGUF：
 
@@ -477,9 +483,33 @@ NextN），256 个路由专家 top-8 外加 1 个共享专家，带 lightning in
   `NextN/MTP draft head ready (block 78, ...)` 那一行属于托管逐算子路径
   （`TS_GLM_NATIVE=0`），GPU 运行时不会出现。
 
+`--tp N` 本身在 GLM-5.3 上同样被接受，约束与家族其它成员完全一致——仅本地单进程
+——但它只是一个被接受的模式，而不是一个已验证的配置：GLM-5.3 的 checkpoint 上从未
+跑过 `--tp N > 1`，唯一记录在案的算术是一次装不下——`--tp 8` 每个 rank 要 41.7 GiB，
+而卡是 46 GB——原因就是每个 rank 都各自持有一份完整长度的 MLA 与 indexer 缓存。
+
 UD-Q2_K_XL 量化下 checkpoint 为 7 个分片共 236.4 GiB，因此需要一台**合计**显存
 能装下它并为 KV 缓存留出余量的机器——按权重算至少要 8 张 45 GiB A40 中的 6 张，
 实际用满 8 张。
+
+### 实测
+
+8× A40 46 GB（无 NVLink，CUDA 12.8）、GLM-5.3 UD-Q2_K_XL、10,531 token 的提示与
+300 个 decode token，三次重复取中位数（每次换一份新的提示正文），两个引擎都按整层
+放置：
+
+| 项目 | llama.cpp | TensorSharp |
+|---|---:|---:|
+| prefill tok/s | 未记录 | 251.6 t/s |
+| decode tok/s | 20.28 t/s | **20.48 t/s** |
+| 加载耗时 | 753 s | **264 s** |
+
+**decode 打平**——20.48 对 20.28，差距在 1% 以内——而 TensorSharp 加载这个
+236.4 GiB 的 checkpoint **快 2.9 倍**。prefill 是它落后的一项，而且真正的比较口径
+是首 token 时延而非 tok/s：那次 llama.cpp 的运行发生在客户端尚未在流中请求 usage
+之前，因此没有自己的提示 token 计数。同一条提示上 TensorSharp 的首 token 为
+**41.9 s**（41.85 / 41.86 / 42.07），llama.cpp 为 **29.0 s**（29.01 / 29.05 /
+31.23），约**慢 1.4 倍**。完整记录与方法见[跨引擎报告](../validation/cross-engine-2026-09/README.md)。
 
 ## GLM-5.3-Flash（`glm5next`）
 
@@ -515,7 +545,7 @@ KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无�
 | rank 汇合 | 注意力的 rank 局部隐状态会在非线性 Sinkhorn 超连接之前归约。分段快路径先归约路由专家局部输出，再由每个 rank 在本地计算并加入其复制的共享专家，然后进入超连接 |
 | 不切分的工作 | 超连接、池化 indexer、router、norm、稠密层、共享专家与 embedding 都保持不切分。分段路径按 rank 复制这些计算；output norm 与 LM head 留在 rank 0。组合调度器回退路径则只在 rank 0 计算并加入一次共享专家 |
 
-GLM 5.x 的原生 TP 路径在 GGML GPU 后端上对 GLM-5.2 与 GLM-5.3-Flash
+GLM 5.x 的原生 TP 路径在 GGML GPU 后端上对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
 都只支持本地单进程，不支持分布式或跨节点运行。
 
 GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）、每张本地 GPU 一个 rank、
@@ -565,7 +595,7 @@ llama.cpp 自己的 top-2 边距也只有约 0.13 logit，候选集完全相同�
 
 ### 对话格式
 
-GLM-5.3 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
+GLM-5.3-Flash 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
 总是以 `<think>` 开启，历史轮次保留思考内容（`clear_thinking` 默认 false）。
 工具调用与 GLM-5.2 相同的 XML 元素形式。图像渲染为
 `<|begin_of_image|><|image|><|end_of_image|>`，宿主把 `<|image|>` 展开为合并

@@ -229,7 +229,7 @@ them. The full context is in the [V4 card](models/deepseek4.md) and the
 |---|---|---|---|---|
 | `TS_DSV4_NGPU` | V4 and V4.1 | How many GPUs the layer split spreads whole layers over — the same thing `--tp N` sets for these architectures. `0` selects every visible device | `0` (all visible) | no |
 | `TS_DSV4_UBATCH` | V4 and V4.1 | Prefill micro-batch width | `256` in the conservative profile; the measured eight-A40 V4.1 profile uses `1024` | no |
-| `TS_DSV4_THREADS` | V4 and V4.1 | Native thread pool for GPU-only loads. CPU expert offload uses the detected available parallelism instead, and `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` sets that | min(cores, 32) | no |
+| `TS_DSV4_THREADS` | V4 and V4.1 | Native thread pool for GPU-only loads. CPU expert offload uses the detected available parallelism instead, and `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` sets that. On the pure-C# `--backend cpu` executor it sizes that executor's own worker pool and defaults to `ProcessorCount` rather than min(cores, 32) | min(cores, 32) | no |
 | `TS_DSV4_PERF` | V4 and V4.1 | `1` prints per-stage timing | off | no |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 and V4.1 | Placement headroom, graph-cache depth, weight-load parallelism, and whether host-resident experts are multiplied in place out of the GGUF mapping | see the cards | no |
 | `TS_DSV4_DSPARK` | V4 only | DSpark drafter GGUF, equivalent to `--draft-model`. V4.1 rejects V4 drafters — it has no DSpark path | unset | no |

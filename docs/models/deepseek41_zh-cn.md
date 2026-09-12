@@ -8,7 +8,10 @@ TensorSharp 为 V4.1 提供了**运行在 `ggml_cuda` 上的专用推理计算�
 结论需要以[验证报告](../deepseek41_validation.md)中记录的实测产物为准。
 同一套计算图也能在 `--backend ggml_cpu` 上加载，但那条路径是为了在没有 GPU 时运行
 和检查该架构，而不是拿来对外服务——见
-[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)。
+[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)。还有第二条不需要 GPU 的路径，而且
+完全不带 ggml、也不依赖任何原生库：`--backend cpu` 用纯 C# 的
+`DeepSeek4CpuExecutor` 跑 V4.1，用托管代码实现同一套计算图，并对齐 PyTorch 参考实现。
+两者都是正确性与可移植性通道，而不是服务通道——见[后端](#后端)。
 
 [官方模型](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)声明的架构是
 `DeepseekV41ForCausalLM`。它的文本网络有 40 层、hidden size 5120、64 个 query head
@@ -340,6 +343,18 @@ staging 以 64 MiB 为单位分组；单张更大的表沿用此前的一表分�
 而不是一次明确的请求；启动时会逐个列出它作用到的设备。在你的硬件上实测之前，请把它
 当作可移植性与正确性通道。
 
+`--backend cpu` 根本不是 ggml 后端：它是纯 C# 的 `DeepSeek4CpuExecutor`，不依赖任何
+原生库，也不需要 GPU，并且实现了完整的 V4.1 计算图——比例 1 与比例 2 的块压缩器、
+共享的压缩 cache 与索引器 cache（含 lightning indexer 的 top-k）、候选块剪枝、
+Engram 表、延迟 hyper-connection 门控、共享专家，以及检查点里训练好的 cache 量化
+（原始行 FP8 E4M3、索引器 MXFP4、压缩 cache NVFP4）。它以 atol=rtol=2e-5 对齐独立的
+PyTorch 参考实现 `eng/dsv41-reference.py`，并要求贪心 argmax 完全一致，覆盖一次性
+prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对齐，而不是在已发布权重上
+的等价。Direct CUDA 引擎 `--backend cuda` 同样用自己的内核、不经 ggml 运行 V4.1，但还
+没有数值门禁。和 `ggml_cpu` 一样，这两条都是正确性与可移植性通道，而不是服务通道；
+细节见[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)的末尾。`--backend mlx` 仍然被
+拒绝。
+
 ### 每张 GPU 一个后端
 
 DeepSeek 架构专属的算子（压缩器、注意力前后处理、MoE 路由与归约、带 clamp 的 SwiGLU、
@@ -530,9 +545,28 @@ CUDA 上一样是必需的，缺少它时会在读取任何权重之前拒绝加
 `CUDA` 加载的——那会把一张 GPU 拉进一次明确要求纯 CPU 的运行里；现在，没有 ggml 注册
 名的后端会按名字被拒绝，而不是被硬着头皮尝试。
 
-`--backend cpu` 依然是另一回事，也依然被拒绝：那是纯 C# 执行器
-（`DeepSeek4CpuExecutor`），它实现的是 V4 的计算图，不是 V4.1 的。直接 CUDA 的 V4
-引擎 `--backend cuda` 出于同样的原因被拒绝。
+`--backend cpu` 是纯 C# 执行器（`DeepSeek4CpuExecutor`），它如今除 V4 之外也实现了
+V4.1 的计算图：比例 1 与比例 2 的压缩器、共享的压缩 cache 与索引器 cache、候选剪枝、
+Engram 表、延迟 hyper-connection 门控，以及训练好的 cache 量化。
+`InferenceWeb.Tests.Dsv41CpuExecutorTests` 以 atol=rtol=2e-5 把它对齐到
+`eng/dsv41-reference.py`，覆盖一次性 prefill、分块大小 1/3/5/8 与 reset。那道门禁是
+fixture 规模的——一个五层、hidden 256、16 token 的 F32 合成模型——因此它确立的是与参考
+实现在架构层面的一致，而不是在已发布的 246 GiB Q2_K 权重上的等价；而且不设置
+`TS_DSV41_FIXTURE_DIR` 指向 fixture 目录时，这些测试会静默返回，什么都不检查。与
+`--backend ggml_cpu` 不同，它不接受视觉伴随文件：那个编码器是原生 ggml 组件，在这里
+`LoadVisionEncoder` 会抛异常，所以图像与视频输入不可用。原生加载器的 Engram 与注意力
+开关——`TS_DSV41_ENGRAM_WARM`、`_THREADS`、`_RANDOM`、`_SIDECAR`、
+`TS_DSV41_SPARSE_FA`、`TS_DSV41_COMPACT_RAW_GATHER`——在这里全部无效，但准备好的
+`deepseek41.engram.bin` sidecar 仍然是必需的；`TS_DSV4_THREADS` 在这个后端上默认取
+`ProcessorCount`，而不是 min(核数, 32)；`TS_DSV4_CPU_TRACE_DIR` 写出的逐张量文件与
+`eng/dsv41-reference.py --output` 写出的同名，于是两个目录可以逐张量对拍。和
+`--backend ggml_cpu` 一样，它是正确性与可移植性通道，而不是服务通道：完整检查点在它
+上面的吞吐、加载时间与常驻内存占用都没有测过。
+
+Direct CUDA 引擎 `--backend cuda` 也用自己的内核、不经 ggml 运行 V4.1。它还没有数值
+门禁——已经验证了什么、还有什么挡着，见
+[CUDA 后端说明](../validation/deepseek41-cuda-backend/README.md)。`--backend mlx`
+仍然被拒绝。
 
 ## 前向计算图与状态
 

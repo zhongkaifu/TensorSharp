@@ -18,8 +18,6 @@
   <h1>Agentic Work</h1>
   <p class="lede">TensorSharp.AgentHost turns a local model response into a bounded <strong>generate → inspect → run → repair → answer</strong> loop. It can load Agent Skills only when they are needed, work with files through five built-in code tools, run checks inside an OS sandbox, and return finished artifacts to an ordinary CLI, Web UI, Ollama, or OpenAI client.</p>
 
-  <div class="callout note"><div class="ic">🏷️</div><p><strong>Release boundary (verified 2026-09-01):</strong> <a href="https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0" target="_blank" rel="noopener">v3.3.0.0</a> is the latest tagged release and has prebuilt CLI/server archives. AgentHost was added in the current source after that tag; build the current source until a later release explicitly includes it.</p></div>
-
   <h2 id="flow">What happens in one turn</h2>
   <ol class="steps">
     <li><h3>Advertise capabilities cheaply</h3><p>TensorSharp puts only each reachable skill's name and description in the prompt. A selected skill is preferred and made reachable; selection does <em>not</em> load its instructions.</p></li>

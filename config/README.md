@@ -184,7 +184,7 @@ Notes:
   keys now fail with a message naming the replacement). Any drafter that ships
   as its own GGUF — Gemma's assistant head, a DFlash/DSpark block drafter — is
   named by `"draft-model"`, and naming it is the request: no `"spec": true`
-  needed beside it. Qwen3.6 and GLM 5.2 embed theirs in the trunk, so
+  needed beside it. Qwen3.6, GLM 5.2 and GLM-5.3 embed theirs in the trunk, so
   `"spec": true` is all they need. `"spec-type": "ngram"` needs no drafter at
   all, so it works with any config in this folder.
 - **Image-edit** configs run the DiT pipeline: `--image in.png --prompt "…" --output

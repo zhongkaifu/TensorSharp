@@ -40,6 +40,22 @@ knowing before you plan around them.
   architecture. First cut: text only, single device, generic per-op path, no
   tools and no thinking. See the [model card](models/hunyuan-dense.md).
 
+GLM-5.3 is not on that list because it needed no new architecture: the non-Flash
+release is the same `glm-dsa` block shape as GLM-5.2 — 79 blocks (78 trunk plus
+one NextN), 256 routed experts at top-8 with one shared expert, MLA with the
+lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path with no new
+code and no new flag. It is text only ([unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)
+publishes no mmproj at any quant, and `LoadVisionEncoder` warns and ignores an
+`--mmproj` on `glm-dsa` rather than failing the run), `--spec` engages on the
+default layer split rather than under `--tp` because the `blk.78` NextN block
+ships no LM head of its own and borrows the trunk LM head, which `--tp` splits
+column-wise, and UD-Q2_K_XL is 236.4 GiB across seven shards. Measured against
+llama.cpp on 8x A40 46 GB — 10,531-token prompt, 300 decode tokens, median of 3,
+whole-layer placement — it is a decode tie (20.48 vs 20.28 t/s) with a 2.9×
+faster load of that 236.4 GiB checkpoint (264 s vs 753 s) and a slower TTFT
+(41.9 s vs 29.0 s); see the [cross-engine report](validation/cross-engine-2026-09/README.md)
+beside the [GLM card](models/glm.md#glm-53-glm-dsa).
+
 ### TensorAgent and iOS
 
 TensorAgent is a .NET MAUI iOS/iPadOS application that runs the TensorSharp engine locally. It links the native GGML library as an iOS `.xcframework`, uses `ggml_metal` on physical devices, and shares the host-neutral chat pipeline (`TensorSharp.Chat`) with the CLI and server. The iOS target is enabled with `TensorSharpIosTargets=true`; it is not a separate numerical backend or a remote inference service.
