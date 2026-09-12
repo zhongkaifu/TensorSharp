@@ -83,7 +83,7 @@
   </div>
   <p>规律很清楚：TensorSharp 的融合整模型图在约 2K 以下的 prefill 上领先 1.16-1.27×，两个引擎在 2K 到 16K 之间交叉，再往上 llama.cpp 保持 6-8% 的 prefill 优势；decode 在短上下文时打平，到 128K 降到 0.86×。启用 <strong>DFlash</strong> 投机解码后，TensorSharp 在短与中等提示上领先，从 16K 起落后——但这个差距主要来自运行期的<em>成本调控器</em>：一次误判的探测会让它暂停起草；在保持启用的那些重复里，TensorSharp 在 16K 达到 llama.cpp 的 94%、64K 达到 96%。DFlash 的绝对数字还高度依赖语料（501 token 那一点在<em>两个</em>引擎上都是 100% 接受率）。两个引擎都能在单卡上跑满 128K。两行长上下文有一个说明：它们是在换行符归一化修复落地之前测的，因此在这两个点上 TensorSharp prefill 的是同一文档的 CRLF 形式（多 1.2% 的 token）；吞吐是速率，影响很小，但那里两侧生成的续写并不严格可比。方法、逐次重复的离散度、显存与调控器分析见 <a href="models_zh-cn.html#table">Muse-Glimmer 架构卡片</a>（<code>docs/models/muse-glimmer_zh-cn.md</code>）。</p>
 
-  <h2 id="glm">GLM-5.2 744B：规模的另一端</h2>
+  <h2 id="glm">GLM 5.x：规模的另一端</h2>
   <p>第二组手工对比，这次跑的是单卡装不下的模型：<strong>3× RTX PRO 6000 Blackwell（各 97 GiB，PCIe，无 NVLink）</strong>，<code>GLM-5.2-UD-IQ2_XXS</code>（744B-A40B MoE，MLA + DeepSeek 稀疏注意力，218 GiB 权重按层切分到三张卡上），两个引擎在同一次会话里背靠背测量——llama.cpp 用 <code>llama-bench</code>，TensorSharp 用对拍工具的 <code>--bench</code>，同样取两次重复中的较好值。这些数字的重复间波动约 4%。</p>
   <div class="table-scroll">
   <table>
@@ -99,6 +99,21 @@
   </div>
   <p>交叉点大约落在一千个提示 token 上，原因就是微批：256 个专家 top-8 的情况下，一个 512 token 的分块平均只给每个专家路由约 16 行，于是每个专家 GEMM 的 tile 大部分都是填充，把分块调大比图上任何其他改动都更管用。再往下，一整次 prefill 就是一张小图，每次调用的固定开销——托管层的一跳、输入上传、154,880 宽的 logits 回拷——占比明显，llama.cpp 那几个百分点就来自这里。Decode 受访存约束，两边都是各领先几个百分点。除了计时也校验输出：在同一后端上，TensorSharp 与 llama.cpp 逐 token 一致——<code>ggml_cuda</code> 上 6/6 条录制提示，<code>ggml_cpu</code> 上 3/3，100% 托管的 <code>cpu</code> 后端上 1/1。</p>
   <p>有两件事在这台机器上<em>不会</em>让它变快。<code>--tp 3</code> 把 pp2048 / tg64 从 915.9 / 43.9 拉到 505.6 / 17.6——78 层里每层都要两次 <code>[6144, n_tokens]</code> 隐状态的 all-reduce，没有 NVLink 的 PCIe 付不起这笔账。<code>--n-cpu-moe 30</code> 则拉到 94.7 / 16.4。它们存在的意义是让原本装不下的权重能跑起来：卸载把加载器能定下的上下文从 342,272 抬到 646,400 token。参见 <a href="models-text_zh-cn.html#glm">GLM 5.x</a>。</p>
+
+  <h3>GLM-5.3 在 8× A40 上：decode 打平，加载快 2.9×</h3>
+  <p>GLM-5.3（非 Flash）与 GLM-5.2 是同一套 <code>glm-dsa</code> 块结构 —— 79 个块（78 层主干加一个 NextN）、256 个路由专家 top-8 外加一个共享专家、带 lightning indexer 的 MLA、rope base 8e6 —— 所以它就走上面这条路径加载，不需要新代码，也不需要新开关；又因为 llama.cpp 注册了 <code>glm-dsa</code>，这个模型确实存在可比的参考列（GLM-5.3-Flash 则不行：它的 <code>glm5next</code> 需要尚未合入主线的 llama.cpp 构建 2e0e57f / PR #27754 才能对比）。测量环境是 <strong>8× A40 46 GB（无 NVLink，CUDA 12.8）</strong>、<code>GLM-5.3 UD-Q2_K_XL</code>、10,531 token 的提示与 300 个 decode token，三次重复取中位数、每次换一份新的提示正文，两个引擎都按整层切分放置：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>指标</th><th>llama.cpp</th><th>TensorSharp</th></tr></thead>
+    <tbody>
+      <tr><td>Prefill（10,531 个提示 token）</td><td>未记录</td><td>251.6 tok/s</td></tr>
+      <tr><td>Decode（300 token）</td><td>20.28 tok/s</td><td>20.48 tok/s</td></tr>
+      <tr><td>首 token 时延</td><td><strong>29.0 s</strong></td><td>41.9 s</td></tr>
+      <tr><td>加载（236.4 GiB，7 个分片）</td><td>753 s</td><td><span class="yes"><strong>264 s</strong></span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置（TensorSharp 用 <code>--tp 1</code> 选它）；<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/validation/cross-engine-2026-09/README.md" target="_blank" rel="noopener"><code>docs/validation/cross-engine-2026-09/README.md</code></a>。</p>
 
   <h2 id="minimax-h3">MiniMax-H3：视频与音频一次生成</h2>
   <p>MiniMax-H3 在同一个打包潜变量里对画面和原生 <strong>32&nbsp;kHz 立体声</strong>音轨一起去噪，因此下面每个数字都是同时产出两者的一次完整运行。同一条 22 帧、8 步的请求在两台机器上对 <strong><code>stable-diffusion.cpp</code></strong> 做过测量，而<strong>两者的结论并不一致</strong>。两组数据都列在下面，各自标明硬件；它们互不取代，把两者平均出来的数字不对应任何一台真实存在的机器。</p>
@@ -224,7 +239,8 @@
   <h2 id="testing">测试</h2>
   <p>下方构建与测试命令需要<a href="getting-started_zh-cn.html#install-dotnet">按平台安装的 .NET 10 SDK</a>；运行命令前请先验证安装。</p>
   <h3>单元测试（xUnit）</h3>
-  <p><code>InferenceWeb.Tests</code> 测试无需运行服务器的进程内行为：托管量化运算、直接 CUDA 与 MLX 后端内核（在硬件可用时）、分页 KV 调度、批量执行器正确性、各模型批量前向与 legacy 路径的一致性、MTP / NextN 推测解码正确性、DiffusionGemma 探针、编解码器往返、提示词渲染，以及服务器 CLI 选项构建器。</p>
+  <p><code>InferenceWeb.Tests</code> 测试无需运行服务器的进程内行为：托管量化运算、直接 CUDA 与 MLX 后端内核（在硬件可用时）、分页 KV 调度、批量执行器正确性、各模型批量前向与 legacy 路径的一致性、MTP / NextN 推测解码正确性、纯 C# DeepSeek V4.1 执行器对独立 PyTorch 参考实现的数值门控、DiffusionGemma 探针、编解码器往返、提示词渲染，以及服务器 CLI 选项构建器。</p>
+  <p>其中 V4.1 那一项值得展开说。<code>InferenceWeb.Tests.Dsv41CpuExecutorTests</code> 把 <code>DeepSeek4CpuExecutor</code>（<code>--backend cpu</code> 跑 DeepSeek V4.1 Flash 所用的 100% 纯 C# 执行器，不依赖 ggml、不依赖原生库、不依赖 GPU）对齐到独立的 PyTorch 参考实现 <code>eng/dsv41-reference.py</code>，容差 <code>atol=rtol=2e-5</code>，并要求贪心 argmax 完全一致，覆盖一次性 prefill、分块 prefill（块大小 1/3/5/8，逐位置检查）与 reset。有两条注意事项必须一起交代：这些测试在<strong>未设置 <code>TS_DSV41_FIXTURE_DIR</code> 时会静默返回</strong>；而 fixture 是刻意做小的 —— 五层、256 隐藏维、16 token 的 F32 合成模型 —— 因此它证明的是与参考实现的架构级一致，而不是真实 246 GiB Q2_K 权重上的 CPU/CUDA 一致性。它是正确性与可移植性路径，而非服务路径，这也是它只出现在这里、不出现在上面任何表格里的原因：<code>--backend cpu</code> 上跑完整 V4.1 权重的吞吐、加载时间与常驻内存都从未测量过。</p>
   <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>
 
   <h3>服务器集成测试</h3>

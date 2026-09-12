@@ -26,6 +26,19 @@ TensorSharp 是面向 GGUF 模型的原生 .NET 10 推理引擎。当前源码�
   Hy-MT2 GGUF 才不会因架构未注册而加载失败。第一版：仅文本、单设备、走通用 per-op
   路径，没有工具调用也没有思考模式。见[模型卡片](models/hunyuan-dense_zh-cn.md)。
 
+GLM-5.3 不在上面这份清单里，是因为它不需要新架构：非 Flash 版与 GLM-5.2 是同一套
+`glm-dsa` 块形态——79 块（78 层主干加一个 NextN）、256 个路由专家 top-8 外加一个共享
+专家、带 lightning indexer 的 MLA、rope base 8e6——因此无需新代码也无需新标志，直接
+走 GLM-5.2 的加载路径。它仅文本（[unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)
+在任何量化档都没有发布 mmproj，`LoadVisionEncoder` 在 `glm-dsa` 上遇到 `--mmproj` 只会
+告警并忽略，而不是让这次运行失败）；`--spec` 只在不传 `--tp`（即默认按层切分）时生效，
+因为 `blk.78` 的 NextN 块没有自己的 LM head，只能借用主干的 LM head，而 `--tp` 会把它
+按列切开；UD-Q2_K_XL 为 236.4 GiB、分成七个分片。在 8x A40 46 GB 上与 llama.cpp 实测
+对比（10,531 token 的 prompt、300 个 decode token、三次取中位数、按整层放置）：decode
+打平（20.48 对 20.28 t/s），加载这份 236.4 GiB 检查点快 2.9×（264 秒对 753 秒），而
+TTFT 更慢（41.9 秒对 29.0 秒）；见[跨引擎报告](validation/cross-engine-2026-09/README.md)
+与[GLM 卡片](models/glm_zh-cn.md#glm-53glm-dsa)。
+
 ### TensorAgent 与 iOS
 
 TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS 应用，在设备本地运行 TensorSharp 引擎。它把原生 GGML 作为 iOS `.xcframework` 链接进来，在真机上使用 `ggml_metal`，并与 CLI、服务端共享与宿主无关的聊天流水线（`TensorSharp.Chat`）。iOS 目标通过 `TensorSharpIosTargets=true` 启用；它不是独立的数值后端，也不是远程推理服务。

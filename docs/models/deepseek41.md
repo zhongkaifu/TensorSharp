@@ -9,7 +9,11 @@ the implemented path and its limits. Model-quality and performance claims need
 the measured artifacts tracked in the [validation report](../deepseek41_validation.md).
 The same graph also loads on `--backend ggml_cpu`, which exists to run and check
 the architecture without a GPU rather than to serve it — see
-[Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend).
+[Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend). A second
+GPU-free option carries no ggml and no native library at all: `--backend cpu`
+runs V4.1 on the pure-C# `DeepSeek4CpuExecutor`, which implements this same
+graph in managed code and is held to the PyTorch oracle. Both are correctness
+and portability paths, not serving paths — see [Backends](#backends).
 
 The [official model](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 declares `DeepseekV41ForCausalLM`. Its text network has 40 layers, hidden size
@@ -417,6 +421,22 @@ originally closed was a silent fallback onto whichever GPU enumerated first, not
 an explicit request; startup names each device it applies to. Treat it as a
 portability and correctness path until it has been measured on your hardware.
 
+`--backend cpu` is not a ggml backend at all: it is the pure-C#
+`DeepSeek4CpuExecutor`, with no native library and no GPU, and it implements the
+whole V4.1 graph — the ratio-1 and ratio-2 block compressors, the shared
+compressed and indexer caches with the lightning indexer's top-k, candidate
+block pruning, the Engram tables, the delayed hyper-connection gates, the shared
+expert, and the checkpoint's trained cache quantization (FP8 E4M3 raw rows,
+MXFP4 indexer, NVFP4 compressed). It is held to the independent PyTorch oracle
+`eng/dsv41-reference.py` at atol=rtol=2e-5, plus exact greedy-argmax agreement,
+across one-shot prefill, chunk sizes 1/3/5/8 and reset — at fixture scale
+rather than on the released weights. `--backend cuda`, the direct-CUDA engine,
+also runs V4.1 through its own kernels with no ggml, and has no numerical gate
+yet. Like `ggml_cpu`, both are correctness and portability paths, not serving
+ones; the end of
+[Running on the ggml CPU backend](#running-on-the-ggml-cpu-backend) has the
+detail. `--backend mlx` remains refused.
+
 ### One backend per GPU
 
 The architecture-specific DeepSeek ops (compressors, attention prologue and
@@ -778,8 +798,22 @@ shared compressed and indexer caches, candidate pruning, the Engram tables, the
 delayed hyper-connection gates and the trained cache quantization. It is held to
 `eng/dsv41-reference.py` at atol=rtol=2e-5 by
 `InferenceWeb.Tests.Dsv41CpuExecutorTests`, across one-shot prefill, chunk sizes
-1/3/5/8 and reset. Like `--backend ggml_cpu` it is a correctness and portability
-path, not a serving one.
+1/3/5/8 and reset. That gate is fixture-scale — a five-layer, 256-hidden,
+16-token F32 synthetic model — so it establishes architectural agreement with
+the oracle rather than parity on the released 246 GiB Q2_K weights, and the
+tests return silently unless `TS_DSV41_FIXTURE_DIR` names the fixture
+directory. Unlike `--backend ggml_cpu` it takes no vision companion: that
+encoder is a native ggml component, and `LoadVisionEncoder` throws here, so
+image and video input are not available. The native loader's Engram and
+attention knobs — `TS_DSV41_ENGRAM_WARM`, `_THREADS`, `_RANDOM`, `_SIDECAR`,
+`TS_DSV41_SPARSE_FA`, `TS_DSV41_COMPACT_RAW_GATHER` — are inert on it, though
+the prepared `deepseek41.engram.bin` sidecar is still mandatory;
+`TS_DSV4_THREADS` defaults to `ProcessorCount` here rather than
+min(cores, 32); and `TS_DSV4_CPU_TRACE_DIR` writes the same per-tensor files
+that `eng/dsv41-reference.py --output` writes, so the two directories diff
+tensor by tensor. Like `--backend ggml_cpu` it is a correctness and portability
+path, not a serving one: no throughput, load time or resident footprint has been
+measured for a full checkpoint on it.
 
 `--backend cuda`, the direct-CUDA engine, also runs V4.1 with its own kernels and
 no ggml. It is not yet held to a numerical gate — see

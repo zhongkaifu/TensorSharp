@@ -82,7 +82,7 @@ Shipped implementations:
 
 | Name | Class | Weights | Notes |
 | --- | --- | --- | --- |
-| `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP (Qwen 3.6, GLM 5.2, Gemma 4's separate assistant GGUF). EAGLE-shaped heads fit here unchanged. |
+| `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP (Qwen 3.6, GLM 5.2, GLM-5.3, Gemma 4's separate assistant GGUF). EAGLE-shaped heads fit here unchanged. |
 | `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8). |
 | `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Works on every model. |
 | `auto` | — | — | Default: use whatever drafter the checkpoint carries. |
@@ -152,7 +152,7 @@ chat path: 1.02x → 1.85x.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. A NextN/MTP block with a KV cache of its
-own (Qwen 3.6, GLM 5.2) keeps it false — a gap in what it replayed makes every
+own (Qwen 3.6, GLM 5.2, GLM-5.3) keeps it false — a gap in what it replayed makes every
 later proposal garbage. Gemma 4's assistant head keeps no state at all: every
 draft step reads the trunk's donor KV and the hidden state it is handed, so it
 drafts from any position and reports true. Without that, a Gemma 4 chat armed
@@ -262,7 +262,7 @@ One caveat worth stating: some models' `SpecForward` is not drafter-independent
 — Muse-Glimmer and DeepSeek V4 share the fused verify kernel with their drafter
 and refuse to run without it. Those report `SpeculationProfitable` as false when
 no drafter is loaded, so weight-free speculation is declined rather than
-crashed. Qwen 3.5/3.6, GLM 5.2 and Gemma 4 have drafter-independent trunks and
+crashed. Qwen 3.5/3.6, GLM 5.2, GLM-5.3 and Gemma 4 have drafter-independent trunks and
 accept `--spec-type ngram` on any checkpoint. (Gemma 4 used to be gated on its
 assistant GGUF too; the gate was an artifact — its multi-row verify is the same
 fused whole-model kernel its prefill runs, and the hidden-state capture is only

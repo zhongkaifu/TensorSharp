@@ -214,7 +214,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 |---|---|---|---|---|
 | `TS_DSV4_NGPU` | V4 与 V4.1 | 按层切分把整层铺到几张 GPU 上——对这两个架构来说，`--tp N` 设置的就是它。`0` 表示使用所有可见设备 | `0`（全部可见） | 否 |
 | `TS_DSV4_UBATCH` | V4 与 V4.1 | Prefill 微批宽度 | 保守配置为 `256`；八卡 A40 的实测 V4.1 配置用 `1024` | 否 |
-| `TS_DSV4_THREADS` | V4 与 V4.1 | 纯 GPU 加载时的原生线程池。CPU 专家卸载改用探测到的可用并行度，由 `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` 设定 | min(核数, 32) | 否 |
+| `TS_DSV4_THREADS` | V4 与 V4.1 | 纯 GPU 加载时的原生线程池。CPU 专家卸载改用探测到的可用并行度，由 `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` 设定。在纯 C# 的 `--backend cpu` 执行器上，它设定的是该执行器自己的工作线程池，默认取 `ProcessorCount` 而不是 min(核数, 32) | min(核数, 32) | 否 |
 | `TS_DSV4_PERF` | V4 与 V4.1 | `1` 打印分阶段耗时 | 关 | 否 |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 与 V4.1 | 放置余量、计算图缓存深度、权重加载并行度，以及驻留主机的专家是否直接在 GGUF 映射上就地相乘 | 见各卡片 | 否 |
 | `TS_DSV4_DSPARK` | 仅 V4 | DSpark 草稿 GGUF，等价于 `--draft-model`。V4.1 会拒绝 V4 的草稿模型——它没有 DSpark 路径 | 未设置 | 否 |

@@ -25,9 +25,9 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`，且必须**显式**用 `--mmproj` 指定——这是唯一没有 mmproj 自动探测的系列。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
-| DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/8e0c4de3cb6519bfc11ed69dc87184b457a57bb5)，固定 revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5`——七个 Q2_K 分片（246.35 GiB，张量类型混合 Q2_K/Q3_K）需放在同一目录，`--model` 指向第一个分片。该文件**不能单独运行**：`eng/dsv41-prepare.py` 会依据官方 [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 的 `config.json` / `tokenizer.json` 在分片旁生成由分词器派生的 Engram sidecar；`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；V4 的草稿模型会被拒绝。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
+| DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/8e0c4de3cb6519bfc11ed69dc87184b457a57bb5)，固定 revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5`——七个 Q2_K 分片（246.35 GiB，张量类型混合 Q2_K/Q3_K）需放在同一目录，`--model` 指向第一个分片。该文件**不能单独运行**：`eng/dsv41-prepare.py` 会依据官方 [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 的 `config.json` / `tokenizer.json` 在分片旁生成由分词器派生的 Engram sidecar；`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样必须准备 Engram sidecar，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731（284B MoE） | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)；每种量化一个子目录（`UD-Q8_K_XL/`、`UD-IQ4_XS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。仅文本 |
-| GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——下一行的 GLM-5.3-Flash 才是支持图像的那个。这些 GGUF 已带有服务端 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
+| GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——再往下两行的 GLM-5.3-Flash 才是支持图像的那个；中间那行的 GLM-5.3 同样仅文本。这些 GGUF 已带有服务端 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
 | GLM 5.x | GLM-5.3（`glm-dsa`，256 个路由专家，仅文本） | [unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm-dsa`，层结构与 GLM-5.2 一致（79 个 block —— 78 层主干加 1 个 NextN ——256 个路由专家 top-8、带 lightning indexer 的 MLA、rope base 8e6），因此直接走现有的 GLM-5.2 路径，无需额外开关。**仅文本**——与下面的 Flash 仓库不同，这个仓库完全没有发布 mmproj。它确实带着供 `--spec` 使用的 NextN 块，但 `blk.78` 没有自己的 `nextn.shared_head_head.weight`，draft 块只能借用主干的 LM head——而在 `--tp N` 下该 head 是按列切分的。加载器拒绝用某个 rank 上的词表切片来 draft，并在 stderr 上明说，所以只有**不带** `--tp`（即默认按层切分到所有可见 GPU）运行时 `--spec` 才会真正生效 |
 | GLM 5.x | GLM-5.3-Flash（320B，288 个路由专家，文本 + 图像） | [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)；每种量化一个子目录（`UD-Q2_K_XL/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。`general.architecture` 为 `glm5next`，与 GLM-5.2 走同一个原生执行器。与 5.2 不同，它**支持图像**：同仓库的 `mmproj-BF16.gguf`（GLM-OCR ViT）启用 `--image`、多图提示与多轮图像会话。它的 NextN 块尚未接入，因此这里没有 `--spec`。不传 `--tp` 时默认按层切分到所有可见 GPU；在 GGML GPU 后端上，传入 `--tp N` 则选择仅支持本地单进程的原生张量并行 |
 | DeepSeek V4 | DSpark 推测解码 draft（可选，仅提速） | 见下方 [DSpark draft 模型](#dspark-draft-模型)，用 `--draft-model` 加载，解码约 1.3-1.4 倍 |
@@ -83,7 +83,8 @@ draft，社区亦有 GGUF 转换，但它们是另一种 draft 结构：5 层 Tr
 | Gemma-4-31B | — | [williamliao/dspark_gemma4_31b-it-GGUF](https://huggingface.co/williamliao/dspark_gemma4_31b-it-GGUF) |
 
 Gemma 4 目前已有可用的推测解码路径：上表中的 `gemma4-assistant` MTP draft（
-`--draft-model`）；Qwen 3.6 与 GLM 5.2 则内置 NextN 块。它们与 DSpark 是不同的 draft。
+`--draft-model`）；Qwen 3.6、GLM 5.2 与 GLM-5.3 则内置 NextN 块（GLM-5.3 只在默认按层切分、
+即不传 `--tp` 时才会真正 draft）。它们与 DSpark 是不同的 draft。
 
 ### 按模型下载并运行
 
@@ -130,6 +131,15 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 routed-MoE TP，而它目前实测比按层切分更慢。权重与上下文放不下时加 `--n-cpu-moe N`。
 Python 只用于准备 sidecar，推理阶段不需要。
 
+`--backend cpu` 不是上面“换后端”提示里的 `ggml_cpu`：它用纯 C# 执行器 `DeepSeek4CpuExecutor`
+跑完整的 V4.1 计算图——不依赖 ggml、原生库与 GPU，凡是 .NET 能跑的地方它都能跑——定位是正确性
+与可移植性路径，而非服务路径；整份 checkpoint 在它上面的吞吐、加载时间与常驻内存都从未实测过。
+上面的 `deepseek41.engram.bin` sidecar 依然必需。`--mmproj` 在这里完全不可用（视觉伴随文件是
+原生 ggml 组件，`LoadVisionEncoder` 会抛异常），所以没有图像也没有视频；分布式 TP 组、任何草稿
+模型或 `TS_DSV4_DSPARK`、非 `0` 的 `TS_DSV41_TP`、非 `0` 的 `TS_DSV41_ENGRAM_DEVICE`，都会在
+读取任何权重之前被拒绝。它也没有多轮 KV 前缀复用、没有按序列的 slot——每次分叉的对话都要重新
+prefill，并发请求只能串行。
+
 **DeepSeek V4 Flash**（284B MoE，纯文本，支持 DSpark 推测解码）：
 
 ```bash
@@ -145,6 +155,27 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
 
 去掉 `--draft-model` 即为普通解码。CLI 上的推测解码要求纯贪心采样（`--temperature 0`）；
 `--spec-pmin` 控制每个块草拟到多深。
+
+**GLM 5.x**（GLM-5.3，`glm-dsa`，256 个路由专家，仅文本，内嵌 NextN 块）：
+
+```bash
+# UD-Q2_K_XL 是七个分片、236.4 GiB——需要一台*合计*显存能装下它再加 KV cache 的机器；
+# 实测配置为八张 46 GB A40，按层切分
+hf download unsloth/GLM-5.3-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf \
+    --backend ggml_cuda --spec --port 5000
+```
+
+这里没有 `--mmproj`：该仓库在任何量化下都没有发布 mmproj，而给 `glm-dsa` 模型传 `--mmproj`
+只会告警并被忽略，不会报错退出，所以无论如何都是仅文本的运行。`--spec` 必须在加载之前就写在
+命令行上，并且只在上面这种**默认按层切分**下生效——不传 `--tp` 时会用上所有可见 GPU。
+`--tp N` 在 GGML GPU 后端上可以接受，但仅限本地单进程（`--tp-node-id` / `--tp-peers` 对整个
+GLM 系列都会在构建模型之前被拒绝），而且会在每个 rank 上复制一份 KV cache；它对 GLM-5.3 并不是
+已验证的配置，并且在它之下加载器会放弃 draft——`blk.78` 借用的主干 LM head 是按列切分的——
+转为普通解码。GLM-5.2 与 GLM-5.3-Flash 的下载方式相同，仓库见上表。详见
+[glm](docs/models/glm_zh-cn.md#glm-53glm-dsa)。
 
 **Gemma 4**（文本 + 图像/视频/音频、思维链、工具、可选 MTP）：
 

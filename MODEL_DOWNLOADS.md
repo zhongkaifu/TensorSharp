@@ -28,9 +28,9 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
 | Hunyuan Dense | Tencent dense Hunyuan checkpoints (`hunyuan-dense`) | Any GGUF whose `general.architecture` is `hunyuan-dense`, such as the Hy-MT2 releases (`tencent/Hy-MT2-1.8B` supplies the reference chat template). Text only, single device, no projector and no drafter. See [hunyuan-dense.md](docs/models/hunyuan-dense.md) |
 | Muse-Glimmer | Muse-Glimmer-30B (dense, image-capable) | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) — e.g. `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` or `Muse-Glimmer-30B-Q8_0.gguf`; `general.architecture` = `muse-glimmer` / `muse_glimmer`. Image input requires `mmproj-Muse-Glimmer-30B-Q8_0.gguf` (same repo) passed **explicitly** with `--mmproj` — this is the one family with no mmproj auto-detection. Optional speed artifacts: the DFlash block drafter `dflash-kquant.gguf` (same repo) or the newer DFlash2 drafter [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF) (prefer `-Q4_K_M` on a 16 GB card — see the note on drafter size in [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect)), loaded with `--draft-model` for lossless speculative decoding — pass no sampler flags, it needs plain greedy |
-| DeepSeek V4.1 | DeepSeek-V4.1-Flash (`deepseek41`, 384 routed experts) | [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/8e0c4de3cb6519bfc11ed69dc87184b457a57bb5) at revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` — seven Q2_K shards (246.35 GiB, mixed Q2_K/Q3_K tensors) kept in one directory; point `--model` at the first shard. The file **does not run on its own**: `eng/dsv41-prepare.py` writes the tokenizer-derived Engram sidecar beside the shards from the official [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) `config.json` / `tokenizer.json`, and `eng/dsv41-prepare-vision.py` builds the optional ~970 MB vision companion that `--mmproj` needs for images and video. `ggml_cuda` is the serving backend; V4 drafters are rejected. Full recipe and checkpoint hashes: [deepseek41.md](docs/models/deepseek41.md) |
+| DeepSeek V4.1 | DeepSeek-V4.1-Flash (`deepseek41`, 384 routed experts) | [vcruz305/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/8e0c4de3cb6519bfc11ed69dc87184b457a57bb5) at revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` — seven Q2_K shards (246.35 GiB, mixed Q2_K/Q3_K tensors) kept in one directory; point `--model` at the first shard. The file **does not run on its own**: `eng/dsv41-prepare.py` writes the tokenizer-derived Engram sidecar beside the shards from the official [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) `config.json` / `tokenizer.json`, and `eng/dsv41-prepare-vision.py` builds the optional ~970 MB vision companion that `--mmproj` needs for images and video. `ggml_cuda` is the serving backend; `ggml_cpu` and `cpu` are correctness and portability paths rather than serving ones — `--backend cpu` runs the whole V4.1 graph on the pure-C# `DeepSeek4CpuExecutor`, with no ggml, no native library and no GPU; it needs the same mandatory Engram sidecar, and the vision companion does not follow it there (`LoadVisionEncoder` throws), so images and video are not available on that backend. V4 drafters are rejected. Full recipe and checkpoint hashes: [deepseek41.md](docs/models/deepseek41.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
-| GLM 5.x | GLM-5.2 (744B-A40B MoE, embedded NextN MTP) | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) — one subdirectory per quant (`UD-Q4_K_XL/`, `UD-IQ2_XXS/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. **Text only** — GLM-5.3-Flash in the next row is the one that takes images. These GGUFs already carry the NextN block for the server's `--spec` — unlike Qwen 3.6 there is no separate MTP repo to pick |
+| GLM 5.x | GLM-5.2 (744B-A40B MoE, embedded NextN MTP) | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) — one subdirectory per quant (`UD-Q4_K_XL/`, `UD-IQ2_XXS/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. **Text only** — GLM-5.3-Flash, two rows down, is the one that takes images; the GLM-5.3 row in between is text-only as well. These GGUFs already carry the NextN block for the server's `--spec` — unlike Qwen 3.6 there is no separate MTP repo to pick |
 | GLM 5.x | GLM-5.3 (`glm-dsa`, 256 routed experts, text only) | [unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF) — one subdirectory per quant (`UD-Q2_K_XL/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. `general.architecture` = `glm-dsa`, and the block shape matches GLM-5.2 (79 blocks — 78 trunk plus one NextN — 256 routed experts top-8, MLA with the lightning indexer, rope base 8e6), so it loads on the existing GLM-5.2 path with nothing new to enable. **Text only** — this repo publishes no mmproj at all, unlike the Flash one below. It does carry the NextN block for `--spec`, but `blk.78` ships no `nextn.shared_head_head.weight` of its own, so the draft block borrows the trunk's LM head — which is column-parallel under `--tp N`. The loader refuses to draft from one rank's strip of the vocabulary and says so on stderr, so `--spec` is only engaged when you run **without** `--tp`, i.e. on the default layer split across every visible GPU |
 | GLM 5.x | GLM-5.3-Flash (320B, 288 routed experts, text + image) | [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) — one subdirectory per quant (`UD-Q2_K_XL/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. `general.architecture` = `glm5next`, and it loads through the same native executor as GLM-5.2. Unlike 5.2 it **takes images**: `mmproj-BF16.gguf` (the GLM-OCR ViT, same repo) enables `--image`, multi-image prompts and multi-turn image sessions. Its NextN block is not wired up yet, so there is no `--spec` here. Omitting `--tp` uses the default layer split across every visible GPU; on GGML GPU backends, `--tp N` selects native local/single-process tensor parallelism |
 | DeepSeek V4 | DSpark speculative drafters (optional — speed only) | see [DSpark drafters](#dspark-drafters) below — a separate GGUF loaded with `--draft-model` for ~1.3-1.4x decode |
@@ -91,8 +91,9 @@ with a clear message rather than mis-loading them. Listed here so you know what 
 | Gemma-4-31B | — | [williamliao/dspark_gemma4_31b-it-GGUF](https://huggingface.co/williamliao/dspark_gemma4_31b-it-GGUF) (3.3-11 GB) |
 
 Gemma 4 does have a supported speculative path today — the `gemma4-assistant` MTP drafts in
-the table above, via `--draft-model` — and Qwen 3.6 and GLM 5.2 have their
-embedded NextN blocks. Those are different drafters from DSpark.
+the table above, via `--draft-model` — and Qwen 3.6, GLM 5.2 and GLM-5.3 have their
+embedded NextN blocks (GLM-5.3 drafts only on the default layer split, i.e. without `--tp`).
+Those are different drafters from DSpark.
 
 ### Download & Run — per-model quick reference
 
@@ -142,6 +143,17 @@ opts into the experimental routed-MoE TP, which has measured slower than the spl
 Add `--n-cpu-moe N` when the weights and context do not fit. Python is needed to prepare the
 sidecars, not to serve.
 
+`--backend cpu` is not the `ggml_cpu` of the swap-the-backend note above: it runs the whole
+V4.1 graph on the pure-C# `DeepSeek4CpuExecutor` — no ggml, no native library, no GPU, so it
+runs anywhere .NET runs — and it is a correctness and portability path, not a serving path;
+no throughput, load time or resident footprint has ever been measured for a full checkpoint
+on it. The `deepseek41.engram.bin` sidecar above is still mandatory. `--mmproj` is not
+available there at all (the vision companion is a native ggml component and
+`LoadVisionEncoder` throws), so no images and no video, and distributed TP groups, any draft
+model or `TS_DSV4_DSPARK`, `TS_DSV41_TP` other than `0` and `TS_DSV41_ENGRAM_DEVICE` other
+than `0` are refused before a weight is read. There is also no multi-turn KV prefix reuse and
+no per-sequence slots — every diverging turn re-prefills and concurrent requests serialize.
+
 **DeepSeek V4 Flash** — 284B MoE, text only, DSpark speculative decoding ([unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF))
 
 ```bash
@@ -157,6 +169,29 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
 
 Drop `--draft-model` for plain decode. Speculation needs greedy sampling (`--temperature 0`);
 `--spec-pmin` tunes how far each block is drafted.
+
+**GLM 5.x** — GLM-5.3 (`glm-dsa`), 256 routed experts, text only, embedded NextN block ([unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF))
+
+```bash
+# UD-Q2_K_XL is seven shards, 236.4 GiB -- it wants a box whose *combined* VRAM clears
+# that plus the KV cache; the measured configuration is eight 46 GB A40s, layer-split
+hf download unsloth/GLM-5.3-GGUF --include "UD-Q2_K_XL/*" --local-dir models
+
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+    --model models/UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00007.gguf \
+    --backend ggml_cuda --spec --port 5000
+```
+
+There is no `--mmproj` here: this repo publishes no vision tower at any quant, and an
+`--mmproj` on a `glm-dsa` model is warned about and ignored rather than refused, so it is a
+text-only run either way. `--spec` has to be on the command line before load, and it is
+engaged on the **default layer split** shown above — omitting `--tp` uses every visible GPU.
+`--tp N` is accepted on the GGML GPU backends but is local / single-process only
+(`--tp-node-id` / `--tp-peers` are refused for the whole GLM family before the model is built)
+and replicates the KV cache on every rank; it is not a validated configuration for GLM-5.3,
+and under it the loader declines to draft — the trunk LM head that `blk.78` borrows is
+column-parallel — and serves standard decode. GLM-5.2 and GLM-5.3-Flash download the same
+way from their own repos in the table above. Details: [glm.md](docs/models/glm.md#glm-53-glm-dsa).
 
 **Gemma 4** — text + image/video/audio, thinking, tools, MTP ([ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF))
 

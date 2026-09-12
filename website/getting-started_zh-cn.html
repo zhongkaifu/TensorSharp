@@ -69,7 +69,6 @@ dotnet build TensorSharp.Cli/TensorSharp.Cli.csproj -c Release
 # Web 应用
 dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release</code></pre>
   <p>CLI 二进制位于 <code>TensorSharp.Cli/bin/...</code>，服务器位于 <code>TensorSharp.Server.Host/bin/...</code>。如需启用 CUDA 或 Vulkan 的原生构建、手动原生构建或 MLX，见<a href="backends_zh-cn.html#native-build">构建原生库</a>。</p>
-  <div class="callout note"><div class="ic">📦</div><p><strong>发行状态（核验于 2026-09-01）：</strong><a href="https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0" target="_blank" rel="noopener">v3.3.0.0</a> 提供十个预构建归档——Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64 各有 CLI 和 Server。CUDA 归档仍需兼容的 NVIDIA GPU 与驱动。请从 <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">Releases 页面</a>下载并检查更新版本；源码构建仍受支持。</p></div>
 
   <h2 id="download">3 · 下载模型</h2>
   <p>快速上手请从公开的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org/gemma-4-E4B-it-GGUF</a> 仓库下载推荐的、经基准验证的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q8_0.gguf（7.48 GiB）</a>。同一仓库还提供更省内存的 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_K_M.gguf" target="_blank" rel="noopener">gemma-4-E4B-it-Q4_K_M.gguf</a>，更多选项见<a href="models-downloads_zh-cn.html#downloads">模型</a>页。</p>

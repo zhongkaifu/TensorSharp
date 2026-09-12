@@ -53,17 +53,19 @@ Two implementations, both reproducing llama.cpp's `src/models/glm-dsa.cpp`:
 Getting `glm5next` onto the pure-C# backend took four fixes, all of which were
 silent or fatal rather than merely slow:
 
-- **NoPE MLA.** GLM-5.3 sets `rope.dimension_count = 0`: there is no rope half
-  anywhere, `n_nope == n_embd_head_k`, and the compressed latent IS the whole
-  cache row. The GLM-5.2 path splits every head into a NoPE and a RoPE part, so
-  it narrowed a zero-width slice and threw. `GlmDsaModel.Attention` now mirrors
-  the `hp.n_rot == 0` branches in `ggml_ops_glm_dsa.cpp`: no pe half on the query
-  or the key, no `_kPeCache` row, no rope on either the attention or the DSA
+- **NoPE MLA.** GLM-5.3-Flash sets `rope.dimension_count = 0`: there is no rope
+  half anywhere (plain GLM-5.3 keeps RoPE NORM at base 8e6 with `n_rot` 64),
+  `n_nope == n_embd_head_k`, and the compressed latent IS the whole cache row.
+  The GLM-5.2 path splits every head into a NoPE and a RoPE part, so it narrowed
+  a zero-width slice and threw. `GlmDsaModel.Attention` now mirrors the
+  `hp.n_rot == 0` branches in `ggml_ops_glm_dsa.cpp`: no pe half on the query or
+  the key, no `_kPeCache` row, no rope on either the attention or the DSA
   indexer, and the score is the absorbed term alone.
 - **The MLA-absorbed layout check** demanded `attn_k_b` / `attn_v_b` on every
-  trunk layer. GLM-5.3 is KDA-recurrent on most of its trunk and carries them on
-  only 12 of 45 layers, starting at layer 3, so a valid checkpoint was rejected
-  at layer 0. The requirement is now scoped to the full-attention layers.
+  trunk layer. `glm5next` is KDA-recurrent on most of its trunk and carries them
+  on only 12 of 45 layers, starting at layer 3, so a valid checkpoint was
+  rejected at layer 0. The requirement is now scoped to the full-attention
+  layers.
 - **`IQ2_XS` and `IQ4_XS` had no managed support**, so the loader expanded them
   to F32 -- 765 GB for this model. Loading never finished; it just grew. Both now
   have managed dequantizers (checked against ggml's own) and direct
@@ -107,7 +109,7 @@ per-op and fused executors pick different experts from small numerical
 differences, the same effect that keeps `TS_BATCHED_FUSED_DECODE` off by default.
 A cosine of 0.96 is consistent with that but does not prove it: it is lower than
 the ~0.999 a higher-precision checkpoint would be expected to give, and no
-higher-precision GLM-5.3 GGUF was available to use as a control. Treat the
+higher-precision GLM-5.3-Flash GGUF was available to use as a control. Treat the
 managed path as a reference implementation to A/B against, not as bit-parity.
 
 Split GGUFs are handled by `GgufFile` itself (`split.count` / `-00001-of-000NN`),
@@ -128,9 +130,10 @@ every one of N GPUs and splits the weights *inside* each layer, so decode reads
 Megatron column/row pattern used by the rest of the repo:
 
 The native GLM 5.x tensor-parallel executor is **local and single-process** for
-both GLM-5.2 and GLM-5.3-Flash. It does not join the cross-node
+GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike. It does not join the cross-node
 `ITensorParallelGroup`, so `--tp-node-id` / `--tp-peers` do not make this path
-distributed.
+distributed — they are refused for the whole GLM family before the model is
+built.
 
 | Piece | Split | Collective |
 |---|---|---|
@@ -508,7 +511,7 @@ shrunk under you.
 | `TS_GLM_MOE_MMAP` | 1 | 0 copies host-resident experts instead of mapping the GGUF |
 | `TS_GLM_TP_SHARD` | 3 | tensor-parallel split: 1 heads, 2 routed experts, 3 both |
 | `TS_GLM_TP_OVERSUBSCRIBE` | 0 | 1 lets tensor-parallel ranks share a GPU (correctness testing only) |
-| `TS_GLM_TP_FUSED` | auto | GLM-5.3 uses concurrent segmented rank-local graphs when the full local-GPU configuration is eligible; 0 forces the combined scheduler diagnostic fallback. CPU MoE, tracing, partial sharding, oversubscription, and missing native hyper-connection kernels also select the fallback automatically |
+| `TS_GLM_TP_FUSED` | auto | GLM-5.3-Flash local TP on GGML: concurrent segmented rank-local graphs when the full local-GPU configuration is eligible; 0 forces the combined scheduler diagnostic fallback. CPU MoE, tracing, partial sharding, oversubscription, and missing native hyper-connection kernels also select the fallback automatically |
 | `TS_GLM_BATCHED_DECODE` | 1 | 0 makes the native side decline every batched decode, forcing the per-sequence path |
 | `TS_GLM_TRACE` | — | layer list (or `all`) to dump per-layer activation sums, matching `llama-eval-callback`'s layout |
 | `TS_GLM_BD_DEBUG` | 0 | 1 narrates each batched decode step (which slots, graph reused or rebuilt, how far it got) |
@@ -537,8 +540,14 @@ back into numbers / arrays / objects).
 GLM-5.3 (not Flash) is the same architecture as GLM-5.2, so everything above
 applies to it unchanged: `general.architecture` is `glm-dsa`, `block_count` is
 79 (78 trunk + one NextN), 256 routed experts top-8 with one shared expert,
-MLA with the lightning indexer, `rope.freq_base` 8e6, `context_length` 1M.
-It needs no new code path and no new flag - it is the GLM-5.2 loader.
+MLA with the lightning indexer, `rope.freq_base` 8e6, `context_length` 1M - the
+same advertised ceiling, sized down to whatever the devices actually have (see
+[Context length](#context-length)). It needs no new code path and no new flag -
+it is the GLM-5.2 loader. What carries over is the architecture, not the
+numbers: every measured block above was taken on a GLM-5.2 checkpoint, and the
+`--backend cpu` subsection - its four fixes, its 0.9567 prefill cosine, its
+tok/s table - is GLM-5.3-**Flash** (`glm5next`), with no managed-path
+measurement for plain GLM-5.3 anywhere.
 
 Two differences matter in practice, both read off the published GGUF:
 
@@ -571,9 +580,37 @@ Two differences matter in practice, both read off the published GGUF:
   The `NextN/MTP draft head ready (block 78, ...)` line belongs to the managed
   per-op path (`TS_GLM_NATIVE=0`) and is not printed on a GPU run.
 
+`--tp N` itself is accepted on GLM-5.3 under exactly the same constraint as the
+rest of the family - local and single-process - but it is an accepted mode rather
+than a validated one: nothing at `--tp N > 1` has ever been run on a GLM-5.3
+checkpoint, and the only recorded arithmetic is a non-fit, `--tp 8` wanting
+41.7 GiB per rank against 46 GB cards, because every rank keeps its own
+full-length MLA and indexer caches.
+
 At UD-Q2_K_XL the checkpoint is 236.4 GiB across seven shards, so it wants a
 box whose *combined* VRAM clears that with room for the KV cache - six of the
 eight 45 GiB A40s by weight alone, eight in practice.
+
+### Measured
+
+8x A40 46 GB (no NVLink, CUDA 12.8), GLM-5.3 UD-Q2_K_XL, a 10,531-token prompt
+and 300 decode tokens, median of three repeats with a fresh prompt body each
+time, whole-layer placement on both engines:
+
+| test | llama.cpp | TensorSharp |
+|---|---:|---:|
+| prefill tok/s | not recorded | 251.6 t/s |
+| decode tok/s | 20.28 t/s | **20.48 t/s** |
+| load | 753 s | **264 s** |
+
+**Decode is a tie** - 20.48 against 20.28, inside a percent - and TensorSharp
+loads the 236.4 GiB checkpoint **2.9x faster**. Prefill is where it is behind,
+and the honest comparison is time to first token rather than tokens per second,
+because that llama.cpp cell ran before the client asked for usage in the stream
+and so has no prompt-token count of its own: TensorSharp reaches first token in
+**41.9 s** (41.85 / 41.86 / 42.07) against llama.cpp's **29.0 s** (29.01 /
+29.05 / 31.23), about **1.4x slower**. Full record and method in the
+[cross-engine report](../validation/cross-engine-2026-09/README.md).
 
 ## GLM-5.3-Flash (`glm5next`)
 
@@ -613,8 +650,8 @@ native executor's local, single-process tensor-parallel plan:
 | Unsharded work | Hyper-connections, pooled indexer, router, norms, dense layers, shared expert and embedding remain unsharded. The segmented path replicates their computation per rank; output norm and LM head stay on rank 0. The combined scheduler fallback instead computes and adds the shared expert once on rank 0 |
 
 The native GLM 5.x TP path is local/single-process on GGML GPU backends for
-both GLM-5.2 and GLM-5.3-Flash; it does not support distributed or cross-node
-execution.
+GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike; it does not support distributed or
+cross-node execution.
 
 With GLM-5.3-Flash's default full sharding (heads and routed-expert rows), one
 rank per local GPU, no CPU MoE or tracing, and native hyper-connection kernels,
@@ -669,8 +706,8 @@ own top-2 margin at a flip point is ~0.13 logits with the same candidate set).
 
 ### Chat format
 
-GLM-5.3's template always reasons: the `<|system|>Reasoning Effort: Max` line
-is unconditional, the generation prompt always opens `<think>`, and past
+GLM-5.3-Flash's template always reasons: the `<|system|>Reasoning Effort: Max`
+line is unconditional, the generation prompt always opens `<think>`, and past
 turns keep their reasoning (`clear_thinking` defaults to false). Tool calls
 use the same XML element form as GLM-5.2. Images render as
 `<|begin_of_image|><|image|><|end_of_image|>`, and the host expands

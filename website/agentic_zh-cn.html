@@ -18,8 +18,6 @@
   <h1>智能体工作流</h1>
   <p class="lede">TensorSharp.AgentHost 把本地模型的一次回复变成有界的<strong>生成 → 检查 → 运行 → 修复 → 回答</strong>循环。它只在需要时加载 Agent Skills（智能体技能），通过五个内置代码工具处理文件，在操作系统沙箱中运行检查，并向普通 CLI、Web UI、Ollama 或 OpenAI 客户端返回完成的产物。</p>
 
-  <div class="callout note"><div class="ic">🏷️</div><p><strong>版本边界（核验于 2026-09-01）：</strong><a href="https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0" target="_blank" rel="noopener">v3.3.0.0</a> 是最新标签版本，并提供预构建 CLI / server 归档。AgentHost 是在该标签之后加入当前源码的；在后续发行版明确包含它之前，请构建当前源码。</p></div>
-
   <h2 id="flow">一轮请求里发生什么</h2>
   <ol class="steps">
     <li><h3>低成本公布能力</h3><p>TensorSharp 在提示词里只放入每个可达技能的名称与描述。选中技能只表示优先使用并允许访问，<em>不会</em>加载其说明正文。</p></li>
