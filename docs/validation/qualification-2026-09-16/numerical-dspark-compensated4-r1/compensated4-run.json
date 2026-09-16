@@ -1,0 +1,56 @@
+{
+  "prefix1-17": {
+    "exit_code": 1,
+    "command": [
+      "/usr/local/bin/python",
+      "/workspace/ts-codex-20260916-r3/repo/eng/tests/dsv41-dspark-inference.py",
+      "/workspace/ts-main/repo/fixtures/text-f32-small",
+      "--out",
+      "/workspace/ts-dspark-sum-variants-20260916/compensated4-prefix1-17",
+      "--library",
+      "/workspace/ts-dspark-sum-variants-20260916/compensated4.so",
+      "--backend",
+      "CUDA",
+      "--gpus",
+      "1",
+      "--reference-only",
+      "--reference-prefixes",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "--keep-going"
+    ],
+    "started_utc": "2026-09-16T19:24:09.646349+00:00",
+    "ended_utc": "2026-09-16T19:24:17.679216+00:00"
+  },
+  "precision": {
+    "exit_code": 0,
+    "command": [
+      "/workspace/ts-dspark-sum-variants-20260916/compensated4-precision-test"
+    ],
+    "started_utc": "2026-09-16T19:24:17.683161+00:00",
+    "ended_utc": "2026-09-16T19:24:19.891889+00:00"
+  },
+  "benchmark": {
+    "exit_code": 0,
+    "command": [
+      "/workspace/ts-dspark-sum-variants-20260916/compensated4-benchmark"
+    ],
+    "started_utc": "2026-09-16T19:24:19.892007+00:00",
+    "ended_utc": "2026-09-16T19:24:27.396972+00:00"
+  }
+}

@@ -276,6 +276,23 @@ uses eight; smaller placements require enough CPU expert offload to fit.
 Its Engram warming consumes approximately 60 GiB of host page cache before
 readiness. Record cold-load and warming time separately from warm throughput.
 
+On CUDA, Q2_K and Q4_K gate/up strips run through TensorSharp's owned
+quantized strip kernel (`ggml_ops_matmul_quant_strip.cuh`,
+`tsg_matmul_id_quant_pair`): it reads only the rank's weight strip but keeps
+the unsplit launch's stream-k partitions and reduction order, so each strip's
+gate/up rows equal the full tensor's bit for bit. Before it, ggml's batched
+MMQ path grouped a strip's F32 sums differently from the unsplit launch and
+the down projection's Q8 activation requantization amplified that into a
+checkpoint-shaped Q2_K/Q3_K failure at 16 tokens (relative L2 `3.9e-5`
+against the `1e-5` full-weight tolerance). `GgmlOpsDsv41TpTest` keeps the
+strict full-weight reference and its original tolerances as the pass
+criterion, records the same-device partitioned evaluation beside it, and
+`--cuda 1 --quant-strip-only` checks bitwise gate/up equality plus scratch
+growth/failure recovery. Nonaligned strip shapes stay on ggml's route. Narrow
+strips are 15-36% slower per MoE call in the recorded microbenchmarks, so this
+is a correctness change, not a speedup; see
+[numerical-tp-chosen-r1](../validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md).
+
 If the weights and context do not fit, add `--n-cpu-moe N` to keep the routed
 experts of the first N layers on the host, or `--cpu-moe` for all routed
 experts. Attention, routing, and the shared expert remain on the GPU. Engram

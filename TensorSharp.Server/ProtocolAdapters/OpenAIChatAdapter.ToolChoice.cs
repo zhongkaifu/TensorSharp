@@ -15,14 +15,30 @@ public sealed partial class OpenAIChatAdapter
     /// </summary>
     private static void ValidateClientToolChoice(JsonElement body, List<ToolFunction>? clientTools)
     {
+        if (body.TryGetProperty("parallel_tool_calls", out var parallel) &&
+            parallel.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new JsonException("parallel_tool_calls must be a boolean.");
         if (!body.TryGetProperty("tool_choice", out var requested)) return;
-        bool required = requested.ValueKind == JsonValueKind.String && requested.GetString() == "required";
+        bool required = false;
         string? named = null;
-        if (requested.ValueKind == JsonValueKind.Object &&
-            requested.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String && type.GetString() == "function" &&
-            requested.TryGetProperty("function", out var function) && function.ValueKind == JsonValueKind.Object &&
-            function.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String)
+        if (requested.ValueKind == JsonValueKind.String)
+        {
+            switch (requested.GetString())
+            {
+                case "auto":
+                case "none": return;
+                case "required": required = true; break;
+                default: throw new NotSupportedException("tool_choice must be auto, none, required, or a named function.");
+            }
+        }
+        else if (requested.ValueKind == JsonValueKind.Object &&
+                 requested.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String && type.GetString() == "function" &&
+                 requested.TryGetProperty("function", out var function) && function.ValueKind == JsonValueKind.Object &&
+                 function.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String &&
+                 !string.IsNullOrEmpty(name.GetString()))
             named = name.GetString();
+        else
+            throw new NotSupportedException("tool_choice names a function as {type: function, function: {name: ...}} with a nonempty name.");
         if (!required && named == null) return;
 
         // Internal skill/shell rounds are serviced invisibly by this server;

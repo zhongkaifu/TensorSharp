@@ -1,0 +1,13 @@
+{
+  "recorded_utc": "2026-09-16T19:25:10.046779+00:00",
+  "source_directory": "/workspace/ts-dspark-sum-variants-20260916",
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "binaries_sha256": {
+    "compensated4.so": "3f6c10674e9d9e4aa8822537d5003bc6defa7df6e410eb496b89aa0c1e90b1e1",
+    "compensated4-benchmark": "385bfffc63ef2ba99be21a4e2189b34a2460f1e8181fd3722f052d8d1da8bc7d",
+    "compensated4-precision-test": "ee7aa46b8dd6962fc18ea62c9ba98b48f1196d5a5fdc3b3dfdc66906987a42d7"
+  },
+  "physical_gpu": 0,
+  "release_qualified": false,
+  "integrated": false
+}

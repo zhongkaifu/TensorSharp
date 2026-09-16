@@ -1,0 +1,202 @@
+[
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w1-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "1ed334113b9feeeebe760058a1d4f56e5edef39116711a44776a40812448e76f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w1-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "1ed334113b9feeeebe760058a1d4f56e5edef39116711a44776a40812448e76f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w2-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "aab03f50a50c96e103d47a1231411605f17df49d165188f2288b328c79664c22"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w2-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "290662d1b48fc328f89d49b984532ac3ff698c523491bfb98a9522324337231f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w2-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "1ed334113b9feeeebe760058a1d4f56e5edef39116711a44776a40812448e76f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w2-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "f1e91d071f91a2c441cc53993a9edadd2e2c9183d589f29b5e9d4603fea50288"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "21f1e573bed9ee8b9f0d5e6bef2b28c39aa3daf66b4e77ea7549a96e04e6468b"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "7575487aa141ae43e73a0515914236f485ae6d0703d6a3793104618ee1249e7c"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "aab03f50a50c96e103d47a1231411605f17df49d165188f2288b328c79664c22"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "68df278dbab830a5d01e07d1cd656423357d323fa78f77fafcc71d9d757d1682"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row2-plain.f32",
+    "bytes": 993280,
+    "sha256": "1ed334113b9feeeebe760058a1d4f56e5edef39116711a44776a40812448e76f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w3-row2-verify.f32",
+    "bytes": 993280,
+    "sha256": "2b9e8a5781d5526261df15f5a6d1c04245fb23d3a60c8fe8e6dbc4d5b2d9819c"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "8b94e186d581c336080847d5154495f6f4d66154ebe7228fd2878667469c67ad"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "9547f28b30af8f25a47c9eb65090fd46092b69b9b604fcd03c7da3af23f9ff61"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "21f1e573bed9ee8b9f0d5e6bef2b28c39aa3daf66b4e77ea7549a96e04e6468b"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "90d2862e31cf436636f6a6f237dc0ea624ebd6dabd444b32fe1a9bad52093c02"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row2-plain.f32",
+    "bytes": 993280,
+    "sha256": "aab03f50a50c96e103d47a1231411605f17df49d165188f2288b328c79664c22"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row2-verify.f32",
+    "bytes": 993280,
+    "sha256": "a585b044b571134a3ca0180fce9d6872d102350520e9132e22f4203ab75541f9"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row3-plain.f32",
+    "bytes": 993280,
+    "sha256": "1ed334113b9feeeebe760058a1d4f56e5edef39116711a44776a40812448e76f"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/json-w4-row3-verify.f32",
+    "bytes": 993280,
+    "sha256": "2de94bdf4a14d753d60c5f433aced784f780a79e5f34f8cb61c2d9fb4f75a7ef"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w1-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "e0a52bb1e8ccd744387508575814f3bdf526aed9e2f9d78aaf4fb8db01ae3bd8"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w1-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "e0a52bb1e8ccd744387508575814f3bdf526aed9e2f9d78aaf4fb8db01ae3bd8"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w2-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "6524fececed1be6d3ae77bb8fafb992b5a8337c9f6e72a88ce7edaeb8c1ffa59"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w2-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "5a50a79988227db9cdddbe73239492ab729c6e9d8c6d75d0e0f2ec5ac950a588"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w2-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "e0a52bb1e8ccd744387508575814f3bdf526aed9e2f9d78aaf4fb8db01ae3bd8"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w2-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "c3b56205e8b0056be470d80efc0da9626a528643c808c5ffef6b122f9b3cc31c"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "6c7a13819e2f0b3c336099c9ac28453677deae39e637927a848f0e066b7a6a7e"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "2b8277a1e84fcbbdd1c39b8c4547e5adc63f2902888c871d38217b261957ba50"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "6524fececed1be6d3ae77bb8fafb992b5a8337c9f6e72a88ce7edaeb8c1ffa59"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "f52cb36c2fe0366dad8dc01026ab1b7014787782bc9fc3f12bd1663f5b022a0a"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row2-plain.f32",
+    "bytes": 993280,
+    "sha256": "e0a52bb1e8ccd744387508575814f3bdf526aed9e2f9d78aaf4fb8db01ae3bd8"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w3-row2-verify.f32",
+    "bytes": 993280,
+    "sha256": "6a9931154bf7b47dcaa78e35c94c2b989356c0a59dd5802fd864fc922d53ef0a"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row0-plain.f32",
+    "bytes": 993280,
+    "sha256": "835e6d2f2160c2a93c8654a3feea38a5a00f116fb02d3ef7516cc12d3385fd57"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row0-verify.f32",
+    "bytes": 993280,
+    "sha256": "9d559b3b56cce6843d7e14591822e5b59805569c3b008e607163185a449fe9db"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row1-plain.f32",
+    "bytes": 993280,
+    "sha256": "6c7a13819e2f0b3c336099c9ac28453677deae39e637927a848f0e066b7a6a7e"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row1-verify.f32",
+    "bytes": 993280,
+    "sha256": "5612702b3d0a2fc15f4ac1653fd648ce85ac85c2822d40e311146005fd04b6b3"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row2-plain.f32",
+    "bytes": 993280,
+    "sha256": "6524fececed1be6d3ae77bb8fafb992b5a8337c9f6e72a88ce7edaeb8c1ffa59"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row2-verify.f32",
+    "bytes": 993280,
+    "sha256": "e8bf94fc026ad0263122cd67652ed77f86e2ec0d27a2133e94243ce493ce890b"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row3-plain.f32",
+    "bytes": 993280,
+    "sha256": "e0a52bb1e8ccd744387508575814f3bdf526aed9e2f9d78aaf4fb8db01ae3bd8"
+  },
+  {
+    "path": "/workspace/ts-codex-20260916-r4/verify-probe-r2/probe/retained-A-w4-row3-verify.f32",
+    "bytes": 993280,
+    "sha256": "2a8f803ca305323b729ed57bc2a1e2b1dbfa900207e7c96e34f6d51d8ce227a7"
+  }
+]

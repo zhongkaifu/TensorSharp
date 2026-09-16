@@ -1,0 +1,9 @@
+{
+  "parent_source_manifest_sha256": "f7431257148bd5168c0f80e3049b36fc5228c19a8d47448e09e60ff7eb43eb28",
+  "test_overrides_sha256": {
+    "InferenceWeb.Tests/Qwen4ExpMtpIntegrationTests.cs": "aae9e5ad31346a7acf571e39f0fc8607d014f668465b1d3930d0cae229e5b03f",
+    "InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs": "7898bca8c7e82a083adf7a8cfb7946dc654c73c975e002972d5133719ce25a34",
+    "InferenceWeb.Tests/Qwen4ExpVideoForwardTests.cs": "442b3ce312997c5d2a0a916586701b85353861fd873802768cefda4236fe03f5"
+  },
+  "scope": "Add explicit Metal fixture backend; retained test includes post-freeze opt-in CUDA split fixture. Production source unchanged."
+}

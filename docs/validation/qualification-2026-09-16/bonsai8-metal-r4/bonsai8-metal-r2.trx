@@ -1,0 +1,138 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="3dd312cd-08c6-4b42-ac1e-7a1a05e2e2f5" name="@Zhongkais-MacBook-Pro 2026-09-16 11:38:52" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T11:38:52.1796340-07:00" queuing="2026-09-16T11:38:52.1796340-07:00" start="2026-09-16T11:38:50.5167610-07:00" finish="2026-09-16T11:38:54.5805690-07:00" />
+  <TestSettings name="default" id="627bd25f-0e44-45af-859d-eec84c4b3842">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_11_38_52" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="f710604b-d63c-4ab5-8721-91c5b897a833" testId="a8585158-cfd2-f30a-1304-9338fa099287" testName="InferenceWeb.Tests.Qwen3BatchedForwardTests.PerSequenceCache_GrowsReleasesAndReturnsToPrimary" computerName="Zhongkais-MacBook-Pro" duration="00:00:02.0406490" startTime="2026-09-16T11:38:52.4968330-07:00" endTime="2026-09-16T11:38:54.5375330-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f710604b-d63c-4ab5-8721-91c5b897a833">
+      <Output>
+        <StdOut>[bonsai-8b] loading Bonsai-8B-Q1_0.gguf
+[bonsai-8b] native=/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4
+[bonsai-8b cache growth] request top-1=350, restored-primary top-1=1632</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="982af3a5-7665-47a4-8ce1-451b4eb7b678" testId="d6399dc2-2c71-9f3d-3872-ef65a0ad64ca" testName="InferenceWeb.Tests.Qwen3BatchedForwardTests.BatchSize1_MatchesSingleSequenceTop1" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.3797591" startTime="2026-09-16T11:38:51.7633790-07:00" endTime="2026-09-16T11:38:52.1405410-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="982af3a5-7665-47a4-8ce1-451b4eb7b678">
+      <Output>
+        <StdOut>[bonsai-8b] loading Bonsai-8B-Q1_0.gguf
+[bonsai-8b] native=/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4
+[bonsai-8b] scalar top-1=3, batch top-1=3</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="26ae6c71-7fe2-4b70-95e3-fee4f0434b37" testId="fa654e29-de6f-6c79-30fc-1acbdb15eeb6" testName="InferenceWeb.Tests.Qwen3BatchedForwardTests.RetainedDecodeGraph_SurvivesTruncateAndResidencyRelease" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.3559085" startTime="2026-09-16T11:38:52.1408510-07:00" endTime="2026-09-16T11:38:52.4966540-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="26ae6c71-7fe2-4b70-95e3-fee4f0434b37">
+      <Output>
+        <StdOut>[bonsai-8b] loading Bonsai-8B-Q1_0.gguf
+[bonsai-8b] native=/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4
+[bonsai-8b truncate] top-1=374, max |delta|=0.000E+000
+[bonsai-8b residency release] top-1=264, max |delta|=0.000E+000</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="ea0cfb32-dff6-4180-8666-69317a8a6fd9" testId="6bea6e4a-032d-5053-1857-4f0c06555dcc" testName="InferenceWeb.Tests.Qwen3BatchedForwardTests.BatchSize2_KeepsSequencesIndependent" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.7755379" startTime="2026-09-16T11:38:50.9820150-07:00" endTime="2026-09-16T11:38:51.7602730-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ea0cfb32-dff6-4180-8666-69317a8a6fd9">
+      <Output>
+        <StdOut>[bonsai-8b] loading Bonsai-8B-Q1_0.gguf
+[bonsai-8b] native=/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4
+[bonsai-8b batch=2] A=1632 (serial 1632), B=271 (serial 271)</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen3BatchedForwardTests.BatchSize1_MatchesSingleSequenceTop1" storage="/private/tmp/tensorsharp-r4-metal/managed-repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d6399dc2-2c71-9f3d-3872-ef65a0ad64ca">
+      <Execution id="982af3a5-7665-47a4-8ce1-451b4eb7b678" />
+      <TestMethod codeBase="/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen3BatchedForwardTests" name="BatchSize1_MatchesSingleSequenceTop1" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen3BatchedForwardTests.PerSequenceCache_GrowsReleasesAndReturnsToPrimary" storage="/private/tmp/tensorsharp-r4-metal/managed-repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a8585158-cfd2-f30a-1304-9338fa099287">
+      <Execution id="f710604b-d63c-4ab5-8721-91c5b897a833" />
+      <TestMethod codeBase="/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen3BatchedForwardTests" name="PerSequenceCache_GrowsReleasesAndReturnsToPrimary" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen3BatchedForwardTests.BatchSize2_KeepsSequencesIndependent" storage="/private/tmp/tensorsharp-r4-metal/managed-repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="6bea6e4a-032d-5053-1857-4f0c06555dcc">
+      <Execution id="ea0cfb32-dff6-4180-8666-69317a8a6fd9" />
+      <TestMethod codeBase="/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen3BatchedForwardTests" name="BatchSize2_KeepsSequencesIndependent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen3BatchedForwardTests.RetainedDecodeGraph_SurvivesTruncateAndResidencyRelease" storage="/private/tmp/tensorsharp-r4-metal/managed-repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="fa654e29-de6f-6c79-30fc-1acbdb15eeb6">
+      <Execution id="26ae6c71-7fe2-4b70-95e3-fee4f0434b37" />
+      <TestMethod codeBase="/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen3BatchedForwardTests" name="RetainedDecodeGraph_SurvivesTruncateAndResidencyRelease" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="a8585158-cfd2-f30a-1304-9338fa099287" executionId="f710604b-d63c-4ab5-8721-91c5b897a833" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d6399dc2-2c71-9f3d-3872-ef65a0ad64ca" executionId="982af3a5-7665-47a4-8ce1-451b4eb7b678" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="fa654e29-de6f-6c79-30fc-1acbdb15eeb6" executionId="26ae6c71-7fe2-4b70-95e3-fee4f0434b37" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6bea6e4a-032d-5053-1857-4f0c06555dcc" executionId="ea0cfb32-dff6-4180-8666-69317a8a6fd9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="4" executed="4" passed="4" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.05]   Discovering: InferenceWeb.Tests
+ggml_metal_device_init: testing tensor API for f16 support
+tensorsharp: default Metal language version raised from 3.2 to 4.0 (host executable records an old SDK; set TENSORSHARP_METAL_MSL_DEFAULT=off to disable)
+ggml_metal_device_init: testing tensor API for bfloat support
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: loaded 20 libraries from embedded data in 0.009 sec (max single = 0.009 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M5 Pro)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple10  (1010)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = true
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 40200.90 MB
+ggml_metal_init: allocating
+ggml_metal_init: picking default device: Apple M5 Pro
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[xUnit.net 00:00:00.29]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.30]   Starting:    InferenceWeb.Tests
+Backend: GgmlMetal
+Model: qwen3, Layers=36, Hidden=4096, Heads=32, KVHeads=8, HeadDim=128, Vocab=151669
+RoPE base=1000000, scale=4, type=yarn, origCtx=16384, eps=1E-06
+Loading model weights... done (145 F32 tensors, 254 quantized tensors)
+  Quantized: 1098 MB (1098 MB file-backed), F32: 1 MB
+  Fused projections: 36 QKV
+  Fused projections: 36 Gate+Up
+Context length: using MAX_CONTEXT=4096; model declares qwen3.context_length=65536.
+Initial GgmlMetal KV cache allocation: 64 tokens (grows on demand up to 4096).
+Backend: GgmlMetal
+Model: qwen3, Layers=36, Hidden=4096, Heads=32, KVHeads=8, HeadDim=128, Vocab=151669
+RoPE base=1000000, scale=4, type=yarn, origCtx=16384, eps=1E-06
+Loading model weights... done (145 F32 tensors, 254 quantized tensors)
+  Quantized: 1098 MB (1098 MB file-backed), F32: 1 MB
+  Fused projections: 36 QKV
+  Fused projections: 36 Gate+Up
+Context length: using MAX_CONTEXT=4096; model declares qwen3.context_length=65536.
+Initial GgmlMetal KV cache allocation: 64 tokens (grows on demand up to 4096).
+Backend: GgmlMetal
+Model: qwen3, Layers=36, Hidden=4096, Heads=32, KVHeads=8, HeadDim=128, Vocab=151669
+RoPE base=1000000, scale=4, type=yarn, origCtx=16384, eps=1E-06
+Loading model weights... done (145 F32 tensors, 254 quantized tensors)
+  Quantized: 1098 MB (1098 MB file-backed), F32: 1 MB
+  Fused projections: 36 QKV
+  Fused projections: 36 Gate+Up
+Context length: using MAX_CONTEXT=4096; model declares qwen3.context_length=65536.
+Initial GgmlMetal KV cache allocation: 64 tokens (grows on demand up to 4096).
+[KV cache] Truncating from 7 to 6
+Backend: GgmlMetal
+Model: qwen3, Layers=36, Hidden=4096, Heads=32, KVHeads=8, HeadDim=128, Vocab=151669
+RoPE base=1000000, scale=4, type=yarn, origCtx=16384, eps=1E-06
+Loading model weights... done (145 F32 tensors, 254 quantized tensors)
+  Quantized: 1098 MB (1098 MB file-backed), F32: 1 MB
+  Fused projections: 36 QKV
+  Fused projections: 36 Gate+Up
+Context length: using MAX_CONTEXT=4096; model declares qwen3.context_length=65536.
+Initial GgmlMetal KV cache allocation: 64 tokens (grows on demand up to 4096).
+Expanded Qwen3 attention cache to 4096 tokens.
+[xUnit.net 00:00:03.87]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

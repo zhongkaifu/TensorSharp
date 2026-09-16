@@ -14,7 +14,7 @@ namespace InferenceWeb.Tests;
 /// Ordered video-frame input for Qwen 3.8 Flash Next (<c>qwen4exp</c>): the OpenAI
 /// <c>video_url</c> part is sampled into timed frames, the prompt renders them as the
 /// Qwen3-VL video layout (one <c>&lt;|video_pad|&gt;</c> block per temporal pair, each
-/// labelled with its time, wrapped once per clip), and the injector's prompt layout
+/// labelled with its time), and the injector's prompt layout
 /// gives consecutive pairs increasing temporal M-RoPE ids. Encoder and model
 /// numerics are covered separately.
 /// </summary>
@@ -60,11 +60,12 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         Assert.All(message.ImagePaths, path => Assert.True(File.Exists(path)));
 
         // Three frames at 0, 1, 2 s merge into pairs (0,1) at 0.5 s and (2,2) at 2.0 s:
-        // the odd tail repeats its last frame, as the Qwen-VL processor pads a clip.
-        string clip = Start
+        // the odd tail repeats its last frame. The vision blocks match the Qwen3-VL
+        // v4.57.1 processor: it replaces the whole outer vision-start/video-pad/end span.
+        // https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/qwen3_vl/processing_qwen3_vl.py
+        string clip = "Sampled video frame times in chronological order: 0, 1, 2 seconds.\n"
             + "<0.5 seconds>" + Start + VideoPad + End
-            + "<2.0 seconds>" + Start + VideoPad + End
-            + End;
+            + "<2.0 seconds>" + Start + VideoPad + End;
         string content = ChatTemplate.InjectMultimodalTokens(new() { message }, "qwen4exp")[0].Content!;
         Assert.StartsWith(Image + clip + Image + "Describe the numbered frames", content);
         Assert.Equal(2, Count(content, VideoPad));
@@ -98,7 +99,8 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         Assert.Equal(new[] { new QwenVideoFrames.Group(2, 3, 1.0) }, items[1].Groups);
 
         string content = ChatTemplate.InjectMultimodalTokens(new() { message }, "qwen4exp")[0].Content!;
-        string clip = Start + "<1.0 seconds>" + Start + VideoPad + End + End;
+        string clip = "Sampled video frame times in chronological order: 0, 2 seconds.\n"
+            + "<1.0 seconds>" + Start + VideoPad + End;
         Assert.StartsWith(clip + clip + "Which clip", content);
     }
 
@@ -166,9 +168,11 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         var sb = new StringBuilder();
         QwenVideoFrames.AppendPlaceholders(message, sb);
         Assert.Equal(Image
-            + Start + "<0.2 seconds>" + Start + VideoPad + End + "<1.2 seconds>" + Start + VideoPad + End
-            + "<2.0 seconds>" + Start + VideoPad + End + End
-            + Start + "<0.0 seconds>" + Start + VideoPad + End + End, sb.ToString());
+            + "Sampled video frame times in chronological order: 0, 0.5, 1, 1.5, 2 seconds.\n"
+            + "<0.2 seconds>" + Start + VideoPad + End + "<1.2 seconds>" + Start + VideoPad + End
+            + "<2.0 seconds>" + Start + VideoPad + End
+            + "Sampled video frame times in chronological order: 0 seconds.\n"
+            + "<0.0 seconds>" + Start + VideoPad + End, sb.ToString());
     }
 
     [Fact]

@@ -111,9 +111,9 @@ namespace TensorSharp.Models
                 rgba, origWidth, origHeight, resizedW, resizedH);
         }
 
-        /// <summary>Qwen3-VL video processor pixel floor over the whole padded clip (4 merged tokens).</summary>
+        /// <summary>TensorSharp's video pixel floor over the whole padded clip.</summary>
         public const long VideoMinPixels = 4L * 32 * 32;
-        /// <summary>Qwen3-VL video processor pixel budget over the whole padded clip (24 576 merged tokens).</summary>
+        /// <summary>TensorSharp's video pixel budget over the whole padded clip.</summary>
         public const long VideoMaxPixels = 24576L * 32 * 32;
 
         /// <summary>
@@ -128,6 +128,10 @@ namespace TensorSharp.Models
         {
             if (frameCount <= 0)
                 throw new ArgumentOutOfRangeException(nameof(frameCount));
+            if (temporalPatchSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(temporalPatchSize));
+            if (minPixels <= 0 || maxPixels < minPixels)
+                throw new ArgumentOutOfRangeException(nameof(minPixels), "Pixel budgets must be positive and ordered.");
             int factor = Factor;
             if (height < factor || width < factor)
                 throw new ArgumentException($"Video frame too small: {height}x{width}, minimum {factor}x{factor}");
@@ -135,16 +139,18 @@ namespace TensorSharp.Models
                 throw new ArgumentException($"Video frame aspect ratio {height}x{width} exceeds 200:1.");
 
             long tBar = (long)Math.Ceiling((double)frameCount / temporalPatchSize) * temporalPatchSize;
+            if ((double)tBar * factor * factor > maxPixels)
+                throw new ArgumentException("The frame count exceeds the video pixel budget even at the minimum patch grid.");
             int hBar = (int)Math.Round((double)height / factor, MidpointRounding.ToEven) * factor;
             int wBar = (int)Math.Round((double)width / factor, MidpointRounding.ToEven) * factor;
 
-            if (tBar * hBar * wBar > maxPixels)
+            if ((double)tBar * hBar * wBar > maxPixels)
             {
                 double beta = Math.Sqrt((double)tBar * height * width / maxPixels);
                 hBar = Math.Max(factor, (int)Math.Floor(height / beta / factor) * factor);
                 wBar = Math.Max(factor, (int)Math.Floor(width / beta / factor) * factor);
             }
-            else if (tBar * hBar * wBar < minPixels)
+            else if ((double)tBar * hBar * wBar < minPixels)
             {
                 double beta = Math.Sqrt((double)minPixels / ((double)tBar * height * width));
                 hBar = (int)Math.Ceiling(height * beta / factor) * factor;
@@ -155,4 +161,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

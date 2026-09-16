@@ -7272,49 +7272,7 @@ namespace TensorSharp.Models
 
             float* ptr = GetFloatPtr(data);
 
-            // Parallel over sequence positions: each position's heads are independent
-            if (seqLen >= 64)
-            {
-                var cosTab = _neoXRopeCos;
-                var sinTab = _neoXRopeSin;
-                System.Threading.Tasks.Parallel.For(0, seqLen, s =>
-                {
-                    int tableOff = s * ropeHalf;
-                    for (int h = 0; h < numHeads; h++)
-                    {
-                        float* head = ptr + ((long)s * numHeads + h) * headDim;
-                        for (int j = 0; j < ropeHalf; j++)
-                        {
-                            float cos = cosTab[tableOff + j];
-                            float sin = sinTab[tableOff + j];
-                            float x0 = head[j];
-                            float x1 = head[j + ropeHalf];
-                            head[j] = x0 * cos - x1 * sin;
-                            head[j + ropeHalf] = x0 * sin + x1 * cos;
-                        }
-                    }
-                });
-            }
-            else
-            {
-                for (int s = 0; s < seqLen; s++)
-                {
-                    int tableOff = s * ropeHalf;
-                    for (int h = 0; h < numHeads; h++)
-                    {
-                        float* head = ptr + ((long)s * numHeads + h) * headDim;
-                        for (int j = 0; j < ropeHalf; j++)
-                        {
-                            float cos = _neoXRopeCos[tableOff + j];
-                            float sin = _neoXRopeSin[tableOff + j];
-                            float x0 = head[j];
-                            float x1 = head[j + ropeHalf];
-                            head[j] = x0 * cos - x1 * sin;
-                            head[j + ropeHalf] = x0 * sin + x1 * cos;
-                        }
-                    }
-                }
-            }
+            NeoXRopeCpu.Apply(ptr, seqLen, numHeads, headDim, _neoXRopeCos, _neoXRopeSin, ropeHalf);
             return data;
         }
 

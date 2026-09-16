@@ -1,0 +1,499 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="0bdadb36-974c-4404-a54e-2135753d4a66" name="@Zhongkais-MacBook-Pro 2026-09-16 10:17:31" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T10:17:31.4964130-07:00" queuing="2026-09-16T10:17:31.4964130-07:00" start="2026-09-16T10:17:30.5802460-07:00" finish="2026-09-16T10:17:32.2147920-07:00" />
+  <TestSettings name="default" id="b6ccf133-f0de-4412-9d26-b2b84b06cc3f">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_10_17_31" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="9bf30000-3151-4562-b785-46c724cc5a82" testId="1756590d-5d70-aa88-10bf-6f8f94356cad" testName="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests.NativeLoader_RejectsTpPartitionThatCutsAQuantizationHeadGroup" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0088492" startTime="2026-09-16T10:17:32.1400540-07:00" endTime="2026-09-16T10:17:32.1489390-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9bf30000-3151-4562-b785-46c724cc5a82" />
+    <UnitTestResult executionId="8df77c7e-9143-4ac7-8726-485427731b2e" testId="dbe83dcc-f7cb-c9b2-6c21-4f8fe626c47f" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.EveryWindowPartiallyRejected_StillMatchesPlainGreedy(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1089081" startTime="2026-09-16T10:17:31.4805610-07:00" endTime="2026-09-16T10:17:31.5370540-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8df77c7e-9143-4ac7-8726-485427731b2e">
+      <Output>
+        <StdOut>GgmlCpu wrong-tail: period=[8,96,50] prompt=[8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,100,8,96]
+GgmlCpu wrong-tail: drafted=23 accepted=13 verify=10 plain=0 rollbacks=10
+plain: 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96
+spec : 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="44811bbc-7335-4edf-8f4e-3674634cb40c" testId="ea1fd37e-75c0-b64b-b625-6cff48bee325" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0391905" startTime="2026-09-16T10:17:31.2502870-07:00" endTime="2026-09-16T10:17:31.2894040-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="44811bbc-7335-4edf-8f4e-3674634cb40c" />
+    <UnitTestResult executionId="4d4fb604-8b85-4841-bbd2-e437aac0dc31" testId="71ee8421-21bd-c591-3089-d502703b9af9" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.ManagedAndNativeSpecForward_AgreeRowForRow" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0153972" startTime="2026-09-16T10:17:31.6256490-07:00" endTime="2026-09-16T10:17:31.6400440-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4d4fb604-8b85-4841-bbd2-e437aac0dc31" />
+    <UnitTestResult executionId="f56a8f64-b256-432e-bd37-ddc09ef0e641" testId="429d764f-79ea-683a-c561-c16952c5f7a8" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.EveryWindowPartiallyRejected_StillMatchesPlainGreedy(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0646251" startTime="2026-09-16T10:17:31.3633590-07:00" endTime="2026-09-16T10:17:31.4281000-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f56a8f64-b256-432e-bd37-ddc09ef0e641">
+      <Output>
+        <StdOut>Cpu wrong-tail: period=[8,96,50] prompt=[8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,100,8,96]
+Cpu wrong-tail: drafted=23 accepted=13 verify=10 plain=0 rollbacks=10
+plain: 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96
+spec : 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="efe52414-ce37-4e26-81fe-57c5a2c84ec5" testId="82a95304-5a60-fdca-cd79-7f1fb70bcd88" testName="InferenceWeb.Tests.NativeGgmlIdentityTests.MappedIdentityFindsLibraryUsedByNativeExecution" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0020119" startTime="2026-09-16T10:17:31.3612070-07:00" endTime="2026-09-16T10:17:31.3632180-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="efe52414-ce37-4e26-81fe-57c5a2c84ec5" />
+    <UnitTestResult executionId="ce814675-26da-4448-9e3d-a56e8a609e7d" testId="59667fff-9752-5479-f098-38f6d7cda3ad" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0424897" startTime="2026-09-16T10:17:31.5820170-07:00" endTime="2026-09-16T10:17:31.6244660-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ce814675-26da-4448-9e3d-a56e8a609e7d">
+      <Output>
+        <StdOut>Cpu ngram: period=[8,96,50] prompt=[8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,100,8,96]
+Cpu ngram: drafted=19 accepted=16 verify=8 plain=0 rollbacks=3
+plain: 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96
+spec : 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="801d2f96-d497-43e9-9b47-42d6faf0ce30" testId="a6db2bd5-e57a-c5a9-102b-73269a1cd5d2" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaEveryWindowPartiallyRejected" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-16T10:17:31.6245480-07:00" endTime="2026-09-16T10:17:31.6247500-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="801d2f96-d497-43e9-9b47-42d6faf0ce30">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="20e8c938-3790-4782-a705-e39fbf0b70dd" testId="cfb70937-e37b-81e1-6056-992571965a53" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0177627" startTime="2026-09-16T10:17:31.5436470-07:00" endTime="2026-09-16T10:17:31.5613970-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="20e8c938-3790-4782-a705-e39fbf0b70dd" />
+    <UnitTestResult executionId="eb452465-03cd-4fb8-92ee-027befbac129" testId="b4229ee0-b2e6-1043-89f2-37bcc2f979aa" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0425045" startTime="2026-09-16T10:17:31.2894930-07:00" endTime="2026-09-16T10:17:31.3326380-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="eb452465-03cd-4fb8-92ee-027befbac129" />
+    <UnitTestResult executionId="b540c94c-5afe-4f29-90ca-a9b0414b5e91" testId="ba18da8d-efbe-05b3-46e2-4a5525c80789" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaSnapshotVerifyRestoreRewind" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-16T10:17:31.6794040-07:00" endTime="2026-09-16T10:17:31.6794170-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b540c94c-5afe-4f29-90ca-a9b0414b5e91">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="68fdaafb-5a51-4c3a-a6b8-c349fd84f866" testId="6cdb9809-d858-5de1-1112-443891f0b684" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0268857" startTime="2026-09-16T10:17:31.2233470-07:00" endTime="2026-09-16T10:17:31.2501950-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="68fdaafb-5a51-4c3a-a6b8-c349fd84f866" />
+    <UnitTestResult executionId="7684240e-caeb-4842-86bf-507ca92aac9a" testId="e539ad73-3b1f-7e4d-391e-266fb9e09680" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0064797" startTime="2026-09-16T10:17:31.5371820-07:00" endTime="2026-09-16T10:17:31.5435930-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="7684240e-caeb-4842-86bf-507ca92aac9a" />
+    <UnitTestResult executionId="ae25cdc9-d299-468c-8760-aec76ff9a244" testId="03118dc0-a4f5-551c-dd20-1963756d2865" testName="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests.NativeLoader_AcceptsGlm5NextWithTwoAlignedTpRanks" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0404566" startTime="2026-09-16T10:17:32.1490430-07:00" endTime="2026-09-16T10:17:32.1894690-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ae25cdc9-d299-468c-8760-aec76ff9a244" />
+    <UnitTestResult executionId="7289ea01-a9e1-4b98-868c-60b3ce1fe355" testId="348f3516-97dd-ad44-125a-4c8d089ac5ab" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaNgramRollback" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-16T10:17:31.6255580-07:00" endTime="2026-09-16T10:17:31.6255720-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="7289ea01-a9e1-4b98-868c-60b3ce1fe355">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="92c35262-38ca-44f0-8b27-af261fd788e4" testId="72783320-0505-6980-c4e2-f2c58692f198" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.BoundSlots_AbaRollbackPreservesEachContinuation" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0373702" startTime="2026-09-16T10:17:31.6401070-07:00" endTime="2026-09-16T10:17:31.6781520-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="92c35262-38ca-44f0-8b27-af261fd788e4" />
+    <UnitTestResult executionId="5d3a4d8f-1d94-4adf-b165-9f19a03dff8f" testId="c18d56bb-0beb-3f70-7e88-5d202a233bb4" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(backend: Cpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0347533" startTime="2026-09-16T10:17:31.1568220-07:00" endTime="2026-09-16T10:17:31.1936150-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5d3a4d8f-1d94-4adf-b165-9f19a03dff8f" />
+    <UnitTestResult executionId="f1091933-7cfe-4f97-adc0-135d9b51b10f" testId="5d40a56b-06f9-5bea-5a31-e7d7cce4ebad" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.OrdinaryGlmDsa_RetainsItsSpeculativeTrunk" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0189941" startTime="2026-09-16T10:17:31.2046090-07:00" endTime="2026-09-16T10:17:31.2232080-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f1091933-7cfe-4f97-adc0-135d9b51b10f" />
+    <UnitTestResult executionId="73cd90c5-425c-455e-bc0e-d72fa68d6a0a" testId="78776ad4-92cc-bab5-7a6f-46014b4548cc" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0266587" startTime="2026-09-16T10:17:31.3328390-07:00" endTime="2026-09-16T10:17:31.3596290-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="73cd90c5-425c-455e-bc0e-d72fa68d6a0a" />
+    <UnitTestResult executionId="42cec277-136c-4d3b-bd0b-3c72d2682858" testId="5ee77a11-dc64-836f-0932-caf2a1476a2c" testName="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0103936" startTime="2026-09-16T10:17:31.1971710-07:00" endTime="2026-09-16T10:17:31.2040510-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="42cec277-136c-4d3b-bd0b-3c72d2682858" />
+    <UnitTestResult executionId="ecc648bc-7a79-4353-b181-cdae98633ba5" testId="3a3d86df-c98c-ee75-9282-f9b9ae540dee" testName="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(backend: GgmlCpu)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0204987" startTime="2026-09-16T10:17:31.5614640-07:00" endTime="2026-09-16T10:17:31.5819630-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ecc648bc-7a79-4353-b181-cdae98633ba5">
+      <Output>
+        <StdOut>GgmlCpu ngram: period=[8,96,50] prompt=[8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,100,8,96]
+GgmlCpu ngram: drafted=19 accepted=16 verify=8 plain=0 rollbacks=3
+plain: 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96
+spec : 50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96,50,8,96</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="fef88aa0-aa08-4ffb-a86f-a388dff20d5f" testId="502ab4fa-2706-12c1-a217-1da37f8211ce" testName="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers(kind: 2)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.4390963" startTime="2026-09-16T10:17:31.6795850-07:00" endTime="2026-09-16T10:17:32.1175350-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fef88aa0-aa08-4ffb-a86f-a388dff20d5f" />
+    <UnitTestResult executionId="775f456e-2191-42c8-b9e3-c1e585365a6a" testId="318b40dc-d55c-a2e6-b9b0-1912b929fbc7" testName="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers(kind: 1)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0222298" startTime="2026-09-16T10:17:32.1176720-07:00" endTime="2026-09-16T10:17:32.1398450-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="775f456e-2191-42c8-b9e3-c1e585365a6a" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.EveryWindowPartiallyRejected_StillMatchesPlainGreedy(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="429d764f-79ea-683a-c561-c16952c5f7a8">
+      <Execution id="f56a8f64-b256-432e-bd37-ddc09ef0e641" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="EveryWindowPartiallyRejected_StillMatchesPlainGreedy" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="c18d56bb-0beb-3f70-7e88-5d202a233bb4">
+      <Execution id="5d3a4d8f-1d94-4adf-b165-9f19a03dff8f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaSnapshotVerifyRestoreRewind" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ba18da8d-efbe-05b3-46e2-4a5525c80789">
+      <Execution id="b540c94c-5afe-4f29-90ca-a9b0414b5e91" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="CudaSnapshotVerifyRestoreRewind" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.ManagedAndNativeSpecForward_AgreeRowForRow" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="71ee8421-21bd-c591-3089-d502703b9af9">
+      <Execution id="4d4fb604-8b85-4841-bbd2-e437aac0dc31" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="ManagedAndNativeSpecForward_AgreeRowForRow" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e539ad73-3b1f-7e4d-391e-266fb9e09680">
+      <Execution id="7684240e-caeb-4842-86bf-507ca92aac9a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers(kind: 1)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="318b40dc-d55c-a2e6-b9b0-1912b929fbc7">
+      <Execution id="775f456e-2191-42c8-b9e3-c1e585365a6a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests" name="CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="59667fff-9752-5479-f098-38f6d7cda3ad">
+      <Execution id="ce814675-26da-4448-9e3d-a56e8a609e7d" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="78776ad4-92cc-bab5-7a6f-46014b4548cc">
+      <Execution id="73cd90c5-425c-455e-bc0e-d72fa68d6a0a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="SchedulerRequestedNgram_ArmsAndPreservesThePlainStream" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaNgramRollback" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="348f3516-97dd-ad44-125a-4c8d089ac5ab">
+      <Execution id="7289ea01-a9e1-4b98-868c-60b3ce1fe355" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="CudaNgramRollback" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.EveryWindowPartiallyRejected_StillMatchesPlainGreedy(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="dbe83dcc-f7cb-c9b2-6c21-4f8fe626c47f">
+      <Execution id="8df77c7e-9143-4ac7-8726-485427731b2e" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="EveryWindowPartiallyRejected_StillMatchesPlainGreedy" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests.NativeLoader_AcceptsGlm5NextWithTwoAlignedTpRanks" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="03118dc0-a4f5-551c-dd20-1963756d2865">
+      <Execution id="ae25cdc9-d299-468c-8760-aec76ff9a244" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests" name="NativeLoader_AcceptsGlm5NextWithTwoAlignedTpRanks" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="6cdb9809-d858-5de1-1112-443891f0b684">
+      <Execution id="68fdaafb-5a51-4c3a-a6b8-c349fd84f866" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaEveryWindowPartiallyRejected" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a6db2bd5-e57a-c5a9-102b-73269a1cd5d2">
+      <Execution id="801d2f96-d497-43e9-9b47-42d6faf0ce30" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="CudaEveryWindowPartiallyRejected" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NativeGgmlIdentityTests.MappedIdentityFindsLibraryUsedByNativeExecution" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="82a95304-5a60-fdca-cd79-7f1fb70bcd88">
+      <Execution id="efe52414-ce37-4e26-81fe-57c5a2c84ec5" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NativeGgmlIdentityTests" name="MappedIdentityFindsLibraryUsedByNativeExecution" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.OrdinaryGlmDsa_RetainsItsSpeculativeTrunk" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="5d40a56b-06f9-5bea-5a31-e7d7cce4ebad">
+      <Execution id="f1091933-7cfe-4f97-adc0-135d9b51b10f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="OrdinaryGlmDsa_RetainsItsSpeculativeTrunk" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers(kind: 2)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="502ab4fa-2706-12c1-a217-1da37f8211ce">
+      <Execution id="fef88aa0-aa08-4ffb-a86f-a388dff20d5f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests" name="CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="3a3d86df-c98c-ee75-9282-f9b9ae540dee">
+      <Execution id="ecc648bc-7a79-4353-b181-cdae98633ba5" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests.NativeLoader_RejectsTpPartitionThatCutsAQuantizationHeadGroup" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="1756590d-5d70-aa88-10bf-6f8f94356cad">
+      <Execution id="9bf30000-3151-4562-b785-46c724cc5a82" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextNativeTensorParallelTests" name="NativeLoader_RejectsTpPartitionThatCutsAQuantizationHeadGroup" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.BoundSlots_AbaRollbackPreservesEachContinuation" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="72783320-0505-6980-c4e2-f2c58692f198">
+      <Execution id="92c35262-38ca-44f0-8b27-af261fd788e4" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="BoundSlots_AbaRollbackPreservesEachContinuation" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(backend: GgmlCpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="5ee77a11-dc64-836f-0932-caf2a1476a2c">
+      <Execution id="42cec277-136c-4d3b-bd0b-3c72d2682858" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="cfb70937-e37b-81e1-6056-992571965a53">
+      <Execution id="20e8c938-3790-4782-a705-e39fbf0b70dd" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests" name="SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="b4229ee0-b2e6-1043-89f2-37bcc2f979aa">
+      <Execution id="eb452465-03cd-4fb8-92ee-027befbac129" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="SchedulerRequestedNgram_ArmsAndPreservesThePlainStream" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests.ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(backend: Cpu)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ea1fd37e-75c0-b64b-b625-6cff48bee325">
+      <Execution id="44811bbc-7335-4edf-8f4e-3674634cb40c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm5NextSpeculationEligibilityTests" name="ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="1756590d-5d70-aa88-10bf-6f8f94356cad" executionId="9bf30000-3151-4562-b785-46c724cc5a82" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="dbe83dcc-f7cb-c9b2-6c21-4f8fe626c47f" executionId="8df77c7e-9143-4ac7-8726-485427731b2e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ea1fd37e-75c0-b64b-b625-6cff48bee325" executionId="44811bbc-7335-4edf-8f4e-3674634cb40c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="71ee8421-21bd-c591-3089-d502703b9af9" executionId="4d4fb604-8b85-4841-bbd2-e437aac0dc31" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="429d764f-79ea-683a-c561-c16952c5f7a8" executionId="f56a8f64-b256-432e-bd37-ddc09ef0e641" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="82a95304-5a60-fdca-cd79-7f1fb70bcd88" executionId="efe52414-ce37-4e26-81fe-57c5a2c84ec5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="59667fff-9752-5479-f098-38f6d7cda3ad" executionId="ce814675-26da-4448-9e3d-a56e8a609e7d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a6db2bd5-e57a-c5a9-102b-73269a1cd5d2" executionId="801d2f96-d497-43e9-9b47-42d6faf0ce30" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="cfb70937-e37b-81e1-6056-992571965a53" executionId="20e8c938-3790-4782-a705-e39fbf0b70dd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b4229ee0-b2e6-1043-89f2-37bcc2f979aa" executionId="eb452465-03cd-4fb8-92ee-027befbac129" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ba18da8d-efbe-05b3-46e2-4a5525c80789" executionId="b540c94c-5afe-4f29-90ca-a9b0414b5e91" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6cdb9809-d858-5de1-1112-443891f0b684" executionId="68fdaafb-5a51-4c3a-a6b8-c349fd84f866" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e539ad73-3b1f-7e4d-391e-266fb9e09680" executionId="7684240e-caeb-4842-86bf-507ca92aac9a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="03118dc0-a4f5-551c-dd20-1963756d2865" executionId="ae25cdc9-d299-468c-8760-aec76ff9a244" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="348f3516-97dd-ad44-125a-4c8d089ac5ab" executionId="7289ea01-a9e1-4b98-868c-60b3ce1fe355" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="72783320-0505-6980-c4e2-f2c58692f198" executionId="92c35262-38ca-44f0-8b27-af261fd788e4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="c18d56bb-0beb-3f70-7e88-5d202a233bb4" executionId="5d3a4d8f-1d94-4adf-b165-9f19a03dff8f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5d40a56b-06f9-5bea-5a31-e7d7cce4ebad" executionId="f1091933-7cfe-4f97-adc0-135d9b51b10f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="78776ad4-92cc-bab5-7a6f-46014b4548cc" executionId="73cd90c5-425c-455e-bc0e-d72fa68d6a0a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5ee77a11-dc64-836f-0932-caf2a1476a2c" executionId="42cec277-136c-4d3b-bd0b-3c72d2682858" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="3a3d86df-c98c-ee75-9282-f9b9ae540dee" executionId="ecc648bc-7a79-4353-b181-cdae98633ba5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="502ab4fa-2706-12c1-a217-1da37f8211ce" executionId="fef88aa0-aa08-4ffb-a86f-a388dff20d5f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="318b40dc-d55c-a2e6-b9b0-1912b929fbc7" executionId="775f456e-2191-42c8-b9e3-c1e585365a6a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="23" executed="20" passed="20" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.05]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.39]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.41]   Starting:    InferenceWeb.Tests
+Backend: Cpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (29 F32 tensors, 0 quantized tensors)
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: Cpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (29 F32 tensors, 0 quantized tensors)
+Backend: Cpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (29 F32 tensors, 0 quantized tensors)
+Backend: Cpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (29 F32 tensors, 0 quantized tensors)
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+[xUnit.net 00:00:00.89]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+[xUnit.net 00:00:00.89]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+Backend: Cpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+Loading model weights... done (55 F32 tensors, 0 quantized tensors)
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=1024, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=2, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=2
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/2
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+Test 'InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaEveryWindowPartiallyRejected' was skipped in the test run.
+Test 'InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaNgramRollback' was skipped in the test run.
+[xUnit.net 00:00:00.94]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+[glm] KDA capture failed with an unknown exception
+[glm] KDA state restore refused: no snapshot for slot 0 at or before position 5
+[glm] KDA restore failed with an unknown exception; reset required
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 2 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=2, indexer 1x64 top-4 on 0/2 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm] KDA capture failed: std::bad_alloc
+[glm] KDA state restore refused: no snapshot for slot 0 at or before position 5
+[glm] KDA restore failed; reset required: std::bad_alloc
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=2, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 2 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=4, flash_attn=off, fused_indexer=off
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=2, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] --tp 2 on 0 GPU(s): ranks share devices (testing only, no speedup)
+[glm] --tp 2 cannot split 2 heads in the 2-head groups required by the output weights' quantization blocks
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=4, flash_attn=off, fused_indexer=off
+[glm] --tp 2 on 0 GPU(s): ranks share devices (testing only, no speedup)
+[glm] host experts served from the GGUF mapping (0.0 GiB, no private copy)
+Backend: GgmlCpu
+Model: glm5next, Layers=1, Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), Vocab=128
+  MoE: 4 experts, top-2, ffn=32, shared=0, scale=1, norm=False, gating=sigmoid, dense_lead=1
+  DSA indexer: 1 heads x 64, top-k=4, full layers=0/1
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using MAX_CONTEXT=256; model declares glm5next.context_length=256.
+[glm] prefaulted 0.0 GiB of mmapped host experts in 0.0s
+[glm] hyper-connection ops: native
+[glm] TP executor: combined scheduler fallback (ranks are oversubscribed on the visible GPUs)
+[glm] glm-dsa: 1 trunk layers, n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=32, head_v=32, rope=0), 4 experts top-2 (ff=32), dense_lead=1, indexer 1x64 top-4 on 0/1 layers, vocab=128
+[glm] loaded 0.0 GiB across 0 GPU(s) in 0.0s (0.00 GiB/s, host experts mmapped); n_ctx=256, n_ubatch=4, flash_attn=off, fused_indexer=off
+[glm] tensor parallel across 2 rank(s): every layer on every rank, heads 2/4 and ~0/32 expert rows per rank, 2 reductions per layer
+[xUnit.net 00:00:01.45]   Finished:    InferenceWeb.Tests
+Test 'InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaSnapshotVerifyRestoreRewind' was skipped in the test run.
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-16T10:17:31.6252510-07:00">
+        <Text>[xUnit.net 00:00:00.89]     InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaEveryWindowPartiallyRejected [SKIP]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-16T10:17:31.6256710-07:00">
+        <Text>[xUnit.net 00:00:00.89]     InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaNgramRollback [SKIP]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-16T10:17:31.6884000-07:00">
+        <Text>[xUnit.net 00:00:00.94]     InferenceWeb.Tests.Glm5NextSpeculativeRollbackTests.CudaSnapshotVerifyRestoreRewind [SKIP]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

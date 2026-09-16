@@ -286,6 +286,8 @@ static int shard_first_rot(int total, int n, int r, int rot)
 // only on layers that compute a fresh top-k.
 struct glm_slot
 {
+    // A partial recurrent-state restore cannot be reused until a successful reset.
+    bool kda_restore_failed = false;
     int id = 0;
     int64_t n_past = 0;
     // [rank][layer]. Under tensor parallelism every rank keeps its own copy of
@@ -5906,7 +5908,7 @@ TSG_EXPORT int TSGgml_GlmNPast(void * handle)
 TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || n_tokens <= 0) return 0;
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
 
     const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     int done = 0;
@@ -5990,6 +5992,11 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
     glm_model * m = (glm_model *) handle;
     if (!m || n < 2 || !slot_ids || !tokens || !positions || !logits_out) return 0;
     if (n > MAX_BATCHED_DECODE) return 0;
+    for (int i = 0; i < n; ++i)
+    {
+        auto it = m->slots.find(slot_ids[i]);
+        if (it == m->slots.end() || it->second->kda_restore_failed) return 0;
+    }
     // Tensor parallelism splits the batch's work across ranks a second time; the
     // per-sequence path already handles that case correctly, so the batched
     // graph stays single-rank rather than duplicating the reduction plumbing.
@@ -6008,28 +6015,47 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
     }
 }
 
-TSG_EXPORT void TSGgml_GlmReset(void * handle)
+TSG_EXPORT int TSGgml_GlmResetChecked(void * handle)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot) return;
-    m->active_slot->n_past = 0;
-    // glm5next: a new conversation must not inherit the KDA recurrent state.
-    if (m->hp.g5n) slot_clear_recurrent(*m, *m->active_slot);
-    if (m->kda_snap.slot_id == m->active_slot->id) m->kda_snap.valid = false;
+    if (!m || !m->active_slot) return 0;
+    auto & slot = *m->active_slot;
+    slot.kda_restore_failed = true;
+    if (m->kda_snap.slot_id == slot.id) m->kda_snap.valid = false;
+    try
+    {
+        if (m->hp.g5n) slot_clear_recurrent(*m, slot);
+        slot.n_past = 0;
+        slot.kda_restore_failed = false;
+        return 1;
+    }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[glm] reset failed; slot remains unusable: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[glm] reset failed with an unknown exception; slot remains unusable\n");
+    }
+    return 0;
+}
+
+TSG_EXPORT void TSGgml_GlmReset(void * handle)
+{
+    TSGgml_GlmResetChecked(handle);
 }
 
 TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || n_past < 0 || n_past > m->active_slot->n_past) return 0;
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_past < 0 || n_past > m->active_slot->n_past) return 0;
     // The KDA recurrence cannot be rewound to an earlier position: a cached
     // prefix is reusable only when the new prompt EXTENDS it (no rewind), and
     // anything else must restart from zero with a cleared state.
     if (m->hp.g5n && n_past != m->active_slot->n_past && n_past != 0) return 0;
     if (m->hp.g5n && n_past == 0)
     {
-        slot_clear_recurrent(*m, *m->active_slot);
-        if (m->kda_snap.slot_id == m->active_slot->id) m->kda_snap.valid = false;
+        return TSGgml_GlmResetChecked(handle);
     }
     m->active_slot->n_past = n_past;
     return 1;
@@ -6095,7 +6121,7 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
                                      float * h_out, float * logits_out, int all_logits_rows)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot || n_tokens <= 0) return 0;
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
 
     const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     const int64_t n_embd = m->hp.n_embd;
@@ -6170,6 +6196,32 @@ TSG_EXPORT int TSGgml_GlmMtpCatchUp(void * handle, const int32_t * tokens, int n
 //
 // The copies are device-to-device on the device that owns each layer's state;
 // nothing crosses the host. On GLM-5.3-Flash that is ~150 MB per capture.
+
+#if defined(TSG_GGML_TEST_HOOKS)
+static thread_local int glm_test_kda_stage = 0, glm_test_kda_kind = 0;
+// Keep fixture-only entry points separate from the production iOS export list.
+#ifndef TSG_TEST_EXPORT
+#define TSG_TEST_EXPORT TSG_EXPORT
+#endif
+TSG_TEST_EXPORT void TSGgml_GlmTestKdaSnapshotFault(int stage, int kind)
+{
+    glm_test_kda_stage = stage;
+    glm_test_kda_kind = kind;
+}
+#endif
+static void glm_test_kda_fault(int stage)
+{
+#if defined(TSG_GGML_TEST_HOOKS)
+    if (glm_test_kda_stage == stage)
+    {
+        glm_test_kda_stage = 0;
+        if (glm_test_kda_kind == 1) throw std::bad_alloc();
+        throw 17;
+    }
+#else
+    (void) stage;
+#endif
+}
 
 /// Version of the KDA snapshot API, so a managed build can tell a native
 /// library that predates it apart (and decline speculation on glm5next instead
@@ -6276,13 +6328,14 @@ static void kda_snapshot_sync(glm_model & m)
 /// Copy the active slot's KDA recurrent state into the snapshot arena and
 /// record the slot's position. Returns 1 on success. On glm-dsa proper (no
 /// recurrent state) only the position is recorded, so a restore is a rewind.
-TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
+static int glm_kda_state_capture(void * handle)
 {
     glm_model * m = (glm_model *) handle;
     if (!m || !m->active_slot) return 0;
     glm_slot & slot = *m->active_slot;
     glm_model::kda_snapshot & snap = m->kda_snap;
     snap.valid = false;
+    glm_test_kda_fault(1);
     if (m->hp.g5n)
     {
         if (!kda_snapshot_ensure(*m, slot)) return 0;
@@ -6307,7 +6360,7 @@ TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
 /// captured position. Returns that position (>= 0), or -1 when there is no
 /// usable snapshot for the active slot (never taken, taken of another slot,
 /// invalidated by a reset/free, or the slot is already behind it).
-TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
+static int glm_kda_state_restore(void * handle)
 {
     glm_model * m = (glm_model *) handle;
     if (!m || !m->active_slot) return -1;
@@ -6327,7 +6380,9 @@ TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
         // restore zeros.
         for (int r = 0; r < m->tp; r++)
         {
-            if (snap.conv[r].size() != slot.kda_conv[r].size()) return -1;
+            if (snap.conv[r].size() != slot.kda_conv[r].size() ||
+                snap.ssm[r].size() != slot.kda_ssm[r].size() ||
+                slot.kda_ssm[r].size() != slot.kda_conv[r].size()) return -1;
             for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
             {
                 ggml_tensor * a = slot.kda_conv[r][il], * b = snap.conv[r][il];
@@ -6342,7 +6397,11 @@ TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
         {
             for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
             {
-                if (slot.kda_conv[r][il]) ggml_backend_tensor_copy(snap.conv[r][il], slot.kda_conv[r][il]);
+                if (slot.kda_conv[r][il])
+                {
+                    ggml_backend_tensor_copy(snap.conv[r][il], slot.kda_conv[r][il]);
+                    glm_test_kda_fault(2);
+                }
                 if (slot.kda_ssm[r][il])  ggml_backend_tensor_copy(snap.ssm[r][il],  slot.kda_ssm[r][il]);
             }
         }
@@ -6350,6 +6409,39 @@ TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
     }
     slot.n_past = snap.n_past;
     return (int) snap.n_past;
+}
+
+// C ABI callers must receive a failure status even when arena allocation or
+// a backend state copy throws. A failed capture leaves live state untouched;
+// a failed restore may have copied only some layers and therefore poisons only
+// that slot until ResetChecked succeeds.
+TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
+{
+    auto * m = (glm_model *) handle;
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed) return 0;
+    try { return glm_kda_state_capture(handle); }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[glm] KDA capture failed: %s\n", error.what());
+    }
+    catch (...) { fprintf(stderr, "[glm] KDA capture failed with an unknown exception\n"); }
+    m->kda_snap.valid = false;
+    return 0;
+}
+
+TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
+{
+    auto * m = (glm_model *) handle;
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed) return -1;
+    try { return glm_kda_state_restore(handle); }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[glm] KDA restore failed; reset required: %s\n", error.what());
+    }
+    catch (...) { fprintf(stderr, "[glm] KDA restore failed with an unknown exception; reset required\n"); }
+    m->kda_snap.valid = false;
+    m->active_slot->kda_restore_failed = true;
+    return -1;
 }
 
 TSG_EXPORT void TSGgml_GlmFree(void * handle)

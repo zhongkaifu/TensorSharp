@@ -184,6 +184,14 @@ namespace TensorSharp.Models
 
         private unsafe Tensor EncodeCore(float[] pixelValues, float[] secondFrame, int resizedH, int resizedW)
         {
+            ArgumentNullException.ThrowIfNull(pixelValues);
+            int factor = checked(_patchSize * _spatialMergeSize);
+            if (resizedH <= 0 || resizedW <= 0 || resizedH % factor != 0 || resizedW % factor != 0)
+                throw new ArgumentException($"Vision dimensions must be positive multiples of {factor}.");
+            long expectedPixels = checked(3L * resizedH * resizedW);
+            if (pixelValues.LongLength != expectedPixels ||
+                (secondFrame != null && secondFrame.LongLength != expectedPixels))
+                throw new ArgumentException("Each frame must contain exactly 3 * height * width channel-first values.");
             long encodeStart = Stopwatch.GetTimestamp();
             int gridH = resizedH / _patchSize;
             int gridW = resizedW / _patchSize;
@@ -1357,4 +1365,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

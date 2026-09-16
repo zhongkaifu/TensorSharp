@@ -126,7 +126,8 @@ public sealed class OpenAIResponsesAdapter
         List<ChatMessage> messages;
         try
         {
-            messages = ChatMessageParser.ParseResponsesInput(inputEl, instructions, _uploads, logger, _svc.Architecture);
+            messages = ChatMessageParser.ParseResponsesInput(inputEl, instructions, _uploads, logger, _svc.Architecture,
+                _svc.IsAudioEncoderLoaded);
         }
         catch (UploadLimitExceededException ex)
         {

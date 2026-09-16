@@ -45,6 +45,15 @@ def prepare(package, expected, output):
                     text = replace_one(text, 'case "short": await ShortAsync(); break;',
                                        'case "qwen-mtp": await QwenMtpAsync(); break;\n                    case "short": await ShortAsync(); break;')
                     text = replace_one(text, 'model.WarmUpKernels();', 'Bench.RequireMtpHead(model, o);\n        model.WarmUpKernels();')
+                    # Older benchmark snapshots set only the environment path.
+                    # Qwen's layer placement needs the head before construction;
+                    # the real CLI/server pass this explicit factory argument.
+                    old_create = 'ModelBase.Create(o.Model, backend);'
+                    new_create = 'ModelBase.Create(o.Model, backend, draftModelPath: o.DraftModel);'
+                    if old_create in text:
+                        text = replace_one(text, old_create, new_create)
+                    elif text.count(new_create) != 1:
+                        raise ValueError('Frozen benchmark construction seam changed')
                     data = text.encode('utf-8')
                 (output / name).write_bytes(data)
                 sources[name]['derived_sha256'] = sha(data)

@@ -1,0 +1,4 @@
+tool_round_trip c1 repeat0: 1/1 passed; 1.99s
+tool_round_trip c4 repeat0: 4/4 passed; 16.72s
+agentic c1 repeat0: 1/1 passed; 3.99s
+agentic c4 repeat0: 4/4 passed; 22.93s

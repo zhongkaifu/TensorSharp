@@ -1,0 +1,3191 @@
+{
+  "format_version": 1,
+  "engine": "tensorsharp",
+  "url": "http://127.0.0.1:5134",
+  "harness_sha256": {
+    "validate_inference.py": "90fb8c6e3716ea8b0e4682f53058d2850e2f43f11e651fe1b99732cca7836915",
+    "engines.py": "d0c7b8dbacf70d6a663d39a51a6fa5e77cd36714d70591f8dc0e8ae9fe304ea6",
+    "scenarios.py": "eedb1dd22a925200143c4cb6a80f81aa33fad6c0e98b91e1a02c5c48f85c9971"
+  },
+  "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+  "weights_id": "38bb39ee97821de2c9009abb7e93950eec396e66:a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+  "profile": "qwen38-r4-http-unqualified",
+  "thinking": false,
+  "stream": true,
+  "sampling": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 0,
+    "seed": 42,
+    "repeat_penalty": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0
+  },
+  "structured_tool_results": true,
+  "serial_tool_workflows": false,
+  "max_tokens_override": null,
+  "execution_plan": {
+    "scenarios": [
+      "tool_round_trip",
+      "agentic"
+    ],
+    "concurrency": [
+      1,
+      4
+    ],
+    "repeats": 1,
+    "expected_cases": 10
+  },
+  "run_complete": true,
+  "cases": [
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "9905147837a0a004dfdec08bfbc542987e37600ae863db8f0c254195c8deab7a",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c1-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 737.2972825542092,
+            "prefill_tps": 447.5806541111685,
+            "decode_tps": 100.95709292982315,
+            "total_wall_ms": 1114.0108369290829,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_bf25b870af60453a858",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_bf25b870af60453a858",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247712.372170207,
+            "t_first_abs": 4247713.10946749,
+            "t_last_abs": 4247713.485865016,
+            "t_end_abs": 4247713.486181044
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c1-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_bf25b870af60453a858",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_bf25b870af60453a858",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 163,
+            "completion_tokens": 14,
+            "ttft_ms": 619.7743704542518,
+            "prefill_tps": 262.99893601688024,
+            "decode_tps": 51.04563433091314,
+            "total_wall_ms": 874.774401076138,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247713.48633594,
+            "t_first_abs": 4247714.10611031,
+            "t_last_abs": 4247714.360784391,
+            "t_end_abs": 4247714.361110341
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 1989.1808973625302,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "7dc1bd8a516221e253f96da492f3248750fb7d153bd32ed8068b116bd6743bf0",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 6084.578066132963,
+            "prefill_tps": 54.23547802546818,
+            "decode_tps": 12.220790969099616,
+            "total_wall_ms": 10651.253561489284,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_eda18275f2114b0189d",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_eda18275f2114b0189d",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247714.369113187,
+            "t_first_abs": 4247720.453691253,
+            "t_last_abs": 4247723.563146288,
+            "t_end_abs": 4247725.020366749
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_eda18275f2114b0189d",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_eda18275f2114b0189d",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 163,
+            "completion_tokens": 14,
+            "ttft_ms": 4692.353383637965,
+            "prefill_tps": 34.73736666304248,
+            "decode_tps": 11.800091540918945,
+            "total_wall_ms": 6071.180150844157,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247725.020572361,
+            "t_first_abs": 4247729.712925744,
+            "t_last_abs": 4247730.814612113,
+            "t_end_abs": 4247731.091752511
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16722.87313826382,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "effb0550d780f727c07543d872671191b7a85faa2baa86832dfc9323cb6724e4",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i1]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 5920.087308622897,
+            "prefill_tps": 55.74242114965752,
+            "decode_tps": 11.895221226195597,
+            "total_wall_ms": 9192.74490699172,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_0fbc28580d714330904",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_0fbc28580d714330904",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247714.370739531,
+            "t_first_abs": 4247720.290826839,
+            "t_last_abs": 4247723.485387014,
+            "t_end_abs": 4247723.563484438
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i1]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_0fbc28580d714330904",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_0fbc28580d714330904",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 163,
+            "completion_tokens": 14,
+            "ttft_ms": 5799.2851212620735,
+            "prefill_tps": 28.106912592103594,
+            "decode_tps": 9.469334534718799,
+            "total_wall_ms": 7251.681374385953,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247723.563679745,
+            "t_first_abs": 4247729.362964867,
+            "t_last_abs": 4247730.73581741,
+            "t_end_abs": 4247730.81536112
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16444.844554178417,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "183343bef56425b7af72097195854ca75d48c76d49b2c876942703d0d144b14f",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i2]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 6081.921648234129,
+            "prefill_tps": 54.25916660662912,
+            "decode_tps": 12.221866221823554,
+            "total_wall_ms": 10649.811605922878,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_2ed612c43c2447479eb",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_2ed612c43c2447479eb",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247714.372281583,
+            "t_first_abs": 4247720.454203231,
+            "t_last_abs": 4247723.563384702,
+            "t_end_abs": 4247725.022093189
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i2]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_2ed612c43c2447479eb",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_2ed612c43c2447479eb",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 163,
+            "completion_tokens": 14,
+            "ttft_ms": 4691.809355281293,
+            "prefill_tps": 34.74139455741536,
+            "decode_tps": 11.806667313756328,
+            "total_wall_ms": 6068.845956586301,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247725.02235478,
+            "t_first_abs": 4247729.714164135,
+            "t_last_abs": 4247730.815236915,
+            "t_end_abs": 4247731.091200736
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16719.1562615335,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "bda862485a07bcc40363b08494233f8cc5881d39828814c7fbe019a73161ecdf",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i3]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 6080.924654379487,
+            "prefill_tps": 54.26806263128646,
+            "decode_tps": 12.224445196464478,
+            "total_wall_ms": 10648.858704604208,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_d824c9e05afe4df0b79",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_d824c9e05afe4df0b79",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247714.373822575,
+            "t_first_abs": 4247720.45474723,
+            "t_last_abs": 4247723.563272761,
+            "t_end_abs": 4247725.02268128
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i3]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_d824c9e05afe4df0b79",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_d824c9e05afe4df0b79",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 163,
+            "completion_tokens": 14,
+            "ttft_ms": 4692.124920897186,
+            "prefill_tps": 34.73905804895591,
+            "decode_tps": 11.817825181042586,
+            "total_wall_ms": 6069.165866822004,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247725.022933682,
+            "t_first_abs": 4247729.715058603,
+            "t_last_abs": 4247730.815091799,
+            "t_end_abs": 4247731.092099549
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16718.492465093732,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "7dae62159b31952b8102e58c6a66c559b350ac82d145c69d404528893ef3105b",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 1752.128235064447,
+            "prefill_tps": 228.29379265455827,
+            "decode_tps": 102.13914277615115,
+            "total_wall_ms": 2046.0480265319347,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_edd1b4128b6e4aab9a3",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_edd1b4128b6e4aab9a3",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247731.205203107,
+            "t_first_abs": 4247732.957331342,
+            "t_last_abs": 4247733.251048316,
+            "t_end_abs": 4247733.251251133
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_edd1b4128b6e4aab9a3",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_edd1b4128b6e4aab9a3",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 166.9670259580016,
+            "prefill_tps": 2850.8623021154585,
+            "decode_tps": 48.72497401087159,
+            "total_wall_ms": 1068.416957743466,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_339543aa7b294411a67",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_339543aa7b294411a67",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247733.251406536,
+            "t_first_abs": 4247733.418373562,
+            "t_last_abs": 4247734.300877881,
+            "t_end_abs": 4247734.319823494
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_edd1b4128b6e4aab9a3",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_edd1b4128b6e4aab9a3",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_339543aa7b294411a67",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_339543aa7b294411a67",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 255,
+            "completion_tokens": 21,
+            "ttft_ms": 578.5968769341707,
+            "prefill_tps": 440.7213556892606,
+            "decode_tps": 82.66097365653042,
+            "total_wall_ms": 873.629730194807,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247734.320125775,
+            "t_first_abs": 4247734.898722652,
+            "t_last_abs": 4247735.140674799,
+            "t_end_abs": 4247735.193755506
+          }
+        }
+      ],
+      "validated_content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 3988.7973619624972,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "d58d8e9c4967b5b2d6185f000d3118535525bc87db5147e22180250d15d79feb",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6296.51341214776,
+            "prefill_tps": 63.52722114881651,
+            "decode_tps": 11.635684201740096,
+            "total_wall_ms": 8952.216925099492,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_8fde0fe25b3046a48cc",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_8fde0fe25b3046a48cc",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247735.210206652,
+            "t_first_abs": 4247741.506720064,
+            "t_last_abs": 4247744.084995607,
+            "t_end_abs": 4247744.162423577
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_8fde0fe25b3046a48cc",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_8fde0fe25b3046a48cc",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 2291.1054864525795,
+            "prefill_tps": 207.7599668869948,
+            "decode_tps": 11.524636676330703,
+            "total_wall_ms": 6101.285877637565,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_06e889609b554a0897b",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_06e889609b554a0897b",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247744.16261429,
+            "t_first_abs": 4247746.453719776,
+            "t_last_abs": 4247750.184856922,
+            "t_end_abs": 4247750.263900167
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_8fde0fe25b3046a48cc",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_8fde0fe25b3046a48cc",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_06e889609b554a0897b",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_06e889609b554a0897b",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 255,
+            "completion_tokens": 21,
+            "ttft_ms": 5706.588137894869,
+            "prefill_tps": 44.685194346979486,
+            "decode_tps": 11.158791601863062,
+            "total_wall_ms": 7591.144437901676,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247750.264221521,
+            "t_first_abs": 4247755.970809659,
+            "t_last_abs": 4247757.763118424,
+            "t_end_abs": 4247757.855365959
+          }
+        }
+      ],
+      "validated_content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 22645.43365314603,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "1b952a8e63b67ab65eaf213bc9aa34cb7dad2035cdfebbf79a2747a7a58a1dac",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6499.140894040465,
+            "prefill_tps": 61.54659616116171,
+            "decode_tps": 12.23783459768214,
+            "total_wall_ms": 9264.033094979823,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_f943a550a9f34cc7ad3",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_f943a550a9f34cc7ad3",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247735.211775627,
+            "t_first_abs": 4247741.710916521,
+            "t_last_abs": 4247744.162330598,
+            "t_end_abs": 4247744.475808722
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_f943a550a9f34cc7ad3",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_f943a550a9f34cc7ad3",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 2118.828729726374,
+            "prefill_tps": 224.65241919835148,
+            "decode_tps": 11.711771777235226,
+            "total_wall_ms": 7237.730744294822,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_bb04ac5b2023429087b",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_bb04ac5b2023429087b",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247744.475996033,
+            "t_first_abs": 4247746.594824763,
+            "t_last_abs": 4247750.266344395,
+            "t_end_abs": 4247751.713726778
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_f943a550a9f34cc7ad3",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_f943a550a9f34cc7ad3",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_bb04ac5b2023429087b",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_bb04ac5b2023429087b",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 255,
+            "completion_tokens": 21,
+            "ttft_ms": 4428.7801226601005,
+            "prefill_tps": 57.57793183167489,
+            "decode_tps": 11.679192738405996,
+            "total_wall_ms": 6427.155010402203,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247751.713979414,
+            "t_first_abs": 4247756.142759536,
+            "t_last_abs": 4247757.855206659,
+            "t_end_abs": 4247758.141134424
+          }
+        }
+      ],
+      "validated_content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 22929.68232370913,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "d6cc93c41de1c4b88e8b9de8ec92a616155cfbe75f86bdfd39901398f1a42951",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6498.001818545163,
+            "prefill_tps": 61.55738505003312,
+            "decode_tps": 12.240587233280495,
+            "total_wall_ms": 9262.89392169565,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_96ecf5ee904f4bbb8e5",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_96ecf5ee904f4bbb8e5",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247735.213359692,
+            "t_first_abs": 4247741.711361511,
+            "t_last_abs": 4247744.162224319,
+            "t_end_abs": 4247744.476253614
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_96ecf5ee904f4bbb8e5",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_96ecf5ee904f4bbb8e5",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 2117.3433465883136,
+            "prefill_tps": 224.81001995589486,
+            "decode_tps": 11.708024637767924,
+            "total_wall_ms": 7234.9216286093,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_ca65352e22ff4ec9b56",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_ca65352e22ff4ec9b56",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247744.476474367,
+            "t_first_abs": 4247746.593817714,
+            "t_last_abs": 4247750.266512411,
+            "t_end_abs": 4247751.711395996
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_96ecf5ee904f4bbb8e5",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_96ecf5ee904f4bbb8e5",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_ca65352e22ff4ec9b56",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_ca65352e22ff4ec9b56",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 255,
+            "completion_tokens": 21,
+            "ttft_ms": 4430.129775777459,
+            "prefill_tps": 57.5603905317309,
+            "decode_tps": 11.668627009119904,
+            "total_wall_ms": 6429.066830314696,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247751.711665454,
+            "t_first_abs": 4247756.14179523,
+            "t_last_abs": 4247757.855792942,
+            "t_end_abs": 4247758.140732285
+          }
+        }
+      ],
+      "validated_content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 22927.615544758737,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "5be7b93c99665bece39463eb155624fa2ae68a87e21ee4878e1f391bcb28232d",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6496.9562301412225,
+            "prefill_tps": 61.56729179493107,
+            "decode_tps": 12.233391489803383,
+            "total_wall_ms": 9263.58166988939,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_1a3172309184427e9aa",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_1a3172309184427e9aa",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247735.214756271,
+            "t_first_abs": 4247741.711712501,
+            "t_last_abs": 4247744.164016919,
+            "t_end_abs": 4247744.478337941
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_1a3172309184427e9aa",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_1a3172309184427e9aa",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 2117.138517089188,
+            "prefill_tps": 224.8317699374923,
+            "decode_tps": 11.722915436917539,
+            "total_wall_ms": 7231.941076926887,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_02427bfdcd0147c6bd2",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_02427bfdcd0147c6bd2",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247744.478592605,
+            "t_first_abs": 4247746.595731122,
+            "t_last_abs": 4247750.263760652,
+            "t_end_abs": 4247751.710533682
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_1a3172309184427e9aa",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_1a3172309184427e9aa",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_02427bfdcd0147c6bd2",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_02427bfdcd0147c6bd2",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 255,
+            "completion_tokens": 21,
+            "ttft_ms": 4432.912493124604,
+            "prefill_tps": 57.52425756102834,
+            "decode_tps": 11.680845109524792,
+            "total_wall_ms": 6429.561805911362,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247751.71081925,
+            "t_first_abs": 4247756.143731743,
+            "t_last_abs": 4247757.855936623,
+            "t_end_abs": 4247758.140381056
+          }
+        }
+      ],
+      "validated_content": "{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 22925.84923375398,
+      "concurrency": 4,
+      "repeat": 0
+    }
+  ],
+  "waves": [
+    {
+      "scenario": "tool_round_trip",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 1990.2024250477552,
+      "generated_tokens": 53,
+      "end_to_end_tokens_per_second": 26.630456948985106,
+      "all_passed": true
+    },
+    {
+      "scenario": "tool_round_trip",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 16724.47628993541,
+      "generated_tokens": 212,
+      "end_to_end_tokens_per_second": 12.676032201234252,
+      "all_passed": true
+    },
+    {
+      "scenario": "agentic",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 3989.840192720294,
+      "generated_tokens": 96,
+      "end_to_end_tokens_per_second": 24.061114070472755,
+      "all_passed": true
+    },
+    {
+      "scenario": "agentic",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 22932.45326448232,
+      "generated_tokens": 384,
+      "end_to_end_tokens_per_second": 16.744828630905246,
+      "all_passed": true
+    }
+  ],
+  "not_covered": {
+    "image": "requires a released, compatible vision companion and separate media validation",
+    "audio": "no audio validation in this suite",
+    "video": "requires compatible vision companion and separate media validation"
+  },
+  "warmup": {
+    "scenario": "short",
+    "tag": "warmup",
+    "status": "ok",
+    "input_sha256": "315f1a2eb2a7a2cc67392b990f40f1cd73d2681754c1dbb23c3ff7d7c1bd5f25",
+    "turns": [
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "[validation warmup]\nWhat is 17 + 25? Reply with only the integer."
+            }
+          ],
+          "tools": null,
+          "response_format": null,
+          "extra_body": {
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 0,
+            "seed": 42,
+            "repeat_penalty": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+            "think": false
+          },
+          "max_tokens": 256,
+          "stream": true
+        },
+        "metrics": {
+          "prompt_tokens": 33,
+          "completion_tokens": 3,
+          "ttft_ms": 382.7286558225751,
+          "prefill_tps": 86.22296631820039,
+          "decode_tps": 53836.48745268119,
+          "total_wall_ms": 382.91565515100956,
+          "finish_reason": "stop",
+          "tool_calls": [],
+          "tool_call_details": [],
+          "assistant_message": {
+            "role": "assistant",
+            "content": "\n\n42"
+          },
+          "usage_present": true,
+          "decode_timing_source": "stream_window",
+          "server_timings": {},
+          "reasoning_text": "",
+          "output_text": "\n\n42",
+          "t_start_abs": 4247711.988400496,
+          "t_first_abs": 4247712.371129151,
+          "t_last_abs": 4247712.371166301,
+          "t_end_abs": 4247712.371316151
+        }
+      }
+    ],
+    "validated_content": "\n\n42",
+    "total_wall_ms": 382.9982951283455
+  },
+  "summary": {
+    "tool_round_trip@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 737.2972825542092,
+      "ttft_ms_samples": [
+        737.2972825542092
+      ],
+      "prefill_tps_median": 447.5806541111685,
+      "prefill_tps_samples": [
+        447.5806541111685
+      ],
+      "decode_tps_median": 100.95709292982315,
+      "decode_tps_samples": [
+        100.95709292982315
+      ],
+      "conversation_wall_ms_median": 1989.1808973625302
+    },
+    "tool_round_trip@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 6081.423151306808,
+      "ttft_ms_samples": [
+        6084.578066132963,
+        5920.087308622897,
+        6081.921648234129,
+        6080.924654379487
+      ],
+      "prefill_tps_median": 54.26361461895779,
+      "prefill_tps_samples": [
+        54.23547802546818,
+        55.74242114965752,
+        54.25916660662912,
+        54.26806263128646
+      ],
+      "decode_tps_median": 12.221328595461586,
+      "decode_tps_samples": [
+        12.220790969099616,
+        11.895221226195597,
+        12.221866221823554,
+        12.224445196464478
+      ],
+      "conversation_wall_ms_median": 16718.824363313615
+    },
+    "agentic@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 1752.128235064447,
+      "ttft_ms_samples": [
+        1752.128235064447
+      ],
+      "prefill_tps_median": 228.29379265455827,
+      "prefill_tps_samples": [
+        228.29379265455827
+      ],
+      "decode_tps_median": 102.13914277615115,
+      "decode_tps_samples": [
+        102.13914277615115
+      ],
+      "conversation_wall_ms_median": 3988.7973619624972
+    },
+    "agentic@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 6497.479024343193,
+      "ttft_ms_samples": [
+        6296.51341214776,
+        6499.140894040465,
+        6498.001818545163,
+        6496.9562301412225
+      ],
+      "prefill_tps_median": 61.5623384224821,
+      "prefill_tps_samples": [
+        63.52722114881651,
+        61.54659616116171,
+        61.55738505003312,
+        61.56729179493107
+      ],
+      "decode_tps_median": 12.235613043742761,
+      "decode_tps_samples": [
+        11.635684201740096,
+        12.23783459768214,
+        12.240587233280495,
+        12.233391489803383
+      ],
+      "conversation_wall_ms_median": 22926.732389256358
+    }
+  }
+}

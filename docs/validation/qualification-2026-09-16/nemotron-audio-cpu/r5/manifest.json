@@ -1,0 +1,26 @@
+{
+  "command": [
+    "/workspace/tensorsharp-no-patch-20260915/dotnet/dotnet",
+    "vstest",
+    "/workspace/ts-nemotron-audio-derived-r5/app/InferenceWeb.Tests.dll",
+    "--Logger:trx",
+    "--ResultsDirectory:/workspace/ts-nemotron-audio-derived-r5/results"
+  ],
+  "exit_code": 0,
+  "environment": {
+    "TS_TEST_GGML_BACKEND": "cpu"
+  },
+  "app_sha256": {
+    "TensorSharp.Models.dll": "008441819be0fc68046de0fc3e0107acb1d373b822ee58f77e10f890f0555d37",
+    "InferenceWeb.Tests.dll": "b9f7a721ba07f6aa271e35e9180be107cf10d02636f26fec9a5bbdfb378516f2",
+    "libGgmlOps.so": "7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7"
+  },
+  "source_sha256": {
+    "TestAssemblyConfig.cs": "955c2119be9a2ce20cdf400c432ae343cd77822967156e99a56f1b79223cedee",
+    "Probe.cs": "b9a467280c8b943262608e9079aa651959640578f41f3daa784f50de8931fe6e",
+    "NemotronAudioInputTests.cs": "f663c40561a299613e6ad95e9f88d3c558853850f0d165f5566eb5b0e6c9d711",
+    "NemotronAudioEncoderTests.cs": "d31df7e6920e41d1e55e353794037ffede1ed93efc6ae5c75b1cbb3913ee0b3f",
+    "GlobalUsings.cs": "6b8ff963dd19942eea18086c402b64be5ec5273e48baa087ff64def48be2e3a1",
+    "GgmlBackendTestInitializer.cs": "8dc173dce8074fe3e37e89188fa5f3bcbf173e3ce76329043a9d8ae6c32f3e7a"
+  }
+}

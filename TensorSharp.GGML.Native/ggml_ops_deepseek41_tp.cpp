@@ -127,6 +127,7 @@ struct graph
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
+    tsg_dsv4_fused_desc quant_strip;
     ~graph() { if (ctx) ggml_free(ctx); }
 };
 
@@ -135,6 +136,7 @@ struct rank_layer
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     ggml_tensor * gate = nullptr, * up = nullptr, * down = nullptr;
+    int64_t full_rows = 0, first_row = 0;
     std::map<int64_t, std::unique_ptr<graph>> graphs;
     ~rank_layer()
     {
@@ -276,18 +278,26 @@ struct executor::impl
             g.ids = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, used, tokens);
             g.weights = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, 1, used, tokens);
             for (auto * input : {g.input, g.ids, g.weights}) ggml_set_input(input);
+            g.quant_strip.kind = TSG_MATMUL_ID_QUANT_STRIP;
+            g.quant_strip.i0 = int32_t(weights.full_rows);
+            g.quant_strip.i1 = int32_t(weights.first_row);
             auto matmul = [&](ggml_tensor * w, ggml_tensor * x) {
+#if defined(TSG_GGML_USE_CUDA)
+                if (x == g.input && rank.cuda_backend && tsg_matmul_id_quant_strip_supported(
+                        rank.cuda_backend, w, tokens, weights.full_rows, weights.first_row))
+                    return tsg_matmul_id_quant_strip(g.ctx, w, x, g.ids, &g.quant_strip);
+#endif
                 if (w->type == GGML_TYPE_F32 && rank.cuda_backend)
                     return tsg_matmul_id_f32(g.ctx, w, x, g.ids);
-                // Quantized strips take ggml's own integer (MMVQ/MMQ) paths,
-                // which have no F32-precision variant: their activations are
-                // requantized to Q8 per 32 values and the int8 products are
-                // exact, so a strip already equals the same rows of the full
-                // tensor up to F32 summation grouping. That grouping is
-                // decided per launch (stream-k over the launch's tile count),
-                // so bitwise agreement with an unsplit launch is not available
-                // to any partition; dsv41_tp_test compares against the same
-                // partition evaluated on one device where that matters.
+                // Quantized strips that tsg_matmul_id_quant_strip_supported
+                // accepts took the owned strip kernel above: it keeps the
+                // unsplit launch's stream-k partitions and reduction order, so
+                // its gate/up rows equal the full tensor's bit for bit. The
+                // remaining quantized shapes use ggml's own integer (MMVQ/MMQ)
+                // paths, which requantize activations to Q8 per 32 values and
+                // decide F32 summation grouping per launch; dsv41_tp_test keeps
+                // the full-weight reference as the pass criterion and records
+                // the same-device partitioned evaluation beside it.
                 auto * out = ggml_mul_mat_id(g.ctx, w, x, g.ids);
                 if (w->type == GGML_TYPE_F32)
                 {
@@ -296,8 +306,17 @@ struct executor::impl
                 }
                 return out;
             };
-            auto * up = matmul(weights.up, g.input);
-            auto * gate = matmul(weights.gate, g.input);
+            ggml_tensor * up, * gate;
+#if defined(TSG_GGML_USE_CUDA)
+            if (rank.cuda_backend && weights.gate->type == weights.up->type &&
+                tsg_matmul_id_quant_strip_supported(rank.cuda_backend, weights.gate, tokens, weights.full_rows, weights.first_row)) {
+                g.quant_strip.kind = TSG_MATMUL_ID_QUANT_PAIR;
+                auto * pair = tsg_matmul_id_quant_pair(g.ctx,weights.gate,weights.up,g.input,g.ids,&g.quant_strip);
+                gate = ggml_view_3d(g.ctx,pair,pair->ne[0],pair->ne[1],pair->ne[2],pair->nb[1],pair->nb[2],0);
+                up = ggml_view_3d(g.ctx,pair,pair->ne[0],pair->ne[1],pair->ne[2],pair->nb[1],pair->nb[2],pair->nb[3]);
+            } else
+#endif
+            { up = matmul(weights.up,g.input); gate = matmul(weights.gate,g.input); }
             if (spec.clamp > 1e-6f)
             {
                 up = ggml_clamp(g.ctx, up, -spec.clamp, spec.clamp);
@@ -424,6 +443,8 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
     state->pool.run([&](int r) {
         auto & rank = *state->ranks[r];
         auto weights = std::make_unique<rank_layer>();
+        weights->full_rows = gate.ne[1];
+        weights->first_row = strips[r].first;
         weights->ctx = ggml_init({16 * ggml_tensor_overhead(), nullptr, true});
         require(weights->ctx != nullptr, "Cannot create V4.1 TP weight context");
         weights->gate = ggml_new_tensor_3d(weights->ctx, gate.type, gate.ne[0], strips[r].count, gate.ne[2]);

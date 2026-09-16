@@ -1,0 +1,1202 @@
+[
+  {
+    "id": "required-absent-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "required"
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "required-absent-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "required",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "required-empty-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": "required"
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "required-empty-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": "required",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-absent-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-absent-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      },
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-empty-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-empty-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      },
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-undeclared-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "undeclared_weather_tool"
+        }
+      }
+    },
+    "expected_status": 400,
+    "oracle": "undeclared_weather_tool"
+  },
+  {
+    "id": "named-undeclared-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "undeclared_weather_tool"
+        }
+      },
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "undeclared_weather_tool"
+  },
+  {
+    "id": "named-case-mismatch-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "Get_Weather"
+        }
+      }
+    },
+    "expected_status": 400,
+    "oracle": "Get_Weather"
+  },
+  {
+    "id": "named-case-mismatch-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "Get_Weather"
+        }
+      },
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "Get_Weather"
+  },
+  {
+    "id": "required-empty-serial-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": "required",
+      "parallel_tool_calls": false
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "required-empty-serial-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [],
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "at least one"
+  },
+  {
+    "id": "named-undeclared-serial-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "undeclared_weather_tool"
+        }
+      },
+      "parallel_tool_calls": false
+    },
+    "expected_status": 400,
+    "oracle": "undeclared_weather_tool"
+  },
+  {
+    "id": "named-undeclared-serial-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "undeclared_weather_tool"
+        }
+      },
+      "parallel_tool_calls": false,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 400,
+    "oracle": "undeclared_weather_tool"
+  },
+  {
+    "id": "required-offered-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "required"
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "required-offered-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "named-offered-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "named-offered-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "get_weather"
+        }
+      },
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "none-offered-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "none"
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "none-offered-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "none",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "auto-offered-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "auto-offered-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "choice-absent-offered-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "choice-absent-offered-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "none-no-tools-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "none"
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "none-no-tools-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "none",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "auto-no-tools-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "auto"
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "auto-no-tools-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with only the single word apple. Do not use any tool."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tool_choice": "auto",
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "text"
+  },
+  {
+    "id": "required-offered-serial-blocking",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": false,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
+      "parallel_tool_calls": false
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  },
+  {
+    "id": "required-offered-serial-stream",
+    "body": {
+      "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris. Do not invent its result."
+        }
+      ],
+      "stream": true,
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 1,
+      "seed": 42,
+      "think": false,
+      "max_tokens": 256,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "expected_status": 200,
+    "oracle": "tool"
+  }
+]

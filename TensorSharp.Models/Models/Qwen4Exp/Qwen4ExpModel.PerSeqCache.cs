@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -59,6 +59,21 @@ namespace TensorSharp.Models
             public int PleNextPos;
             public int MropeCacheGap;
             public bool SpecStateFailed;
+            // True once a fused forward has seeded the native per-sequence state
+            // entries (GDN conv+ssm, PLE conv, QSA raw keys) from this holder's host
+            // seeds: from then on the DEVICE entries are the truth and a copy must
+            // download them. False for a fresh, copied or imported holder, whose host
+            // bytes are what the next forward uploads (see RetainedCache).
+            public bool DeviceStateSeeded;
+            // Retained-set bookkeeping (RetainedCache): a shared-prefix checkpoint is
+            // a host-authoritative copy that is cloned, never bound; a retired holder
+            // is being torn down and must not be re-keyed; RetainedBytes is what it
+            // counts against the retention budget; RetainedSerial orders eviction.
+            public bool IsCheckpoint;
+            public bool Retired;
+            public bool Disposed;
+            public long RetainedBytes;
+            public long RetainedSerial;
             // Pinned descriptor arrays. Their addresses are the native graph
             // signature, so per-holder arrays select per-holder graphs.
             public Qwen4ExpAttnArgs[] AttnArgs;
@@ -129,6 +144,7 @@ namespace TensorSharp.Models
             PleNextPos = _pleNextPos,
             MropeCacheGap = _mropeCacheGap,
             SpecStateFailed = _specStateFailed,
+            DeviceStateSeeded = _deviceStateAuthoritative,
             AttnArgs = _attnArgs,
             GdnArgs = _gdnArgs,
             PleArgs = _pleArgs,
@@ -153,6 +169,7 @@ namespace TensorSharp.Models
             _pleNextPos = h.PleNextPos;
             _mropeCacheGap = h.MropeCacheGap;
             _specStateFailed = h.SpecStateFailed;
+            _deviceStateAuthoritative = h.DeviceStateSeeded;
             // Null args are lazily rebuilt by Ensure*Args from THIS holder's
             // tensors, which is what keys the native graphs per holder.
             _attnArgs = h.AttnArgs;
@@ -162,10 +179,17 @@ namespace TensorSharp.Models
         }
 
         private Qwen4ExpKvCacheHolder CreateFreshHolder()
+            => AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
+
+        /// <summary>A brand-new, zeroed holder with attention K/V and QSA raw-key
+        /// caches of <paramref name="cap"/> rows and zeroed recurrent/PLE state. The
+        /// allocation half of <see cref="CreateFreshHolder"/>, on its own so a copy
+        /// can be sized to what its source holds (RetainedCache).</summary>
+        private Qwen4ExpKvCacheHolder AllocateHolder(int cap)
         {
             int nLayer = Config.NumLayers;
             DType kvDtype = _kvCacheDtype.ToDType();
-            int cap = _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
+            if (cap <= 0) throw new ArgumentOutOfRangeException(nameof(cap));
 
             var k = new Tensor[nLayer];
             var v = new Tensor[nLayer];
@@ -175,56 +199,72 @@ namespace TensorSharp.Models
             var convStateT = new Tensor[nLayer];
             var stateT = new Tensor[nLayer];
 
-            for (int l = 0; l < nLayer; l++)
+            try
             {
-                if (_isRecurrent[l])
+                for (int l = 0; l < nLayer; l++)
                 {
-                    convState[l] = new float[(long)(_convKernel - 1) * _convDim];
-                    convStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
-                    Ops.Fill(convStateT[l], 0f);
-                    stateT[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
-                    Ops.Fill(stateT[l], 0f);
-                    continue;
+                    if (_isRecurrent[l])
+                    {
+                        convState[l] = new float[(long)(_convKernel - 1) * _convDim];
+                        convStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
+                        Ops.Fill(convStateT[l], 0f);
+                        stateT[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
+                        Ops.Fill(stateT[l], 0f);
+                        continue;
+                    }
+                    k[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
+                    v[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
+                    InitializeCacheTensor(k[l]);
+                    InitializeCacheTensor(v[l]);
+                    if (UsesQsa(l))
+                    {
+                        idx[l] = new Tensor(_allocator, kvDtype, 1, cap, _indexerHeadDim);
+                        InitializeQsaCache(idx[l]);
+                    }
                 }
-                k[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
-                v[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, cap, Config.HeadDim);
-                InitializeCacheTensor(k[l]);
-                InitializeCacheTensor(v[l]);
-                if (UsesQsa(l))
+
+                float[] pleConv = null;
+                if (_pleHeads > 0)
+                    pleConv = GC.AllocateArray<float>(
+                        checked((int)((long)(_pleConvKernel - 1) * _pleNgram * _hcDim)), pinned: true);
+
+                var holder = new Qwen4ExpKvCacheHolder
                 {
-                    idx[l] = new Tensor(_allocator, kvDtype, 1, cap, _indexerHeadDim);
-                    InitializeQsaCache(idx[l]);
-                }
+                    K = k,
+                    V = v,
+                    IdxK = idx,
+                    KvCapacity = cap,
+                    CacheSeqLen = 0,
+                    KvHostStale = false,
+                    GdnConvState = convState,
+                    GdnConvWriteIdx = convWriteIdx,
+                    GdnConvStateT = convStateT,
+                    GdnStateT = stateT,
+                    PleConvState = pleConv,
+                    PleHistory = new List<int>(),
+                    PleNextPos = 0,
+                    MropeCacheGap = 0,
+                    AttnArgs = null,
+                    GdnArgs = null,
+                    PleArgs = null,
+                    SlotBase = 0,
+                };
+                holder.SlotBase = ClaimSlotBase();
+                return holder;
             }
-
-            float[] pleConv = null;
-            if (_pleHeads > 0)
-                pleConv = GC.AllocateArray<float>(
-                    checked((int)((long)(_pleConvKernel - 1) * _pleNgram * _hcDim)), pinned: true);
-
-            int slotBase = ClaimSlotBase();
-
-            return new Qwen4ExpKvCacheHolder
+            catch
             {
-                K = k,
-                V = v,
-                IdxK = idx,
-                KvCapacity = cap,
-                CacheSeqLen = 0,
-                KvHostStale = false,
-                GdnConvState = convState,
-                GdnConvWriteIdx = convWriteIdx,
-                GdnConvStateT = convStateT,
-                GdnStateT = stateT,
-                PleConvState = pleConv,
-                PleHistory = new List<int>(),
-                PleNextPos = 0,
-                MropeCacheGap = 0,
-                AttnArgs = null,
-                GdnArgs = null,
-                PleArgs = null,
-                SlotBase = slotBase,
-            };
+                // Allocation can fail after earlier layers already own buffers.
+                // None of these tensors has been published to a live holder.
+                foreach (Tensor[] set in new[] { k, v, idx, convStateT, stateT })
+                    foreach (Tensor tensor in set)
+                        if (tensor != null)
+                        {
+                            InvalidateTensorDeviceCache(tensor);
+                            tensor.Dispose();
+                        }
+                throw;
+            }
         }
 
         public bool BindSequenceCache(string requestId)
@@ -295,6 +335,10 @@ namespace TensorSharp.Models
 
             if (string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal))
             {
+                // The dictionary entry is stale for the active holder: growth or a
+                // re-seed may have replaced fields since it was loaded. Dispose what
+                // is live, not what was recorded at bind time.
+                holder = SnapshotActiveCache();
                 _activeFusedKey = null;
                 if (_primaryHolder != null)
                 {
@@ -324,7 +368,9 @@ namespace TensorSharp.Models
 
         private void DisposeHolder(Qwen4ExpKvCacheHolder holder)
         {
-            if (holder == null) return;
+            if (holder == null || holder.Disposed) return;
+            holder.Disposed = true;
+            holder.Retired = true;
             ReleaseMtpState(holder.GdnConvStateT);
             if (ReferenceEquals(_specSnapshotOwner, holder.GdnConvStateT))
                 ReleaseSpecSnapshot();
@@ -364,6 +410,16 @@ namespace TensorSharp.Models
                 }
                 _fusedHolders.Clear();
                 _fusedHolders = null;
+            }
+            if (_retainedFusedHolders != null)
+            {
+                foreach (var holder in _retainedFusedHolders.Values)
+                {
+                    DisposeHolder(holder);
+                    ReleaseSlotBase(holder.SlotBase);
+                }
+                _retainedFusedHolders.Clear();
+                _retainedFusedHolders = null;
             }
             if (_primaryHolder != null)
             {

@@ -1,0 +1,5791 @@
+{
+  "format_version": 1,
+  "engine": "tensorsharp",
+  "url": "http://127.0.0.1:5134",
+  "harness_sha256": {
+    "validate_inference.py": "90fb8c6e3716ea8b0e4682f53058d2850e2f43f11e651fe1b99732cca7836915",
+    "engines.py": "d0c7b8dbacf70d6a663d39a51a6fa5e77cd36714d70591f8dc0e8ae9fe304ea6",
+    "scenarios.py": "eedb1dd22a925200143c4cb6a80f81aa33fad6c0e98b91e1a02c5c48f85c9971"
+  },
+  "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003",
+  "weights_id": "38bb39ee97821de2c9009abb7e93950eec396e66:a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+  "profile": "qwen38-r4-http-unqualified",
+  "thinking": false,
+  "stream": true,
+  "sampling": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 0,
+    "seed": 42,
+    "repeat_penalty": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0
+  },
+  "structured_tool_results": false,
+  "serial_tool_workflows": false,
+  "max_tokens_override": null,
+  "execution_plan": {
+    "scenarios": [
+      "short",
+      "short_zh",
+      "json",
+      "json_schema",
+      "json_unicode",
+      "multi_turn",
+      "tool_round_trip",
+      "agentic"
+    ],
+    "concurrency": [
+      1,
+      4
+    ],
+    "repeats": 1,
+    "expected_cases": 40
+  },
+  "run_complete": true,
+  "cases": [
+    {
+      "scenario": "short",
+      "tag": "short-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "b54975f2822e45dd9bf9db2c0daba69430ef998af22384cf80fce83e70cb3e97",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short-c1-r0-i0]\nWhat is 17 + 25? Reply with only the integer."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 38,
+            "completion_tokens": 3,
+            "ttft_ms": 287.8838311880827,
+            "prefill_tps": 131.99768755048115,
+            "decode_tps": 66939.42358405287,
+            "total_wall_ms": 288.0359282717109,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247608.685463517,
+            "t_first_abs": 4247608.973347348,
+            "t_last_abs": 4247608.973377226,
+            "t_end_abs": 4247608.973499445
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 288.14079612493515,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "short",
+      "tag": "short-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "263a7e4e0e46e35d2c8e8e12805befe3385ce70b4f0beccee5e755004fb7da93",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short-c4-r0-i0]\nWhat is 17 + 25? Reply with only the integer."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 38,
+            "completion_tokens": 3,
+            "ttft_ms": 4454.910823144019,
+            "prefill_tps": 8.529912608482205,
+            "decode_tps": 7.37608943695557,
+            "total_wall_ms": 4804.330547340214,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247608.979776597,
+            "t_first_abs": 4247613.43468742,
+            "t_last_abs": 4247613.705833807,
+            "t_end_abs": 4247613.784107144
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 4804.459816776216,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short",
+      "tag": "short-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "9871e19e4cac0622ca626ce06890e1a53424a0863bf19dc07ea6c63dbde17ef3",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short-c4-r0-i1]\nWhat is 17 + 25? Reply with only the integer."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 38,
+            "completion_tokens": 3,
+            "ttft_ms": 4588.468003086746,
+            "prefill_tps": 8.281631249130802,
+            "decode_tps": 9.339366286620207,
+            "total_wall_ms": 5091.151537373662,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247608.981257413,
+            "t_first_abs": 4247613.569725416,
+            "t_last_abs": 4247613.783872708,
+            "t_end_abs": 4247614.07240895
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 5091.33086912334,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short",
+      "tag": "short-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "27971c3bcb4341abaa0223bc4db729758031ef6c6a2a978827e88deed1bf232b",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short-c4-r0-i2]\nWhat is 17 + 25? Reply with only the integer."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 38,
+            "completion_tokens": 3,
+            "ttft_ms": 4586.373185738921,
+            "prefill_tps": 8.285413868666192,
+            "decode_tps": 9.329403893166647,
+            "total_wall_ms": 5089.851042255759,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247608.982822522,
+            "t_first_abs": 4247613.569195707,
+            "t_last_abs": 4247613.783571676,
+            "t_end_abs": 4247614.072673564
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 5089.969993568957,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short",
+      "tag": "short-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "ed889e788f79210f28a803f9b6b9b1c488f493d97d533fbbd689e2a00ff3dee3",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short-c4-r0-i3]\nWhat is 17 + 25? Reply with only the integer."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 38,
+            "completion_tokens": 3,
+            "ttft_ms": 4585.911777801812,
+            "prefill_tps": 8.286247499121043,
+            "decode_tps": 9.352267059056956,
+            "total_wall_ms": 5088.633136823773,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247608.984250992,
+            "t_first_abs": 4247613.570162769,
+            "t_last_abs": 4247613.784014661,
+            "t_end_abs": 4247614.072884128
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 5088.815259747207,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short_zh",
+      "tag": "short_zh-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "2422b4f1f697adc35671f61ad16c66b67a840f5821caf0a49aabbf27ab54b440",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short_zh-c1-r0-i0]\n用阿拉伯数字回答：十七加二十五等于多少？只输出结果。"
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 41,
+            "completion_tokens": 3,
+            "ttft_ms": 684.1852189972997,
+            "prefill_tps": 59.925293417018146,
+            "decode_tps": 69477.61648710731,
+            "total_wall_ms": 684.360378421843,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247614.083145752,
+            "t_first_abs": 4247614.767330971,
+            "t_last_abs": 4247614.767359757,
+            "t_end_abs": 4247614.76750613
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 684.4449630007148,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "short_zh",
+      "tag": "short_zh-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "e6ec82e87f770024480997cff0612021d72366503fe493798fb4bc182710bb93",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short_zh-c4-r0-i0]\n用阿拉伯数字回答：十七加二十五等于多少？只输出结果。"
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 41,
+            "completion_tokens": 3,
+            "ttft_ms": 4456.963764503598,
+            "prefill_tps": 9.199087577631774,
+            "decode_tps": 9.177995567774362,
+            "total_wall_ms": 4850.835166871548,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247614.780386644,
+            "t_first_abs": 4247619.237350409,
+            "t_last_abs": 4247619.455262913,
+            "t_end_abs": 4247619.631221811
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 4851.02863330394,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short_zh",
+      "tag": "short_zh-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "8a02d80cab6c3593f03bc5570f6647cfd56c82f406bccec0933ed5f727d4caf9",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short_zh-c4-r0-i1]\n用阿拉伯数字回答：十七加二十五等于多少？只输出结果。"
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 41,
+            "completion_tokens": 3,
+            "ttft_ms": 4279.737398959696,
+            "prefill_tps": 9.58002703856693,
+            "decode_tps": 6.313873265212624,
+            "total_wall_ms": 4675.016858614981,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247614.780908986,
+            "t_first_abs": 4247619.060646385,
+            "t_last_abs": 4247619.377409157,
+            "t_end_abs": 4247619.455925845
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 4675.172070041299,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short_zh",
+      "tag": "short_zh-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "8598ba5670fddbcf3a12a1839c1c888e4f61cd4f84b5538af0661e00aef9bb78",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short_zh-c4-r0-i2]\n用阿拉伯数字回答：十七加二十五等于多少？只输出结果。"
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 41,
+            "completion_tokens": 3,
+            "ttft_ms": 4455.020505934954,
+            "prefill_tps": 9.203100175494148,
+            "decode_tps": 9.169235600757606,
+            "total_wall_ms": 4848.20207208395,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247614.782693674,
+            "t_first_abs": 4247619.23771418,
+            "t_last_abs": 4247619.45583487,
+            "t_end_abs": 4247619.630895746
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 4848.4362894669175,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "short_zh",
+      "tag": "short_zh-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "c56ee2f6f83f1dbe5c50ba8610a483295e0d89858bc07686512d242607f2b104",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation short_zh-c4-r0-i3]\n用阿拉伯数字回答：十七加二十五等于多少？只输出结果。"
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 41,
+            "completion_tokens": 3,
+            "ttft_ms": 4452.136209234595,
+            "prefill_tps": 9.209062363132116,
+            "decode_tps": 9.144043356184717,
+            "total_wall_ms": 4846.693828701973,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n42"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n42",
+            "t_start_abs": 4247614.7848345,
+            "t_first_abs": 4247619.23697071,
+            "t_last_abs": 4247619.455692332,
+            "t_end_abs": 4247619.631528329
+          }
+        }
+      ],
+      "validated_content": "\n\n42",
+      "total_wall_ms": 4846.881712786853,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json",
+      "tag": "json-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "9ae4c08002382b42bfdf3f4f742a8153fef17df30b75b4991768fa85c4084d0d",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json-c1-r0-i0]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 91,
+            "completion_tokens": 20,
+            "ttft_ms": 943.6852997168899,
+            "prefill_tps": 96.4304520026967,
+            "decode_tps": 86.60309653897113,
+            "total_wall_ms": 1198.03964253515,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+            "t_start_abs": 4247619.640739116,
+            "t_first_abs": 4247620.584424416,
+            "t_last_abs": 4247620.803816109,
+            "t_end_abs": 4247620.838778758
+          }
+        }
+      ],
+      "validated_content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+      "total_wall_ms": 1198.2602728530765,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "json",
+      "tag": "json-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "820cc3973263c3e195f42ed80a0e365680660fab31f290df81e48eb9922ce237",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json-c4-r0-i0]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 91,
+            "completion_tokens": 20,
+            "ttft_ms": 4738.569780252874,
+            "prefill_tps": 19.204106770617987,
+            "decode_tps": 11.639907980327362,
+            "total_wall_ms": 6448.87775555253,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+            "t_start_abs": 4247620.848756163,
+            "t_first_abs": 4247625.587325944,
+            "t_last_abs": 4247627.219641253,
+            "t_end_abs": 4247627.297633919
+          }
+        }
+      ],
+      "validated_content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+      "total_wall_ms": 6449.137652292848,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json",
+      "tag": "json-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "ae2c9d7dc48cf336c794300ad551a4c7876d6befab1767cf51401c8cd5b15752",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json-c4-r0-i1]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 91,
+            "completion_tokens": 20,
+            "ttft_ms": 4886.51396241039,
+            "prefill_tps": 18.62268289828278,
+            "decode_tps": 12.179259744612537,
+            "total_wall_ms": 6653.976431116462,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+            "t_start_abs": 4247620.850308414,
+            "t_first_abs": 4247625.736822376,
+            "t_last_abs": 4247627.296851507,
+            "t_end_abs": 4247627.504284845
+          }
+        }
+      ],
+      "validated_content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+      "total_wall_ms": 6654.214019887149,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json",
+      "tag": "json-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "547a37ee875604cbc9f815c54d7c19f45af1bd02a463db20ff46eefc42ca777e",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json-c4-r0-i2]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 91,
+            "completion_tokens": 20,
+            "ttft_ms": 4884.6836518496275,
+            "prefill_tps": 18.629660892275403,
+            "decode_tps": 12.173125815738777,
+            "total_wall_ms": 6652.368480339646,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+            "t_start_abs": 4247620.851550476,
+            "t_first_abs": 4247625.736234128,
+            "t_last_abs": 4247627.297049344,
+            "t_end_abs": 4247627.503918956
+          }
+        }
+      ],
+      "validated_content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+      "total_wall_ms": 6652.627885341644,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json",
+      "tag": "json-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "0cf9f851be0434313e02ea4a8da7e3d9a6ed64c770f51c563d705b0eabac35aa",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json-c4-r0-i3]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 91,
+            "completion_tokens": 20,
+            "ttft_ms": 4882.160684093833,
+            "prefill_tps": 18.639288193950605,
+            "decode_tps": 12.168639593866198,
+            "total_wall_ms": 6650.963523425162,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+            "t_start_abs": 4247620.853665562,
+            "t_first_abs": 4247625.735826246,
+            "t_last_abs": 4247627.297216889,
+            "t_end_abs": 4247627.504629086
+          }
+        }
+      ],
+      "validated_content": "{\"name\": \"Mars\", \"moons\": 2, \"habitable\": false}",
+      "total_wall_ms": 6651.199532672763,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_schema",
+      "tag": "json_schema-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "d5296157315c22a3a585d61e2c51fcfbce4695dcc27de94d0cffa30ea5d3bcb2",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_schema-c1-r0-i0]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "planet",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "enum": [
+                        "Mars"
+                      ]
+                    },
+                    "moons": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "habitable": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "moons",
+                    "habitable"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 237,
+            "completion_tokens": 20,
+            "ttft_ms": 1451.849278062582,
+            "prefill_tps": 163.24008530435356,
+            "decode_tps": 0.0,
+            "total_wall_ms": 1451.975379139185,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+            "t_start_abs": 4247627.517492304,
+            "t_first_abs": 4247628.969341582,
+            "t_last_abs": 4247628.969341582,
+            "t_end_abs": 4247628.969467683
+          }
+        }
+      ],
+      "validated_content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+      "total_wall_ms": 1452.0818749442697,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_schema",
+      "tag": "json_schema-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "b348eb9ba60a446d7d1d6530d84f0ccf114e8bc11e89f83d48b647011298c350",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_schema-c4-r0-i0]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "planet",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "enum": [
+                        "Mars"
+                      ]
+                    },
+                    "moons": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "habitable": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "moons",
+                    "habitable"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 237,
+            "completion_tokens": 28,
+            "ttft_ms": 7929.529487155378,
+            "prefill_tps": 29.88828030514341,
+            "decode_tps": 0.0,
+            "total_wall_ms": 7929.672024212778,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+            "t_start_abs": 4247628.994882132,
+            "t_first_abs": 4247636.924411619,
+            "t_last_abs": 4247636.924411619,
+            "t_end_abs": 4247636.924554156
+          }
+        }
+      ],
+      "validated_content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+      "total_wall_ms": 7929.780184291303,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_schema",
+      "tag": "json_schema-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "1df6f9a5b81283c581ba47351f3c09a2e09fce93c5cae7cb7bcdcb9657d433fd",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_schema-c4-r0-i1]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "planet",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "enum": [
+                        "Mars"
+                      ]
+                    },
+                    "moons": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "habitable": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "moons",
+                    "habitable"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 237,
+            "completion_tokens": 20,
+            "ttft_ms": 7477.678498253226,
+            "prefill_tps": 31.694328668364495,
+            "decode_tps": 0.0,
+            "total_wall_ms": 7477.806876413524,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+            "t_start_abs": 4247628.996437149,
+            "t_first_abs": 4247636.474115647,
+            "t_last_abs": 4247636.474115647,
+            "t_end_abs": 4247636.474244026
+          }
+        }
+      ],
+      "validated_content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+      "total_wall_ms": 7477.911029011011,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_schema",
+      "tag": "json_schema-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "a3d15c88eab508611e99f37d7592bfd5ba87f3735fce9363ce795c320e3e2605",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_schema-c4-r0-i2]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "planet",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "enum": [
+                        "Mars"
+                      ]
+                    },
+                    "moons": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "habitable": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "moons",
+                    "habitable"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 237,
+            "completion_tokens": 20,
+            "ttft_ms": 7644.03807464987,
+            "prefill_tps": 31.004555142911897,
+            "decode_tps": 0.0,
+            "total_wall_ms": 7644.27584130317,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+            "t_start_abs": 4247628.998751272,
+            "t_first_abs": 4247636.642789347,
+            "t_last_abs": 4247636.642789347,
+            "t_end_abs": 4247636.643027114
+          }
+        }
+      ],
+      "validated_content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+      "total_wall_ms": 7644.37619689852,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_schema",
+      "tag": "json_schema-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "3782d0d6b10f1ca71903462ebbff7c4836ad930e988fb6f8274ec73db2e4ee47",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_schema-c4-r0-i3]\nReturn exactly a JSON object with name \"Mars\", moons 2, and habitable false. Use exactly those three keys and no other text."
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "planet",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "enum": [
+                        "Mars"
+                      ]
+                    },
+                    "moons": {
+                      "type": "integer",
+                      "enum": [
+                        2
+                      ]
+                    },
+                    "habitable": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "moons",
+                    "habitable"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 237,
+            "completion_tokens": 20,
+            "ttft_ms": 7641.874963417649,
+            "prefill_tps": 31.01333130083135,
+            "decode_tps": 0.0,
+            "total_wall_ms": 7642.399395816028,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+            "t_start_abs": 4247629.000483207,
+            "t_first_abs": 4247636.642358171,
+            "t_last_abs": 4247636.642358171,
+            "t_end_abs": 4247636.642882603
+          }
+        }
+      ],
+      "validated_content": "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}",
+      "total_wall_ms": 7642.507955431938,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_unicode",
+      "tag": "json_unicode-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "23e88c78b88cba4d02ebcd47c442ccb886e043aee866d01be04a8e46148783c7",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_unicode-c1-r0-i0]\n把以下字段原样写入 JSON，不添加其他内容：city 为 \"北京\"，message 为 \"你好，世界\"，emoji 为 \"🚀\"。"
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 100,
+            "completion_tokens": 27,
+            "ttft_ms": 880.9926826506853,
+            "prefill_tps": 113.5083207491862,
+            "decode_tps": 54.420219571872856,
+            "total_wall_ms": 1359.0544471517205,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+            "t_start_abs": 4247636.940740333,
+            "t_first_abs": 4247637.821733016,
+            "t_last_abs": 4247638.299496615,
+            "t_end_abs": 4247638.29979478
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+      "total_wall_ms": 1359.3134256079793,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_unicode",
+      "tag": "json_unicode-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "b6497f035d3cf206781f875717d0e3f15d1332b2e036fee217c8ddef93568777",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_unicode-c4-r0-i0]\n把以下字段原样写入 JSON，不添加其他内容：city 为 \"北京\"，message 为 \"你好，世界\"，emoji 为 \"🚀\"。"
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 100,
+            "completion_tokens": 27,
+            "ttft_ms": 5089.561317116022,
+            "prefill_tps": 19.648058795107428,
+            "decode_tps": 12.326780371847532,
+            "total_wall_ms": 7412.991668097675,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+            "t_start_abs": 4247638.315159539,
+            "t_first_abs": 4247643.404720856,
+            "t_last_abs": 4247645.513949642,
+            "t_end_abs": 4247645.728151207
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+      "total_wall_ms": 7413.245306350291,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_unicode",
+      "tag": "json_unicode-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "5703cbb23c2529bed0ab35fcc736a66a0a6c409c756ace0090095b49137b346f",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_unicode-c4-r0-i1]\n把以下字段原样写入 JSON，不添加其他内容：city 为 \"北京\"，message 为 \"你好，世界\"，emoji 为 \"🚀\"。"
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 100,
+            "completion_tokens": 27,
+            "ttft_ms": 5087.63805963099,
+            "prefill_tps": 19.655486264534524,
+            "decode_tps": 12.325095567589445,
+            "total_wall_ms": 7410.998223349452,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+            "t_start_abs": 4247638.316646706,
+            "t_first_abs": 4247643.404284766,
+            "t_last_abs": 4247645.513801877,
+            "t_end_abs": 4247645.72764493
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+      "total_wall_ms": 7411.241906695068,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_unicode",
+      "tag": "json_unicode-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "f12b3d7c440e64cd0f0b6e58257b794d7de645a9a96d40d9963eb6a0c8603706",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_unicode-c4-r0-i2]\n把以下字段原样写入 JSON，不添加其他内容：city 为 \"北京\"，message 为 \"你好，世界\"，emoji 为 \"🚀\"。"
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 100,
+            "completion_tokens": 27,
+            "ttft_ms": 5086.907998658717,
+            "prefill_tps": 19.65830717330987,
+            "decode_tps": 12.330936155767825,
+            "total_wall_ms": 7410.596397705376,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+            "t_start_abs": 4247638.318166209,
+            "t_first_abs": 4247643.405074208,
+            "t_last_abs": 4247645.51359214,
+            "t_end_abs": 4247645.728762607
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+      "total_wall_ms": 7410.81880684942,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "json_unicode",
+      "tag": "json_unicode-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "8f0d19deddb9d39625c5cbade5ec41b090657f9bc72be6d3d4bbee2cf261fdf4",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation json_unicode-c4-r0-i3]\n把以下字段原样写入 JSON，不添加其他内容：city 为 \"北京\"，message 为 \"你好，世界\"，emoji 为 \"🚀\"。"
+              }
+            ],
+            "tools": null,
+            "response_format": {
+              "type": "json_object"
+            },
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 100,
+            "completion_tokens": 27,
+            "ttft_ms": 4914.175008423626,
+            "prefill_tps": 20.349295625122252,
+            "decode_tps": 11.808280856328777,
+            "total_wall_ms": 7194.966644048691,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+            "t_start_abs": 4247638.319384358,
+            "t_first_abs": 4247643.233559366,
+            "t_last_abs": 4247645.435404014,
+            "t_end_abs": 4247645.514351002
+          }
+        }
+      ],
+      "validated_content": "{\"city\": \"北京\", \"message\": \"你好，世界\", \"emoji\": \"\\ud83d\\ude80\"}",
+      "total_wall_ms": 7195.210780017078,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "multi_turn",
+      "tag": "multi_turn-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "7b4f37453f82e83615e46d2179bef4d8f986c4594787923e463ee33bb6292eeb",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c1-r0-i0]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 42,
+            "completion_tokens": 2,
+            "ttft_ms": 868.6920385807753,
+            "prefill_tps": 48.34854946825282,
+            "decode_tps": 58087.19632134163,
+            "total_wall_ms": 868.8353952020407,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\nOK"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\nOK",
+            "t_start_abs": 4247645.746510852,
+            "t_first_abs": 4247646.615202891,
+            "t_last_abs": 4247646.615220106,
+            "t_end_abs": 4247646.615346247
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c1-r0-i0]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\nOK"
+              },
+              {
+                "role": "user",
+                "content": "What was the code? Return only JSON with one key \"code\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 71,
+            "completion_tokens": 13,
+            "ttft_ms": 115.04058446735144,
+            "prefill_tps": 617.1734986286499,
+            "decode_tps": 46.03057284975035,
+            "total_wall_ms": 395.0698198750615,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"code\": \"juniper-5938\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"code\": \"juniper-5938\"}",
+            "t_start_abs": 4247646.615424054,
+            "t_first_abs": 4247646.730464638,
+            "t_last_abs": 4247646.991160938,
+            "t_end_abs": 4247647.010493874
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"code\": \"juniper-5938\"}",
+      "total_wall_ms": 1264.204416424036,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "multi_turn",
+      "tag": "multi_turn-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "6663a0b07033d180b98e79bd92d2e81bc74feac65ace98294316a18aa4086156",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i0]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 42,
+            "completion_tokens": 2,
+            "ttft_ms": 4664.339408278465,
+            "prefill_tps": 9.004490523450468,
+            "decode_tps": 7.427500002611318,
+            "total_wall_ms": 6112.17472422868,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\nOK"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\nOK",
+            "t_start_abs": 4247647.032466332,
+            "t_first_abs": 4247651.696805741,
+            "t_last_abs": 4247651.831440544,
+            "t_end_abs": 4247653.144641057
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i0]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\nOK"
+              },
+              {
+                "role": "user",
+                "content": "What was the code? Return only JSON with one key \"code\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 71,
+            "completion_tokens": 13,
+            "ttft_ms": 3936.093859374523,
+            "prefill_tps": 18.0381877405948,
+            "decode_tps": 11.871532314208745,
+            "total_wall_ms": 5184.08565595746,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"code\": \"juniper-5938\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"code\": \"juniper-5938\"}",
+            "t_start_abs": 4247653.144833685,
+            "t_first_abs": 4247657.080927544,
+            "t_last_abs": 4247658.091749036,
+            "t_end_abs": 4247658.328919341
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"code\": \"juniper-5938\"}",
+      "total_wall_ms": 11296.690975315869,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "multi_turn",
+      "tag": "multi_turn-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "6af248f1dd7e54a70f75874f56c33820ba2d8ba27582e215e7d1c2f1c7eaac04",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i1]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 42,
+            "completion_tokens": 2,
+            "ttft_ms": 4468.36400963366,
+            "prefill_tps": 9.39941327730893,
+            "decode_tps": 5.098272407267773,
+            "total_wall_ms": 4798.986170440912,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\nOK"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\nOK",
+            "t_start_abs": 4247647.033162847,
+            "t_first_abs": 4247651.501526857,
+            "t_last_abs": 4247651.697671731,
+            "t_end_abs": 4247651.832149018
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i1]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\nOK"
+              },
+              {
+                "role": "user",
+                "content": "What was the code? Return only JSON with one key \"code\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 71,
+            "completion_tokens": 13,
+            "ttft_ms": 5102.937175892293,
+            "prefill_tps": 13.91355557646759,
+            "decode_tps": 11.11976507959459,
+            "total_wall_ms": 6260.050364769995,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"code\": \"juniper-5938\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"code\": \"juniper-5938\"}",
+            "t_start_abs": 4247651.832315168,
+            "t_first_abs": 4247656.935252344,
+            "t_last_abs": 4247658.014411833,
+            "t_end_abs": 4247658.092365533
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"code\": \"juniper-5938\"}",
+      "total_wall_ms": 11059.431253001094,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "multi_turn",
+      "tag": "multi_turn-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "6dc6b71f91d91163efa078502f770dcaf2b515550c8682d488bd62cf06fd915f",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i2]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 42,
+            "completion_tokens": 2,
+            "ttft_ms": 4662.171995267272,
+            "prefill_tps": 9.008676651705603,
+            "decode_tps": 7.437663705610048,
+            "total_wall_ms": 6110.810537822545,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\nOK"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\nOK",
+            "t_start_abs": 4247647.035417126,
+            "t_first_abs": 4247651.697589121,
+            "t_last_abs": 4247651.832039943,
+            "t_end_abs": 4247653.146227663
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i2]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\nOK"
+              },
+              {
+                "role": "user",
+                "content": "What was the code? Return only JSON with one key \"code\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 71,
+            "completion_tokens": 13,
+            "ttft_ms": 3933.6564959958196,
+            "prefill_tps": 18.049364521857186,
+            "decode_tps": 11.8499532212982,
+            "total_wall_ms": 5182.851850986481,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"code\": \"juniper-5938\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"code\": \"juniper-5938\"}",
+            "t_start_abs": 4247653.146406152,
+            "t_first_abs": 4247657.080062648,
+            "t_last_abs": 4247658.092724874,
+            "t_end_abs": 4247658.329258003
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"code\": \"juniper-5938\"}",
+      "total_wall_ms": 11294.054641388357,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "multi_turn",
+      "tag": "multi_turn-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "77e297f4e7ef10cd465533a18226dd64e5779c13daddef8696201b4c15cd54c0",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i3]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 42,
+            "completion_tokens": 2,
+            "ttft_ms": 4661.084111779928,
+            "prefill_tps": 9.010779250658375,
+            "decode_tps": 7.44163211638129,
+            "total_wall_ms": 6107.815652154386,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\nOK"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\nOK",
+            "t_start_abs": 4247647.036152269,
+            "t_first_abs": 4247651.697236381,
+            "t_last_abs": 4247651.831615504,
+            "t_end_abs": 4247653.143967921
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation multi_turn-c4-r0-i3]\nRemember the secret code juniper-5938. Acknowledge with exactly \"OK\"."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\nOK"
+              },
+              {
+                "role": "user",
+                "content": "What was the code? Return only JSON with one key \"code\"."
+              }
+            ],
+            "tools": null,
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 71,
+            "completion_tokens": 13,
+            "ttft_ms": 3934.966708533466,
+            "prefill_tps": 18.043354686083532,
+            "decode_tps": 11.84500941711619,
+            "total_wall_ms": 5184.413592331111,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"code\": \"juniper-5938\"}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"code\": \"juniper-5938\"}",
+            "t_start_abs": 4247653.144168442,
+            "t_first_abs": 4247657.079135151,
+            "t_last_abs": 4247658.092220035,
+            "t_end_abs": 4247658.328582034
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"code\": \"juniper-5938\"}",
+      "total_wall_ms": 11292.663211002946,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c1-r0-i0",
+      "status": "ok",
+      "input_sha256": "fe24af23d4d1e74a8d5c68716a27d92b7df05a88f94e47e0653fbc6d368aae67",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c1-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 1361.2052546814084,
+            "prefill_tps": 242.4322113546622,
+            "decode_tps": 75.32304665006264,
+            "total_wall_ms": 1885.2369170635939,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_f687a7071e9b45f3ab1",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_f687a7071e9b45f3ab1",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247658.353269221,
+            "t_first_abs": 4247659.714474476,
+            "t_last_abs": 4247660.218968143,
+            "t_end_abs": 4247660.238506138
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c1-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_f687a7071e9b45f3ab1",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_f687a7071e9b45f3ab1",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 124,
+            "completion_tokens": 15,
+            "ttft_ms": 522.0350585877895,
+            "prefill_tps": 237.53193958935458,
+            "decode_tps": 100.21541786260809,
+            "total_wall_ms": 661.8776544928551,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247660.238653612,
+            "t_first_abs": 4247660.760688671,
+            "t_last_abs": 4247660.900387734,
+            "t_end_abs": 4247660.900531267
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 2547.374116256833,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i0",
+      "status": "ok",
+      "input_sha256": "45b75d8c5c96f5996cb7ae9429344b491f52e97d7781e2b4fe662bf03240ebd6",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 5875.729748047888,
+            "prefill_tps": 56.16323659365663,
+            "decode_tps": 12.452641646406477,
+            "total_wall_ms": 10434.196433983743,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_cd3e0cfbbde345d5805",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_cd3e0cfbbde345d5805",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247660.932817267,
+            "t_first_abs": 4247666.808547015,
+            "t_last_abs": 4247669.860108369,
+            "t_end_abs": 4247671.367013701
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i0]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_cd3e0cfbbde345d5805",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_cd3e0cfbbde345d5805",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 124,
+            "completion_tokens": 15,
+            "ttft_ms": 4602.3185001686215,
+            "prefill_tps": 26.94294190970417,
+            "decode_tps": 12.070984129499271,
+            "total_wall_ms": 6032.625410705805,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247671.367266226,
+            "t_first_abs": 4247675.969584726,
+            "t_last_abs": 4247677.129390741,
+            "t_end_abs": 4247677.399891636
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16467.33502857387,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "683d03e088f612c279c5a4177930637fef4139b5fbf56da44bcdb8c022ad1e62",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i1]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 5721.632676199079,
+            "prefill_tps": 57.675845108466724,
+            "decode_tps": 12.202622979830625,
+            "total_wall_ms": 8925.746781751513,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_13b1622cc1ba4f21a61",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_13b1622cc1ba4f21a61",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247660.934581865,
+            "t_first_abs": 4247666.656214541,
+            "t_last_abs": 4247669.770299116,
+            "t_end_abs": 4247669.860328646
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i1]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_13b1622cc1ba4f21a61",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_13b1622cc1ba4f21a61",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 124,
+            "completion_tokens": 15,
+            "ttft_ms": 5917.473819106817,
+            "prefill_tps": 20.95488781033873,
+            "decode_tps": 11.017533052656614,
+            "total_wall_ms": 7268.030647188425,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247669.860591131,
+            "t_first_abs": 4247675.77806495,
+            "t_last_abs": 4247677.048766834,
+            "t_end_abs": 4247677.128621778
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16194.281733594835,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i2",
+      "status": "ok",
+      "input_sha256": "8e858a493cb1626f0094ac928fb06c97b47fa0e73b07d0c1fa0390fc814d77c4",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i2]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 5871.555565856397,
+            "prefill_tps": 56.203163931374256,
+            "decode_tps": 12.45149858316156,
+            "total_wall_ms": 10428.127682767808,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_e11af865791947ca87f",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_e11af865791947ca87f",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247660.936076329,
+            "t_first_abs": 4247666.807631895,
+            "t_last_abs": 4247669.859473386,
+            "t_end_abs": 4247671.364204012
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i2]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_e11af865791947ca87f",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_e11af865791947ca87f",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 124,
+            "completion_tokens": 15,
+            "ttft_ms": 4606.133065186441,
+            "prefill_tps": 26.92062913622772,
+            "decode_tps": 12.082272520080718,
+            "total_wall_ms": 6034.740151837468,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247671.364364419,
+            "t_first_abs": 4247675.970497484,
+            "t_last_abs": 4247677.1292199,
+            "t_end_abs": 4247677.399104571
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16463.26608210802,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "tool_round_trip",
+      "tag": "tool_round_trip-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "57a3c44864ace173cca348d38ef1f3b0e334860e825ca5c3e83bdd4ff6377406",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i3]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 330,
+            "completion_tokens": 39,
+            "ttft_ms": 5869.741522707045,
+            "prefill_tps": 56.22053351470381,
+            "decode_tps": 12.447562293868542,
+            "total_wall_ms": 10428.05114760995,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "get_weather"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_08d8b25f0ad54be6a4e",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_08d8b25f0ad54be6a4e",
+                  "type": "function",
+                  "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247660.937397145,
+            "t_first_abs": 4247666.807138667,
+            "t_last_abs": 4247669.859945241,
+            "t_end_abs": 4247671.365448292
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation tool_round_trip-c4-r0-i3]\nUse get_weather for Paris in celsius, then report the returned temperature as a JSON object with exactly city and temperature_c. Do not invent weather."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_08d8b25f0ad54be6a4e",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": "{\"city\":\"Paris\",\"units\":\"celsius\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_08d8b25f0ad54be6a4e",
+                "content": "{\"city\": \"Paris\", \"temperature_c\": 19}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "description": "Look up the current temperature.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "units": {
+                        "type": "string",
+                        "enum": [
+                          "celsius"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "units"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 124,
+            "completion_tokens": 15,
+            "ttft_ms": 4602.917548269033,
+            "prefill_tps": 26.939435412357376,
+            "decode_tps": 12.064119490863941,
+            "total_wall_ms": 6033.89298915863,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+            "t_start_abs": 4247671.365614518,
+            "t_first_abs": 4247675.968532066,
+            "t_last_abs": 4247677.128998025,
+            "t_end_abs": 4247677.399507507
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"city\": \"Paris\", \"temperature_c\": 19}",
+      "total_wall_ms": 16462.376355193555,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c1-r0-i0",
+      "status": "fail",
+      "input_sha256": "899fe612823f73774b6f909bac2345f6dec7e4d76e47d82a137c8215a2ab5326",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 1146.8058722093701,
+            "prefill_tps": 348.7948655419622,
+            "decode_tps": 100.61213158695892,
+            "total_wall_ms": 1445.2975979074836,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_0a7c8cbb18254750ae5",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_0a7c8cbb18254750ae5",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247677.435379261,
+            "t_first_abs": 4247678.582185133,
+            "t_last_abs": 4247678.880359911,
+            "t_end_abs": 4247678.880676859
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_0a7c8cbb18254750ae5",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_0a7c8cbb18254750ae5",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 180.65905757248402,
+            "prefill_tps": 2634.797315983005,
+            "decode_tps": 41.077415123603174,
+            "total_wall_ms": 1231.051903218031,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_66c923dc9ce34bd5b39",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_66c923dc9ce34bd5b39",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247678.88094509,
+            "t_first_abs": 4247679.061604148,
+            "t_last_abs": 4247680.108408088,
+            "t_end_abs": 4247680.111996993
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c1-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_0a7c8cbb18254750ae5",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_0a7c8cbb18254750ae5",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_66c923dc9ce34bd5b39",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_66c923dc9ce34bd5b39",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 216,
+            "completion_tokens": 27,
+            "ttft_ms": 788.0972307175398,
+            "prefill_tps": 274.07785686968884,
+            "decode_tps": 96.8030264481752,
+            "total_wall_ms": 1056.9807244464755,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+            "t_start_abs": 4247680.112296905,
+            "t_first_abs": 4247680.900394136,
+            "t_last_abs": 4247681.16898078,
+            "t_end_abs": 4247681.16927763
+          }
+        }
+      ],
+      "validated_content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+      "detail": "ValueError: final answer failed the scenario's semantic/structural check",
+      "total_wall_ms": 3734.2476919293404,
+      "concurrency": 1,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i0",
+      "status": "fail",
+      "input_sha256": "2070b8edd805dd777483862eeeba208b80e5d14bc91a8b79a418fefe392da929",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6531.5478490665555,
+            "prefill_tps": 61.241226313172504,
+            "decode_tps": 12.098548796519314,
+            "total_wall_ms": 9089.392863214016,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_15e27e8220b0471d894",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_15e27e8220b0471d894",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247681.197541941,
+            "t_first_abs": 4247687.72908979,
+            "t_last_abs": 4247690.208726026,
+            "t_end_abs": 4247690.286934804
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_15e27e8220b0471d894",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_15e27e8220b0471d894",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 3983.6923787370324,
+            "prefill_tps": 119.4871377470437,
+            "decode_tps": 11.7494243795567,
+            "total_wall_ms": 7723.820575512946,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_821aa7ad0b224abc8c6",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_821aa7ad0b224abc8c6",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247690.287219684,
+            "t_first_abs": 4247694.270912062,
+            "t_last_abs": 4247697.930665818,
+            "t_end_abs": 4247698.011040259
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i0]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_15e27e8220b0471d894",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_15e27e8220b0471d894",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_821aa7ad0b224abc8c6",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"quantity\":5,\"unit_price\":13.75}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_821aa7ad0b224abc8c6",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 216,
+            "completion_tokens": 27,
+            "ttft_ms": 9557.974583469331,
+            "prefill_tps": 22.59893015132886,
+            "decode_tps": 10.244880325879297,
+            "total_wall_ms": 12136.063273996115,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+            "t_start_abs": 4247698.011297256,
+            "t_first_abs": 4247707.569271839,
+            "t_last_abs": 4247710.107124813,
+            "t_end_abs": 4247710.14736053
+          }
+        }
+      ],
+      "validated_content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+      "detail": "ValueError: final answer failed the scenario's semantic/structural check",
+      "total_wall_ms": 28950.102291069925,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i1",
+      "status": "ok",
+      "input_sha256": "f7b8c7a22b5a24cc9d1eea82ffdd1a5e9972c9fb79703a45a3133bd31183ca44",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6529.232786037028,
+            "prefill_tps": 61.262940548759836,
+            "decode_tps": 12.097895175814399,
+            "total_wall_ms": 9088.83642964065,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_ca9c309b42aa4a738b4",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_ca9c309b42aa4a738b4",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247681.199331396,
+            "t_first_abs": 4247687.728564182,
+            "t_last_abs": 4247690.208334387,
+            "t_end_abs": 4247690.288167826
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_ca9c309b42aa4a738b4",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_ca9c309b42aa4a738b4",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 3979.571365751326,
+            "prefill_tps": 119.61087168746708,
+            "decode_tps": 11.73775110455135,
+            "total_wall_ms": 7722.018503583968,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_6ec75c445ae94b96b52",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_6ec75c445ae94b96b52",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247690.28842129,
+            "t_first_abs": 4247694.267992656,
+            "t_last_abs": 4247697.931386062,
+            "t_end_abs": 4247698.010439794
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i1]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_ca9c309b42aa4a738b4",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_ca9c309b42aa4a738b4",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_6ec75c445ae94b96b52",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_6ec75c445ae94b96b52",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 216,
+            "completion_tokens": 22,
+            "ttft_ms": 9556.720442138612,
+            "prefill_tps": 22.60189583945424,
+            "decode_tps": 11.974490121491788,
+            "total_wall_ms": 11389.787167310715,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247698.010709324,
+            "t_first_abs": 4247707.567429766,
+            "t_last_abs": 4247709.321157882,
+            "t_end_abs": 4247709.400496491
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 28201.483311131597,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i2",
+      "status": "fail",
+      "input_sha256": "b67f25fdf08123bd5fb2714c988a16a6c3b4330a9d4b6e8bb291c8da295e04f6",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6527.48553827405,
+            "prefill_tps": 61.27933913519862,
+            "decode_tps": 12.093501568373062,
+            "total_wall_ms": 9088.063820265234,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_b2bd888baf6148ccb67",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_b2bd888baf6148ccb67",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247681.200661331,
+            "t_first_abs": 4247687.72814687,
+            "t_last_abs": 4247690.208817983,
+            "t_end_abs": 4247690.288725152
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_b2bd888baf6148ccb67",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_b2bd888baf6148ccb67",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 3981.0753101482987,
+            "prefill_tps": 119.56568588054883,
+            "decode_tps": 11.74585950494761,
+            "total_wall_ms": 7720.605524256825,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_e8d55e23feb040d6a98",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_e8d55e23feb040d6a98",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247690.288975659,
+            "t_first_abs": 4247694.270050969,
+            "t_last_abs": 4247697.930915462,
+            "t_end_abs": 4247698.009581183
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i2]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_b2bd888baf6148ccb67",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_b2bd888baf6148ccb67",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_e8d55e23feb040d6a98",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_e8d55e23feb040d6a98",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 216,
+            "completion_tokens": 27,
+            "ttft_ms": 9558.49229451269,
+            "prefill_tps": 22.59770613865543,
+            "decode_tps": 10.240453922614753,
+            "total_wall_ms": 12137.911946512759,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+            "t_start_abs": 4247698.0098594,
+            "t_first_abs": 4247707.568351694,
+            "t_last_abs": 4247710.107301647,
+            "t_end_abs": 4247710.147771346
+          }
+        }
+      ],
+      "validated_content": "\n\n```json\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}\n```",
+      "detail": "ValueError: final answer failed the scenario's semantic/structural check",
+      "total_wall_ms": 28947.408402338624,
+      "concurrency": 4,
+      "repeat": 0
+    },
+    {
+      "scenario": "agentic",
+      "tag": "agentic-c4-r0-i3",
+      "status": "ok",
+      "input_sha256": "e2d3f756965c01a310a272186931ddc79796a14ef6ca89f9e737f4b99edce704",
+      "turns": [
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 400,
+            "completion_tokens": 31,
+            "ttft_ms": 6527.233488857746,
+            "prefill_tps": 61.281705439650096,
+            "decode_tps": 12.100806263974528,
+            "total_wall_ms": 9085.357851348817,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "read_invoice"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_dbcdaedaa1364b2f8a7",
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "arguments": "{\"invoice_id\":\"INV-472\"}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_dbcdaedaa1364b2f8a7",
+                  "type": "function",
+                  "function": {
+                    "name": "read_invoice",
+                    "arguments": "{\"invoice_id\":\"INV-472\"}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247681.202200934,
+            "t_first_abs": 4247687.729434423,
+            "t_last_abs": 4247690.20860807,
+            "t_end_abs": 4247690.287558786
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_dbcdaedaa1364b2f8a7",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_dbcdaedaa1364b2f8a7",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 476,
+            "completion_tokens": 44,
+            "ttft_ms": 3981.266244314611,
+            "prefill_tps": 119.55995173137312,
+            "decode_tps": 11.74200986139905,
+            "total_wall_ms": 7727.132068946958,
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+              "calculate_total"
+            ],
+            "tool_call_details": [
+              {
+                "id": "call_8560509ea8b04c13adc",
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                }
+              }
+            ],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n",
+              "tool_calls": [
+                {
+                  "id": "call_8560509ea8b04c13adc",
+                  "type": "function",
+                  "function": {
+                    "name": "calculate_total",
+                    "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                  }
+                }
+              ]
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n",
+            "t_start_abs": 4247690.287826571,
+            "t_first_abs": 4247694.269092815,
+            "t_last_abs": 4247697.93115753,
+            "t_end_abs": 4247698.01495864
+          }
+        },
+        {
+          "request": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[validation agentic-c4-r0-i3]\nRead invoice INV-472 with read_invoice, then pass its returned unit_price and quantity to calculate_total. You must call both tools in that order. Finally return only JSON with invoice_id and total using the tool results."
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_dbcdaedaa1364b2f8a7",
+                    "type": "function",
+                    "function": {
+                      "name": "read_invoice",
+                      "arguments": "{\"invoice_id\":\"INV-472\"}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_dbcdaedaa1364b2f8a7",
+                "content": "{\"invoice_id\": \"INV-472\", \"unit_price\": 13.75, \"quantity\": 5}"
+              },
+              {
+                "role": "assistant",
+                "content": "\n\n",
+                "tool_calls": [
+                  {
+                    "id": "call_8560509ea8b04c13adc",
+                    "type": "function",
+                    "function": {
+                      "name": "calculate_total",
+                      "arguments": "{\"unit_price\":13.75,\"quantity\":5}"
+                    }
+                  }
+                ]
+              },
+              {
+                "role": "tool",
+                "tool_call_id": "call_8560509ea8b04c13adc",
+                "content": "{\"total\": 68.75}"
+              }
+            ],
+            "tools": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "read_invoice",
+                  "description": "Read an invoice by its identifier.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "invoice_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "invoice_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              {
+                "type": "function",
+                "function": {
+                  "name": "calculate_total",
+                  "description": "Calculate the total for an invoice.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "unit_price": {
+                        "type": "number"
+                      },
+                      "quantity": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "unit_price",
+                      "quantity"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            ],
+            "response_format": null,
+            "extra_body": {
+              "temperature": 0,
+              "top_p": 1,
+              "top_k": 0,
+              "seed": 42,
+              "repeat_penalty": 1,
+              "presence_penalty": 0,
+              "frequency_penalty": 0,
+              "think": false,
+              "tool_choice": "none"
+            },
+            "max_tokens": 256,
+            "stream": true
+          },
+          "metrics": {
+            "prompt_tokens": 216,
+            "completion_tokens": 22,
+            "ttft_ms": 9551.14241503179,
+            "prefill_tps": 22.615095725099295,
+            "decode_tps": 11.969378967039308,
+            "total_wall_ms": 11385.6251668185,
+            "finish_reason": "stop",
+            "tool_calls": [],
+            "tool_call_details": [],
+            "assistant_message": {
+              "role": "assistant",
+              "content": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}"
+            },
+            "usage_present": true,
+            "decode_timing_source": "stream_window",
+            "server_timings": {},
+            "reasoning_text": "",
+            "output_text": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+            "t_start_abs": 4247698.015319951,
+            "t_first_abs": 4247707.566462366,
+            "t_last_abs": 4247709.320939357,
+            "t_end_abs": 4247709.400945118
+          }
+        }
+      ],
+      "validated_content": "\n\n{\"invoice_id\": \"INV-472\", \"total\": 68.75}",
+      "total_wall_ms": 28198.987250216305,
+      "concurrency": 4,
+      "repeat": 0
+    }
+  ],
+  "waves": [
+    {
+      "scenario": "short",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 289.09222315996885,
+      "generated_tokens": 3,
+      "end_to_end_tokens_per_second": 10.377311320270119,
+      "all_passed": true
+    },
+    {
+      "scenario": "short",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 5094.36165727675,
+      "generated_tokens": 12,
+      "end_to_end_tokens_per_second": 2.355545367074457,
+      "all_passed": true
+    },
+    {
+      "scenario": "short_zh",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 685.1496091112494,
+      "generated_tokens": 3,
+      "end_to_end_tokens_per_second": 4.378605723633832,
+      "all_passed": true
+    },
+    {
+      "scenario": "short_zh",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 4852.50418074429,
+      "generated_tokens": 12,
+      "end_to_end_tokens_per_second": 2.472949955946129,
+      "all_passed": true
+    },
+    {
+      "scenario": "json",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 1199.1451848298311,
+      "generated_tokens": 20,
+      "end_to_end_tokens_per_second": 16.678547562894288,
+      "all_passed": true
+    },
+    {
+      "scenario": "json",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 6657.312357798219,
+      "generated_tokens": 80,
+      "end_to_end_tokens_per_second": 12.01686141499578,
+      "all_passed": true
+    },
+    {
+      "scenario": "json_schema",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 1453.0233275145292,
+      "generated_tokens": 20,
+      "end_to_end_tokens_per_second": 13.764403930259691,
+      "all_passed": true
+    },
+    {
+      "scenario": "json_schema",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 7931.1547093093395,
+      "generated_tokens": 88,
+      "end_to_end_tokens_per_second": 11.095483977472835,
+      "all_passed": true
+    },
+    {
+      "scenario": "json_unicode",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 1360.204666852951,
+      "generated_tokens": 27,
+      "end_to_end_tokens_per_second": 19.84995395028954,
+      "all_passed": true
+    },
+    {
+      "scenario": "json_unicode",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 7415.058837272227,
+      "generated_tokens": 108,
+      "end_to_end_tokens_per_second": 14.564955230986392,
+      "all_passed": true
+    },
+    {
+      "scenario": "multi_turn",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 1264.9428825825453,
+      "generated_tokens": 15,
+      "end_to_end_tokens_per_second": 11.85824293455492,
+      "all_passed": true
+    },
+    {
+      "scenario": "multi_turn",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 11298.256441950798,
+      "generated_tokens": 60,
+      "end_to_end_tokens_per_second": 5.3105539167280735,
+      "all_passed": true
+    },
+    {
+      "scenario": "tool_round_trip",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 2548.206778243184,
+      "generated_tokens": 54,
+      "end_to_end_tokens_per_second": 21.191372874861177,
+      "all_passed": true
+    },
+    {
+      "scenario": "tool_round_trip",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 16468.651364557445,
+      "generated_tokens": 216,
+      "end_to_end_tokens_per_second": 13.115828079575383,
+      "all_passed": true
+    },
+    {
+      "scenario": "agentic",
+      "concurrency": 1,
+      "repeat": 0,
+      "wall_ms": 3735.2186189964414,
+      "generated_tokens": 102,
+      "end_to_end_tokens_per_second": 27.307638562640495,
+      "all_passed": false
+    },
+    {
+      "scenario": "agentic",
+      "concurrency": 4,
+      "repeat": 0,
+      "wall_ms": 28951.889406889677,
+      "generated_tokens": 398,
+      "end_to_end_tokens_per_second": 13.746943918115687,
+      "all_passed": false
+    }
+  ],
+  "not_covered": {
+    "image": "requires a released, compatible vision companion and separate media validation",
+    "audio": "no audio validation in this suite",
+    "video": "requires compatible vision companion and separate media validation"
+  },
+  "warmup": {
+    "scenario": "short",
+    "tag": "warmup",
+    "status": "ok",
+    "input_sha256": "315f1a2eb2a7a2cc67392b990f40f1cd73d2681754c1dbb23c3ff7d7c1bd5f25",
+    "turns": [
+      {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "[validation warmup]\nWhat is 17 + 25? Reply with only the integer."
+            }
+          ],
+          "tools": null,
+          "response_format": null,
+          "extra_body": {
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 0,
+            "seed": 42,
+            "repeat_penalty": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+            "think": false
+          },
+          "max_tokens": 256,
+          "stream": true
+        },
+        "metrics": {
+          "prompt_tokens": 33,
+          "completion_tokens": 3,
+          "ttft_ms": 268.13920494168997,
+          "prefill_tps": 123.0704029542276,
+          "decode_tps": 18602.917999272337,
+          "total_wall_ms": 268.38862895965576,
+          "finish_reason": "stop",
+          "tool_calls": [],
+          "tool_call_details": [],
+          "assistant_message": {
+            "role": "assistant",
+            "content": "\n\n42"
+          },
+          "usage_present": true,
+          "decode_timing_source": "stream_window",
+          "server_timings": {},
+          "reasoning_text": "",
+          "output_text": "\n\n42",
+          "t_start_abs": 4247608.416314765,
+          "t_first_abs": 4247608.68445397,
+          "t_last_abs": 4247608.68456148,
+          "t_end_abs": 4247608.684703394
+        }
+      }
+    ],
+    "validated_content": "\n\n42",
+    "total_wall_ms": 268.4615133330226
+  },
+  "summary": {
+    "short@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 287.8838311880827,
+      "ttft_ms_samples": [
+        287.8838311880827
+      ],
+      "prefill_tps_median": 131.99768755048115,
+      "prefill_tps_samples": [
+        131.99768755048115
+      ],
+      "decode_tps_median": 66939.42358405287,
+      "decode_tps_samples": [
+        66939.42358405287
+      ],
+      "conversation_wall_ms_median": 288.14079612493515
+    },
+    "short@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 4586.142481770366,
+      "ttft_ms_samples": [
+        4454.910823144019,
+        4588.468003086746,
+        4586.373185738921,
+        4585.911777801812
+      ],
+      "prefill_tps_median": 8.285830683893618,
+      "prefill_tps_samples": [
+        8.529912608482205,
+        8.281631249130802,
+        8.285413868666192,
+        8.286247499121043
+      ],
+      "decode_tps_median": 9.334385089893427,
+      "decode_tps_samples": [
+        7.37608943695557,
+        9.339366286620207,
+        9.329403893166647,
+        9.352267059056956
+      ],
+      "conversation_wall_ms_median": 5089.392626658082
+    },
+    "short_zh@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 684.1852189972997,
+      "ttft_ms_samples": [
+        684.1852189972997
+      ],
+      "prefill_tps_median": 59.925293417018146,
+      "prefill_tps_samples": [
+        59.925293417018146
+      ],
+      "decode_tps_median": 69477.61648710731,
+      "decode_tps_samples": [
+        69477.61648710731
+      ],
+      "conversation_wall_ms_median": 684.4449630007148
+    },
+    "short_zh@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 4453.5783575847745,
+      "ttft_ms_samples": [
+        4456.963764503598,
+        4279.737398959696,
+        4455.020505934954,
+        4452.136209234595
+      ],
+      "prefill_tps_median": 9.206081269313131,
+      "prefill_tps_samples": [
+        9.199087577631774,
+        9.58002703856693,
+        9.203100175494148,
+        9.209062363132116
+      ],
+      "decode_tps_median": 9.156639478471162,
+      "decode_tps_samples": [
+        9.177995567774362,
+        6.313873265212624,
+        9.169235600757606,
+        9.144043356184717
+      ],
+      "conversation_wall_ms_median": 4847.659001126885
+    },
+    "json@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 943.6852997168899,
+      "ttft_ms_samples": [
+        943.6852997168899
+      ],
+      "prefill_tps_median": 96.4304520026967,
+      "prefill_tps_samples": [
+        96.4304520026967
+      ],
+      "decode_tps_median": 86.60309653897113,
+      "decode_tps_samples": [
+        86.60309653897113
+      ],
+      "conversation_wall_ms_median": 1198.2602728530765
+    },
+    "json@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 4883.42216797173,
+      "ttft_ms_samples": [
+        4738.569780252874,
+        4886.51396241039,
+        4884.6836518496275,
+        4882.160684093833
+      ],
+      "prefill_tps_median": 18.634474543113004,
+      "prefill_tps_samples": [
+        19.204106770617987,
+        18.62268289828278,
+        18.629660892275403,
+        18.639288193950605
+      ],
+      "decode_tps_median": 12.170882704802487,
+      "decode_tps_samples": [
+        11.639907980327362,
+        12.179259744612537,
+        12.173125815738777,
+        12.168639593866198
+      ],
+      "conversation_wall_ms_median": 6651.913709007204
+    },
+    "json_schema@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 1451.849278062582,
+      "ttft_ms_samples": [
+        1451.849278062582
+      ],
+      "prefill_tps_median": 163.24008530435356,
+      "prefill_tps_samples": [
+        163.24008530435356
+      ],
+      "conversation_wall_ms_median": 1452.0818749442697
+    },
+    "json_schema@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 7642.95651903376,
+      "ttft_ms_samples": [
+        7929.529487155378,
+        7477.678498253226,
+        7644.03807464987,
+        7641.874963417649
+      ],
+      "prefill_tps_median": 31.008943221871625,
+      "prefill_tps_samples": [
+        29.88828030514341,
+        31.694328668364495,
+        31.004555142911897,
+        31.01333130083135
+      ],
+      "conversation_wall_ms_median": 7643.442076165229
+    },
+    "json_unicode@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 880.9926826506853,
+      "ttft_ms_samples": [
+        880.9926826506853
+      ],
+      "prefill_tps_median": 113.5083207491862,
+      "prefill_tps_samples": [
+        113.5083207491862
+      ],
+      "decode_tps_median": 54.420219571872856,
+      "decode_tps_samples": [
+        54.420219571872856
+      ],
+      "conversation_wall_ms_median": 1359.3134256079793
+    },
+    "json_unicode@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 5087.273029144853,
+      "ttft_ms_samples": [
+        5089.561317116022,
+        5087.63805963099,
+        5086.907998658717,
+        4914.175008423626
+      ],
+      "prefill_tps_median": 19.656896718922198,
+      "prefill_tps_samples": [
+        19.648058795107428,
+        19.655486264534524,
+        19.65830717330987,
+        20.349295625122252
+      ],
+      "decode_tps_median": 12.325937969718488,
+      "decode_tps_samples": [
+        12.326780371847532,
+        12.325095567589445,
+        12.330936155767825,
+        11.808280856328777
+      ],
+      "conversation_wall_ms_median": 7411.030356772244
+    },
+    "multi_turn@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 868.6920385807753,
+      "ttft_ms_samples": [
+        868.6920385807753
+      ],
+      "prefill_tps_median": 48.34854946825282,
+      "prefill_tps_samples": [
+        48.34854946825282
+      ],
+      "decode_tps_median": 58087.19632134163,
+      "decode_tps_samples": [
+        58087.19632134163
+      ],
+      "conversation_wall_ms_median": 1264.204416424036
+    },
+    "multi_turn@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 4661.6280535236,
+      "ttft_ms_samples": [
+        4664.339408278465,
+        4468.36400963366,
+        4662.171995267272,
+        4661.084111779928
+      ],
+      "prefill_tps_median": 9.00972795118199,
+      "prefill_tps_samples": [
+        9.004490523450468,
+        9.39941327730893,
+        9.008676651705603,
+        9.010779250658375
+      ],
+      "decode_tps_median": 7.432581854110683,
+      "decode_tps_samples": [
+        7.427500002611318,
+        5.098272407267773,
+        7.437663705610048,
+        7.44163211638129
+      ],
+      "conversation_wall_ms_median": 11293.358926195651
+    },
+    "tool_round_trip@c1": {
+      "passed": 1,
+      "total": 1,
+      "ttft_ms_median": 1361.2052546814084,
+      "ttft_ms_samples": [
+        1361.2052546814084
+      ],
+      "prefill_tps_median": 242.4322113546622,
+      "prefill_tps_samples": [
+        242.4322113546622
+      ],
+      "decode_tps_median": 75.32304665006264,
+      "decode_tps_samples": [
+        75.32304665006264
+      ],
+      "conversation_wall_ms_median": 2547.374116256833
+    },
+    "tool_round_trip@c4": {
+      "passed": 4,
+      "total": 4,
+      "ttft_ms_median": 5870.648544281721,
+      "ttft_ms_samples": [
+        5875.729748047888,
+        5721.632676199079,
+        5871.555565856397,
+        5869.741522707045
+      ],
+      "prefill_tps_median": 56.21184872303903,
+      "prefill_tps_samples": [
+        56.16323659365663,
+        57.675845108466724,
+        56.203163931374256,
+        56.22053351470381
+      ],
+      "decode_tps_median": 12.449530438515051,
+      "decode_tps_samples": [
+        12.452641646406477,
+        12.202622979830625,
+        12.45149858316156,
+        12.447562293868542
+      ],
+      "conversation_wall_ms_median": 16462.821218650788
+    },
+    "agentic@c1": {
+      "passed": 0,
+      "total": 1
+    },
+    "agentic@c4": {
+      "passed": 2,
+      "total": 4,
+      "ttft_ms_median": 6528.233137447387,
+      "ttft_ms_samples": [
+        6529.232786037028,
+        6527.233488857746
+      ],
+      "prefill_tps_median": 61.27232299420497,
+      "prefill_tps_samples": [
+        61.262940548759836,
+        61.281705439650096
+      ],
+      "decode_tps_median": 12.099350719894463,
+      "decode_tps_samples": [
+        12.097895175814399,
+        12.100806263974528
+      ],
+      "conversation_wall_ms_median": 28200.23528067395
+    }
+  }
+}

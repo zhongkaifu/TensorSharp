@@ -1,0 +1,48 @@
+{
+  "recorded_at_utc": "2026-09-16T17:17:31.393820+00:00",
+  "release_qualified": false,
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "upstream_status": "",
+  "local_platform": "macOS-27.0-arm64-arm-64bit",
+  "source_sha256": {
+    "TensorSharp.GGML.Native/ggml_ops_attention_precision.cpp": "79c43584c07a73cdfd62e21d740390d337ac464eb242e331b315fe4df5ecd55a",
+    "TensorSharp.GGML.Native/ggml_ops_matmul_precision.cpp": "49c521f8f7f2dce698cb33e3743252b2f7ee5a8deedccc4b4bfe1a561c572538",
+    "TensorSharp.GGML.Native/ggml_ops_matmul_precision.cu": "7079c3f6779bc8279d9ff3a3d3d7b57454d8f8ac0faff9c8a22d5ef5828e1846",
+    "TensorSharp.GGML.Native/ggml_ops_precision_policy.h": "a06c66945e0f202e85c6a77f303c01a73afeb5eec5732b938af20d37089994a8",
+    "TensorSharp.GGML.Native/tests/attention_precision_test.cpp": "0ce9db5a9bec030cbce10a39bd993fec74185e2fa4313d67bd5eeec41fba347a",
+    "TensorSharp.GGML.Native/tests/cuda_matmul_precision_test.cpp": "eb5821a5d2b4ca8faffa345ac5537671e07da6b9a3af492841afe176f5e1f995",
+    "TensorSharp.GGML.Native/tests/dsv41_tp_test.cpp": "fd4ba57c05d9903833f616291e789b3da2e4b7128045f9d3d2c243785be02ac2",
+    "TensorSharp.GGML.Native/ggml_ops_deepseek41_tp.cpp": "517ede9ef1925cadd37acd0031ea4d49591d57c6b84e7d31869d06a1428fc61d",
+    "eng/tests/dsv41-dspark-inference.py": "3a7b6901e407a6f6b6295950a1125b25d3aa6a6f02478849fdb39be7bc4ee19c"
+  },
+  "native_binaries": {
+    "/tmp/ts-numerical-build/GgmlOpsMatmulPrecisionCpuTest": "239dade025cb9670e3682e16e155305e9742afe2bbc161bb0ba1342c9169888f",
+    "/tmp/ts-numerical-build/GgmlOpsAttentionPrecisionCpuTest": "da7d22d2da4e0963a9299ebfeb27c53de0ea5ba0441608b9a4d721cfa5bce188",
+    "/tmp/ts-numerical-build/GgmlOpsDsv41QuantTest": "d9365511b7af15fcf212ac95ea3c15801dcebe78b168800b11a869b4099b802f",
+    "/tmp/ts-numerical-build/GgmlOpsDsv41TpTest": "cabb877cbc8fae664bd36abfc6223235c5cf3bd486032ba84296e26a4df8c94b",
+    "/tmp/ts-numerical-tp-before-arm-fix": "79ae8e23b8ea562e741509ecb1ae288665151d56bf8e89227074f861d8e030e0",
+    "/tmp/ts-numerical-dot-bench": "11815e654646e41e7d681a7312dde39ae71a8027d3677b5e027ea18865d9d537"
+  },
+  "original_tp_binary_sha256": "3b7c6866a3c78c77ea3adce6f321e6fd3566faab95ff9a90c379ed2d26814131",
+  "original_tp_source_sha256": {
+    "TensorSharp.GGML.Native/tests/dsv41_tp_test.cpp": "fd4ba57c05d9903833f616291e789b3da2e4b7128045f9d3d2c243785be02ac2",
+    "TensorSharp.GGML.Native/ggml_ops_deepseek41_tp.cpp": "517ede9ef1925cadd37acd0031ea4d49591d57c6b84e7d31869d06a1428fc61d"
+  },
+  "artifact_sha256": {
+    "arm-dot-benchmark.cpp": "cb6ebf8264b02cfcf677864b5990842a736bd67262c81086679ae02d555d2942",
+    "cpu-prefix11-trace.json": "de05d649e53b0c436559b817ff31d2e3f27c032b3da5cf6aff2f9af68cb89518",
+    "arm-dot-benchmark.log": "b64db4a584dbbe9f797f1fad055cbb24d782aded5b30685dc63e8f8c8572c4c3",
+    "cpu-tp-standard-before-arm-fix.log": "58dd454292c61baf1d250bfc6ba4d8c33b045b3598a259a0acafaf1d589eac16",
+    "cpu-prefix5.json": "694f1a63df64af91f616f6beef73d238d18eb6c742dfd50bd8af45047cf58eea",
+    "cuda2-split.json": "ba0f85498707e75efa31197794fbbf4adf2a4cfbf130275a6894773e958e8082",
+    "README.md": "896d446feb7d78ac80a8b9437b4fd1c463f4f8a16eb9197feb69d946b997f9da",
+    "cpu-quant.log": "78d64a534a2dc5df107485cda82051c643f9702094dbfdc84e2c93d8ea958f16",
+    "arm-precision-after.log": "bb6345f563cd513d35db15933ea3e26bf3ca73281b77d877adc865f47fecc103",
+    "cpu-tp-standard-after-arm-fix.log": "58dd454292c61baf1d250bfc6ba4d8c33b045b3598a259a0acafaf1d589eac16",
+    "cpu-tp-checkpoint-after-arm-fix.log": "9750b11df72b1d9a25695078324e1aa2b003e92429eb775d51b676a461c7cc9e",
+    "cpu-tp-original-checkpoint.log": "9750b11df72b1d9a25695078324e1aa2b003e92429eb775d51b676a461c7cc9e",
+    "cpu-prefixes1-17.json": "d20199b61e6cb4381437bd64efbd9a054772892c67d2d5eb31b3add2c64b6ecf",
+    "arm-precision-before.log": "8acd948874cf336c13779906461ef36bd5e2f7ff58656fea8687d9ad9b2d4ab0"
+  },
+  "baseline_arm_matmul_source_sha256": "8a7b51bee07488238160c009e8416796e36740d5e07f1e53b1bae8c140e7e045"
+}

@@ -43,14 +43,15 @@ class Ple(C.Structure):
 class Target:
     GK, GV, GKH, GVH, CONV = 4, 4, 1, 2, 3
 
-    def __init__(self, sample, geometry="tiny"):
+    def __init__(self, sample, geometry="tiny", attention_head_dim=8, attention_heads=4):
         if geometry == "gdn32":
             # CUDA ssm_conv requires a multiple of128 channels, and its GDN
             # supports head32. Keep the exact H8/HC4/attention/PLE subspace.
             self.GK = self.GV = 32
         elif geometry != "tiny":
             raise ValueError("Unknown target fixture geometry")
-        self.base = b = op.Fixture(sample, seed=701, capacity=512, kv_alignment=64)
+        self.base = b = op.Fixture(sample, seed=701, capacity=512, kv_alignment=64,
+                                   attention_head_dim=attention_head_dim, attention_heads=attention_heads)
         self.g = Gdn()
         self.p = Ple()
         for field in ("hc_norm", "hc_down", "hc_up", "hc_inject",
@@ -90,7 +91,7 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--backend", choices=("CPU", "CUDA"), default="CPU")
+    parser.add_argument("--backend", choices=("CPU", "CUDA", "Metal"), default="CPU")
     parser.add_argument("--geometry", choices=("tiny", "gdn32"), default="tiny",
                         help="Explicit gdn32 uses128 convchannels supported byCUDA; tiny preserves the original CPU case")
     args = parser.parse_args()

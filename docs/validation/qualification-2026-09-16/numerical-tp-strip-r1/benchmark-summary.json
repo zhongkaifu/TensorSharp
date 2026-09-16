@@ -1,0 +1,182 @@
+[
+  {
+    "type": "q2_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.330025,
+    "candidate_median_ms": 0.457976,
+    "candidate_over_original": 1.3877009317475948
+  },
+  {
+    "type": "q2_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.8368405,
+    "candidate_median_ms": 1.099797,
+    "candidate_over_original": 1.3142253511869944
+  },
+  {
+    "type": "q2_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 1.476296,
+    "candidate_median_ms": 1.992959,
+    "candidate_over_original": 1.34997249874009
+  },
+  {
+    "type": "q2_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.223024,
+    "candidate_median_ms": 0.40633050000000004,
+    "candidate_over_original": 1.821913785063491
+  },
+  {
+    "type": "q2_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.601232,
+    "candidate_median_ms": 0.996867,
+    "candidate_over_original": 1.6580404901934693
+  },
+  {
+    "type": "q2_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 0.994451,
+    "candidate_median_ms": 1.8175145,
+    "candidate_over_original": 1.8276561640543374
+  },
+  {
+    "type": "q2_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.26151199999999997,
+    "candidate_median_ms": 0.44655100000000003,
+    "candidate_over_original": 1.7075736486279791
+  },
+  {
+    "type": "q2_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.612709,
+    "candidate_median_ms": 1.0066175,
+    "candidate_over_original": 1.642896546321337
+  },
+  {
+    "type": "q2_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 1.0027265,
+    "candidate_median_ms": 1.8262835,
+    "candidate_over_original": 1.8213176773526978
+  },
+  {
+    "type": "q4_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.36759600000000003,
+    "candidate_median_ms": 0.4643815,
+    "candidate_over_original": 1.2632931261493596
+  },
+  {
+    "type": "q4_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.7947195,
+    "candidate_median_ms": 1.0609769999999998,
+    "candidate_over_original": 1.3350333042035585
+  },
+  {
+    "type": "q4_K",
+    "ranks": 2,
+    "rows": 1024,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 1.540114,
+    "candidate_median_ms": 1.8910345,
+    "candidate_over_original": 1.2278535874617074
+  },
+  {
+    "type": "q4_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.21711950000000002,
+    "candidate_median_ms": 0.37123649999999997,
+    "candidate_over_original": 1.7098256950665414
+  },
+  {
+    "type": "q4_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.5815965000000001,
+    "candidate_median_ms": 0.861301,
+    "candidate_over_original": 1.480925349447598
+  },
+  {
+    "type": "q4_K",
+    "ranks": 7,
+    "rows": 256,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 0.975942,
+    "candidate_median_ms": 1.53776,
+    "candidate_over_original": 1.5756674064647285
+  },
+  {
+    "type": "q4_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 16,
+    "pairs": 60,
+    "original_median_ms": 0.2039305,
+    "candidate_median_ms": 0.3574495,
+    "candidate_over_original": 1.7528005864743135
+  },
+  {
+    "type": "q4_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 65,
+    "pairs": 60,
+    "original_median_ms": 0.581521,
+    "candidate_median_ms": 0.8621449999999999,
+    "candidate_over_original": 1.4825689871904884
+  },
+  {
+    "type": "q4_K",
+    "ranks": 8,
+    "rows": 256,
+    "tokens": 129,
+    "pairs": 60,
+    "original_median_ms": 0.953241,
+    "candidate_median_ms": 1.5172694999999998,
+    "candidate_over_original": 1.591695594293573
+  }
+]

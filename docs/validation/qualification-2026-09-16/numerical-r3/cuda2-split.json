@@ -1,0 +1,4341 @@
+{
+  "started_at_unix": 1789578558.9603562,
+  "release_qualified": false,
+  "checks": [
+    {
+      "name": "load_draft_model",
+      "passed": true
+    },
+    {
+      "name": "load_draft_model",
+      "passed": true
+    },
+    {
+      "name": "draft_block_size",
+      "passed": true
+    },
+    {
+      "name": "draft_target_features_cross_devices",
+      "passed": true,
+      "target_layers": [
+        1,
+        3,
+        4
+      ],
+      "devices": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "name": "target_prefix1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.6689300537109375e-06,
+      "relative_l2": 6.561940500137156e-07
+    },
+    {
+      "name": "draft_tokens_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "native_ring_draft_tokens_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "native_ring_draft_confidence_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.086162567138672e-07,
+      "relative_l2": 6.79036628118089e-07
+    },
+    {
+      "name": "verify_full_vocabulary_prefix1",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.6226043701171875e-06,
+      "relative_l2": 7.816865980267722e-07
+    },
+    {
+      "name": "draft_confidence_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.086162567138672e-07,
+      "relative_l2": 6.79036628118089e-07
+    },
+    {
+      "name": "target_prefix5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.6689300537109375e-06,
+      "relative_l2": 5.696449095094238e-07
+    },
+    {
+      "name": "draft_tokens_prefix5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "native_ring_draft_tokens_prefix5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "native_ring_draft_confidence_prefix5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.980232238769531e-07,
+      "relative_l2": 1.8525564774961303e-07
+    },
+    {
+      "name": "verify_full_vocabulary_prefix5",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.814697265625e-06,
+      "relative_l2": 7.943500058205913e-07
+    },
+    {
+      "name": "draft_confidence_prefix5",
+      "passed": false,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.00010269880294799805,
+      "relative_l2": 6.659053287868927e-05
+    },
+    {
+      "name": "target_prefix17",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 4.231929779052734e-06,
+      "relative_l2": 1.4982963244821605e-06
+    },
+    {
+      "name": "draft_tokens_prefix17",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "native_ring_draft_tokens_prefix17",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "native_ring_draft_confidence_prefix17",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 1.7881393432617188e-07,
+      "relative_l2": 1.26885229939022e-07
+    },
+    {
+      "name": "verify_full_vocabulary_prefix17",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 5.125999450683594e-06,
+      "relative_l2": 1.122883510313688e-06
+    },
+    {
+      "name": "draft_confidence_prefix17",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 1.7881393432617188e-07,
+      "relative_l2": 1.26885229939022e-07
+    },
+    {
+      "name": "rewind_p1_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        2,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        2,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        2,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p1_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p1_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p1_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p1_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p1_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p1_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p1_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p1_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p1_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        3,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        4,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        5,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        6,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        7,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p2_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p2_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p2_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p2_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p2_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p7_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p7_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p7_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p7_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p7_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p8_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p8_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p8_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p8_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p8_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p9_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p9_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p9_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p9_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p9_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p255_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p255_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p255_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p255_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p255_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted0",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted0_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted0_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted0_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted0",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted0",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted1",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted1_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted1_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted1_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted2",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted2_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted2_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted2_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted3",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted3_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted3_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted3_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted4",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted4_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted4_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted4_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "rewind_p257_accepted5",
+      "passed": true
+    },
+    {
+      "name": "rewind_position",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted5_stage0",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted5_stage1",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "read_native_draft_ring",
+      "passed": true
+    },
+    {
+      "name": "rewound_ring_p257_accepted5_stage2",
+      "passed": true,
+      "shape": [
+        8,
+        64
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_draft_p257_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "rewound_confidence_p257_accepted5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "divergent_continuation_p257_accepted5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "ordinary_forward_invalidates_old_verify",
+      "passed": true
+    },
+    {
+      "name": "overwide_verify_refused",
+      "passed": true
+    },
+    {
+      "name": "overwide_position_unchanged",
+      "passed": true
+    },
+    {
+      "name": "invalid_token_verify_refused",
+      "passed": true
+    },
+    {
+      "name": "invalid_token_position_unchanged",
+      "passed": true
+    },
+    {
+      "name": "rewind_cannot_drop_anchor",
+      "passed": true
+    },
+    {
+      "name": "repeated_rewind_first",
+      "passed": true
+    },
+    {
+      "name": "repeated_rewind_second",
+      "passed": true
+    },
+    {
+      "name": "repeated_rewind_cannot_extend_interval",
+      "passed": true
+    },
+    {
+      "name": "conversation_rewind_uses_checkpoint",
+      "passed": true
+    },
+    {
+      "name": "checkpoint_restores_draft_ring_tokens",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "checkpoint_restores_draft_ring_confidence",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "checkpoint_branch_continuation",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "slot_allocation",
+      "passed": true
+    },
+    {
+      "name": "select_second_slot",
+      "passed": true
+    },
+    {
+      "name": "interleaved_slot_select",
+      "passed": true
+    },
+    {
+      "name": "interleaved_draft_tokens",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_draft_confidence",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_slot_select",
+      "passed": true
+    },
+    {
+      "name": "interleaved_draft_tokens",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_draft_confidence",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_slot_select",
+      "passed": true
+    },
+    {
+      "name": "interleaved_draft_tokens",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_draft_confidence",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_slot_select",
+      "passed": true
+    },
+    {
+      "name": "interleaved_draft_tokens",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "interleaved_draft_confidence",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "select_primary_before_free",
+      "passed": true
+    },
+    {
+      "name": "free_second_slot",
+      "passed": true
+    }
+  ],
+  "status": "failed",
+  "source_sha256": "c116a8c62cfe475235f756a03e012bf2a112bd24d4a3d129869e695e0143145b",
+  "backend": "CUDA",
+  "gpus": 2,
+  "atol": 2e-05,
+  "rtol": 2e-05,
+  "scope": "Deterministic native numerical/state fixture, not a language model",
+  "reference_checks_excluded": false,
+  "state_checks_excluded": false,
+  "native_ring_control": true,
+  "reference_prefixes": [
+    1,
+    5,
+    17
+  ],
+  "inputs": {
+    "/workspace/ts-fix-dspark/repo/fixtures/text-f32-small/deepseek41-fixture.gguf": "f3917170dd3b8bf2b3220a1c41ff5a6dfd81517b2ae37079afbf5224d7dca99d",
+    "/workspace/ts-fix-dspark/repo/fixtures/text-f32-small/deepseek41.config.json": "159a8b4c221953310a590a40b28c90181d8bc05e421d0f4ec49dda94360e96c0",
+    "/workspace/ts-fix-dspark/repo/fixtures/text-f32-small/deepseek41.engram.bin": "d9f9c28124c59c1df587ccd9eef24297c5eefa0aad1bcccc1939b8ded2f5f126",
+    "/workspace/ts-numerical-r3-dspark-cuda2-20260916/deepseek41-dspark-fixture.gguf": "edfdccb348e5e85c714fb8dfe38a61b2324105d1cbd5e14c738324a0940ef600",
+    "/workspace/ts-numerical-r3-dspark-cuda2-20260916/draft-config.json": "15f12789189ea9487c4e023b6e7c2b75be1e66796138a5b992d1d567ee42604e"
+  },
+  "native_sha256": "b6cf00377fca4154f8d318677e201044bf93adfa97ef26b0d6742ce1d4cbe751",
+  "oracle_sources": {
+    "/workspace/ts-codex-20260916-r3/repo/eng/dsv41-dspark-reference.py": "122040f831a5e6466928218fc3708557d1a0f2f58c7aa2af30b020cc8875302e",
+    "/workspace/ts-codex-20260916-r3/repo/eng/dsv41-reference.py": "25e89dc3f354fe60c5c83ddf9f1b1fadcea71f627a94d67313fbbcb582f932d1"
+  },
+  "failed_checks": [
+    "draft_confidence_prefix5"
+  ],
+  "error": "AssertionError('1 numerical comparisons failed')",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/ts-codex-20260916-r3/repo/eng/tests/dsv41-dspark-inference.py\", line 336, in main\n    raise AssertionError(f\"{len(report['failed_checks'])} numerical comparisons failed\")\nAssertionError: 1 numerical comparisons failed\n",
+  "finished_at_unix": 1789578576.8140488,
+  "native_unchanged": true,
+  "inputs_unchanged": true
+}

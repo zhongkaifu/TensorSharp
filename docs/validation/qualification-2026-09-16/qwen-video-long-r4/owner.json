@@ -1,0 +1,142 @@
+{
+  "status": "failed",
+  "release_qualified": false,
+  "performance_qualified": false,
+  "profile_sha256": "dd93d2538ab5f2951918a1702f0c0a5a36e1b4d823f1c918cfe9a04323624bc6",
+  "owner_sha256": "612b29564854f8a7bf1698756f747c674728e24c741c2174b582a6bb736a6d0e",
+  "model_assets": {
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6",
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9",
+    "/workspace/models/qwen38/mmproj-BF16.gguf": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+    "/workspace/models/qwen38/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/card-0.png": "922f16960fb8fa086b6203f4fd212c92e97c165e8b051fbdd0d483f0bc5a0b25",
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-0.png": "a2e597c35e9299fce55eac8eb3d6306a3cfcb9c7391837bb681b47c39247a92b",
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-1.png": "3c5d04cd6f61635007297c4427f66d638e59f24a319ae03230154726e85258e3"
+  },
+  "parent_source_manifest_sha256": "f7431257148bd5168c0f80e3049b36fc5228c19a8d47448e09e60ff7eb43eb28",
+  "derivation_sha256": "d1ec91eab955051504757a03998de67b8ca1528f5da9fbbf8c75ddd91344fe64",
+  "scope": "Corrective video timestamp and exactly counted long-context replay, with HTTP32 regression. Original failed records retained; shared-host timing descriptive only.",
+  "before": {
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": {
+      "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+      "inode": 86198253,
+      "size": 10946624,
+      "mtime_ns": 1789492893000000000
+    },
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": {
+      "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6",
+      "inode": 86237602,
+      "size": 49979779296,
+      "mtime_ns": 1789493002000000000
+    },
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": {
+      "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9",
+      "inode": 86580448,
+      "size": 28878402944,
+      "mtime_ns": 1789492974000000000
+    },
+    "/workspace/models/qwen38/mmproj-BF16.gguf": {
+      "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+      "inode": 21664773,
+      "size": 907542944,
+      "mtime_ns": 1789493012000000000
+    },
+    "/workspace/models/qwen38/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": {
+      "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
+      "inode": 69048538,
+      "size": 2786568256,
+      "mtime_ns": 1789544033000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/card-0.png": {
+      "sha256": "922f16960fb8fa086b6203f4fd212c92e97c165e8b051fbdd0d483f0bc5a0b25",
+      "inode": 74472917,
+      "size": 6606,
+      "mtime_ns": 1789492936000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-0.png": {
+      "sha256": "a2e597c35e9299fce55eac8eb3d6306a3cfcb9c7391837bb681b47c39247a92b",
+      "inode": 74760725,
+      "size": 3274,
+      "mtime_ns": 1789492936000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-1.png": {
+      "sha256": "3c5d04cd6f61635007297c4427f66d638e59f24a319ae03230154726e85258e3",
+      "inode": 74887292,
+      "size": 4097,
+      "mtime_ns": 1789492936000000000
+    }
+  },
+  "command": [
+    "python3",
+    "/workspace/ts-codex-20260916-r4/http-r1/harness/eng/validation/run-release-profile.py",
+    "--profile",
+    "/workspace/ts-codex-20260916-r4/video-timestamps-r1/profile.json",
+    "--repo",
+    "/workspace/ts-codex-20260916-r4/http-r1/harness",
+    "--dotnet",
+    "/workspace/tensorsharp-no-patch-20260915/dotnet/dotnet",
+    "--native",
+    "/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so",
+    "--server-assembly",
+    "/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/TensorSharp.Server.Host.dll",
+    "--application-manifest",
+    "/workspace/ts-codex-20260916-r4/video-timestamps-r1/application.json",
+    "--application-manifest-sha256",
+    "b23e6b8b04deaab1997a598e432b7c4afe2552a9a4d5400326acd2ba79904955",
+    "--output",
+    "/workspace/ts-codex-20260916-r4/video-timestamps-r1/results/lifecycle"
+  ],
+  "exit_code": 1,
+  "after": {
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf": {
+      "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+      "inode": 86198253,
+      "size": 10946624,
+      "mtime_ns": 1789492893000000000
+    },
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf": {
+      "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6",
+      "inode": 86237602,
+      "size": 49979779296,
+      "mtime_ns": 1789493002000000000
+    },
+    "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf": {
+      "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9",
+      "inode": 86580448,
+      "size": 28878402944,
+      "mtime_ns": 1789492974000000000
+    },
+    "/workspace/models/qwen38/mmproj-BF16.gguf": {
+      "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+      "inode": 21664773,
+      "size": 907542944,
+      "mtime_ns": 1789493012000000000
+    },
+    "/workspace/models/qwen38/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf": {
+      "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
+      "inode": 69048538,
+      "size": 2786568256,
+      "mtime_ns": 1789544033000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/card-0.png": {
+      "sha256": "922f16960fb8fa086b6203f4fd212c92e97c165e8b051fbdd0d483f0bc5a0b25",
+      "inode": 74472917,
+      "size": 6606,
+      "mtime_ns": 1789492936000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-0.png": {
+      "sha256": "a2e597c35e9299fce55eac8eb3d6306a3cfcb9c7391837bb681b47c39247a92b",
+      "inode": 74760725,
+      "size": 3274,
+      "mtime_ns": 1789492936000000000
+    },
+    "/workspace/tensorsharp-no-patch-20260915/media-fixtures/frame-1.png": {
+      "sha256": "3c5d04cd6f61635007297c4427f66d638e59f24a319ae03230154726e85258e3",
+      "inode": 74887292,
+      "size": 4097,
+      "mtime_ns": 1789492936000000000
+    }
+  },
+  "finished_unix": 1789583235.5377192
+}

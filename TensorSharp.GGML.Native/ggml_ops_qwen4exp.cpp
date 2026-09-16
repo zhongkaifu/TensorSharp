@@ -572,7 +572,10 @@ void Q4eBinder::add(ggml_tensor* tgt, void* data, std::size_t bytes,
                     ggml_backend_buffer_usage usage)
 {
             if (tgt == nullptr || data == nullptr) return;
-            if (bytes >= 4096)
+            // Mutable KV must survive graph rebuilds even in small models. Its
+            // host seed may be stale after the first forward, so a graph-local
+            // fallback would silently replace live cache rows with that seed.
+            if (bytes >= 4096 || usage == GGML_BACKEND_BUFFER_USAGE_ANY)
             {
                 bool needs_upload = false;
                 if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
@@ -587,6 +590,8 @@ void Q4eBinder::add(ggml_tensor* tgt, void* data, std::size_t bytes,
                     if (ggml_backend_tensor_alloc(buf, tgt, data) == GGML_STATUS_SUCCESS)
                         return;
                 }
+                if (usage == GGML_BACKEND_BUFFER_USAGE_ANY)
+                    throw std::runtime_error("qwen4exp: could not persist mutable cache buffer");
                 // A weight this size normally cache-binds; falling through here means
                 // the resident cache could not take it (VRAM pressure). It will live
                 // in the graph's own allocation instead - flagged below - and that is

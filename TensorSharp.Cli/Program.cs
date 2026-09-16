@@ -1226,7 +1226,7 @@ namespace TensorSharp.Cli
                 // Same gate as the server's parsers: a family with no audio tower
                 // (DeepSeek V4.1, Nemotron-H) is refused here rather than decoding
                 // the clip and then generating as if none had been given.
-                if (AudioInputSupport.UnsupportedReasonFor(model.Config.Architecture) is string audioError)
+                if (AudioInputSupport.UnsupportedReasonFor(model) is string audioError)
                 {
                     _log.LogError(LogEventIds.CliFailed, "--audio rejected: {Reason}", audioError);
                     return;

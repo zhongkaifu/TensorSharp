@@ -1,0 +1,125 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="04d750a5-5bc9-428e-b2b6-2f20592bf8fc" name="@d71188ba1e2e 2026-09-16 18:47:33" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T18:47:33.1442713+00:00" queuing="2026-09-16T18:47:33.1442714+00:00" start="2026-09-16T18:47:29.0243838+00:00" finish="2026-09-16T18:47:33.1700347+00:00" />
+  <TestSettings name="default" id="dacca2ee-8171-479c-b52d-5fad1fdd2a5d">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-16_18_47_33" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="c60ceb85-7954-4aa7-9bef-b8ab321f3591" testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" computerName="d71188ba1e2e" duration="00:00:01.3980587" startTime="2026-09-16T18:47:31.5243194+00:00" endTime="2026-09-16T18:47:32.8883155+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c60ceb85-7954-4aa7-9bef-b8ab321f3591">
+      <Output>
+        <StdOut>native /workspace/ts-qwen-target-precision-r15/tests/bin/Release/net10.0/libGgmlOps.so sha256=3e07f9344ce5b0e06761fa86aacef96ade6edad6d57329a91b9e55e910a29edf; backend=GgmlCuda
+native /workspace/ts-qwen-target-precision-r15/tests/bin/Release/net10.0/libGgmlOps.so sha256=3e07f9344ce5b0e06761fa86aacef96ade6edad6d57329a91b9e55e910a29edf; backend=GgmlCuda
+preGrow=False suffix=151 chunked=249 whole=249
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320
+preGrow=False suffix=173 chunked=115 whole=115
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320
+preGrow=False suffix=193 chunked=169 whole=169
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320
+native /workspace/ts-qwen-target-precision-r15/tests/bin/Release/net10.0/libGgmlOps.so sha256=3e07f9344ce5b0e06761fa86aacef96ade6edad6d57329a91b9e55e910a29edf; backend=GgmlCuda
+native /workspace/ts-qwen-target-precision-r15/tests/bin/Release/net10.0/libGgmlOps.so sha256=3e07f9344ce5b0e06761fa86aacef96ade6edad6d57329a91b9e55e910a29edf; backend=GgmlCuda
+preGrow=True suffix=151 chunked=249 whole=249
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320
+preGrow=True suffix=173 chunked=115 whole=115
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320
+preGrow=True suffix=193 chunked=169 whole=169
+raw-key max abs=0; logit max abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" storage="/workspace/ts-qwen-target-precision-r15/tests/bin/release/net10.0/inferenceweb.tests.dll" id="d7ae0da4-feb7-ab0a-f656-37f0da54095a">
+      <Execution id="c60ceb85-7954-4aa7-9bef-b8ab321f3591" />
+      <TestMethod codeBase="/workspace/ts-qwen-target-precision-r15/tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" executionId="c60ceb85-7954-4aa7-9bef-b8ab321f3591" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="1" executed="1" passed="1" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.38]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.56]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.59]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:03.05]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

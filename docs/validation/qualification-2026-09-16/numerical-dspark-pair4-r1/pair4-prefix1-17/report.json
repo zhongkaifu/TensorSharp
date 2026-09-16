@@ -1,0 +1,699 @@
+{
+  "started_at_unix": 1789585518.6099136,
+  "release_qualified": false,
+  "checks": [
+    {
+      "name": "load_draft_model",
+      "passed": true
+    },
+    {
+      "name": "load_draft_model",
+      "passed": true
+    },
+    {
+      "name": "draft_block_size",
+      "passed": true
+    },
+    {
+      "name": "target_prefix1",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.430511474609375e-06,
+      "relative_l2": 5.160305566750294e-07
+    },
+    {
+      "name": "draft_tokens_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix1",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.7418136596679688e-06,
+      "relative_l2": 7.449638190283353e-07
+    },
+    {
+      "name": "draft_confidence_prefix1",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.384185791015625e-07,
+      "relative_l2": 7.455867473949092e-07
+    },
+    {
+      "name": "target_prefix2",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.430511474609375e-06,
+      "relative_l2": 4.997945128944866e-07
+    },
+    {
+      "name": "draft_tokens_prefix2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix2",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.86102294921875e-06,
+      "relative_l2": 8.105764495956668e-07
+    },
+    {
+      "name": "draft_confidence_prefix2",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 1.4901161193847656e-07,
+      "relative_l2": 2.406053538587464e-07
+    },
+    {
+      "name": "target_prefix3",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.9073486328125e-06,
+      "relative_l2": 6.852698332551828e-07
+    },
+    {
+      "name": "draft_tokens_prefix3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix3",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.4570693969726562e-06,
+      "relative_l2": 8.193218885800345e-07
+    },
+    {
+      "name": "draft_confidence_prefix3",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 4.76837158203125e-07,
+      "relative_l2": 5.132095664234167e-07
+    },
+    {
+      "name": "target_prefix4",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.9073486328125e-06,
+      "relative_l2": 6.268518212480719e-07
+    },
+    {
+      "name": "draft_tokens_prefix4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix4",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.2186508178710938e-06,
+      "relative_l2": 7.923069903497135e-07
+    },
+    {
+      "name": "draft_confidence_prefix4",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.980232238769531e-07,
+      "relative_l2": 2.440394398475881e-07
+    },
+    {
+      "name": "target_prefix5",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 1.9073486328125e-06,
+      "relative_l2": 6.210450519842829e-07
+    },
+    {
+      "name": "draft_tokens_prefix5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix5",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.86102294921875e-06,
+      "relative_l2": 7.707682377728582e-07
+    },
+    {
+      "name": "draft_confidence_prefix5",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.980232238769531e-07,
+      "relative_l2": 1.5884723166127773e-07
+    },
+    {
+      "name": "target_prefix6",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 2.7418136596679688e-06,
+      "relative_l2": 8.781835381233435e-07
+    },
+    {
+      "name": "draft_tokens_prefix6",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix6",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.2633543014526367e-06,
+      "relative_l2": 8.387405323263032e-07
+    },
+    {
+      "name": "draft_confidence_prefix6",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 1.1920928955078125e-07,
+      "relative_l2": 1.3610964423944997e-07
+    },
+    {
+      "name": "target_prefix7",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.5762786865234375e-06,
+      "relative_l2": 1.125952799301871e-06
+    },
+    {
+      "name": "draft_tokens_prefix7",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix7",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.8461217880249023e-06,
+      "relative_l2": 8.162343289146655e-07
+    },
+    {
+      "name": "draft_confidence_prefix7",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 6.556510925292969e-07,
+      "relative_l2": 7.037894551508244e-07
+    },
+    {
+      "name": "target_prefix8",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 2.7418136596679688e-06,
+      "relative_l2": 8.34507231641943e-07
+    },
+    {
+      "name": "draft_tokens_prefix8",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix8",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 2.902001142501831e-06,
+      "relative_l2": 7.708877026349369e-07
+    },
+    {
+      "name": "draft_confidence_prefix8",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 3.8743019104003906e-07,
+      "relative_l2": 5.708687681597506e-07
+    },
+    {
+      "name": "target_prefix9",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 2.9802322387695312e-06,
+      "relative_l2": 8.626138411312513e-07
+    },
+    {
+      "name": "draft_tokens_prefix9",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix9",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.4905970096588135e-06,
+      "relative_l2": 9.062415616080135e-07
+    },
+    {
+      "name": "draft_confidence_prefix9",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.980232238769531e-07,
+      "relative_l2": 3.451633200215721e-07
+    },
+    {
+      "name": "target_prefix10",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.0547380447387695e-06,
+      "relative_l2": 9.834204605418964e-07
+    },
+    {
+      "name": "draft_tokens_prefix10",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix10",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.635883331298828e-06,
+      "relative_l2": 1.0573602820410755e-06
+    },
+    {
+      "name": "draft_confidence_prefix10",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.5331974029541016e-07,
+      "relative_l2": 5.40746496053682e-07
+    },
+    {
+      "name": "target_prefix11",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 5.125999450683594e-06,
+      "relative_l2": 1.6142634921430176e-06
+    },
+    {
+      "name": "draft_tokens_prefix11",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix11",
+      "passed": false,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 6.222724914550781e-05,
+      "relative_l2": 9.620333714224056e-06
+    },
+    {
+      "name": "draft_confidence_prefix11",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 8.940696716308594e-08,
+      "relative_l2": 1.589802315501145e-07
+    },
+    {
+      "name": "target_prefix12",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.5762786865234375e-06,
+      "relative_l2": 1.073882094016136e-06
+    },
+    {
+      "name": "draft_tokens_prefix12",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix12",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.4570693969726562e-06,
+      "relative_l2": 1.0598371602942225e-06
+    },
+    {
+      "name": "draft_confidence_prefix12",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.384185791015625e-07,
+      "relative_l2": 2.1934730884517783e-07
+    },
+    {
+      "name": "target_prefix13",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.380700945854187e-06,
+      "relative_l2": 1.3156915184725598e-06
+    },
+    {
+      "name": "draft_tokens_prefix13",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix13",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 4.0531158447265625e-06,
+      "relative_l2": 1.2303323019831387e-06
+    },
+    {
+      "name": "draft_confidence_prefix13",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 5.364418029785156e-07,
+      "relative_l2": 7.324731132232412e-07
+    },
+    {
+      "name": "target_prefix14",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.516674041748047e-06,
+      "relative_l2": 1.1883340834493745e-06
+    },
+    {
+      "name": "draft_tokens_prefix14",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix14",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.0100345611572266e-06,
+      "relative_l2": 9.470606294945676e-07
+    },
+    {
+      "name": "draft_confidence_prefix14",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 1.043081283569336e-06,
+      "relative_l2": 1.2206508926633877e-06
+    },
+    {
+      "name": "target_prefix15",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 4.291534423828125e-06,
+      "relative_l2": 1.3909067751571496e-06
+    },
+    {
+      "name": "draft_tokens_prefix15",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix15",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.933906555175781e-06,
+      "relative_l2": 1.036015841673334e-06
+    },
+    {
+      "name": "draft_confidence_prefix15",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 3.5762786865234375e-07,
+      "relative_l2": 2.9346527856808786e-07
+    },
+    {
+      "name": "target_prefix16",
+      "passed": true,
+      "shape": [
+        256
+      ],
+      "max_abs": 3.337860107421875e-06,
+      "relative_l2": 1.237383868061218e-06
+    },
+    {
+      "name": "draft_tokens_prefix16",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix16",
+      "passed": true,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 3.993511199951172e-06,
+      "relative_l2": 9.298992105690403e-07
+    },
+    {
+      "name": "draft_confidence_prefix16",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 2.384185791015625e-07,
+      "relative_l2": 2.3900384403732173e-07
+    },
+    {
+      "name": "target_prefix17",
+      "passed": false,
+      "shape": [
+        256
+      ],
+      "max_abs": 0.0023900270462036133,
+      "relative_l2": 0.0008323927706493813
+    },
+    {
+      "name": "draft_tokens_prefix17",
+      "passed": true,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.0,
+      "relative_l2": 0.0
+    },
+    {
+      "name": "verify_full_vocabulary_prefix17",
+      "passed": false,
+      "shape": [
+        6,
+        256
+      ],
+      "max_abs": 0.0070171356201171875,
+      "relative_l2": 0.001150543061510662
+    },
+    {
+      "name": "draft_confidence_prefix17",
+      "passed": false,
+      "shape": [
+        5
+      ],
+      "max_abs": 0.001804649829864502,
+      "relative_l2": 0.0013382022260684772
+    }
+  ],
+  "status": "failed",
+  "source_sha256": "3a7b6901e407a6f6b6295950a1125b25d3aa6a6f02478849fdb39be7bc4ee19c",
+  "backend": "CUDA",
+  "gpus": 1,
+  "atol": 2e-05,
+  "rtol": 2e-05,
+  "scope": "Deterministic native numerical/state fixture, not a language model",
+  "reference_checks_excluded": false,
+  "state_checks_excluded": true,
+  "native_ring_control": false,
+  "reference_prefixes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17
+  ],
+  "inputs": {
+    "/workspace/ts-main/repo/fixtures/text-f32-small/deepseek41-fixture.gguf": "f3917170dd3b8bf2b3220a1c41ff5a6dfd81517b2ae37079afbf5224d7dca99d",
+    "/workspace/ts-main/repo/fixtures/text-f32-small/deepseek41.config.json": "159a8b4c221953310a590a40b28c90181d8bc05e421d0f4ec49dda94360e96c0",
+    "/workspace/ts-main/repo/fixtures/text-f32-small/deepseek41.engram.bin": "d9f9c28124c59c1df587ccd9eef24297c5eefa0aad1bcccc1939b8ded2f5f126",
+    "/workspace/ts-dspark-sum-variants-20260916/pair4-prefix1-17/deepseek41-dspark-fixture.gguf": "edfdccb348e5e85c714fb8dfe38a61b2324105d1cbd5e14c738324a0940ef600",
+    "/workspace/ts-dspark-sum-variants-20260916/pair4-prefix1-17/draft-config.json": "15f12789189ea9487c4e023b6e7c2b75be1e66796138a5b992d1d567ee42604e"
+  },
+  "native_sha256": "fc5caf05da801fd57547e194349ea20fe042c16fc7a5ac90d979020b12be9527",
+  "oracle_sources": {
+    "/workspace/ts-codex-20260916-r3/repo/eng/dsv41-dspark-reference.py": "122040f831a5e6466928218fc3708557d1a0f2f58c7aa2af30b020cc8875302e",
+    "/workspace/ts-codex-20260916-r3/repo/eng/dsv41-reference.py": "25e89dc3f354fe60c5c83ddf9f1b1fadcea71f627a94d67313fbbcb582f932d1"
+  },
+  "failed_checks": [
+    "verify_full_vocabulary_prefix11",
+    "target_prefix17",
+    "verify_full_vocabulary_prefix17",
+    "draft_confidence_prefix17"
+  ],
+  "error": "AssertionError('4 numerical comparisons failed')",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/ts-codex-20260916-r3/repo/eng/tests/dsv41-dspark-inference.py\", line 262, in main\n    raise AssertionError(f\"{len(report['failed_checks'])} numerical comparisons failed\")\nAssertionError: 4 numerical comparisons failed\n",
+  "finished_at_unix": 1789585527.642076,
+  "native_unchanged": true,
+  "inputs_unchanged": true
+}

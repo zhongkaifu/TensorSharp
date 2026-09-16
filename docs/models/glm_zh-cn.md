@@ -612,6 +612,18 @@ CUDA 设备）：n-gram 投机贪心与普通贪心逐 token
 等于逐 token 解码；托管与原生的 `SpecForward` 逐行一致，隐状态也一致。真实
 GLM-5.3-Flash checkpoint 上尚无投机解码实测，因此没有吞吐结论。
 
+C ABI 上的失败会被隔离而不是向外传播。抛异常的捕获（arena 分配、后端拷贝）返回失败并保持
+活动状态不变。只拷贝了部分层之后才抛异常的恢复会把该 slot 标记为不可用：forward、投机 forward、
+捕获、恢复与回退都会拒绝它，直到 `TSGgml_GlmResetChecked` 成功（`TSGgml_GlmReset` 与 glm5next
+回退到 0 现在都经过它，托管侧以 `GgmlGlmNative.ResetChecked` 调用）；其它 slot 照常运行。回滚测试
+套件中的 CUDA 行是 `[GlmNativeCudaFact]`（`TS_TEST_GLM_CUDA=1`），套件还在两个后端上检查 A/B/A
+绑定 slot 回滚；`Glm5NextNativeSnapshotBoundaryTests`（`TS_TEST_GLM_SNAPSHOT_BOUNDARY=1`，需要带
+测试钩子构建的原生库，其故障注入器 `TSGgml_GlmTestKdaSnapshotFault` 是 `TSG_TEST_EXPORT`，不进入
+iOS 导出列表）在 CPU 与 CUDA 上向捕获与恢复中途注入 `std::bad_alloc` 和非标准异常，并检查一次
+checked reset 能恢复完整词表的 logits。已记录的运行：
+[`glm5next-cuda-r4`](../validation/qualification-2026-09-16/glm5next-cuda-r4/README.md)
+（单张 A40 上原始 22/22 与扩展 26/26，无跳过）。
+
 ### 实测
 
 2× RTX PRO 6000 Blackwell（96 GB），GLM-5.3-Flash-UD-Q2_K_XL（101 GiB），层切分，

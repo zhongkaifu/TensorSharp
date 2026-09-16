@@ -22,8 +22,9 @@ namespace TensorSharp.Runtime
     /// processor then merges the sampled frames in pairs (the tower's temporal patch
     /// size) and replaces the single <c>&lt;|video_pad|&gt;</c> with one
     /// <c>&lt;{t:F1} seconds&gt;&lt;|vision_start|&gt;&lt;|video_pad|&gt;&lt;|vision_end|&gt;</c>
-    /// block per pair, where <c>t</c> is the mean source time of the pair, so the
-    /// template's own start/end tokens stay wrapped around the whole clip. A clip with
+    /// block per pair, where <c>t</c> is the mean source time of the pair. The
+    /// processor replaces the clip's outer start/pad/end sequence; it does not
+    /// nest a second pair of vision delimiters around the temporal blocks. A clip with
     /// an odd number of frames repeats its last frame to complete the final pair, and
     /// that pair's time is the repeated frame's time. Every pair is then expanded to its
     /// merged-patch token count and positioned like a still image whose temporal
@@ -129,7 +130,7 @@ namespace TensorSharp.Runtime
         /// <summary>
         /// Append the message's vision placeholders in prompt order: one
         /// <c>&lt;|vision_start|&gt;&lt;|image_pad|&gt;&lt;|vision_end|&gt;</c> per still
-        /// image, and per clip the wrapped per-pair blocks described on this class.
+        /// image, and per clip the timestamped per-pair blocks described on this class.
         /// </summary>
         public static void AppendPlaceholders(ChatMessage message, StringBuilder text)
         {
@@ -140,13 +141,31 @@ namespace TensorSharp.Runtime
                     text.Append(VisionStart).Append(ImagePad).Append(VisionEnd);
                     continue;
                 }
-                text.Append(VisionStart);
+                // The tower labels a temporal pair with its mean timestamp. That
+                // loses the individual sampling times, especially when a frame
+                // cap selects nonadjacent frames. Preserve those source facts in
+                // text so later turns can resolve time within a pair. Keep the
+                // trained per-pair vision-token layout itself unchanged.
+                text.Append("Sampled video frame times in chronological order: ");
+                bool firstFrame = true;
+                foreach (var group in item.Groups!)
+                {
+                    AppendFrameTime(group.First);
+                    if (group.Second != group.First) AppendFrameTime(group.Second);
+                }
+                text.Append(" seconds.\n");
                 foreach (var group in item.Groups!)
                 {
                     text.Append('<').Append(FormatSeconds(group.Seconds)).Append(" seconds>")
                         .Append(VisionStart).Append(VideoPad).Append(VisionEnd);
                 }
-                text.Append(VisionEnd);
+
+                void AppendFrameTime(int index)
+                {
+                    if (!firstFrame) text.Append(", ");
+                    text.Append(message.ImageTimestamps![index]!.Value.ToString("R", CultureInfo.InvariantCulture));
+                    firstFrame = false;
+                }
             }
         }
     }

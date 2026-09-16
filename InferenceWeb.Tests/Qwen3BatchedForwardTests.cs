@@ -29,26 +29,23 @@ public sealed class Qwen3BatchedForwardTests
 
     public Qwen3BatchedForwardTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [ModelFact(EnvModelDir)]
     public Task BatchSize1_MatchesSingleSequenceTop1() => RunSingleSequenceAsync();
 
-    [Fact]
+    [ModelFact(EnvModelDir)]
     public Task BatchSize2_KeepsSequencesIndependent() => RunTwoSequencesAsync();
 
-    [Fact]
+    [ModelFact(EnvModelDir)]
     public Task RetainedDecodeGraph_SurvivesTruncateAndResidencyRelease() =>
         RunDecodeGraphLifecycleAsync();
 
-    [Fact]
+    [ModelFact(EnvModelDir)]
     public Task PerSequenceCache_GrowsReleasesAndReturnsToPrimary() =>
         RunPerSequenceGrowthLifecycleAsync();
 
     private async Task RunSingleSequenceAsync()
     {
         var model = await TryLoadModelAsync();
-        if (model is null)
-            return;
-
         try
         {
             int[] prompt = [1, 100, 200, 300, 400, 500];
@@ -73,9 +70,6 @@ public sealed class Qwen3BatchedForwardTests
     private async Task RunTwoSequencesAsync()
     {
         var model = await TryLoadModelAsync();
-        if (model is null)
-            return;
-
         try
         {
             int[] promptA = [1, 100, 200, 300];
@@ -112,9 +106,6 @@ public sealed class Qwen3BatchedForwardTests
     private async Task RunDecodeGraphLifecycleAsync()
     {
         var model = await TryLoadModelAsync();
-        if (model is null)
-            return;
-
         try
         {
             int[] prompt = [1, 100, 200, 300, 400, 500];
@@ -150,9 +141,6 @@ public sealed class Qwen3BatchedForwardTests
     private async Task RunPerSequenceGrowthLifecycleAsync()
     {
         var model = await TryLoadModelAsync();
-        if (model is null)
-            return;
-
         const string requestId = "bonsai-growth";
         try
         {
@@ -235,11 +223,11 @@ public sealed class Qwen3BatchedForwardTests
         string directory = Environment.GetEnvironmentVariable(EnvModelDir);
         if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
         {
-            _output.WriteLine($"{EnvModelDir} is not set; skipping model-backed check.");
-            return null;
+            if (!File.Exists(directory))
+                throw new FileNotFoundException($"{EnvModelDir} must name an existing GGUF or directory.", directory);
         }
 
-        string path = Directory.GetFiles(directory, "*.gguf")
+        string path = File.Exists(directory) ? directory : Directory.GetFiles(directory, "*.gguf")
             .FirstOrDefault(candidate =>
             {
                 string name = Path.GetFileName(candidate).ToLowerInvariant();
@@ -252,14 +240,18 @@ public sealed class Qwen3BatchedForwardTests
 
         if (path is null)
         {
-            _output.WriteLine("No base Qwen3 or Bonsai-8B GGUF found; skipping model-backed check.");
-            return null;
+            throw new FileNotFoundException("The configured fixture directory contains no base Qwen3 or Bonsai-8B GGUF.");
         }
 
         _output.WriteLine($"[bonsai-8b] loading {Path.GetFileName(path)}");
         var backend = OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
         var model = ModelBase.Create(path, backend) as Qwen3Model;
         Assert.NotNull(model);
+        string native = TestGates.MappedNativeGgmlOpsPath();
+        string nativeSha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(native))).ToLowerInvariant();
+        _output.WriteLine($"[bonsai-8b] native={native} sha256={nativeSha}");
+        string expectedNative = Environment.GetEnvironmentVariable("TS_TEST_QWEN3_EXPECTED_NATIVE_SHA256");
+        if (!string.IsNullOrEmpty(expectedNative)) Assert.Equal(expectedNative, nativeSha);
         await Task.Yield();
         return model;
     }

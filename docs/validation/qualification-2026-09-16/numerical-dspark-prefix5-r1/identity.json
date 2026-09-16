@@ -1,0 +1,12 @@
+{
+  "recorded_utc": "2026-09-16T18:30:21.652211+00:00",
+  "source_run": "/workspace/ts-numerical-r3-prefix5-cuda-trace-20260916",
+  "native_library": "/workspace/ts-codex-20260916-r3/repo/TensorSharp.GGML.Native/build/libGgmlOps.so",
+  "native_sha256": "b6cf00377fca4154f8d318677e201044bf93adfa97ef26b0d6742ce1d4cbe751",
+  "qualification": false,
+  "original_failure_retained": true,
+  "physical_gpu": 6,
+  "run_exit_code": 1,
+  "passed_checks": 11,
+  "total_checks": 12
+}

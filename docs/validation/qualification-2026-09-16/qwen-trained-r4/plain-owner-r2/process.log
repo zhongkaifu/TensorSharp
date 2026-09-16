@@ -1,0 +1,124 @@
+[agent-turn-bench] loading Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf backend=GgmlCuda chunk=512 maxBatched=4096 kv=f16
+  Multi-GPU: 3 GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole layers), not tensor parallelism - this architecture shards no weights. Same mode llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed.
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[GGML] multi-device (layer split): 3 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=48, Hidden=2560, Heads=24, KVHeads=2, HeadDim=256, Vocab=248320
+  hyper-connections: count=4 lowRank=320 (residual is 10240 wide)
+  experts=512 used=10 ff=640 sharedFf=640
+  GDN layers=36/48, QSA indexer heads=4 dim=128 topK=2048
+  PLE: layers=[1] ngram=3 heads=16 headDim=160
+  Prefaulted GGUF page cache: 46.5 GiB with 16 read streams in 1.1s (41.73 GiB/s)
+Loading model weights... done (557 F32 tensors, 74251 quantized tensors)
+  Quantized: 74905 MB (74905 MB file-backed), F32: 298 MB
+  Layer split across 3 GPUs: gpu0=16 layers/16201 MB, gpu1=17 layers/16570 MB, gpu2=15 layers/17610 MB
+  Device-resident quantized weights: 3073 MB across 521 tensors
+Context length: using MAX_CONTEXT=65536; model declares qwen4exp.context_length=262144.
+  Qwen4Exp shared MTP ready: block=48, features=10240, draftCompression=0, privateKV=F16, device=2, mappedBytes=2772343808.
+Qwen3.5 Vision encoder: imageSize=768, patchSize=16, hidden=1152, intermediate=4304, heads=16, blocks=27, projDim=2560, mergeSize=2, gridPerSide=48, ropeTheta=10000
+Loading vision encoder weights... done (334 tensors)
+[qwen-mtp-followup] mode=plain tier=dense attached_head=PerToken release_qualified=false
+  Warming up kernels (decode + prefill)...
+    Decode warmup: 7094.9 ms
+    Prefill warmup (2048 tokens): starting...
+    Prefill warmup (2048 tokens): completed in 1680.6 ms
+[agent-turn-bench] loaded qwen4exp in 16.4s; context=65536 drafter=pertoken
+
+==== qwen-mtp ====
+[qwen-mtp-followup] mode=plain tier=dense attached_head=PerToken release_qualified=false
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=159
+    warmup: prompt 30 reused 0 fresh 30 | steps 97 (prefill 1 x 30 tok) | ttft 390 ms prefill 77 tok/s decode 51.9 tok/s | 96 tokens (max_tokens)
+      text: \n\nHere is the count from one to twenty in words:\n\n1. One\n2. Two\n3. Three\n4. Four\n5. Five\n6. Six\n7. S...
+      note: [Debug] Live-cache continuation declined for warmup: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for warmup: all 30 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no shar...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=167
+    short: prompt 31 reused 0 fresh 31 | steps 46 (prefill 1 x 31 tok) | ttft 279 ms prefill 111 tok/s decode 49.9 tok/s | 44 tokens (eos)
+      text: \n\nA hash collision occurs when two distinct pieces of input data produce the same hash value. This is an inh...
+      note: [Debug] Live-cache continuation declined for short: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for short: all 31 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1642
+    copy: prompt 490 reused 0 fresh 490 | steps 193 (prefill 1 x 490 tok) | ttft 770 ms prefill 636 tok/s decode 51.9 tok/s | 192 tokens (max_tokens)
+      text: \n\n```csharp\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.M...
+      note: [Debug] Live-cache continuation declined for copy: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for copy: all 490 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1651
+    json: prompt 489 reused 0 fresh 489 | steps 112 (prefill 1 x 489 tok) | ttft 767 ms prefill 638 tok/s decode 41.9 tok/s | 110 tokens (eos)
+      text: {\n  "name": "Widget.cs",\n  "lines": 33,\n  "summary": "The file contains two C# classes, Widget6 and Widget2...
+      note: [Debug] Live-cache continuation declined for json: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for json: all 489 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1252
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1392
+    retained-A: prompt 414 reused 0 fresh 414 | steps 37 (prefill 1 x 414 tok) | ttft 698 ms prefill 593 tok/s decode 48.5 tok/s | 35 tokens (eos)
+      text: \n\nThe code defines a disposable `Widget6` class that accumulates non-negative integer measurements (scaled b...
+      note: [Debug] Live-cache continuation declined for retained-A: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for retained-A: all 414 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1381
+    retained-B: prompt 411 reused 0 fresh 411 | steps 35 (prefill 1 x 411 tok) | ttft 676 ms prefill 608 tok/s decode 49.2 tok/s | 33 tokens (eos)
+      text: \n\nUnit tests are useful because they verify that individual components of code function correctly in isolati...
+      note: [Debug] Live-cache continuation declined for retained-B: prompt diverges from the live cache at token 390 of 450 and this model cannot rewind its KV state (recurrent layers have no reverse). | [Information] No prompt reuse for retained-B: all 411 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 390 of 450 and this model cannot rewind its KV state (recurrent layers have no reverse). Ret...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1966
+    retained-A-followup: prompt 601 reused 0 fresh 601 | steps 135 (prefill 2 x 301 tok) | ttft 964 ms prefill 624 tok/s decode 51.8 tok/s | 132 tokens (eos)
+      text: \n\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.Module3\n   ...
+      note: [Debug] Live-cache continuation declined for retained-A-followup: prompt diverges from the live cache at token 390 of 445 and this model cannot rewind its KV state (recurrent layers have no reverse). | [Information] No prompt reuse for retained-A-followup: all 601 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 390 of 445 and this model cannot rewind its KV state (recurrent layers have no reve...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1614
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1614
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1614
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1614
+    [engine Warning] The model declined the default batched fused-decode path for a 3-sequence decode step; serving sequences round-robin on the serial fused path instead (concurrency stays near 1x). Reported once.
+[q4e retained] evicting parallel4-i0 (1845.5 MB) for retaining conversation parallel4-i2
+[q4e retained] evicting parallel4-i1 (1845.5 MB) for retaining conversation parallel4-i3
+    parallel4-i0: prompt 482 reused 0 fresh 482 | steps 0 (prefill 0 x 0 tok) | ttft 7191 ms prefill 67 tok/s decode 11.9 tok/s | 192 tokens (max_tokens)
+      text: \n\n```csharp\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.M...
+      note: Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained.
+    parallel4-i1: prompt 482 reused 0 fresh 482 | steps 0 (prefill 0 x 0 tok) | ttft 7191 ms prefill 67 tok/s decode 11.9 tok/s | 192 tokens (max_tokens)
+      text: \n\n```csharp\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.M...
+      note: Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained.
+    parallel4-i2: prompt 482 reused 0 fresh 482 | steps 0 (prefill 0 x 0 tok) | ttft 7191 ms prefill 67 tok/s decode 11.9 tok/s | 192 tokens (max_tokens)
+      text: \n\n```csharp\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.M...
+      note: Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained.
+    parallel4-i3: prompt 482 reused 0 fresh 482 | steps 0 (prefill 0 x 0 tok) | ttft 7862 ms prefill 61 tok/s decode 12.1 tok/s | 192 tokens (max_tokens)
+      text: \n\n```csharp\n   1  using System.Collections.Generic;\n   2  using System.Linq;\n   3  namespace Demo.Tools.M...
+      note: Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained.
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=164
+    after-parallel4: prompt 31 reused 0 fresh 31 | steps 68 (prefill 1 x 31 tok) | ttft 541 ms prefill 57 tok/s decode 51.0 tok/s | 66 tokens (eos)
+      text: \n\nA linked list is a linear data structure where each element, known as a node, contains data and a referenc...
+      note: [Debug] Live-cache continuation declined for after-parallel4: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for after-parallel4: all 31 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: none of the 4 retained holder(s) and 0 checkpoint(s) ...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=246
+ done
+  Vision encode: 2153 ms total (patchEmbed 54 ms, blocks 639 ms, proj 1438 ms), 1200 patches -> 300 tokens
+    image: prompt 339 reused 0 fresh 339 | steps 43 (prefill 1 x 339 tok) | ttft 786 ms prefill 431 tok/s decode 48.5 tok/s | 41 tokens (eos)
+      text: \n\nThe image displays a solid red rectangular card positioned in the lower portion of a white background. Abo...
+      note: [Debug] Live-cache continuation declined for image: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for image: all 339 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no shar...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=438
+    image-followup: prompt 415 reused 381 fresh 34 | steps 35 (prefill 1 x 34 tok) | ttft 126 ms prefill 269 tok/s decode 48.2 tok/s | 33 tokens (eos)
+      text: \n\nThe text in the image is "4821". The dominant color is red, which fills the large rectangular card in the ...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=358
+ done
+  Vision encode: 455 ms total (patchEmbed 30 ms, blocks 89 ms, proj 323 ms), 1200 patches -> 300 tokens
+ done
+  Vision encode: 435 ms total (patchEmbed 15 ms, blocks 86 ms, proj 324 ms), 1200 patches -> 300 tokens
+    ordered-frames: prompt 657 reused 0 fresh 657 | steps 69 (prefill 2 x 329 tok) | ttft 1090 ms prefill 603 tok/s decode 50.1 tok/s | 66 tokens (eos)
+      text: \n\nThe visible numbers in the images, in chronological order, are 17 and 42.\n\nThe first image, taken at 0 s...
+      note: [Debug] Live-cache continuation declined for ordered-frames: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for ordered-frames: all 657 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder an...
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=546
+    ordered-frames-followup: prompt 758 reused 724 fresh 34 | steps 100 (prefill 1 x 34 tok) | ttft 125 ms prefill 273 tok/s decode 49.5 tok/s | 98 tokens (eos)
+      text: \n\nThe number that appeared at 1 second is 42.\n\nThe ordering is based on the timestamps provided for the tw...
+
+| scenario | request | prompt | reused | fresh | steps | prefill steps | tok/prefill step | ttft ms | prefill tok/s | decode tok/s | out | drafted | accepted | verify | plain | note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| qwen-mtp | warmup | 30 | 0 | 30 | 97 | 1 | 30 | 390 | 77 | 51.9 | 96 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for warmup: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for warmup: all 30 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no shar... |
+| qwen-mtp | short | 31 | 0 | 31 | 46 | 1 | 31 | 279 | 111 | 49.9 | 44 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for short: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for short: all 31 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share... |
+| qwen-mtp | copy | 490 | 0 | 490 | 193 | 1 | 490 | 770 | 636 | 51.9 | 192 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for copy: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for copy: all 490 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share... |
+| qwen-mtp | json | 489 | 0 | 489 | 112 | 1 | 489 | 767 | 638 | 41.9 | 110 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for json: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for json: all 489 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no share... |
+| qwen-mtp | retained-A | 414 | 0 | 414 | 37 | 1 | 414 | 698 | 593 | 48.5 | 35 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for retained-A: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for retained-A: all 414 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no... |
+| qwen-mtp | retained-B | 411 | 0 | 411 | 35 | 1 | 411 | 676 | 608 | 49.2 | 33 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for retained-B: prompt diverges from the live cache at token 390 of 450 and this model cannot rewind its KV state (recurrent layers have no reverse). | [Information] No prompt reuse for retained-B: all 411 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 390 of 450 and this model cannot rewind its KV state (recurrent layers have no reverse). Ret... |
+| qwen-mtp | retained-A-followup | 601 | 0 | 601 | 135 | 2 | 301 | 964 | 624 | 51.8 | 132 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for retained-A-followup: prompt diverges from the live cache at token 390 of 445 and this model cannot rewind its KV state (recurrent layers have no reverse). | [Information] No prompt reuse for retained-A-followup: all 601 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 390 of 445 and this model cannot rewind its KV state (recurrent layers have no reve... |
+| qwen-mtp | parallel4-i0 | 482 | 0 | 482 | 0 | 0 | 0 | 7191 | 67 | 11.9 | 192 | 0 | 0 | 0 | 0 | Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained. |
+| qwen-mtp | parallel4-i1 | 482 | 0 | 482 | 0 | 0 | 0 | 7191 | 67 | 11.9 | 192 | 0 | 0 | 0 | 0 | Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained. |
+| qwen-mtp | parallel4-i2 | 482 | 0 | 482 | 0 | 0 | 0 | 7191 | 67 | 11.9 | 192 | 0 | 0 | 0 | 0 | Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained. |
+| qwen-mtp | parallel4-i3 | 482 | 0 | 482 | 0 | 0 | 0 | 7862 | 61 | 12.1 | 192 | 0 | 0 | 0 | 0 | Engine-step attribution unavailable for simultaneous requests; aggregate delivery window retained. |
+| qwen-mtp | after-parallel4 | 31 | 0 | 31 | 68 | 1 | 31 | 541 | 57 | 51.0 | 66 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for after-parallel4: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for after-parallel4: all 31 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: none of the 4 retained holder(s) and 0 checkpoint(s) ... |
+| qwen-mtp | image | 339 | 0 | 339 | 43 | 1 | 339 | 786 | 431 | 48.5 | 41 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for image: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for image: all 339 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no shar... |
+| qwen-mtp | image-followup | 415 | 381 | 34 | 35 | 1 | 34 | 126 | 269 | 48.2 | 33 | 0 | 0 | 0 | 0 |  |
+| qwen-mtp | ordered-frames | 657 | 0 | 657 | 69 | 2 | 329 | 1090 | 603 | 50.1 | 66 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for ordered-frames: no live cache resident (reset, batched step, or first request). | [Information] No prompt reuse for ordered-frames: all 657 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder an... |
+| qwen-mtp | ordered-frames-followup | 758 | 724 | 34 | 100 | 1 | 34 | 125 | 273 | 49.5 | 98 | 0 | 0 | 0 | 0 |  |
+[agent-turn-bench] rows written to /workspace/ts-codex-20260916-r4/qwen-trained-r1/plain.rows.json
+[agent-turn-bench] PASS: every multi-token input was forwarded in batched chunks.

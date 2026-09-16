@@ -139,8 +139,7 @@ public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
         Assert.NotEqual(IntPtr.Zero, handle);
         try
         {
-            string native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-                .Single(m => TestGates.IsNativeGgmlOps(m.FileName)).FileName;
+            string native = TestGates.MappedNativeGgmlOpsPath();
             CheckHash(native, Environment.GetEnvironmentVariable("TS_TEST_DSV41_DSPARK_NATIVE_SHA256")!);
             Assert.Equal(256, GgmlDeepSeek4Native.VocabSize(handle));
             Assert.Equal(5, GgmlDeepSeek4Native.DsparkBlockSize(handle));

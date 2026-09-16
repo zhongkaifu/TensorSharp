@@ -228,10 +228,14 @@ nothing and every test that loads the model (`DisposingDraftHead_...`,
 `TargetSnapshot_...`, `LearnedHead_...`, `DraftPrivateState_...`,
 `DraftHead_F16CacheCatchUp...`, `HistoricalMediaPositions_...`) failed on that
 line. The two skips are the QSA tests gated on `TS_TEST_QWEN4EXP_QSA=1`. This is
-a Linux-portability defect of the test, not of the CUDA path; it is fixed in
+a Linux-portability defect of the test, not of the CUDA path; it was fixed in
 `Qwen4ExpMtpIntegrationTests.cs` by resolving the platform file name the way
 `Qwen35VerifyOwnerIsolationTests` and `GgmlNative` already do
-(`GgmlOps.dll` / `libGgmlOps.dylib` / `libGgmlOps.so`).
+(`GgmlOps.dll` / `libGgmlOps.dylib` / `libGgmlOps.so`). The fixture tests now
+share one helper, `TestGates.MappedNativeGgmlOpsPath()`, which matches that
+platform name and on macOS reads dyld's mapped-image table (`Process.Modules`
+omits `dlopen`-loaded libraries there); the result below was recorded with the
+per-test lookup.
 
 Result with that fix (managed Release build of this branch in
 `/workspace/ts-sanitizer/repo`, same shared native library, same environment):

@@ -26,12 +26,13 @@ public sealed class Qwen4ExpVideoForwardTests(ITestOutputHelper output)
     public void TwoTemporalPairs_ForwardWithIncreasingTimeReachQsaHistoryAndChangeLogits()
     {
         string directory = Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_MTP_FIXTURE")!;
-        // The default KV capacity: with TS_KV_INITIAL_TOKENS below the prompt length the
-        // QSA cache would have to grow before its first forward, which the model refuses.
+        // TS_KV_INITIAL_TOKENS=8 also exercises growth immediately after reset
+        // when the second video prompt exceeds the first allocation.
         var backend = Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_MTP_BACKEND") switch
         {
             null or "" or "GgmlCpu" => BackendType.GgmlCpu,
             "GgmlCuda" => BackendType.GgmlCuda,
+            "GgmlMetal" => BackendType.GgmlMetal,
             var unsupported => throw new InvalidOperationException($"Unsupported fixture backend {unsupported}"),
         };
         using var model = new Qwen4ExpModel(Path.Combine(directory, "target.gguf"), backend,

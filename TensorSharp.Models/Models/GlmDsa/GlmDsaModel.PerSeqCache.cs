@@ -96,6 +96,7 @@ namespace TensorSharp.Models
                 if (!GgmlGlmNative.SetActiveSlot(_native, slot))
                     throw new InvalidOperationException($"GLM slot {slot} missing for request {requestId}.");
                 _activeSlotKey = requestId;
+                _cacheSeqLen = GgmlGlmNative.NPast(_native);
                 return fresh;
             }
         }
@@ -133,8 +134,10 @@ namespace TensorSharp.Models
                         throw new InvalidOperationException(
                             "GLM primary-slot allocation failed (device memory exhausted?).");
                 }
-                GgmlGlmNative.SetActiveSlot(_native, _primarySlot);
+                if (!GgmlGlmNative.SetActiveSlot(_native, _primarySlot))
+                    throw new InvalidOperationException($"GLM primary slot {_primarySlot} missing.");
                 _activeSlotKey = null;
+                _cacheSeqLen = GgmlGlmNative.NPast(_native);
             }
         }
 

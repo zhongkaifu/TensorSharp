@@ -100,7 +100,11 @@ public static class ServerOptionsBuilder
             defaultMaxTokens = DefaultMaxTokensFallback;
         }
 
-        string uploadDirectory = Path.Combine(baseDirectory, "uploads");
+        // Keep mutable media outside a pinned/read-only application deployment
+        // when configured, just as logs and prefix checkpoints can be relocated.
+        string? uploadDirectory = Environment.GetEnvironmentVariable("TENSORSHARP_UPLOAD_DIR");
+        if (string.IsNullOrWhiteSpace(uploadDirectory))
+            uploadDirectory = Path.Combine(baseDirectory, "uploads");
         Directory.CreateDirectory(uploadDirectory);
 
         string? logDirectory = Environment.GetEnvironmentVariable("TENSORSHARP_LOG_DIR");

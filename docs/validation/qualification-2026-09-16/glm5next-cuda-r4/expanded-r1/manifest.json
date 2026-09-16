@@ -1,0 +1,61 @@
+{
+  "native_sha256": "7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7",
+  "build_command": [
+    "/workspace/tensorsharp-no-patch-20260915/dotnet/dotnet",
+    "build",
+    "/workspace/ts-glm5spec-r4-derived/Derived.csproj",
+    "-c",
+    "Release",
+    "-o",
+    "/workspace/ts-glm5spec-r4-derived/build",
+    "-m:1",
+    "/nodeReuse:false"
+  ],
+  "run_command": [
+    "/workspace/tensorsharp-no-patch-20260915/dotnet/dotnet",
+    "vstest",
+    "/workspace/ts-glm5spec-r4-derived/app/InferenceWeb.Tests.dll",
+    "--Logger:trx",
+    "--ResultsDirectory:/workspace/ts-glm5spec-r4-derived/results"
+  ],
+  "run_exit_code": 0,
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "5",
+    "TS_TEST_GGML_BACKEND": "cpu",
+    "TS_TEST_GLM_CUDA": "1",
+    "TS_TEST_GLM_SNAPSHOT_BOUNDARY": "1"
+  },
+  "source_sha256": {
+    "Derived.csproj": "28ebaa57f83145944032a955828008c1843ca95a5431d9c2a6719520124b1128",
+    "EnvScope.cs": "dda0e84fa9b515dff15fb22fa7ac6da86c155f881862437b0b45e51c2a7d49db",
+    "GatedFacts.cs": "1cbfe262a92753071d8f4adbb7d5b0dfbe3918016e3752def61cb7ea290e2867",
+    "GgmlBackendTestInitializer.cs": "8dc173dce8074fe3e37e89188fa5f3bcbf173e3ce76329043a9d8ae6c32f3e7a",
+    "Glm5NextNativeSnapshotBoundaryTests.cs": "84a651160bcfac2df21a874f38d4c027fc0b5f955b084ebe0ecdefdd748b57a5",
+    "Glm5NextNativeTensorParallelTests.cs": "efe77ebb45c921aaa0a495649a317ac3b0ac64a5c7f5e4a35bc702530e6879d4",
+    "Glm5NextSpeculationEligibilityTests.cs": "74bf967e4875b1096e9740bee6af383ddf0510e04f7d9f99891043eb328e2c67",
+    "Glm5NextSpeculativeRollbackTests.cs": "f210b069db5b0817d9e73e70004e41102a51c221b4dfe31d78cee6f5c0c4fe7e",
+    "GlmDsaSyntheticModelBuilder.cs": "8dc15bf7299bad2336e765a10349a9f10fe32ac89e7b575d91bfb90cf5bd9f74",
+    "GlmNativeCudaFact.cs": "274d8da2e6fffeadfb295ef9db7fdc2276ecf0389d1461ca105e56dae8677780",
+    "GlobalUsings.cs": "6b8ff963dd19942eea18086c402b64be5ec5273e48baa087ff64def48be2e3a1",
+    "NativeGgmlIdentityTests.cs": "5a1da45983ba302329816056c35a7e288de991f8dc406d3c55aa645c9e0e6e01",
+    "TestAssemblyConfig.cs": "955c2119be9a2ce20cdf400c432ae343cd77822967156e99a56f1b79223cedee",
+    "VideoFixture.cs": "78725fb06308439283bd68e118e53c42fe175c4aa54c44609b25ff2396c8e01a"
+  },
+  "assembly_sha256": {
+    "AdvUtils.dll": "cd315ba0d3026b4d6c5a74d79c44d85b580d0ed8e13623a3a58aeed947bc7d1d",
+    "TensorSharp.AgentHost.dll": "72339e982e285aedead48c18a449a2c07f875f54a1f9a22f4a712779a9b0990b",
+    "TensorSharp.Backends.Cuda.dll": "f6d5d7f48cf7c212cbfec6ee6a72b5e1c9b2feb493658cc2c624d47b7d313583",
+    "TensorSharp.Backends.GGML.dll": "17c60ff946c345e7f0ea8d3232936b60340b696b0011d6e5037cbced99a4af76",
+    "TensorSharp.Backends.MLX.dll": "601a1a726c999ab308a0c80fc9b1cfde40d4aacf9056056ced41662917a7bdb0",
+    "TensorSharp.Chat.dll": "9a801113505ad5572ba31928c79ccff4d4b475ddd7807583d4f220115e4da814",
+    "TensorSharp.Cli.dll": "afb91462aca38c25197c4b38d4afb1c101d1d0f935513cf8e97b057fe57ae179",
+    "TensorSharp.Core.dll": "55ca4029a5262bf775f7e01abaf7d6f1ae8bf64aa0d71a3476e76ec3809bc029",
+    "TensorSharp.Distributed.dll": "c0e1a6c16a9874a4d46c97c297d1b4bad073883673de32f37088132bf4b61971",
+    "TensorSharp.Models.dll": "2ffdbde3afb31a6c63dfc905078fcc6d4cd1394ba24327b906806a4d1961e52f",
+    "TensorSharp.Runtime.dll": "81790b40398269f27cad24d5ace2888cced7358868d8232bae75638b701f42a4",
+    "TensorSharp.Runtime.Logging.dll": "5f290e5b253b9a64dfcfa91b9bbfaf49175331115b5fea6abf5dc59ae9f889d1",
+    "TensorSharp.Server.dll": "5b2535242698a6ed6e7a01dc4433bd3de1ec0f3e92fa482d0cf5a6df23b73053",
+    "TensorSharp.Server.Host.dll": "617f2776d0c705f679f1e35d6a365efa46919d4c8e791156c28de1e4bbe9484f",
+    "InferenceWeb.Tests.dll": "31cf41f3f6926496f3c6232e06d6afc853c593483ba78207180708aa263a4865"
+  }
+}

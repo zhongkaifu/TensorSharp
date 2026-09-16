@@ -108,6 +108,9 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmKdaStateRestore(IntPtr handle);
 
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmResetChecked(IntPtr handle);
+
         /// <param name="nGpu">GPUs to spread the layers over; 0 = every visible device.</param>
         /// <param name="nCpuMoe">Leading layers whose routed experts stay in system RAM;
         /// <see cref="CpuMoeAuto"/> offloads the fewest that make the model fit.</param>
@@ -257,5 +260,17 @@ namespace TensorSharp.GGML
         /// exists for the active slot (never taken, taken of another slot, or
         /// invalidated by a reset / free).</summary>
         public static int KdaStateRestore(IntPtr handle) => TSGgml_GlmKdaStateRestore(handle);
+
+        public static bool ResetChecked(IntPtr handle)
+        {
+            try { return TSGgml_GlmResetChecked(handle) != 0; }
+            catch (EntryPointNotFoundException)
+            {
+                // Older libraries cannot arm KDA speculation. Preserve their
+                // existing ordinary reset contract without requiring a rebuild.
+                Reset(handle);
+                return true;
+            }
+        }
     }
 }

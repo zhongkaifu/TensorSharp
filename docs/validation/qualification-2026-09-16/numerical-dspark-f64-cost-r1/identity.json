@@ -1,0 +1,8 @@
+{
+  "benchmark_sha256": "5c1a069320af0cc48ad9cb94ad2695a101cef1bf13937da22d78e624baf6b75d",
+  "source_sha256": "37509fbc7705a6f2262f19e2c22af90ea188269f0f0e3b24ec1f0dba7fa5f66a",
+  "physical_gpu": 6,
+  "release_qualified": false,
+  "integrated": false,
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45"
+}

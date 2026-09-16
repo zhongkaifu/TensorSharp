@@ -1,0 +1,22 @@
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+Fixture gate=q2_K up=q2_K down=q3_K embedding=5120 hidden=2304 experts=8 top_k=6
+q2_K/q3_K ranks=2 layer=0 tokens=1 max_abs=5.82077e-11 rel_l2=1.1582e-07
+q2_K/q3_K ranks=2 layer=1 tokens=1 max_abs=6.91216e-11 rel_l2=1.16803e-07
+q2_K/q3_K ranks=2 layer=0 tokens=5 max_abs=6.54836e-11 rel_l2=1.11357e-07
+q2_K/q3_K ranks=2 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=1.1237e-07
+q2_K/q3_K ranks=2 layer=0 tokens=16 max_abs=1.16415e-10 rel_l2=1.51707e-07
+q2_K/q3_K ranks=2 layer=1 tokens=16 max_abs=1.45519e-10 rel_l2=1.63275e-07
+q2_K/q3_K ranks=2 layer=0 tokens=1 max_abs=5.82077e-11 rel_l2=1.1582e-07
+q2_K/q3_K ranks=2 layer=1 tokens=1 max_abs=6.91216e-11 rel_l2=1.16803e-07
+Fixture gate=q4_K up=q4_K down=q6_K embedding=5120 hidden=2304 experts=8 top_k=6
+q4_K/q6_K ranks=2 layer=0 tokens=1 max_abs=5.82077e-11 rel_l2=1.23877e-07
+q4_K/q6_K ranks=2 layer=1 tokens=1 max_abs=5.82077e-11 rel_l2=1.22994e-07
+q4_K/q6_K ranks=2 layer=0 tokens=5 max_abs=8.73115e-11 rel_l2=1.17215e-07
+q4_K/q6_K ranks=2 layer=1 tokens=5 max_abs=8.73115e-11 rel_l2=1.1938e-07
+q4_K/q6_K ranks=2 layer=0 tokens=16 max_abs=8.73115e-11 rel_l2=9.31294e-08
+q4_K/q6_K ranks=2 layer=1 tokens=16 max_abs=8.73115e-11 rel_l2=9.87027e-08
+q4_K/q6_K ranks=2 layer=0 tokens=1 max_abs=5.82077e-11 rel_l2=1.23877e-07
+q4_K/q6_K ranks=2 layer=1 tokens=1 max_abs=5.82077e-11 rel_l2=1.22994e-07
+Passed 16 true MoE tensor-parallel comparisons

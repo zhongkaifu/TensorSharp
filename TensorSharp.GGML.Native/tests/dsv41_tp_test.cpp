@@ -1,6 +1,8 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_deepseek41_tp.h"
+#include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_matmul_precision.h"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #if defined(TSG_GGML_USE_CUDA)
@@ -135,15 +137,29 @@ struct evaluation
 {
     reference_backend device;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t cuda_backend = nullptr;  // non-owning: device.inner
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * x = nullptr, * ids = nullptr, * weights = nullptr, * out = nullptr;
     ggml_tensor * gate_out = nullptr, * up_out = nullptr, * hidden_out = nullptr;
+    ggml_tensor * raw_gate = nullptr, * raw_up = nullptr;
+    tsg_dsv4_fused_desc strip_desc;
     evaluation(const fixture & data, int tokens, tsg_dsv41_tp::executor * tp, int layer,
-               ggml_backend_dev_t reference_device = nullptr, bool preserve_taps = false, bool shared_once = false)
+               ggml_backend_dev_t reference_device = nullptr, bool preserve_taps = false, bool shared_once = false,
+               int full_rows = 0, int first_row = 0)
         : device(tp ? nullptr : reference_device), backend(device.backend)
     {
+#if defined(TSG_GGML_USE_CUDA)
+        // The owned strip kernel runs inside TensorSharp's fused CUDA backend,
+        // which reference_backend already wraps around a CUDA reference device.
+        if (full_rows) {
+            cuda_backend = device.inner;
+            require(cuda_backend != nullptr, "Cannot create CUDA strip test backend");
+        }
+#else
+        require(!full_rows, "CUDA strip test unavailable in a CPU build");
+#endif
         ctx = ggml_init({1024 * 1024, nullptr, true});
         x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, data.embedding, tokens);
         if (tp && layer == 1)
@@ -163,11 +179,30 @@ struct evaluation
             up = ggml_new_tensor_3d(ctx, data.up.type, data.embedding, data.hidden, data.experts);
             down = ggml_new_tensor_3d(ctx, data.down.type, data.hidden, data.embedding, data.experts);
             auto * input = ggml_reshape_3d(ctx, x, data.embedding, 1, tokens);
-            auto * g = ggml_clamp(ctx, device.mul_mat_id(ctx, gate, input, ids), -INFINITY, .1f);
-            auto * u = ggml_clamp(ctx, device.mul_mat_id(ctx, up, input, ids), -.1f, .1f);
+            auto projection = [&](ggml_tensor * weight) {
+                if (!full_rows) return device.mul_mat_id(ctx, weight, input, ids);
+#if defined(TSG_GGML_USE_CUDA)
+                require(tsg_matmul_id_quant_strip_supported(cuda_backend, weight, tokens, full_rows, first_row),
+                    "Test shape does not engage the quantized CUDA strip operation");
+#endif
+                strip_desc.kind = TSG_MATMUL_ID_QUANT_STRIP;
+                strip_desc.i0 = full_rows; strip_desc.i1 = first_row;
+                return tsg_matmul_id_quant_strip(ctx, weight, input, ids, &strip_desc);
+            };
+            if (full_rows) {
+                strip_desc.kind=TSG_MATMUL_ID_QUANT_PAIR;strip_desc.i0=full_rows;strip_desc.i1=first_row;
+                auto * pair=tsg_matmul_id_quant_pair(ctx,gate,up,input,ids,&strip_desc);
+                raw_gate=ggml_view_3d(ctx,pair,pair->ne[0],pair->ne[1],pair->ne[2],pair->nb[1],pair->nb[2],0);
+                raw_up=ggml_view_3d(ctx,pair,pair->ne[0],pair->ne[1],pair->ne[2],pair->nb[1],pair->nb[2],pair->nb[3]);
+            } else { raw_gate = projection(gate); raw_up = projection(up); }
+            auto * g = ggml_clamp(ctx, raw_gate, -INFINITY, .1f);
+            auto * u = ggml_clamp(ctx, raw_up, -.1f, .1f);
             auto * h = ggml_swiglu_split(ctx, g, u);
             gate_out = g; up_out = u; hidden_out = h;
-            if (preserve_taps) { ggml_set_output(g); ggml_set_output(u); ggml_set_output(h); }
+            if (preserve_taps) {
+                ggml_set_output(raw_gate); ggml_set_output(raw_up);
+                ggml_set_output(g); ggml_set_output(u); ggml_set_output(h);
+            }
             auto * e = ggml_mul(ctx, device.mul_mat_id(ctx, down, h, ids), weights);
             for (int expert = 0; expert < data.used; ++expert)
             {
@@ -585,6 +620,100 @@ std::vector<float> exact_reference(const fixture & data, int tokens)
     return std::vector<float>(result.begin(), result.end());
 }
 
+void quantized_scratch_lifecycle(ggml_backend_dev_t device)
+{
+    fixture data(GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 5120);
+    tsg_dsv41_tp::executor tp(std::vector<ggml_backend_dev_t>(2, device), data.used);
+    tp.add_layer(0,data.gate,data.up,data.down,.1f);
+    const char * fault_name = std::getenv("TS_TP_TEST_REAL_OOM") ?
+        "TS_TP_TEST_EXHAUST_SCRATCH" : "TS_TP_TEST_FAIL_SCRATCH_GROWTH";
+    auto fault=[&](bool enabled) {
+#if defined(_WIN32)
+        _putenv_s(fault_name,enabled?"1":"");
+#else
+        if(enabled)setenv(fault_name,"1",1);
+        else unsetenv(fault_name);
+#endif
+    };
+    try {
+        for (int shape : {16, 16, 16, -129, 16, 129, 129, 129, 17, 65, 257, 16, 129}) {
+            const bool fail=shape<0;const int tokens=std::abs(shape);
+            fault(fail);tp.begin_forward();
+            const auto actual=evaluation(data,tokens,&tp,0).run();
+            fault(false);
+            if(fail) {
+                require(tp.error().find("scratch")!=std::string::npos,"Scratch allocation failure did not reach TP error latch");
+                require(std::all_of(actual.begin(),actual.end(),[](float v){return std::isnan(v);}),"Scratch failure did not invalidate TP output");
+            } else {
+                require(tp.error().empty(),tp.error().c_str());
+                const auto expected=evaluation(data,tokens,nullptr,0,device).run();
+                double error=0,norm=0,maximum=0;
+                for(size_t i=0;i<actual.size();++i) {
+                    require(std::isfinite(actual[i]),"Recovered scratch produced nonfinite output");
+                    const double delta=double(actual[i])-expected[i];error+=delta*delta;norm+=double(expected[i])*expected[i];maximum=std::max(maximum,std::abs(delta));
+                }
+                require(maximum<2e-6 && std::sqrt(error/std::max(1e-30,norm))<1e-5,"Recovered scratch differs from original unsplit oracle");
+            }
+            std::cout<<"SCRATCH_LIFECYCLE tokens="<<tokens<<" injected="<<fail<<" passed"<<std::endl;
+        }
+    } catch(...) {fault(false);throw;}
+}
+
+void quantized_strip_projections(ggml_backend_dev_t device)
+{
+    int checks = 0;
+    for (auto format : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K})
+    {
+        fixture full(format, format == GGML_TYPE_Q2_K ? GGML_TYPE_Q3_K : GGML_TYPE_Q6_K, 5120);
+        for (int used : {1, 6}) for (int tokens : {9, 16, 17, 33, 65, 129})
+        {
+            full.used = used;
+            evaluation unsplit(full, tokens, nullptr, 0, device, true);
+            const auto expected = unsplit.run();
+            const auto gate = values(unsplit.raw_gate), up = values(unsplit.raw_up);
+            // Rotate unequal seven-rank strips, and cover all retained rank
+            // counts at the original failing 16-token checkpoint shape.
+            for (int ranks : (tokens == 16 ? std::vector<int>{2, 4, 7, 8} : std::vector<int>{7}))
+            {
+                const int layer = ranks - 1;
+                std::vector<float> sum(expected.size());
+                for (auto part : tsg_dsv41_tp::split_weights(full.hidden, full.down.type, ranks, layer))
+                {
+                    fixture subset(full, part);
+                    evaluation sliced(subset, tokens, nullptr, layer, device, true, false, full.hidden, int(part.first));
+                    const auto output = sliced.run();
+                    const auto actual_gate = values(sliced.raw_gate), actual_up = values(sliced.raw_up);
+                    for (int row = 0; row < tokens * used; ++row)
+                    {
+                        require(std::memcmp(actual_gate.data() + row * part.count,
+                            gate.data() + row * full.hidden + part.first, part.count * sizeof(float)) == 0,
+                            "Quantized gate strip differs from untouched unsplit CUDA projection");
+                        require(std::memcmp(actual_up.data() + row * part.count,
+                            up.data() + row * full.hidden + part.first, part.count * sizeof(float)) == 0,
+                            "Quantized up strip differs from untouched unsplit CUDA projection");
+                    }
+                    for (size_t i = 0; i < output.size(); ++i) sum[i] += output[i];
+                }
+                double error = 0, norm = 0, maximum = 0;
+                for (size_t i = 0; i < sum.size(); ++i)
+                {
+                    require(std::isfinite(sum[i]), "Quantized strip result is nonfinite");
+                    const double delta = double(sum[i]) - expected[i];
+                    error += delta * delta; norm += double(expected[i]) * expected[i];
+                    maximum = std::max(maximum, std::abs(delta));
+                }
+                const double relative = std::sqrt(error / std::max(1e-30, norm));
+                std::cout << "QUANT_STRIP " << ggml_type_name(format) << " tokens=" << tokens << " used=" << used
+                    << " ranks=" << ranks << " bitwise_gate_up=true max_abs=" << maximum << " rel_l2=" << relative << std::endl;
+                require(maximum < 2e-6 && relative < 1e-5,
+                    "Quantized strip MoE exceeds original unsplit reference tolerance");
+                ++checks;
+            }
+        }
+    }
+    std::cout << "Passed " << checks << " quantized strip projection and MoE comparisons\n";
+}
+
 void diagnose(const fixture & data, int tokens, int ranks, int layer, ggml_backend_dev_t device,
               const std::vector<float> & tp_output)
 {
@@ -734,7 +863,7 @@ int main(int argc, char ** argv)
 {
     try
     {
-        bool cuda = false, checkpoint_shape = false, diagnostic = false, down_f32 = false, failure_only = false;
+        bool cuda = false, checkpoint_shape = false, diagnostic = false, down_f32 = false, failure_only = false, strip_only = false;
         int cuda_ranks = 0, fanout_pairs = 0;
         for (int arg = 1; arg < argc; ++arg)
         {
@@ -744,10 +873,12 @@ int main(int argc, char ** argv)
             else if (option == "--diagnose") diagnostic = true;
             else if (option == "--diagnostic-down-f32") down_f32 = true;
             else if (option == "--failure-only") failure_only = true;
+            else if (option == "--quant-strip-only") strip_only = true;
             else if (option == "--fanout-pairs" && arg + 1 < argc) fanout_pairs = std::stoi(argv[++arg]);
-            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2|4|7|8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only|--fanout-pairs N]");
+            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2|4|7|8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only|--fanout-pairs N] | --cuda 1 --quant-strip-only");
         }
-        if (cuda && cuda_ranks != 2 && cuda_ranks != 4 && cuda_ranks != 7 && cuda_ranks != 8) return 1;
+        if (cuda && cuda_ranks != 2 && cuda_ranks != 4 && cuda_ranks != 7 && cuda_ranks != 8 && !(strip_only && cuda_ranks == 1)) return 1;
+        require(!strip_only || (cuda && !failure_only && !fanout_pairs), "Quantized strip test requires CUDA and an exclusive test mode");
         require(!down_f32 || checkpoint_shape, "The F32-down control requires --checkpoint-shape");
         require(fanout_pairs >= 0 && fanout_pairs <= 10000 && !(fanout_pairs && failure_only), "Invalid fanout comparison count");
         std::vector<ggml_backend_dev_t> devices;
@@ -762,6 +893,7 @@ int main(int argc, char ** argv)
         if (cuda) return 77;
 #endif
         const auto cpu = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+        if (strip_only) { quantized_scratch_lifecycle(devices[0]); quantized_strip_projections(devices[0]); return 0; }
         if (failure_only)
         {
             failure_recovery(cuda ? devices : std::vector<ggml_backend_dev_t>(2, cpu));
@@ -839,40 +971,33 @@ int main(int argc, char ** argv)
                               << " tokens=" << tokens << " max_abs=" << against_full.max_abs << " rel_l2=" << against_full.rel_l2 << std::endl;
                     const auto device = cuda ? devices[0] : cpu;
                     if (diagnostic && !within(against_full)) diagnose(data, tokens, ranks, layer, device, actual);
-                    if (!within(against_full))
-                    {
-                        // The full-weight graph is only a valid oracle where the
-                        // device evaluates each output row independently of how
-                        // many rows share its launch. ggml CUDA's batched MMQ path
-                        // (used from nine tokens on this shape) violates that:
-                        // stream-k splits every launch's K loop by the launch's
-                        // total tile count, so the F32 accumulation grouping of a
-                        // gate/up row changes with the row count of the tensor it
-                        // is part of (~1e-7 relative), and the down projection
-                        // then requantizes those hidden activations to Q8 with
-                        // roundf(x*127/amax): a single flipped bin moves one
-                        // token's whole output by ~2e-5 relative. TensorSharp
-                        // cannot make its rank strips reproduce the unsplit
-                        // launch's grouping, and this instability is a property
-                        // of the reference: re-evaluating the very same
-                        // full-weight graph with the executor's row partition on
-                        // the reference device, without the executor, moves it
-                        // by the same amount. So the oracle for such shapes is
-                        // that same-device partitioned evaluation, at the
-                        // unchanged tolerance; --diagnose prints the mechanism
-                        // and both sides' distance from an exact F64 reference.
-                        const auto partitioned = partitioned_reference(data, tokens, ranks, layer, device, false).output;
-                        const auto oracle_shift = measure(expected[tokens], partitioned);
-                        const auto against_partitioned = measure(partitioned, actual);
-                        std::cout << "  full-weight reference re-evaluated with the executor's row partition on the reference device:"
-                                  << " max_abs=" << oracle_shift.max_abs << " rel_l2=" << oracle_shift.rel_l2
-                                  << "; TP versus that partitioned reference: max_abs=" << against_partitioned.max_abs
-                                  << " rel_l2=" << against_partitioned.rel_l2 << std::endl;
-                        require(within(against_partitioned),
-                                "TP output differs from the same-device evaluation of its own row partition");
-                        require(!within(oracle_shift),
-                                "TP output differs from a full-weight reference that is stable under the executor's row partition");
-                    }
+                    // Additional record, not a pass criterion: the same weights
+                    // evaluated with the executor's row partition as ordinary
+                    // ggml graphs on the reference device. ggml's batched MMQ
+                    // path (stream-k over the launch's tile count, then Q8
+                    // requantization of the hidden activations) makes that
+                    // partitioned evaluation move away from the unsplit launch
+                    // on checkpoint shapes from nine tokens; the executor's owned
+                    // quantized strip kernel keeps the unsplit launch's
+                    // partitions, so it is expected to match the full-weight
+                    // reference and may therefore sit outside this one.
+                    // --diagnose prints the mechanism and each side's distance
+                    // from an exact F64 reference.
+                    const auto partitioned = partitioned_reference(data, tokens, ranks, layer, device, false).output;
+                    const auto oracle_shift = measure(expected[tokens], partitioned);
+                    const auto against_partitioned = measure(partitioned, actual);
+                    std::cout << "  ORACLE full-weight=" << (within(against_full) ? "pass" : "FAIL")
+                              << " partitioned-reference=" << (within(against_partitioned) ? "within" : "outside")
+                              << " (TP versus partitioned: max_abs=" << against_partitioned.max_abs
+                              << " rel_l2=" << against_partitioned.rel_l2
+                              << "; partitioned versus full-weight: max_abs=" << oracle_shift.max_abs
+                              << " rel_l2=" << oracle_shift.rel_l2 << ")" << std::endl;
+                    // The strict full-weight comparison and its original
+                    // tolerances remain the pass criterion.
+                    require(against_full.max_abs < (type == GGML_TYPE_F32 ? 1e-7 : 2e-6),
+                            "TP output differs from the full-weight reference");
+                    require(against_full.rel_l2 < 1e-5,
+                            "TP relative error exceeds the full-weight reference tolerance");
                     ++checks;
                 }
             }

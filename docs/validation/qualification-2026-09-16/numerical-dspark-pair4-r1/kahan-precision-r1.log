@@ -1,0 +1,270 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT_ID weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT_ID weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=4.900892e-07 rel_l2=7.8554572e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=168.1 max_abs=6.6267833e-07 rel_l2=7.6771247e-08
+TSDSV4-0 MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=2.1658095e-07 rel_l2=3.5382832e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=63.5 max_abs=2.2238839e-07 rel_l2=3.4909855e-08
+TSDSV4-0 MUL_MAT nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0016198436 rel_l2=0.00025338982ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=87.9 max_abs=0.0016347309 rel_l2=0.00027297141
+TSDSV4-0 MUL_MAT nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.4722257e-07 rel_l2=4.0953466e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=82.5 max_abs=3.8261521e-07 rel_l2=4.0752172e-08
+TSDSV4-0 MUL_MAT nt=1 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.1035204e-07 rel_l2=7.5917195e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=73.8 max_abs=5.7498437e-07 rel_l2=7.1468137e-08
+TSDSV4-0 MUL_MAT nt=1 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=2.6511498e-07 rel_l2=3.8390903e-08 mean_us=22.7 max_abs=3.7542941e-07 rel_l2=3.550022e-08
+TSDSV4-0 MUL_MAT nt=4 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0057520184 rel_l2=0.0006811963ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=95.7 max_abs=0.0057601076 rel_l2=0.00068908205
+TSDSV4-0 MUL_MAT nt=4 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.0858628e-07 rel_l2=3.9556362e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=104.7 max_abs=3.3394545e-07 rel_l2=3.8407105e-08
+TSDSV4-0 MUL_MAT nt=4 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0013190846 rel_l2=0.00017312998ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=55.8 max_abs=0.0015801539 rel_l2=0.0002115618
+TSDSV4-0 MUL_MAT nt=4 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.4722257e-07 rel_l2=3.9894121e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=87.4 max_abs=4.1815343e-07 rel_l2=4.2291917e-08
+TSDSV4-0 MUL_MAT nt=4 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.010837552 rel_l2=0.0015241742ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=63.8 max_abs=0.012660207 rel_l2=0.0018853071
+TSDSV4-0 MUL_MAT nt=4 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=3.1942091e-07 rel_l2=3.8584035e-08 mean_us=23.5 max_abs=2.8751037e-07 rel_l2=3.9359288e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0057520184 rel_l2=0.00067489907ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=38.4 max_abs=0.0081823807 rel_l2=0.00072048975
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.0858628e-07 rel_l2=3.7218691e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=100.5 max_abs=3.643401e-07 rel_l2=3.8365661e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0015529598 rel_l2=0.00017242884ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=98.7 max_abs=0.0016131135 rel_l2=0.00019866457
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.4076569e-07 rel_l2=3.9486991e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=65.3 max_abs=4.0518788e-07 rel_l2=3.8697622e-08
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.014486779 rel_l2=0.0014794488ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=90.3 max_abs=0.011987931 rel_l2=0.0015125377
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=3.2668322e-07 rel_l2=3.8293192e-08 mean_us=23.8 max_abs=3.9216229e-07 rel_l2=3.8246393e-08
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0065394075 rel_l2=0.00067671421ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=68.7 max_abs=0.0068782511 rel_l2=0.00070907233
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.6790778e-06 rel_l2=1.0592132e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=84.1 max_abs=1.0884935e-06 rel_l2=1.0447513e-07
+TSDSV4-0 MUL_MAT nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0016193263 rel_l2=0.00018581663ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=62.1 max_abs=0.0019073154 rel_l2=0.00020581724
+TSDSV4-0 MUL_MAT nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.3908175e-06 rel_l2=1.0579258e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=103.9 max_abs=1.4393747e-06 rel_l2=1.0957068e-07
+TSDSV4-0 MUL_MAT nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.014486779 rel_l2=0.0015335255ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=45.7 max_abs=0.013711487 rel_l2=0.001602829
+TSDSV4-0 MUL_MAT nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.303649e-06 rel_l2=1.0380774e-07 mean_us=31.2 max_abs=1.230454e-06 rel_l2=1.0862194e-07
+TSDSV4-0 MUL_MAT nt=31 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=1.5316322e-06 rel_l2=1.5127544e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=51.7 max_abs=1.6359882e-06 rel_l2=1.5537633e-07
+TSDSV4-0 MUL_MAT nt=31 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.5316322e-06 rel_l2=1.5127544e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=58.4 max_abs=1.6359882e-06 rel_l2=1.5537633e-07
+TSDSV4-0 MUL_MAT nt=31 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.015121297 rel_l2=0.0008846128ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=68.2 max_abs=0.01585789 rel_l2=0.00091735646
+TSDSV4-0 MUL_MAT nt=31 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.8443038e-06 rel_l2=1.5577982e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=101.3 max_abs=1.8171185e-06 rel_l2=1.5663577e-07
+TSDSV4-0 MUL_MAT nt=31 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.016092859 rel_l2=0.0015637519ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=98.6 max_abs=0.014566976 rel_l2=0.001548812
+TSDSV4-0 MUL_MAT nt=31 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.5207461e-06 rel_l2=1.5212541e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=156.0 max_abs=1.9337731e-06 rel_l2=1.5680159e-07
+TSDSV4-0 MUL_MAT_ID nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0056636185 rel_l2=0.00069158362ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=81.7 max_abs=0.0057595904 rel_l2=0.00072229553
+TSDSV4-0 MUL_MAT_ID nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=3.6862552e-07 rel_l2=3.9492392e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=84.2 max_abs=3.4255016e-07 rel_l2=3.5341856e-08
+TSDSV4-0 MUL_MAT_ID nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0015465816 rel_l2=0.00017412277ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=63.4 max_abs=0.0013238714 rel_l2=0.00017853003
+TSDSV4-0 MUL_MAT_ID nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.082464e-07 rel_l2=3.6915181e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=37.9 max_abs=3.9088587e-07 rel_l2=3.6464791e-08
+TSDSV4-0 MUL_MAT_ID nt=1 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.013122826 rel_l2=0.0014411484ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=72.1 max_abs=0.011257824 rel_l2=0.0015532845
+TSDSV4-0 MUL_MAT_ID nt=1 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.1394105e-07 rel_l2=4.0492299e-08 mean_us=14.9 max_abs=3.9865472e-07 rel_l2=3.6791401e-08
+TSDSV4-0 MUL_MAT_ID nt=4 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0062815974 rel_l2=0.00067910703ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=91.0 max_abs=0.0062230477 rel_l2=0.00070592612
+TSDSV4-0 MUL_MAT_ID nt=4 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6862552e-07 rel_l2=3.7918677e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=80.9 max_abs=4.1871944e-07 rel_l2=3.7382462e-08
+TSDSV4-0 MUL_MAT_ID nt=4 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.001996389 rel_l2=0.00017583228ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=84.7 max_abs=0.0016903465 rel_l2=0.00018460182
+TSDSV4-0 MUL_MAT_ID nt=4 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.082464e-07 rel_l2=3.6486434e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=82.8 max_abs=4.8636289e-07 rel_l2=3.7326508e-08
+TSDSV4-0 MUL_MAT_ID nt=4 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.013122826 rel_l2=0.0013986694ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=89.2 max_abs=0.014572956 rel_l2=0.0016255585
+TSDSV4-0 MUL_MAT_ID nt=4 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.397034e-07 rel_l2=3.8317553e-08 mean_us=17.5 max_abs=3.8745566e-07 rel_l2=3.6869169e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0062815974 rel_l2=0.00067866774ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=38.3 max_abs=0.0066234687 rel_l2=0.00071892507
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6862552e-07 rel_l2=3.7234135e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=56.2 max_abs=4.1378435e-07 rel_l2=3.8493673e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.001996389 rel_l2=0.00018101526ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=134.6 max_abs=0.0020554761 rel_l2=0.00020581628
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.082464e-07 rel_l2=3.6987265e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=123.6 max_abs=3.5267504e-07 rel_l2=3.7081532e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.013122826 rel_l2=0.0013845706ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=66.7 max_abs=0.013608658 rel_l2=0.0015360658
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.397034e-07 rel_l2=3.8763425e-08 mean_us=23.3 max_abs=3.5131916e-07 rel_l2=3.8106186e-08
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0065632799 rel_l2=0.00068539928ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=55.2 max_abs=0.0072762217 rel_l2=0.00070223348
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.3839789e-07 rel_l2=3.8072555e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=137.2 max_abs=4.9697001e-07 rel_l2=3.8344597e-08
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0022422361 rel_l2=0.00018316398ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=125.7 max_abs=0.0018959575 rel_l2=0.00019463733
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.0352719e-07 rel_l2=3.7785407e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=134.1 max_abs=5.4662132e-07 rel_l2=3.8976303e-08
+TSDSV4-0 MUL_MAT_ID nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.015919889 rel_l2=0.0014405064ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=128.6 max_abs=0.016879448 rel_l2=0.0015348704
+TSDSV4-0 MUL_MAT_ID nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.397034e-07 rel_l2=3.8481022e-08 mean_us=25.2 max_abs=4.9134957e-07 rel_l2=3.8648974e-08
+TSDSV4-0 MUL_MAT_ID nt=31 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0065632799 rel_l2=0.00068359155ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=145.9 max_abs=0.0071636403 rel_l2=0.00071209205
+TSDSV4-0 MUL_MAT_ID nt=31 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.3839789e-07 rel_l2=3.8218839e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=150.7 max_abs=5.3094391e-07 rel_l2=3.8269467e-08
+TSDSV4-0 MUL_MAT_ID nt=31 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0022422361 rel_l2=0.000183242ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=52.2 max_abs=0.0019747297 rel_l2=0.00019747254
+TSDSV4-0 MUL_MAT_ID nt=31 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.0352719e-07 rel_l2=3.8386301e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=155.2 max_abs=4.8989327e-07 rel_l2=3.8107281e-08
+TSDSV4-0 MUL_MAT_ID nt=31 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.015919889 rel_l2=0.0014698337ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=62.2 max_abs=0.016878044 rel_l2=0.001597327
+TSDSV4-0 MUL_MAT_ID nt=31 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=4.4483022e-07 rel_l2=3.8246039e-08 mean_us=26.7 max_abs=5.4717412e-07 rel_l2=3.8898083e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.0858628e-07 rel_l2=3.8887694e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=138.0 max_abs=4.3962626e-07 rel_l2=3.8203347e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=256 rows=64 slots=1 batches=3,2/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.577219e-07 rel_l2=3.7661592e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=88.7 max_abs=6.7279171e-07 rel_l2=3.9155778e-08
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=55.3 max_abs=2.2649765e-05 rel_l2=3.54901e-06
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=22.8 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=36.1 max_abs=1.4603138e-06 rel_l2=2.5600713e-07
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=19.3 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0 max_abs=5.343239e-07 rel_l2=3.7908e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=50.6 max_abs=4.336494e-07 rel_l2=3.8598376e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.7419764e-07 rel_l2=3.8010658e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=33.2 max_abs=4.4536241e-07 rel_l2=3.6851113e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.3340119e-07 rel_l2=3.5301967e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.5 max_abs=3.8475495e-07 rel_l2=3.6342338e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.343239e-07 rel_l2=3.7908e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=34.0 max_abs=4.336494e-07 rel_l2=3.8598376e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.7419764e-07 rel_l2=3.8010658e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.5 max_abs=4.4536241e-07 rel_l2=3.6851113e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.3340119e-07 rel_l2=3.5301967e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.3 max_abs=3.8475495e-07 rel_l2=3.6342338e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=256 rows=64 slots=1 batches=1,1/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.4647847e-07 rel_l2=3.9424518e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=31.6 max_abs=5.0242954e-07 rel_l2=3.8643286e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=256 rows=64 slots=1 batches=3,2/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.4547573e-07 rel_l2=3.7388692e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.7 max_abs=5.1148982e-07 rel_l2=3.6422165e-08
+TSDSV4-0 MUL_MAT nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=37.7 max_abs=2.2649765e-05 rel_l2=3.54901e-06
+TSDSV4-0 MUL_MAT nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=26.8 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.4 max_abs=1.4603138e-06 rel_l2=2.5600713e-07
+TSDSV4-0 MUL_MAT_ID nt=16 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=17.7 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.4116958e-07 rel_l2=3.8471302e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=33.0 max_abs=5.2341721e-07 rel_l2=3.7406725e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.6649072e-07 rel_l2=3.7710877e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=27.9 max_abs=3.8047391e-07 rel_l2=3.7795502e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.1523734e-07 rel_l2=3.8332306e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=27.6 max_abs=3.9295887e-07 rel_l2=3.5711836e-08
+TSDSV4-0 MUL_MAT nt=5 weights=f16 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.4116958e-07 rel_l2=3.8471302e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=31.2 max_abs=5.2341721e-07 rel_l2=3.7406725e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.6649072e-07 rel_l2=3.7710877e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=26.6 max_abs=3.8047391e-07 rel_l2=3.7795502e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f16 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.1523734e-07 rel_l2=3.8332306e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=26.7 max_abs=3.9295887e-07 rel_l2=3.5711836e-08
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.9806446e-07 rel_l2=3.9341168e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=27.4 max_abs=5.1922768e-07 rel_l2=4.0070151e-08
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=256 rows=64 slots=1 batches=3,2/3,2 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=4.3795535e-07 rel_l2=3.7832101e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=30.0 max_abs=4.364565e-07 rel_l2=3.8501637e-08
+TSDSV4-0 MUL_MAT nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=39.2 max_abs=2.2649765e-05 rel_l2=3.54901e-06
+TSDSV4-0 MUL_MAT nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=20.7 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT_ID nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=1 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.2 max_abs=1.4603138e-06 rel_l2=2.5600713e-07
+TSDSV4-0 MUL_MAT_ID nt=16 weights=bf16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=2 convert=0 precision=F32 pipeline=0 max_abs=0 rel_l2=0 mean_us=17.4 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.5228884e-07 rel_l2=3.754856e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=39.6 max_abs=6.5436836e-07 rel_l2=3.6391231e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6814527e-07 rel_l2=3.6416139e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=28.1 max_abs=4.0799932e-07 rel_l2=3.6317997e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=0 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6591155e-07 rel_l2=3.674971e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=26.5 max_abs=4.0127088e-07 rel_l2=3.6266162e-08
+TSDSV4-0 MUL_MAT nt=5 weights=bf16 inner=257 rows=37 slots=1 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=5.5228884e-07 rel_l2=3.754856e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=31.1 max_abs=6.5436836e-07 rel_l2=3.6391231e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=257 rows=37 slots=2 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6814527e-07 rel_l2=3.6416139e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=26.3 max_abs=4.0799932e-07 rel_l2=3.6317997e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=bf16 inner=257 rows=37 slots=4 batches=2,2/4,6 padded=1 stride0=1 pattern=0 convert=1 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=3.6591155e-07 rel_l2=3.674971e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=26.7 max_abs=4.0127088e-07 rel_l2=3.6266162e-08
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=128 rows=1280 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0053590483 rel_l2=0.00068609019ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=41.3 max_abs=0.0055717206 rel_l2=0.00070800113
+TSDSV4-0 MUL_MAT nt=16 weights=f32 inner=128 rows=1280 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=1.4212022e-06 rel_l2=1.0978445e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=38.6 max_abs=1.3194948e-06 rel_l2=1.0992502e-07
+TSDSV4-0 MUL_MAT nt=31 weights=f32 inner=128 rows=1280 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0.0021187575 rel_l2=0.00025896767ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=35.1 max_abs=0.0022243918 rel_l2=0.00027077029
+TSDSV4-0 MUL_MAT nt=31 weights=f32 inner=128 rows=1280 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=1.4212022e-06 rel_l2=1.0988985e-07ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=42.5 max_abs=1.2837226e-06 rel_l2=1.1010836e-07
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=4096 rows=17 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=3 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=29.4 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=1 max_abs=8.1717256e-07 rel_l2=3.7218691e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=56.9 max_abs=7.286802e-07 rel_l2=3.8365661e-08
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=4096 rows=17 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=3 convert=0 precision=F32 pipeline=0ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=0 rel_l2=0ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=33.4 max_abs=0 rel_l2=0
+TSDSV4-0 MUL_MAT_ID nt=5 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=1ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ max_abs=7.3725104e-07 rel_l2=3.7234135e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=37.4 max_abs=8.275687e-07 rel_l2=3.8493673e-08

@@ -1,0 +1,10 @@
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+Fixture gate=q2_K up=q2_K down=q3_K embedding=5120 hidden=2304 experts=8 top_k=6
+q2_K/q3_K ranks=2 layer=0 tokens=1 max_abs=7.27596e-11 rel_l2=1.22362e-07
+q2_K/q3_K ranks=2 layer=1 tokens=1 max_abs=6.54836e-11 rel_l2=1.25115e-07
+q2_K/q3_K ranks=2 layer=0 tokens=5 max_abs=7.27596e-11 rel_l2=1.19574e-07
+q2_K/q3_K ranks=2 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=1.20749e-07
+q2_K/q3_K ranks=2 layer=0 tokens=16 max_abs=3.94066e-08 rel_l2=3.88634e-05
+TP relative error exceeds the full-weight reference tolerance

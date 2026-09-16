@@ -68,6 +68,8 @@ namespace TensorSharp.Server
         public string LoadedMmProjPath => _lifecycle.LoadedMmProjPath;
         public string LoadedBackend => _lifecycle.LoadedBackend;
         public virtual string Architecture => _lifecycle.Architecture;
+        /// <summary>Whether the loaded model carries its optional audio tower (see <see cref="TensorSharp.Models.Architecture.AudioInputSupport"/>).</summary>
+        public virtual bool IsAudioEncoderLoaded => TensorSharp.Models.Architecture.AudioInputSupport.IsAudioEncoderLoaded(_lifecycle.Model);
         public ModelBase Model => _lifecycle.Model;
 
         /// <summary>

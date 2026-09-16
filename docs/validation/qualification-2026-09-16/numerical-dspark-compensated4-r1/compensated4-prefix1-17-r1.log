@@ -1,0 +1,9 @@
+usage: dsv41-dspark-inference.py [-h] --out OUT [--library LIBRARY]
+                                 [--backend BACKEND] [--gpus GPUS]
+                                 [--require-split-dspark] [--prepare-only]
+                                 [--state-only] [--reference-only]
+                                 [--keep-going] [--native-ring-control]
+                                 [--trace-native]
+                                 [--reference-prefixes REFERENCE_PREFIXES [REFERENCE_PREFIXES ...]]
+                                 fixture_dir
+dsv41-dspark-inference.py: error: argument --reference-prefixes: invalid int value: '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17'

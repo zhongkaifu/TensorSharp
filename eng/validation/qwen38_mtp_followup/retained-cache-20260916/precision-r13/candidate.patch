@@ -1,0 +1,45 @@
+--- a/TensorSharp.GGML.Native/ggml_ops_qwen4exp.cpp
++++ b/TensorSharp.GGML.Native/ggml_ops_qwen4exp.cpp
+@@ -716,6 +716,7 @@
+     ggml_tensor* par = ggml_mul(ctx, ggml_silu(ctx, e_gate), e_up);
+     ggml_tensor* experts = ggml_mul_mat_id(ctx, w_down_e, par, sel);    // [n_embd, n_used, T]
+     experts = ggml_mul(ctx, experts, w_sel);
++    ggml_set_output(experts); // Isolate routed expert weighted-reduction fusion.
+ 
+     ggml_tensor* moe_out = ggml_view_2d(ctx, experts, n_embd, T,
+             experts->nb[2], 0);
+@@ -2093,10 +2094,10 @@
+             slot->qsa_inputs.push_back(in);
+         }
+ #ifdef TSG_GGML_USE_CUDA
+-        if (!qsa_plans.empty() && ggml_backend_is_cuda(g_backend))
++        if (ggml_backend_is_cuda(g_backend))
+         {
+             slot->precise_backend = tsg_dsv4_fused_backend_init(g_backend);
+-            if (!slot->precise_backend) throw std::runtime_error("qwen4exp QSA: precise backend creation failed");
++            if (!slot->precise_backend) throw std::runtime_error("qwen4exp target: precise backend creation failed");
+         }
+ #endif
+ 
+@@ -2279,6 +2280,21 @@
+             ggml_set_output(res_out);
+         }
+ 
++        if (slot->precise_backend)
++        {
++            // Match the draft executor: target verification must preserve F32
++            // operands and use the same reduction as scalar target decoding.
++            // Quantized/mixed-weight operations retain their declared routes.
++            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
++            {
++                auto* node = ggml_graph_node(graph, i);
++                if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)
++                    && (node->src[0]->type == GGML_TYPE_F32 || node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_BF16)
++                    && node->src[1]->type == GGML_TYPE_F32)
++                    tsg_matmul_require_f32(ctx, node);
++            }
++        }
++
+         const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
+         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+         std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&ggml_gallocr_free)>

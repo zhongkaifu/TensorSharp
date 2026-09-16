@@ -25,7 +25,7 @@ def fixture():
         counters = {'Drafted': 6, 'Accepted': 3, 'VerifySteps': 2, 'PlainSteps': 0, 'Rollbacks': 1}
         rows.append({'Label': key, 'Prompt': 3, 'Tokens': [10, 20, 30], 'OutTokens': 3, 'Finish': 'eos', 'Reused': 2,
                      **counters, 'TtftMs': 100, 'TotalMs': 300, 'DecodeTps': 10, 'PrefillTps': 30,
-                     'RequestTimelines': [{'Finish': 'eos', 'Error': None, 'OutTokens': 3, 'Speculation': counters.copy()}]})
+                     'RequestTimelines': [{'Id': key, 'Finish': 'eos', 'Error': None, 'OutTokens': 3, 'Speculation': counters.copy()}]})
         inputs.append({'id': key, 'tokens': [1, 2, 3], 'tokens_i32_sha256': c.token_sha([1, 2, 3]), 'prompt_tokens': 3,
                        'max_new_tokens': 128, 'verify_reserve': 4, 'maximum_position_exclusive': 135, 'media': key.startswith('image')})
     mtp = copy.deepcopy(rows)
@@ -34,8 +34,8 @@ def fixture():
             row[field] = row['RequestTimelines'][0]['Speculation'][field] = 0
     owner = {'exit_code': 0, 'before_identity_passed': True, 'after_identity_passed': True, 'process_gone': True, 'exclusive_timing': True,
              **dict.fromkeys(('native_sha256', 'managed_manifest_sha256', 'model_inventory_sha256', 'head_sha256'), 'a' * 64)}
-    return {'plain': rows, 'mtp': mtp, 'plain_owner': owner.copy(), 'mtp_owner': owner.copy(), 'plain_inputs': {'inputs': copy.deepcopy(inputs), 'mode': 'plain', 'tier': 'dense', 'actual_head': 'Mtp'},
-            'mtp_inputs': {'inputs': copy.deepcopy(inputs), 'mode': 'mtp', 'tier': 'dense', 'actual_head': 'Mtp'},
+    return {'plain': rows, 'mtp': mtp, 'plain_owner': owner.copy(), 'mtp_owner': owner.copy(), 'plain_inputs': {'inputs': copy.deepcopy(inputs), 'mode': 'plain', 'tier': 'dense', 'actual_head': 'PerToken'},
+            'mtp_inputs': {'inputs': copy.deepcopy(inputs), 'mode': 'mtp', 'tier': 'dense', 'actual_head': 'PerToken'},
             'plain_memory': dict.fromkeys(('host_rss_peak_bytes', 'cgroup_current_peak_bytes', 'gpu_used_peak_bytes'), 1000),
             'mtp_memory': dict.fromkeys(('host_rss_peak_bytes', 'cgroup_current_peak_bytes', 'gpu_used_peak_bytes'), 1000)}
 
@@ -50,8 +50,21 @@ class Gates(unittest.TestCase):
         self.assertFalse(result['release_qualified'])
 
     def test_same_tokens_different_finish_fails(self):
-        r = fixture(); r['mtp'][1]['Finish'] = 'length'
+        r = fixture(); r['mtp'][1]['Finish'] = 'max_tokens'
         self.assertEqual('failed', self.pair(r)['status'])
+
+    def test_scheduler_token_budget_finish_requires_the_complete_budget(self):
+        r = fixture()
+        for mode in ('plain', 'mtp'):
+            for row, inp in zip(r[mode], r[mode + '_inputs']['inputs']):
+                row['Finish'] = row['RequestTimelines'][0]['Finish'] = 'max_tokens'
+                inp['max_new_tokens'] = 3
+                inp['maximum_position_exclusive'] = 10
+        self.assertEqual('passed', self.pair(r)['status'])
+        for mode in ('plain', 'mtp'):
+            r[mode + '_inputs']['inputs'][1]['max_new_tokens'] = 4
+            r[mode + '_inputs']['inputs'][1]['maximum_position_exclusive'] = 11
+        self.assertTrue(any('incomplete token budget' in x for x in self.pair(r)['failures']))
 
     def test_longer_matching_prefix_is_not_full_parity(self):
         r = fixture(); r['mtp'][1]['Tokens'].append(40); r['mtp'][1]['OutTokens'] += 1
@@ -73,6 +86,10 @@ class Gates(unittest.TestCase):
     def test_concurrent_aggregate_cannot_substitute_per_request_counters(self):
         r = fixture(); r['mtp'][7]['RequestTimelines'][0]['Speculation']['VerifySteps'] = 0
         self.assertTrue(any('disagree' in x for x in self.pair(r)['failures']))
+
+    def test_concurrent_timeline_must_belong_to_the_actual_request(self):
+        r = fixture(); r['mtp'][7]['RequestTimelines'][0]['Id'] = 'parallel4-i1'
+        self.assertTrue(any('timeline identity' in x for x in self.pair(r)['failures']))
 
     def test_prompt_history_change_is_not_matched_workload(self):
         r = fixture(); inp = r['mtp_inputs']['inputs'][6]
@@ -104,6 +121,37 @@ class Gates(unittest.TestCase):
     def test_one_outlier_does_not_change_three_repeat_median(self):
         repeats = [fixture() for _ in range(3)]; repeats[0]['mtp'][1]['TtftMs'] = 300
         self.assertEqual('passed', c.compare_repeats(repeats)['status'])
+
+    def test_paired_concurrent_drift_is_not_repeat_determinism(self):
+        repeats = [fixture() for _ in range(3)]
+        for mode in ('plain', 'mtp'):
+            repeats[1][mode][7]['Tokens'] = [10, 21, 30]
+        self.assertTrue(all(self.pair(r)['status'] == 'passed' for r in repeats))
+        result = c.compare_repeats(repeats)
+        self.assertEqual('failed', result['status'])
+        changed = [r for r in result['determinism'] if r['failures']]
+        self.assertEqual(2, len(changed))
+        self.assertTrue(all(r['id'] == 'parallel4-i0' and r['first_divergence'] == 1 for r in changed))
+
+    def test_paired_finish_drift_is_not_repeat_determinism(self):
+        repeats = [fixture() for _ in range(3)]
+        for r in repeats:
+            for mode in ('plain', 'mtp'):
+                for inp in r[mode + '_inputs']['inputs']:
+                    inp['max_new_tokens'] = 3
+                    inp['maximum_position_exclusive'] = 10
+        for mode in ('plain', 'mtp'):
+            repeats[2][mode][7]['Finish'] = repeats[2][mode][7]['RequestTimelines'][0]['Finish'] = 'max_tokens'
+        self.assertTrue(all(self.pair(r)['status'] == 'passed' for r in repeats))
+        self.assertTrue(any('determinism failed' in x for x in c.compare_repeats(repeats)['failures']))
+
+    def test_paired_prompt_drift_is_not_a_repeated_workload(self):
+        repeats = [fixture() for _ in range(3)]
+        for mode in ('plain', 'mtp'):
+            inp = repeats[1][mode + '_inputs']['inputs'][7]
+            inp['tokens'] = [1, 2, 8]; inp['tokens_i32_sha256'] = c.token_sha(inp['tokens'])
+        self.assertTrue(all(self.pair(r)['status'] == 'passed' for r in repeats))
+        self.assertTrue(any('changed across repeats' in x for x in c.compare_repeats(repeats)['failures']))
 
     def test_missing_memory_does_not_silently_pass(self):
         repeats = [fixture() for _ in range(3)]; del repeats[0]['mtp_memory']

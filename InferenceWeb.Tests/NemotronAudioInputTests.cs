@@ -1,164 +1,107 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
-// Licensed under the BSD-3-Clause license in the repository root.
+using System.Text;
 using System.Text.Json;
-using TensorSharp.Models;
-using TensorSharp.Runtime;
-using TensorSharp.Server.Hosting;
-using TensorSharp.Server.RequestParsers;
 
 namespace InferenceWeb.Tests;
 
-/// <summary>
-/// Nemotron-H (Nemotron 3 Nano Omni included) has an audio front-end but no
-/// audio tower: the public mmproj carries only the RADIO vision encoder, so a
-/// clip cannot be turned into embeddings. Audio used to be decoded, warned
-/// about once on stderr, and the request then generated as if no audio had
-/// been sent. Every entry point now refuses it with one message, before any
-/// upload is written.
-/// </summary>
-public sealed class NemotronAudioInputTests : IDisposable
+public sealed class NemotronAudioInputTests
 {
-    private readonly string _directory = Path.Combine(Path.GetTempPath(), "nemotron-audio-" + Guid.NewGuid().ToString("N"));
-
-    public NemotronAudioInputTests() => Directory.CreateDirectory(_directory);
-
-    public void Dispose() => Directory.Delete(_directory, true);
-
     [Theory]
-    [InlineData("nemotron_h")]
-    [InlineData("nemotron_h_moe")]
-    [InlineData("nemotron_h_omni")]
-    [InlineData("NEMOTRON_H_MOE")]
-    public void EveryNemotronAliasGetsTheSameRefusal(string architecture)
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    public void OfficialParakeetFrontend_AllMelValuesMatch(int caseIndex)
     {
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, ChatGenerationPipeline.AudioInputErrorFor(architecture));
-        Assert.Contains("does not support audio input", NemotronModel.AudioInputUnsupportedMessage);
-        Assert.Contains("RADIO vision tower", NemotronModel.AudioInputUnsupportedMessage);
-
-        var history = new List<ChatMessage>
+        using var stream = typeof(NemotronAudioInputTests).Assembly.GetManifestResourceStream(
+            "InferenceWeb.Tests.Fixtures.NemotronAudio.frontend_reference.json")!;
+        using var json = JsonDocument.Parse(stream);
+        var example = json.RootElement.GetProperty("cases")[caseIndex];
+        float[] samples = example.GetProperty("samples").EnumerateArray().Select(v => v.GetSingle()).ToArray();
+        float[] expected = example.GetProperty("expected").EnumerateArray().Select(v => v.GetSingle()).ToArray();
+        var result = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
+        Assert.Equal(example.GetProperty("frames").GetInt32(), result.frames);
+        Assert.Equal(example.GetProperty("valid_frames").GetInt32(), result.validFrames);
+        Assert.Equal(expected.Length, result.mel.Length);
+        for (int i = 0; i < expected.Length; i++)
         {
-            new() { Role = "user", Content = "Describe this", ImagePaths = new() { "photo.png" } },
-            new() { Role = "assistant", Content = "A photo." },
-            new() { Role = "user", Content = "And this?", AudioPaths = new() { "clip.wav" } },
-        };
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage,
-            ChatGenerationPipeline.UnsupportedAudioInputError(architecture, history));
-
-        // Image-only and text-only histories are untouched by the gate.
-        history.RemoveAt(2);
-        Assert.Null(ChatGenerationPipeline.UnsupportedAudioInputError(architecture, history));
-    }
-
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("gemma4")]
-    [InlineData("qwen35")]
-    [InlineData("not-a-registered-architecture")]
-    public void FamiliesWithAnAudioTowerOrUnknownToTheRegistryAreNotGated(string? architecture)
-    {
-        Assert.Null(ChatGenerationPipeline.AudioInputErrorFor(architecture));
-    }
-
-    [Fact]
-    public void DeepSeek41KeepsItsOwnRefusal()
-    {
-        Assert.Equal(ChatGenerationPipeline.DeepSeek41AudioInputError, ChatGenerationPipeline.AudioInputErrorFor("deepseek41"));
-    }
-
-    [Theory]
-    [InlineData("{\"type\":\"input_audio\",\"input_audio\":{\"format\":\"wav\",\"data\":\"AQID\"}}")]
-    [InlineData("{\"type\":\"input_audio\"}")]
-    [InlineData("{\"type\":\"audio_url\",\"audio_url\":{\"url\":\"data:audio/wav;base64,AQID\"}}")]
-    [InlineData("{\"type\":\"audio_url\",\"audio_url\":null}")]
-    public void OpenAIChatRequestIsRejectedBeforeAnyUploadIsWritten(string audioPart)
-    {
-        var uploads = new UploadStoragePolicy(_directory);
-        using var messages = JsonDocument.Parse("""
-            [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]},
-             {"role":"assistant","content":"An earlier image."},
-             {"role":"user","content":[{"type":"text","text":"What is said here?"},
-            """ + audioPart + "]}]");
-
-        JsonException error = Assert.Throws<JsonException>(() =>
-            ChatMessageParser.ParseOpenAI(messages.RootElement, uploads, architecture: "nemotron_h_moe"));
-
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, error.Message);
-        Assert.Empty(Directory.EnumerateFiles(_directory));
-        Assert.Equal(0, uploads.UsedBytes);
-    }
-
-    [Theory]
-    [InlineData("{\"type\":\"input_audio\",\"input_audio\":{\"format\":\"wav\",\"data\":\"AQID\"}}")]
-    [InlineData("{\"type\":\"input_audio\"}")]
-    [InlineData("{\"type\":\"audio_url\",\"audio_url\":{\"url\":\"https://example.invalid/audio.wav\"}}")]
-    public void ResponsesRequestIsRejectedBeforeAnyUploadIsWritten(string audioPart)
-    {
-        var uploads = new UploadStoragePolicy(_directory);
-        using var input = JsonDocument.Parse("""
-            [{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AQID"}]},
-             {"type":"message","role":"user","content":[
-            """ + audioPart + "]}]");
-
-        JsonException error = Assert.Throws<JsonException>(() => ChatMessageParser.ParseResponsesInput(
-            input.RootElement, null, uploads, architecture: "nemotron_h_omni"));
-
-        Assert.Equal(NemotronModel.AudioInputUnsupportedMessage, error.Message);
-        Assert.Empty(Directory.EnumerateFiles(_directory));
-        Assert.Equal(0, uploads.UsedBytes);
-    }
-
-    [Fact]
-    public void ImageOnlyNemotronRequestsStillParse()
-    {
-        var uploads = new UploadStoragePolicy(_directory);
-        using var messages = JsonDocument.Parse("""
-            [{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]}]
-            """);
-
-        var parsed = ChatMessageParser.ParseOpenAI(messages.RootElement, uploads, architecture: "nemotron_h_moe");
-
-        Assert.Equal(new byte[] { 1, 2, 3 }, File.ReadAllBytes(Assert.Single(parsed[0].ImagePaths)));
-        Assert.Null(parsed[0].AudioPaths);
-    }
-}
-
-/// <summary>
-/// The fact the refusal rests on, checked against the real files: the Omni
-/// mmproj is a vision-only projector. If a distribution ever ships the audio
-/// tower, this is the test that says the refusal must go.
-/// </summary>
-[Trait("Requires", "Models")]
-public sealed class NemotronOmniMmprojContractTests
-{
-    private sealed class MmprojFactAttribute : FactAttribute
-    {
-        public MmprojFactAttribute()
-        {
-            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_TEST_NEMOTRON_MMPROJ")))
-                Skip = "Requires TS_TEST_NEMOTRON_MMPROJ: the Nemotron 3 Nano Omni mmproj GGUF.";
+            double delta = Math.Abs(result.mel[i] - expected[i]);
+            // Independent torch F32 STFT/librosa Slaney-filter reference;
+            // allow FFT rounding while rejecting window/filter/normalization drift.
+            double tolerance = 1e-3 + 1e-4 * Math.Abs(expected[i]);
+            Assert.True(double.IsFinite(delta) && delta <= tolerance,
+                $"case={caseIndex} frame={i / 128} mel={i % 128} expected={expected[i]:R} actual={result.mel[i]:R} delta={delta:R} tolerance={tolerance:R}");
         }
     }
 
-    [MmprojFact]
-    public void TheOmniMmprojCarriesOnlyTheVisionTower()
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(159, 1)]
+    [InlineData(160, 1)]
+    [InlineData(1279, 1)]
+    [InlineData(1280, 2)]
+    [InlineData(1281, 2)]
+    [InlineData(2559, 2)]
+    [InlineData(2560, 3)]
+    public void CenterStftExtraFrame_IsIncludedInAudioTokenCount(int samples, int tokens)
     {
-        using var gguf = GgufFile.OpenWithoutSiblingShards(Environment.GetEnvironmentVariable("TS_TEST_NEMOTRON_MMPROJ")!);
+        float[] waveform = Enumerable.Range(0, samples).Select(i => MathF.Sin(i * .13f) * .2f).ToArray();
+        var first = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(waveform);
+        var second = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(waveform);
+        Assert.Equal(1 + samples / 160, first.frames);
+        Assert.Equal(Math.Max(1, samples / 160), first.validFrames);
+        Assert.Equal(tokens, NemotronAudioEncoder.OutputLength(first.frames));
+        Assert.Equal(first.mel, second.mel);
+        Assert.All(first.mel, value => Assert.True(float.IsFinite(value)));
+        Assert.All(first.mel.Skip(first.validFrames * 128), value => Assert.Equal(0, value));
+    }
 
-        Assert.Equal("clip", gguf.GetString("general.architecture"));
-        Assert.Equal("nemotron_v2_vl", gguf.GetString("clip.projector_type"));
-        Assert.True(gguf.GetBool("clip.has_vision_encoder"));
-        Assert.False(gguf.Metadata.ContainsKey("clip.has_audio_encoder"));
-        Assert.Empty(gguf.Metadata.Keys.Where(k => k.StartsWith("clip.audio", StringComparison.OrdinalIgnoreCase)));
+    [Fact]
+    public void MediaPlan_PreservesAllClipAndImagePositionsAcrossTurns()
+    {
+        var history = new List<ChatMessage>
+        {
+            new() { Role = "user", ImagePaths = new() { "image1" }, AudioPaths = new() { "audio1", "audio2" } },
+            new() { Role = "assistant", Content = "response" },
+            new() { Role = "user", AudioPaths = new() { "audio3" } },
+        };
+        var tokens = new List<int> { 1, 27, 2, 18, 3, 27, 4, 27 };
+        var plan = ModelMultimodalInjector.PlanNemotronMedia(history, tokens, 18, 27);
+        Assert.Equal(new[] { (1, true, "audio1"), (3, false, "image1"), (5, true, "audio2"), (7, true, "audio3") }, plan);
+        Assert.Equal(new[] { 1, 27, 2, 18, 3, 27, 4, 27 }, tokens);
+        Assert.Throws<InvalidOperationException>(() => ModelMultimodalInjector.PlanNemotronMedia(history, new List<int> { 18, 27 }, 18, 27));
+        Assert.Throws<InvalidOperationException>(() => ModelMultimodalInjector.PlanNemotronMedia(history, tokens, 18, -1));
+    }
 
-        string[] names = gguf.Tensors.Keys.ToArray();
-        Assert.NotEmpty(names);
-        // Vision blocks and the nemotron_v2_vl MLP projector, nothing else.
-        Assert.All(names, n => Assert.True(n.StartsWith("v.", StringComparison.Ordinal) ||
-                                            n.StartsWith("mm.", StringComparison.Ordinal), n));
-        Assert.Empty(names.Where(n => n.StartsWith("a.", StringComparison.Ordinal) ||
-                                      n.Contains("audio", StringComparison.OrdinalIgnoreCase)));
-        Assert.Contains("v.blk.0.attn_qkv.weight", names);
-        Assert.Contains("mm.model.mlp.3.weight", names);
+    [Fact]
+    public void WavDecoder_PreservesInterleavedStereoOrderAndRejectsMalformedSamples()
+    {
+        byte[] wav = Wav(new[] { .8f, -.2f, -.6f, .4f, .2f, .6f });
+        float[] mono = NemotronAudioPreprocessor.DecodeWAV(wav);
+        Assert.Equal(3, mono.Length);
+        Assert.InRange(Math.Abs(mono[0] - .3f), 0, 1e-7f);
+        Assert.InRange(Math.Abs(mono[1] + .1f), 0, 1e-7f);
+        Assert.InRange(Math.Abs(mono[2] - .4f), 0, 1e-7f);
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(wav[..^1]));
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(Wav(new[] { float.NaN, 0f })));
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(Wav(new[] { 1f })));
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(Wav(Array.Empty<float>())));
+        byte[] invalidSize = (byte[])wav.Clone(); Array.Fill(invalidSize, (byte)255, 40, 4);
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(invalidSize));
+        byte[] invalidRate = (byte[])wav.Clone(); Array.Clear(invalidRate, 24, 4);
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(invalidRate));
+        byte[] invalidBits = (byte[])wav.Clone(); invalidBits[34] = 64;
+        Assert.Throws<InvalidDataException>(() => NemotronAudioPreprocessor.DecodeWAV(invalidBits));
+        Assert.Throws<ArgumentException>(() => NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(new[] { float.PositiveInfinity }));
+    }
+
+    private static byte[] Wav(float[] samples)
+    {
+        using var stream = new MemoryStream(); using var writer = new BinaryWriter(stream, Encoding.ASCII, true);
+        writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + samples.Length * 4); writer.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+        writer.Write(16); writer.Write((ushort)3); writer.Write((ushort)2); writer.Write(16000); writer.Write(16000 * 8);
+        writer.Write((ushort)8); writer.Write((ushort)32); writer.Write(Encoding.ASCII.GetBytes("data")); writer.Write(samples.Length * 4);
+        foreach (float sample in samples) writer.Write(sample); writer.Flush(); return stream.ToArray();
     }
 }

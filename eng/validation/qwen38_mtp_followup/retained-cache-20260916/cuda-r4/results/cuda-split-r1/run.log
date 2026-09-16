@@ -1,0 +1,43 @@
+Test run for /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.30]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.61]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.64]   Starting:    InferenceWeb.Tests
+[GGML] multi-device (layer split): 2 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+  Layer split: honouring TS_Q4E_LAYER_SPLIT=1,1
+  Layer split across 2 GPUs: gpu0=1 layers/0 MB, gpu1=1 layers/0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=1, mappedBytes=10336.
+[GGML] multi-device (layer split): 2 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+  Layer split: honouring TS_Q4E_LAYER_SPLIT=1,1
+  Layer split across 2 GPUs: gpu0=1 layers/0 MB, gpu1=1 layers/0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=1, mappedBytes=10336.
+[xUnit.net 00:00:03.10]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.LayerSplitCandidate_CloneCorePreservesAllDeviceStateAndFullLogits [1 s]
+
+Test Run Successful.
+Total tests: 1
+     Passed: 1
+ Total time: 4.0504 Seconds
+Results File: /workspace/ts-qwen-retained-r4/results/cuda-split-r1/result.trx

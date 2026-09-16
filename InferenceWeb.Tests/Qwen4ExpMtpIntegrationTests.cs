@@ -296,6 +296,40 @@ public sealed class Qwen4ExpMtpIntegrationTests(ITestOutputHelper output)
     }
 
     [Qwen4ExpQsaTinyFact]
+    public void QsaFirstPromptAndReset_GrowBeforeForwardWithoutExportingInvalidatedState()
+    {
+        Assert.Equal("8", Environment.GetEnvironmentVariable("TS_KV_INITIAL_TOKENS"));
+        using var fixture = new Fixture(output);
+        using var model = fixture.Load();
+        using var cold = fixture.Load();
+        int[] first = Enumerable.Range(11, 14).ToArray();
+        int[] afterReset = Enumerable.Range(41, 24).ToArray();
+        Assert.Equal(8, Field<int>(model, "_kvCacheCapacity"));
+
+        // The first request exceeds the initial allocation before any native
+        // QSA entry has been seeded. Compare every logit with a pre-grown model.
+        float[] initial = AllLogits(model, first);
+        Assert.Equal(16, Field<int>(model, "_kvCacheCapacity"));
+        cold.SpecEnsureCapacity(16);
+        Assert.Equal(initial, AllLogits(cold, first));
+        Assert.Equal(RawQsa(cold).Bytes, RawQsa(model).Bytes);
+
+        model.ResetKVCache();
+        Assert.Equal(0, model.CacheSeqLen);
+        Assert.False(Field<bool>(model, "_kvCacheHostStale"));
+        // Reset invalidates the previous native entry; this larger request
+        // forces growth before it can be reseeded, reproducing the video bug.
+        float[] reset = AllLogits(model, afterReset);
+        Assert.Equal(32, Field<int>(model, "_kvCacheCapacity"));
+        cold.ResetKVCache();
+        cold.SpecEnsureCapacity(32);
+        Assert.Equal(reset, AllLogits(cold, afterReset));
+        Assert.Equal(RawQsa(cold).Bytes, RawQsa(model).Bytes);
+        Assert.Equal(AllLogits(cold, [79, 83]), AllLogits(model, [79, 83]));
+        output.WriteLine("QSA first/reset prompt growth 8->16->32: all logits and raw-key bytes match pre-grown references.");
+    }
+
+    [Qwen4ExpQsaTinyFact]
     public void QsaMediaHistory_HolderReleaseAndRewindPreserveOtherRawCache()
     {
         Assert.Equal("8", Environment.GetEnvironmentVariable("TS_KV_INITIAL_TOKENS"));
@@ -418,25 +452,17 @@ public sealed class Qwen4ExpMtpIntegrationTests(ITestOutputHelper output)
             {
                 null or "" or "GgmlCpu" => BackendType.GgmlCpu,
                 "GgmlCuda" => BackendType.GgmlCuda,
+                "GgmlMetal" => BackendType.GgmlMetal,
                 var unsupported => throw new InvalidOperationException($"Unsupported fixture backend {unsupported}"),
             };
             var model = new Qwen4ExpModel(Path.Combine(_path, "target.gguf"), backend,
                 draftGgufPath: Path.Combine(_path, "head.gguf"));
             try
             {
-                // The mapped native library carries the platform's file name: the
-                // Windows-only "GgmlOps.dll" match left this collection empty on
-                // Linux, so every CUDA run of these tests failed before touching
-                // the model (docs/validation/qwen38-mtp-cuda-graphs/README.md).
-                string nativeFileName = OperatingSystem.IsWindows() ? "GgmlOps.dll"
-                    : OperatingSystem.IsMacOS() ? "libGgmlOps.dylib"
-                    : "libGgmlOps.so";
-                var modules = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-                    .Where(m => string.Equals(Path.GetFileName(m.FileName), nativeFileName, StringComparison.OrdinalIgnoreCase)).ToArray();
-                Assert.Single(modules);
-                string hash = Hash(modules[0].FileName);
+                string native = TestGates.MappedNativeGgmlOpsPath();
+                string hash = Hash(native);
                 Assert.Equal(Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_NATIVE_SHA256"), hash);
-                _output.WriteLine($"native {modules[0].FileName} sha256={hash}; backend={backend}");
+                _output.WriteLine($"native {native} sha256={hash}; backend={backend}");
                 Assert.Equal(260, model.Config.VocabSize);
                 Assert.Equal(32, model.SpecFeatureSize);
                 return model;

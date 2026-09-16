@@ -48,11 +48,16 @@ def main():
     parser.add_argument("--geometry", choices=("tiny", "gdn32"), default="tiny",
                         help="gdn32 uses supported CUDA GDN/conv dimensions; tiny preserves the CPU fixture")
     parser.add_argument("--qsa", action="store_true", help="Enable synthetic target QSA with ratio4/topk8; head remains dense.")
+    parser.add_argument("--attention-head-dim", type=int, choices=(8, 64, 256), default=8,
+                        help="Explicit synthetic attention geometry; 64/256 exercise the flash-attention route with F16 KV.")
+    parser.add_argument("--attention-heads", type=int, choices=(4, 24), default=4,
+                        help="24 attention heads over the two KV heads exercises the trained target's GQA ratio.")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     module_path = Path(__file__).parent / "tests/qwen4exp-target-snapshot.py"
     module = load_module(module_path)
-    target = module.Target(json.loads(args.sample.read_text(encoding="utf-8")), geometry=args.geometry)
+    target = module.Target(json.loads(args.sample.read_text(encoding="utf-8")), geometry=args.geometry,
+                           attention_head_dim=args.attention_head_dim, attention_heads=args.attention_heads)
     b = target.base
     arrays = b.arrays
     rng = np.random.default_rng(481048)
@@ -184,7 +189,9 @@ def main():
     target_path, head_path = args.output_dir / "target.gguf", args.output_dir / "head.gguf"
     write(target_path, trunk_weights, False)
     write(head_path, head_weights, True)
-    report = dict(schema_version=1, fixture=True, scope=__doc__, geometry=args.geometry, qsa=args.qsa, source_sha256=sha(__file__),
+    report = dict(schema_version=1, fixture=True, scope=__doc__, geometry=args.geometry,
+                  attention_head_dim=args.attention_head_dim, attention_heads=args.attention_heads,
+                  qsa=args.qsa, source_sha256=sha(__file__),
                   target_fixture_sha256=sha(module_path),
                   operator_fixture_sha256=sha(module_path.with_name("qwen4exp-mtp-operator.py")),
                   sample_sha256=sha(args.sample), vocab=vocab, eos_token_id=257, context_length=1024,

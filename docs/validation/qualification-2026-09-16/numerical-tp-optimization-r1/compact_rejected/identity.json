@@ -1,0 +1,23 @@
+{
+  "recorded_utc": "2026-09-16T18:14:36.723514+00:00",
+  "source_directory": "/workspace/ts-tp-compact-prototype-20260916",
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "sources_sha256": {
+    "ts-tp-strip-benchmark.cpp": "6042543193956f068e1817f1925a977fd5a635fb639b9d185998d6c32964e926",
+    "ts-tp-strip-benchmark-build.py": "8cdd22e97420ea45aacc5dfb6d0480667d0928f472e9260c8cfeec385a7ecd06",
+    "ts-tp-integrated-build.py": "98e5345710d93e22594cfc80536c916bb15e500f52a7b1bb7419ff6158385cea",
+    "ggml_ops_matmul_quant_tile.cuh": "4b4cc3d186a80f38ec8f2b800b7b1d223e655f0e1bbc0bd4aaf1d212e84c67e0",
+    "ggml_ops_matmul_quant_strip.cuh": "9eddf92d9b5cc0dfa44561be2b6d64ceb095debee57d4237d3d816dc2548f73b",
+    "ggml_ops_matmul_precision.h": "0393c8ebc50b54f86537e779f628b19e04d3ee9604b9378651f3b630c2c8f480",
+    "ggml_ops_matmul_precision.cu": "9ae4c9936ffa229017874c05f318681a9ec9e12b3c5e161a19fca457ceef3176",
+    "ggml_ops_matmul_precision.cpp": "33949d3beb97fcb04bb4c1d47a2483368dfa5575c9dabf2bf921974681412859",
+    "ggml_ops_dsv4_fused.h": "fcc5081b92eb218e0c3056be80a5d30623e8ae4a41fe5c5c34e22f5ec15b14b1",
+    "ggml_ops_dsv4_fused.cu": "deb9263afad8440a1a1a61a9c0f1556d9b9ded128a8e63cb3694cd424982e202",
+    "ggml_ops_deepseek41_tp.cpp": "f12cbc7777167e11639fa1a63c070c5bced1cfebfc3bdedb30848dac893e29a6",
+    "dsv41_tp_test.cpp": "e0945ddd9d941fed95eafeb9aafc860f221dc296b0d675c8ab329e82d2878486"
+  },
+  "binaries_sha256": {
+    "integrated-test": "d38d286c66a92a80c777356eee7e060a87b91ca6443f2d09a0a9f975dac6147a",
+    "strip-benchmark": "84657cd5e2d90d7b727424f7a22609c3e39acc17e731f04511214e2f2251359b"
+  }
+}

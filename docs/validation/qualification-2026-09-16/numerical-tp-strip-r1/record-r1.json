@@ -1,0 +1,48 @@
+{
+  "recorded_utc": "2026-09-16T17:57:16.342547+00:00",
+  "baseline_repository": "/workspace/ts-codex-20260916-r3/repo",
+  "candidate_directory": "/workspace/ts-tp-virtual-prototype-20260916",
+  "upstream_ggml_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "upstream_ggml_status": "",
+  "native_source_sha256": {
+    "ggml_ops_matmul_precision.cpp": "2c684fa0140d9d03594df09b6427b423fe4089df22ef51a51cbad4d12d089393",
+    "ggml_ops_matmul_precision.h": "e8fa1bbe07cde96a6a34fe8816acf407aeb979da166b85869759b45e9b47c08a",
+    "ggml_ops_matmul_precision.cu": "b73aea2290c396e48f1dc6ea79def4da3f4195e0935d2d472e6aaf9a8123702e",
+    "ggml_ops_matmul_quant_strip.cuh": "7432ec7d04665fc67c5b6ffff7ed475be909a9be4fc2d70f553a8f092e2eada1",
+    "ggml_ops_dsv4_fused.cu": "2a0202c92313fcb7a2b84065651a980740219afa41e3817120893da7c412c325",
+    "ggml_ops_dsv4_fused.h": "46df50d1547b972c1ce6211d448d15d9ab5214f15540c71c94de26ba92d6498b",
+    "ggml_ops_deepseek41_tp.cpp": "3d8fef2edb713f0f3cfb0194aa353db9d266619a3c5333a8d5bf38b844a8c933",
+    "dsv41_tp_test.cpp": "571de461e58ea5c0d26931bb6e2d46e21ec5b85c6bb86b36b5c6976949d9369e",
+    "ts-tp-integrated-build.py": "df2b392ac5a8e80217e9be29b2741de97d600a2f796a5284eb3305c55187267d",
+    "ts-tp-strip-benchmark.cpp": "6042543193956f068e1817f1925a977fd5a635fb639b9d185998d6c32964e926",
+    "ts-tp-strip-benchmark-build.py": "524d145a19bc8c9bb73fefdce21b5db6bf219da483bf2d6182164ecaaef39d2e"
+  },
+  "binaries": {
+    "original": {
+      "path": "/workspace/ts-codex-20260916-r3/repo/TensorSharp.GGML.Native/build/GgmlOpsDsv41TpTest",
+      "sha256": "9edc228549c1c6c7bc46371f31bd6ab1fe1e6cb53e205dc1b2a8b968ef256176"
+    },
+    "candidate": {
+      "path": "/workspace/ts-tp-virtual-prototype-20260916/integrated-test",
+      "sha256": "6aed08b9eda9a2b0f91c9c6835f7a3cf367afde2b0197869c2933d7c1af74fd1"
+    },
+    "microbenchmark": {
+      "path": "/workspace/ts-tp-virtual-prototype-20260916/strip-benchmark",
+      "sha256": "52d8bf375308eb28449b000b5a706f636a3185fb8750074f59e6af29125cde33"
+    }
+  },
+  "qualification": {
+    "original_physical_cuda_0_6_exit": 1,
+    "candidate_physical_cuda_0_6_exit": 0,
+    "candidate_physical_cuda_0_6_passed": 16,
+    "original_oracle": "untouched full-weight ggml CUDA MoE",
+    "tolerances": {
+      "maximum_absolute": 2e-06,
+      "relative_l2": 1e-05
+    },
+    "one_gpu_36_case_sweep": "passed with initial fast-math isolated build; not exact production-flags binary coverage",
+    "microbenchmark": "60 alternating warmed pairs for 18 cases, GPU6; other VM campaigns active; material regression observed, not accepted",
+    "full_model_tp": "not run",
+    "release_qualified": false
+  }
+}

@@ -741,6 +741,24 @@ native `SpecForward` agree row for row, hidden states included. No speculation
 run on the real GLM-5.3-Flash checkpoint exists yet, so there is no throughput
 verdict for it.
 
+Failures at the C ABI are contained rather than propagated. A capture that
+throws (arena allocation, a backend copy) returns failure and leaves the live
+state untouched. A restore that throws after copying only some layers marks
+that slot unusable: forward, speculative forward, capture, restore and rewind
+all refuse it until `TSGgml_GlmResetChecked` (which `TSGgml_GlmReset` and a
+glm5next rewind to 0 now go through, and which the managed side calls as
+`GgmlGlmNative.ResetChecked`) succeeds; other slots keep running. The CUDA rows
+of the rollback suite are `[GlmNativeCudaFact]` facts (`TS_TEST_GLM_CUDA=1`),
+the suite also checks A/B/A bound-slot rollback on both backends, and
+`Glm5NextNativeSnapshotBoundaryTests` (`TS_TEST_GLM_SNAPSHOT_BOUNDARY=1`, a
+native library built with test hooks, whose fault injector
+`TSGgml_GlmTestKdaSnapshotFault` is a `TSG_TEST_EXPORT` kept out of the iOS
+export list) injects `std::bad_alloc` and a non-standard exception into capture
+and mid-restore on CPU and CUDA and checks that a checked reset recovers the
+full-vocabulary logits. Recorded runs:
+[`glm5next-cuda-r4`](../validation/qualification-2026-09-16/glm5next-cuda-r4/README.md)
+(original 22/22 and expanded 26/26 on one A40, no skips).
+
 ### Measured
 
 2× RTX PRO 6000 Blackwell (96 GB), GLM-5.3-Flash-UD-Q2_K_XL (101 GiB), layer

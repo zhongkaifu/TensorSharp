@@ -10,8 +10,9 @@
 | Vision encoder | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs) (RADIO / v2_vl ViT) |
 | Image processor | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | Audio frontend | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs) (Parakeet-style log-mel) |
+| Audio encoder | [`NemotronAudioEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioEncoder.cs) (Parakeet/FastConformer + sound projector; needs a companion GGUF that no public repository ships, see §4.7) |
 | Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni |
-| Modalities | Text, image (Omni-class with `mmproj` loaded). Audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
+| Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
 | Batched / paged forward | **Default ON** — set `TS_NEMOTRON_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
@@ -31,8 +32,9 @@ The Omni `mmproj` enables **image input only**: it carries the 32-block RADIO
 vision tower (`v.blk.*`, `v.patch_embd`, `v.position_embd`) and the
 `nemotron_v2_vl` MLP projector (`mm.model.mlp.*`) with `clip.has_vision_encoder`
 and nothing for audio, and the language GGUF has only the `<so_embedding>`
-placeholder token. An audio attachment is therefore **refused** at the request
-(HTTP 400) rather than decoded and dropped (see §4.6).
+placeholder token. With only these files loaded an audio attachment is
+therefore **refused** at the request (HTTP 400) rather than decoded and
+dropped (see §4.6); audio needs a separately prepared companion GGUF (§4.7).
 
 These conversions identify NVIDIA's corresponding Nemotron repositories as
 their upstream bases. The upstream cards use NVIDIA-specific (`other`) terms;
@@ -72,10 +74,12 @@ Nemotron-H is NVIDIA's hybrid **Mamba2 + Transformer** family. The same
 backbone covers the dense `nemotron_h` line (e.g. Nemotron-H-8B / 47B) and the
 MoE `nemotron_h_moe` line. The Omni distribution (Nemotron 3 Nano Omni)
 additionally ships a RADIO / v2_vl vision encoder (via `mmproj`). TensorSharp
-also implements a Parakeet-style audio preprocessor for the Omni line, but
-the audio tower itself (a 24-layer Parakeet/FastConformer encoder plus its
-projector) is not in any public GGUF, so audio input is refused (see §4.6) —
-image is the only functional extra modality.
+also implements the Omni line's Parakeet-style audio preprocessor and its
+audio tower (a 24-layer Parakeet/FastConformer encoder plus sound projector,
+`NemotronAudioEncoder`), but those weights are not in any public GGUF: with
+the published files image is the only functional extra modality and audio is
+refused (see §4.6); a companion GGUF converted from NVIDIA's checkpoint enables
+audio (see §4.7).
 
 The defining traits are:
 
@@ -332,12 +336,14 @@ Stock llama.cpp answers the same checkpoint with "This model does not
 support audio input"; audio there needs a community fork and a unified
 `mmproj` that carries the audio tower.
 
-TensorSharp therefore **refuses** audio for this family rather than decoding
-the clip, warning, and generating as if none had been sent (which is what it
-did before: the model saw an unfilled `<so_embedding>` and answered the text
-alone). One table, `AudioInputSupport.UnsupportedReasonFor`, keyed on the
-architecture through the registry so every alias (`nemotron_h`,
-`nemotron_h_moe`, `nemotron_h_omni`) is covered, drives every entry point:
+Unless an audio tower was loaded from a companion GGUF (§4.7), TensorSharp
+therefore **refuses** audio for this family rather than decoding the clip,
+warning, and generating as if none had been sent (which is what it did before:
+the model saw an unfilled `<so_embedding>` and answered the text alone). One
+table, `AudioInputSupport.UnsupportedReasonFor`, keyed on the architecture
+through the registry so every alias (`nemotron_h`, `nemotron_h_moe`,
+`nemotron_h_omni`) is covered and told whether the loaded model reports
+`NemotronModel.IsAudioEncoderLoaded`, drives every entry point:
 
 - `/v1/chat/completions` and `/v1/responses` scan the whole request before
   writing any upload and answer **400** `invalid_request_error` with
@@ -352,11 +358,50 @@ architecture through the registry so every alias (`nemotron_h`,
   `NotSupportedException` with the same message for any caller that bypasses
   those gates.
 
-If a distribution ever ships the audio tower, `NemotronOmniMmprojContractTests`
-(gated on `TS_TEST_NEMOTRON_MMPROJ`) is the test that will fail first; wiring
-the tower then means an encoder graph over `NemotronAudioPreprocessor`'s
-frames, a projector into the 2688-wide embedding, and the existing
-`_pendingAudioEmbeddings` sink (`SetAudioEmbeddings`) that Gemma 4 already uses.
+`NemotronAudioRefusalTests` covers these gates (with and without a loaded
+tower) and `NemotronOmniMmprojContractTests` (gated on `TS_TEST_NEMOTRON_MMPROJ`)
+pins the published mmproj's vision-only layout; if a distribution ever ships
+the tower in that file, it is the test that fails first.
+
+### 4.7 Audio tower (`NemotronAudioEncoder`, companion GGUF)
+
+`NemotronAudioEncoder` runs NVIDIA's Parakeet/FastConformer encoder
+(subsampling convolutions, relative-position attention, convolution blocks)
+and the `sound_projection` MLP into the language model's hidden size, one clip
+at a time so a neighbouring clip's padding can neither change its length nor
+leak into its bidirectional attention. It reads a **companion GGUF** that keeps
+the official `sound_encoder.encoder.*` / `sound_projection.*` tensor names with
+`nemotron.audio.*` hyperparameters (`general.architecture=nemotron_audio`).
+No public repository ships such a file; the conversion scripts that extract it
+from NVIDIA's BF16 checkpoint are archived with the evidence in
+[`docs/validation/qualification-2026-09-16/nemotron-audio-cpu`](../validation/qualification-2026-09-16/nemotron-audio-cpu/README.md)
+(`reference-scripts/prepare.py`; `prepare_f32.py` writes the same weights with
+`nemotron.audio.compute_bf16=false`).
+
+Loading follows the tensors, not a flag. `LoadProjectors` hands the `--mmproj`
+path to both towers: the vision encoder loads only when the file has `v.*`
+tensors, and the audio encoder only when it has `sound_projection.linear2.weight`
+(or, when `TS_NEMOTRON_AUDIO_MMPROJ` names a file, from that file instead, so a
+vision mmproj and an audio companion can be used together). The encoder then
+validates every tensor shape and the Parakeet sampling configuration, and the
+projection width must equal the language model's hidden size; a partial or
+mismatched companion fails the load with `InvalidDataException` instead of
+being served. Only then does `IsAudioEncoderLoaded` lift the §4.6 refusal, and
+`ProcessNemotronHistory` plans every image and clip against the original prompt
+(`PlanNemotronMedia`, per-modality attachment order), expands each
+`<so_embedding>` to `<so_start>` + N + `<so_end>`, and queues the projected rows.
+
+What is established (CPU only; see the evidence README): the Parakeet mel
+frontend matches an independent reference on six clips
+(`NemotronAudioInputTests`); the encoder and projector match the official
+Transformers modules on small 8- and 128-mel fixtures in F32 and BF16 compute,
+managed and GGML CPU (`NemotronAudioEncoderTests`); two-clip injection and
+sliced queueing keep exact rows and independent request retention
+(`NemotronAudioInjectorTests`). On the official trained companion the explicit
+F32-compute configuration matches all 8,064 output values; the original BF16
+compute configuration still **fails** (3,794/8,064 at an unchanged tolerance,
+first difference a BF16 rounding boundary in layer 0). Spoken-audio answer
+quality, GPU execution and latency are not qualified.
 
 ## 5. Parameters and settings
 
@@ -644,9 +689,8 @@ the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 - **Per-token MoE batching** — even with `MoEExpertsForward`, the per-token
   managed loop is still the outer driver. A batched kernel that handles
   multiple tokens in one dispatch would help long prompts.
-- **Audio tower** — the audio frontend (log-mel) and the embedding sink
-  (`SetAudioEmbeddings` / `_pendingAudioEmbeddings`) exist, but the
-  Parakeet/FastConformer encoder and its projector are not in any public
-  GGUF, so audio is refused (see §4.6). Support needs a distribution that
-  ships the tower (a unified `mmproj`) plus its encoder graph; until then
-  the refusal stays, and `NemotronOmniMmprojContractTests` pins the fact.
+- **Audio tower** — `NemotronAudioEncoder` runs on the managed CPU path from
+  a companion GGUF (§4.7); the public GGUFs still carry no tower, so audio is
+  refused unless that companion is loaded. Open work: BF16-compute parity on
+  the trained weights, a GPU/native encoder graph, spoken-audio acceptance and
+  latency qualification.

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Xunit;
 using Xunit.Abstractions;
 using Xunit.Sdk;
@@ -84,6 +86,43 @@ namespace InferenceWeb.Tests
 
         public static bool IsNativeGgmlOps(string path)
             => string.Equals(Path.GetFileName(path), NativeGgmlOpsFileName, StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Identify the actual loaded library after native execution. macOS
+        /// Process.Modules omits dlopen-loaded libraries, so query dyld's mapped
+        /// image table there. Never substitute an unobserved on-disk candidate.
+        /// </summary>
+        public static string MappedNativeGgmlOpsPath()
+        {
+            IEnumerable<string> paths;
+            if (OperatingSystem.IsMacOS())
+                paths = MacMappedImagePaths();
+            else
+            {
+                using var process = Process.GetCurrentProcess();
+                paths = process.Modules.Cast<ProcessModule>().Select(module => module.FileName).ToArray();
+            }
+            string[] matches = paths.Where(IsNativeGgmlOps).Distinct(StringComparer.Ordinal).ToArray();
+            if (matches.Length != 1)
+                throw new InvalidOperationException($"Expected one mapped {NativeGgmlOpsFileName}; observed {matches.Length}: {string.Join(", ", matches)}");
+            return matches[0];
+        }
+
+        private static IEnumerable<string> MacMappedImagePaths()
+        {
+            uint count = DyldImageCount();
+            for (uint index = 0; index < count; ++index)
+            {
+                string path = Marshal.PtrToStringUTF8(DyldGetImageName(index));
+                if (!string.IsNullOrEmpty(path)) yield return path;
+            }
+        }
+
+        [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "_dyld_image_count")]
+        private static extern uint DyldImageCount();
+
+        [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "_dyld_get_image_name")]
+        private static extern IntPtr DyldGetImageName(uint index);
 
         /// <summary>
         /// First GGUF in <paramref name="dir"/> whose name contains

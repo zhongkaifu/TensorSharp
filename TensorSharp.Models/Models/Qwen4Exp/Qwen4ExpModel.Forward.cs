@@ -247,6 +247,11 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Qwen4ExpResetFfnCache();
             }
             _specStateFailed = false;
+            // Host seeds zeroed and every entry re-armed: the host is the truth again.
+            _deviceStateAuthoritative = false;
+            // Reset invalidates QSA's native entry. There are no live KV rows
+            // to export when a larger first prompt immediately grows capacity.
+            _kvCacheHostStale = false;
         }
 
         protected override float[] ForwardCore(int[] tokens)
@@ -941,6 +946,7 @@ namespace TensorSharp.Models
                 if (!ok) { _fusedAttnUnsupported = true; return false; }
                 if (!_resOnDevice) InvalidateTensorDeviceCache(res);
                 _kvCacheHostStale = true;
+                _deviceStateAuthoritative = true;
                 return true;
             }
             catch (Exception ex)
@@ -954,6 +960,14 @@ namespace TensorSharp.Models
         // The fused attention kernel writes the KV cache on the device; the host
         // mirror is behind until something syncs it.
         private bool _kvCacheHostStale;
+
+        // True once a fused forward has seeded the native per-sequence state
+        // entries (GDN conv+ssm, PLE conv, QSA raw keys) of the ACTIVE holder from
+        // its host seeds. From then on those device entries are the truth and the
+        // host seeds are stale; a reset zeroes the seeds and re-arms the upload,
+        // which is the only way back to host-authoritative. Travels with the
+        // holder (PerSeqCache) and decides what a copy reads (RetainedCache).
+        private bool _deviceStateAuthoritative;
 
         private unsafe bool TryFillAttnArgs(int il, ref Qwen4ExpAttnArgs a)
         {
@@ -1369,6 +1383,7 @@ namespace TensorSharp.Models
                     }
                 }
                 _kvCacheHostStale = true;
+                _deviceStateAuthoritative = true;
                 return true;
             }
             catch (InvalidOperationException)
@@ -1560,6 +1575,7 @@ namespace TensorSharp.Models
                     Config.Eps, cacheSlot: il, resResident: _resOnDevice);
                 if (!ok) { _fusedGdnUnsupported = true; return false; }
                 if (!_resOnDevice) InvalidateTensorDeviceCache(res);
+                _deviceStateAuthoritative = true;
                 return true;
             }
             catch (Exception ex)

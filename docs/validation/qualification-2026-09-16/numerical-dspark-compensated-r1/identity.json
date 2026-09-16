@@ -1,0 +1,13 @@
+{
+  "recorded_utc": "2026-09-16T18:51:03.648618+00:00",
+  "source_directory": "/workspace/ts-dspark-sum-variants-20260916",
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "binaries_sha256": {
+    "benchmark": "fb8c985929580943ace829d05fcf33b7408916d4346240e6aaac7c2d9ee00b93",
+    "compensated.so": "b37a94699dfccf237d0de169cf4dcf6dd5768a1f76773fd22e715449b295bceb",
+    "vector_f64.so": "8bad09ac8339d9c653bf7fa556a6723e98f9d84ef974aac132843377822af05d",
+    "indexed_f64.so": "3203ce512bb035adf0e0ae8005a7ebc445912bead0c3f36e71d128df87000448"
+  },
+  "release_qualified": false,
+  "remaining_original_failure": "verify_full_vocabulary_prefix11"
+}

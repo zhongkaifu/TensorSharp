@@ -1,0 +1,7516 @@
+{
+  "header_length": 148728,
+  "weights": {
+    "sound_encoder.encoder.layers.3.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337657720,
+        2337659768
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2297805688,
+        2297807736
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2600104824,
+        2604299128
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833837432,
+        1833839480
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1894718328,
+        1894736760
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1984996216,
+        1984998264
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136132472,
+        2136134520
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1894738808,
+        1894740856
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1844358008,
+        1844360056
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1785564024,
+        1787661176
+      ]
+    },
+    "sound_encoder.encoder.layers.17.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1901036408,
+        1909425016
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934590840,
+        1934592888
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2045889400,
+        2045891448
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488808312,
+        2488810360
+      ]
+    },
+    "sound_encoder.encoder.layers.4.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2362870648,
+        2371259256
+      ]
+    },
+    "sound_encoder.encoder.layers.11.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1623905144,
+        1632293752
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2438443896,
+        2440541048
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2096272248,
+        2096274296
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287285112,
+        2287287160
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934601080,
+        1934603128
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186517368,
+        2186519416
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136128376,
+        2136130424
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833835384,
+        1833837432
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589567864,
+        2589569912
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1697407864,
+        1699505016
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2251619192,
+        2253716344
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2346066808,
+        2348163960
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2539205496,
+        2539207544
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2190723960,
+        2192821112
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        160,
+        168
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1491676024,
+        1491678072
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2348186488,
+        2348188536
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388038520,
+        2388040568
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2600098680,
+        2600100728
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1481169784,
+        1483266936
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783456632,
+        1783458680
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1531548536,
+        1531550584
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287287160,
+        2287289208
+      ]
+    },
+    "sound_encoder.encoder.layers.7.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2505630584,
+        2514019192
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1642828664,
+        1642830712
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287272824,
+        2287274872
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2297801592,
+        2297803640
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639952760,
+        2639954808
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2146632568,
+        2146651000
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2140341112,
+        2142438264
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1894740856,
+        1894742904
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2348184440,
+        2348186488
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2398567288,
+        2398569336
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733061496,
+        1733063544
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337665912,
+        2337667960
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488818552,
+        2488820600
+      ]
+    },
+    "sound_encoder.encoder.layers.10.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1548356472,
+        1556745080
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2444735352,
+        2446832504
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783448440,
+        1783450488
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236894072,
+        2236896120
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2297807736,
+        2302002040
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1894736760,
+        1894738808
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085743480,
+        2085745528
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539197304,
+        2539199352
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2045866872,
+        2045885304
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1542062968,
+        1542065016
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1693209464,
+        1693211512
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438425464,
+        2438427512
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531528056,
+        1531530104
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1888426872,
+        1890524024
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682680696,
+        1682682744
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1592447864,
+        1596642168
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1586129784,
+        1588226936
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1798173560,
+        1800270712
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1693213560,
+        1697407864
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2096249720,
+        2096268152
+      ]
+    },
+    "sound_encoder.encoder.layers.15.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1800270712,
+        1808659320
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2243203960,
+        2245301112
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1481165688,
+        1481167736
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236896120,
+        2236898168
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581917048,
+        1581919096
+      ]
+    },
+    "sound_encoder.encoder.layers.4.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2371259256,
+        2379647864
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2092055416,
+        2094152568
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682678648,
+        1682680696
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2539209592,
+        2541306744
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639956856,
+        2639958904
+      ]
+    },
+    "sound_encoder.encoder.layers.3.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2320876408,
+        2329265016
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2085759864,
+        2085761912
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438419320,
+        2438421368
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682682744,
+        1682684792
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2136144760,
+        2136146808
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481153400,
+        1481155448
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833839480,
+        1833841528
+      ]
+    },
+    "sound_encoder.encoder.layers.9.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2631562104,
+        2639950712
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1590324088,
+        1592421240
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2604299128,
+        2606396280
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        128,
+        136
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2186529656,
+        2188626808
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        256,
+        1,
+        3,
+        3
+      ],
+      "data_offsets": [
+        2650466680,
+        2650471288
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1991289720,
+        1993386872
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2600100728,
+        2600102776
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1793977208,
+        1793979256
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1542058872,
+        1542060920
+      ]
+    },
+    "sound_encoder.encoder.layers.19.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2018579320,
+        2026967928
+      ]
+    },
+    "sound_encoder.encoder.layers.11.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1607127928,
+        1615516536
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2448950136,
+        2448952184
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1739375480,
+        1741472632
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2593786744,
+        2595883896
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2503533432,
+        2505630584
+      ]
+    },
+    "sound_encoder.encoder.layers.7.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2514019192,
+        2522407800
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2186527608,
+        2186529656
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733063544,
+        1733065592
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1894744952,
+        1898939256
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2398569336,
+        2398571384
+      ]
+    },
+    "sound_encoder.encoder.layers.2.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2060573560,
+        2068962168
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2146651000,
+        2146653048
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2348163960,
+        2348182392
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1984998264,
+        1987095416
+      ]
+    },
+    "sound_encoder.encoder.layers.19.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2010190712,
+        2018579320
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1938809720,
+        1940906872
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2352384888,
+        2354482040
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632308088,
+        1632310136
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488810360,
+        2488812408
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085739384,
+        2085741432
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884222328,
+        1884224376
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085755768,
+        2085757816
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2337676152,
+        2337678200
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287281016,
+        2287283064
+      ]
+    },
+    "sound_encoder.encoder.layers.13.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1716282232,
+        1724670840
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639965048,
+        2639967096
+      ]
+    },
+    "sound_encoder.encoder.layers.3.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2329265016,
+        2337653624
+      ]
+    },
+    "sound_encoder.encoder.layers.1.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1506362232,
+        1514750840
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136140664,
+        2136142712
+      ]
+    },
+    "sound_encoder.encoder.layers.9.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2606396280,
+        2614784888
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388050808,
+        2388052856
+      ]
+    },
+    "sound_encoder.encoder.layers.0.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1447590776,
+        1455979384
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1743596408,
+        1747790712
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136126328,
+        2136128376
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1793952632,
+        1793971064
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2241106808,
+        2243203960
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2192821112,
+        2194918264
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.3.bias": {
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "data_offsets": [
+        2650471288,
+        2650471800
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2045885304,
+        2045887352
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539199352,
+        2539201400
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632301944,
+        1632303992
+      ]
+    },
+    "sound_encoder.encoder.layers.21.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2161339256,
+        2169727864
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438421368,
+        2438423416
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1691089784,
+        1693186936
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984973688,
+        1984975736
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682692984,
+        1682695032
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2247424888,
+        2251619192
+      ]
+    },
+    "sound_encoder.encoder.layers.23.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2278882168,
+        2287270776
+      ]
+    },
+    "sound_encoder.encoder.layers.8.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2556013432,
+        2564402040
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539195256,
+        2539197304
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733075832,
+        1733077880
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287289208,
+        2287291256
+      ]
+    },
+    "sound_encoder.encoder.feature_extractor.featurizer.window": {
+      "dtype": "BF16",
+      "shape": [
+        400
+      ],
+      "data_offsets": [
+        1441271896,
+        1441272696
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639969144,
+        2639971192
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481145208,
+        1481147256
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2087861112,
+        2089958264
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531542392,
+        1531544440
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2448929656,
+        2448948088
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        96,
+        104
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2589590392,
+        2589592440
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1592445816,
+        1592447864
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2396449656,
+        2398546808
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884226424,
+        1884228472
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2050087800,
+        2052184952
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1581931384,
+        1581933432
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "data_offsets": [
+        2650466168,
+        2650466680
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236904312,
+        2236906360
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589569912,
+        2589571960
+      ]
+    },
+    "sound_encoder.encoder.layers.18.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1951419256,
+        1959807864
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        176,
+        184
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1491655544,
+        1491673976
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1642822520,
+        1642824568
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1894742904,
+        1894744952
+      ]
+    },
+    "sound_encoder.encoder.layers.16.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1867430776,
+        1875819384
+      ]
+    },
+    "sound_encoder.encoder.layers.8.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2581179256,
+        2589567864
+      ]
+    },
+    "sound_encoder.encoder.layers.9.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2614784888,
+        2623173496
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136130424,
+        2136132472
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1945123704,
+        1945125752
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2549715832,
+        2549717880
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2247398264,
+        2247416696
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833827192,
+        1833829240
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2045891448,
+        2045893496
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884220280,
+        1884222328
+      ]
+    },
+    "sound_encoder.encoder.layers.14.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1758276472,
+        1766665080
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2035381112,
+        2037478264
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488804216,
+        2488806264
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2499332984,
+        2499335032
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1636512632,
+        1638609784
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1993386872,
+        1995484024
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1945119608,
+        1945121656
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1984994168,
+        1984996216
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035368824,
+        2035370872
+      ]
+    },
+    "sound_encoder.encoder.layers.1.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1523139448,
+        1531528056
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1542038392,
+        1542056824
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2591689592,
+        2593786744
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236900216,
+        2236902264
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2197035896,
+        2197037944
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1592439672,
+        1592441720
+      ]
+    },
+    "sound_encoder.encoder.layers.23.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2262104952,
+        2270493560
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531544440,
+        1531546488
+      ]
+    },
+    "sound_encoder.encoder.layers.21.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2169727864,
+        2178116472
+      ]
+    },
+    "sound_encoder.encoder.layers.18.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1968196472,
+        1976585080
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1441297272,
+        1441299320
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2553916280,
+        2556013432
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2339775352,
+        2341872504
+      ]
+    },
+    "sound_encoder.encoder.layers.2.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2077350776,
+        2085739384
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884224376,
+        1884226424
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531530104,
+        1531532152
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531538296,
+        1531540344
+      ]
+    },
+    "sound_encoder.encoder.subsampling.linear.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2650739576,
+        2650741624
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2247418744,
+        2247420792
+      ]
+    },
+    "sound_encoder.encoder.layers.22.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2220110712,
+        2228499320
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589576056,
+        2589578104
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934599032,
+        1934601080
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085749624,
+        2085751672
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1793971064,
+        1793973112
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1936712568,
+        1938809720
+      ]
+    },
+    "sound_encoder.encoder.layers.7.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2522407800,
+        2530796408
+      ]
+    },
+    "sound_encoder.encoder.layers.22.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2228499320,
+        2236887928
+      ]
+    },
+    "sound_encoder.encoder.layers.0.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1464367992,
+        1472756600
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1596642168,
+        1598739320
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2144535416,
+        2146632568
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733069688,
+        1733071736
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        56,
+        64
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1693211512,
+        1693213560
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1632314232,
+        1632316280
+      ]
+    },
+    "sound_encoder.encoder.layers.12.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1657510776,
+        1665899384
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539193208,
+        2539195256
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488814456,
+        2488816504
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2094152568,
+        2096249720
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1634415480,
+        1636512632
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337655672,
+        2337657720
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2490923896,
+        2493021048
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984988024,
+        1984990072
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2348188536,
+        2348190584
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934603128,
+        1934605176
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539189112,
+        2539191160
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1592441720,
+        1592443768
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1945125752,
+        1945127800
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2392255352,
+        2394352504
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136134520,
+        2136136568
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481161592,
+        1481163640
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186513272,
+        2186515320
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337667960,
+        2337670008
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085757816,
+        2085759864
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2039575416,
+        2041672568
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682686840,
+        1682688888
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085747576,
+        2085749624
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2390158200,
+        2392255352
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1783466872,
+        1785564024
+      ]
+    },
+    "sound_encoder.encoder.layers.12.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1665899384,
+        1674287992
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236906360,
+        2236908408
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388044664,
+        2388046712
+      ]
+    },
+    "sound_encoder.encoder.layers.18.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1959807864,
+        1968196472
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2136146808,
+        2138243960
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1735181176,
+        1737278328
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1945101176,
+        1945119608
+      ]
+    },
+    "sound_encoder.encoder.layers.21.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2178116472,
+        2186505080
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438437752,
+        2438439800
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1491682168,
+        1495876472
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783452536,
+        1783454584
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632303992,
+        1632306040
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1848556408,
+        1850653560
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2442638200,
+        2444735352
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2096276344,
+        2100470648
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1844362104,
+        1848556408
+      ]
+    },
+    "sound_encoder.encoder.layers.10.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1556745080,
+        1565133688
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2388059000,
+        2388061048
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388040568,
+        2388042616
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2495118200,
+        2497215352
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733067640,
+        1733069688
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531546488,
+        1531548536
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1693186936,
+        1693205368
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1546259320,
+        1548356472
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1840141176,
+        1842238328
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.5.weight": {
+      "dtype": "BF16",
+      "shape": [
+        256,
+        1,
+        3,
+        3
+      ],
+      "data_offsets": [
+        2650603384,
+        2650607992
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1491680120,
+        1491682168
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1789758328,
+        1791855480
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1793973112,
+        1793975160
+      ]
+    },
+    "sound_encoder.encoder.layers.15.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1808659320,
+        1817047928
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        32,
+        40
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2293586808,
+        2295683960
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035362680,
+        2035364728
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136122232,
+        2136124280
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1743594360,
+        1743596408
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2398546808,
+        2398565240
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        16,
+        24
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1489558392,
+        1491655544
+      ]
+    },
+    "sound_encoder.encoder.layers.4.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2379647864,
+        2388036472
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2297781112,
+        2297799544
+      ]
+    },
+    "sound_encoder.encoder.layers.8.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2572790648,
+        2581179256
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2541306744,
+        2543403896
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682684792,
+        1682686840
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1682701176,
+        1684798328
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287274872,
+        2287276920
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337653624,
+        2337655672
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833831288,
+        1833833336
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2440541048,
+        2442638200
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1733079928,
+        1733081976
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632299896,
+        1632301944
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581910904,
+        1581912952
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2644169592,
+        2646266744
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581921144,
+        1581923192
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2100470648,
+        2102567800
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984981880,
+        1984983928
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388052856,
+        2388054904
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639960952,
+        2639963000
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1886329720,
+        1888426872
+      ]
+    },
+    "sound_encoder.encoder.layers.13.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1707893624,
+        1716282232
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1682699128,
+        1682701176
+      ]
+    },
+    "sound_encoder.encoder.layers.17.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1917813624,
+        1926202232
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1581933432,
+        1581935480
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1844335480,
+        1844353912
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388042616,
+        2388044664
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1945127800,
+        1949322104
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589580152,
+        2589582200
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488820600,
+        2488822648
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2446832504,
+        2448929656
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2648363896,
+        2650461048
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1581935480,
+        1584032632
+      ]
+    },
+    "sound_encoder.encoder.layers.6.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2472024952,
+        2480413560
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1441291128,
+        1441293176
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1491673976,
+        1491676024
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1940906872,
+        1943004024
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581915000,
+        1581917048
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984985976,
+        1984988024
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934592888,
+        1934594936
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1995502456,
+        1995504504
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1945121656,
+        1945123704
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2045887352,
+        2045889400
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186519416,
+        2186521464
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539191160,
+        2539193208
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2096268152,
+        2096270200
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934609272,
+        1934611320
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2600078200,
+        2600096632
+      ]
+    },
+    "sound_encoder.encoder.layers.6.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2455247736,
+        2463636344
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1793979256,
+        1798173560
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1441299320,
+        1445493624
+      ]
+    },
+    "sound_encoder.encoder.layers.16.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1850653560,
+        1859042168
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1483266936,
+        1485364088
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2295683960,
+        2297781112
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2398571384,
+        2398573432
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733073784,
+        1733075832
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488802168,
+        2488804216
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639963000,
+        2639965048
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337659768,
+        2337661816
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1844355960,
+        1844358008
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884212088,
+        1884214136
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1632318328,
+        1634415480
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438423416,
+        2438425464
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581929336,
+        1581931384
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2188626808,
+        2190723960
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733065592,
+        1733067640
+      ]
+    },
+    "sound_encoder.encoder.layers.1.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1514750840,
+        1523139448
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1934613368,
+        1934615416
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1835946872,
+        1838044024
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1733081976,
+        1733084024
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1995484024,
+        1995502456
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2247420792,
+        2247422840
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2236908408,
+        2236910456
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1838044024,
+        1840141176
+      ]
+    },
+    "sound_encoder.encoder.layers.23.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2270493560,
+        2278882168
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        88,
+        96
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035358584,
+        2035360632
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2589592440,
+        2591689592
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488812408,
+        2488814456
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783442296,
+        1783444344
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        184,
+        192
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1481167736,
+        1481169784
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2043769720,
+        2045866872
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1487461240,
+        1489558392
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1842238328,
+        1844335480
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2543403896,
+        2545501048
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934596984,
+        1934599032
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1642824568,
+        1642826616
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        0,
+        8
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388048760,
+        2388050808
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2646266744,
+        2648363896
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        64,
+        72
+      ]
+    },
+    "sound_encoder.encoder.layers.22.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2203333496,
+        2211722104
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2297803640,
+        2297805688
+      ]
+    },
+    "sound_encoder.encoder.layers.5.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2413253496,
+        2421642104
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1898939256,
+        1901036408
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337663864,
+        2337665912
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884207992,
+        1884210040
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833825144,
+        1833827192
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1783464824,
+        1783466872
+      ]
+    },
+    "sound_projection.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2659130232,
+        2667518840
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531536248,
+        1531538296
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2448954232,
+        2448956280
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.0.bias": {
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "data_offsets": [
+        2650461048,
+        2650461560
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1743588216,
+        1743590264
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2639975288,
+        2642072440
+      ]
+    },
+    "sound_encoder.encoder.layers.3.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2304099192,
+        2312487800
+      ]
+    },
+    "sound_encoder.encoder.layers.10.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1573522296,
+        1581910904
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2539207544,
+        2539209592
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783446392,
+        1783448440
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1495876472,
+        1497973624
+      ]
+    },
+    "sound_encoder.encoder.layers.11.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1615516536,
+        1623905144
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884214136,
+        1884216184
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2035377016,
+        2035379064
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        144,
+        152
+      ]
+    },
+    "sound_encoder.encoder.layers.21.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2152950648,
+        2161339256
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1987095416,
+        1989192568
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035364728,
+        2035366776
+      ]
+    },
+    "sound_encoder.encoder.layers.6.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2480413560,
+        2488802168
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186521464,
+        2186523512
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287276920,
+        2287278968
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085751672,
+        2085753720
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1741472632,
+        1743569784
+      ]
+    },
+    "sound_encoder.encoder.layers.7.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2530796408,
+        2539185016
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438431608,
+        2438433656
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2197042040,
+        2201236344
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085741432,
+        2085743480
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2146657144,
+        2146659192
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186515320,
+        2186517368
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337670008,
+        2337672056
+      ]
+    },
+    "sound_encoder.encoder.layers.4.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2354482040,
+        2362870648
+      ]
+    },
+    "sound_encoder.encoder.layers.13.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1724670840,
+        1733059448
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2302002040,
+        2304099192
+      ]
+    },
+    "sound_encoder.encoder.layers.20.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2127733624,
+        2136122232
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388036472,
+        2388038520
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236887928,
+        2236889976
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.6.bias": {
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "data_offsets": [
+        2650607992,
+        2650608504
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481157496,
+        1481159544
+      ]
+    },
+    "sound_encoder.encoder.layers.20.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2110956408,
+        2119345016
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1533649784,
+        1535746936
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2287293304,
+        2287295352
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.3.weight": {
+      "dtype": "BF16",
+      "shape": [
+        256,
+        256,
+        1,
+        1
+      ],
+      "data_offsets": [
+        2650471800,
+        2650602872
+      ]
+    },
+    "sound_encoder.encoder.layers.23.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2253716344,
+        2262104952
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085753720,
+        2085755768
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136138616,
+        2136140664
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833833336,
+        1833835384
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2639971192,
+        2639973240
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1743592312,
+        1743594360
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632306040,
+        1632308088
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1531552632,
+        1533649784
+      ]
+    },
+    "sound_encoder.encoder.layers.16.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1859042168,
+        1867430776
+      ]
+    },
+    "sound_encoder.encoder.layers.11.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1598739320,
+        1607127928
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186511224,
+        2186513272
+      ]
+    },
+    "sound_encoder.encoder.layers.2.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2052184952,
+        2060573560
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1642830712,
+        1647025016
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1844353912,
+        1844355960
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2499339128,
+        2503533432
+      ]
+    },
+    "sound_encoder.encoder.layers.1.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1497973624,
+        1506362232
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2085763960,
+        2087861112
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884218232,
+        1884220280
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2096270200,
+        2096272248
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984983928,
+        1984985976
+      ]
+    },
+    "sound_encoder.encoder.layers.20.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2119345016,
+        2127733624
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388046712,
+        2388048760
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1592421240,
+        1592439672
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934594936,
+        1934596984
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2388061048,
+        2390158200
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481163640,
+        1481165688
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035374968,
+        2035377016
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1693207416,
+        1693209464
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2499330936,
+        2499332984
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2348182392,
+        2348184440
+      ]
+    },
+    "sound_encoder.encoder.layers.16.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1844360056,
+        1844362104
+      ]
+    },
+    "sound_encoder.encoder.layers.13.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1699505016,
+        1707893624
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1833845624,
+        1833847672
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2287291256,
+        2287293304
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783444344,
+        1783446392
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2096274296,
+        2096276344
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1743569784,
+        1743588216
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1747790712,
+        1749887864
+      ]
+    },
+    "sound_projection.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2689538936,
+        2689540984
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682688888,
+        1682690936
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1441272696,
+        1441291128
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531532152,
+        1531534200
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2297799544,
+        2297801592
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2600102776,
+        2600104824
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1441293176,
+        1441295224
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1638609784,
+        1640706936
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2488826744,
+        2490923896
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1682697080,
+        1682699128
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287283064,
+        2287285112
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589578104,
+        2589580152
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2388056952,
+        2388059000
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2146653048,
+        2146655096
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2037478264,
+        2039575416
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1737278328,
+        1739375480
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2291489656,
+        2293586808
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1791855480,
+        1793952632
+      ]
+    },
+    "sound_encoder.encoder.layers.15.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1817047928,
+        1825436536
+      ]
+    },
+    "sound_encoder.encoder.layers.8.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2564402040,
+        2572790648
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589584248,
+        2589586296
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        112,
+        120
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2142438264,
+        2144535416
+      ]
+    },
+    "sound_encoder.encoder.layers.5.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2421642104,
+        2430030712
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1539941240,
+        1542038392
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589586296,
+        2589588344
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581912952,
+        1581915000
+      ]
+    },
+    "sound_encoder.encoder.layers.4.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2348190584,
+        2352384888
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2589588344,
+        2589590392
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1686895480,
+        1688992632
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589582200,
+        2589584248
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1995506552,
+        1995508600
+      ]
+    },
+    "sound_encoder.encoder.layers.3.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2312487800,
+        2320876408
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2337678200,
+        2339775352
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2247422840,
+        2247424888
+      ]
+    },
+    "sound_encoder.encoder.layers.22.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2211722104,
+        2220110712
+      ]
+    },
+    "sound_encoder.encoder.layers.4.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2388054904,
+        2388056952
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2197039992,
+        2197042040
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2549719928,
+        2549721976
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        152,
+        160
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1995508600,
+        1995510648
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884210040,
+        1884212088
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2197015416,
+        2197033848
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        48,
+        56
+      ]
+    },
+    "sound_encoder.encoder.layers.5.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2430030712,
+        2438419320
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783458680,
+        1783460728
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035372920,
+        2035374968
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136136568,
+        2136138616
+      ]
+    },
+    "sound_encoder.encoder.layers.9.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2600096632,
+        2600098680
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733077880,
+        1733079928
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2497215352,
+        2499312504
+      ]
+    },
+    "sound_encoder.encoder.layers.18.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1976585080,
+        1984973688
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2499312504,
+        2499330936
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632293752,
+        1632295800
+      ]
+    },
+    "sound_encoder.encoder.layers.20.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2102567800,
+        2110956408
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1445493624,
+        1447590776
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1542065016,
+        1546259320
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035370872,
+        2035372920
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.6.weight": {
+      "dtype": "BF16",
+      "shape": [
+        256,
+        256,
+        1,
+        1
+      ],
+      "data_offsets": [
+        2650608504,
+        2650739576
+      ]
+    },
+    "sound_encoder.encoder.layers.12.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1674287992,
+        1682676600
+      ]
+    },
+    "sound_encoder.encoder.layers.0.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1455979384,
+        1464367992
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2448956280,
+        2453150584
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2136142712,
+        2136144760
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984979832,
+        1984981880
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2402767736,
+        2404864888
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984975736,
+        1984977784
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488816504,
+        2488818552
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1943004024,
+        1945101176
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581923192,
+        1581925240
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2343969656,
+        2346066808
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632295800,
+        1632297848
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1892621176,
+        1894718328
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934607224,
+        1934609272
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783460728,
+        1783462776
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1640706936,
+        1642804088
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2194918264,
+        2197015416
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2146655096,
+        2146657144
+      ]
+    },
+    "sound_encoder.encoder.layers.11.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1632316280,
+        1632318328
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1833849720,
+        1835946872
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481159544,
+        1481161592
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589571960,
+        2589574008
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2146659192,
+        2150853496
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2236910456,
+        2236912504
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1884230520,
+        1884232568
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1884228472,
+        1884230520
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438427512,
+        2438429560
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1592443768,
+        1592445816
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984990072,
+        1984992120
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2197037944,
+        2197039992
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1542056824,
+        1542058872
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539201400,
+        2539203448
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632297848,
+        1632299896
+      ]
+    },
+    "sound_encoder.encoder.layers.20.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2138243960,
+        2140341112
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2289392504,
+        2291489656
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1588226936,
+        1590324088
+      ]
+    },
+    "sound_encoder.encoder.layers.15.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1793975160,
+        1793977208
+      ]
+    },
+    "sound_encoder.encoder.layers.8.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2589574008,
+        2589576056
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186509176,
+        2186511224
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2041672568,
+        2043769720
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833841528,
+        1833843576
+      ]
+    },
+    "sound_encoder.encoder.layers.4.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2394352504,
+        2396449656
+      ]
+    },
+    "sound_encoder.encoder.layers.19.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2026967928,
+        2035356536
+      ]
+    },
+    "sound_encoder.encoder.layers.23.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2247416696,
+        2247418744
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2545501048,
+        2547598200
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2488824696,
+        2488826744
+      ]
+    },
+    "sound_encoder.encoder.layers.18.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1989192568,
+        1991289720
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481149304,
+        1481151352
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783454584,
+        1783456632
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539187064,
+        2539189112
+      ]
+    },
+    "sound_encoder.encoder.layers.23.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2287295352,
+        2289392504
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1999704952,
+        2001802104
+      ]
+    },
+    "sound_encoder.encoder.layers.6.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2488806264,
+        2488808312
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1688992632,
+        1691089784
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682690936,
+        1682692984
+      ]
+    },
+    "sound_encoder.encoder.layers.20.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2136124280,
+        2136126328
+      ]
+    },
+    "sound_encoder.encoder.layers.7.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2547598200,
+        2549695352
+      ]
+    },
+    "sound_encoder.encoder.layers.16.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1875819384,
+        1884207992
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236889976,
+        2236892024
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2239009656,
+        2241106808
+      ]
+    },
+    "sound_encoder.encoder.layers.14.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1775053688,
+        1783442296
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.5.bias": {
+      "dtype": "BF16",
+      "shape": [
+        256
+      ],
+      "data_offsets": [
+        2650602872,
+        2650603384
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2197033848,
+        2197035896
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2642072440,
+        2644169592
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481155448,
+        1481157496
+      ]
+    },
+    "sound_encoder.encoder.subsampling.layers.0.weight": {
+      "dtype": "BF16",
+      "shape": [
+        256,
+        1,
+        3,
+        3
+      ],
+      "data_offsets": [
+        2650461560,
+        2650466168
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337661816,
+        2337663864
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1890524024,
+        1892621176
+      ]
+    },
+    "sound_encoder.encoder.layers.10.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1565133688,
+        1573522296
+      ]
+    },
+    "sound_encoder.encoder.layers.10.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1542060920,
+        1542062968
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2341872504,
+        2343969656
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2438439800,
+        2438441848
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438435704,
+        2438437752
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639967096,
+        2639969144
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833843576,
+        1833845624
+      ]
+    },
+    "sound_encoder.encoder.layers.15.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1833847672,
+        1833849720
+      ]
+    },
+    "sound_encoder.encoder.layers.15.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1825436536,
+        1833825144
+      ]
+    },
+    "sound_encoder.encoder.layers.0.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1472756600,
+        1481145208
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        168,
+        176
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186507128,
+        2186509176
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639950712,
+        2639952760
+      ]
+    },
+    "sound_encoder.encoder.layers.0.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1485364088,
+        1487461240
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        40,
+        48
+      ]
+    },
+    "sound_encoder.encoder.layers.9.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2623173496,
+        2631562104
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2453150584,
+        2455247736
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        1642804088,
+        1642822520
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1995510648,
+        1999704952
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2201236344,
+        2203333496
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1787661176,
+        1789758328
+      ]
+    },
+    "sound_encoder.encoder.layers.19.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2035379064,
+        2035381112
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438433656,
+        2438435704
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1535746936,
+        1537844088
+      ]
+    },
+    "sound_encoder.encoder.layers.3.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2337672056,
+        2337674104
+      ]
+    },
+    "sound_encoder.encoder.layers.16.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1884232568,
+        1886329720
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2085761912,
+        2085763960
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632310136,
+        1632312184
+      ]
+    },
+    "sound_encoder.encoder.layers.2.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2045893496,
+        2050087800
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2597981048,
+        2600078200
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581925240,
+        1581927288
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481151352,
+        1481153400
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186523512,
+        2186525560
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639958904,
+        2639960952
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287270776,
+        2287272824
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035360632,
+        2035362680
+      ]
+    },
+    "sound_encoder.encoder.layers.13.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1693205368,
+        1693207416
+      ]
+    },
+    "sound_encoder.encoder.layers.12.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1649122168,
+        1657510776
+      ]
+    },
+    "sound_encoder.encoder.layers.2.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2089958264,
+        2092055416
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2398573432,
+        2402767736
+      ]
+    },
+    "sound_encoder.encoder.layers.6.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2463636344,
+        2472024952
+      ]
+    },
+    "sound_encoder.encoder.layers.5.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2438429560,
+        2438431608
+      ]
+    },
+    "sound_encoder.encoder.layers.17.feed_forward1.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1909425016,
+        1917813624
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2236912504,
+        2239009656
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2448952184,
+        2448954232
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        8,
+        16
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035356536,
+        2035358584
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682695032,
+        1682697080
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1531550584,
+        1531552632
+      ]
+    },
+    "sound_encoder.encoder.layers.17.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        72,
+        80
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.pointwise_conv1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2549721976,
+        2553916280
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236892024,
+        2236894072
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2549717880,
+        2549719928
+      ]
+    },
+    "sound_encoder.encoder.layers.9.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2639973240,
+        2639975288
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984992120,
+        1984994168
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2493021048,
+        2495118200
+      ]
+    },
+    "sound_encoder.encoder.layers.5.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2404864888,
+        2413253496
+      ]
+    },
+    "sound_encoder.encoder.layers.20.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        104,
+        112
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733059448,
+        1733061496
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.norm.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2499337080,
+        2499339128
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236902264,
+        2236904312
+      ]
+    },
+    "sound_encoder.encoder.layers.22.self_attn.v_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2245301112,
+        2247398264
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581919096,
+        1581921144
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2549713784,
+        2549715832
+      ]
+    },
+    "sound_encoder.encoder.layers.10.norm_self_att.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1581927288,
+        1581929336
+      ]
+    },
+    "sound_encoder.encoder.layers.8.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        2595883896,
+        2597981048
+      ]
+    },
+    "sound_encoder.encoder.layers.0.norm_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1481147256,
+        1481149304
+      ]
+    },
+    "sound_encoder.encoder.layers.0.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1441295224,
+        1441297272
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1934611320,
+        1934613368
+      ]
+    },
+    "sound_encoder.encoder.layers.14.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1749887864,
+        1758276472
+      ]
+    },
+    "sound_encoder.encoder.layers.13.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1733084024,
+        1735181176
+      ]
+    },
+    "sound_encoder.encoder.layers.7.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2499335032,
+        2499337080
+      ]
+    },
+    "sound_encoder.encoder.layers.12.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1682676600,
+        1682678648
+      ]
+    },
+    "sound_encoder.encoder.layers.19.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2035366776,
+        2035368824
+      ]
+    },
+    "sound_encoder.encoder.layers.3.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        136,
+        144
+      ]
+    },
+    "sound_encoder.encoder.layers.6.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2448948088,
+        2448950136
+      ]
+    },
+    "sound_encoder.encoder.layers.14.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        1766665080,
+        1775053688
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531540344,
+        1531542392
+      ]
+    },
+    "sound_encoder.encoder.layers.16.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1884216184,
+        1884218232
+      ]
+    },
+    "sound_encoder.encoder.feature_extractor.featurizer.fb": {
+      "dtype": "BF16",
+      "shape": [
+        1,
+        128,
+        257
+      ],
+      "data_offsets": [
+        1441206104,
+        1441271896
+      ]
+    },
+    "sound_encoder.encoder.layers.19.feed_forward1.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2001802104,
+        2010190712
+      ]
+    },
+    "sound_encoder.encoder.layers.11.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1632312184,
+        1632314232
+      ]
+    },
+    "sound_encoder.encoder.layers.18.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1984977784,
+        1984979832
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1647025016,
+        1649122168
+      ]
+    },
+    "sound_encoder.encoder.layers.17.feed_forward2.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        1926202232,
+        1934590840
+      ]
+    },
+    "sound_encoder.encoder.layers.15.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1833829240,
+        1833831288
+      ]
+    },
+    "sound_encoder.encoder.layers.5.self_attn.bias_v": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2438441848,
+        2438443896
+      ]
+    },
+    "sound_encoder.encoder.layers.21.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2186525560,
+        2186527608
+      ]
+    },
+    "sound_encoder.encoder.layers.6.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2488822648,
+        2488824696
+      ]
+    },
+    "sound_encoder.encoder.layers.2.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2085745528,
+        2085747576
+      ]
+    },
+    "sound_encoder.encoder.layers.10.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1584032632,
+        1586129784
+      ]
+    },
+    "sound_encoder.encoder.layers.11.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        24,
+        32
+      ]
+    },
+    "sound_encoder.encoder.layers.1.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1491678072,
+        1491680120
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        1949322104,
+        1951419256
+      ]
+    },
+    "sound_encoder.encoder.layers.22.norm_feed_forward2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2236898168,
+        2236900216
+      ]
+    },
+    "sound_encoder.encoder.layers.8.conv.depthwise_conv.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1,
+        9
+      ],
+      "data_offsets": [
+        2549695352,
+        2549713784
+      ]
+    },
+    "sound_encoder.encoder.layers.21.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2186505080,
+        2186507128
+      ]
+    },
+    "sound_encoder.encoder.layers.1.norm_feed_forward1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1531534200,
+        1531536248
+      ]
+    },
+    "sound_encoder.encoder.layers.12.self_attn.o_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1684798328,
+        1686895480
+      ]
+    },
+    "sound_encoder.encoder.layers.12.conv.norm.running_var": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1642826616,
+        1642828664
+      ]
+    },
+    "sound_encoder.encoder.subsampling.linear.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        4096
+      ],
+      "data_offsets": [
+        2650741624,
+        2659130232
+      ]
+    },
+    "sound_encoder.encoder.layers.14.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1783450488,
+        1783452536
+      ]
+    },
+    "sound_encoder.encoder.layers.14.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1743590264,
+        1743592312
+      ]
+    },
+    "sound_encoder.encoder.layers.1.self_attn.relative_k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1537844088,
+        1539941240
+      ]
+    },
+    "sound_encoder.encoder.layers.21.conv.pointwise_conv2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024,
+        1
+      ],
+      "data_offsets": [
+        2150853496,
+        2152950648
+      ]
+    },
+    "sound_encoder.encoder.layers.2.feed_forward2.linear1.weight": {
+      "dtype": "BF16",
+      "shape": [
+        4096,
+        1024
+      ],
+      "data_offsets": [
+        2068962168,
+        2077350776
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_conv.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539185016,
+        2539187064
+      ]
+    },
+    "sound_encoder.encoder.layers.22.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        120,
+        128
+      ]
+    },
+    "sound_encoder.encoder.layers.13.norm_out.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1733071736,
+        1733073784
+      ]
+    },
+    "sound_encoder.encoder.layers.9.norm_feed_forward1.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2639954808,
+        2639956856
+      ]
+    },
+    "sound_encoder.encoder.layers.5.conv.norm.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2398565240,
+        2398567288
+      ]
+    },
+    "sound_encoder.encoder.layers.17.self_attn.k_proj.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ],
+      "data_offsets": [
+        1934615416,
+        1936712568
+      ]
+    },
+    "sound_encoder.encoder.layers.7.norm_self_att.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2539203448,
+        2539205496
+      ]
+    },
+    "sound_encoder.encoder.layers.18.conv.norm.num_batches_tracked": {
+      "dtype": "I64",
+      "shape": [],
+      "data_offsets": [
+        80,
+        88
+      ]
+    },
+    "sound_encoder.encoder.layers.3.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        2337674104,
+        2337676152
+      ]
+    },
+    "sound_encoder.encoder.layers.14.self_attn.bias_u": {
+      "dtype": "BF16",
+      "shape": [
+        8,
+        128
+      ],
+      "data_offsets": [
+        1783462776,
+        1783464824
+      ]
+    },
+    "sound_projection.linear2.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2688,
+        4096
+      ],
+      "data_offsets": [
+        2667518840,
+        2689538936
+      ]
+    },
+    "sound_encoder.encoder.layers.17.norm_out.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1934605176,
+        1934607224
+      ]
+    },
+    "sound_encoder.encoder.layers.23.norm_feed_forward2.bias": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        2287278968,
+        2287281016
+      ]
+    },
+    "sound_encoder.encoder.layers.19.conv.norm.running_mean": {
+      "dtype": "BF16",
+      "shape": [
+        1024
+      ],
+      "data_offsets": [
+        1995504504,
+        1995506552
+      ]
+    }
+  },
+  "audio_bytes": 1248335072
+}

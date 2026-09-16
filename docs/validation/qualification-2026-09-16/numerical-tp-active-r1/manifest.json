@@ -1,0 +1,20 @@
+{
+  "README.md": "04fc7ec8316e730e131a3d3a8efc292c7acb01c125b5128ef89f0b79fa95a7a3",
+  "identity.json": "85869a11f846a77de7f5653902c4cd8850394c1671b8da86275f43569d79081c",
+  "integrated-build.log": "9abfc97902e7447cf361fd1b5b0b88f7d4bcf977899185510e729ca4f6133a07",
+  "source/dsv41_tp_test.cpp": "a16b69dcb79b12d9da50d277dec86479d93d49068f7e39417932183f3b285004",
+  "source/ggml_ops_deepseek41_tp.cpp": "f12cbc7777167e11639fa1a63c070c5bced1cfebfc3bdedb30848dac893e29a6",
+  "source/ggml_ops_dsv4_fused.cu": "deb9263afad8440a1a1a61a9c0f1556d9b9ded128a8e63cb3694cd424982e202",
+  "source/ggml_ops_dsv4_fused.h": "fcc5081b92eb218e0c3056be80a5d30623e8ae4a41fe5c5c34e22f5ec15b14b1",
+  "source/ggml_ops_matmul_precision.cpp": "33949d3beb97fcb04bb4c1d47a2483368dfa5575c9dabf2bf921974681412859",
+  "source/ggml_ops_matmul_precision.cu": "face92b6b46220ddf948dda72b10846c7c514fcadb2941b21721cee4c4b756f6",
+  "source/ggml_ops_matmul_precision.h": "827ea43ffc4486528283bd8d790ee3bb29800066f41cfed56ce46a87200080e3",
+  "source/ggml_ops_matmul_quant_strip.cuh": "40016f126e57c36c8090977e9d8197cb5abfcb014453813be16e0fe59823cb94",
+  "source/ts-tp-integrated-build.py": "ee241843836911e9df2f299b7dd6159dee1d9e1d90131263c261f15bce7580fe",
+  "source/ts-tp-strip-benchmark-build.py": "ba106cb34ba50cd7f639c5e121277fadca18a7d36ccf0a609fa78bf33ee10da9",
+  "source/ts-tp-strip-benchmark.cpp": "6042543193956f068e1817f1925a977fd5a635fb639b9d185998d6c32964e926",
+  "strip-benchmark-build.log": "e8265a56d7a1e145fab17242dcb56765978da0800e1dcce16cb06f1c3d43f8b1",
+  "strip-benchmark-r1.log": "8d7ce5dfd278b30470f0cf148d5eb6ad1bf826b5a69f3768eabfa7d7cf28ea91",
+  "strip-extended-r1.log": "ba2e3164cd31e02277c0e067cc4a47899575f8b3ebb119820621013ccbb302b6",
+  "summary.json": "6d36c9e55b5cca3028c7084a5cc0ce1bad9d6b3106caa71705f677517cace71e"
+}

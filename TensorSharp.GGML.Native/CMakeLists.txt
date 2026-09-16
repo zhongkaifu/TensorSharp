@@ -441,6 +441,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_test(NAME qwen4exp-qsa-position-plan COMMAND GgmlOpsQwen4ExpQsaPlanTest)
     set_tests_properties(qwen4exp-qsa-position-plan PROPERTIES TIMEOUT 30)
+    set_property(SOURCE ggml_ops_glm_dsa.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_deepseek4.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_deepseek41_tp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     enable_testing()
@@ -474,6 +475,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsDsv41TpTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cuda CUDA::cublas)
+        add_test(NAME deepseek41-quantized-strip-projections-cuda
+                 COMMAND GgmlOpsDsv41TpTest --cuda 1 --quant-strip-only)
+        set_tests_properties(deepseek41-quantized-strip-projections-cuda PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 600)
         # Multi-device tests are explicit: a one-GPU CI lane must not claim
         # that its skipped multi-device checks established tensor parallelism.
         foreach(TP_RANKS 2 4 7 8)

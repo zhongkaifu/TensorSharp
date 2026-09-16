@@ -157,6 +157,70 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
     }
 
     [Fact]
+    public void TemporalPair_RejectsMalformedFrameBuffersBeforeUnsafePatchReads()
+    {
+        using var encoder = new Qwen35VisionEncoder(_mmproj, _allocator);
+        var valid = Pixels(1);
+        Assert.Throws<ArgumentException>(() => encoder.Encode(new float[1], new float[1], Side, Side));
+        Assert.Throws<ArgumentException>(() => encoder.Encode(valid, valid, Side + 1, Side));
+        Assert.Throws<ArgumentException>(() => encoder.Encode(valid, valid, -Side, Side));
+        Assert.Throws<ArgumentException>(() => encoder.Encode(valid, valid, int.MaxValue, Side));
+        using var recovered = encoder.Encode(valid, valid, Side, Side);
+        AssertFinite(Values(recovered));
+    }
+
+    [Fact]
+    public void VideoCache_ReencodesWhenOlderFrameChangesWithoutChangingPairSizeOrLatestTimestamp()
+    {
+        using var encoder = new Qwen35VisionEncoder(_mmproj, _allocator);
+        var (model, injector) = Host(encoder);
+        try
+        {
+            string first = Path.Combine(_directory, "first.bmp");
+            string second = Path.Combine(_directory, "second.bmp");
+            void WriteFrame(string path, byte color)
+            {
+                // Uncompressed 24-bit BMP: changing pixels preserves the exact file
+                // length. Side * 3 is already a multiple of the four-byte row stride.
+                using var writer = new BinaryWriter(File.Create(path));
+                writer.Write((ushort)0x4d42); writer.Write(54 + Side * Side * 3);
+                writer.Write(0); writer.Write(54); writer.Write(40);
+                writer.Write(Side); writer.Write(Side); writer.Write((ushort)1); writer.Write((ushort)24);
+                writer.Write(0); writer.Write(Side * Side * 3);
+                writer.Write(0); writer.Write(0); writer.Write(0); writer.Write(0);
+                for (int y = 0; y < Side; y++)
+                    for (int x = 0; x < Side; x++)
+                    { writer.Write(color); writer.Write((byte)(x * 3)); writer.Write((byte)(y * 3)); }
+            }
+            WriteFrame(first, 16); WriteFrame(second, 200);
+            var epoch = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            File.SetLastWriteTimeUtc(first, epoch);
+            File.SetLastWriteTimeUtc(second, epoch.AddHours(2));
+            var message = new ChatMessage { Role = "user", IsVideo = true,
+                ImagePaths = new() { first, second }, ImageTimestamps = new() { 0, 1 } };
+            float[] Encode()
+            {
+                var tokens = injector.ProcessPromptTokens(new() { message }, new() { 7, 101, 9 });
+                Assert.True(injector.QueuePromptEmbeddingsForSlice(0, tokens.Count));
+                var queued = Field<List<(Tensor Embeddings, int StartPosition)>>(model, "_visionEmbeddingsList");
+                float[] values = Values(Assert.Single(queued).Embeddings);
+                foreach (var q in queued) q.Embeddings.Dispose();
+                queued.Clear();
+                injector.ClearPreparedPromptState(null);
+                return values;
+            }
+            float[] before = Encode();
+            Assert.Equal(before, Encode());
+            long size = new FileInfo(first).Length;
+            WriteFrame(first, 120);
+            File.SetLastWriteTimeUtc(first, epoch.AddHours(1));
+            Assert.Equal(size, new FileInfo(first).Length);
+            Assert.True(MaxAbsDiff(before, Encode()) > 1e-3f);
+        }
+        finally { injector.Dispose(); GC.SuppressFinalize(model); }
+    }
+
+    [Fact]
     public void VideoResize_FitsTheWholeClipAgainstTheSharedBudget()
     {
         var processor = new Qwen35ImageProcessor(QwenVLSyntheticMmprojBuilder.PatchSize, QwenVLSyntheticMmprojBuilder.MergeSize);
@@ -170,6 +234,9 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
         Assert.True((long)64 * h * w <= Qwen35ImageProcessor.VideoMaxPixels);
         Assert.True(h % 32 == 0 && w % 32 == 0 && h < 1080 && w < 1920);
         Assert.Throws<ArgumentException>(() => processor.SmartResizeVideo(2, 16, 64));
+        Assert.Throws<ArgumentOutOfRangeException>(() => processor.SmartResizeVideo(2, 64, 64, temporalPatchSize: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => processor.SmartResizeVideo(2, 64, 64, minPixels: 0));
+        Assert.Throws<ArgumentException>(() => processor.SmartResizeVideo(int.MaxValue, 64, 64));
     }
 
     // ---- helpers -------------------------------------------------------------

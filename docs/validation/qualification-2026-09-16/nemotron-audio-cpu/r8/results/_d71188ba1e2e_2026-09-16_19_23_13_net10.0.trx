@@ -1,0 +1,174 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="0545d845-7943-4547-baed-dfe526b6fb1a" name="@d71188ba1e2e 2026-09-16 19:23:13" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T19:23:13.6647143+00:00" queuing="2026-09-16T19:23:13.6647146+00:00" start="2026-09-16T19:23:12.1577874+00:00" finish="2026-09-16T19:23:14.1907168+00:00" />
+  <TestSettings name="default" id="1a0feea4-2d23-418c-be62-c3c45583eecc">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-16_19_23_13" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="6e988349-795a-4e4b-b516-52dd5f6fe50a" testId="f674dd2c-aa2f-9d30-b73e-fa0fd876c193" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: True, melBins: 8)" computerName="d71188ba1e2e" duration="00:00:00.0249524" startTime="2026-09-16T19:23:13.7703662+00:00" endTime="2026-09-16T19:23:13.7930953+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6e988349-795a-4e4b-b516-52dd5f6fe50a">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=1.4901161193847656E-07.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="ae709204-0377-4167-a559-397bc6a932f6" testId="2c065c3a-0724-0717-1cb9-bdeaafd73580" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1281, tokens: 2)" computerName="d71188ba1e2e" duration="00:00:00.0049248" startTime="2026-09-16T19:23:13.4880320+00:00" endTime="2026-09-16T19:23:13.4881849+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ae709204-0377-4167-a559-397bc6a932f6" />
+    <UnitTestResult executionId="482583fb-06f2-499b-81f0-36b9d719cf24" testId="be333769-5ba8-0700-2e6a-f2bfc6e17f0e" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 160, tokens: 1)" computerName="d71188ba1e2e" duration="00:00:00.1421902" startTime="2026-09-16T19:23:13.3134235+00:00" endTime="2026-09-16T19:23:13.4643638+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="482583fb-06f2-499b-81f0-36b9d719cf24" />
+    <UnitTestResult executionId="a2644415-6070-439c-95bc-5d95a1661782" testId="1cf9b1f0-25bd-41aa-086b-f272c6ddccce" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: True, melBins: 8)" computerName="d71188ba1e2e" duration="00:00:00.0271632" startTime="2026-09-16T19:23:13.8579440+00:00" endTime="2026-09-16T19:23:13.8847233+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a2644415-6070-439c-95bc-5d95a1661782">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=0.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="a4ed1ae2-e8c7-4021-8f11-4f007ecba8c2" testId="b77b41aa-2441-4ad3-e538-85c89323eb40" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1, tokens: 1)" computerName="d71188ba1e2e" duration="00:00:00.0004074" startTime="2026-09-16T19:23:13.4884173+00:00" endTime="2026-09-16T19:23:13.4885547+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a4ed1ae2-e8c7-4021-8f11-4f007ecba8c2" />
+    <UnitTestResult executionId="49b20bdf-4807-4bec-b3eb-ad8ad932465e" testId="f7a9cbc2-c087-3048-82f2-2b792b2ab410" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: False, melBins: 128)" computerName="d71188ba1e2e" duration="00:00:00.0373655" startTime="2026-09-16T19:23:13.8204879+00:00" endTime="2026-09-16T19:23:13.8574899+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="49b20bdf-4807-4bec-b3eb-ad8ad932465e">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=0.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="715a3244-1825-4f12-a8cf-92903aab2a23" testId="8dfdf401-fe7a-024d-1a9e-9cd7b230ee53" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1280, tokens: 2)" computerName="d71188ba1e2e" duration="00:00:00.0034320" startTime="2026-09-16T19:23:13.4895828+00:00" endTime="2026-09-16T19:23:13.4897062+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="715a3244-1825-4f12-a8cf-92903aab2a23" />
+    <UnitTestResult executionId="5ff33154-6239-445e-8f46-157582c2a3da" testId="5c0c34e3-5746-5c63-1417-12ada030df74" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 2560, tokens: 3)" computerName="d71188ba1e2e" duration="00:00:00.0052150" startTime="2026-09-16T19:23:13.4888025+00:00" endTime="2026-09-16T19:23:13.4889488+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5ff33154-6239-445e-8f46-157582c2a3da" />
+    <UnitTestResult executionId="00d3f01c-3d6a-40a9-b6cd-9a9d674c2f87" testId="54444691-e608-167f-092f-53737a6102d0" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: False, melBins: 8)" computerName="d71188ba1e2e" duration="00:00:00.0267753" startTime="2026-09-16T19:23:13.7934195+00:00" endTime="2026-09-16T19:23:13.8200201+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="00d3f01c-3d6a-40a9-b6cd-9a9d674c2f87">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=0.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d0e31f8a-4073-4b91-8327-f9f0d1041242" testId="d9e5e727-c6a0-2cf7-42db-0af9aee04608" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: False, melBins: 8)" computerName="d71188ba1e2e" duration="00:00:00.0237448" startTime="2026-09-16T19:23:13.8852101+00:00" endTime="2026-09-16T19:23:13.9085080+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d0e31f8a-4073-4b91-8327-f9f0d1041242">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=1.4901161193847656E-07.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="aad72010-57ef-438e-b51a-d102d3c9e995" testId="279b481f-14b7-b4e6-09a2-706d6447eb5d" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: True, melBins: 128)" computerName="d71188ba1e2e" duration="00:00:00.0868380" startTime="2026-09-16T19:23:13.6813643+00:00" endTime="2026-09-16T19:23:13.7695536+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="aad72010-57ef-438e-b51a-d102d3c9e995">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=2.5331974029541016E-07.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="b919f57d-95d0-442c-95d1-6f9cd923015b" testId="84d089d0-da9d-63d4-b22e-166a70e56bb8" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1279, tokens: 1)" computerName="d71188ba1e2e" duration="00:00:00.0036918" startTime="2026-09-16T19:23:13.4876292+00:00" endTime="2026-09-16T19:23:13.4877655+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b919f57d-95d0-442c-95d1-6f9cd923015b" />
+    <UnitTestResult executionId="5694eb9a-d8b8-49b6-a7a1-32bf83e44385" testId="dd260ad4-1e61-8603-c9b2-c9fafb5e0f80" testName="InferenceWeb.Tests.NemotronAudioInjectorTests.AudioOnlyTwoClipHistory_QueuesExactRowsAndKeepsOtherRequestAlive" computerName="d71188ba1e2e" duration="00:00:00.1675153" startTime="2026-09-16T19:23:13.5737992+00:00" endTime="2026-09-16T19:23:13.6806730+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5694eb9a-d8b8-49b6-a7a1-32bf83e44385" />
+    <UnitTestResult executionId="26aeafcd-5fb4-4aa1-9aaa-f8bd0582b4e4" testId="5fc9dd45-1be8-4b2d-926d-2e5b2d99bbdc" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: False, melBins: 128)" computerName="d71188ba1e2e" duration="00:00:00.0311658" startTime="2026-09-16T19:23:13.9088349+00:00" endTime="2026-09-16T19:23:13.9397223+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="26aeafcd-5fb4-4aa1-9aaa-f8bd0582b4e4">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=2.5331974029541016E-07.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="38128840-88e8-4765-8427-04b6567c2e35" testId="c6beca8e-259a-2108-2fae-e43377616efb" testName="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: True, melBins: 128)" computerName="d71188ba1e2e" duration="00:00:00.0511869" startTime="2026-09-16T19:23:13.9477145+00:00" endTime="2026-09-16T19:23:13.9908380+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="38128840-88e8-4765-8427-04b6567c2e35">
+      <Output>
+        <StdOut>All six official-reference clips passed; maximum absolute difference=0.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="5de608a2-cb91-431f-a5b9-e1cfa12de558" testId="ba65b844-f6c6-aa41-0fca-ceaaabfef52e" testName="InferenceWeb.Tests.NemotronAudioInputTests.WavDecoder_PreservesInterleavedStereoOrderAndRejectsMalformedSamples" computerName="d71188ba1e2e" duration="00:00:00.0040169" startTime="2026-09-16T19:23:13.5709741+00:00" endTime="2026-09-16T19:23:13.5711303+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5de608a2-cb91-431f-a5b9-e1cfa12de558" />
+    <UnitTestResult executionId="f005a055-9aa0-4484-9036-e58f5b5a878f" testId="f15ea9b1-3ca4-ca4e-6235-7cd1761f7245" testName="InferenceWeb.Tests.NemotronAudioInputTests.MediaPlan_PreservesAllClipAndImagePositionsAcrossTurns" computerName="d71188ba1e2e" duration="00:00:00.0167692" startTime="2026-09-16T19:23:13.4914439+00:00" endTime="2026-09-16T19:23:13.5066150+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f005a055-9aa0-4484-9036-e58f5b5a878f" />
+    <UnitTestResult executionId="8e6e0ddb-c180-4da6-96b9-128fd59f16ff" testId="6140e78c-154b-dc86-0af4-cce3269efee7" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 159, tokens: 1)" computerName="d71188ba1e2e" duration="00:00:00.0008413" startTime="2026-09-16T19:23:13.4891838+00:00" endTime="2026-09-16T19:23:13.4893310+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8e6e0ddb-c180-4da6-96b9-128fd59f16ff" />
+    <UnitTestResult executionId="9992f0f1-2cd2-48c5-9f52-7aa8e352492d" testId="4bf0dd37-9558-f0d4-fece-5eb051ceb430" testName="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 2559, tokens: 2)" computerName="d71188ba1e2e" duration="00:00:00.0070810" startTime="2026-09-16T19:23:13.4861837+00:00" endTime="2026-09-16T19:23:13.4864297+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9992f0f1-2cd2-48c5-9f52-7aa8e352492d" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: True, melBins: 128)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="279b481f-14b7-b4e6-09a2-706d6447eb5d">
+      <Execution id="aad72010-57ef-438e-b51a-d102d3c9e995" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1, tokens: 1)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="b77b41aa-2441-4ad3-e538-85c89323eb40">
+      <Execution id="a4ed1ae2-e8c7-4021-8f11-4f007ecba8c2" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: True, melBins: 8)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="1cf9b1f0-25bd-41aa-086b-f272c6ddccce">
+      <Execution id="a2644415-6070-439c-95bc-5d95a1661782" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 2559, tokens: 2)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="4bf0dd37-9558-f0d4-fece-5eb051ceb430">
+      <Execution id="9992f0f1-2cd2-48c5-9f52-7aa8e352492d" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: False, melBins: 8)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="d9e5e727-c6a0-2cf7-42db-0af9aee04608">
+      <Execution id="d0e31f8a-4073-4b91-8327-f9f0d1041242" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 2560, tokens: 3)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="5c0c34e3-5746-5c63-1417-12ada030df74">
+      <Execution id="5ff33154-6239-445e-8f46-157582c2a3da" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 159, tokens: 1)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="6140e78c-154b-dc86-0af4-cce3269efee7">
+      <Execution id="8e6e0ddb-c180-4da6-96b9-128fd59f16ff" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: False, melBins: 128)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="5fc9dd45-1be8-4b2d-926d-2e5b2d99bbdc">
+      <Execution id="26aeafcd-5fb4-4aa1-9aaa-f8bd0582b4e4" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: False, native: True, melBins: 8)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="f674dd2c-aa2f-9d30-b73e-fa0fd876c193">
+      <Execution id="6e988349-795a-4e4b-b516-52dd5f6fe50a" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1279, tokens: 1)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="84d089d0-da9d-63d4-b22e-166a70e56bb8">
+      <Execution id="b919f57d-95d0-442c-95d1-6f9cd923015b" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1281, tokens: 2)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="2c065c3a-0724-0717-1cb9-bdeaafd73580">
+      <Execution id="ae709204-0377-4167-a559-397bc6a932f6" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: False, melBins: 8)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="54444691-e608-167f-092f-53737a6102d0">
+      <Execution id="00d3f01c-3d6a-40a9-b6cd-9a9d674c2f87" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: True, melBins: 128)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="c6beca8e-259a-2108-2fae-e43377616efb">
+      <Execution id="38128840-88e8-4765-8427-04b6567c2e35" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 160, tokens: 1)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="be333769-5ba8-0700-2e6a-f2bfc6e17f0e">
+      <Execution id="482583fb-06f2-499b-81f0-36b9d719cf24" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInjectorTests.AudioOnlyTwoClipHistory_QueuesExactRowsAndKeepsOtherRequestAlive" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="dd260ad4-1e61-8603-c9b2-c9fafb5e0f80">
+      <Execution id="5694eb9a-d8b8-49b6-a7a1-32bf83e44385" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInjectorTests" name="AudioOnlyTwoClipHistory_QueuesExactRowsAndKeepsOtherRequestAlive" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.CenterStftExtraFrame_IsIncludedInAudioTokenCount(samples: 1280, tokens: 2)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="8dfdf401-fe7a-024d-1a9e-9cd7b230ee53">
+      <Execution id="715a3244-1825-4f12-a8cf-92903aab2a23" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="CenterStftExtraFrame_IsIncludedInAudioTokenCount" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.WavDecoder_PreservesInterleavedStereoOrderAndRejectsMalformedSamples" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="ba65b844-f6c6-aa41-0fca-ceaaabfef52e">
+      <Execution id="5de608a2-cb91-431f-a5b9-e1cfa12de558" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="WavDecoder_PreservesInterleavedStereoOrderAndRejectsMalformedSamples" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioInputTests.MediaPlan_PreservesAllClipAndImagePositionsAcrossTurns" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="f15ea9b1-3ca4-ca4e-6235-7cd1761f7245">
+      <Execution id="f005a055-9aa0-4484-9036-e58f5b5a878f" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioInputTests" name="MediaPlan_PreservesAllClipAndImagePositionsAcrossTurns" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.NemotronAudioEncoderTests.OfficialParakeetAndProjection_AllRowsMatch(bf16: True, native: False, melBins: 128)" storage="/workspace/ts-nemotron-audio-derived-r8/app/inferenceweb.tests.dll" id="f7a9cbc2-c087-3048-82f2-2b792b2ab410">
+      <Execution id="49b20bdf-4807-4bec-b3eb-ad8ad932465e" />
+      <TestMethod codeBase="/workspace/ts-nemotron-audio-derived-r8/app/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.NemotronAudioEncoderTests" name="OfficialParakeetAndProjection_AllRowsMatch" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="f674dd2c-aa2f-9d30-b73e-fa0fd876c193" executionId="6e988349-795a-4e4b-b516-52dd5f6fe50a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2c065c3a-0724-0717-1cb9-bdeaafd73580" executionId="ae709204-0377-4167-a559-397bc6a932f6" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="be333769-5ba8-0700-2e6a-f2bfc6e17f0e" executionId="482583fb-06f2-499b-81f0-36b9d719cf24" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1cf9b1f0-25bd-41aa-086b-f272c6ddccce" executionId="a2644415-6070-439c-95bc-5d95a1661782" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b77b41aa-2441-4ad3-e538-85c89323eb40" executionId="a4ed1ae2-e8c7-4021-8f11-4f007ecba8c2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f7a9cbc2-c087-3048-82f2-2b792b2ab410" executionId="49b20bdf-4807-4bec-b3eb-ad8ad932465e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8dfdf401-fe7a-024d-1a9e-9cd7b230ee53" executionId="715a3244-1825-4f12-a8cf-92903aab2a23" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5c0c34e3-5746-5c63-1417-12ada030df74" executionId="5ff33154-6239-445e-8f46-157582c2a3da" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="54444691-e608-167f-092f-53737a6102d0" executionId="00d3f01c-3d6a-40a9-b6cd-9a9d674c2f87" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d9e5e727-c6a0-2cf7-42db-0af9aee04608" executionId="d0e31f8a-4073-4b91-8327-f9f0d1041242" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="279b481f-14b7-b4e6-09a2-706d6447eb5d" executionId="aad72010-57ef-438e-b51a-d102d3c9e995" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="84d089d0-da9d-63d4-b22e-166a70e56bb8" executionId="b919f57d-95d0-442c-95d1-6f9cd923015b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="dd260ad4-1e61-8603-c9b2-c9fafb5e0f80" executionId="5694eb9a-d8b8-49b6-a7a1-32bf83e44385" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5fc9dd45-1be8-4b2d-926d-2e5b2d99bbdc" executionId="26aeafcd-5fb4-4aa1-9aaa-f8bd0582b4e4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="c6beca8e-259a-2108-2fae-e43377616efb" executionId="38128840-88e8-4765-8427-04b6567c2e35" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ba65b844-f6c6-aa41-0fca-ceaaabfef52e" executionId="5de608a2-cb91-431f-a5b9-e1cfa12de558" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f15ea9b1-3ca4-ca4e-6235-7cd1761f7245" executionId="f005a055-9aa0-4484-9036-e58f5b5a878f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6140e78c-154b-dc86-0af4-cce3269efee7" executionId="8e6e0ddb-c180-4da6-96b9-128fd59f16ff" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4bf0dd37-9558-f0d4-fece-5eb051ceb430" executionId="9992f0f1-2cd2-48c5-9f52-7aa8e352492d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="19" executed="19" passed="19" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.20]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.30]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.35]   Starting:    InferenceWeb.Tests
+[xUnit.net 00:00:01.07]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

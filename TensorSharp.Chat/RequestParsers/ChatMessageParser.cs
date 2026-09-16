@@ -239,14 +239,14 @@ namespace TensorSharp.Server.RequestParsers
         /// is either text or an image (data URL or external URL).
         /// </summary>
         public static List<ChatMessage> ParseOpenAI(JsonElement messagesEl, UploadStoragePolicy uploads, ILogger logger = null,
-            string architecture = null)
+            string architecture = null, bool audioEncoderLoaded = false)
         {
             // Scan the complete request before writing any uploads: an image
             // preceding unsupported audio or an invalid image must not leave
             // partial files, or silently disappear from the model's input.
             // The audio gate covers every family without an audio tower
             // (DeepSeek V4.1, Nemotron-H); the image checks are V4.1's own.
-            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture);
+            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture, audioEncoderLoaded);
             bool deepSeek41 = string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase);
             if (audioError != null || deepSeek41)
             {
@@ -465,9 +465,9 @@ namespace TensorSharp.Server.RequestParsers
         /// folds it into the model's system prompt.
         /// </summary>
         public static List<ChatMessage> ParseResponsesInput(JsonElement inputEl, string instructions, UploadStoragePolicy uploads, ILogger logger = null,
-            string architecture = null)
+            string architecture = null, bool audioEncoderLoaded = false)
         {
-            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture);
+            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture, audioEncoderLoaded);
             bool deepSeek41 = string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase);
             if ((audioError != null || deepSeek41) && inputEl.ValueKind == JsonValueKind.Array)
             {

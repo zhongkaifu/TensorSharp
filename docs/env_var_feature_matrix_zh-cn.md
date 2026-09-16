@@ -291,6 +291,8 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
 | `TS_GLM_TP_FUSED` | GGML 上 GLM-5.3-Flash 的本地 TP | `0` 强制使用组合调度器诊断回退，而不是并发提交按 rank 分段计算图。CPU MoE、张量 tracing、部分 `TS_GLM_TP_SHARD` 切分、rank 超额共享 GPU，或后端缺少原生超连接内核时也会自动回退 | 自动（满足条件时分段） | `0`, `1` | 否 |
 | `TS_Q4E_LAYER_SPLIT` | `--tp N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--tp N` 是按层切分而非张量并行——`qwen4exp` 不切分任何权重 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
+| `TS_Q4E_RETAINED_CACHE` | 完整 GGML token-span 路径上的 Qwen 3.8 Flash Next（`qwen4exp`） | `0` 关闭保留会话复用与共享前缀检查点（仅精确前缀） | 开 | 未注册 | 否 |
+| `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next（`qwen4exp`）保留复用 | 保留会话与共享前缀检查点共用的预算（MiB），受实测内存余量限制；先驱逐最早保留的会话；`0` 或无法解析的值拒绝所有保留 | `4096` | 未注册 | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
 | `TS_GGML_TP_CUDA_GRAPHS` | 本地 TP，`ggml_cuda` | `0` 关闭多 GPU 运行下的 CUDA graph 捕获。TP 下默认**开启**捕获：一个张量并行 token 是几十次按 rank 的小提交，重放的代价远低于重新下发（4×A40：Qwen3.5-9B tp4 88 → 128.5 tok/s，Qwen3.5-35B-A3B tp2 71.3 → 104.1）。历史上曾因捕获污染的隐患而禁用，那个隐患已不再成立——ggml 用 `cudaStreamCaptureModeRelaxed` 捕获。这个 opt-out 会在第一次后端调用之前翻译成原生的 `GGML_CUDA_DISABLE_GRAPHS`，因为 ggml 会在首次使用时锁定该值 | 开启捕获 | 未注册 | 否 |
 | `TS_GGML_TP_AR_PROBE` | 本地 TP，`ggml_cuda` | `0` 跳过两项启动前探测；`force` 忽略缓存的判定（`~/.cache/tensorsharp/tp-collective-probe`）重新探测。模型加载前，进程组会检查两件事：所宣称的设备对之间 peer copy 是否真的把数据送到，以及一次小型 NCCL AllReduce 能否端到端完成——一些云主机声称支持 P2P 但数据永远送不到，NCCL 的第一次集合通信随后会让每块 GPU 永远空转。peer 检查失败时会保留 NCCL 但拿掉它的 peer 传输（`NCCL_P2P_DISABLE=1`），这正是超过 2 张 GPU 时仍能保住设备集合通信的原因 | 探测开启，判定按 驱动/NCCL/GPU 组合缓存 | 未注册 | 否 |
@@ -319,6 +321,8 @@ TestMatrix 配置中 sweep。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
+| `TENSORSHARP_UPLOAD_DIR` | `TensorSharp.Server` | 上传媒体与抽取出的视频帧所在目录；不可变部署时设为应用目录之外的绝对路径 | 服务端二进制旁的 `uploads` | 未注册 | 否 |
+| `TS_NEMOTRON_AUDIO_MMPROJ` | 带 `--mmproj` 的 Nemotron-H | 改从该音频配套 GGUF（NVIDIA `sound_encoder.*` / `sound_projection.*` 张量）而不是 `--mmproj` 文件加载 Parakeet 音频塔，从而可以同时使用视觉 mmproj 与音频配套文件。除非该文件的张量校验通过，音频仍被拒绝（HTTP 400）；见 `docs/models/nemotron_zh-cn.md` §4.7 | 未设置（`--mmproj` 含这些张量时从中读取音频塔） | 未注册 | 否 |
 | `TS_PDF_MAX_PAGES` | PDF 文档输入（CLI `--pdf`、服务端 `/api/upload`） | 文本提取与页面图像渲染读取的 PDF 页数上限 | `0`（全部页面） | 未注册 | 否 |
 | `TS_GGUF_PREFAULT` / `TS_GGUF_PREFAULT_THREADS` | 模型加载，所有走 `GgufReader` 的架构 | `0` 跳过加载器读文件之前的并行页缓存预热；threads 变量设定它的并发流数。加载路径本身只用一到两条流读文件，因此冷加载被单流带宽卡住——在 MooseFS 卷上单流约 440 MB/s，8-16 流约 1.8 GB/s。该预热在 iOS 上、以及文件大于可用内存一半时会自行跳过，文件已在页缓存中时则是空操作 | 开，`min(16, 核心数)` | 未注册 | 否 |
 | `TS_DIRECT_QUANT_WEIGHTS` | `cpu` 后端上的 direct 视频网络（Wan、MiniMax-H3） | `0` 改回在加载时把每个量化权重一次性展开成 F32 再走普通 GEMM，而不是保持 GGUF 存储类型直接参与乘法。展开会占用 4 倍权重内存，每次前向也要多读 4 倍字节；保留该开关是为了在同一个二进制里 A/B 比较两者的数值漂移 | 启用（权重保持量化） | 未注册 | 否 |

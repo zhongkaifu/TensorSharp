@@ -1,0 +1,78 @@
+Test run for /workspace/ts-qwen-retained-diagnostic-r8/tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.37]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.58]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.61]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:02.79]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [FAIL]
+[xUnit.net 00:00:02.80]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:02.80]                  ↓ (pos 0)
+[xUnit.net 00:00:02.80]       Expected: [-0.252141595, -0.833743453, -2.04346848, -1.70139122, 3.25115871, ···]
+[xUnit.net 00:00:02.80]       Actual:   [-0.252030253, -0.833799601, -2.04350424, -1.70151234, 3.25110054, ···]
+[xUnit.net 00:00:02.80]                  ↑ (pos 0)
+[xUnit.net 00:00:02.80]       Stack Trace:
+[xUnit.net 00:00:02.80]         /workspace/ts-qwen-retained-diagnostic-r8/tests/Qwen4ExpRetainedCacheTests.cs(495,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
+[xUnit.net 00:00:02.80]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:02.80]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:02.80]       Output:
+[xUnit.net 00:00:02.80]         native /workspace/ts-qwen-retained-diagnostic-r8/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+[xUnit.net 00:00:02.80]         native /workspace/ts-qwen-retained-diagnostic-r8/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+[xUnit.net 00:00:02.80]         preGrow=False suffix=151 chunked=249 whole=249
+[xUnit.net 00:00:02.80]         raw-key max abs=0; logit max abs=0.00026249885559082031
+[xUnit.net 00:00:02.80]         state=gdn_conv max_abs=5.9604644775390625E-07 changed=181/256
+[xUnit.net 00:00:02.80]         state=gdn_delta max_abs=3.5762786865234375E-07 changed=1803/2048
+[xUnit.net 00:00:02.80]         state=ple_conv max_abs=2.384185791015625E-07 changed=64/128
+[xUnit.net 00:00:02.80]         state=_kCache max_abs=0 changed=0/320
+[xUnit.net 00:00:02.80]         state=_vCache max_abs=0.00048828125 changed=1/320
+[xUnit.net 00:00:02.84]   Finished:    InferenceWeb.Tests
+  Failed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [1 s]
+  Error Message:
+   Assert.Equal() Failure: Collections differ
+           ↓ (pos 0)
+Expected: [-0.252141595, -0.833743453, -2.04346848, -1.70139122, 3.25115871, ···]
+Actual:   [-0.252030253, -0.833799601, -2.04350424, -1.70151234, 3.25110054, ···]
+           ↑ (pos 0)
+  Stack Trace:
+     at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix() in /workspace/ts-qwen-retained-diagnostic-r8/tests/Qwen4ExpRetainedCacheTests.cs:line 495
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+  Standard Output Messages:
+ native /workspace/ts-qwen-retained-diagnostic-r8/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+ native /workspace/ts-qwen-retained-diagnostic-r8/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+ preGrow=False suffix=151 chunked=249 whole=249
+ raw-key max abs=0; logit max abs=0.00026249885559082031
+ state=gdn_conv max_abs=5.9604644775390625E-07 changed=181/256
+ state=gdn_delta max_abs=3.5762786865234375E-07 changed=1803/2048
+ state=ple_conv max_abs=2.384185791015625E-07 changed=64/128
+ state=_kCache max_abs=0 changed=0/320
+ state=_vCache max_abs=0.00048828125 changed=1/320
+
+
+
+Test Run Failed.
+Total tests: 1
+     Failed: 1
+ Total time: 3.7928 Seconds
+Results File: /workspace/ts-qwen-retained-diagnostic-r8/results/cuda-chunk-state-r1/result.trx

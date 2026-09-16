@@ -19,7 +19,7 @@ per-layer fused kernels, which in turn fall back op-by-op). Vision rides the
 Qwen3.5-VL tower with (T,H,W) IMRoPE positions; multi-image and multi-turn
 image sessions are supported, with KV reuse across turns (the GDN recurrence
 cannot rewind, so a cached prefix is reused only when the new prompt extends
-it exactly).
+it exactly; see [Retained-prefix reuse](#retained-prefix-reuse)).
 
 ## Video input
 
@@ -44,15 +44,25 @@ Qwen-VL video layout takes over from there:
   repeats its last frame to complete the final pair. Each pair is encoded on
   its own (the reference tower attends within one temporal patch only) and
   yields the same merged-patch token count as one still frame. The clip is
-  resized as a whole against the Qwen3-VL video pixel budget, so every pair of
-  a clip shares one grid.
+  resized as a whole against one video pixel budget
+  (`Qwen35ImageProcessor.VideoMinPixels` / `VideoMaxPixels`), so every pair of
+  a clip shares one grid; a frame count that cannot fit that budget even at the
+  minimum grid is rejected.
 - **Prompt layout.** The template renders a video part as
-  `<|vision_start|><|video_pad|><|vision_end|>`; the `<|video_pad|>` becomes
-  one `<t seconds><|vision_start|><|video_pad|>…<|vision_end|>` block per pair,
-  `t` being the pair's mean source time with one decimal, and the template's
-  own start/end tokens stay wrapped around the clip. Two `video_url` parts in
-  one message render as two clips. Still images in the same message keep their
-  `<|image_pad|>` spans, in attachment order.
+  `<|vision_start|><|video_pad|><|vision_end|>`, and that whole outer span is
+  replaced — as the Qwen3-VL processor (transformers v4.57.1
+  `processing_qwen3_vl.py`) does, with no second pair of delimiters around the
+  clip — by one `<t seconds><|vision_start|><|video_pad|>…<|vision_end|>` block
+  per pair, `t` being the pair's mean source time with one decimal. Because a
+  pair's label loses its two frames' individual times (and a `max_frames` cap
+  can select non-adjacent frames), the blocks are preceded by one text line,
+  `Sampled video frame times in chronological order: 0, 1, 2 seconds.`, listing
+  every sampled source time; the per-pair vision-token layout is unchanged.
+  Two `video_url` parts in one message render as two clips. Still images in the
+  same message keep their `<|image_pad|>` spans, in attachment order.
+- **Encoding cache.** A pair's embedding is cached under both frame paths and
+  the clip size, and invalidated when either frame file's size or timestamp
+  changes (not only the later one).
 - **Positions.** Each pair is positioned like a still image whose (T, H, W)
   coordinates start at the running position of that pair — the Qwen3-VL
   `get_rope_index` rule, which splits a video grid into per-pair entries — so
@@ -82,6 +92,43 @@ rebuild — and each sequence decodes through its own captured single-graph
 fused decode. The engine round-robins sequences per step
 (`SupportsPerSequenceFusedForward`); a fused N-way batched decode is a future
 optimization.
+
+## Retained-prefix reuse
+
+`Qwen4ExpModel.RetainedCache.cs` gives `qwen4exp` the retained-holder reuse the
+Qwen 3.5 and DeepSeek V4 paths have:
+
+- A finished conversation's whole per-sequence holder is **retained** and
+  re-keyed for the turn that extends it exactly. Nothing moves: the native
+  state entries keyed on the holder, its captured graphs and the draft head's
+  private K/V stay where they are.
+- The state at the end of the prompt every chat shares is **checkpointed** as a
+  host-authoritative deep copy (attention K/V, QSA raw keys and positions,
+  GDN/PLE recurrent state, private MTP state) and **cloned** into each new chat.
+  A clone refuses to copy missing authoritative native state rather than stale
+  host seeds.
+- Reuse is **exact-prefix only** (`IExactFusedCacheReuse`): a holder whose
+  tokens the new prompt does not reproduce to the last one is not a
+  continuation, and every partial match re-prefills.
+- Both retained conversations and checkpoints count against one budget,
+  `TS_Q4E_RETAINED_CACHE_MB` (default 4096, clamped by measured memory
+  headroom; `0` or an unparsable value declines every retention), evicting the
+  oldest retained conversation first. `TS_Q4E_RETAINED_CACHE=0` disables the
+  feature.
+- It needs the complete GGML token-span path (every piece of per-sequence state
+  device-resident and keyed by the holder) and a GDN state layout the native
+  entry can be copied through exactly. Retention works under a layer split;
+  checkpoints are admitted under a layer split and refused under tensor
+  parallelism.
+
+Evidence (synthetic fixtures, not trained-model acceptance or performance):
+[`eng/validation/qwen38_mtp_followup/retained-cache-20260916`](../../eng/validation/qwen38_mtp_followup/retained-cache-20260916/README.md)
+— `Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` cover
+retained A/B/A, checkpoint clones, speculative rebound, budget eviction,
+missing-state refusal and QSA first/reset growth on CPU, and a physical
+two-GPU layer-split checkpoint lifecycle on CUDA. One strict CUDA gate remains
+failed: chunked 16+4 versus whole 20-token prefill still differs in full
+logits (same greedy argmax).
 
 ## Multi-GPU
 

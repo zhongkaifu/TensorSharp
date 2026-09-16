@@ -373,7 +373,12 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
     [InlineData("deepseek41", "required", false, 404)]
     [InlineData("deepseek41", "named", false, 404)]
     [InlineData("deepseek41", "none-unused-schema", false, 404)]
-    [InlineData("deepseek4", "unknown-choice", false, 404)]
+    // An unknown tool_choice is malformed on every family (OpenAI answers 400
+    // invalid_request_error), so V4 and V4.1 agree, streaming or not; only the
+    // schema grammar stays architecture-specific (qwen2 below reaches the
+    // hosted-model guard). See OpenAIToolChoiceValidationTests for the rest.
+    [InlineData("deepseek4", "unknown-choice", false, 400)]
+    [InlineData("deepseek4", "unknown-choice", true, 400)]
     [InlineData("qwen2", "unsupported-schema", false, 404)]
     public async Task DeepSeek41ToolGrammar_ValidatesPoliciesBeforeStreamingOrModelGeneration(
         string architecture, string scenario, bool stream, int expectedStatus)

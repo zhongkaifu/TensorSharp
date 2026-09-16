@@ -1,0 +1,60 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=1 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+SCRATCH_LIFECYCLE tokens=17 injected=0 passed
+SCRATCH_LIFECYCLE tokens=65 injected=0 passed
+SCRATCH_LIFECYCLE tokens=257 injected=0 passed
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+QUANT_STRIP q2_K tokens=9 used=1 ranks=7 bitwise_gate_up=true max_abs=3.49246e-10 rel_l2=1.66943e-07
+QUANT_STRIP q2_K tokens=16 used=1 ranks=2 bitwise_gate_up=true max_abs=4.65661e-10 rel_l2=1.54561e-07
+QUANT_STRIP q2_K tokens=16 used=1 ranks=4 bitwise_gate_up=true max_abs=4.07454e-10 rel_l2=1.67738e-07
+QUANT_STRIP q2_K tokens=16 used=1 ranks=7 bitwise_gate_up=true max_abs=3.49246e-10 rel_l2=1.66563e-07
+QUANT_STRIP q2_K tokens=16 used=1 ranks=8 bitwise_gate_up=true max_abs=4.07454e-10 rel_l2=1.70237e-07
+QUANT_STRIP q2_K tokens=17 used=1 ranks=7 bitwise_gate_up=true max_abs=3.49246e-10 rel_l2=1.66636e-07
+QUANT_STRIP q2_K tokens=33 used=1 ranks=7 bitwise_gate_up=true max_abs=4.07454e-10 rel_l2=1.6677e-07
+QUANT_STRIP q2_K tokens=65 used=1 ranks=7 bitwise_gate_up=true max_abs=4.65661e-10 rel_l2=1.66347e-07
+QUANT_STRIP q2_K tokens=129 used=1 ranks=7 bitwise_gate_up=true max_abs=4.65661e-10 rel_l2=1.66173e-07
+QUANT_STRIP q2_K tokens=9 used=6 ranks=7 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.79418e-07
+QUANT_STRIP q2_K tokens=16 used=6 ranks=2 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.6837e-07
+QUANT_STRIP q2_K tokens=16 used=6 ranks=4 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.79927e-07
+QUANT_STRIP q2_K tokens=16 used=6 ranks=7 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.79129e-07
+QUANT_STRIP q2_K tokens=16 used=6 ranks=8 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.82863e-07
+QUANT_STRIP q2_K tokens=17 used=6 ranks=7 bitwise_gate_up=true max_abs=1.45519e-10 rel_l2=1.79256e-07
+QUANT_STRIP q2_K tokens=33 used=6 ranks=7 bitwise_gate_up=true max_abs=1.74623e-10 rel_l2=1.79284e-07
+QUANT_STRIP q2_K tokens=65 used=6 ranks=7 bitwise_gate_up=true max_abs=1.74623e-10 rel_l2=1.79628e-07
+QUANT_STRIP q2_K tokens=129 used=6 ranks=7 bitwise_gate_up=true max_abs=1.60071e-10 rel_l2=1.79432e-07
+QUANT_STRIP q4_K tokens=9 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.66316e-08
+QUANT_STRIP q4_K tokens=16 used=1 ranks=2 bitwise_gate_up=true max_abs=1.74623e-10 rel_l2=8.25966e-08
+QUANT_STRIP q4_K tokens=16 used=1 ranks=4 bitwise_gate_up=true max_abs=2.32831e-10 rel_l2=9.19801e-08
+QUANT_STRIP q4_K tokens=16 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.57825e-08
+QUANT_STRIP q4_K tokens=16 used=1 ranks=8 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.81222e-08
+QUANT_STRIP q4_K tokens=17 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.59402e-08
+QUANT_STRIP q4_K tokens=33 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.64845e-08
+QUANT_STRIP q4_K tokens=65 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.63421e-08
+QUANT_STRIP q4_K tokens=129 used=1 ranks=7 bitwise_gate_up=true max_abs=2.91038e-10 rel_l2=9.62812e-08
+QUANT_STRIP q4_K tokens=9 used=6 ranks=7 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.1782e-07
+QUANT_STRIP q4_K tokens=16 used=6 ranks=2 bitwise_gate_up=true max_abs=1.16415e-10 rel_l2=1.06739e-07
+QUANT_STRIP q4_K tokens=16 used=6 ranks=4 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.14173e-07
+QUANT_STRIP q4_K tokens=16 used=6 ranks=7 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.17989e-07
+QUANT_STRIP q4_K tokens=16 used=6 ranks=8 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.20269e-07
+QUANT_STRIP q4_K tokens=17 used=6 ranks=7 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.18031e-07
+QUANT_STRIP q4_K tokens=33 used=6 ranks=7 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.1798e-07
+QUANT_STRIP q4_K tokens=65 used=6 ranks=7 bitwise_gate_up=true max_abs=8.73115e-11 rel_l2=1.18355e-07
+QUANT_STRIP q4_K tokens=129 used=6 ranks=7 bitwise_gate_up=true max_abs=1.16415e-10 rel_l2=1.17997e-07
+Passed 36 quantized strip projection and MoE comparisons

@@ -147,6 +147,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmNPast" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmQueueVisionRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmReset" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmResetChecked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmRewind" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSetActiveSlot" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmSlotAlloc" SymbolType="Function" />

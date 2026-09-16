@@ -690,6 +690,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TENSORSHARP_LOG_LEVEL` | 控制台与文件日志的最低输出级别：`Trace`、`Debug`、`Information`、`Warning`、`Error`、`Critical`（默认：`Information`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_DIR` | JSON-line 文件日志的写入目录（默认：`<binDir>/logs`）。`TensorSharp.Cli` 同样识别该变量。 |
 | `TENSORSHARP_LOG_FILE` | 设为 `0` 可关闭文件日志，仅保留控制台输出（默认：开启）。`TensorSharp.Cli` 同样识别该变量。 |
+| `TENSORSHARP_UPLOAD_DIR` | 上传媒体与抽取出的视频帧的存放目录（默认：`<binDir>/uploads`）；只读或固定版本的部署可将其指向应用目录之外。仅服务端识别。 |
 | `TENSORSHARP_TP_DEGREE` | 多卡度 —— 把模型摊到本机多少张 GPU 上（默认：`1`）。当未传 `--tp` 参数时作为 `ModelBase.Create` 的兜底来源；`TensorSharp.Cli` 与 `TensorSharp.Server` 都提供了 `--tp <N>` 参数。需要 `--backend cuda`、`ggml_cuda` 或 `ggml_vulkan`。在改走按层切分而非张量并行的架构（`qwen4exp`、DeepSeek V4）上，它只是个设备数，而不是切分度。 |
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。 |
 | `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |

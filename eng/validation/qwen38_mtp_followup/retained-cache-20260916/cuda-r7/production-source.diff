@@ -1,0 +1,18 @@
+--- r4
++++ public-split
+@@ -92,11 +92,11 @@
+ 
+         public bool SupportsExactFusedCacheReuse => SupportsRetainedFusedCache;
+ 
+-        /// <summary>A checkpoint is a deep copy that downloads every device-resident
+-        /// piece of state; the download paths are exercised on a single device only,
+-        /// so a layer split keeps rebinding and declines checkpoints.</summary>
++        /// <summary>A checkpoint downloads each layer's state from its owning
++        /// device, including a layer split. Tensor-parallel state layouts are
++        /// separate and remain unsupported.</summary>
+         public bool SupportsPrefixCheckpoints =>
+-            SupportsRetainedFusedCache && LayerSplitDegree <= 1 && !IsTensorParallel;
++            SupportsRetainedFusedCache && !IsTensorParallel;
+ 
+         // ---- exact-prefix admission checks (IExactFusedCacheReuse) ----
+ 

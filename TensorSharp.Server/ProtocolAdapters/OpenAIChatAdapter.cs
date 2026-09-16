@@ -115,7 +115,8 @@ public sealed partial class OpenAIChatAdapter
         List<ChatMessage> messages;
         try
         {
-            messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture);
+            messages = ChatMessageParser.ParseOpenAI(messagesEl, _uploads, openaiLogger, _svc.Architecture,
+                _svc.IsAudioEncoderLoaded);
         }
         catch (UploadLimitExceededException ex)
         {

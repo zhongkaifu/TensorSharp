@@ -66,6 +66,20 @@ namespace TensorSharp.Models
                 int tokenCount,
                 int extra0 = 0,
                 int extra1 = 0)
+                : this(fullPath, fileSize, lastWriteUtcTicks, embeddings, tokenCount, extra0, extra1, 0, 0)
+            {
+            }
+
+            public CachedEmbedding(
+                string fullPath,
+                long fileSize,
+                long lastWriteUtcTicks,
+                Tensor embeddings,
+                int tokenCount,
+                int extra0,
+                int extra1,
+                long secondFileSize,
+                long secondLastWriteUtcTicks)
             {
                 FullPath = fullPath;
                 FileSize = fileSize;
@@ -74,6 +88,8 @@ namespace TensorSharp.Models
                 TokenCount = tokenCount;
                 Extra0 = extra0;
                 Extra1 = extra1;
+                SecondFileSize = secondFileSize;
+                SecondLastWriteUtcTicks = secondLastWriteUtcTicks;
             }
 
             public string FullPath { get; }
@@ -83,9 +99,14 @@ namespace TensorSharp.Models
             public int TokenCount { get; }
             public int Extra0 { get; }
             public int Extra1 { get; }
+            public long SecondFileSize { get; }
+            public long SecondLastWriteUtcTicks { get; }
 
             public bool Matches(long fileSize, long lastWriteUtcTicks) =>
                 FileSize == fileSize && LastWriteUtcTicks == lastWriteUtcTicks;
+
+            public bool MatchesPair(long firstSize, long firstTicks, long secondSize, long secondTicks) =>
+                Matches(firstSize, firstTicks) && SecondFileSize == secondSize && SecondLastWriteUtcTicks == secondTicks;
 
             public void Dispose()
             {
@@ -720,57 +741,81 @@ namespace TensorSharp.Models
 
         internal List<int> ProcessNemotronHistory(NemotronModel model, List<ChatMessage> history, List<int> inputTokens)
         {
-            // Audio first, and as a refusal rather than a warning: there is no
-            // audio tower to run (see NemotronModel.AudioInputUnsupportedMessage),
-            // and a request that carries on without it hands the model an
-            // unfilled <so_embedding> placeholder - a silent downgrade the
-            // request-level gates (OpenAI/Responses parsers, Web UI, CLI) already
-            // refuse; this is the last line for callers that bypass them.
-            foreach (var message in history)
-                if (message?.AudioPaths is { Count: > 0 })
-                    throw new NotSupportedException(NemotronModel.AudioInputUnsupportedMessage);
-
-            if (model.VisionEncoder == null)
+            if (!history.Exists(message => message.ImagePaths?.Count > 0 || message.AudioPaths?.Count > 0))
                 return inputTokens;
-
+            // Audio without a loaded tower is a refusal, not a warning: a request
+            // that carried on would hand the model an unfilled <so_embedding>
+            // placeholder - a silent downgrade the request-level gates (OpenAI /
+            // Responses parsers, Web UI, CLI) already refuse through
+            // AudioInputSupport; this is the last line for callers that bypass them.
+            if (model.AudioEncoder == null && history.Exists(message => message?.AudioPaths is { Count: > 0 }))
+                throw new NotSupportedException(NemotronModel.AudioInputUnsupportedMessage);
             int imageTokenId = _model.Tokenizer.LookupToken("<image>");
             int imageStartId = _model.Tokenizer.LookupToken("<img>");
             int imageEndId = _model.Tokenizer.LookupToken("</img>");
             if (imageTokenId < 0) imageTokenId = 18;
             if (imageStartId < 0) imageStartId = 19;
             if (imageEndId < 0) imageEndId = 20;
+            int audioTokenId = _model.Tokenizer.LookupToken("<so_embedding>");
+            int audioStartId = _model.Tokenizer.LookupToken("<so_start>");
+            int audioEndId = _model.Tokenizer.LookupToken("<so_end>");
+            var placements = PlanNemotronMedia(history, inputTokens, imageTokenId, audioTokenId);
+            int added = 0;
+            foreach (var placement in placements)
+            {
+                if (placement.Audio && (audioStartId < 0 || audioEndId < 0))
+                    throw new NotSupportedException("Nemotron audio requires the <so_start> and <so_end> sentinel tokens, which this tokenizer does not define.");
+                if (!placement.Audio && model.VisionEncoder == null)
+                    throw new NotSupportedException("Nemotron image input requires a vision projector.");
+                CachedEmbedding cached = placement.Audio
+                    ? GetOrCreateCachedEmbedding(_audioCache, placement.Path, fullPath =>
+                    {
+                        float[] samples = NemotronAudioPreprocessor.DecodeAudioFile(fullPath);
+                        var (mel, frames, validFrames) = NemotronAudioPreprocessor.ComputeParakeetMelSpectrogram(samples);
+                        return CreateCachedEmbedding(fullPath, model.AudioEncoder.Encode(mel, frames, validFrames));
+                    })
+                    : GetOrCreateNemotronVisionEmbedding(model, placement.Path);
+                int position = checked(placement.Position + added);
+                inputTokens = ExpandSingleTokenPlaceholder(inputTokens, position,
+                    placement.Audio ? audioStartId : imageStartId, cached.TokenCount,
+                    placement.Audio ? audioEndId : imageEndId);
+                if (placement.Audio)
+                    for (int i = 0; i < cached.TokenCount; i++) inputTokens[position + 1 + i] = audioTokenId;
+                var span = new PreparedEmbeddingSpan(cached, position + 1, position, position + cached.TokenCount + 2);
+                (placement.Audio ? _preparedAudioEmbeddings : _preparedVisionEmbeddings).Add(span);
+                added = checked(added + cached.TokenCount + 1);
+            }
+            return inputTokens;
+        }
 
-            int searchFrom = 0;
+        // Plan against the original tokens before expanding either modality. A
+        // manually placed audio marker may precede an image in the same turn.
+        // Independent cursors retain per-modality attachment order; sorting the
+        // positions makes every recorded insertion offset valid after expansion.
+        internal static IReadOnlyList<(int Position, bool Audio, string Path)> PlanNemotronMedia(
+            List<ChatMessage> history, List<int> tokens, int imageTokenId, int audioTokenId)
+        {
+            var result = new List<(int Position, bool Audio, string Path)>();
+            int imageFrom = 0, audioFrom = 0;
             foreach (var message in history)
             {
-                if (message.ImagePaths != null && message.ImagePaths.Count > 0)
+                foreach (bool audio in new[] { false, true })
                 {
-                    foreach (var imagePath in message.ImagePaths)
+                    var paths = audio ? message.AudioPaths : message.ImagePaths;
+                    if (paths == null) continue;
+                    foreach (string path in paths)
                     {
-                        if (string.IsNullOrEmpty(imagePath))
-                            continue;
-
-                        CachedEmbedding cached = GetOrCreateNemotronVisionEmbedding(model, imagePath);
-                        int tokenPosition = FindTokenPosition(inputTokens, imageTokenId, searchFrom);
-                        if (tokenPosition < 0)
-                            continue;
-
-                        inputTokens = ExpandSingleTokenPlaceholder(
-                            inputTokens, tokenPosition, imageStartId, cached.TokenCount, imageEndId);
-
-                        // Insertion point is right after the start sentinel token.
-                        _preparedVisionEmbeddings.Add(new PreparedEmbeddingSpan(
-                            cached,
-                            tokenPosition + 1,
-                            tokenPosition,
-                            tokenPosition + cached.TokenCount + 2));
-
-                        searchFrom = tokenPosition + cached.TokenCount + 2;
+                        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Nemotron media paths must not be empty.");
+                        int marker = audio ? audioTokenId : imageTokenId;
+                        int position = marker < 0 ? -1 : FindTokenPosition(tokens, marker, audio ? audioFrom : imageFrom);
+                        if (position < 0) throw new InvalidOperationException("Nemotron media attachment has no matching prompt placeholder.");
+                        result.Add((position, audio, path));
+                        if (audio) audioFrom = position + 1; else imageFrom = position + 1;
                     }
                 }
             }
-
-            return inputTokens;
+            result.Sort((a, b) => a.Position.CompareTo(b.Position));
+            return result;
         }
 
         private CachedEmbedding GetOrCreateNemotronVisionEmbedding(NemotronModel model, string imagePath)
@@ -896,10 +941,8 @@ namespace TensorSharp.Models
             string key = first + "\n" + second + "\n" + resizedHeight + "x" + resizedWidth;
             GetMediaVersion(first, out long firstSize, out long firstTicks);
             GetMediaVersion(second, out long secondSize, out long secondTicks);
-            long size = unchecked(firstSize * 31 + secondSize);
-            long ticks = Math.Max(firstTicks, secondTicks);
-
-            if (_videoFrameCache.TryGetValue(key, out var cached) && cached.Matches(size, ticks))
+            if (_videoFrameCache.TryGetValue(key, out var cached) &&
+                cached.MatchesPair(firstSize, firstTicks, secondSize, secondTicks))
                 return cached;
             cached?.Dispose();
 
@@ -910,7 +953,8 @@ namespace TensorSharp.Models
             Tensor embeddings = encoder.Encode(firstPixels, secondPixels, resizedHeight, resizedWidth);
             int mergedH = resizedHeight / processor.PatchSize / processor.MergeSize;
             int mergedW = resizedWidth / processor.PatchSize / processor.MergeSize;
-            var fresh = new CachedEmbedding(key, size, ticks, embeddings, (int)embeddings.Sizes[0], mergedH, mergedW);
+            var fresh = new CachedEmbedding(key, firstSize, firstTicks, embeddings, (int)embeddings.Sizes[0],
+                mergedH, mergedW, secondSize, secondTicks);
             _videoFrameCache[key] = fresh;
             return fresh;
         }

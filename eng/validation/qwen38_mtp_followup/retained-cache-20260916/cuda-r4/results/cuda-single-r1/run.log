@@ -1,0 +1,365 @@
+Test run for /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.32]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.43]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.50]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RequiresCompletedNativeRestoreAndExactCapturedPositionOnce [13 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: True) [9 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: False) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RejectsChangedHolderEvenAtSamePosition [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataSnapshot_CopiesPleHistoryAndRestoresSameOwnerWithoutRewindingEarly [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpVideoForwardTests.TwoTemporalPairs_ForwardWithIncreasingTimeReachQsaHistoryAndChangeLogits [468 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint [896 ms]
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:04.26]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [FAIL]
+[xUnit.net 00:00:04.27]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:04.27]                  ↓ (pos 0)
+[xUnit.net 00:00:04.27]       Expected: [-0.252141595, -0.833743453, -2.04346848, -1.70139122, 3.25115871, ···]
+[xUnit.net 00:00:04.27]       Actual:   [-0.252030253, -0.833799601, -2.04350424, -1.70151234, 3.25110054, ···]
+[xUnit.net 00:00:04.27]                  ↑ (pos 0)
+[xUnit.net 00:00:04.27]       Stack Trace:
+[xUnit.net 00:00:04.27]         /workspace/ts-qwen-retained-r4/tests/Qwen4ExpRetainedCacheTests.cs(512,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
+[xUnit.net 00:00:04.27]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:04.27]            at System.Reflection.RuntimeMethodInfo.Invoke(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)
+[xUnit.net 00:00:04.27]       Output:
+[xUnit.net 00:00:04.27]         native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+[xUnit.net 00:00:04.27]         native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+[xUnit.net 00:00:04.27]         preGrow=False suffix=151 chunked=249 whole=249
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.ReleasedConversation_RebindsAfterAnotherRequest_BitExact_WithQsaHistory [548 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Checkpoint_MissingAuthoritativeRecurrentEntryDoesNotPublishStaleHostState [230 ms]
+  Failed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [527 ms]
+  Error Message:
+   Assert.Equal() Failure: Collections differ
+           ↓ (pos 0)
+Expected: [-0.252141595, -0.833743453, -2.04346848, -1.70139122, 3.25115871, ···]
+Actual:   [-0.252030253, -0.833799601, -2.04350424, -1.70151234, 3.25110054, ···]
+           ↑ (pos 0)
+  Stack Trace:
+     at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix() in /workspace/ts-qwen-retained-r4/tests/Qwen4ExpRetainedCacheTests.cs:line 512
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.RuntimeMethodInfo.Invoke(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)
+  Standard Output Messages:
+ native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+ native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+ preGrow=False suffix=151 chunked=249 whole=249
+
+
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.DraftHead_SpeculationEngagesOnAReboundHolder_AndMatchesPlainGreedy [794 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixCheckpoint_ClonesEqualColdPrefill_AndTheSourceIsUntouched [638 ms]
+[q4e retained] evicting conv-0 (0.0 MB) for retaining conversation conv-26
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[q4e retained] declined retaining conversation declined: 0.0 MB does not fit the retention budget (TS_Q4E_RETAINED_CACHE_MB=0 MB, retained 0.0 MB, headroom 42334 MB); that request re-prefills. Reported once.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines [983 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaFirstPromptAndReset_GrowBeforeForwardWithoutExportingInvalidatedState [641 ms]
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DisposingDraftHead_PreservesBorrowedTargetOutputAndRetry [287 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.TargetSnapshot_RestoresGdnPleAndRejectsWrongHolderWithoutMutation [334 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.LearnedHead_DraftVerifyRollbackGreedyMatchesPlainWithEngagement [495 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaMediaHistory_HolderReleaseAndRewindPreserveOtherRawCache [576 ms]
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaRawCache_GrowthPreservesBytesAndRollbackReplaysAllLogits [577 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftPrivateState_FollowsHolderAndReleasePreservesOtherConversation [241 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftHead_F16CacheCatchUpReplayAndTargetIndependence [264 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.HistoricalMediaPositions_DelayedDraftCatchUpMatchesImmediateChunkSchedule [300 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 4) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 3) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 0) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 7) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 1) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 6) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 2) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 5) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: False) [1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: True) [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.CausalCoordinateOrderIsTimeThenHeightThenWidth [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.TextMediaAndDelayedTextPreserveCompleteHistoryAndCallerCoordinates [2 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.HolderSwitchRestoresItsOwnCompleteHistoryAndSpecRewindReplacesOnlyTail [2 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Qwen4Exp_AdvertisesExactPrefixReuseOnly [< 1 ms]
+[q4e retained] evicting older (0.0 MB) for test
+[q4e retained] evicting newer (0.0 MB) for test
+[q4e retained] declined test: 0.0 MB does not fit the retention budget (TS_Q4E_RETAINED_CACHE_MB=0 MB, retained 0.0 MB, headroom 8796093022208 MB); that request re-prefills. Reported once.
+[q4e retained] evicting first (0.0 MB) for test
+[q4e retained] declined test: 0.0 MB does not fit the retention budget (TS_Q4E_RETAINED_CACHE_MB=0 MB, retained 0.0 MB, headroom 8796093022208 MB); that request re-prefills. Reported once.
+[memory] Qwen4Exp: freed 1 retained conversation holder(s)
+[xUnit.net 00:00:10.43]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Eviction_DropsOldestConversationsFirst_NeverACheckpoint_AndDeclinesWhenNothingFits [9 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.HalfSpareClamp_EvictsEvenUnderAGenerousConfiguredBudget [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Budget_IncludesRetainedBytes_ClampsToHalfSpare_AndZeroDeclines [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.ZeroBudget_DeclinesWithoutTouchingRetainedHolders [< 1 ms]
+  Passed InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.DiscardAndTrim_FreeConversationsAndKeepCheckpoints [1 ms]
+
+Test Run Failed.
+Total tests: 41
+     Passed: 40
+     Failed: 1
+ Total time: 11.3180 Seconds
+Results File: /workspace/ts-qwen-retained-r4/results/cuda-single-r1/result.trx

@@ -717,7 +717,7 @@ namespace TensorSharp.Cli
                 Console.WriteLine($"Audio file not found: {path}");
                 return;
             }
-            if (TensorSharp.Models.Architecture.AudioInputSupport.UnsupportedReasonFor(_model.Config.Architecture) is string audioError)
+            if (TensorSharp.Models.Architecture.AudioInputSupport.UnsupportedReasonFor(_model) is string audioError)
             {
                 Console.WriteLine($"Audio not attached: {audioError}");
                 return;

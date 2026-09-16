@@ -1,4 +1,4 @@
-// Copyright (c) Zhongkai Fu. All rights reserved.
+﻿// Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
 using System.Collections.Generic;
@@ -308,6 +308,96 @@ namespace TensorSharp.Models
         {
             DisposeMtpCache(tensor);
             tensor = null;
+        }
+
+        /// <summary>Device-resident bytes of the draft head's private state for
+        /// <paramref name="owner"/> (its F16 K/V pair), for the retention budget.</summary>
+        private long MtpStateBytes(object owner)
+        {
+            if (owner == null || _mtpStates == null || !_mtpStates.TryGetValue(owner, out var state)) return 0;
+            long bytes = 0;
+            foreach (Tensor t in new[] { state.K, state.V, state.RetiringK, state.RetiringV })
+                if (t != null) bytes = checked(bytes + t.Storage.ByteLength);
+            return bytes;
+        }
+
+        /// <summary>Give <paramref name="targetOwner"/> an independent copy of
+        /// <paramref name="sourceOwner"/>'s draft-head state: its own F16 K/V pair
+        /// holding the same <c>Position</c> rows, its own native executor bound to
+        /// them, and its own copy of the position ranges. A shared-prefix clone
+        /// that carried only the target's state would leave the head with a gap it
+        /// cannot draft across (<see cref="IDraftHead.DraftHeadResumesAfterGap"/>).
+        /// A source with no state, or a failed one, leaves the target without one -
+        /// the same as a fresh holder. Throws when the copy cannot be made; the
+        /// caller disposes the half-built holder.</summary>
+        private void CloneMtpState(object sourceOwner, object targetOwner)
+        {
+            if (!HasDraftHead || sourceOwner == null || targetOwner == null || ReferenceEquals(sourceOwner, targetOwner))
+                return;
+            if (_mtpStates.TryGetValue(targetOwner, out var existing))
+                throw new InvalidOperationException("qwen4exp MTP: the clone target already owns draft state.");
+            if (!_mtpStates.TryGetValue(sourceOwner, out var source) || source.Failed
+                || source.Executor == IntPtr.Zero || source.K == null || source.V == null || source.Position <= 0)
+                return;
+            _mtpStates.EnsureCapacity(_mtpStates.Count + 1);
+            List<MtpPositionRange> ranges = null;
+            if (_mtpPositions.TryGetValue(sourceOwner, out var sourceRanges))
+            {
+                _mtpPositions.EnsureCapacity(_mtpPositions.Count + 1);
+                ranges = new List<MtpPositionRange>(sourceRanges.Count);
+                foreach (var r in sourceRanges)
+                    ranges.Add(new MtpPositionRange
+                    {
+                        Position = r.Position, Count = r.Count, RopePosition = r.RopePosition,
+                        MultiAxis = r.MultiAxis == null ? null : (int[])r.MultiAxis.Clone(),
+                    });
+            }
+            var state = new MtpState();
+            Tensor nextK = null, nextV = null;
+            int previousRank = GgmlBasicOps.GetActiveRank();
+            try
+            {
+                GgmlBasicOps.SetActiveRank(_mtpConfig.Device);
+                int cap = source.Capacity;
+                CheckMtpDeviceBudget(checked(2L * Config.NumKVHeads * cap * Config.HeadDim * sizeof(ushort)));
+                nextK = new Tensor(_allocator, DType.Float16, Config.NumKVHeads, cap, Config.HeadDim);
+                nextV = new Tensor(_allocator, DType.Float16, Config.NumKVHeads, cap, Config.HeadDim);
+                InitializeMtpCache(nextK);
+                InitializeMtpCache(nextV);
+                // The executor owns the authoritative rows; bring them to the source's
+                // host mirror first (the same export growth performs), then copy the
+                // written rows across on the host.
+                if (!GgmlBasicOps.Qwen4ExpMtpCopyKv(source.Executor,
+                    TensorComputePrimitives.GetStoragePointer(source.K),
+                    TensorComputePrimitives.GetStoragePointer(source.V), source.K.Storage.ByteLength))
+                    throw new InvalidOperationException("qwen4exp MTP failed to export KV for a clone.");
+                CopyCacheRows(source.K, nextK, source.Position);
+                CopyCacheRows(source.V, nextV, source.Position);
+                InvalidateTensorDeviceCache(nextK);
+                InvalidateTensorDeviceCache(nextV);
+                var config = _mtpConfig;
+                config.Capacity = cap;
+                var attn = _mtpAttn;
+                attn.KCache = TensorComputePrimitives.GetStoragePointer(nextK);
+                attn.VCache = TensorComputePrimitives.GetStoragePointer(nextV);
+                attn.KvBytes = nextK.Storage.ByteLength;
+                IntPtr executor = GgmlBasicOps.Qwen4ExpMtpCreate(ref config, ref attn, ref _mtpFfn, ref _mtpHead);
+                if (executor == IntPtr.Zero) throw new InvalidOperationException("qwen4exp MTP executor creation failed for a clone.");
+                state.Executor = executor;
+                state.K = nextK; state.V = nextV; state.Capacity = cap; state.Position = source.Position;
+                nextK = nextV = null;
+                _mtpStates.Add(targetOwner, state);
+                if (ranges != null) _mtpPositions[targetOwner] = ranges;
+            }
+            finally
+            {
+                try
+                {
+                    try { ReleaseMtpCache(ref nextK); }
+                    finally { ReleaseMtpCache(ref nextV); }
+                }
+                finally { GgmlBasicOps.SetActiveRank(previousRank); }
+            }
         }
 
         private void ReleaseMtpState(object owner)

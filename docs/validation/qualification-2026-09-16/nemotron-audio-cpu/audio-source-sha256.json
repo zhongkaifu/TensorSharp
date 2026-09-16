@@ -1,0 +1,10 @@
+{
+  "TensorSharp.Models/Models/Nemotron/NemotronAudioEncoder.cs": "189bf66e65ffcf8f04919734f48f44d833cd0615228ee225f76e3cc9b8d31185",
+  "TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs": "f08664a3d46bc4ef41f039e85e9fd1738c555622bc67505d389863f41f61bef3",
+  "TensorSharp.Models/Models/Nemotron/NemotronModel.cs": "784e8ac0a761e849168eff319b4a9f2e961a6fddef641f149fbe207435c82e48",
+  "TensorSharp.Models/Models/Nemotron/NemotronModel.Multimodal.cs": "e8194d5df6b6ac5de1430985a71e0cc8dfea5e62608d29e13f39888e642f2b28",
+  "TensorSharp.Models/ModelMultimodalInjector.cs": "a647b3b96d832e005a80e8af12aaea3645720d6497569e162bdda8f7fbd552cf",
+  "InferenceWeb.Tests/NemotronAudioEncoderTests.cs": "d31df7e6920e41d1e55e353794037ffede1ed93efc6ae5c75b1cbb3913ee0b3f",
+  "InferenceWeb.Tests/NemotronAudioInputTests.cs": "f663c40561a299613e6ad95e9f88d3c558853850f0d165f5566eb5b0e6c9d711",
+  "InferenceWeb.Tests/Fixtures/NemotronAudio/reference.json": "8fc2aa8a8cdeac7ea944c6b2dce668b8c9a12ffe267c68eeae12f4d52effa568"
+}

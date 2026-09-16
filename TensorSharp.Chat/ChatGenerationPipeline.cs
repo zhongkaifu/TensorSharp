@@ -274,7 +274,8 @@ namespace TensorSharp.Server
 
             // Validate the original history before compaction or media preparation
             // can remove an attachment and accidentally turn it into text-only input.
-            string audioError = UnsupportedAudioInputError(model.Config.Architecture, history);
+            string audioError = UnsupportedAudioInputError(model.Config.Architecture, history,
+                AudioInputSupport.IsAudioEncoderLoaded(model));
             if (audioError != null)
                 throw new InvalidOperationException(audioError);
 
@@ -1608,14 +1609,16 @@ namespace TensorSharp.Server
         /// audio (or is not a family the table knows): <see cref="AudioInputSupport"/>,
         /// which every entry point that accepts audio consults before writing an
         /// upload or rendering a prompt (the OpenAI chat and Responses parsers, the
-        /// Web UI, this pipeline and the CLI).
+        /// Web UI, this pipeline and the CLI). <paramref name="audioEncoderLoaded"/>
+        /// is whether the loaded model carries its optional audio tower (Nemotron-H).
         /// </summary>
-        internal static string AudioInputErrorFor(string architecture)
-            => AudioInputSupport.UnsupportedReasonFor(architecture);
+        internal static string AudioInputErrorFor(string architecture, bool audioEncoderLoaded = false)
+            => AudioInputSupport.UnsupportedReasonFor(architecture, audioEncoderLoaded);
 
-        internal static string UnsupportedAudioInputError(string architecture, List<ChatMessage> history)
+        internal static string UnsupportedAudioInputError(string architecture, List<ChatMessage> history,
+            bool audioEncoderLoaded = false)
         {
-            string error = AudioInputErrorFor(architecture);
+            string error = AudioInputErrorFor(architecture, audioEncoderLoaded);
             if (error == null || history == null)
                 return null;
             foreach (ChatMessage message in history)

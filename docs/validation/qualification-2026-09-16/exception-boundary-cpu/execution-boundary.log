@@ -1,0 +1,49 @@
+[dsv4] forward failed: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] forward failed with an unknown execution exception
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] speculative forward failed: std::bad_alloc
+[dsv4] speculative forward failed with an unknown execution exception
+[dsv4] batched decode failed: std::bad_alloc
+[dsv4] batched decode failed: std::bad_alloc
+[dsv4] batched decode failed with an unknown execution exception
+[dsv4] batched decode failed with an unknown execution exception
+[dsv4] DSpark draft failed: std::bad_alloc
+[dsv4] DSpark draft failed: std::bad_alloc
+[dsv4] DSpark draft failed with an unknown execution exception
+[dsv4] DSpark draft failed with an unknown execution exception
+[dsv4] forward failed: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] forward failed with an unknown execution exception
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] batched decode failed: std::bad_alloc
+[dsv4] batched decode failed: std::bad_alloc
+[dsv4] batched decode failed with an unknown execution exception
+[dsv4] batched decode failed with an unknown execution exception
+[dsv4] reset failed; slot remains unusable: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed with an unknown exception; slot remains unusable
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] truncate failed; reset required: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] truncate failed with an unknown exception; reset required
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] truncate failed; reset required: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] truncate failed with an unknown exception; reset required
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed; slot remains unusable: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed with an unknown exception; slot remains unusable
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed; slot remains unusable: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed with an unknown exception; slot remains unusable
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed; slot remains unusable: std::bad_alloc
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+[dsv4] reset failed with an unknown exception; slot remains unusable
+[dsv4] sequence execution previously failed; reset or destroy the slot before reuse
+Passed 32/32 actual C ABI boundary cases

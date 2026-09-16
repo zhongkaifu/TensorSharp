@@ -1,0 +1,7 @@
+{
+  "parent_source_manifest_sha256": "f7431257148bd5168c0f80e3049b36fc5228c19a8d47448e09e60ff7eb43eb28",
+  "source_changes": {
+    "TensorSharp.Runtime/QwenVideoFrames.cs": "3f370e4d69c503348333d8922a1749645714ce695b18648a1218c4fdc28125ad"
+  },
+  "scope": "Preserve per-frame sampled source times alongside trained temporal-pair vision blocks; only Runtime production DLL rebuilt."
+}

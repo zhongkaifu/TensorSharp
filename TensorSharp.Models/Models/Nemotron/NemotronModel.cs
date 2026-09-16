@@ -11,6 +11,8 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -215,13 +217,18 @@ namespace TensorSharp.Models
 
         // Multimodal: pending injections to apply at the next Forward() call.
         private NemotronVisionEncoder _visionEncoder;
+        private NemotronAudioEncoder _audioEncoder;
         private readonly List<(Tensor embeddings, int position)> _pendingVisionEmbeddings = new();
         private readonly List<(Tensor embeddings, int position)> _pendingAudioEmbeddings = new();
 
         public NemotronVisionEncoder VisionEncoder => _visionEncoder;
+        public NemotronAudioEncoder AudioEncoder => _audioEncoder;
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            using (var metadata = new GgufFile(mmProjPath))
+                if (!metadata.Tensors.Keys.Any(name => name.StartsWith("v.", StringComparison.Ordinal)))
+                    return;
             // The mmproj uses the GGML allocator path so we get fast Metal/CUDA matmul
             // for the vision encoder's BF16 weights. Falls back to CPU when the LM is on CPU.
             IAllocator visionAllocator = _backend == BackendType.Cuda
@@ -229,6 +236,25 @@ namespace TensorSharp.Models
                 : _allocator;
             _visionEncoder = new NemotronVisionEncoder(mmProjPath, visionAllocator);
             _visionEncoder.SetHostModel(this);
+        }
+
+        public void LoadAudioEncoder(string mmProjPath)
+        {
+            string path = Environment.GetEnvironmentVariable("TS_NEMOTRON_AUDIO_MMPROJ");
+            if (string.IsNullOrWhiteSpace(path)) path = mmProjPath;
+            using (var metadata = new GgufFile(path))
+                if (!metadata.Tensors.ContainsKey("sound_projection.linear2.weight"))
+                    return;
+            IAllocator allocator = _backend == BackendType.Cuda ? new CpuAllocator(BlasEnum.DotNet) : _allocator;
+            var encoder = new NemotronAudioEncoder(path, allocator);
+            if (encoder.ProjectionDim != Config.HiddenSize || encoder.MelBins != NemotronAudioPreprocessor.MelBins)
+            {
+                encoder.Dispose();
+                throw new InvalidDataException("Nemotron audio companion dimensions do not match the language model.");
+            }
+            encoder.SetHostModel(this);
+            _audioEncoder?.Dispose();
+            _audioEncoder = encoder;
         }
 
         public NemotronImageProcessor ImageProcessor =>
@@ -3372,6 +3398,8 @@ namespace TensorSharp.Models
 
             _visionEncoder?.Dispose();
             _visionEncoder = null;
+            _audioEncoder?.Dispose();
+            _audioEncoder = null;
 
             base.Dispose();
         }

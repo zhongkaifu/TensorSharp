@@ -1,0 +1,36 @@
+Start testing: Sep 16 09:38 PDT
+----------------------------------------------------------
+11/18 Testing: deepseek41-dspark-ring-guards
+11/18 Test: deepseek41-dspark-ring-guards
+Command: "/tmp/tensorsharp-boundary-20260916/build/GgmlOpsDsv41DsparkRingTest"
+Directory: /tmp/tensorsharp-boundary-20260916/build
+"deepseek41-dspark-ring-guards" start time: Sep 16 09:38 PDT
+Output:
+----------------------------------------------------------
+PASS: DSpark guard/ring contract checks=281727 branches=24680 refused=1680
+Scope: direct production rewind predicate plus independent ring simulation; no model/CUDA/cache tensor execution.
+<end of output>
+Test time =   0.45 sec
+----------------------------------------------------------
+Test Passed.
+"deepseek41-dspark-ring-guards" end time: Sep 16 09:38 PDT
+"deepseek41-dspark-ring-guards" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/18 Testing: attention-exception-boundary
+16/18 Test: attention-exception-boundary
+Command: "/tmp/tensorsharp-boundary-20260916/build/GgmlOpsAttentionExceptionBoundaryTest"
+Directory: /tmp/tensorsharp-boundary-20260916/build
+"attention-exception-boundary" start time: Sep 16 09:38 PDT
+Output:
+----------------------------------------------------------
+attention exception boundary: before=1 caught=1 injected=1 unwound=1 changed_input=1
+<end of output>
+Test time =   0.14 sec
+----------------------------------------------------------
+Test Passed.
+"attention-exception-boundary" end time: Sep 16 09:39 PDT
+"attention-exception-boundary" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 16 09:39 PDT

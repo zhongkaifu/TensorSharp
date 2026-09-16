@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // Decode-class width for the TensorSharp-owned F32 precision paths (explicit
-// F32 matmul and F32 attention on CUDA).
+// F32 matmul on CUDA and F32 attention on CPU/CUDA).
 //
 // A launch with at most this many activation columns / query rows must compute
 // every column with exactly the kernel, key partition and reduction order a
@@ -25,5 +25,13 @@
 // block size is 5, so 6 rows) and the ordinary forwards of the same width
 // that the parity fixtures compare it against; 8 also matches the batch the
 // upstream mul_mat_vec kernels treat as decode. dsv4_load warns when a
-// drafter's verify width exceeds it.
+// drafter's verify width exceeds it; wider verification batches require
+// independent numerical and rewind qualification.
+//
+// Cost: the invariant paths give up the throughput kernels at these widths. A
+// verify-width attention launch (<= 8 queries, 16 fixed key splits) measured
+// 1.8-2.1x slower per launch than the tiled SGEMM path at 8192 keys on an A40;
+// single-query decode already used the split-key path and is unchanged. The
+// owned aarch64 CPU dot that keeps neighbouring F32 products together measured
+// within 0.76% of ggml's upstream dot (numerical-r3 ARM benchmark).
 constexpr int64_t TSG_PRECISION_DECODE_COLUMNS = 8;

@@ -63,16 +63,6 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
         return env;
     }
 
-    /// <summary>The CUDA row is opt-in through TS_TEST_GLM_CUDA=1 and is a
-    /// no-op otherwise. It must NOT be combined with TS_TEST_GGML_BACKEND=cuda:
-    /// the GLM executor owns its CUDA devices natively and coerces the managed
-    /// side to the ggml-cpu context (NormalizeBackend), so a process already
-    /// pinned to CUDA cannot construct the model at all. Run it with the
-    /// default cpu pin, e.g. CUDA_VISIBLE_DEVICES=6 TS_TEST_GLM_CUDA=1.</summary>
-    private static bool BackendAvailable(BackendType backend)
-        => backend != BackendType.GgmlCuda
-           || Environment.GetEnvironmentVariable("TS_TEST_GLM_CUDA") == "1";
-
     private static int[] SeedPrompt()
     {
         var p = new List<int>();
@@ -263,20 +253,16 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
     [Theory]
     [InlineData(BackendType.Cpu)]
     [InlineData(BackendType.GgmlCpu)]
-    [InlineData(BackendType.GgmlCuda)]
     public void NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(BackendType backend)
     {
-        if (!BackendAvailable(backend)) return;
         RunAndCheck(backend, (t, _) => NGram(t, maxDraft: 4), requireRollback: true, "ngram");
     }
 
     [Theory]
     [InlineData(BackendType.Cpu)]
     [InlineData(BackendType.GgmlCpu)]
-    [InlineData(BackendType.GgmlCuda)]
     public void EveryWindowPartiallyRejected_StillMatchesPlainGreedy(BackendType backend)
     {
-        if (!BackendAvailable(backend)) return;
         RunAndCheck(backend, (t, vocab) => new PartiallyWrongDrafter(NGram(t, maxDraft: 4), vocab),
                     requireRollback: true, "wrong-tail");
     }
@@ -284,10 +270,8 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
     [Theory]
     [InlineData(BackendType.Cpu)]
     [InlineData(BackendType.GgmlCpu)]
-    [InlineData(BackendType.GgmlCuda)]
     public void SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(BackendType backend)
     {
-        if (!BackendAvailable(backend)) return;
         using var env = EnvironmentForFixture();
         using var model = ModelBase.Create(Fixture(), backend);
         var target = Assert.IsAssignableFrom<ISpeculativeTarget>(model);
@@ -343,6 +327,66 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
         Assert.Equal(position2, target.CacheSeqLen);
         float[] next2 = model.Forward(new[] { window[2] });
         AssertClose(sequential[2], next2, 1e-3, "continuation after the second rollback");
+    }
+
+    [GlmNativeCudaFact]
+    public void CudaNgramRollback()
+        => NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(BackendType.GgmlCuda);
+
+    [GlmNativeCudaFact]
+    public void CudaEveryWindowPartiallyRejected()
+        => EveryWindowPartiallyRejected_StillMatchesPlainGreedy(BackendType.GgmlCuda);
+
+    [GlmNativeCudaFact]
+    public void CudaSnapshotVerifyRestoreRewind()
+        => SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(BackendType.GgmlCuda);
+
+    [Fact]
+    public void BoundSlots_AbaRollbackPreservesEachContinuation()
+        => CheckBoundSlotsAbaRollback(BackendType.GgmlCpu);
+
+    [GlmNativeCudaFact]
+    public void CudaBoundSlots_AbaRollbackPreservesEachContinuation()
+        => CheckBoundSlotsAbaRollback(BackendType.GgmlCuda);
+
+    private void CheckBoundSlotsAbaRollback(BackendType backend)
+    {
+        using var env = EnvironmentForFixture();
+        string path = Fixture();
+        using var model = (GlmDsaModel)ModelBase.Create(path, backend);
+        using var cold = ModelBase.Create(path, backend);
+        var target = (ISpeculativeTarget)model;
+        int[] a = { 65, 66, 67, 68, 69 };
+        int[] b = { 71, 72 };
+        int vocab = model.Config.VocabSize;
+        model.Forward(a);
+        model.BindSequenceCache("A");
+        Assert.Equal(0, target.CacheSeqLen);
+        model.Forward(a);
+        model.BindSequenceCache("B");
+        Assert.Equal(0, target.CacheSeqLen);
+        model.Forward(b);
+        model.BindSequenceCache("A");
+        Assert.Equal(a.Length, target.CacheSeqLen);
+        target.SpecSnapshotRecurrentState();
+        target.SpecForward(new[] { 74, 75, 76 }, null, new float[3 * vocab], true);
+        target.SpecRestoreRecurrentState();
+        target.SpecRewindCache(a.Length);
+        float[] actualA = (float[])model.Forward(new[] { 74 }).Clone();
+        cold.Forward(a);
+        AssertClose(cold.Forward(new[] { 74 }), actualA, 1e-6, "A rollback continuation");
+        model.BindSequenceCache("B");
+        Assert.Equal(b.Length, target.CacheSeqLen);
+        float[] actualB = (float[])model.Forward(new[] { 77 }).Clone();
+        cold.ResetKVCache();
+        cold.Forward(b);
+        AssertClose(cold.Forward(new[] { 77 }), actualB, 1e-6, "B isolated continuation");
+        model.BindSequenceCache("A");
+        Assert.Equal(a.Length + 1, target.CacheSeqLen);
+        model.RestorePrimaryCache();
+        Assert.Equal(a.Length, target.CacheSeqLen);
+        model.OnSequenceReleased("A");
+        model.OnSequenceReleased("B");
     }
 
     [Fact]

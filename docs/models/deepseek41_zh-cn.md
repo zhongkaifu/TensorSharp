@@ -230,6 +230,17 @@ TensorSharp 默认按可用显存分配整层。
 它的 Engram 预热在就绪之前会占用约 60 GiB 主机页缓存。冷加载与预热时间要与热态吞吐
 分开记录。
 
+在 CUDA 上，Q2_K 与 Q4_K 的 gate/up 分片走 TensorSharp 自有的量化分片 kernel
+（`ggml_ops_matmul_quant_strip.cuh`、`tsg_matmul_id_quant_pair`）：它只读取本 rank 的权重分片，
+但保留未切分发射的 stream-k 划分与归约顺序，因此每个分片的 gate/up 行与完整张量逐位相同。
+在此之前，ggml 的批量 MMQ 路径对分片的 F32 求和分组与未切分发射不同，down 投影的 Q8 激活
+重新量化又把它放大成检查点形状 Q2_K/Q3_K 在 16 token 时的失败（相对 L2 `3.9e-5`，完整权重
+容差为 `1e-5`）。`GgmlOpsDsv41TpTest` 仍以严格的完整权重参考及其原始容差为通过标准，同时
+记录同设备按分区求值的结果，`--cuda 1 --quant-strip-only` 检查 gate/up 逐位相等以及 scratch
+增长/失败恢复。非对齐的分片形状仍走 ggml 路径。已记录的微基准中窄分片每次 MoE 调用慢
+15-36%，因此这是正确性修复而非加速；见
+[numerical-tp-chosen-r1](../validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md)。
+
 如果权重与上下文放不下，加上 `--n-cpu-moe N` 把前 N 层的路由专家留在主机上，或者用
 `--cpu-moe` 卸载全部路由专家。注意力、路由与共享专家仍在 GPU 上。Engram 表始终以内存
 映射方式留在主机上；每个输入批次只读取并传输选中的 embedding 行。CPU MoE 卸载与按层
