@@ -99,11 +99,6 @@ namespace
 // ONE ggml graph + ONE compute buffer). This is the llama-parity concurrency
 // path: where TSGgml_Gemma4ModelDecode (ggml_ops_gemma4_decode.cpp) decodes ONE token and the engine
 // round-robins N serial calls for N concurrent requests (N weight loads ->
-// ============================================================================
-// TRUE TOKEN-BATCHED dense decode (N concurrent sequences, one token each, in
-// ONE ggml graph + ONE compute buffer). This is the llama-parity concurrency
-// path: where TSGgml_Gemma4ModelDecode (ggml_ops_gemma4_decode.cpp) decodes ONE token and the engine
-// round-robins N serial calls for N concurrent requests (N weight loads ->
 // aggregate ~= single-stream), this kernel processes all N decode tokens
 // together so every weight is loaded ONCE and applied to N tokens. Decode is
 // memory-bandwidth bound, so that amortisation is the win (and one compute
