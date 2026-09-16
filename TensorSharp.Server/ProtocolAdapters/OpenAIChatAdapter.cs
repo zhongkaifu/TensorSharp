@@ -152,6 +152,38 @@ public sealed partial class OpenAIChatAdapter
         bool openaiThink = body.TryGetProperty("think", out var oaiThinkProp) && oaiThinkProp.GetBoolean();
         var requestedSkills = SkillSelectionParser.Parse(body);
 
+        // A block-diffusion model has no tool-call loop: nothing could feed a result
+        // back into a denoising turn, and it used to answer a "required" call with
+        // prose and finish_reason=stop. Refuse the contract up front instead.
+        bool toolChoiceRequested = !toolsDisabled && body.TryGetProperty("tool_choice", out var anyToolChoice)
+            && anyToolChoice.ValueKind != JsonValueKind.Null;
+        if (_svc.IsDiffusionModel && (openaiTools is { Count: > 0 } || toolChoiceRequested))
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: tools/tool_choice on a diffusion model (id={ChatcmplId})", requestId);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new
+            {
+                error = new
+                {
+                    message = "The loaded model generates by block diffusion and has no tool-call channel; " +
+                              "remove tools and tool_choice from the request (only tool_choice \"none\" is accepted).",
+                    type = "invalid_request_error",
+                },
+            }).ConfigureAwait(false);
+            return;
+        }
+
+        if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
+        {
+            openaiLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/v1/chat/completions rejected: {Error} (id={ChatcmplId})", reasoningEffortError, requestId);
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = reasoningEffortError, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
+        }
+        samplingConfig.ReasoningEffort = reasoningEffort;
+
         string lastOpenAiUserContent = LoggingExtensions.SanitizeForLog(
             messages.LastOrDefault(m => m.Role == "user")?.Content ?? string.Empty, 512);
         if (openaiLogger.IsEnabled(LogLevel.Information))

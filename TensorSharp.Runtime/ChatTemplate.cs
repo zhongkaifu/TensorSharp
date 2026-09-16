@@ -637,7 +637,8 @@ namespace TensorSharp.Runtime
         /// </summary>
         public static string RenderFromGgufTemplate(string template, List<ChatMessage> messages,
             bool addGenerationPrompt = true, string? architecture = null,
-            List<ToolFunction>? tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false,
+            string? reasoningEffort = null)
         {
             // Several families ship a template built on Jinja features the lightweight
             // engine renders inconsistently (recursive macros, namespaces, tojson, dict
@@ -647,9 +648,9 @@ namespace TensorSharp.Runtime
             var protocol = ChatProtocolRegistry.For(architecture);
             if (protocol?.PreferOwnRenderer != null
                 && protocol.PreferOwnRenderer(new ChatRenderRequest(
-                    messages, addGenerationPrompt, architecture, tools, enableThinking)))
+                    messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort)))
             {
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort);
             }
 
             if (!string.IsNullOrWhiteSpace(template))
@@ -766,9 +767,10 @@ namespace TensorSharp.Runtime
 
         private static string RenderHardcoded(List<ChatMessage> messages,
             bool addGenerationPrompt, string? architecture,
-            List<ToolFunction>? tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false,
+            string? reasoningEffort = null)
         {
-            var request = new ChatRenderRequest(messages, addGenerationPrompt, architecture, tools, enableThinking);
+            var request = new ChatRenderRequest(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort);
             var render = ChatProtocolRegistry.For(architecture)?.Render;
 
             // No purpose-built renderer: generic ChatML, which is also what an
@@ -1667,11 +1669,20 @@ namespace TensorSharp.Runtime
         /// user/assistant messages with &lt;|start|&gt;role&lt;|message|&gt;content&lt;|end|&gt; framing,
         /// and a generation prompt of just &lt;|start|&gt;assistant (model generates channel tags).
         /// </summary>
+        /// <param name="reasoningEffort">The <c>Reasoning:</c> level of the system message:
+        /// <c>low</c>, <c>medium</c> (the default) or <c>high</c>. This line is the only
+        /// lever over how long GPT-OSS reasons - the model always opens the
+        /// <c>analysis</c> channel before its answer, so "thinking off" cannot be
+        /// rendered and the caller maps it to <c>low</c> instead (see
+        /// <see cref="ReasoningEffort.ForRequest"/>). It used to be hard-coded to
+        /// <c>medium</c>, which is why a 256-token request with thinking off spent its
+        /// whole budget in analysis and ended with no content.</param>
         public static string RenderHarmony(List<ChatMessage> messages, bool addGenerationPrompt = true,
-            List<ToolFunction>? tools = null, bool enableThinking = false)
+            List<ToolFunction>? tools = null, bool enableThinking = false, string? reasoningEffort = null)
         {
             var sb = new StringBuilder();
             bool hasTools = tools != null && tools.Count > 0;
+            string reasoningLevel = ReasoningEffort.Resolve(reasoningEffort);
 
             int startIdx = 0;
             string? developerContent = null;
@@ -1686,7 +1697,7 @@ namespace TensorSharp.Runtime
             sb.Append("You are ChatGPT, a large language model trained by OpenAI.\n");
             sb.Append("Knowledge cutoff: 2024-06\n");
             sb.Append($"Current date: {DateTime.Now:yyyy-MM-dd}\n\n");
-            sb.Append("Reasoning: medium\n\n");
+            sb.Append("Reasoning: ").Append(reasoningLevel).Append("\n\n");
             sb.Append("# Valid channels: analysis, commentary, final. Channel must be included for every message.");
             if (hasTools)
                 sb.Append("\nCalls to these tools must go to the commentary channel: 'functions'.");

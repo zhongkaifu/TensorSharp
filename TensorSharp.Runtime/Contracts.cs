@@ -212,6 +212,21 @@ namespace TensorSharp.Runtime
             string? architecture = null,
             List<ToolFunction>? tools = null,
             bool enableThinking = false);
+
+        /// <summary>
+        /// Render with the request's <c>reasoning_effort</c> level. The default
+        /// implementation ignores the level, which is right for every renderer whose
+        /// family has no such prompt line; <see cref="GgufPromptRenderer"/> forwards it.
+        /// </summary>
+        string Render(
+            string template,
+            List<ChatMessage> messages,
+            bool addGenerationPrompt,
+            string? architecture,
+            List<ToolFunction>? tools,
+            bool enableThinking,
+            string? reasoningEffort)
+            => Render(template, messages, addGenerationPrompt, architecture, tools, enableThinking);
     }
 
     public interface IOutputProtocolParser

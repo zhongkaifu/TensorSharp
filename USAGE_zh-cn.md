@@ -1913,6 +1913,14 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
+# 推理强度（GPT-OSS / Harmony）。模型总是先推理再作答；reasoning_effort
+# （"low" | "medium" | "high"，默认 "medium"，其他值返回 HTTP 400）设置 Harmony
+# 的 "Reasoning:" system 行，这是控制推理长度的唯一开关。显式 "think": false 且
+# 未指定 reasoning_effort 时按 "low" 渲染。其他模型系列接受该字段但忽略它。
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-oss-20b-Q8_0.gguf", "messages": [{"role": "user", "content": "What is 17 + 25?"}], "reasoning_effort": "low", "max_tokens": 256}'
+
 # 结构化输出（OpenAI response_format）
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \

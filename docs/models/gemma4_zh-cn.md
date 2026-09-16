@@ -636,7 +636,7 @@ Gemma 4 checkpoint 上运行。
 `Gemma4OutputParser` 处理两种结构化包装：
 
 - **思维链** —— `<|channel>thought ... <channel|>` 的 chain-of-thought，再跟最终答案。
-- **工具调用** —— `<|tool_call>call:function_name{...args...}<tool_call|>` 块，由 `OutputParser` 解出结构化的 tool call。
+- **工具调用** —— `<|tool_call>call:function_name{...args...}<tool_call|>` 块，由 `OutputParser` 解出结构化的 tool call。参数使用 Gemma 自己的语法（裸键名，字符串用 `<|"|>` 包裹），而模型经常把看起来像标识符的字符串值直接裸写——`call:read_invoice{invoice_id:INV-472}`、`{path:src/main.py}`、`{ids:[INV-1, INV-2]}`。转换器会给每个不是 JSON 数字 / `true` / `false` / `null` 的裸值加引号（数组内也一样；数字保持数字）。参数仍无法解析的调用会以原文作为 content 返回，而不是一条空消息；多调用轮次中每个调用都带自己的 `index`，流式客户端可据此配对参数增量。
 
 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
 

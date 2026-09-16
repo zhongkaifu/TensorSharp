@@ -10,7 +10,7 @@
 | Source class | [`DiffusionGemmaModel`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.cs) |
 | Sampler | [`DiffusionGemmaSampler`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaSampler.cs) |
 | Modalities | Text only |
-| Thinking / tools | Not supported |
+| Thinking / tools | Thought channel parsed out (returned only on `"think": true`); tools/tool_choice refused with HTTP 400 |
 | Generation mode | Block text diffusion, not autoregressive token decode |
 | CLI support | `TensorSharp.Cli` detects `DiffusionGemmaModel` and uses diffusion run mode |
 | Server support | Web UI chat stream with live denoising previews; Ollama/OpenAI compatibility endpoints use append-oriented response shapes and return the final text only (no denoising previews) |
@@ -205,6 +205,21 @@ The Ollama and OpenAI compatibility adapters still use append-oriented response
 shapes through `ChatStreamWithMetricsAsync`. They can surface the final
 DiffusionGemma text, but the live denoising previews and `replace` frames are
 Web UI-only.
+
+The model writes Gemma 4's channel syntax: a canvas may open with the
+`<|channel>thought\n` primer, or close a thought block the prompt opened with a
+bare `<channel|>`, before the answer. The architecture is registered as the
+`diffusion-gemma` chat protocol (`Gemma4OutputParser`, always required, the
+GGUF template still renders the prompt), and every preview and the final text
+go through that parser: the thought block is dropped unless the request asks for
+reasoning (`"think": true` returns it as `reasoning_content`), and the channel
+markers never reach a client. Before this the raw canvas was delivered verbatim
+and OpenAI answers began with the literal `<|channel>thought` marker.
+
+Tool calling is refused up front: `/v1/chat/completions` answers HTTP 400
+(`{"error": ...}`, `invalid_request_error`) to any request that carries `tools`
+or a `tool_choice` other than `"none"` while a DiffusionGemma model is loaded,
+because a block-diffusion turn has no tool loop to feed a result back into.
 
 ## 7. Test coverage
 

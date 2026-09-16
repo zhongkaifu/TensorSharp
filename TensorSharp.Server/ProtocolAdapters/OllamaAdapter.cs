@@ -325,6 +325,13 @@ public sealed class OllamaAdapter
         }
         var ollamaTools = ToolFunctionParser.ParseOllama(body);
         bool ollamaThink = body.TryGetProperty("think", out var thinkProp) && thinkProp.GetBoolean();
+        if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = reasoningEffortError }).ConfigureAwait(false);
+            return;
+        }
+        samplingConfig.ReasoningEffort = reasoningEffort;
         var requestedSkills = SkillSelectionParser.Parse(body);
 
         string lastOllamaUserContent = LoggingExtensions.SanitizeForLog(

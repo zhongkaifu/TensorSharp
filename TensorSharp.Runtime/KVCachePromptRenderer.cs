@@ -203,9 +203,12 @@ namespace TensorSharp.Runtime
             string architecture,
             bool addGenerationPrompt,
             List<ToolFunction>? tools = null,
-            bool enableThinking = false)
+            bool enableThinking = false,
+            string? reasoningEffort = null)
         {
-            return RenderToTokens(tokenizer, chatTemplate, messages, architecture, addGenerationPrompt, out _, tools, enableThinking);
+            return RenderToTokens(
+                tokenizer, chatTemplate, messages, architecture, addGenerationPrompt, out _, tools, enableThinking,
+                reasoningEffort);
         }
 
         public List<int> RenderToTokens(
@@ -216,11 +219,12 @@ namespace TensorSharp.Runtime
             bool addGenerationPrompt,
             out List<int>? explicitBreakpoints,
             List<ToolFunction>? tools = null,
-            bool enableThinking = false)
+            bool enableThinking = false,
+            string? reasoningEffort = null)
         {
             return RenderToTokens(
                 tokenizer, chatTemplate, messages, architecture, addGenerationPrompt,
-                out explicitBreakpoints, out _, tools, enableThinking);
+                out explicitBreakpoints, out _, tools, enableThinking, reasoningEffort);
         }
 
         /// <summary>
@@ -237,7 +241,8 @@ namespace TensorSharp.Runtime
             out List<int>? explicitBreakpoints,
             out string generationPromptTrailingWhitespace,
             List<ToolFunction>? tools = null,
-            bool enableThinking = false)
+            bool enableThinking = false,
+            string? reasoningEffort = null)
         {
             explicitBreakpoints = null;
             generationPromptTrailingWhitespace = string.Empty;
@@ -276,6 +281,7 @@ namespace TensorSharp.Runtime
             {
                 pass = Render(
                     tokenizer, chatTemplate, messages, architecture, addGenerationPrompt, tools, enableThinking,
+                    reasoningEffort,
                     spliceToolCallRounds: splicing == ToolCallRawSplicing.Always || losslessGemma4ToolReplay,
                     useGemma4RawToolReplay: losslessGemma4ToolReplay,
                     proveToolResults: losslessGemma4ToolReplay);
@@ -289,6 +295,7 @@ namespace TensorSharp.Runtime
                 losslessGemma4ToolReplay = false;
                 pass = Render(
                     tokenizer, chatTemplate, messages, architecture, addGenerationPrompt, tools, enableThinking,
+                    reasoningEffort,
                     spliceToolCallRounds: splicing == ToolCallRawSplicing.Always,
                     useGemma4RawToolReplay: false,
                     proveToolResults: false);
@@ -314,6 +321,7 @@ namespace TensorSharp.Runtime
                 // when doing so leaves every tool result visible to the model.
                 RenderPass spliced = Render(
                     tokenizer, chatTemplate, messages, architecture, addGenerationPrompt, tools, enableThinking,
+                    reasoningEffort,
                     spliceToolCallRounds: true,
                     useGemma4RawToolReplay: false,
                     proveToolResults: true);
@@ -415,6 +423,7 @@ namespace TensorSharp.Runtime
             bool addGenerationPrompt,
             List<ToolFunction>? tools,
             bool enableThinking,
+            string? reasoningEffort,
             bool spliceToolCallRounds,
             bool useGemma4RawToolReplay,
             bool proveToolResults)
@@ -638,10 +647,11 @@ namespace TensorSharp.Runtime
             string text = _innerRenderer.Render(
                 chatTemplate,
                 messagesForRender,
-                addGenerationPrompt: addGenerationPrompt,
-                architecture: architecture,
-                tools: tools,
-                enableThinking: enableThinking);
+                addGenerationPrompt,
+                architecture,
+                tools,
+                enableThinking,
+                reasoningEffort);
 
             text = ValidateAndStripToolResultProofs(
                 text, toolResultProofs, out bool renderedToolResultsProven);

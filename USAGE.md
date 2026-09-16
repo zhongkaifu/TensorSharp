@@ -2120,6 +2120,15 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
 
+# Reasoning effort (GPT-OSS / Harmony). The model always reasons before it
+# answers; reasoning_effort ("low" | "medium" | "high", default "medium",
+# anything else is HTTP 400) sets the Harmony "Reasoning:" system line, which is
+# the only lever over how long it reasons. An explicit "think": false with no
+# reasoning_effort renders at "low". Other families accept the field and ignore it.
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-oss-20b-Q8_0.gguf", "messages": [{"role": "user", "content": "What is 17 + 25?"}], "reasoning_effort": "low", "max_tokens": 256}'
+
 # Structured outputs (OpenAI response_format)
 #
 # Enforced by grammar-constrained decoding: the schema is compiled to a grammar

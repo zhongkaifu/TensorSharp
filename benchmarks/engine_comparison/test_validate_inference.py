@@ -286,6 +286,73 @@ class ValidationTests(unittest.TestCase):
             {"scenario": "short", "tag": "c2-i1", "concurrency": 2, "input_sha256": "y", "status": "fail", "turns": []}]}
         self.assertEqual(validation.compare(report, copy.deepcopy(report), .05)["status"], "fail")
 
+    FENCED = '```json\n{"name": "Mars", "moons": 2, "habitable": false}\n```'
+
+    def test_strip_json_fence_accepts_only_one_fence_around_the_whole_text(self):
+        self.assertEqual(json.loads(validation.strip_json_fence(self.FENCED)), {"name": "Mars", "moons": 2, "habitable": False})
+        self.assertEqual(validation.strip_json_fence('  ```\n{"a":1}\n```  '), '{"a":1}')
+        self.assertIsNone(validation.strip_json_fence('{"a":1}'))
+        self.assertIsNone(validation.strip_json_fence('Here you go:\n```json\n{"a":1}\n```'))
+        self.assertIsNone(validation.strip_json_fence('```json\n{"a":1}\n```\nDone.'))
+        self.assertIsNone(validation.strip_json_fence('```python\n{"a":1}\n```'))
+        self.assertIsNone(validation.strip_json_fence('```json\n{"a":1}\n``` and ```'))
+        self.assertIsNone(validation.strip_json_fence(None))
+
+    def test_fenced_json_is_lenient_ok_only_when_opted_in_and_never_strict_ok(self):
+        response = self.workflow_response(self.FENCED)
+        with patch.object(engines, "run_openai_chat", return_value=response):
+            strict = validation.run_case("http://unused", "model", "tensorsharp", "json", "fence")
+            lenient = validation.run_case("http://unused", "model", "tensorsharp", "json", "fence",
+                                          accept_fenced_json=True)
+        self.assertEqual(strict["status"], "fail")
+        self.assertNotIn("lenient_status", strict)
+        self.assertEqual(lenient["status"], "fail")
+        self.assertIn("structural check", lenient["detail"])
+        self.assertEqual(lenient["lenient_status"], "ok")
+        self.assertEqual(lenient["lenient_detail"], "exact JSON inside a code fence")
+        # The flag changes no request, so the two runs stay comparable.
+        self.assertEqual(strict["input_sha256"], lenient["input_sha256"])
+        self.assertEqual(strict["turns"], lenient["turns"])
+
+    def test_fenced_json_that_is_wrong_or_truncated_stays_lenient_fail(self):
+        wrong = self.workflow_response('```json\n{"name": "Mars", "moons": 3, "habitable": false}\n```')
+        truncated = {**self.workflow_response(self.FENCED), "finish_reason": "length"}
+        for response in (wrong, truncated):
+            with patch.object(engines, "run_openai_chat", return_value=response):
+                result = validation.run_case("http://unused", "model", "tensorsharp", "json", "fence",
+                                             accept_fenced_json=True)
+            self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["lenient_status"], "fail")
+        exact = self.workflow_response('{"name": "Mars", "moons": 2, "habitable": false}')
+        with patch.object(engines, "run_openai_chat", return_value=exact):
+            result = validation.run_case("http://unused", "model", "tensorsharp", "json", "fence",
+                                         accept_fenced_json=True)
+        self.assertEqual((result["status"], result["lenient_status"]), ("ok", "ok"))
+
+    def test_lenient_counts_are_summarized_and_flag_is_recorded_without_changing_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fenced.json"
+            argv = ["validate_inference.py", "--url", "http://unused", "--engine", "tensorsharp",
+                    "--model", "model", "--weights-id", "revision-q2k", "--profile", "cpu4",
+                    "--output", str(output), "--scenarios", "json", "--concurrency", "1",
+                    "--repeats", "2", "--accept-fenced-json"]
+            responses = [self.workflow_response("42"), self.workflow_response(self.FENCED),
+                         self.workflow_response('{"name": "Mars", "moons": 2, "habitable": false}')]
+            with patch("sys.argv", argv), patch.object(engines, "run_openai_chat", side_effect=responses):
+                self.assertEqual(validation.main(), 1)  # strict failure still fails the run
+            report = json.loads(output.read_text())
+        self.assertTrue(report["accept_fenced_json"])
+        self.assertEqual(report["summary"]["json@c1"]["passed"], 1)
+        self.assertEqual(report["summary"]["json@c1"]["lenient_passed"], 2)
+        self.assertEqual([c["lenient_status"] for c in report["cases"]], ["ok", "ok"])
+        self.assertEqual([c["status"] for c in report["cases"]], ["fail", "ok"])
+
+    def test_summary_omits_lenient_counts_when_not_opted_in(self):
+        with patch.object(engines, "run_openai_chat", return_value=self.workflow_response("42")):
+            case = validation.run_case("http://unused", "model", "tensorsharp", "short", "plain")
+        case.update(concurrency=1)
+        self.assertNotIn("lenient_passed", validation.summarize([case])["short@c1"])
+
 
 if __name__ == "__main__":
     unittest.main()

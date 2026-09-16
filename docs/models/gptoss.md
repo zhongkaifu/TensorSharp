@@ -400,6 +400,23 @@ alternating SWA** — inside the paged scheduling stack:
 - The output parser strips the `<|channel>analysis ...` block (or surfaces
   it as `<think>` content for the API) and exposes the `<|channel>final`
   payload as the assistant message.
+- **Reasoning cannot be switched off, only shortened.** The model always
+  opens the analysis channel before it answers; the one lever over how long
+  it reasons is the `Reasoning: low|medium|high` line of the Harmony system
+  message. The OpenAI `reasoning_effort` request field (`low`, `medium`,
+  `high`; anything else is HTTP 400) sets that line, default `medium`; the
+  Responses API spelling is `reasoning: {"effort": ...}`. A request that
+  explicitly sends `"think": false` and names no effort is rendered at `low`
+  (an absent `think` keeps `medium`) — previously the line was hard-coded to
+  `medium`, so a 256-token request with thinking off spent its whole budget
+  in analysis and ended with `finish_reason=length` and no content. The
+  level is part of the shared-prefix checkpoint key, and the Web UI applies
+  the same `think:false → low` mapping so the startup warm-up prepares both
+  prefixes.
+- **`response_format` works with `think: true`.** The final channel opens
+  with the same `final<|message|>` header in both modes, so the JSON grammar
+  arms there either way (`ThinkingGrammarActivationTrigger`) and the model is
+  free to reason before the constrained answer.
 - **Tool calling is supported** via the Harmony `commentary` channel. When
   the request includes `tools`:
   - The system message gains the line *"Calls to these tools must go to the

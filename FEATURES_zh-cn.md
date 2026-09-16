@@ -48,7 +48,8 @@
 
 - **Qwen 3.5/3.6-family / Nemotron-H：** 使用 `<think>...</think>` 标签
 - **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签
-- **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复
+- **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复。推理无法关闭，只能缩短：OpenAI 的 `reasoning_effort` 字段（`low` / `medium` / `high`，默认 `medium`；其他值返回 HTTP 400）设置 Harmony 的 `Reasoning:` 行，显式 `"think": false` 且未指定 effort 时按 `low` 渲染。`response_format` 可以与 `"think": true` 同时使用（两种模式下语法都在 final channel 启用）
+- **DiffusionGemma：** 使用 Gemma 4 的 channel 语法；每帧预览和最终文本都会剥离思维块，仅在 `"think": true` 时返回。tools / `tool_choice` 以 HTTP 400 拒绝
 - **DeepSeek V4：** 使用 `<think>...</think>` 标签；不传 `--think` 时聊天模板会直接闭合该块，因此推理是显式开启的
 - **DeepSeek V4.1：** 同样使用 `<think>...</think>`，但带有训练过的收尾转换——达到 `TS_THINKING_BUDGET` 时模型会输出 `</think>`，并在原有 `max_tokens` 之内继续写最终答案。当请求的输出额度不少于 512 token 时，预算默认取 75%；额度更小则没有自动预算，设为 `0` 可关闭。推理进入重复循环时，重复守卫也会请求同一个收尾转换
 - **GLM 5.x：** 同样是 `<think>...</think>`，也与其他系列一样按需开启——加 `--think` 会补上 `Reasoning Effort: Max` 系统行，并在生成提示里留下一个未闭合的 `<think>` 由模型自己收尾；不加时提示里写的是空的 `<think></think>`，模型于是直接作答。历史轮次的思考内容始终不会带进提示，与模板 `clear_thinking` 的默认行为一致

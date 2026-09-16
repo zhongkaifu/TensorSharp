@@ -142,6 +142,13 @@ public sealed class OpenAIResponsesAdapter
         }
         var tools = ToolFunctionParser.ParseOpenAIResponses(body);
         bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object;
+        // `reasoning.effort` is the Responses API spelling of reasoning_effort.
+        if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
+        {
+            await WriteErrorAsync(ctx, 400, reasoningEffortError!).ConfigureAwait(false);
+            return;
+        }
+        samplingConfig.ReasoningEffort = reasoningEffort;
         var requestedSkills = SkillSelectionParser.Parse(body);
 
         string requestId = OpenAIResponsesFactory.NewResponseId();

@@ -206,7 +206,8 @@ namespace TensorSharp.Runtime
             {
                 Id = "harmony",
                 Architectures = new[] { "gptoss", "gpt-oss" },
-                Render = r => ChatTemplate.RenderHarmony(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                Render = r => ChatTemplate.RenderHarmony(
+                    r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking, r.ReasoningEffort),
                 // The embedded template relies on recursive macros, namespace(),
                 // strftime_now and list slicing - especially on the tool-rendering path
                 // - which the lightweight Jinja engine does not fully support.
@@ -214,6 +215,32 @@ namespace TensorSharp.Runtime
                 CreateOutputParser = () => new HarmonyOutputParser(),
                 OutputParserAlwaysRequired = true,
                 GrammarActivationTrigger = "final<|message|>",
+                // GPT-OSS reasons in the analysis channel first whether or not the
+                // request asked for thinking, and the final channel opens with exactly
+                // this header either way. With only the unconditional trigger declared,
+                // the structured-output check read "no delayed trigger for thinking" and
+                // refused every response_format request that also set think=true, though
+                // the grammar arms at the very same place in both modes.
+                ThinkingGrammarActivationTrigger = "final<|message|>",
+                // The system message's `Reasoning: low|medium|high` line is the only
+                // lever over how long GPT-OSS reasons (see ReasoningEffort).
+                RendersReasoningEffort = true,
+            });
+
+            // DiffusionGemma writes Gemma 4's channel syntax: an answer may open with
+            // the `<|channel>thought\n` primer, or close a thought block the prompt
+            // opened with a bare `<channel|>`, before the reply. It had no protocol
+            // entry, so no parser ran over the denoised text and OpenAI answers began
+            // with the literal channel marker (38/39 JSON checks failed in the release
+            // campaign). The GGUF template keeps rendering the prompt - there is
+            // deliberately no Render here - and tool calls are refused at the adapter:
+            // a block-diffusion turn has no tool-call loop to feed a result back into.
+            Register(new ChatProtocol
+            {
+                Id = "diffusion-gemma",
+                Architectures = new[] { "diffusion-gemma", "diffusion_gemma" },
+                CreateOutputParser = () => new Gemma4OutputParser(),
+                OutputParserAlwaysRequired = true,
             });
 
             // ---- Others -----------------------------------------------------
