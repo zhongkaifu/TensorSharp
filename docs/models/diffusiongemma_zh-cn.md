@@ -10,7 +10,7 @@
 | 模型类 | [`DiffusionGemmaModel`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.cs) |
 | 采样器 | [`DiffusionGemmaSampler`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaSampler.cs) |
 | 模态 | 仅文本 |
-| 思维链 / 工具调用 | 不支持 |
+| 思维链 / 工具调用 | 思维 channel 会被解析剥离（仅 `"think": true` 时返回）；tools/tool_choice 以 HTTP 400 拒绝 |
 | 生成方式 | 分块文本扩散，不是自回归 token decode |
 | CLI 支持 | `TensorSharp.Cli` 检测到 `DiffusionGemmaModel` 后进入 diffusion 运行模式 |
 | 服务端支持 | Web UI chat stream 带实时去噪预览；Ollama/OpenAI 兼容端点使用 append-oriented 响应形状，只返回最终文本（没有去噪预览） |
@@ -191,6 +191,20 @@ Diffusion 专属元数据：
 Ollama 与 OpenAI 兼容适配器仍通过 `ChatStreamWithMetricsAsync` 使用 append-oriented
 响应形状。它们可以返回 DiffusionGemma 的最终文本，但实时去噪预览与 `replace`
 帧只在 Web UI 中提供。
+
+模型使用 Gemma 4 的 channel 语法：一张 canvas 可能以 `<|channel>thought\n` 开头，或
+用一个孤立的 `<channel|>` 关闭提示里打开的思维块，然后才是答案。该架构注册为
+`diffusion-gemma` 聊天协议（`Gemma4OutputParser`，始终必需，提示仍由 GGUF 模板渲染），
+每一帧预览和最终文本都经过该解析器：除非请求开启推理（`"think": true` 时以
+`reasoning_content` 返回），思维块会被丢弃，channel 标记永远不会到达客户端。此前
+原始 canvas 被原样返回，OpenAI 的回答以字面的 `<|channel>thought` 标记开头。
+
+工具调用会被直接拒绝：加载 DiffusionGemma 模型时，`/v1/chat/completions` 对任何带
+`tools` 或 `tool_choice`（`"none"` 除外）的请求返回 HTTP 400（`{"error": ...}`，
+`invalid_request_error`），因为分块扩散的一轮没有可以回填结果的工具循环。
+`/v1/responses` 与 Ollama 的 `/api/chat` 以同样方式拒绝 `tools`。内置的 skills /
+代码执行工具也永远不会提供给该系列（协议条目声明 `RendersToolDeclarations = false`），
+因此 `--code-exec` 与 skills 发现不会改变扩散请求的任何行为。
 
 ## 7. 测试覆盖
 

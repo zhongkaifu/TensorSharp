@@ -768,6 +768,14 @@ python validate_inference.py \
 These ten cases check a client serialization constraint. A successful follow-up
 does not erase a default-policy failure or establish a numerical inference fix.
 
+`--accept-fenced-json` is a second, opt-in verdict for the JSON scenarios: when
+the only defect in an answer is a single ```` ```json ```` fence around
+otherwise exact JSON, the case additionally records `lenient_status: "ok"` (and
+`lenient_detail`). The strict `status` stays the case status, the exit code and
+the `passed` count; the per-scenario summary adds `lenient_passed`, and the
+progress line prints both. Wrong or truncated fenced answers stay lenient-fail.
+The flag changes no request, so a run with it hashes identically to one without.
+
 `validate_deepseek41_tools.py` separately exercises tool policy through actual
 HTTP/SSE. Its default plan has 30 cases: `required`, a named weather function
 among two declarations, `none` after a generated weather call and fixed result,

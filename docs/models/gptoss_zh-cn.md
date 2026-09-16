@@ -305,6 +305,8 @@ GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
   - `<|channel>analysis ...` 思维链推理。
   - `<|channel>final ...` 用户可见的回答。
 - 输出解析器剥掉 `<|channel>analysis ...` 块（或在 API 中作为 `<think>` 内容暴露），把 `<|channel>final` 部分作为 assistant 消息暴露。
+- **推理无法关闭，只能缩短。** 模型总是先打开 analysis channel 再作答；唯一能控制推理长度的开关是 Harmony system 消息里的 `Reasoning: low|medium|high` 一行。OpenAI 的 `reasoning_effort` 请求字段（`low`、`medium`、`high`；其他值返回 HTTP 400）设置这一行，默认 `medium`；Responses API 的写法是 `reasoning: {"effort": ...}`。显式发送 `"think": false` 且未指定 effort 的请求按 `low` 渲染（不带 `think` 则保持 `medium`）——此前这一行硬编码为 `medium`，因此关闭思维链的 256 token 请求会把整个预算花在 analysis 上，以 `finish_reason=length` 且没有 content 结束。该等级参与共享前缀 checkpoint 的 key，Web UI 也应用同样的 `think:false → low` 映射，使启动预热同时准备两种前缀。
+- **`response_format` 可以与 `think: true` 同时使用。** 两种模式下 final channel 都以同一个 `final<|message|>` 头开始，因此 JSON 语法在同一位置启用（`ThinkingGrammarActivationTrigger`），模型可以先推理再输出受约束的答案。
 - **支持工具调用**（通过 Harmony `commentary` channel）。当请求包含 `tools` 时：
   - system 消息追加 “Calls to these tools must go to the commentary channel: 'functions'.”，developer 消息追加 `# Tools` 块，把每个工具声明为 TypeScript namespace（`namespace functions { type NAME = (_: { ... }) => any; }`）。
   - 模型以 `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{args}<|call|>` 形式输出调用；`HarmonyOutputParser` 解析 channel 与 `to=functions.NAME` recipient，并把 JSON 参数解析为 `ToolCall`（每轮最多一个调用，与参考实现一致）。

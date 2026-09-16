@@ -21,13 +21,26 @@ namespace TensorSharp.Runtime
             List<ToolFunction>? tools = null,
             bool enableThinking = false)
         {
+            return Render(template, messages, addGenerationPrompt, architecture, tools, enableThinking, null);
+        }
+
+        public string Render(
+            string template,
+            List<ChatMessage> messages,
+            bool addGenerationPrompt,
+            string? architecture,
+            List<ToolFunction>? tools,
+            bool enableThinking,
+            string? reasoningEffort)
+        {
             return ChatTemplate.RenderFromGgufTemplate(
                 template,
                 messages,
                 addGenerationPrompt,
                 architecture,
                 tools,
-                enableThinking);
+                enableThinking,
+                reasoningEffort);
         }
     }
 }

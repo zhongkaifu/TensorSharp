@@ -137,6 +137,16 @@ namespace TensorSharp.Runtime
         public ThinkingTokenBudget? ThinkingBudget { get; set; }
 
         /// <summary>
+        /// The OpenAI <c>reasoning_effort</c> the request asked for (<c>low</c>,
+        /// <c>medium</c>, <c>high</c>), or null for the family's default. It rides on
+        /// the sampling config because that is the one per-request object every
+        /// generation entry point already carries down to the prompt renderer; it is
+        /// a prompt fact rather than a sampler one, and the renderer that reads it is
+        /// <see cref="ChatTemplate.RenderHarmony"/>. See <see cref="Runtime.ReasoningEffort"/>.
+        /// </summary>
+        public string? ReasoningEffort { get; set; }
+
+        /// <summary>
         /// Returns true if this config is effectively greedy decoding.
         /// </summary>
         public bool IsGreedy => Temperature <= 0f && TopK <= 0 && TopP >= 1.0f && MinP <= 0f;
@@ -253,6 +263,7 @@ namespace TensorSharp.Runtime
                 StopSequences = StopSequences != null ? new List<string>(StopSequences) : null,
                 FirstTokenAllowList = FirstTokenAllowList,
                 ThinkingBudget = ThinkingBudget,
+                ReasoningEffort = ReasoningEffort,
             };
         }
     }

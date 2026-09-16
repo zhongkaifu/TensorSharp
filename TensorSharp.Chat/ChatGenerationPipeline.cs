@@ -29,9 +29,13 @@ namespace TensorSharp.Server
     /// <summary>A single streaming update from the DiffusionGemma denoising pipeline.
     /// Previews are intermediate best-guess canvases (whole-text "replace" semantics); the final
     /// update carries the trimmed answer; the done update carries metrics.</summary>
+    /// <param name="Text">The CONTENT channel of the canvas: the denoised text after
+    /// the family's output parser has removed channel markers and the thought block.</param>
+    /// <param name="Thinking">The thought block of the canvas, only when the request
+    /// asked for reasoning; otherwise null.</param>
     internal readonly record struct DiffusionStreamUpdate(
         string Text, bool IsPreview, bool Done, int Step, int TotalSteps,
-        int PromptTokens, int EvalTokens, long TotalNs);
+        int PromptTokens, int EvalTokens, long TotalNs, string? Thinking = null);
 
     /// <summary>A single streaming update from the autoregressive chat / generate pipeline.
     /// Ordinary updates carry only <see cref="Piece"/> (the text decoded since the last
@@ -285,7 +289,7 @@ namespace TensorSharp.Server
             // directly for a live denoising preview.
             if (model is DiffusionGemmaModel)
             {
-                await foreach (var u in DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken)
+                await foreach (var u in DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken, enableThinking)
                     .ConfigureAwait(false))
                 {
                     if (u.Done)
@@ -297,9 +301,12 @@ namespace TensorSharp.Server
                             u.TotalNs, 0, u.TotalNs,
                             cancellationToken.IsCancellationRequested ? "cancelled" : "stop");
                     }
-                    else if (!u.IsPreview && u.Text.Length > 0)
+                    else if (!u.IsPreview && (u.Text.Length > 0 || !string.IsNullOrEmpty(u.Thinking)))
                     {
-                        yield return ChatStreamUpdate.Text(u.Text);
+                        // The denoised text has already been through the family's output
+                        // parser (channel markers and the thought block are gone), so it
+                        // is handed over pre-separated; an adapter must not parse it again.
+                        yield return ChatStreamUpdate.Parsed(u.Text, u.Thinking, null);
                     }
                 }
                 yield break;
@@ -315,6 +322,8 @@ namespace TensorSharp.Server
             int engineContextLimit = (int)Math.Min(int.MaxValue, engineCapacityLong);
 
             string arch = model.Config.Architecture;
+            // A prompt fact carried on the sampling config (see SamplingConfig.ReasoningEffort).
+            string reasoningEffort = samplingConfig?.ReasoningEffort;
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
             List<ChatMessage> renderHistory;
             lock (session.HistoryLock)
@@ -345,7 +354,7 @@ namespace TensorSharp.Server
                 model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                 addGenerationPrompt: true, out explicitBreakpoints,
                 out generationPromptTrailingWhitespace,
-                tools: tools, enableThinking: enableThinking);
+                tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
 
             // A raw token suffix keeps the newest tool result, but it also cuts off
             // leading system/developer instructions. Compact complete message ranges
@@ -366,7 +375,7 @@ namespace TensorSharp.Server
                 _kvCacheRenderer.RenderToTokens(
                     model.Tokenizer, model.Config.ChatTemplate, candidate, arch,
                     addGenerationPrompt: true, tools: tools,
-                    enableThinking: enableThinking).Count;
+                    enableThinking: enableThinking, reasoningEffort: reasoningEffort).Count;
 
             ContextHistoryWindow window = CompactHistoryForContextBudget(
                 renderHistory,
@@ -382,7 +391,7 @@ namespace TensorSharp.Server
                     model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                     addGenerationPrompt: true, out explicitBreakpoints,
                     out generationPromptTrailingWhitespace,
-                    tools: tools, enableThinking: enableThinking);
+                    tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                 _logger.LogWarning(LogEventIds.PromptTruncated,
                     "prompt.history_compacted from {OriginalTokens} to {KeptTokens} tokens by removing {RemovedMessages} old messages (contextLimit={ContextLimit}, historyReserve={HistoryReserve} for a requested reply of {RequestedTokens}, sessionId={SessionId}); leading instructions, latest user task, and newest repair round were preserved",
                     window.OriginalPromptTokens, inputTokens.Count, window.RemovedMessages,
@@ -472,7 +481,7 @@ namespace TensorSharp.Server
                                 model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                                 addGenerationPrompt: true, out explicitBreakpoints,
                                 out generationPromptTrailingWhitespace,
-                                tools: tools, enableThinking: enableThinking);
+                                tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                             inputTokens = model.MultimodalInjector.ProcessPromptTokens(
                                 renderHistory, unexpandedTokens, requestId);
 
@@ -511,7 +520,7 @@ namespace TensorSharp.Server
                                         model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
                                         addGenerationPrompt: true, out explicitBreakpoints,
                                         out generationPromptTrailingWhitespace,
-                                        tools: tools, enableThinking: enableThinking);
+                                        tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                                     inputTokens = model.MultimodalInjector.ProcessPromptTokens(
                                         renderHistory, unexpandedTokens, requestId);
                                     mediaWindow = recoveredWindow;
@@ -570,7 +579,7 @@ namespace TensorSharp.Server
             // engine can checkpoint its state there once and start the next new chat
             // from a copy (see SequenceState.SharedPrefixTokens).
             int sharedPrefixTokens = ComputeSharedPrefixTokens(
-                model, renderHistory, inputTokens, arch, tools, enableThinking);
+                model, renderHistory, inputTokens, arch, tools, enableThinking, reasoningEffort);
 
             var seq = new SequenceState(
                 requestId: requestId,
@@ -830,11 +839,16 @@ namespace TensorSharp.Server
         /// The sampler runs on a background thread under <see cref="ModelBase.GpuComputeLock"/> and pushes
         /// updates through a channel so the request thread can stream them without blocking.
         /// </summary>
+        /// <param name="enableThinking">Whether the caller wants the thought block. DiffusionGemma
+        /// writes Gemma 4's channel syntax and its raw canvas used to be delivered verbatim, so every
+        /// OpenAI answer opened with the literal <c>&lt;|channel&gt;thought</c> marker; the family's
+        /// output parser now separates the channels, and the thought is dropped unless asked for.</param>
         public async IAsyncEnumerable<DiffusionStreamUpdate> DiffusionChatStreamAsync(
             ChatSession session,
             List<ChatMessage> history,
             int maxTokens,
-            [EnumeratorCancellation] CancellationToken cancellationToken)
+            [EnumeratorCancellation] CancellationToken cancellationToken,
+            bool enableThinking = false)
         {
             session ??= new ChatSession("__svc_intrinsic__");
             var model = (DiffusionGemmaModel)(_lifecycle.Model
@@ -861,6 +875,10 @@ namespace TensorSharp.Server
             inputTokens = TruncatePromptToContext(
                 session, inputTokens, maxTokens, out _, preserveAllInput: preserveAttachedDocuments);
             int promptTokenCount = inputTokens.Count;
+            // The publisher template may leave a thought channel open at the end of the
+            // prompt; the parser then has to start inside it, exactly as it does for
+            // Gemma 4's autoregressive turns.
+            string generationSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking: false);
             promptSw.Stop();
 
             int canvas = model.CanvasLength;
@@ -885,8 +903,11 @@ namespace TensorSharp.Server
             await foreach (var preview in handle.Previews.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
                 string previewText = DecodeDiffusionPreview(model, preview.Tokens);
+                var (previewContent, previewThinking) =
+                    SeparateDiffusionChannels(arch, previewText, enableThinking, generationSuffix);
                 yield return new DiffusionStreamUpdate(
-                    previewText, IsPreview: true, Done: false, preview.Step + 1, preview.TotalSteps, 0, 0, 0);
+                    previewContent, IsPreview: true, Done: false, preview.Step + 1, preview.TotalSteps, 0, 0, 0,
+                    previewThinking);
             }
 
             var generated = await handle.Completion.ConfigureAwait(false);
@@ -894,6 +915,10 @@ namespace TensorSharp.Server
 
             generated ??= new List<int>();
             string finalText = model.Tokenizer.Decode(generated);
+            // The tracked history keeps the raw text beside the raw tokens; the caller
+            // gets the channels separated.
+            var (finalContent, finalThinking) =
+                SeparateDiffusionChannels(arch, finalText, enableThinking, generationSuffix);
 
             lock (session.HistoryLock)
                 ChatHistoryPreparer.UpdateTrackedHistory(
@@ -908,9 +933,35 @@ namespace TensorSharp.Server
                 cancellationToken.IsCancellationRequested ? "cancelled" : "stop", finalText);
 
             // Final answer (replaces the last preview), then the terminal metrics update.
-            yield return new DiffusionStreamUpdate(finalText, IsPreview: false, Done: false, 0, 0, 0, 0, 0);
+            yield return new DiffusionStreamUpdate(finalContent, IsPreview: false, Done: false, 0, 0, 0, 0, 0,
+                finalThinking);
             yield return new DiffusionStreamUpdate("", IsPreview: false, Done: true, 0, 0,
                 promptTokenCount, generated.Count, totalNs);
+        }
+
+        /// <summary>
+        /// Run the family's output parser over one whole denoised canvas. A diffusion
+        /// canvas is re-decoded from scratch at every step rather than appended to, so
+        /// each call gets a fresh parser primed with the prompt's open channel, if any.
+        /// Returns the content and, only when reasoning was requested, the thought
+        /// block (null otherwise: the adapters treat null as "no reasoning to report").
+        /// </summary>
+        internal static (string Content, string? Thinking) SeparateDiffusionChannels(
+            string arch, string rawText, bool enableThinking, string? generationSuffix)
+        {
+            if (string.IsNullOrEmpty(rawText))
+                return (string.Empty, null);
+            IOutputParser parser = OutputParserFactory.Create(arch);
+            parser.Init(enableThinking, null);
+            parser.SetGenerationPromptSuffix(generationSuffix);
+            ParsedOutput parsed = parser.Add(rawText, true);
+            string content = parsed.Content ?? string.Empty;
+            // A diffusion turn has no tool loop, so a call the model wrote anyway is
+            // shown as text rather than dropped on the floor.
+            if (content.Length == 0 && !string.IsNullOrEmpty(parsed.ToolCallText))
+                content = parsed.ToolCallText;
+            string? thinking = enableThinking && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
+            return (content, thinking);
         }
 
         /// <summary>Get the diffusion batch scheduler bound to the currently-loaded model, (re)creating it
@@ -983,12 +1034,15 @@ namespace TensorSharp.Server
         /// </summary>
         internal int ComputeSharedPrefixTokens(
             ModelBase model, List<ChatMessage> history, List<int> promptTokens,
-            string arch, List<ToolFunction> tools, bool enableThinking)
+            string arch, List<ToolFunction> tools, bool enableThinking, string reasoningEffort = null)
         {
             try
             {
                 if (model?.Tokenizer == null || history == null || promptTokens == null)
                     return 0;
+                // Only a family that renders the level has a prefix that depends on it.
+                if (ChatProtocolRegistry.For(arch)?.RendersReasoningEffort != true)
+                    reasoningEffort = null;
                 int leading = 0;
                 while (leading < history.Count
                     && (history[leading].Role == "system" || history[leading].Role == "developer"))
@@ -1003,7 +1057,8 @@ namespace TensorSharp.Server
                         return 0;
 
                 var keyBuilder = new StringBuilder();
-                keyBuilder.Append(arch).Append('|').Append(enableThinking ? 'T' : 'F').Append('|');
+                keyBuilder.Append(arch).Append('|').Append(enableThinking ? 'T' : 'F').Append('|')
+                    .Append(reasoningEffort ?? string.Empty).Append('|');
                 for (int i = 0; i < leading; i++)
                     keyBuilder.Append(history[i].Role).Append(':').Append(history[i].Content).Append('\u0001');
                 if (hasTools)
@@ -1019,7 +1074,7 @@ namespace TensorSharp.Server
                 {
                     prefixTokens = _kvCacheRenderer.RenderToTokens(
                         model.Tokenizer, model.Config.ChatTemplate, history.GetRange(0, leading), arch,
-                        addGenerationPrompt: false, tools: tools, enableThinking: enableThinking);
+                        addGenerationPrompt: false, tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                     lock (_sharedPrefixLock)
                     {
                         if (_sharedPrefixRenders.TryAdd(key, prefixTokens))
@@ -1063,7 +1118,8 @@ namespace TensorSharp.Server
             ITokenizer tokenizer, List<int> promptTokens, string arch, bool enableThinking)
         {
             string suffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, enableThinking);
-            bool gemma = arch == "gemma4";
+            // DiffusionGemma renders through the same channel-priming template family.
+            bool gemma = arch == "gemma4" || arch == "diffusion-gemma" || arch == "diffusion_gemma";
             if ((!gemma && string.IsNullOrEmpty(suffix)) || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
                 return string.Empty;
             try

@@ -406,7 +406,7 @@ namespace TensorSharp.Server
 
         /// <summary>True when the loaded model is a DiffusionGemma block-diffusion model, which is
         /// generated via an iterative denoising sampler instead of the autoregressive engine.</summary>
-        public bool IsDiffusionModel => _lifecycle.Model is DiffusionGemmaModel;
+        public virtual bool IsDiffusionModel => _lifecycle.Model is DiffusionGemmaModel;
 
         /// <summary>Stream a DiffusionGemma chat turn as rich denoising updates (live preview canvases +
         /// final answer + metrics). Used by the Web UI for a live denoising view. Must be called within
@@ -415,9 +415,10 @@ namespace TensorSharp.Server
             ChatSession session,
             List<ChatMessage> history,
             int maxTokens,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool enableThinking = false)
         {
-            return _generation.DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken);
+            return _generation.DiffusionChatStreamAsync(session, history, maxTokens, cancellationToken, enableThinking);
         }
 
         /// <summary>

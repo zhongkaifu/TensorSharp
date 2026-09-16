@@ -11,12 +11,15 @@ using System.Text;
 namespace TensorSharp.Runtime
 {
     /// <summary>Everything a chat renderer is given for one prompt.</summary>
+    /// <param name="ReasoningEffort">The request's <c>reasoning_effort</c> level, or null
+    /// for the family's default. See <see cref="Runtime.ReasoningEffort"/>.</param>
     public sealed record ChatRenderRequest(
         List<ChatMessage> Messages,
         bool AddGenerationPrompt,
         string? Architecture,
         List<ToolFunction>? Tools,
-        bool EnableThinking);
+        bool EnableThinking,
+        string? ReasoningEffort = null);
 
     /// <summary>
     /// Whether a family may reuse a past TOOL-CALLING round's exact generated tokens
@@ -146,6 +149,15 @@ namespace TensorSharp.Runtime
         /// disabled, but must finish their reasoning block before JSON enforcement.
         /// </summary>
         public string? ThinkingGrammarActivationTrigger { get; init; }
+
+        /// <summary>
+        /// True when this family's prompt carries the request's
+        /// <see cref="ChatRenderRequest.ReasoningEffort"/> (Harmony's
+        /// <c>Reasoning: low|medium|high</c> system line). Families that do not render
+        /// it ignore the value, and it then stays out of the shared-prefix key so an
+        /// explicit <c>think:false</c> and an absent one keep sharing one checkpoint.
+        /// </summary>
+        public bool RendersReasoningEffort { get; init; }
 
         /// <summary>Trained single token that may close this family's open
         /// reasoning channel at its budget. Null retains the host's hard stop.</summary>

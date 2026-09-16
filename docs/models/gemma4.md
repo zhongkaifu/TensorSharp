@@ -807,7 +807,15 @@ beside it.
   the final answer.
 - **Tool calling** — `<|tool_call>call:function_name{...args...}<tool_call|>`
   blocks, which `OutputParser` extracts into structured tool calls regardless
-  of the surrounding content.
+  of the surrounding content. The arguments use Gemma's own syntax (bare keys,
+  strings wrapped in `<|"|>`), and the model regularly writes a string value
+  bare when it looks like an identifier — `call:read_invoice{invoice_id:INV-472}`,
+  `{path:src/main.py}`, `{ids:[INV-1, INV-2]}`. The converter quotes every bare
+  value that is not a JSON number / `true` / `false` / `null` (inside arrays
+  too; numbers stay numbers). A call whose arguments still do not parse is
+  surfaced verbatim as content rather than as an empty message, and each call
+  in a multi-call turn carries its own `index` so streaming clients can pair
+  the argument deltas.
 
 Chat template falls back to the hardcoded Gemma 4 template when the GGUF does
 not ship a Jinja2 one.

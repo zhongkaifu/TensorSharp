@@ -142,7 +142,24 @@ public sealed class OpenAIResponsesAdapter
             return;
         }
         var tools = ToolFunctionParser.ParseOpenAIResponses(body);
+        // Same contract as /v1/chat/completions: a block-diffusion model has no
+        // tool-call loop, so tools are refused up front rather than answered with prose.
+        if (_svc.IsDiffusionModel && tools is { Count: > 0 })
+        {
+            logger.LogWarning(LogEventIds.HttpRequestRejected, "/v1/responses rejected: tools on a diffusion model");
+            await WriteErrorAsync(ctx, 400,
+                "The loaded model generates by block diffusion and has no tool-call channel; remove tools from the request.")
+                .ConfigureAwait(false);
+            return;
+        }
         bool enableThinking = body.TryGetProperty("reasoning", out var reasoningEl) && reasoningEl.ValueKind == JsonValueKind.Object;
+        // `reasoning.effort` is the Responses API spelling of reasoning_effort.
+        if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
+        {
+            await WriteErrorAsync(ctx, 400, reasoningEffortError!).ConfigureAwait(false);
+            return;
+        }
+        samplingConfig.ReasoningEffort = reasoningEffort;
         var requestedSkills = SkillSelectionParser.Parse(body);
 
         string requestId = OpenAIResponsesFactory.NewResponseId();

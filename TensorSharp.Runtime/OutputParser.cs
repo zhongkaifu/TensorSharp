@@ -694,6 +694,12 @@ namespace TensorSharp.Runtime
         // into it rather than a consumption.
         private int _toolReportedChars;
 
+        // Position of the next completed call in this turn. Every other parser
+        // numbers its calls so a streaming client can pair the argument deltas of
+        // two parallel calls; Gemma 4's were all index 0, and a two-call turn
+        // collapsed into one call on the wire.
+        private int _callIndex;
+
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
         public bool AlwaysRequired => true;
@@ -714,6 +720,7 @@ namespace TensorSharp.Runtime
             _needsChannelNameStrip = false;
             _state = State.CollectingContent;
             _toolReportedChars = 0;
+            _callIndex = 0;
         }
 
         public ParsedOutput Add(string text, bool done)
@@ -876,8 +883,7 @@ namespace TensorSharp.Runtime
                             if (endIdx > _toolReportedChars)
                                 toolCallTextSb.Append(raw, _toolReportedChars, endIdx - _toolReportedChars);
                             _toolReportedChars = 0;
-                            var tc = ParseGemma4ToolCall(raw);
-                            if (tc != null) toolCalls.Add(tc);
+                            AcceptGemma4ToolCall(raw, toolCalls, contentSb);
                             _state = State.CollectingContent;
                             keepParsing = after.Length > 0;
                         }
@@ -886,8 +892,7 @@ namespace TensorSharp.Runtime
                             if (buf.Length > _toolReportedChars)
                                 toolCallTextSb.Append(buf, _toolReportedChars, buf.Length - _toolReportedChars);
                             _toolReportedChars = 0;
-                            var tc = ParseGemma4ToolCall(buf);
-                            if (tc != null) toolCalls.Add(tc);
+                            AcceptGemma4ToolCall(buf, toolCalls, contentSb);
                             _buffer.Clear();
                             _state = State.CollectingContent;
                         }
@@ -917,6 +922,27 @@ namespace TensorSharp.Runtime
             return result;
         }
 
+        /// <summary>
+        /// A completed call body either becomes a structured <see cref="ToolCall"/> or,
+        /// when its arguments cannot be read, is surfaced verbatim as CONTENT. Dropping
+        /// it produced an empty assistant message with <c>finish_reason=stop</c> and no
+        /// tool call: the client saw nothing at all and could not tell a refusal from a
+        /// parse failure. The raw text at least shows what the model wrote.
+        /// </summary>
+        private void AcceptGemma4ToolCall(string raw, List<ToolCall> toolCalls, StringBuilder contentSb)
+        {
+            var tc = ParseGemma4ToolCall(raw);
+            if (tc != null)
+            {
+                tc.Index = _callIndex++;
+                toolCalls.Add(tc);
+            }
+            else
+            {
+                contentSb.Append(raw);
+            }
+        }
+
         /// <summary>The call's tool name, once <c>call:NAME{</c> has been written.</summary>
         private static string? ToolCallNameFrom(string body)
         {
@@ -930,7 +956,9 @@ namespace TensorSharp.Runtime
         }
 
         private static readonly Regex GemmaQuotedStringRe = new(@"<\|""\|>(.*?)<\|""\|>", RegexOptions.Singleline);
-        private static readonly Regex GemmaBareKeyRe = new(@"([,{])(\w+):");
+        private static readonly Regex GemmaBareKeyRe = new(@"([,{]\s*)(\w+)\s*:");
+        // A JSON number exactly as RFC 8259 spells it; any other bare value is a string.
+        private static readonly Regex JsonNumberRe = new(@"^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$");
 
         // Tool names whose call bodies already failed to parse. The raw body
         // still reaches the client via ToolCallText, but the dropped structured
@@ -966,12 +994,22 @@ namespace TensorSharp.Runtime
                 if (first)
                     Console.Error.WriteLine(
                         $"[Gemma4OutputParser] Tool call '{name}' has arguments that do not parse as JSON ({ex.Message}); " +
-                        "it is dropped from ToolCalls, so the tool will not run — the raw call text is still " +
-                        "delivered in ToolCallText. Reported once per tool name.");
+                        "it is dropped from ToolCalls, so the tool will not run — the raw call text is " +
+                        "delivered as content and in ToolCallText instead. Reported once per tool name.");
                 return null;
             }
         }
 
+        /// <summary>
+        /// Turn Gemma 4's call syntax into JSON: keys are bare identifiers, strings are
+        /// wrapped in <c>&lt;|"|&gt;</c> ... <c>&lt;|"|&gt;</c>, and - what this used to
+        /// miss - the model regularly writes a string value BARE when it looks like an
+        /// identifier (<c>{invoice_id:INV-472}</c>, <c>{path:src/main.py}</c>,
+        /// <c>{ids:[INV-1, INV-2]}</c>). Such a call parsed only by luck, and
+        /// <c>read_invoice{invoice_id:INV-472}</c> was dropped whole. A bare value that
+        /// is not a JSON number, <c>true</c>, <c>false</c> or <c>null</c> is quoted,
+        /// inside arrays included; numbers stay numbers.
+        /// </summary>
         internal static string Gemma4ArgsToJson(string s)
         {
             var quotedStrings = new List<string>();
@@ -982,6 +1020,7 @@ namespace TensorSharp.Runtime
             });
 
             text = GemmaBareKeyRe.Replace(text, "$1\"$2\":");
+            text = QuoteGemmaBareValues(text);
 
             for (int i = 0; i < quotedStrings.Count; i++)
             {
@@ -990,6 +1029,104 @@ namespace TensorSharp.Runtime
             }
 
             return text;
+        }
+
+        /// <summary>
+        /// Quote every bare scalar in VALUE position (after a <c>:</c> inside an object,
+        /// after <c>[</c> or <c>,</c> inside an array) that is not already a JSON scalar.
+        /// Placeholders (<c>\x00</c> i <c>\x00</c>, the strings the model quoted itself)
+        /// and real JSON strings pass through untouched.
+        /// </summary>
+        private static string QuoteGemmaBareValues(string text)
+        {
+            var sb = new StringBuilder(text.Length + 16);
+            var containers = new Stack<char>();
+            bool expectValue = false;
+            int i = 0;
+            while (i < text.Length)
+            {
+                char c = text[i];
+                if (expectValue)
+                {
+                    if (char.IsWhiteSpace(c)) { sb.Append(c); i++; continue; }
+                    expectValue = false;
+                    if (c == '{' || c == '[')
+                    {
+                        containers.Push(c);
+                        sb.Append(c);
+                        i++;
+                        expectValue = c == '[';
+                        continue;
+                    }
+                    if (c == '\x00' || c == '"')
+                    {
+                        i = CopyOpaque(text, i, sb);
+                        continue;
+                    }
+                    // A bare token runs to the next delimiter at this level.
+                    int start = i;
+                    while (i < text.Length && text[i] != ',' && text[i] != '}' && text[i] != ']')
+                        i++;
+                    string run = text.Substring(start, i - start);
+                    string token = run.TrimEnd();
+                    if (token.Length > 0)
+                    {
+                        bool scalar = token == "true" || token == "false" || token == "null"
+                                      || JsonNumberRe.IsMatch(token);
+                        sb.Append(scalar ? token : JsonSerializer.Serialize(token));
+                    }
+                    sb.Append(run, token.Length, run.Length - token.Length);
+                    continue;
+                }
+
+                switch (c)
+                {
+                    case '{':
+                    case '[':
+                        containers.Push(c);
+                        expectValue = c == '[';
+                        break;
+                    case '}':
+                    case ']':
+                        if (containers.Count > 0) containers.Pop();
+                        break;
+                    case ':':
+                        expectValue = containers.Count > 0 && containers.Peek() == '{';
+                        break;
+                    case ',':
+                        expectValue = containers.Count > 0 && containers.Peek() == '[';
+                        break;
+                    case '\x00':
+                    case '"':
+                        i = CopyOpaque(text, i, sb);
+                        continue;
+                }
+                sb.Append(c);
+                i++;
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Copy the placeholder or JSON string that starts at <paramref name="i"/>
+        /// and return the index just past it.</summary>
+        private static int CopyOpaque(string text, int i, StringBuilder sb)
+        {
+            if (text[i] == '\x00')
+            {
+                // Always exactly three chars: NUL, the string's index as a char, NUL.
+                int len = Math.Min(3, text.Length - i);
+                sb.Append(text, i, len);
+                return i + len;
+            }
+            int j = i + 1;
+            while (j < text.Length && text[j] != '"')
+            {
+                if (text[j] == '\\' && j + 1 < text.Length) j++;
+                j++;
+            }
+            j = Math.Min(j + 1, text.Length);
+            sb.Append(text, i, j - i);
+            return j;
         }
 
         private static int HoldBack(string buf, params string[] tags)

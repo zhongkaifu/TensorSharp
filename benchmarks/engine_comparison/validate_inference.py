@@ -129,6 +129,27 @@ def assistant_content(metrics):
     return content
 
 
+def strip_json_fence(text):
+    """The JSON inside a single ```json (or bare ```) fence, or None.
+
+    Only whitespace may surround the fence and only one fence may be present;
+    anything else is not "a fence around otherwise exact JSON" and stays a
+    strict failure. Used by --accept-fenced-json for the lenient status only.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```") or stripped.count("```") != 2:
+        return None
+    body = stripped[3:-3]
+    first_line, newline, rest = body.partition("\n")
+    if not newline:
+        return None
+    if first_line.strip().lower() not in ("", "json"):
+        return None
+    return rest.strip()
+
+
 def check_answer(name, text):
     if name in ("short", "short_zh"):
         return text.strip() == "42"
@@ -184,7 +205,8 @@ def execute_tool(name, metrics, step):
 
 
 def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout=1200,
-             structured_tool_results=False, max_tokens=None, serial_tool_workflows=False):
+             structured_tool_results=False, max_tokens=None, serial_tool_workflows=False,
+             accept_fenced_json=False):
     spec = case_spec(name, tag)
     if max_tokens is not None:
         if max_tokens < 1:
@@ -236,13 +258,23 @@ def run_case(url, model, engine, name, tag, thinking=False, stream=True, timeout
         # Never count reasoning-only output as a correct final answer.
         text = assistant_content(metrics)
         result["validated_content"] = text
+        truncated = metrics["finish_reason"] == "length" and name not in ("decode", "decode_8k")
         if not check_answer(name, text):
+            # Opt-in secondary verdict: a ```json fence around otherwise exact JSON
+            # is recorded as lenient-ok. The strict status stays the case status.
+            if accept_fenced_json and not truncated:
+                unfenced = strip_json_fence(text)
+                if unfenced is not None and check_answer(name, unfenced):
+                    result["lenient_status"] = "ok"
+                    result["lenient_detail"] = "exact JSON inside a code fence"
             raise ValueError("final answer failed the scenario's semantic/structural check")
-        if metrics["finish_reason"] == "length" and name not in ("decode", "decode_8k"):
+        if truncated:
             raise ValueError("answer reached the token limit")
         result["status"] = "ok"
     except Exception as error:
         result["detail"] = f"{type(error).__name__}: {error}"
+    if accept_fenced_json:
+        result.setdefault("lenient_status", result["status"])
     result["total_wall_ms"] = (time.monotonic() - started) * 1000
     return result
 
@@ -257,6 +289,8 @@ def summarize(cases):
         passed = [c for c in cells if c["status"] == "ok"]
         metrics = [c["turns"][0]["metrics"] for c in passed]
         item = {"passed": len(passed), "total": len(cells)}
+        if any("lenient_status" in c for c in cells):
+            item["lenient_passed"] = sum(c.get("lenient_status") == "ok" for c in cells)
         for field in ("ttft_ms", "prefill_tps", "decode_tps"):
             values = [m[field] for m in metrics if m.get(field, 0) > 0]
             if values:
@@ -345,6 +379,9 @@ def main():
                     help="Request JSON mode on the final tool-workflow answer; retain strict output checks")
     ap.add_argument("--serial-tool-workflows", action="store_true",
                     help="Send parallel_tool_calls=false on tool-bearing workflow turns; preserve exact call order/argument checks")
+    ap.add_argument("--accept-fenced-json", action="store_true",
+                    help="Also record a lenient per-case status that accepts exact JSON wrapped in a ```json fence; "
+                         "the strict status remains the case status and the exit code")
     ap.add_argument("--timeout", type=float, default=1200)
     ap.add_argument("--reference", type=Path)
     ap.add_argument("--tolerance", type=float, default=0.05)
@@ -364,6 +401,7 @@ def main():
               "thinking": args.thinking, "stream": not args.blocking, "sampling": SAMPLING,
               "structured_tool_results": args.structured_tool_results,
               "serial_tool_workflows": args.serial_tool_workflows,
+              "accept_fenced_json": args.accept_fenced_json,
               "max_tokens_override": args.max_tokens,
               "execution_plan": {"scenarios": names, "concurrency": degrees,
                   "repeats": args.repeats,
@@ -385,7 +423,8 @@ def main():
                     jobs = [pool.submit(run_case, args.url, args.model, args.engine,
                             name, f"{name}-c{concurrency}-r{repeat}-i{i}", args.thinking,
                             not args.blocking, args.timeout, args.structured_tool_results,
-                            args.max_tokens, args.serial_tool_workflows) for i in range(concurrency)]
+                            args.max_tokens, args.serial_tool_workflows,
+                            args.accept_fenced_json) for i in range(concurrency)]
                     cases = [job.result() for job in jobs]
                 wall = time.monotonic() - start
                 for case in cases:
@@ -397,8 +436,10 @@ def main():
                     "repeat": repeat, "wall_ms": wall * 1000,
                     "generated_tokens": tokens, "end_to_end_tokens_per_second": tokens / wall,
                     "all_passed": all(c["status"] == "ok" for c in cases)})
+                lenient = (f"; lenient {sum(c.get('lenient_status') == 'ok' for c in cases)}/{concurrency}"
+                           if args.accept_fenced_json else "")
                 print(f"{name} c{concurrency} repeat{repeat}: "
-                      f"{sum(c['status'] == 'ok' for c in cases)}/{concurrency} passed; {wall:.2f}s", flush=True)
+                      f"{sum(c['status'] == 'ok' for c in cases)}/{concurrency} passed{lenient}; {wall:.2f}s", flush=True)
                 report["summary"] = summarize(report["cases"])
                 args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     report["run_complete"] = True

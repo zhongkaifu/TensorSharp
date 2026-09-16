@@ -1810,6 +1810,12 @@ namespace TensorSharp.Chat
 
             var samplingConfig = SamplingConfigParser.ParseWebUi(body, _options.SamplingDefaults);
             bool uiThink = body.TryGetProperty("think", out var uiThinkProp) && uiThinkProp.GetBoolean();
+            // Same rule as the HTTP APIs (an explicit think:false renders GPT-OSS at
+            // low effort), so the startup warm-up - which goes through this surface with
+            // both think values - prepares the prefixes real requests will ask for.
+            if (!ReasoningEffortParser.TryParse(body, out string reasoningEffort, out string reasoningEffortError))
+                throw new WebUiRequestRejectedException(400, new { error = reasoningEffortError });
+            samplingConfig.ReasoningEffort = reasoningEffort;
             List<ToolFunction> uiTools = null;
             if (body.TryGetProperty("tools", out var uiToolsEl) && uiToolsEl.ValueKind == JsonValueKind.Array)
                 uiTools = ToolFunctionParser.ParseOllama(body);
@@ -1891,7 +1897,7 @@ namespace TensorSharp.Chat
                     });
                 }
                 OnChatRequest?.Invoke(chatSession.Id, body);
-                await foreach (object frame in ChatStreamDiffusionAsync(chatSession, messages, maxTokens, webUiLogger, cancellationToken))
+                await foreach (object frame in ChatStreamDiffusionAsync(chatSession, messages, maxTokens, uiThink, webUiLogger, cancellationToken))
                     yield return frame;
                 yield break;
             }
@@ -2361,7 +2367,7 @@ namespace TensorSharp.Chat
         // ---- Chat for DiffusionGemma: live denoising preview -------------------
 
         private async IAsyncEnumerable<object> ChatStreamDiffusionAsync(
-            ChatSession chatSession, List<ChatMessage> messages, int maxTokens, ILogger webUiLogger,
+            ChatSession chatSession, List<ChatMessage> messages, int maxTokens, bool think, ILogger webUiLogger,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var sw = Stopwatch.StartNew();
@@ -2370,8 +2376,11 @@ namespace TensorSharp.Chat
             int finalTokenCount = 0;
             int turnPromptTokens = 0;
 
+            // The canvas text arrives with its channels already separated (the thought
+            // block is dropped unless the request asked for it), so the replace frames
+            // show the answer rather than Gemma's raw channel markup.
             IAsyncEnumerator<DiffusionStreamUpdate> stream = _svc
-                .DiffusionChatStreamAsync(chatSession, messages, maxTokens, cancellationToken)
+                .DiffusionChatStreamAsync(chatSession, messages, maxTokens, cancellationToken, think)
                 .GetAsyncEnumerator(cancellationToken);
             try
             {
