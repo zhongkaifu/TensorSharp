@@ -820,6 +820,48 @@ beside it.
 Chat template falls back to the hardcoded Gemma 4 template when the GGUF does
 not ship a Jinja2 one.
 
+### Thought channel with thinking off
+
+No Gemma 4 template primes anything after a tool result when thinking is off:
+the canonical E2B/E4B template and the 12B/26B/DiffusionGemma templates all
+end the prompt at `<tool_response|>` and let the model continue its own turn
+(the larger templates prime a closed `<|channel>thought\n<channel|>` only for a
+fresh `<|turn>model`). The renderer keeps that prompt. Priming the closed block
+after a tool result anyway was measured on E4B (Metal, Q8_0, skills preamble)
+and made it worse: the model wrote its reasoning unmarked, closed the block
+again and only then answered, so the reasoning reached `content`.
+
+What E4B does at that boundary (campaign 2026-09-16, B10) is handled while
+sampling instead, from the protocol's `ThinkingBudgetOpenToken` /
+`ThinkingBudgetEndToken` / `SuppressUnopenedThinkingEndAfter`:
+
+- **A channel the model opens with thinking off is capped.** The budget counts
+  from `<|channel>` and closes the channel with `<channel|>` at the first line
+  break past a quarter of `max_tokens` (at most 64 tokens, hard stop at twice
+  that). The parser hides the thought, the answer follows. Before this the
+  `agentic` final turn spent all 256 tokens in the channel and returned empty
+  content. Closing at exactly 16 or 64 tokens (mid-sentence) was also measured:
+  the model then leaked reasoning or turned the cut-off sentence into a tool
+  call. At the first line break past 16, 32, 48 and 64 tokens it answered
+  correctly every time.
+- **After a tool result, a `<channel|>` with no open channel is masked.** E4B
+  wrote the answer, closed a channel it never opened, and wrote the answer
+  again. A stream had already sent the first copy, so the client got both. With
+  the close masked the model ends the turn after the first copy. Masking needs
+  host logits, so these requests do not use the device-argmax path. The mask is
+  limited to that boundary: elsewhere a stray close still splits reasoning from
+  the answer in the parser.
+- With thinking on, the same budget counts from the model's `<|channel>` (or from
+  the first token when the prompt primed `<|channel>thought\n` after a tool
+  result) and closes it at exactly `TS_THINKING_BUDGET`. Before, Gemma 4 had no
+  trained end token declared, and the generic hard stop looked for `</think>`,
+  which Gemma never writes. `TS_THINKING_BUDGET=0` disables both caps.
+
+`response_format` combines with `"think": true`: the JSON grammar stays dormant
+through the thought channel and arms after `<channel|>`
+(`ThinkingGrammarActivationTrigger`). With thinking off it enforces from the
+first token, which also excludes `<|channel>`.
+
 ## 13a. Tensor parallelism
 
 Gemma 4 runs under `--tp N` on the direct `cuda` backend and on the GGML CUDA /

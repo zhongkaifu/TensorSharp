@@ -485,6 +485,7 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 ## 12. 输出解析器与聊天模板
 
 - `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。
+- `response_format` 可以与 `"think": true` 同时使用。开启思考时 prompt 在 assistant 标记后预置 `<think>\n`（Nemotron 3.5 的 GGUF 模板也是如此），因此 JSON 语法在推理期间保持休眠，并在模型输出 `</think>` 后启用（`ThinkingGrammarActivationTrigger`）。此前该组合返回 HTTP 400。`</think>` 同时是该家族的 `ThinkingBudgetEndToken`：Nemotron 3.5 / Omni 的词表中它是单个 token，达到 `TS_THINKING_BUDGET`（输出额度不少于 512 token 时为 75%）时会输出它，受约束的答案在原有 `max_tokens` 内继续。Nemotron-H Reasoning-128K 的 GGUF 用多个 token 拼出 `</think>`，因此保留带说明的 `thinking_budget` 停止。在 Nemotron 3.5 Lightning IQ4_XS（Metal）上实测：`max_tokens` 为 256 时推理就用完了全部额度（content 为空，`finish_reason=length`）；为 1024 时 json / json_schema / json_unicode 在 c1 全部通过，json_schema / json_unicode 在 c4 为 4/4。json 在 c4 为 1/4：四个请求中有三个是在针对另一个 prompt 推理（"User says: Mars"），这是另行跟踪的批量 prefill 损坏问题。
 - 聊天模板使用 ChatML 格式（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
 
 ## 13. 优化机会

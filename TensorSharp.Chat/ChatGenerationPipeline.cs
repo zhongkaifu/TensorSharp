@@ -565,7 +565,11 @@ namespace TensorSharp.Server
             int promptTokenCount = inputTokens.Count;
             var cfg = samplingConfig ?? SamplingConfig.Default;
             int thinkingBudget = ThinkingBudgetFor(effectiveMaxTokens, enableThinking);
-            cfg = WithThinkingBudget(cfg, model.Tokenizer, arch, thinkingBudget, out bool samplingEndsThinking);
+            // With thinking off only a family whose model opens its channel itself is
+            // given a (small) cap; WithThinkingBudget ignores it for every other family.
+            int channelBudget = enableThinking ? thinkingBudget : UnrequestedThinkingBudgetFor(effectiveMaxTokens);
+            cfg = WithThinkingBudget(cfg, model.Tokenizer, arch, channelBudget, out bool samplingEndsThinking,
+                enableThinking, inputTokens);
 
             // Fingerprint the media (images/audio/video) folded into this prompt.
             // The image/placeholder token IDs are identical across requests, so the
@@ -1828,15 +1832,66 @@ namespace TensorSharp.Server
             return (int)(maxTokens * 0.75);
         }
 
+        /// <summary>
+        /// Cap for a reasoning channel the model opens although the request turned
+        /// thinking OFF (families declaring <see cref="ChatProtocol.ThinkingBudgetOpenToken"/>).
+        /// That channel never reaches the client, so every token in it is latency nobody
+        /// asked for, and a model that stays in it until <c>max_tokens</c> returns an empty
+        /// answer - Gemma 4 E4B did exactly that on the final turn of a tool workflow
+        /// (256 tokens of thought, content empty). A short, closed thought still lets it
+        /// answer: measured on E4B (Metal, Q8_0) the channel closed at the first line break
+        /// past 16, 32, 48 or 64 tokens was followed by the correct result every time,
+        /// while closing at exactly 16 or 64 tokens - mid-sentence - produced leaked
+        /// reasoning and a tool call. A quarter of the allowance, at most 64 tokens;
+        /// <c>TS_THINKING_BUDGET=0</c> disables it together with the thinking cap.
+        /// </summary>
+        internal static int UnrequestedThinkingBudgetFor(int maxTokens)
+        {
+            if (maxTokens <= 0)
+                return 0;
+            string configured = Environment.GetEnvironmentVariable("TS_THINKING_BUDGET");
+            if (!string.IsNullOrWhiteSpace(configured)
+                && int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out int explicitBudget)
+                && explicitBudget <= 0)
+                return 0;
+            return Math.Clamp(maxTokens / 4, 1, MaxUnrequestedThinkingTokens);
+        }
+
+        internal const int MaxUnrequestedThinkingTokens = 64;
+
         internal static SamplingConfig WithThinkingBudget(SamplingConfig config, ITokenizer tokenizer,
-            string architecture, int tokenBudget, out bool installed)
+            string architecture, int tokenBudget, out bool installed,
+            bool enableThinking = true, IReadOnlyList<int> promptTokens = null)
         {
             installed = false;
-            string end = ChatProtocolRegistry.For(architecture)?.ThinkingBudgetEndToken;
-            if (tokenBudget <= 0 || end == null || tokenizer == null || config.Grammar?.IsActive == true)
+            var protocol = ChatProtocolRegistry.For(architecture);
+            string end = protocol?.ThinkingBudgetEndToken;
+            if (end == null || tokenizer == null || config.Grammar?.IsActive == true)
                 return config;
-            int id = tokenizer.LookupToken(end);
-            if (id < 0 || id >= tokenizer.VocabSize || tokenizer.Vocab[id] != end || tokenizer.IsEos(id))
+            int id = TrainedSingleToken(tokenizer, end);
+            if (id < 0)
+                return config;
+
+            int openId = -1;
+            bool openAtStart = true;
+            bool suppressUnopenedEnd = false;
+            if (protocol.ThinkingBudgetOpenToken != null)
+            {
+                openId = TrainedSingleToken(tokenizer, protocol.ThinkingBudgetOpenToken);
+                if (openId < 0 || openId == id)
+                    return config;
+                openAtStart = PromptLeavesChannelOpen(promptTokens, openId, id);
+                suppressUnopenedEnd = !enableThinking && !openAtStart
+                    && PromptEndsWith(tokenizer, promptTokens, protocol.SuppressUnopenedThinkingEndAfter);
+            }
+            else if (!enableThinking)
+            {
+                // A family whose channel only the prompt opens has nothing to cap when
+                // thinking is off: its prompt closed the channel, and the reply is the answer.
+                return config;
+            }
+
+            if (tokenBudget <= 0 && !suppressUnopenedEnd)
                 return config;
             // The caller's config can be shared by requests. Only this request
             // gets the immutable budget policy and an independent grammar position.
@@ -1844,9 +1899,65 @@ namespace TensorSharp.Server
             // may reuse one delayed-grammar config across concurrent requests.
             SamplingConfig result = config.Clone();
             result.Grammar = config.Grammar?.Fork();
-            result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget, id, closeOnRepetition: true);
+            // A channel the request did not ask for closes at a line break (see
+            // ThinkingTokenBudget.CloseAtBoundary); a requested one keeps its exact budget.
+            Func<int, bool> boundary = enableThinking ? null : EndsLine(tokenizer);
+            result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget > 0 ? tokenBudget : int.MaxValue, id,
+                closeOnRepetition: true, openTokenId: openId, openAtStart: openAtStart,
+                suppressUnopenedEnd: suppressUnopenedEnd, closeAtBoundary: boundary);
             installed = true;
             return result;
+        }
+
+        private static Func<int, bool> EndsLine(ITokenizer tokenizer) => token =>
+        {
+            try
+            {
+                return tokenizer.Decode(new List<int> { token }).EndsWith('\n');
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        };
+
+        private static int TrainedSingleToken(ITokenizer tokenizer, string text)
+        {
+            int id = tokenizer.LookupToken(text);
+            return id < 0 || id >= tokenizer.VocabSize || tokenizer.Vocab[id] != text || tokenizer.IsEos(id) ? -1 : id;
+        }
+
+        /// <summary>The prompt's tail opens a channel it does not close (Gemma 4 primes
+        /// <c>&lt;|channel&gt;thought\n</c> after a tool result with thinking on).</summary>
+        internal static bool PromptLeavesChannelOpen(IReadOnlyList<int> promptTokens, int openId, int endId)
+        {
+            if (promptTokens == null)
+                return false;
+            int stop = Math.Max(0, promptTokens.Count - 64);
+            for (int i = promptTokens.Count - 1; i >= stop; i--)
+            {
+                if (promptTokens[i] == endId) return false;
+                if (promptTokens[i] == openId) return true;
+            }
+            return false;
+        }
+
+        private static bool PromptEndsWith(ITokenizer tokenizer, IReadOnlyList<int> promptTokens, string marker)
+        {
+            if (string.IsNullOrEmpty(marker) || promptTokens == null || promptTokens.Count == 0)
+                return false;
+            try
+            {
+                int take = Math.Min(promptTokens.Count, 16);
+                var tail = new List<int>(take);
+                for (int i = promptTokens.Count - take; i < promptTokens.Count; i++)
+                    tail.Add(promptTokens[i]);
+                return tokenizer.Decode(tail).TrimEnd().EndsWith(marker, StringComparison.Ordinal);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private static int FindValidUtf8Length(List<byte> bytes)

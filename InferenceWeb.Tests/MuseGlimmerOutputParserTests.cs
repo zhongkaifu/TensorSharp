@@ -145,4 +145,86 @@ public class MuseGlimmerOutputParserTests
         Assert.Equal("hello", content);
         Assert.Empty(calls);
     }
+
+    // ---- Headerless replies (campaign 2026-09-16, B6) -----------------------------
+    //
+    // A structured-output grammar armed from token 0 forbids the " to=user<|message|>"
+    // header, so Muse-Glimmer's first sampled token is already the object's "{". The
+    // server log showed the correct object while the stream delivered content null and
+    // json_schema answered 422: the parser sat in its header state waiting for a
+    // <|message|> that the grammar made impossible.
+
+    private const string HeaderlessJson = "{\"name\":\"Mars\",\"moons\":2,\"habitable\":false}";
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void HeaderlessJson_IsContent_WholeAndStreamed(bool thinking)
+    {
+        var whole = OutputParserFactory.Create("muse-glimmer");
+        whole.Init(thinking, null);
+        Assert.Equal(HeaderlessJson, whole.Add(HeaderlessJson, done: true).Content);
+
+        var streamed = OutputParserFactory.Create("muse-glimmer");
+        streamed.Init(thinking, null);
+        var content = new StringBuilder();
+        // Token-sized pieces, as the grammar-constrained stream delivers them.
+        foreach (string piece in new[] { "{\"", "name", "\":\"", "Mars", "\",\"", "moons", "\":", "2", ",\"",
+                                         "habitable", "\":", "false", "}" })
+        {
+            var r = streamed.Add(piece, done: false);
+            content.Append(r.Content);
+            Assert.Equal("", r.Thinking);
+        }
+        content.Append(streamed.Add("", done: true).Content);
+        Assert.Equal(HeaderlessJson, content.ToString());
+    }
+
+    [Fact]
+    public void HeaderlessJson_FirstPieceIsDeliveredBeforeTheStreamEnds()
+    {
+        // TTFT: the answer must not be held back until done just because no header came.
+        var p = OutputParserFactory.Create("muse-glimmer");
+        p.Init(false, null);
+        Assert.Equal("{\"", p.Add("{\"", done: false).Content);
+    }
+
+    [Fact]
+    public void HeaderlessJson_SurvivesTheJsonSchemaNormalizationPath()
+    {
+        // The buffered json_schema flush parses the whole reply and normalizes the
+        // parsed content; an empty string there is what produced HTTP 422.
+        var format = StructuredOutputFormat.JsonSchema("planet", """
+        {"type":"object","properties":{"name":{"type":"string"},"moons":{"type":"integer"},
+         "habitable":{"type":"boolean"}},"required":["name","moons","habitable"],
+         "additionalProperties":false}
+        """);
+        var p = OutputParserFactory.Create("muse-glimmer");
+        p.Init(false, null);
+        var normalized = StructuredOutputValidator.NormalizeOutput(p.Add(HeaderlessJson, done: true).Content, format);
+        Assert.True(normalized.IsValid, normalized.ErrorMessage);
+        Assert.Equal(HeaderlessJson, normalized.NormalizedContent);
+    }
+
+    [Fact]
+    public void HeaderlessProse_IsFlushedAtTheEndInsteadOfDropped()
+    {
+        // Letters could still be a role word, so prose is buffered as a possible header,
+        // but a reply that never framed itself must reach the client when it ends.
+        var (content, thinking, _) = ParseWhole("Plain answer with no framing.");
+        Assert.Equal("Plain answer with no framing.", content);
+        Assert.Equal("", thinking);
+    }
+
+    [Theory]
+    [InlineData(" to=self")]
+    [InlineData(" to=self<|mess")]
+    [InlineData("<|start|>assistant to=functions.get")]
+    public void UnfinishedHeaderAtEnd_EmitsNothing(string text)
+    {
+        var (content, thinking, calls) = ParseWhole(text);
+        Assert.Equal("", content);
+        Assert.Equal("", thinking);
+        Assert.Empty(calls);
+    }
 }

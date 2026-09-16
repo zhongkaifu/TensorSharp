@@ -41,6 +41,10 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 
 `--draft-model` 也可以用环境变量 `TS_MUSE_GLIMMER_DFLASH` 指定。
 
+### 结构化输出
+
+生成 prompt 停在 `<|start|>assistant`，因此正常回复以模型自己写的路由头开始（推理为 ` to=self<|message|>`，答案为 ` to=user<|message|>` 或 `<|message|>`）。使用 `response_format` 时 JSON 语法从第一个 token 起生效，模型会直接写出对象而没有任何头部。`MuseGlimmerOutputParser` 把不可能是头部开头的回复（JSON 的 `{`、`[`、`"` 或数字）视为答案内容，并在流结束时返回未加框架的文本而不是丢弃。此前解析器一直等待被语法排除的 `<|message|>`：流式响应返回 `content: null`，`json_schema` 在生成正确对象后返回 HTTP 422（2026-09-16 验证活动，B6）。非流式路径现在也对解析后的 content 而不是原始输出做校验。`response_format` 与 `"think": true` 的组合仍返回 HTTP 400：推理消息没有可供语法启用的唯一结束标记。
+
 ## 1. 文本架构
 
 52 层稠密层，`n_embd` 6656，`n_ff` 19968，32 个查询头 / 2 个 KV 头，

@@ -156,6 +156,12 @@ class TestRunner:
             return False, False
         return False, False
 
+    def _declares_reasoning_end(self, architecture):
+        # Mirrors ChatProtocolRegistry.ThinkingGrammarActivationTrigger declarations.
+        normalized = self._normalize_name(architecture)
+        return normalized in ("gptoss", "deepseek41", "deepseekv41", "qwen4exp", "gemma4") \
+            or normalized.startswith("nemotronh")
+
     def _extract_sse_tokens(self, events):
         """Extract concatenated token text from SSE events."""
         tokens = ""
@@ -763,31 +769,43 @@ class TestRunner:
             "response_format + tools correctly returns 400",
         )
 
-        self.expect_http_error(
-            "/v1/chat/completions",
-            {
-                "model": self.model,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "think": True,
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "simple_object",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "answer": {"type": "string"}
-                            },
-                            "required": ["answer"],
-                            "additionalProperties": False
-                        }
+        think_schema_payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "think": True,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "simple_object",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"}
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": False
                     }
                 }
-            },
-            400,
-            "response_format + think correctly returns 400",
-        )
+            }
+        }
+        if self._declares_reasoning_end(self.architecture):
+            # These families arm the JSON grammar where their reasoning ends, so the
+            # combination is served; a 422 would mean the answer failed the schema.
+            try:
+                body = self._post_json_body("/v1/chat/completions", think_schema_payload)
+                content = body["choices"][0]["message"].get("content") or ""
+                json.loads(content)
+                self.ok("response_format + think is served for a family that declares where reasoning ends")
+            except (HTTPError, ValueError, KeyError) as e:
+                self.fail(f"response_format + think on '{self.architecture}': {e}")
+        else:
+            self.expect_http_error(
+                "/v1/chat/completions",
+                think_schema_payload,
+                400,
+                "response_format + think correctly returns 400",
+            )
 
     # =========================================================================
     # Test: Queue status

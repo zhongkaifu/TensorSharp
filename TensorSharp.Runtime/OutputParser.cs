@@ -1891,6 +1891,19 @@ namespace TensorSharp.Runtime
                         break;
 
                     case MState.ParsingHeader:
+                        if (CannotBeHeader(buf))
+                        {
+                            // Headerless output. A structured-output grammar armed from
+                            // token 0 forbids the " to=user<|message|>" header, so the
+                            // model's first token is already the answer's "{". Waiting
+                            // for a <|message|> that can never come swallowed the whole
+                            // correct object: the stream delivered content null and the
+                            // json_schema path returned 422 on an empty string.
+                            _currentRecipient = null;
+                            _state = MState.ParsingContent;
+                            keepParsing = true;
+                            break;
+                        }
                         int headerEnd = buf.IndexOf(HeaderEndTag, StringComparison.Ordinal);
                         if (headerEnd >= 0)
                         {
@@ -1917,6 +1930,20 @@ namespace TensorSharp.Runtime
                                 _buffer.Clear();
                                 _state = MState.ParsingContent;
                             }
+                        }
+                        else
+                        {
+                            // The stream ended inside what was buffered as a header. A
+                            // real, unfinished header ("assistant to=self") carries no
+                            // text for anyone; anything else is text the model wrote
+                            // without framing and must not be dropped on the floor.
+                            if (!LooksLikeHeader(buf))
+                            {
+                                _currentRecipient = null;
+                                EmitContent(buf, contentSb, thinkingSb, toolTextSb);
+                            }
+                            _buffer.Clear();
+                            _state = MState.LookingForStart;
                         }
                         break;
 
@@ -1982,6 +2009,30 @@ namespace TensorSharp.Runtime
             if (end > 0)
                 _currentRecipient = rest.Substring(0, end);
         }
+
+        /// <summary>
+        /// A message header is routing text: optional <c>&lt;|start|&gt;</c>, the role
+        /// word and a <c>to=RECIPIENT</c>, before <c>&lt;|message|&gt;</c>. It therefore
+        /// opens (after whitespace) with a letter or a <c>&lt;</c> of a framing token.
+        /// Anything else - JSON's <c>{</c>/<c>[</c>/<c>"</c>, a digit - is body text
+        /// written with no header at all.
+        /// </summary>
+        internal static bool CannotBeHeader(string buf)
+        {
+            foreach (char c in buf)
+            {
+                if (char.IsWhiteSpace(c)) continue;
+                return !(char.IsLetter(c) || c == '<');
+            }
+            return false;
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex HeaderShape = new(
+            @"^\s*(<\|start\|>)?\s*(assistant)?\s*(to=[^\s<]*)?\s*(<\|?[a-z_|]*)?$",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>True when <paramref name="buf"/> is (a prefix of) a routing header.</summary>
+        internal static bool LooksLikeHeader(string buf) => HeaderShape.IsMatch(buf);
 
         private bool IsThinking() => string.Equals(_currentRecipient, "self", StringComparison.Ordinal);
 

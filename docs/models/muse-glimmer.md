@@ -40,6 +40,22 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 
 `--draft-model` can also be supplied as `TS_MUSE_GLIMMER_DFLASH`.
 
+### Structured output
+
+The generation prompt ends at `<|start|>assistant`, so a normal reply begins
+with its own routing header (` to=self<|message|>` for reasoning,
+` to=user<|message|>` or `<|message|>` for the answer). With
+`response_format` the JSON grammar enforces from the first token, so the model
+writes the object with no header at all. `MuseGlimmerOutputParser` treats a
+reply that cannot start a header (JSON's `{`, `[`, `"`, a digit) as answer
+content, and at the end of the stream it returns unframed text instead of
+dropping it. Before, it waited for a `<|message|>` that the grammar made
+impossible: the stream delivered `content: null` and `json_schema` returned
+HTTP 422 after generating the correct object (campaign 2026-09-16, B6). The
+non-streaming path now also validates the parsed content, not the raw stream.
+`response_format` with `"think": true` is still refused with HTTP 400: the
+reasoning message has no single end marker the grammar could arm on.
+
 ## 1. Text architecture
 
 52 dense layers, `n_embd` 6656, `n_ff` 19968, 32 query heads / 2 KV heads,

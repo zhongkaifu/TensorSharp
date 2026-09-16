@@ -41,7 +41,7 @@ curl http://127.0.0.1:5000/api/embeddings -H 'Content-Type: application/json' \
 | 视频生成 | 任何视频生成模型 —— MiniMax-H3（`minimax-h3`）、Wan 2.1 / 2.2（`wan`）—— 都通过 `/api/video-generate`、`/api/video-generate/stream` 与 `/v1/videos/generations` 提供服务；MiniMax-H3 在 MP4 之外还会返回一个 32 kHz 立体声 `.wav` 旁挂文件，`/api/models` 会告知当前加载的检查点接受哪些条件输入 |
 | Agent Skills | 技能目录来自 `--skills-dir`（或二进制文件旁的 `skills` 目录），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族，模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；`qwen4exp` 等无工具模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`edit_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
-| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`response_format`（`json_object` / `json_schema`）不能与 `think` 或 `tools` 同时使用 |
+| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、Gemma 4、Nemotron-H）允许与 `think` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
 > 只应在可信网络中使用，或在前方部署带身份验证与 TLS 的反向代理。
@@ -1410,7 +1410,7 @@ print()
 
 注意事项：
 
-- `response_format`（`json_object` 或 `json_schema`）当前不能与 `tools` 或 `think` 同时使用（HTTP `400`）。
+- `response_format`（`json_object` 或 `json_schema`）不能与 `tools` 同时使用（HTTP `400`）。只有协议声明了推理结束位置、使 JSON 语法能在该处启用的家族才允许与 `"think": true` 同时使用：GPT-OSS（`final<|message|>`）、DeepSeek V4.1 与 Qwen 3.8 Flash Next（`</think>`）、Gemma 4（`<channel|>`）和 Nemotron-H（`</think>`）。其他家族对该组合返回 HTTP `400`。
 - `json_object` / `json_schema` 请求会把**首个采样 token** 约束为以 `{` 开头的候选（效果等同于 llama.cpp 的 JSON grammar），使爱闲聊的模型无法在 JSON 对象前输出散文，流式首 token 时延（TTFT）因此反映 prefill 延迟而不是被过滤掉的前导文本。后续 token 正常采样。设置 `TS_JSON_FORCE_OPEN=0` 可关闭。
 - 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。设置 `TS_STRUCTURED_STREAM_BUFFER=1` 可对两者强制使用旧的“全部缓存”行为。非流式请求始终归一化。
 - 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。

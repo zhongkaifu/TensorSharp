@@ -103,7 +103,7 @@ python3 test_multiturn.py
 ## 注意事项
 
 - 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server.Host 当前模拟的兼容范围内。
-- 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 或 `think` 同时使用时预期返回 HTTP `400`。
+- 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 同时使用时预期返回 HTTP `400`。与 `think` 同时使用时同样返回 `400`，但声明了推理结束位置的家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、Gemma 4、Nemotron-H）会正常处理；脚本根据服务端报告的架构选择预期结果。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
 - DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。
 - 浏览器 UI 位于 `http://localhost:5000`（`GET /` 直接返回 `index.html`）；`GET /health` 是存活检查接口。

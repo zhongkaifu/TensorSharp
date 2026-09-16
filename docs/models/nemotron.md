@@ -667,6 +667,21 @@ the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 
 - `ChatMlOutputParser` parses `<think> ... </think>` for chain-of-thought
   reasoning and `<tool_call>{...}</tool_call>` for tool calls.
+- `response_format` combines with `"think": true`. Thinking on primes
+  `<think>\n` after the assistant marker (the Nemotron 3.5 GGUF template does
+  the same), so the JSON grammar stays dormant through the reasoning and arms
+  after the model's `</think>` (`ThinkingGrammarActivationTrigger`). Before, the
+  request was refused with HTTP 400. `</think>` is also the family's
+  `ThinkingBudgetEndToken`: on Nemotron 3.5 / Omni, whose vocabulary has it as
+  one token, reaching `TS_THINKING_BUDGET` (75% of an allowance of at least 512
+  tokens) emits it and the constrained answer follows inside `max_tokens`. The
+  Nemotron-H Reasoning-128K GGUFs spell `</think>` in several tokens, so they
+  keep the explained `thinking_budget` stop. Measured on Nemotron 3.5 Lightning
+  IQ4_XS (Metal): with `max_tokens` 256 the reasoning alone used the whole
+  allowance (content empty, `finish_reason=length`); with 1024, json /
+  json_schema / json_unicode passed at c1 and json_schema / json_unicode 4/4 at
+  c4. json at c4 was 1/4: three of the four requests reasoned about a different
+  prompt ("User says: Mars"), the batched-prefill corruption tracked separately.
 - Chat template uses the ChatML format (`<|im_start|>` /
   `<|im_end|>`). Multimodal placeholders include `<image>` (later expanded
   into `<img>` + N + `</img>`) and `<so_embedding>` (audio).
