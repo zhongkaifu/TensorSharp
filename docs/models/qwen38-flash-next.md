@@ -21,6 +21,55 @@ image sessions are supported, with KV reuse across turns (the GDN recurrence
 cannot rewind, so a cached prefix is reused only when the new prompt extends
 it exactly).
 
+## Video input
+
+A video reaches the model as an OpenAI Chat Completions `video_url` content
+part carrying a base64 MP4, WebM or MOV data URI (remote URLs are not
+fetched):
+
+```json
+{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1,"max_frames":8}}
+```
+
+`fps` (0 < fps ≤ 60) and `max_frames` (1–64) are optional; the defaults are
+`VIDEO_SAMPLE_FPS` and a positive `VIDEO_MAX_FRAMES`, otherwise 1 fps and 16
+frames, and a longer clip is sampled evenly across its length. The server
+decodes the clip into ordered frames, each with its source time (frame index
+over the probed frame rate, approximate for variable-rate clips), and the
+Qwen-VL video layout takes over from there:
+
+- **Temporal pairs.** The tower's patch embedding has two temporal slices
+  (`v.patch_embd.weight` and `.weight.1`), so consecutive frames are merged
+  two at a time exactly as the Qwen-VL processor stacks them; an odd clip
+  repeats its last frame to complete the final pair. Each pair is encoded on
+  its own (the reference tower attends within one temporal patch only) and
+  yields the same merged-patch token count as one still frame. The clip is
+  resized as a whole against the Qwen3-VL video pixel budget, so every pair of
+  a clip shares one grid.
+- **Prompt layout.** The template renders a video part as
+  `<|vision_start|><|video_pad|><|vision_end|>`; the `<|video_pad|>` becomes
+  one `<t seconds><|vision_start|><|video_pad|>…<|vision_end|>` block per pair,
+  `t` being the pair's mean source time with one decimal, and the template's
+  own start/end tokens stay wrapped around the clip. Two `video_url` parts in
+  one message render as two clips. Still images in the same message keep their
+  `<|image_pad|>` spans, in attachment order.
+- **Positions.** Each pair is positioned like a still image whose (T, H, W)
+  coordinates start at the running position of that pair — the Qwen3-VL
+  `get_rope_index` rule, which splits a video grid into per-pair entries — so
+  consecutive pairs carry strictly increasing temporal M-RoPE ids, the label
+  text between them advances the stream, and the text after the clip resumes
+  past the last pair's grid. The QSA indexer's position history, MTP
+  draft catch-up and the post-clip rotary/cache gap all record those same
+  coordinates, so speculation and retained prefixes agree with the target.
+
+What this is not: frames are sampled, not decoded by a temporal encoder, and
+the frame times are the sampled source times rather than a re-timed 2 fps
+stream. Frames uploaded through the Web UI carry no source time and stay
+still images, one span each, as before. The full-checkpoint check is
+`benchmarks/engine_comparison/validate_deepseek41_media.py` with the
+`video_order` / `video_timestamp` scenarios against a served Qwen3.8 with its
+`mmproj-BF16.gguf`.
+
 ## Continuous batching
 
 Concurrent requests are served through **per-sequence state holders**: each

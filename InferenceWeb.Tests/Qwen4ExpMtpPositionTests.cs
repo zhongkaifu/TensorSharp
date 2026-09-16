@@ -105,6 +105,26 @@ public class Qwen4ExpMtpPositionTests
     }
 
     [Fact]
+    public void VideoClip_CatchUpReplaysBothTemporalPairsWithIncreasingTimeAndTheLabelTextBetween()
+    {
+        // A two-pair clip as the Qwen-VL injector lays it out: text (0..1), pair 1 at
+        // running position 2 on a 2x2 merged grid, one label token, pair 2 at 5, then
+        // text resuming at 8. The draft's delayed catch-up must see exactly those
+        // coordinates, with the second pair strictly later in time than the first.
+        var pair1 = Media(2, [2,2,2, 2,2,3, 2,3,2, 2,3,3]);
+        var pair2 = Media(7, [5,5,5, 5,5,6, 5,6,5, 5,6,6]);
+        var ranges = new List<Qwen4ExpModel.MtpPositionRange> { Text(0, 2, 0), pair1, Text(6, 1, 4), pair2, Text(11, 2, 7) };
+        var actual = Qwen4ExpModel.ResolveMtpPositions(ranges, 1, 12, fallbackGap: -100);
+        Assert.Equal(new[] { 1,1,1, 2,2,2, 2,2,3, 2,3,2, 2,3,3, 4,4,4, 5,5,5, 5,5,6, 5,6,5, 5,6,6, 7,7,7, 8,8,8 }, actual.MultiAxis);
+        Assert.Equal(1, actual.RopePosition);
+        Assert.True(actual.MultiAxis![3 * 6] > actual.MultiAxis[3 * 1]);
+        // Catching up over only the second pair still uses its recorded coordinates.
+        var late = Qwen4ExpModel.ResolveMtpPositions(ranges, 7, 4, fallbackGap: 0);
+        Assert.Equal(pair2.MultiAxis, late.MultiAxis);
+        Assert.Equal(5, late.RopePosition);
+    }
+
+    [Fact]
     public void UniformHistoricalCoordinates_UseScalarWithoutLatestGapReinterpretation()
     {
         var ranges = new List<Qwen4ExpModel.MtpPositionRange> { Media(7, [50,50,50, 51,51,51]), Text(9, 2, 52) };

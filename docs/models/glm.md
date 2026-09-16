@@ -631,9 +631,12 @@ architectural changes layered on top:
 | Vision | `mmproj-BF16.gguf` (GLM-OCR ViT) | see below |
 
 The KDA recurrent state (conv tail + delta-net state, ~150 MB per sequence)
-cannot be rewound, so a cached prefix is only reused when the new prompt
-extends it exactly — the same contract as the Qwen 3.5 / 3.6 GDN family — and
-`Reset` wipes the state along with the position counter.
+cannot be rewound by position, so a cached prefix is only reused when the new
+prompt extends it exactly — the same contract as the Qwen 3.5 / 3.6 GDN family —
+and `Reset` wipes the state along with the position counter. The one exact
+"rewind" is a speculative rollback: a device-resident snapshot of the state is
+taken before every verify batch and copied back when part of the window is
+rejected (see [speculative decoding](#speculative-decoding-on-glm-53-flash)).
 
 ### Native local tensor parallelism
 
@@ -681,8 +684,62 @@ expert once on rank 0. `TS_GLM_TP_FUSED=0` forces the fallback for diagnostics.
   `<|image|>` placeholder rows inside the native executor
   (`TSGgml_GlmQueueVisionRows`) — the text tower is NoPE, so image tokens
   need no MRoPE bookkeeping.
-- **Not yet**: NextN/MTP speculation (llama.cpp asserts its glm5next MTP graph
-  unimplemented too; `--spec` prints a notice and serves standard decode).
+- **Speculative decoding**: the weight-free n-gram drafter
+  (`--spec --spec-type ngram`), on the native executor and on the managed
+  `cpu` path alike; see the next section. The checkpoint's own NextN/MTP block
+  is **not** built (llama.cpp asserts its glm5next MTP graph unimplemented too),
+  so `--spec` alone — `auto` / `draft-head` — prints a notice and serves
+  standard decode.
+
+### Speculative decoding on GLM-5.3-Flash
+
+GLM-5.2's speculative path is a position rewind: MLA rows and indexer keys are
+per-position, so a rejected tail is dropped for free
+(`SpecVerifyPersistsAcceptedKv = true`). glm5next's 34 KDA layers each carry a
+recurrent state that a verify batch advances by the WHOLE window, and no
+position arithmetic brings it back. So on this architecture the trunk honours
+the recurrent contract instead — the one Qwen 3.5's GatedDeltaNet and Qwen 3.8's
+trunk use:
+
+1. before the verify, the executor copies every KDA layer's conv tail and
+   delta-net state (every rank under `--tp`) into a snapshot arena on the device
+   that owns it (`TSGgml_GlmKdaStateCapture`; ~150 MB, device-to-device, one
+   arena per model because a step snapshots and restores within itself) and
+   remembers the position;
+2. the verify is one trunk graph over `[last, d1..dK]` with the LM head on every
+   row (`TSGgml_GlmSpecForward`, unchanged);
+3. on a partial rejection the snapshot is copied back and the slot rewound to
+   the captured position (`TSGgml_GlmKdaStateRestore`), and the runtime
+   re-forwards the accepted prefix, so the state equals a plain decode of exactly
+   those tokens (`SpecVerifyPersistsAcceptedKv = false`). A rewind to any other
+   position is refused with an error rather than silently keeping the advanced
+   state (`SupportsKVCacheTruncation` stays false).
+
+The hyper-connection streams are the residual stream (per token, not a carried
+state), MLA rows are per-position and pooled-indexer keys per cell, so the KDA
+state is the only thing a rollback restores; the re-forward rewrites the rest
+before anything reads it. The managed `cpu` path does the same with host arrays
+(`GlmDsaModel.Glm5NextSpeculative.cs`). Because every extra verify row runs the
+KDA scan and a rejection pays a restore plus a re-forward, the trunk prefers a
+draft window of 3 by default (`SpecPreferredDraftWindow`, as Qwen 3.8 measured);
+`--spec-draft N` still gets exactly what it asks for. A native library that
+predates the snapshot API (no `TSGgml_GlmKdaStateApiVersion` export) makes the
+model report speculation unprofitable, so it is declined up front rather than
+failing mid-verify. The speculative trunk follows the bound slot
+(`SpecTrunkFollowsBoundCache`), so the server's slot-served requests speculate
+too — this also lifts the warn-once decline GLM-5.2 requests used to hit there.
+
+What is proven on the synthetic KDA fixture (`Glm5NextSpeculativeRollbackTests`,
+`Glm5NextSpeculationEligibilityTests`, on `cpu` and `ggml_cpu`, plus `ggml_cuda`
+under `TS_TEST_GLM_CUDA=1` — with the default cpu backend pin, because the
+executor picks its CUDA devices itself): n-gram speculative greedy equals plain
+greedy with drafts proposed and windows partially rejected; a drafter that is
+wrong at the end of every window still yields the plain stream; after the
+rollbacks the next token's logits equal a plain decode's over the whole
+vocabulary; the verify rows equal the sequential decode's; and the managed and
+native `SpecForward` agree row for row, hidden states included. No speculation
+run on the real GLM-5.3-Flash checkpoint exists yet, so there is no throughput
+verdict for it.
 
 ### Measured
 

@@ -697,11 +697,15 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }"
 ```
 
-### Chat Completions with Video (DeepSeek V4.1)
+### Chat Completions with Video (DeepSeek V4.1, Qwen 3.8 Flash Next)
 
-`video_url` is a V4.1 extension to the Chat Completions content array. The server samples
-the clip through its existing video decoder and turns each frame into an image span, so the
-model needs its prepared vision companion attached with `--mmproj`.
+`video_url` is an extension to the Chat Completions content array, accepted by DeepSeek
+V4.1 and Qwen 3.8 Flash Next (`qwen4exp`). The server samples the clip through its existing
+video decoder into ordered, timed frames, so the model needs its vision companion attached
+with `--mmproj`. V4.1 turns each frame into an image span labelled with its time; Qwen 3.8
+merges consecutive frames in pairs and renders the Qwen-VL video layout (`<t seconds>` +
+`<|video_pad|>` per pair) with increasing temporal M-RoPE coordinates — see
+[its model card](../docs/models/qwen38-flash-next.md#video-input).
 
 ```bash
 VID_B64=$(base64 < clip.mp4 | tr -d '\n')

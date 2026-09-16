@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+using TensorSharp.Models;
 using TensorSharp.Models.Architecture;
 
 namespace InferenceWeb.Tests;
@@ -122,6 +123,70 @@ public class DeepSeek41ArchitectureTests : IDisposable
             Assert.Contains("--backend cpu", DeepSeek41Architecture.DescribeCpuBackendChoice(BackendType.Cpu));
         }
         finally { Directory.Delete(directory, recursive: true); }
+    }
+
+    /// <summary>
+    /// A q8_0/q4_0 cache used to survive the load: the native graph allocated
+    /// F16 caches regardless and <c>KvCacheDtype</c> reported the requested
+    /// tier. It is now refused before the checkpoint is opened, on every
+    /// executor, with the reason.
+    /// </summary>
+    [Theory]
+    [InlineData(KvCacheDtype.Q8_0, BackendType.GgmlCuda)]
+    [InlineData(KvCacheDtype.Q8_0, BackendType.Cuda)]
+    [InlineData(KvCacheDtype.Q8_0, BackendType.GgmlCpu)]
+    [InlineData(KvCacheDtype.Q8_0, BackendType.Cpu)]
+    [InlineData(KvCacheDtype.Q4_0, BackendType.GgmlCuda)]
+    [InlineData(KvCacheDtype.Q4_0, BackendType.Cpu)]
+    public void BlockQuantizedKvCacheIsRefusedBeforeTheLoad(KvCacheDtype dtype, BackendType backend)
+    {
+        KvCacheDtype restoreDtype = KvCacheDtypeConfig.Current;
+        bool restoreExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        KvCacheDtypeConfig.Set(dtype);
+        try
+        {
+            var error = Assert.Throws<NotSupportedException>(() =>
+                DeepSeek41Architecture.ValidateLoad("missing.gguf", backend, null));
+            Assert.StartsWith($"KV_CACHE_DTYPE={dtype.ToShortString()} is not supported by DeepSeek V4.1 Flash", error.Message);
+            Assert.Contains("F16", error.Message);
+            Assert.Contains("no block-dequantize step", error.Message);
+            Assert.Contains("NVFP4", error.Message);
+            Assert.Contains("Unset KV_CACHE_DTYPE or set it to f16", error.Message);
+            Assert.Equal(error.Message, DeepSeek4Architecture.BlockQuantizedKvCacheError("DeepSeek V4.1 Flash", dtype, v41: true));
+        }
+        finally { KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit); }
+    }
+
+    /// <summary>The V4 message must not claim V4.1's trained cache quantization.</summary>
+    [Fact]
+    public void PlainV4RefusalDoesNotClaimTheV41CacheQuantization()
+    {
+        string message = DeepSeek4Architecture.BlockQuantizedKvCacheError("DeepSeek V4 (Flash)", KvCacheDtype.Q8_0, v41: false);
+        Assert.StartsWith("KV_CACHE_DTYPE=q8_0 is not supported by DeepSeek V4 (Flash)", message);
+        Assert.DoesNotContain("NVFP4", message);
+        Assert.Contains("Unset KV_CACHE_DTYPE or set it to f16", message);
+    }
+
+    [Theory]
+    [InlineData(KvCacheDtype.F16)]
+    [InlineData(KvCacheDtype.F32)]
+    public void FloatKvCacheRequestsReachTheLoad(KvCacheDtype dtype)
+    {
+        KvCacheDtype restoreDtype = KvCacheDtypeConfig.Current;
+        bool restoreExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+        KvCacheDtypeConfig.Set(dtype);
+        string directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllBytes(Path.Combine(directory, "deepseek41.engram.bin"), new byte[] { 0 });
+            DeepSeek41Architecture.ValidateLoad(Path.Combine(directory, "model.gguf"), BackendType.GgmlCuda, null);
+        }
+        finally
+        {
+            KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit);
+            Directory.Delete(directory, recursive: true);
+        }
     }
 
     /// <summary>

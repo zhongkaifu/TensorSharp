@@ -100,8 +100,9 @@ public static class EnvVarMatrix
             Category: "KvCache",
             Values: new[] { "f32", "f16", "q8_0" },
             DefaultValue: "f32",
-            Notes: "Precision of the KV cache.",
-            AppliesTo: (m, b, f) => true),
+            Notes: "Precision of the KV cache. DeepSeek V4 / V4.1 keep F16 caches on every executor and refuse " +
+                   "q8_0/q4_0 at load (see docs/models/deepseek41.md), so the sweep skips those families.",
+            AppliesTo: (m, b, f) => !m.Family.StartsWith("deepseek4", StringComparison.OrdinalIgnoreCase)),
 
         new(
             Name: "TS_KV_PAGED_QUANT_BITS",

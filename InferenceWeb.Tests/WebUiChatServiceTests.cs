@@ -533,13 +533,16 @@ public class WebUiChatServiceTests : IDisposable
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task DeepSeek41Audio_IsRejectedBeforeStreamOrGenerationHook(bool withImage)
+    [InlineData("deepseek41", false)]
+    [InlineData("deepseek41", true)]
+    [InlineData("nemotron_h_moe", false)]
+    [InlineData("nemotron_h_moe", true)]
+    [InlineData("nemotron_h", false)]
+    public async Task ArchitecturesWithoutAnAudioTower_RejectAudioBeforeStreamOrGenerationHook(string architecture, bool withImage)
     {
         string modelPath = WriteMinimalGguf("audio-refusal.gguf");
         using var model = new ModelService(NullLogger<ModelService>.Instance,
-            (path, _, _, _) => new ContextReportingModel(path, 8192, 8192, "deepseek41"));
+            (path, _, _, _) => new ContextReportingModel(path, 8192, 8192, architecture));
         model.LoadModel(modelPath, null, "cpu");
         Fixture f = Build(model: model);
         bool accepted = false;

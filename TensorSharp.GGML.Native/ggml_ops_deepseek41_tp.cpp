@@ -279,6 +279,15 @@ struct executor::impl
             auto matmul = [&](ggml_tensor * w, ggml_tensor * x) {
                 if (w->type == GGML_TYPE_F32 && rank.cuda_backend)
                     return tsg_matmul_id_f32(g.ctx, w, x, g.ids);
+                // Quantized strips take ggml's own integer (MMVQ/MMQ) paths,
+                // which have no F32-precision variant: their activations are
+                // requantized to Q8 per 32 values and the int8 products are
+                // exact, so a strip already equals the same rows of the full
+                // tensor up to F32 summation grouping. That grouping is
+                // decided per launch (stream-k over the launch's tile count),
+                // so bitwise agreement with an unsplit launch is not available
+                // to any partition; dsv41_tp_test compares against the same
+                // partition evaluated on one device where that matters.
                 auto * out = ggml_mul_mat_id(g.ctx, w, x, g.ids);
                 if (w->type == GGML_TYPE_F32)
                 {

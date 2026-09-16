@@ -154,6 +154,18 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// Put the process-wide choice back exactly as a test found it, including
+        /// the "explicitly set" flag that <see cref="Set"/> can only raise. Tests
+        /// that call <see cref="Set"/> must restore through here, or every later
+        /// test in the process sees an operator choice that nobody made.
+        /// </summary>
+        internal static void RestoreForTests(KvCacheDtype dtype, bool explicitlySet)
+        {
+            _current = dtype;
+            _explicitlySet = explicitlySet;
+        }
+
+        /// <summary>
         /// Apply a model-aligned default cache dtype if the user hasn't explicitly
         /// chosen one. Models whose dominant weight tier is below F32 (Q8_0,
         /// Q4_K, IQ4_XS, F16, etc.) get an F16 cache: K/V values fit losslessly

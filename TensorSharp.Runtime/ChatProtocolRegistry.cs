@@ -193,6 +193,12 @@ namespace TensorSharp.Runtime
                 ToolCallRawSplicing = ToolCallRawSplicing.Always,
                 ThinkingGrammarActivationTrigger = "</think>",
                 AppendMediaPlaceholders = AppendQwenVisionPads,
+                // A `video_url` part is sampled into timed frames (fps / max_frames
+                // in the part, VIDEO_SAMPLE_FPS / VIDEO_MAX_FRAMES defaults), each a
+                // full image's worth of tokens, so long clips are capped like Gemma 4
+                // and DeepSeek V4.1. The frames render as the Qwen3-VL video layout
+                // (see QwenVideoFrames) and the injector merges them in temporal pairs.
+                CapsVideoFrames = true,
             });
 
             // ---- GPT-OSS / Harmony -----------------------------------------
@@ -360,11 +366,11 @@ namespace TensorSharp.Runtime
             });
         }
 
+        // One <|vision_start|><|image_pad|><|vision_end|> per still image; sampled
+        // video frames (frames with a source time) render as the Qwen3-VL video
+        // layout, one <|video_pad|> block per temporal pair. QwenVideoFrames is the
+        // single definition of that grouping, shared with the injector.
         private static void AppendQwenVisionPads(ChatMessage msg, System.Text.StringBuilder sb)
-        {
-            if (msg.ImagePaths != null)
-                foreach (var _ in msg.ImagePaths)
-                    sb.Append("<|vision_start|><|image_pad|><|vision_end|>");
-        }
+            => QwenVideoFrames.AppendPlaceholders(msg, sb);
     }
 }

@@ -62,7 +62,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `KV_CACHE_DTYPE` | 全部 | KV cache 元素类型 | 自动（随模型对齐：模型权重低于 F32 时为 `f16`，否则为 `f32`） | `f32`, `f16`, `q8_0`（运行时还接受 `q4_0`，不参与 sweep） | 是 |
+| `KV_CACHE_DTYPE` | 除 DeepSeek V4 / V4.1 执行器之外的全部：它们的 cache 固定为 F16，由自己的注意力、gather 与压缩器内核直接读取，`q8_0` / `q4_0` 会在**加载时被拒绝**并给出原因（打开检查点之前抛 `NotSupportedException`），`f32` 会被告知并按 `f16` 报告 | KV cache 元素类型 | 自动（随模型对齐：模型权重低于 F32 时为 `f16`，否则为 `f32`） | `f32`, `f16`, `q8_0`（运行时还接受 `q4_0`，不参与 sweep） | 是 |
 | `TS_KV_PAGED_QUANT_BITS` | 全部分页 KV 模型（不含 `glm-dsa`：MLA 每个 token 只存一行 576 宽的压缩行，DSA 索引器打分的也是这段连续历史，没有可供量化的分页块布局） | TurboQuant 分页 KV 块编解码器（2 bit 使用 affine 的 min+scale 布局） | 关闭（`0`） | `0`, `4`, `8`（运行时还接受 `2`，不参与 sweep） | 是 |
 | `TS_N_CPU_MOE` | MoE 模型 | 前 N 层的路由专家留在系统内存：decode 时在主机上做乘法，prefill 时流式送到加速器上跑一整张图 | 关闭（`0`） | `0`, `16`, `all` | 是（GGML 后端、MoE 家族） |
 | `TS_CPU_MOE` | MoE 模型 | 卸载所有层的路由专家（等价于 `TS_N_CPU_MOE=all`） | 关闭 | `0`, `1` | 否 |

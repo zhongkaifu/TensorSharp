@@ -957,6 +957,27 @@ original output limit retain precedence.
   concurrency does not imply batched GPU throughput.
 - V4.1 DSpark speculative decoding is not implemented; V4 draft models are
   rejected.
+- The K/V cache is F16 on every executor and `KV_CACHE_DTYPE=q8_0` / `q4_0`
+  is **refused at load** (`NotSupportedException`, before the checkpoint is
+  opened, from `DeepSeek41Architecture.ValidateLoad`); an explicit `f32` is
+  announced on stderr and reported as `f16`. It used to be accepted silently:
+  the native graph allocated F16 caches regardless and `KvCacheDtype`
+  reported `q8_0`. The caches are not the per-layer K/V tensors the shared
+  families hand to ggml flash attention (which reads q8_0/q4_0 K/V at its
+  64/128-wide vector-kernel head sizes): they are the MLA latent rows (K
+  doubles as V at the latent width, F16-only in the CUDA flash-attention
+  kernels) in the sliding-window ring, the compressed and indexer rows, the
+  rewind-checkpoint shadows and the DSpark draft rings, written by
+  `TSG_DSV4_FUSED_ATTN_PREP` / `TSG_DSV4_FUSED_COMPRESS` and read by
+  `TSG_DSV4_FUSED_KGATHER`, the compact and TP gathers and the checkpoint
+  copies as F16 rows with no dequantize step, on the ggml CUDA, ggml CPU,
+  direct-CUDA and pure-C# executors alike. Quantizing them would mean
+  re-typing every one of those kernels; and the checkpoint's own trained
+  cache quantization (FP8 E4M3 raw rows, MXFP4 indexer rows, NVFP4
+  compressed rows) is already applied before each F16 store, so a q8_0
+  block would not shrink the cache's information content. The launch
+  examples above pass `KV_CACHE_DTYPE=f16`, which is the only value that
+  changes nothing.
 - Image/video input requires the separately prepared vision companion.
   The encoder and image/text graph have CPU/CUDA fixture coverage and
   complete-checkpoint media checks under layer placement and routed TP.

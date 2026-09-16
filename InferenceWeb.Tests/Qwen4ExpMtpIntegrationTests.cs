@@ -424,8 +424,15 @@ public sealed class Qwen4ExpMtpIntegrationTests(ITestOutputHelper output)
                 draftGgufPath: Path.Combine(_path, "head.gguf"));
             try
             {
+                // The mapped native library carries the platform's file name: the
+                // Windows-only "GgmlOps.dll" match left this collection empty on
+                // Linux, so every CUDA run of these tests failed before touching
+                // the model (docs/validation/qwen38-mtp-cuda-graphs/README.md).
+                string nativeFileName = OperatingSystem.IsWindows() ? "GgmlOps.dll"
+                    : OperatingSystem.IsMacOS() ? "libGgmlOps.dylib"
+                    : "libGgmlOps.so";
                 var modules = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-                    .Where(m => string.Equals(Path.GetFileName(m.FileName), "GgmlOps.dll", StringComparison.OrdinalIgnoreCase)).ToArray();
+                    .Where(m => string.Equals(Path.GetFileName(m.FileName), nativeFileName, StringComparison.OrdinalIgnoreCase)).ToArray();
                 Assert.Single(modules);
                 string hash = Hash(modules[0].FileName);
                 Assert.Equal(Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_NATIVE_SHA256"), hash);

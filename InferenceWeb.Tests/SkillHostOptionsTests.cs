@@ -319,6 +319,7 @@ public class SkillHostOptionsTests : IDisposable
     [Theory]
     [InlineData("gemma4")]
     [InlineData("qwen35")]
+    [InlineData("qwen4exp")]
     public void Capabilities_AFamilyThatCarriesToolDeclarations_GetsProgressiveDisclosure(string architecture)
     {
         // Both render declarations AND have a parser that reads the call back out, so the
@@ -331,13 +332,13 @@ public class SkillHostOptionsTests : IDisposable
 
     [Theory]
     [InlineData("harmony-not-a-real-architecture")]
-    [InlineData("qwen4exp")]
     public void Capabilities_AFamilyNothingCanParse_IsNotOfferedTools(string architecture)
     {
-        // An unrecognised architecture lands on the generic path, and `qwen4exp` is
-        // registered but has no CreateOutputParser — both end up on
+        // An unrecognised architecture lands on the generic path and ends up on
         // PassthroughOutputParser, which returns every byte as content and can never
-        // yield a tool call. Being permissive here was the original bug: skills_read was
+        // yield a tool call. (`qwen4exp` used to be the registered example of this
+        // until it gained its Qwen XML-style parser; it now takes the round trip
+        // above.) Being permissive here was the original bug: skills_read was
         // declared to a model whose replies nothing would parse, so the model called it,
         // nobody answered, and the raw markup reached the user as the answer.
         SkillModelCapabilities capabilities = SkillCapabilities.For(architecture);

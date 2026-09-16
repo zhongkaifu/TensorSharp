@@ -544,6 +544,35 @@ struct glm_model
     glm_slot * active_slot = nullptr;
     int next_slot_id = 0;
 
+    /// glm5next speculative decoding: a device-resident copy of ONE slot's KDA
+    /// recurrent state (conv tail + delta-net state, every rank and layer),
+    /// taken right before a verify batch and copied back when part of that
+    /// batch is rejected. One arena serves every slot - a speculative step
+    /// snapshots and restores within the same step, so two slots never need a
+    /// live copy at once, and every slot's state tensors have identical shapes
+    /// (TSGgml_GlmKdaStateCapture / TSGgml_GlmKdaStateRestore).
+    struct kda_snapshot
+    {
+        int slot_id = -1;
+        int64_t n_past = 0;
+        bool valid = false;
+        std::vector<ggml_tensor *> conv[MAX_GPUS];   // [rank][layer], mirrors glm_slot::kda_conv
+        std::vector<ggml_tensor *> ssm[MAX_GPUS];    // [rank][layer], mirrors glm_slot::kda_ssm
+        std::vector<ggml_context *> ctxs;            // one per buffer type the mirrors live in
+        std::vector<ggml_backend_buffer_t> bufs;
+
+        void release()
+        {
+            for (auto b : bufs) if (b) ggml_backend_buffer_free(b);
+            for (auto c : ctxs) if (c) ggml_free(c);
+            bufs.clear();
+            ctxs.clear();
+            for (int r = 0; r < MAX_GPUS; r++) { conv[r].clear(); ssm[r].clear(); }
+            valid = false;
+            slot_id = -1;
+        }
+    } kda_snap;
+
     bool flash_attn = false;
     bool fused_lid = false;      // ggml_lightning_indexer has a kernel here
 
@@ -609,6 +638,7 @@ struct glm_model
             if (sc.ctx) ggml_free(sc.ctx);
         }
         slot_ctxs.clear();
+        kda_snap.release();
         for (int i = 0; i <= MAX_GPUS; i++)
         {
             if (c_buf[i]) ggml_backend_buffer_free(c_buf[i]);
@@ -1336,6 +1366,9 @@ static void slot_free(glm_model & m, int slot_id)
     }
 
     m.slots.erase(slot_id);
+    // A snapshot of this slot's KDA state describes caches that no longer
+    // exist; slot ids are reused, so it must not survive to match a new one.
+    if (m.kda_snap.slot_id == slot_id) m.kda_snap.valid = false;
     for (auto it = m.slot_ctxs.begin(); it != m.slot_ctxs.end(); )
     {
         if (it->slot_id != slot_id) { ++it; continue; }
@@ -4622,11 +4655,36 @@ struct graph_builder
             trace("l_out", il, 0, inpL);
         }
 
-        if (!res.want_logits)
+        if (!res.want_logits && !res.want_h)
         {
             // A non-final prefill chunk only has to leave its caches and
             // recurrent state behind.
             ggml_build_forward_expand(gf, inpL);
+            return;
+        }
+
+        if (res.want_h)
+        {
+            // Speculation wants one post-final-norm hidden state per token
+            // (llama.cpp's h_nextn), so the stream mean and the norm run over
+            // EVERY row and the LM head selects from the normed rows. Both are
+            // row-wise, so the rows the head reads are bit-identical to the
+            // select-first branch below; only rows nobody reads are extra, and
+            // at a speculative window that is a handful.
+            ggml_tensor * x3all = ggml_reshape_3d(ctx, inpL, hp.n_embd, hcm, nt);
+            ggml_tensor * hn = rms(hc_mean(x3all), m.output_norm);
+            ggml_set_output(hn);
+            ggml_set_name(hn, "h_nextn");
+            res.h_nextn = hn;
+            ggml_build_forward_expand(gf, hn);
+            if (!res.want_logits)
+                return;
+            ggml_tensor * hsel = ggml_get_rows(ctx, hn, inp.out_ids);
+            hsel = ggml_mul_mat(ctx, m.output, hsel);
+            ggml_set_output(hsel);
+            ggml_set_name(hsel, "logits");
+            res.logits = hsel;
+            ggml_build_forward_expand(gf, hsel);
             return;
         }
 
@@ -5957,6 +6015,7 @@ TSG_EXPORT void TSGgml_GlmReset(void * handle)
     m->active_slot->n_past = 0;
     // glm5next: a new conversation must not inherit the KDA recurrent state.
     if (m->hp.g5n) slot_clear_recurrent(*m, *m->active_slot);
+    if (m->kda_snap.slot_id == m->active_slot->id) m->kda_snap.valid = false;
 }
 
 TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
@@ -5967,7 +6026,11 @@ TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
     // prefix is reusable only when the new prompt EXTENDS it (no rewind), and
     // anything else must restart from zero with a cleared state.
     if (m->hp.g5n && n_past != m->active_slot->n_past && n_past != 0) return 0;
-    if (m->hp.g5n && n_past == 0) slot_clear_recurrent(*m, *m->active_slot);
+    if (m->hp.g5n && n_past == 0)
+    {
+        slot_clear_recurrent(*m, *m->active_slot);
+        if (m->kda_snap.slot_id == m->active_slot->id) m->kda_snap.valid = false;
+    }
     m->active_slot->n_past = n_past;
     return 1;
 }
@@ -6090,6 +6153,203 @@ TSG_EXPORT int TSGgml_GlmMtpCatchUp(void * handle, const int32_t * tokens, int n
         done += take;
     }
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// glm5next: KDA recurrent-state snapshot / restore for speculative decoding
+// ---------------------------------------------------------------------------
+//
+// A verify batch over a speculative window advances every KDA layer's conv
+// tail and delta-net state by the whole window, and unlike an MLA row that
+// state cannot be rewound by position: after a partial rejection the only way
+// back to "the accepted prefix, and nothing else" is a copy of the state from
+// before the verify. The managed side takes that copy (capture) right before
+// each verify, and on a partial rejection restores it, rewinds to the captured
+// position and re-forwards the accepted prefix - the same contract Qwen 3.5's
+// GatedDeltaNet and Qwen 3.8's trunk honour (SpecVerifyPersistsAcceptedKv=false).
+//
+// The copies are device-to-device on the device that owns each layer's state;
+// nothing crosses the host. On GLM-5.3-Flash that is ~150 MB per capture.
+
+/// Version of the KDA snapshot API, so a managed build can tell a native
+/// library that predates it apart (and decline speculation on glm5next instead
+/// of failing mid-verify).
+TSG_EXPORT int TSGgml_GlmKdaStateApiVersion(void)
+{
+    return 1;
+}
+
+/// Make sure the snapshot arena mirrors the active slot's state tensors (same
+/// shapes, same buffer types). All slots share one arena because their state
+/// tensors are allocated identically; a shape mismatch (defensive) rebuilds it.
+static bool kda_snapshot_ensure(glm_model & m, glm_slot & slot)
+{
+    glm_model::kda_snapshot & snap = m.kda_snap;
+    bool fits = !snap.ctxs.empty();
+    for (int r = 0; r < m.tp && fits; r++)
+    {
+        if (snap.conv[r].size() != slot.kda_conv[r].size() || snap.ssm[r].size() != slot.kda_ssm[r].size())
+        { fits = false; break; }
+        for (size_t il = 0; il < slot.kda_conv[r].size() && fits; il++)
+        {
+            ggml_tensor * a = slot.kda_conv[r][il], * b = snap.conv[r][il];
+            ggml_tensor * c = slot.kda_ssm[r][il],  * d = snap.ssm[r][il];
+            if ((a == nullptr) != (b == nullptr) || (c == nullptr) != (d == nullptr)) { fits = false; break; }
+            if (a && (!ggml_are_same_shape(a, b) || a->type != b->type
+                      || ggml_backend_buffer_get_type(a->buffer) != ggml_backend_buffer_get_type(b->buffer)))
+            { fits = false; break; }
+            if (c && (!ggml_are_same_shape(c, d) || c->type != d->type
+                      || ggml_backend_buffer_get_type(c->buffer) != ggml_backend_buffer_get_type(d->buffer)))
+            { fits = false; break; }
+        }
+    }
+    if (fits) return true;
+    snap.release();
+
+    // Group the mirrors by buffer type (one context + one buffer each), so a
+    // layer-split model gets one arena per device and TP one per rank.
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<size_t> counts;
+    auto group_of = [&](ggml_tensor * t) -> size_t
+    {
+        ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(t->buffer);
+        for (size_t i = 0; i < bufts.size(); i++) if (bufts[i] == bt) return i;
+        bufts.push_back(bt);
+        counts.push_back(0);
+        return bufts.size() - 1;
+    };
+    for (int r = 0; r < m.tp; r++)
+    {
+        for (ggml_tensor * t : slot.kda_conv[r]) if (t) counts[group_of(t)]++;
+        for (ggml_tensor * t : slot.kda_ssm[r])  if (t) counts[group_of(t)]++;
+    }
+    if (bufts.empty())
+        return true;                         // nothing recurrent to mirror
+
+    snap.ctxs.assign(bufts.size(), nullptr);
+    snap.bufs.assign(bufts.size(), nullptr);
+    for (size_t g = 0; g < bufts.size(); g++)
+    {
+        ggml_init_params ip = { (counts[g] + 4) * ggml_tensor_overhead(), nullptr, true };
+        snap.ctxs[g] = ggml_init(ip);
+        if (!snap.ctxs[g]) { snap.release(); return false; }
+    }
+    for (int r = 0; r < m.tp; r++)
+    {
+        snap.conv[r].assign(slot.kda_conv[r].size(), nullptr);
+        snap.ssm[r].assign(slot.kda_ssm[r].size(), nullptr);
+        for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
+        {
+            if (ggml_tensor * t = slot.kda_conv[r][il])
+            {
+                snap.conv[r][il] = ggml_dup_tensor(snap.ctxs[group_of(t)], t);
+                ggml_format_name(snap.conv[r][il], "snap_kconv.%d.%d", r, (int) il);
+            }
+            if (ggml_tensor * t = slot.kda_ssm[r][il])
+            {
+                snap.ssm[r][il] = ggml_dup_tensor(snap.ctxs[group_of(t)], t);
+                ggml_format_name(snap.ssm[r][il], "snap_kssm.%d.%d", r, (int) il);
+            }
+        }
+    }
+    for (size_t g = 0; g < bufts.size(); g++)
+    {
+        snap.bufs[g] = ggml_backend_alloc_ctx_tensors_from_buft(snap.ctxs[g], bufts[g]);
+        if (!snap.bufs[g])
+        {
+            fprintf(stderr, "[glm] KDA snapshot arena allocation failed (%s)\n", ggml_backend_buft_name(bufts[g]));
+            snap.release();
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Wait for every backend so a device-to-device state copy neither races the
+/// graph that produced the state nor the graph that will consume it.
+static void kda_snapshot_sync(glm_model & m)
+{
+    for (int i = 0; i < m.n_backends; i++)
+        if (m.backends[i]) ggml_backend_synchronize(m.backends[i]);
+}
+
+/// Copy the active slot's KDA recurrent state into the snapshot arena and
+/// record the slot's position. Returns 1 on success. On glm-dsa proper (no
+/// recurrent state) only the position is recorded, so a restore is a rewind.
+TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->active_slot) return 0;
+    glm_slot & slot = *m->active_slot;
+    glm_model::kda_snapshot & snap = m->kda_snap;
+    snap.valid = false;
+    if (m->hp.g5n)
+    {
+        if (!kda_snapshot_ensure(*m, slot)) return 0;
+        kda_snapshot_sync(*m);
+        for (int r = 0; r < m->tp; r++)
+        {
+            for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
+            {
+                if (slot.kda_conv[r][il]) ggml_backend_tensor_copy(slot.kda_conv[r][il], snap.conv[r][il]);
+                if (slot.kda_ssm[r][il])  ggml_backend_tensor_copy(slot.kda_ssm[r][il],  snap.ssm[r][il]);
+            }
+        }
+        kda_snapshot_sync(*m);
+    }
+    snap.slot_id = slot.id;
+    snap.n_past = slot.n_past;
+    snap.valid = true;
+    return 1;
+}
+
+/// Copy the snapshot back into the active slot and rewind the slot to the
+/// captured position. Returns that position (>= 0), or -1 when there is no
+/// usable snapshot for the active slot (never taken, taken of another slot,
+/// invalidated by a reset/free, or the slot is already behind it).
+TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->active_slot) return -1;
+    glm_slot & slot = *m->active_slot;
+    glm_model::kda_snapshot & snap = m->kda_snap;
+    if (!snap.valid || snap.slot_id != slot.id || snap.n_past > slot.n_past)
+    {
+        fprintf(stderr, "[glm] KDA state restore refused: no snapshot for slot %d at or before position %" PRId64 "\n",
+                slot.id, slot.n_past);
+        return -1;
+    }
+    if (m->hp.g5n)
+    {
+        // The arena was built against THIS slot's shapes (or an identical
+        // slot's). A mismatch means the slot was reallocated underneath the
+        // snapshot; a rebuilt arena would hold nothing, so refuse rather than
+        // restore zeros.
+        for (int r = 0; r < m->tp; r++)
+        {
+            if (snap.conv[r].size() != slot.kda_conv[r].size()) return -1;
+            for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
+            {
+                ggml_tensor * a = slot.kda_conv[r][il], * b = snap.conv[r][il];
+                ggml_tensor * c = slot.kda_ssm[r][il],  * d = snap.ssm[r][il];
+                if ((a == nullptr) != (b == nullptr) || (c == nullptr) != (d == nullptr)) return -1;
+                if (a && !ggml_are_same_shape(a, b)) return -1;
+                if (c && !ggml_are_same_shape(c, d)) return -1;
+            }
+        }
+        kda_snapshot_sync(*m);
+        for (int r = 0; r < m->tp; r++)
+        {
+            for (size_t il = 0; il < slot.kda_conv[r].size(); il++)
+            {
+                if (slot.kda_conv[r][il]) ggml_backend_tensor_copy(snap.conv[r][il], slot.kda_conv[r][il]);
+                if (slot.kda_ssm[r][il])  ggml_backend_tensor_copy(snap.ssm[r][il],  slot.kda_ssm[r][il]);
+            }
+        }
+        kda_snapshot_sync(*m);
+    }
+    slot.n_past = snap.n_past;
+    return (int) snap.n_past;
 }
 
 TSG_EXPORT void TSGgml_GlmFree(void * handle)

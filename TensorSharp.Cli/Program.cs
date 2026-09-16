@@ -1223,6 +1223,14 @@ namespace TensorSharp.Cli
                     _log.LogError(LogEventIds.CliFailed, "Audio file not found: {AudioPath}", audioPath);
                     return;
                 }
+                // Same gate as the server's parsers: a family with no audio tower
+                // (DeepSeek V4.1, Nemotron-H) is refused here rather than decoding
+                // the clip and then generating as if none had been given.
+                if (AudioInputSupport.UnsupportedReasonFor(model.Config.Architecture) is string audioError)
+                {
+                    _log.LogError(LogEventIds.CliFailed, "--audio rejected: {Reason}", audioError);
+                    return;
+                }
                 audioPaths = new List<string> { audioPath };
                 if (!hasUserInput)
                     rawText = "Listen to this audio and describe what you hear.";

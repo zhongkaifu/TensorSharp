@@ -68,7 +68,7 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `KV_CACHE_DTYPE` | all | KV cache element type | auto (model-aligned: `f16` when the model's weights are below F32, else `f32`) | `f32`, `f16`, `q8_0` (runtime also accepts `q4_0`, not swept) | yes |
+| `KV_CACHE_DTYPE` | all except the DeepSeek V4 / V4.1 executors, which keep F16 caches read by their own attention, gather and compressor kernels: `q8_0` / `q4_0` are **refused at load** with the reason (`NotSupportedException` before the checkpoint is opened), `f32` is announced and reported as `f16` | KV cache element type | auto (model-aligned: `f16` when the model's weights are below F32, else `f32`) | `f32`, `f16`, `q8_0` (runtime also accepts `q4_0`, not swept) | yes |
 | `TS_KV_PAGED_QUANT_BITS` | all paged-KV models (not `glm-dsa`: MLA keeps one compressed 576-wide row per token and the DSA indexer scores that same contiguous history, so there is no paged block layout to quantize) | TurboQuant paged-KV block codec (2-bit uses the affine min+scale layout) | off (`0`) | `0`, `4`, `8` (the runtime also accepts `2`; not swept) | yes |
 | `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM: multiplied on the host at decode, streamed to the accelerator for one graph at prefill | off (`0`) | `0`, `16`, `all` | yes (GGML backends, MoE families) |
 | `TS_CPU_MOE` | MoE models | Offload every layer's routed experts (equivalent to `TS_N_CPU_MOE=all`) | off | `0`, `1` | no |

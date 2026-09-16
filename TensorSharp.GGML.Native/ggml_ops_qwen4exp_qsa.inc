@@ -82,7 +82,11 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
 #ifdef TSG_GGML_TEST_HOOKS
 // Isolated arithmetic probe using the production builder. Buffers are supplied
 // by the fixture; no target model or per-holder state is created here.
-TSG_EXPORT int TSGgml_Qwen4ExpTestQsa(
+// Keep test exports distinct from the production ABI manifest's TSG_EXPORT scan.
+#ifndef TSG_TEST_EXPORT
+#define TSG_TEST_EXPORT TSG_EXPORT
+#endif
+TSG_TEST_EXPORT int TSGgml_Qwen4ExpTestQsa(
     const TSGgmlQwen4ExpQsaArgs* args, const float* mixed_data, const uint16_t* mask_data,
     const int32_t* positions, int n_embd, int T, int capacity, int live, int padded, int start,
     int n_rot, float base, float scale, float eps, int device,

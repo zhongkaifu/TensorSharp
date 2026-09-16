@@ -154,13 +154,16 @@ namespace TensorSharp.Models
         /// the whole trunk over the window. That holds on every backend GLM runs on;
         /// the runtime cost governor in SpeculativeExecution still measures it and
         /// parks drafting if a particular prompt/context makes it a loss.
+        ///
+        /// glm5next has no draft head of its own (its NextN block is not built),
+        /// so what arms there is the weight-free n-gram speculator; its verify is
+        /// the same one-graph trunk pass, and a rejected window is undone through
+        /// the KDA recurrent-state snapshot (GlmDsaModel.Glm5NextSpeculative.cs).
+        /// The one thing that can make that unavailable is a native library that
+        /// predates the snapshot API, and that is declined here rather than
+        /// discovered mid-verify.
         /// </summary>
-        // The native constructor returns before ParseGlm5NextConfig initializes
-        // _g5n, so use the checkpoint architecture for BOTH execution backends.
-        // KDA needs a recurrent-state snapshot/restore implementation before a
-        // rejected n-gram tail can be undone. Declining the learned NextN head
-        // alone does not prevent the weight-free n-gram algorithm from arming.
-        public bool SpeculationProfitable => Config.Architecture != "glm5next";
+        public bool SpeculationProfitable => !IsGlm5NextArch || Glm5NextRollbackAvailable;
 
         /// <summary>
         /// The verify batch writes MLA rows (and, on the trunk, indexer keys) for
@@ -168,15 +171,33 @@ namespace TensorSharp.Models
         /// partially-accepted window keeps the accepted prefix's KV and only needs
         /// the position rewound. On a long context that removes the dominant
         /// rollback cost — a whole extra trunk forward.
+        ///
+        /// glm5next's KDA layers DO carry recurrent state that the verify advanced
+        /// over the whole window, so there the executor must restore the snapshot
+        /// and re-forward the accepted prefix (the Qwen 3.5 / Qwen 3.8 contract).
         /// </summary>
-        public bool SpecVerifyPersistsAcceptedKv => Config.Architecture != "glm5next";
+        public bool SpecVerifyPersistsAcceptedKv => !IsGlm5NextArch;
 
-        private void RequireSpeculativeCacheSupport()
-        {
-            if (Config.Architecture == "glm5next")
-                throw new NotSupportedException(
-                    "GLM-5.3-Flash speculative decoding needs KDA recurrent-state rollback, which is not implemented. Use standard decoding.");
-        }
+        /// <summary>
+        /// On a recurrent trunk every extra verify row is dearer than on a dense
+        /// one (the KDA scan runs over the window, and a partial rejection pays a
+        /// state restore plus a re-forward of the kept prefix), so glm5next
+        /// prefers the narrow default Qwen 3.8 measured best. It narrows the
+        /// default only; <c>--spec-draft</c> still gets exactly what it asks for.
+        /// glm-dsa proper keeps the shared default.
+        /// </summary>
+        public int SpecPreferredDraftWindow => IsGlm5NextArch ? 3 : 0;
+
+        /// <summary>
+        /// The native executor's SpecForward, snapshot and rewind all act on the
+        /// ACTIVE slot - the one <see cref="BindSequenceCache"/> selected for the
+        /// request being served - so a request served from its own slot (every
+        /// request the engine serves on the native executor) can speculate on
+        /// it. Without this the engine's fused-holder route declined speculation
+        /// on every slot-served request with a warn-once and decoded plainly.
+        /// The managed path has no per-request holders, so the flag is moot there.
+        /// </summary>
+        public bool SpecTrunkFollowsBoundCache => UsesNativeExecutor;
 
         /// <summary>
         /// The trunk re-reads the routed experts once per micro-batch, so a
@@ -205,17 +226,30 @@ namespace TensorSharp.Models
         }
 
         /// <summary>glm-dsa has no recurrent state: MLA rows and indexer keys are
-        /// per-position and a rewind is exact.</summary>
-        public void SpecSnapshotRecurrentState() { }
+        /// per-position and a rewind is exact. glm5next snapshots its KDA state
+        /// (see GlmDsaModel.Glm5NextSpeculative.cs).</summary>
+        public void SpecSnapshotRecurrentState()
+        {
+            if (IsGlm5NextArch)
+                Glm5NextSnapshotRecurrentState();
+        }
 
         /// <summary>See <see cref="SpecSnapshotRecurrentState"/>.</summary>
-        public void SpecRestoreRecurrentState() { }
+        public void SpecRestoreRecurrentState()
+        {
+            if (IsGlm5NextArch)
+                Glm5NextRestoreRecurrentState();
+        }
 
         public void SpecRewindCache(int length)
         {
             if (length < 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
-            RequireSpeculativeCacheSupport();
+            if (IsGlm5NextArch)
+            {
+                Glm5NextRewindCache(length);
+                return;
+            }
             if (UsesNativeExecutor)
             {
                 RewindNative(length);
@@ -235,11 +269,15 @@ namespace TensorSharp.Models
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0)
                 throw new ArgumentException("At least one token is required.", nameof(tokens));
-            RequireSpeculativeCacheSupport();
 
             if (UsesNativeExecutor)
             {
                 SpecForwardNative(tokens, hAllOut, logitsOut, allLogitsRows);
+                return;
+            }
+            if (IsGlm5Next)
+            {
+                SpecForwardGlm5Next(tokens, hAllOut, logitsOut, allLogitsRows);
                 return;
             }
 

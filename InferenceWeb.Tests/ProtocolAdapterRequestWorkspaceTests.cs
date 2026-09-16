@@ -175,6 +175,77 @@ public sealed class ProtocolAdapterRequestWorkspaceTests : IDisposable
         Assert.Empty(Directory.EnumerateFiles(uploads));
     }
 
+    /// <summary>
+    /// Nemotron-H has no audio tower (the Omni mmproj is vision-only), so the
+    /// same request-level gate answers 400 with the family's own reason before
+    /// any upload is written - for every registered alias of the family.
+    /// </summary>
+    [Theory]
+    [InlineData("nemotron_h_moe", "input_audio", false)]
+    [InlineData("nemotron_h_moe", "input_audio", true)]
+    [InlineData("nemotron_h_moe", "audio_url", true)]
+    [InlineData("nemotron_h", "input_audio", false)]
+    [InlineData("nemotron_h_omni", "audio_url", false)]
+    public async Task NemotronAudio_Returns400BeforeUploadingAnyMixedMedia(string architecture, string audioType, bool withImage)
+    {
+        string image = withImage ? "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AQ==\"}}," : "";
+        string audio = audioType == "input_audio"
+            ? "{\"type\":\"input_audio\",\"input_audio\":{\"format\":\"wav\",\"data\":\"AQID\"}}"
+            : "{\"type\":\"audio_url\",\"audio_url\":{\"url\":\"data:audio/wav;base64,AQID\"}}";
+        var context = ContextFor("{\"model\":\"not-hosted.gguf\",\"messages\":[{\"role\":\"user\",\"content\":[" + image + audio + "]}]}");
+        var registry = new SkillRegistry(new SkillRegistryOptions { Roots = Array.Empty<string>() });
+        var options = ServerOptionsBuilder.Build(new[] { "--model", Path.Combine(_base, "hosted.gguf"), "--no-skills" }, _base);
+        using var service = new ToolCapableUnloadedModelService { SelectedArchitecture = architecture };
+        using var store = new InMemoryResponsesStore();
+        string uploads = Path.Combine(_base, "uploads");
+        await InvokeAdapterAsync("openai-chat", context, service, options, uploads, registry,
+            new RecordingRunner(Path.Combine(_base, "workspaces")), new SessionWorkspaceManager(Path.Combine(_base, "workspaces")), store);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+        context.Response.Body.Position = 0;
+        string response = await new StreamReader(context.Response.Body).ReadToEndAsync();
+        using var error = System.Text.Json.JsonDocument.Parse(response);
+        Assert.Equal("invalid_request_error", error.RootElement.GetProperty("error").GetProperty("type").GetString());
+        Assert.Equal(TensorSharp.Models.NemotronModel.AudioInputUnsupportedMessage,
+            error.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.Empty(Directory.EnumerateFiles(uploads));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task NemotronResponsesAudio_ReturnsJson400BeforeUploadsPlanningOrStreaming(bool malformed, bool stream)
+    {
+        string audio = malformed
+            ? "{\"type\":\"input_audio\"}"
+            : "{\"type\":\"input_audio\",\"input_audio\":{\"format\":\"wav\",\"data\":\"AQID\"}}";
+        var context = ContextFor("{\"model\":\"not-hosted.gguf\",\"stream\":" + (stream ? "true" : "false") +
+            ",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AQID\"}]}," +
+            "{\"role\":\"user\",\"content\":[" + audio + "]}]}");
+        var registry = new SkillRegistry(new SkillRegistryOptions { Roots = Array.Empty<string>() });
+        var options = ServerOptionsBuilder.Build(new[] { "--model", Path.Combine(_base, "hosted.gguf"), "--no-skills" }, _base);
+        using var service = new ToolCapableUnloadedModelService { SelectedArchitecture = "nemotron_h_moe" };
+        using var store = new InMemoryResponsesStore();
+        string uploads = Path.Combine(_base, "uploads");
+        string workspaceRoot = Path.Combine(_base, "workspaces");
+        var runner = new RecordingRunner(workspaceRoot);
+
+        await InvokeAdapterAsync("openai-responses", context, service, options, uploads, registry,
+            runner, new SessionWorkspaceManager(workspaceRoot), store);
+
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+        Assert.StartsWith("application/json", context.Response.ContentType);
+        context.Response.Body.Position = 0;
+        string response = await new StreamReader(context.Response.Body).ReadToEndAsync();
+        using var error = System.Text.Json.JsonDocument.Parse(response);
+        Assert.Equal("invalid_request_error", error.RootElement.GetProperty("error").GetProperty("type").GetString());
+        Assert.Equal(TensorSharp.Models.NemotronModel.AudioInputUnsupportedMessage,
+            error.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.DoesNotContain("response.created", response);
+        Assert.Equal(0, runner.DeclareCalls);
+        Assert.Empty(Directory.EnumerateFiles(uploads));
+        Assert.False(Directory.Exists(workspaceRoot));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]

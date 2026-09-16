@@ -262,8 +262,11 @@ One caveat worth stating: some models' `SpecForward` is not drafter-independent
 — Muse-Glimmer and DeepSeek V4 share the fused verify kernel with their drafter
 and refuse to run without it. Those report `SpeculationProfitable` as false when
 no drafter is loaded, so weight-free speculation is declined rather than
-crashed. Qwen 3.5/3.6, GLM 5.2, GLM-5.3 and Gemma 4 have drafter-independent trunks and
-accept `--spec-type ngram` on any checkpoint. (Gemma 4 used to be gated on its
+crashed. Qwen 3.5/3.6, GLM 5.2, GLM-5.3, GLM-5.3-Flash and Gemma 4 have
+drafter-independent trunks and accept `--spec-type ngram` on any checkpoint (for
+GLM-5.3-Flash it is the only drafter: its NextN block is not built, and its KDA
+recurrent state is snapshotted and restored the way Qwen's GDN state is - see
+[rejection on a recurrent trunk](#rejection-on-a-recurrent-trunk)). (Gemma 4 used to be gated on its
 assistant GGUF too; the gate was an artifact — its multi-row verify is the same
 fused whole-model kernel its prefill runs, and the hidden-state capture is only
 filled when a speculator asks for it. TensorAgent ships the assistant GGUF as an
@@ -579,6 +582,20 @@ will not persist falls back to, automatically. The cost of the snapshots is
 VRAM: the GDN op's output grows by one state per slot, ~150 MB per slot for this
 model across all 48 recurrent layers, which is the other reason the default
 window is 3 rather than 8.
+
+**GLM-5.3-Flash takes the simple route.** Its 34 KDA layers are the same kind of
+recurrence (a gated delta rule with a short conv), but the whole model runs
+inside the native glm-dsa executor as one graph per pass, with the state
+committed in-graph per slot. Rather than teach that graph per-row snapshots, the
+executor keeps one device-resident arena per model and copies every layer's
+conv tail and delta-net state into it before a verify
+(`TSGgml_GlmKdaStateCapture`, ~150 MB device-to-device) and back on a partial
+rejection (`TSGgml_GlmKdaStateRestore`), after which the runtime re-forwards the
+accepted prefix - the pre-optimisation Qwen contract, without the PCIe round
+trips that made it a loss there. The managed `cpu` path copies host arrays. The
+trunk prefers a window of 3 for the same reason Qwen 3.8 does. Nothing has been
+measured on the real checkpoint yet; the synthetic-fixture proofs are in
+`Glm5NextSpeculativeRollbackTests`.
 
 ## Sliding-window caches and rollback
 

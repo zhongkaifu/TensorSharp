@@ -44,6 +44,7 @@
 #include "dsv41_raw_gather.h"
 #include "dsv41_truncate.h"
 #include "dsv41_dspark.h"
+#include "ggml_ops_precision_policy.h"
 #include "dsv41_retention.h"
 #include "dsv41_engram_io.h"
 #include "dsv41_engram_advice.h"
@@ -2069,6 +2070,15 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
     if (m->ds.loaded && m->ds.block_size >= m->n_ubatch)
         throw std::runtime_error("DSpark requires ubatch >= draft block size + 1");
+    // The owned CUDA precision paths compute a verify batch exactly like
+    // single-token decode only up to TSG_PRECISION_DECODE_COLUMNS rows. A
+    // wider drafter still works, but its accepted rows may be committed with
+    // last-bit differences that the cache quantization can turn into a
+    // full step, so the rewind/greedy parity fixtures would no longer hold.
+    if (m->ds.loaded && n_gpu > 0 && (int64_t) m->ds.block_size + 1 > TSG_PRECISION_DECODE_COLUMNS)
+        fprintf(stderr, "[dsv4] warning: DSpark verify batches of %d rows exceed the decode-class width %lld; "
+                        "speculative verify and single-token decode will not commit bit-identical cache rows on GPU\n",
+                m->ds.block_size + 1, (long long) TSG_PRECISION_DECODE_COLUMNS);
     m->ring_raw = pad64(hp.n_swa + m->n_ubatch, 256);
     // +1 so the masked scratch row (last row) used by non-boundary CSA/LID
     // decode steps never collides with a real compressed row.

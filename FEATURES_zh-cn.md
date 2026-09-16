@@ -6,7 +6,7 @@
 
 - **句向量嵌入** — GGUF `bert` / XLM-R 编码器；Snowflake Arctic Embed L v2.0（1024 维、CLS 池化）与 all-MiniLM-L6-v2（384 维、均值池化）。100% 纯 C# CPU 与原生 GGML CPU/Metal/CUDA，完整双向注意力；托管执行使用模型独立线程池与 ARM Q8 SIMD 块；原生执行保留量化权重、紧凑投影批次、按序列隔离的注意力与图复用；OpenAI/Ollama 单条及批量输入、归一化向量、base64 与维数缩减。详见[嵌入指南](docs/embeddings_zh-cn.md)与验证报告。
 - **多架构支持** —— DeepSeek V4 Flash、DeepSeek V4.1 Flash（`deepseek41`，服务后端为 `ggml_cuda`；`cpu` 是 100% 纯 C# 的 `DeepSeek4CpuExecutor`，不用 ggml、也没有任何原生依赖，它与 `cuda`、`ggml_cpu` 都是正确性与可移植性路径，而非服务路径）、GLM 5.x（GLM-5.2 与 GLM-5.3 同为 `glm-dsa`，GLM-5.3-Flash 为 `glm5next`）、Gemma 4、DiffusionGemma、Qwen 3.5/3.6-family、Qwen 3.8 Flash Next（`qwen4exp`）、GPT OSS、Nemotron-H、Mistral 3、Hunyuan Dense（`hunyuan-dense`）、Muse-Glimmer、Qwen-Image-Edit（图像编辑）、MiniMax-H3（视频 + 原生 32 kHz 立体声音频），以及 Wan 2.1/2.2（仅视频）
-- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像输入（Qwen 3.5/3.6-family / Qwen 3.8 Flash Next / GLM-5.3-Flash / Mistral 3 / Muse-Glimmer / Nemotron-H Omni，各自通过自己的 `mmproj` 视觉塔；GLM-5.2 与 GLM-5.3 同为 `glm-dsa`，均仅文本）。音频输入仅 Gemma 4 支持。`--pdf` 与架构无关：原生数字 PDF 的文本层会被内联进任意模型的提示词，只有扫描件才回退为页面图像（此时需要视觉模型）。生成的媒体是另一条轴：Qwen-Image-Edit 输出图像，Wan 2.1/2.2 输出 H.264 MP4，而 MiniMax-H3 是唯一**连音频一起输出**的家族——32 kHz 立体声音轨与画面联合去噪，并作为旁挂 `.wav` 写在 MP4 旁边
+- **多模态推理** —— 图像、视频和音频输入（Gemma 4）；图像与 `video_url` 视频输入（Qwen 3.8 Flash Next：有序帧对配 Qwen-VL 时间轴 M-RoPE 坐标；以及 DeepSeek V4.1）；图像输入（Qwen 3.5/3.6-family / GLM-5.3-Flash / Mistral 3 / Muse-Glimmer / Nemotron-H Omni，各自通过自己的 `mmproj` 视觉塔；GLM-5.2 与 GLM-5.3 同为 `glm-dsa`，均仅文本）。音频输入仅 Gemma 4 支持；发给没有音频塔的家族（DeepSeek V4.1、Nemotron-H / Nemotron 3 Nano Omni）的音频会经由同一张表（`AudioInputSupport.UnsupportedReasonFor`）以 HTTP 400 拒绝，绝不会被解码后静默丢弃。`--pdf` 与架构无关：原生数字 PDF 的文本层会被内联进任意模型的提示词，只有扫描件才回退为页面图像（此时需要视觉模型）。生成的媒体是另一条轴：Qwen-Image-Edit 输出图像，Wan 2.1/2.2 输出 H.264 MP4，而 MiniMax-H3 是唯一**连音频一起输出**的家族——32 kHz 立体声音轨与画面联合去噪，并作为旁挂 `.wav` 写在 MP4 旁边
 - **思维链 / 推理模式** —— 通过 `<think>` / `<|channel>thought` / `<|channel>analysis` 标签输出结构化的思维链推理（Qwen 3.5/3.6-family、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4、DeepSeek V4.1、GLM 5.x）
 - **工具调用 / 函数调用** —— 模型可调用用户定义的工具；所有三种 API 风格均支持多轮工具调用对话
 - **Agent Skills（智能体技能）** —— 面向模型的说明文件夹（`SKILL.md` + 脚本 / 参考文档 / 素材），只在任务需要时才加载。每次请求用 `"skills": ["pdf"]`（所有聊天 API）或 CLI 的 `--skill` 选中；其余内容由模型通过内置的 `skills_list` / `skills_read` 工具自取，而这些工具由 TensorSharp 在进程内应答，因此普通 OpenAI 客户端拿到的仍然只是一条写完的回复。→ [Agent Skills（智能体技能）](#agent-skills智能体技能)
@@ -103,7 +103,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/ge
 **三种草稿头形态：**
 
 - **Qwen 3.6（内嵌 NextN）** —— GGUF 在主干栈之后带有一个额外解码块（`{arch}.nextn_predict_layers`）以及 NextN 投影 / 归一化张量。无需独立文件，`--draft-model` 被忽略。主干的递归状态（GatedDeltaNet）会被快照，以便部分被拒的验证批次可以回滚。
-- **GLM 5.2 与 GLM-5.3（内嵌 NextN）** —— 形态相同，且官方 [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) 已经带有该块（`blk.78.nextn.*` 加上一个完整的 MLA + 256 专家解码块），无需额外下载，`--spec` 就是全部配置——在 CLI（`--input`、`--multi-turn-jsonl`、`--interactive`）上与在服务端上都是如此。该块只在传入该参数时才会加载：它是一整个解码层（IQ2_XXS 下约 3 GiB），会与 KV 缓存争抢 loader 用来确定上下文长度的同一块显存。glm-dsa 没有递归状态，因此部分被拒的验证批次会保留已接受前缀的 KV，只回退位置计数，不需要重跑。[unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF) 带的是同一个 `blk.78` 块，条件也一样——无需额外下载，`--spec` 同样必须在加载前就写在命令行上，因为正是这个开关才会把它调进来。唯一不同的一点：GLM-5.3 的这个块不带 `nextn.shared_head_head.weight`，因此它借用主干的 LM 头；而在 `--tp N > 1` 下这个头是列并行的，loader 会拒绝从某一个 rank 的词表切片上起草——这个判断在放置任何一个权重字节之前就做完了，只在 stderr 上留一行，本次运行余下部分走标准 decode（该拒绝路径没有测试覆盖）。也就是说，投机只在默认的按层切分（不传 `--tp`）下启用。详见 [GLM 卡片](docs/models/glm_zh-cn.md#nextn--mtp-投机解码) 与 [GLM-5.3 专节](docs/models/glm_zh-cn.md#glm-53glm-dsa)。
+- **GLM 5.2 与 GLM-5.3（内嵌 NextN）** —— 形态相同，且官方 [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) 已经带有该块（`blk.78.nextn.*` 加上一个完整的 MLA + 256 专家解码块），无需额外下载，`--spec` 就是全部配置——在 CLI（`--input`、`--multi-turn-jsonl`、`--interactive`）上与在服务端上都是如此。该块只在传入该参数时才会加载：它是一整个解码层（IQ2_XXS 下约 3 GiB），会与 KV 缓存争抢 loader 用来确定上下文长度的同一块显存。glm-dsa 没有递归状态，因此部分被拒的验证批次会保留已接受前缀的 KV，只回退位置计数，不需要重跑。[unsloth/GLM-5.3-GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF) 带的是同一个 `blk.78` 块，条件也一样——无需额外下载，`--spec` 同样必须在加载前就写在命令行上，因为正是这个开关才会把它调进来。唯一不同的一点：GLM-5.3 的这个块不带 `nextn.shared_head_head.weight`，因此它借用主干的 LM 头；而在 `--tp N > 1` 下这个头是列并行的，loader 会拒绝从某一个 rank 的词表切片上起草——这个判断在放置任何一个权重字节之前就做完了，只在 stderr 上留一行，本次运行余下部分走标准 decode（该拒绝路径没有测试覆盖）。也就是说，投机只在默认的按层切分（不传 `--tp`）下启用。详见 [GLM 卡片](docs/models/glm_zh-cn.md#nextn--mtp-投机解码) 与 [GLM-5.3 专节](docs/models/glm_zh-cn.md#glm-53glm-dsa)。GLM-5.3-Flash（`glm5next`）是这一家族的例外：它的 NextN 块未构建，因此在它上面起草的是 `--spec --spec-type ngram`；又因为其 KDA 层携带递归状态，主干会在每次验证前拍下该状态的快照、部分被拒时恢复，而不是回退位置——见 [GLM-5.3-Flash 上的投机解码](docs/models/glm_zh-cn.md#glm-53-flash-上的投机解码)。
 - **Gemma 4（独立 `gemma4-assistant` GGUF）** —— 通过 `--draft-model` 加载的 EAGLE 风格递归草稿器，给出该文件本身即可启用投机。它自身不保存任何 K/V：每个草稿层都查询**目标模型**已有的逐层 KV 缓存（最后一个 local 层 + 最后一个 global 层），因此在给定 `(token, hidden)` 时草稿器是无状态的。草稿的隐藏维度必须与目标一致——12B 目标配 12B 草稿，而非 26B-A4B 草稿。草稿 GGUF 不匹配、缺失或不完整会在启动时**立即失败**并给出修复提示，而非静默关闭投机。
 
 **何处有收益**（自动启用；否则引擎走标准 decode）。GLM 一列描述的是共用的 `glm-dsa` 路径，因此同时覆盖 GLM-5.3 与 GLM-5.2，但支撑这些结论的实测运行都来自 GLM-5.2 —— 目前还没有 GLM-5.3 的投机解码实测：
@@ -453,7 +453,19 @@ Qwen3.8-Flash-Next（`qwen4exp`）通过 Qwen3.5-VL 视觉塔支持图像输入�
 可用，并且跨轮复用 KV——但只能“继续追加”，因为 GatedDeltaNet 的递归无法回退，所以只有当
 新提示恰好是缓存前缀的延长时才会复用。
 
+视频输入通过 OpenAI 的 `video_url` content part 传入（base64 的 MP4 / WebM / MOV data
+URI，part 内可带 `fps` 与 `max_frames`，默认值来自 `VIDEO_SAMPLE_FPS` /
+`VIDEO_MAX_FRAMES`）。片段被采样成有序、带时间戳的帧，提示词按 Qwen3-VL 的视频布局渲染
+——每**两**个连续帧一个 `<|video_pad|>` 块，块前标注该帧对的平均源时间 `<t seconds>`，
+整个片段只包一层模板自带的 `<|vision_start|>` … `<|vision_end|>`——视觉塔用它的两个时间
+patch-embedding 切片（`v.patch_embd.weight` / `.weight.1`）编码每一对帧，这正是 Qwen-VL
+processor 的时间维合并。每一对都像一张静态图那样放在它所处的运行位置上，因此相邻帧对拿到
+递增的时间轴 M-RoPE id，而 QSA 位置历史、MTP 追赶与片段之后的 cache gap 看到的是同一套坐标。
+帧仍然是采样得到的，而不是由时间编码器解码；奇数帧的片段会重复最后一帧以补齐最后一对。
+
 - **图像：** PNG、JPEG、HEIC/HEIF
+- **视频：** 通过 `video_url` 的 MP4、WebM、MOV（基于时间抽帧；Qwen3-VL 的整段像素预算会把
+  长片段作为一个整体缩小）
 
 ### GLM-5.3-Flash
 
@@ -477,7 +489,7 @@ Mistral 3 通过 Pixtral 视觉编码器支持图像输入。示例仓库使用 
 
 ### Nemotron-H（Omni 发行版）
 
-Nemotron Omni 发行版加入了 RADIO / v2_vl ViT 图像编码器。通过 `--mmproj` 传入对应的多模态投影器（例如 `nvidia_Nemotron-H-Omni-mmproj.gguf`）即可启用；语言模型 GGUF 不变。图像 token 在 `<image>` 占位符处插入，并由多模态注入器自动展开为 `<img>` + N 个 tile token + `</img>`。
+Nemotron Omni 发行版加入了 RADIO / v2_vl ViT 图像编码器。通过 `--mmproj` 传入对应的多模态投影器（例如 `nvidia_Nemotron-H-Omni-mmproj.gguf`）即可启用；语言模型 GGUF 不变。图像 token 在 `<image>` 占位符处插入，并由多模态注入器自动展开为 `<img>` + N 个 tile token + `</img>`。音频会被拒绝（400 / CLI 错误）：公开的 Omni `mmproj` 只带视觉塔，没有任何东西能填充 `<so_embedding>` 占位符（见 [nemotron_zh-cn.md §4.6](docs/models/nemotron_zh-cn.md)）。
 
 - **图像：** PNG、JPEG、HEIC/HEIF
-- **音频：** 聊天模板会为每个上传的音频文件发出一个 `<so_embedding>` token，CLI 仍会运行 Parakeet 风格 log-mel 预处理器以验证管线，但真正的音频推理需要尚未在公开 GGUF 中发布的 Parakeet 音频 mmproj。
+- **音频：** 在每个入口都被拒绝（`/v1/chat/completions`、`/v1/responses` 与 Web UI 返回 HTTP 400；CLI 拒绝 `--audio` / `/audio`），消息为 `NemotronModel.AudioInputUnsupportedMessage`。聊天模板的 `<so_embedding>` 占位符没有任何东西可以填充：公开 GGUF 不带 Parakeet/FastConformer 音频塔，TensorSharp 里只有 `NemotronAudioPreprocessor` 这个 log-mel 前端。

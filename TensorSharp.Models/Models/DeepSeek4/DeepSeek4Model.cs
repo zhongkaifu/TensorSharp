@@ -59,6 +59,17 @@ namespace TensorSharp.Models
                 Console.Error.WriteLine(v4CpuNote);
             }
             Config = new ModelConfig { Architecture = arch };
+            // V4.1 was refused in ValidateLoad above (and once more before the
+            // factory ran); plain V4 has no pre-load hook, so refuse here.
+            if (!isV41)
+                DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
+            // Every executor of this family keeps F16 caches and ignores the
+            // process-wide dtype, so report what is actually allocated rather
+            // than whatever KV_CACHE_DTYPE happened to say.
+            _kvCacheDtype = DeepSeek4Architecture.ExecutorKvCacheDtype;
+            if (KvCacheDtypeConfig.IsExplicitlySet && KvCacheDtypeConfig.Current == KvCacheDtype.F32)
+                Console.Error.WriteLine(DeepSeek4Architecture.DescribeF32KvCacheRequest(
+                    isV41 ? "DeepSeek V4.1 Flash" : "DeepSeek V4 (Flash)"));
             ParseBaseConfig();
             if (isV41)
             {

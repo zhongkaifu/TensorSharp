@@ -677,11 +677,13 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   }"
 ```
 
-### Chat Completions + 视频（DeepSeek V4.1）
+### Chat Completions + 视频（DeepSeek V4.1、Qwen 3.8 Flash Next）
 
-`video_url` 是 V4.1 对 Chat Completions content 数组的扩展。服务端用既有的视频解码器
-对片段采样，并把每一帧变成一个图像 span，因此模型需要用 `--mmproj` 挂上准备好的视觉
-伴随文件。
+`video_url` 是对 Chat Completions content 数组的扩展，DeepSeek V4.1 与 Qwen 3.8 Flash Next
+（`qwen4exp`）都接受。服务端用既有的视频解码器把片段采样成有序、带时间戳的帧，因此模型需要
+用 `--mmproj` 挂上视觉伴随文件。V4.1 把每一帧变成一个带时间标签的图像 span；Qwen 3.8 则把
+连续帧两两合并，按 Qwen-VL 的视频布局渲染（每对一个 `<t seconds>` + `<|video_pad|>`），
+时间轴 M-RoPE 坐标递增——见[模型卡](../docs/models/qwen38-flash-next_zh-cn.md#视频输入)。
 
 ```bash
 VID_B64=$(base64 < clip.mp4 | tr -d '\n')

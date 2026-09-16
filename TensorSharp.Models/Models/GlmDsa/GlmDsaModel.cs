@@ -586,6 +586,7 @@ namespace TensorSharp.Models
             if (UsesNativeExecutor)
             {
                 ResetNative();
+                Glm5NextInvalidateSnapshot();
                 return;
             }
 
@@ -593,6 +594,7 @@ namespace TensorSharp.Models
             // leaving it behind would silently condition the next sequence on this
             // one, which no amount of KV clearing would show up as.
             ResetKdaState();
+            Glm5NextInvalidateSnapshot();
 
             _cacheSeqLen = 0;
             _sharedTopKCount = 0;
@@ -707,6 +709,16 @@ namespace TensorSharp.Models
         {
             if (tokens == null || tokens.Length == 0)
                 return;
+
+            if (IsGlm5Next)
+            {
+                // The glm5next block is hyper-connected and its attention may be
+                // KDA; DecoderBlock below is GLM-5.2's plain residual block.
+                _forwardSw.Start();
+                SpecForwardGlm5Next(tokens, null, null, allLogitsRows: false);
+                _forwardSw.Stop();
+                return;
+            }
 
             _forwardSw.Start();
             int seqLen = tokens.Length;

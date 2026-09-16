@@ -138,6 +138,9 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmHasMtp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmHiddenSize" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmKdaStateApiVersion" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmKdaStateCapture" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmKdaStateRestore" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmLoadModel" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmMtpCatchUp" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmMtpDraftStep" SymbolType="Function" />

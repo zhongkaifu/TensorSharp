@@ -51,6 +51,10 @@ namespace TensorSharp.Models
                     "--backend ggml_cpu or --backend cpu (portability/correctness only). " +
                     "TS_DSV41_ALLOW_NON_CUDA_GPU=1 additionally permits ggml_vulkan/ggml_metal, whose "
                     + "architecture-specific ops run on the CPU backend.");
+            // A q8_0/q4_0 cache cannot be honoured on any V4.1 executor; refuse it
+            // here, before the checkpoint is opened, instead of loading with F16
+            // caches while reporting the requested dtype (which is what happened).
+            DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4.1 Flash", v41: true);
             if (tpGroup != null)
                 throw new NotSupportedException(
                     "DeepSeek V4.1 uses a single-process native executor and does not support distributed tensor-parallel groups. " +

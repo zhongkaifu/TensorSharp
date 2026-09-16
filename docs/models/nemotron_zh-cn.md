@@ -11,7 +11,7 @@
 | 图像处理器 | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
 | 音频前端 | [`NemotronAudioPreprocessor`](../../TensorSharp.Models/Models/Nemotron/NemotronAudioPreprocessor.cs)（Parakeet 风格 log-mel） |
 | 示例模型 | Nemotron-H-8B-Reasoning-128K、Nemotron-H-47B-Reasoning-128K、Nemotron 3 Nano Omni |
-| 模态 | 文本、图像（Omni 版本配合 `mmproj`）。音频已经被预处理用于 Omni 发布版本，但推理需要一个尚未随这些 GGUF 一起发布的 Parakeet `mmproj`。 |
+| 模态 | 文本、图像（Omni 版本配合 `mmproj`）。音频会被**拒绝**（HTTP 400 / CLI 错误，消息为 `NemotronModel.AudioInputUnsupportedMessage`）：公开的 Omni GGUF 不带音频塔，`mmproj` 里只有 RADIO 视觉塔（见 §4.6）。 |
 | 思维链模式 | 是（`<think> ... </think>`） |
 | 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
 | 批处理 / 分页前向 | **默认启用** —— 设置 `TS_NEMOTRON_BATCHED=0` 可强制走旧的按序列 KV-swap 路径用于 A/B 对比。每槽位 Mamba2 conv + SSM 状态池，注意力层使用分页 K/V。可选的原生批处理 Mamba2 步内核（`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`）。详见 §11。 |
@@ -27,9 +27,11 @@
 | Nemotron-H-47B-Reasoning-128K | [bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF](https://huggingface.co/bartowski/nvidia_Nemotron-H-47B-Reasoning-128K-GGUF) | `nvidia_Nemotron-H-47B-Reasoning-128K-Q4_K_M.gguf`（28.188 GB） | —（仅文本） |
 | Nemotron 3 Nano Omni 30B-A3B | [unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF](https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF) | `NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-Q4_K_XL.gguf`（23.927 GB） | `mmproj-BF16.gguf`（1.590 GB；同仓库）—— **图像输入必需** |
 
-Omni 的 `mmproj` 只启用**图像输入**。音频文件会被预处理（log-mel）用于校验，
-但真正的音频推理需要 Parakeet 音频 mmproj，而这些 GGUF 发行版并未附带
-（见 §4.6）。
+Omni 的 `mmproj` 只启用**图像输入**：它只包含 32 层 RADIO 视觉塔
+（`v.blk.*`、`v.patch_embd`、`v.position_embd`）和 `nemotron_v2_vl` 的 MLP
+投影器（`mm.model.mlp.*`），元数据只有 `clip.has_vision_encoder`，没有任何音频
+项；语言模型 GGUF 也只有 `<so_embedding>` 占位 token。因此音频附件会在请求层被
+**拒绝**（HTTP 400），而不是被解码后丢弃（见 §4.6）。
 
 这些转换仓库将 NVIDIA 对应的 Nemotron 仓库标记为上游。上游模型卡使用
 NVIDIA 特定条款（`other`）；两个 bartowski 转换仓库未声明许可证。再分发前请阅读 NVIDIA 基础模型条款。
@@ -62,7 +64,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -- --model models/NVIDIA
 
 ## 1. 来源与目标
 
-Nemotron-H 是 NVIDIA 的混合 **Mamba2 + Transformer** 系列。同一套 backbone 同时覆盖密集 `nemotron_h` 系（如 Nemotron-H-8B / 47B）与 MoE `nemotron_h_moe` 系。Omni 发布（Nemotron 3 Nano Omni）额外携带 RADIO / v2_vl 视觉编码器（通过 `mmproj` 提供）。TensorSharp 还为 Omni 系实现了 Parakeet 风格的音频预处理器，但真正的音频推理需要一个公开 GGUF 并未附带的 Parakeet 音频 mmproj（见 §4.6）—— 图像是唯一实际可用的额外模态。
+Nemotron-H 是 NVIDIA 的混合 **Mamba2 + Transformer** 系列。同一套 backbone 同时覆盖密集 `nemotron_h` 系（如 Nemotron-H-8B / 47B）与 MoE `nemotron_h_moe` 系。Omni 发布（Nemotron 3 Nano Omni）额外携带 RADIO / v2_vl 视觉编码器（通过 `mmproj` 提供）。TensorSharp 还为 Omni 系实现了 Parakeet 风格的音频预处理器，但音频塔本身（24 层 Parakeet/FastConformer 编码器及其投影器）不在任何公开 GGUF 里，所以音频输入会被拒绝（见 §4.6）—— 图像是唯一实际可用的额外模态。
 
 它的核心特征：
 
@@ -256,7 +258,16 @@ Parakeet 风格 log-mel 频谱提取（镜像 ollama 的 `process_audio.go`）�
 - Slaney 风格 mel 滤波器组，128 bins，0..8 kHz。
 - `log(power + 2⁻²⁴)`，对有效（非 padding）帧做 per-mel 均值 / 方差归一化。
 
-聊天模板对每个上传音频文件发出一个 `<so_embedding>` token 让模型「看到」该模态，但真正的音频推理依赖 Parakeet 音频 mmproj —— 当前发行的公开 Nemotron-H 或 Nemotron Omni GGUF 都不带这个。音频片段仍会被解码并计算 log-mel 频谱以验证前端管线，并且每个会话只提示一次为什么不会进行音频推理。该逻辑位于 `ModelMultimodalInjector`，与该架构其余媒体处理放在一起，因此 CLI、交互式 REPL 与服务端行为一致；它此前只存在于 CLI 中，导致服务端会静默忽略音频。
+聊天模板对每个上传音频文件发出一个 `<so_embedding>` token，但没有任何东西能填充它：把 log-mel 帧变成 embedding 的 Parakeet/FastConformer 编码塔及其后面的投影器都不在公开的 Nemotron 3 Nano Omni GGUF 里。unsloth 仓库的 `mmproj-BF16.gguf` 恰好 390 个张量 —— 32 个 `v.blk.*` 视觉块、`v.patch_embd` / `v.position_embd` / `v.class_embd` 以及三个 `mm.model.mlp.*` 投影器张量 —— 元数据 `clip.has_vision_encoder=true`，没有任何音频键；401 个张量的语言模型 GGUF 同样没有音频张量。上游 llama.cpp 对同一检查点的回答是 "This model does not support audio input"；那边的音频需要社区分支加上带音频塔的统一 `mmproj`。
+
+因此 TensorSharp 对该家族**拒绝**音频，而不是像以前那样解码音频、打印警告、然后当作没有音频继续生成（那样模型看到的是未填充的 `<so_embedding>`，只按文本作答）。一张表 `AudioInputSupport.UnsupportedReasonFor` 通过架构注册表按架构查找，覆盖全部别名（`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`），驱动每一个入口：
+
+- `/v1/chat/completions` 与 `/v1/responses` 在写入任何上传之前扫描整个请求，对任何 `input_audio` / `audio_url` 部分（包括畸形的、以及排在图像之后的）返回 **400** `invalid_request_error`，消息为 `NemotronModel.AudioInputUnsupportedMessage`；只有图像的请求仍正常解析。
+- Web UI 在打开流之前以同一消息返回 400。
+- CLI 在模型加载完成后、解码音频或生成任何一轮之前拒绝 `--audio`，REPL 的 `/audio` 拒绝挂载该文件。
+- `ModelMultimodalInjector.ProcessNemotronHistory` 对绕过上述关卡的调用者抛出带同一消息的 `NotSupportedException`。
+
+如果将来某个发行版带上了音频塔，`NemotronOmniMmprojContractTests`（由 `TS_TEST_NEMOTRON_MMPROJ` 门控）会最先失败；届时接入需要一个跑在 `NemotronAudioPreprocessor` 帧上的编码器计算图、一个投影到 2688 维 embedding 的投影器，以及 Gemma 4 已在使用的 `_pendingAudioEmbeddings` 注入口（`SetAudioEmbeddings`）。
 
 ## 5. 参数与配置
 
@@ -482,6 +493,8 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 - **Per-token MoE 批处理** —— 即使有 `MoEExpertsForward`，per-token 托管循
   环仍是外层驱动。能在单次派发处理多 token 的批量 kernel 对长 prompt 帮助
   很大。
-- **音频 mmproj 支持** —— 音频前端已经接好，但推理需要尚未在当前 GGUF 中
-  发布的 Parakeet 音频 projector。届时只需把它接入 Gemma 4 同款的
-  `_pendingAudioEmbeddings` 注入路径，少量代码即可。
+- **音频塔** —— 音频前端（log-mel）与 embedding 注入口（`SetAudioEmbeddings` /
+  `_pendingAudioEmbeddings`）都在，但 Parakeet/FastConformer 编码器及其投影器不在
+  任何公开 GGUF 里，所以音频被拒绝（见 §4.6）。支持它需要一个带音频塔的发行版
+  （统一 `mmproj`）加上对应的编码器计算图；在此之前拒绝保持不变，
+  `NemotronOmniMmprojContractTests` 钉住这一事实。

@@ -73,6 +73,19 @@ namespace InferenceWeb.Tests
         }
 
         /// <summary>
+        /// File name of the GGML native library on this OS, for tests that pin the
+        /// mapped module's identity (Windows loads GgmlOps.dll; Linux and macOS load
+        /// the lib-prefixed .so/.dylib).
+        /// </summary>
+        public static string NativeGgmlOpsFileName =>
+            OperatingSystem.IsWindows() ? "GgmlOps.dll"
+            : OperatingSystem.IsMacOS() ? "libGgmlOps.dylib"
+            : "libGgmlOps.so";
+
+        public static bool IsNativeGgmlOps(string path)
+            => string.Equals(Path.GetFileName(path), NativeGgmlOpsFileName, StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
         /// First GGUF in <paramref name="dir"/> whose name contains
         /// <paramref name="contains"/> (case-insensitive; '|' separates
         /// accepted alternatives, e.g. "gpt-oss|gpt_oss"), skipping companion

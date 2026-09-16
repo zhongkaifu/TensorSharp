@@ -73,13 +73,16 @@ internal static class GlmDsaSyntheticModelBuilder
     }
 
     /// <summary>
-    /// Write a one-layer glm5next KDA model for native tensor-parallel loader
-    /// tests. The dimensions are deliberately tiny, but preserve the production
-    /// partitioning constraint: a 16-wide KDA head in a Q8_0 output projection
-    /// must travel in two-head groups because Q8_0 has 32-element blocks.
+    /// Write a small glm5next KDA model for native tensor-parallel loader
+    /// tests and the speculative rollback tests. The dimensions are deliberately
+    /// tiny, but preserve the production partitioning constraint: a 16-wide KDA
+    /// head in a Q8_0 output projection must travel in two-head groups because
+    /// Q8_0 has 32-element blocks. Every block is a KDA (recurrent) layer with a
+    /// dense FFN; <paramref name="numLayers"/> of them, so a per-layer state
+    /// snapshot has more than one layer to get wrong.
     /// </summary>
     public static string WriteGlm5NextTpFixture(
-        string path, int numHeads, bool quantizeAttentionOutput)
+        string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1)
     {
         const int hidden = 64;
         const int ffn = 64;
@@ -92,6 +95,8 @@ internal static class GlmDsaSyntheticModelBuilder
 
         if (numHeads <= 0)
             throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (numLayers <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (quantizeAttentionOutput && dInner % Q8Block != 0)
             throw new ArgumentException("The Q8_0 fixture's KDA width must contain whole quantization blocks.",
                 nameof(numHeads));
@@ -101,52 +106,58 @@ internal static class GlmDsaSyntheticModelBuilder
             Gen("token_embd.weight", 0.02f, hidden, vocab),
             Gen("output_norm.weight", 0.2f, hidden),
             Gen("output.weight", 0.02f, hidden, vocab),
-
-            Gen("blk.0.attn_norm.weight", 0.2f, hidden),
-            Gen("blk.0.ffn_norm.weight", 0.2f, hidden),
-
-            Gen("blk.0.hc_attn_fn.weight", 0.02f, hc * hidden, (2 + hc) * hc),
-            Gen("blk.0.hc_attn_scale.weight", 0.02f, 3),
-            Gen("blk.0.hc_attn_base.weight", 0.02f, (2 + hc) * hc),
-            Gen("blk.0.hc_ffn_fn.weight", 0.02f, hc * hidden, (2 + hc) * hc),
-            Gen("blk.0.hc_ffn_scale.weight", 0.02f, 3),
-            Gen("blk.0.hc_ffn_base.weight", 0.02f, (2 + hc) * hc),
-
-            Gen("blk.0.attn_q.weight", 0.02f, hidden, dInner),
-            Gen("blk.0.attn_k.weight", 0.02f, hidden, dInner),
-            Gen("blk.0.attn_v.weight", 0.02f, hidden, dInner),
-            Gen("blk.0.ssm_conv1d_q.weight", 0.02f, conv, 1, dInner),
-            Gen("blk.0.ssm_conv1d_k.weight", 0.02f, conv, 1, dInner),
-            Gen("blk.0.ssm_conv1d_v.weight", 0.02f, conv, 1, dInner),
-            Gen("blk.0.ssm_f_a.weight", 0.02f, hidden, lowRank),
-            Gen("blk.0.ssm_f_b.weight", 0.02f, lowRank, dInner),
-            Gen("blk.0.ssm_dt.bias", 0.02f, dInner),
-            Gen("blk.0.ssm_a", 0.02f, numHeads),
-            Gen("blk.0.ssm_beta.weight", 0.02f, hidden, numHeads),
-            Gen("blk.0.ssm_g_a.weight", 0.02f, hidden, lowRank),
-            Gen("blk.0.ssm_g_b.weight", 0.02f, lowRank, dInner),
-            Gen("blk.0.ssm_norm.weight", 0.2f, headDim),
-
-            Gen("blk.0.ffn_gate.weight", 0.02f, hidden, ffn),
-            Gen("blk.0.ffn_up.weight", 0.02f, hidden, ffn),
-            Gen("blk.0.ffn_down.weight", 0.02f, ffn, hidden),
         };
-        var attentionOutput = Gen("blk.0.attn_output.weight", 0.02f, dInner, hidden);
-        if (quantizeAttentionOutput)
-            attentionOutput.Type = GgmlType.Q8_0;
-        tensors.Add(attentionOutput);
+        for (int l = 0; l < numLayers; l++)
+        {
+            string p = $"blk.{l}.";
+            tensors.AddRange(new[]
+            {
+                Gen(p + "attn_norm.weight", 0.2f, hidden),
+                Gen(p + "ffn_norm.weight", 0.2f, hidden),
+
+                Gen(p + "hc_attn_fn.weight", 0.02f, hc * hidden, (2 + hc) * hc),
+                Gen(p + "hc_attn_scale.weight", 0.02f, 3),
+                Gen(p + "hc_attn_base.weight", 0.02f, (2 + hc) * hc),
+                Gen(p + "hc_ffn_fn.weight", 0.02f, hc * hidden, (2 + hc) * hc),
+                Gen(p + "hc_ffn_scale.weight", 0.02f, 3),
+                Gen(p + "hc_ffn_base.weight", 0.02f, (2 + hc) * hc),
+
+                Gen(p + "attn_q.weight", 0.02f, hidden, dInner),
+                Gen(p + "attn_k.weight", 0.02f, hidden, dInner),
+                Gen(p + "attn_v.weight", 0.02f, hidden, dInner),
+                Gen(p + "ssm_conv1d_q.weight", 0.02f, conv, 1, dInner),
+                Gen(p + "ssm_conv1d_k.weight", 0.02f, conv, 1, dInner),
+                Gen(p + "ssm_conv1d_v.weight", 0.02f, conv, 1, dInner),
+                Gen(p + "ssm_f_a.weight", 0.02f, hidden, lowRank),
+                Gen(p + "ssm_f_b.weight", 0.02f, lowRank, dInner),
+                Gen(p + "ssm_dt.bias", 0.02f, dInner),
+                Gen(p + "ssm_a", 0.02f, numHeads),
+                Gen(p + "ssm_beta.weight", 0.02f, hidden, numHeads),
+                Gen(p + "ssm_g_a.weight", 0.02f, hidden, lowRank),
+                Gen(p + "ssm_g_b.weight", 0.02f, lowRank, dInner),
+                Gen(p + "ssm_norm.weight", 0.2f, headDim),
+
+                Gen(p + "ffn_gate.weight", 0.02f, hidden, ffn),
+                Gen(p + "ffn_up.weight", 0.02f, hidden, ffn),
+                Gen(p + "ffn_down.weight", 0.02f, ffn, hidden),
+            });
+            var attentionOutput = Gen(p + "attn_output.weight", 0.02f, dInner, hidden);
+            if (quantizeAttentionOutput)
+                attentionOutput.Type = GgmlType.Q8_0;
+            tensors.Add(attentionOutput);
+        }
 
         const string a = "glm5next";
         var kv = new List<KvEntry>
         {
             new KvStr  { Key = "general.architecture", V = a },
             new KvStr  { Key = "general.name", V = "tiny-glm5next-tp" },
-            new KvU32  { Key = $"{a}.block_count", V = 1 },
+            new KvU32  { Key = $"{a}.block_count", V = (uint)numLayers },
             new KvU32  { Key = $"{a}.context_length", V = 256 },
             new KvU32  { Key = $"{a}.embedding_length", V = hidden },
             new KvU32  { Key = $"{a}.feed_forward_length", V = ffn },
             new KvU32  { Key = $"{a}.attention.head_count", V = (uint)numHeads },
-            new KvU32Arr { Key = $"{a}.attention.head_count_kv", V = new uint[] { 0 } },
+            new KvU32Arr { Key = $"{a}.attention.head_count_kv", V = new uint[numLayers] },
             new KvF32  { Key = $"{a}.rope.freq_base", V = 10000.0f },
             new KvF32  { Key = $"{a}.attention.layer_norm_rms_epsilon", V = 1e-6f },
             new KvF32  { Key = $"{a}.attention.layer_norm_epsilon", V = 1e-6f },
@@ -159,8 +170,8 @@ internal static class GlmDsaSyntheticModelBuilder
             new KvU32  { Key = $"{a}.rope.dimension_count", V = 0 },
 
             // These are required model-level fields even though this fixture's
-            // sole block is dense rather than routed-MoE or MLA.
-            new KvU32  { Key = $"{a}.leading_dense_block_count", V = 1 },
+            // blocks are dense rather than routed-MoE or MLA.
+            new KvU32  { Key = $"{a}.leading_dense_block_count", V = (uint)numLayers },
             new KvU32  { Key = $"{a}.expert_count", V = 4 },
             new KvU32  { Key = $"{a}.expert_used_count", V = 2 },
             new KvU32  { Key = $"{a}.expert_feed_forward_length", V = 32 },

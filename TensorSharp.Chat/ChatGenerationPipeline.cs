@@ -21,6 +21,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Server
@@ -1600,16 +1601,26 @@ namespace TensorSharp.Server
             return false;
         }
 
-        internal const string DeepSeek41AudioInputError =
-            "DeepSeek V4.1 Flash does not support audio input. Remove audio attachments or use a model with an audio encoder.";
+        internal const string DeepSeek41AudioInputError = AudioInputSupport.DeepSeek41Message;
+
+        /// <summary>
+        /// The refusal an architecture gives audio input, or null when it can consume
+        /// audio (or is not a family the table knows): <see cref="AudioInputSupport"/>,
+        /// which every entry point that accepts audio consults before writing an
+        /// upload or rendering a prompt (the OpenAI chat and Responses parsers, the
+        /// Web UI, this pipeline and the CLI).
+        /// </summary>
+        internal static string AudioInputErrorFor(string architecture)
+            => AudioInputSupport.UnsupportedReasonFor(architecture);
 
         internal static string UnsupportedAudioInputError(string architecture, List<ChatMessage> history)
         {
-            if (!string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase) || history == null)
+            string error = AudioInputErrorFor(architecture);
+            if (error == null || history == null)
                 return null;
             foreach (ChatMessage message in history)
                 if (message?.AudioPaths is { Count: > 0 })
-                    return DeepSeek41AudioInputError;
+                    return error;
             return null;
         }
 

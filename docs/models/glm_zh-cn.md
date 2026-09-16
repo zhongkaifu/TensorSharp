@@ -528,9 +528,10 @@ GLM-5.3-Flash 是混合架构的后继者：320B 参数、288 个路由专家（
 | SwiGLU 截断 | 所有 FFN，上限 10 | 激活前 `up ∈ [−L, L]`、`gate ∈ (−∞, L]`——稠密层、共享专家、路由专家一视同仁 |
 | 视觉 | `mmproj-BF16.gguf`（GLM-OCR ViT） | 见下文 |
 
-KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无法回退，所以只有当
+KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无法按位置回退，所以只有当
 新 prompt **恰好扩展**缓存前缀时才复用——与 Qwen 3.5 / 3.6 GDN 家族相同的契约；`Reset`
-会连同位置计数一起清空该状态。
+会连同位置计数一起清空该状态。唯一精确的"回退"是投机解码的回滚：每次验证批次之前
+都会在设备上拍一份该状态的快照，窗口被部分拒绝时再拷回去（见[投机解码](#glm-53-flash-上的投机解码)）。
 
 ### 原生本地张量并行
 
@@ -570,8 +571,46 @@ GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）�
   （`TSGgml_GlmVisionEncoderF32`）；投影后的嵌入在原生执行器内覆盖
   `<|image|>` 占位行（`TSGgml_GlmQueueVisionRows`）——文本塔是 NoPE，
   完全不需要 MRoPE 记账。
-- **暂未支持**：NextN/MTP 投机（llama.cpp 同样 assert 其 glm5next MTP 图未实现；
-  `--spec` 打印提示后按标准解码服务）。
+- **投机解码**：无权重的 n-gram 草稿器（`--spec --spec-type ngram`），原生执行器与
+  托管 `cpu` 路径都支持；见下一节。checkpoint 自带的 NextN/MTP 块**未**构建
+  （llama.cpp 同样 assert 其 glm5next MTP 图未实现），因此只传 `--spec`——`auto` /
+  `draft-head`——会打印提示并按标准解码服务。
+
+### GLM-5.3-Flash 上的投机解码
+
+GLM-5.2 的投机路径是位置回退：MLA 行与 indexer key 都按位置存放，丢掉被拒的尾巴不花
+任何代价（`SpecVerifyPersistsAcceptedKv = true`）。glm5next 的 34 个 KDA 层各自携带一份
+递归状态，验证批次会把它整整推进一个窗口，没有任何位置运算能把它找回来。因此在这个
+架构上主干改用递归契约——与 Qwen 3.5 的 GatedDeltaNet、Qwen 3.8 的主干相同：
+
+1. 验证之前，执行器把每个 KDA 层的卷积尾部与 delta-net 状态（`--tp` 下每个 rank 各自的）
+   拷到它所在设备上的快照区（`TSGgml_GlmKdaStateCapture`；约 150 MB，设备内拷贝，
+   每个模型只有一块快照区，因为一步之内就完成快照与恢复），并记下位置；
+2. 验证是一张覆盖 `[last, d1..dK]` 的主干图，LM head 跑在每一行上
+   （`TSGgml_GlmSpecForward`，未改动）；
+3. 部分被拒时，把快照拷回去并把 slot 回退到记录的位置（`TSGgml_GlmKdaStateRestore`），
+   运行时再重跑已接受前缀，于是状态等于对这些 token 的普通解码
+   （`SpecVerifyPersistsAcceptedKv = false`）。回退到其它任何位置都会报错拒绝，而不是
+   悄悄保留已推进的状态（`SupportsKVCacheTruncation` 仍为 false）。
+
+超连接流就是残差流（按 token，不是携带状态），MLA 行按位置、池化 indexer key 按格存放，
+所以回滚只需恢复 KDA 状态，其余都会在被读到之前由重跑覆盖。托管 `cpu` 路径用主机数组
+做同样的事（`GlmDsaModel.Glm5NextSpeculative.cs`）。由于每多验证一行都要跑 KDA 扫描，
+而一次拒绝要付出恢复加重跑，主干默认偏好 3 的草稿窗口（`SpecPreferredDraftWindow`，
+与 Qwen 3.8 的实测一致）；`--spec-draft N` 仍然得到它要求的值。如果原生库早于快照 API
+（没有 `TSGgml_GlmKdaStateApiVersion` 导出），模型会报告投机无收益，从而在一开始就拒绝，
+而不是在验证中途失败。投机主干跟随已绑定的 slot（`SpecTrunkFollowsBoundCache`），
+因此服务端按 slot 服务的请求也能投机——这同时解除了 GLM-5.2 请求此前在那里遇到的
+一次性警告拒绝。
+
+在合成 KDA 夹具上已证明的事实（`Glm5NextSpeculativeRollbackTests`、
+`Glm5NextSpeculationEligibilityTests`，覆盖 `cpu` 与 `ggml_cpu`，
+`TS_TEST_GLM_CUDA=1` 时再加 `ggml_cuda`——保持默认的 cpu 后端 pin，因为执行器自己选择
+CUDA 设备）：n-gram 投机贪心与普通贪心逐 token
+一致，且确有草稿被提出、有窗口被部分拒绝；每个窗口末尾都必错的草稿器仍然得到普通
+解码的 token 流；回滚之后下一个 token 的 logits 在整个词表上与普通解码一致；验证各行
+等于逐 token 解码；托管与原生的 `SpecForward` 逐行一致，隐状态也一致。真实
+GLM-5.3-Flash checkpoint 上尚无投机解码实测，因此没有吞吐结论。
 
 ### 实测
 

@@ -244,7 +244,11 @@ namespace TensorSharp.Server.RequestParsers
             // Scan the complete request before writing any uploads: an image
             // preceding unsupported audio or an invalid image must not leave
             // partial files, or silently disappear from the model's input.
-            if (string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase))
+            // The audio gate covers every family without an audio tower
+            // (DeepSeek V4.1, Nemotron-H); the image checks are V4.1's own.
+            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture);
+            bool deepSeek41 = string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase);
+            if (audioError != null || deepSeek41)
             {
                 foreach (JsonElement message in messagesEl.EnumerateArray())
                     if (message.TryGetProperty("content", out JsonElement content) && content.ValueKind == JsonValueKind.Array)
@@ -253,9 +257,9 @@ namespace TensorSharp.Server.RequestParsers
                             if (part.TryGetProperty("type", out JsonElement type) &&
                                 type.ValueKind == JsonValueKind.String)
                             {
-                                if (type.GetString() is "input_audio" or "audio_url")
-                                    throw new JsonException(ChatGenerationPipeline.DeepSeek41AudioInputError);
-                                if (type.GetString() == "image_url")
+                                if (audioError != null && type.GetString() is "input_audio" or "audio_url")
+                                    throw new JsonException(audioError);
+                                if (deepSeek41 && type.GetString() == "image_url")
                                     ValidateDeepSeek41ImageUrl(part);
                             }
                         }
@@ -463,8 +467,9 @@ namespace TensorSharp.Server.RequestParsers
         public static List<ChatMessage> ParseResponsesInput(JsonElement inputEl, string instructions, UploadStoragePolicy uploads, ILogger logger = null,
             string architecture = null)
         {
-            if (string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase) &&
-                inputEl.ValueKind == JsonValueKind.Array)
+            string audioError = ChatGenerationPipeline.AudioInputErrorFor(architecture);
+            bool deepSeek41 = string.Equals(architecture, "deepseek41", StringComparison.OrdinalIgnoreCase);
+            if ((audioError != null || deepSeek41) && inputEl.ValueKind == JsonValueKind.Array)
             {
                 // Validate every supported message before any media is written.
                 // Check the audio type before decoding its payload: missing or
@@ -479,9 +484,9 @@ namespace TensorSharp.Server.RequestParsers
                             if (part.TryGetProperty("type", out JsonElement type) &&
                                 type.ValueKind == JsonValueKind.String)
                             {
-                                if (type.GetString() is "input_audio" or "audio_url")
-                                    throw new JsonException(ChatGenerationPipeline.DeepSeek41AudioInputError);
-                                if (type.GetString() == "input_image")
+                                if (audioError != null && type.GetString() is "input_audio" or "audio_url")
+                                    throw new JsonException(audioError);
+                                if (deepSeek41 && type.GetString() == "input_image")
                                 {
                                     if (!part.TryGetProperty("image_url", out JsonElement url) || url.ValueKind != JsonValueKind.String)
                                         throw new JsonException("DeepSeek V4.1 input_image.image_url must contain a base64 image data URI.");

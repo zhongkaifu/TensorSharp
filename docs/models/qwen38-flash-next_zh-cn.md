@@ -18,6 +18,41 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE；支持多图与多轮图像会话，并在轮次之间复用
 KV（GDN 递归无法回退，因此只有当新 prompt **恰好扩展**已缓存前缀时才复用）。
 
+## 视频输入
+
+视频以 OpenAI Chat Completions 的 `video_url` content part 送达模型，内容是 base64 的
+MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
+
+```json
+{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1,"max_frames":8}}
+```
+
+`fps`（0 < fps ≤ 60）与 `max_frames`（1–64）可选；默认值取 `VIDEO_SAMPLE_FPS` 与正的
+`VIDEO_MAX_FRAMES`，否则为 1 fps 与 16 帧，更长的片段会在全长上均匀采样。服务端把片段解码成
+有序的帧，每帧带其源时间（帧序号除以探测到的帧率，变帧率片段为近似值），之后由 Qwen-VL 的
+视频布局接手：
+
+- **帧对（temporal pair）。** 视觉塔的 patch embedding 有两个时间切片
+  （`v.patch_embd.weight` 与 `.weight.1`），所以连续帧两两合并，与 Qwen-VL processor 堆叠帧
+  的方式完全一致；奇数帧的片段会重复最后一帧补齐最后一对。每一对单独编码（参考实现的视觉塔
+  只在一个时间 patch 内做注意力），得到与一张静态帧相同的合并 patch token 数。整段片段按
+  Qwen3-VL 的视频像素预算整体缩放，因此同一片段的每一对共用一个网格。
+- **提示词布局。** 模板把视频 part 渲染成 `<|vision_start|><|video_pad|><|vision_end|>`；
+  其中的 `<|video_pad|>` 变成每对一个 `<t seconds><|vision_start|><|video_pad|>…<|vision_end|>`
+  块，`t` 是该对的平均源时间（保留一位小数），模板自带的起止 token 仍包在整段片段外面。
+  一条消息里的两个 `video_url` part 渲染成两段片段。同一条消息里的静态图保留各自的
+  `<|image_pad|>` span，按附件顺序排列。
+- **位置。** 每一对都像一张静态图那样定位，其 (T, H, W) 坐标从该对所处的运行位置起算——这
+  就是 Qwen3-VL `get_rope_index` 把视频网格拆成逐对条目的规则——因此相邻帧对拿到严格递增的
+  时间轴 M-RoPE id，中间的时间标签文本推进位置流，片段之后的文本从最后一对的网格之后继续。
+  QSA indexer 的位置历史、MTP 草稿追赶以及片段之后的旋转/cache gap 记录的都是同一套坐标，
+  所以投机解码与保留前缀和目标模型一致。
+
+它不是什么：帧是采样得到的，不是由时间编码器解码；帧时间是采样到的源时间，而非重新对齐到
+2 fps 的流。通过 Web UI 上传的视频帧不带源时间，仍然按静态图处理，每帧一个 span，与以前一样。
+完整 checkpoint 的检查是 `benchmarks/engine_comparison/validate_deepseek41_media.py` 的
+`video_order` / `video_timestamp` 场景，对象是挂了 `mmproj-BF16.gguf` 的 Qwen3.8 服务。
+
 ## 连续批处理
 
 并发请求通过**逐序列状态持有者**（per-sequence state holders）来服务：每个在飞请求

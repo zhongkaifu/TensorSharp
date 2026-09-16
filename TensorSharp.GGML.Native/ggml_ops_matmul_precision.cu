@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_precision_policy.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
@@ -141,7 +142,13 @@ void tsg_matmul_cuda_compute(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
         return;
     }
 
-    if (b->ne[1] <= 4) {
+    // Decode-class widths take the warp kernel: one warp per output element,
+    // so a column's reduction order never depends on how many columns share
+    // the launch. cuBLAS below picks its kernel by (m, n, k) and does not
+    // promise that, and V4.1 quantizes this output into its caches, so a
+    // speculative verify (block_size + 1 columns) has to reduce exactly like
+    // the single-token decode it stands in for (see the policy header).
+    if (b->ne[1] <= TSG_PRECISION_DECODE_COLUMNS) {
         const int64_t count = ggml_nelements(dst);
         const unsigned blocks = unsigned(std::min<int64_t>((count + 3) / 4, 65535));
         vector_f32<<<blocks, 128, 0, state->stream>>>(static_cast<const char *>(a->data),

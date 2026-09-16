@@ -98,6 +98,8 @@ def main():
     ap.add_argument("--state-only", action="store_true", help="Run state fixtures separately; exclude independent reference checks explicitly")
     ap.add_argument("--native-ring-control", action="store_true", help="Add diagnostic draft arithmetic using observed native KV; does not replace independent end-to-end oracle")
     ap.add_argument("--trace-native", action="store_true", help="Record native committed-KV inputs for numerical diagnosis")
+    ap.add_argument("--keep-going", action="store_true",
+                    help="Record a failed check and continue instead of stopping at the first failure (diagnosis only)")
     ap.add_argument("--reference-prefixes", nargs="+", type=int, default=[1, 5, 17],
                     help="Explicit reference prefix lengths; separate diagnostic scopes retain their own results")
     args = ap.parse_args()
@@ -123,6 +125,9 @@ def main():
         report["checks"].append(dict(name=name, passed=bool(ok), **details))
         save()
         if not ok:
+            if args.keep_going:
+                report.setdefault("failed_checks", []).append(name)
+                return
             raise AssertionError(name)
 
     def compare(name, actual, expected, exact=False):
@@ -258,6 +263,18 @@ def main():
                 check(f"rewind_p{length}_accepted{accepted}", api["Rewind"](live, kept) == 1)
                 check("rewind_position", api["NPast"](live) == kept)
                 forward(cold, batch[:accepted+1])
+                if args.native_ring_control:
+                    # The rewound slot must hold the same committed rows as a cold prefill of the kept
+                    # tokens, over the window the draft attends to (a wrapped ring's rows beyond it may
+                    # hold the rejected tail; the draft mask never exposes them).
+                    count = min(kept, config["text_config"]["sliding_window"])
+                    for stage in range(3):
+                        rows = []
+                        for handle in (live, cold):
+                            row = np.empty((count, config["text_config"]["head_dim"]), np.float32)
+                            check("read_native_draft_ring", read_ring(handle, stage, count, row.ctypes.data) == 1)
+                            rows.append(row)
+                        compare(f"rewound_ring_p{length}_accepted{accepted}_stage{stage}", rows[0], rows[1], exact=True)
                 left, left_conf = draft(live, 243)
                 right, right_conf = draft(cold, 243)
                 compare(f"rewound_draft_p{length}_accepted{accepted}", left, right, exact=True)

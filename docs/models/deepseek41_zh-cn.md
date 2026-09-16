@@ -667,6 +667,19 @@ JSON 中的字符串与键），同样的保护依然有效。普通历史的格
 - 并发请求拥有隔离的序列槽位。V4.1 目前回退到逐槽前向调用，而不是 V4 的融合按 token
   批处理计算图，因此并发并不意味着批处理的 GPU 吞吐。
 - V4.1 的 DSpark 投机解码尚未实现；V4 的草稿模型会被拒绝。
+- K/V cache 在每个执行器上都是 F16，`KV_CACHE_DTYPE=q8_0` / `q4_0` 会在**加载时被拒绝**
+  （`DeepSeek41Architecture.ValidateLoad` 在打开检查点之前抛 `NotSupportedException`）；
+  显式的 `f32` 会在 stderr 上被告知并按 `f16` 报告。以前它是被静默接受的：原生计算图照样
+  分配 F16 cache，而 `KvCacheDtype` 却报告 `q8_0`。这些 cache 不是共享家族交给 ggml
+  flash attention 的逐层 K/V 张量（后者在其向量内核的 64/128 宽 head 尺寸下能读
+  q8_0/q4_0 K/V）：它们是 MLA 潜变量行（K 兼作 V，宽度为潜变量宽度，CUDA flash-attention
+  内核只接受 F16），存放在滑动窗口环、压缩行与索引器行、回退检查点影子以及 DSpark 草稿环
+  里，由 `TSG_DSV4_FUSED_ATTN_PREP` / `TSG_DSV4_FUSED_COMPRESS` 写入，由
+  `TSG_DSV4_FUSED_KGATHER`、compact / TP gather 和检查点复制以 F16 行直接读取，没有任何
+  反量化步骤 —— ggml CUDA、ggml CPU、Direct CUDA 与纯 C# 执行器都是如此。要量化它们就得
+  把上述每个内核重新定型；何况检查点自带的训练时 cache 量化（原始行 FP8 E4M3、索引器行
+  MXFP4、压缩行 NVFP4）已在每次 F16 存储之前施加，q8_0 块并不会进一步缩小 cache 的信息量。
+  上面的启动示例传 `KV_CACHE_DTYPE=f16`，这是唯一什么都不改变的取值。
 - 图像/视频输入需要单独准备的视觉伴随文件。编码器与图文计算图有 CPU/CUDA fixture 覆盖，
   并在按层放置与 routed TP 下做过完整检查点的媒体检查。真实图像的 BF16 特征对比超出了
   小规模 fixture 的逐元素容差；见验证报告。目前没有经过验证的音频推理路径。
